@@ -579,6 +579,9 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
+        // 遍历所有 tensor，建立名称到 tensor 的索引：
+        // 会把tensor放到 weights_map 中，key是tensor的名字，value是llama_tensor_weight对象
+        // 可以快速找到 tensor 的数据位置和信息
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
             // make sure there is no duplicated tensor names

@@ -1384,9 +1384,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-
-    if (w_s) {
-        res = ggml_mul(ctx0, res, w_s);
+//关键函数
+    if (w_s) { 
+        res = ggml_mul(ctx0, res, w_s); //缩放
     }
 
     for (const auto & lora : *loras) {
@@ -1483,7 +1483,7 @@ ggml_tensor * llm_graph_context::build_norm(
     return cur;
 }
 
-
+//这个函数是
 llm_graph_qkv llm_graph_context::build_qkv(
         const llama_layer & layer,
               ggml_tensor * cur,
@@ -1548,7 +1548,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Vcur, "Vcur_clamped", il);
         }
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens); //
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     }
@@ -2658,7 +2658,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
-
+// 把当前层刚算出的 K_cur 和 V_cur 写入持久化的 KV Cache，并把这两个“写缓存操作”加入计算图，确保后端真正执行。
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();

@@ -306,7 +306,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.no_alloc   = params.no_alloc;
 
         try {
-            model->load_hparams(ml);
+            model->load_hparams(ml); //这个函数是将加载好的gguf文件中的hparams信息加载到model->hparams中，llama_model_loader只是加载数据，而这个函数会对其进行解析
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }

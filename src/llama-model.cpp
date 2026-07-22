@@ -20,7 +20,10 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
-
+//新加的
+#include "E:\llama\llama.cpp\ggml\src\ggml-impl.h"
+#include "E:\llama\llama.cpp\ggml\src\ggml-backend-impl.h"
+//
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -310,7 +313,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
     llama_model * model = llama_model_mapping(arch, params);
-
+    // 根据arch和params创建不同的模型子类
     if (model != nullptr) {
         model->arch = arch;
         auto & devices = model->devices;
@@ -335,7 +338,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
-
+    //GGML_LOG_INFO("已经调用 llama_meta_device_get_split_state, tensor_name: %s\n", tensor_name.c_str());
+    //如果是q,k,v权重，打印切分信息
+    
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
@@ -684,6 +689,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
     }
+    //如果是q,k,v权重，打印切分信息
+    if (std::regex_match(tensor_name, std::regex("blk\\.\\d*\\.attn_(q|k|v)\\.weight"))) {
+        GGML_LOG_INFO("llama_meta_device_get_split_state: tensor_name: %s, axis: %d, ne[0]: %lld, ne[1]: %lld, ne[2]: %lld, ne[3]: %lld\n",
+            tensor_name.c_str(), split_state.axis,
+            split_state.ne[0], split_state.ne[1], split_state.ne[2], split_state.ne[3]);
+    }
+    //看一下kv切分信息
+    if (std::regex_match(tensor_name, std::regex("cache_(k|v)_l\\d*"))) {
+        GGML_LOG_INFO("llama_meta_device_get_split_state: tensor_name: %s, axis: %d, ne[0]: %lld, ne[1]: %lld, ne[2]: %lld, ne[3]: %lld\n",
+            tensor_name.c_str(), split_state.axis,
+            split_state.ne[0], split_state.ne[1], split_state.ne[2], split_state.ne[3]);
+    }
     return split_state;
     GGML_UNUSED(userdata);
 }
@@ -871,10 +888,11 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
-
+    // 按优先级添加缓冲区类型：ACCEL -> GPU host -> CPU extra -> CPU
     // add ACCEL buffer types
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        //遍历所有设备，如果设备类型是加速器（ACCEL），则获取其缓冲区类型并添加到列表中
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
@@ -893,6 +911,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     if (!no_host) {
         for (const auto & dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
+            // 遍历所有设备，如果设备支持主机缓冲区类型，则将其添加到列表中
             if (buft) {
                 buft_list.emplace_back(dev.dev, buft);
                 break;
@@ -928,6 +947,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     }
 
     return buft_list;
+    //之后创建 tensor 时，loader 会从这个列表里挑一个兼容的 buffer type
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
@@ -980,16 +1000,17 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
+    // 内部实现细节
     impl() = default;
     ~impl() = default;
 
-    uint64_t n_elements = 0;
+    uint64_t n_elements = 0; // 模型参数量
 
-    size_t n_bytes = 0;
+    size_t n_bytes = 0; // 模型参数占用的字节数
 
     std::string desc_str;
 
-    llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
+    llama_ftype ftype = LLAMA_FTYPE_ALL_F32; // 模型描述和量化类型
 
     // model memory mapped files
     llama_mmaps mappings;
@@ -1002,16 +1023,16 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
-    std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list; // 候选 buffer types for each GPU device
 
     struct layer_dev {
         ggml_backend_dev_t dev;
         buft_list_t * buft_list;
     };
 
-    layer_dev dev_input = {};
-    layer_dev dev_output = {};
-    std::vector<layer_dev> dev_layer;
+    layer_dev dev_input = {};   // 输入层放哪个设备
+    layer_dev dev_output = {};  // 输出层放哪个设备
+    std::vector<layer_dev> dev_layer;   // 每一层放哪个设备
 
     bool has_tensor_overrides;
 
@@ -1041,7 +1062,7 @@ void llama_model_base::load_stats(llama_model_loader & ml) {
 
 void llama_model_base::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
-
+    //加载模型的超参数和元数据，不包括权重
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
         gguf_type type = gguf_get_kv_type(ctx, i);
@@ -1295,11 +1316,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+            LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+        LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
@@ -1312,7 +1335,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
-
+    LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
@@ -1637,7 +1660,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
-
+    // 创建分配并加载模型权重
     return true;
 }
 

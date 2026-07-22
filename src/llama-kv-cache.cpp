@@ -65,12 +65,12 @@ llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
                 ggml_type   type_k,
-                ggml_type   type_v,
+                ggml_type   type_v, // 数据类型
                      bool   v_trans,
-                     bool   offload,
+                     bool   offload, // 是否将KV缓存放到设备外存储
                      bool   unified,
                  uint32_t   kv_size,
-                 uint32_t   n_seq_max,
+                 uint32_t   n_seq_max, // 最多支持多少个序列
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
@@ -230,7 +230,7 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-
+        // 创建KV tensor
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 

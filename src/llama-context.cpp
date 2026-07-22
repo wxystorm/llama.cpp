@@ -1788,7 +1788,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
-
+        // 拿出要处理的一个 ubatch
         // count the outputs in this ubatch
         {
             int32_t n_outputs_new = 0;
@@ -1804,11 +1804,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
         }
-
+        // 统计有多少个输出 token ，构建计算图依赖n_outputs
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
+        // 根据当前ubatch构建计算图并执行计算，返回结果res
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -1848,7 +1848,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
-
+        // 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }

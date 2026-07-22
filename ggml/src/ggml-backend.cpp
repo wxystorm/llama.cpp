@@ -1373,6 +1373,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+        // 打印每个split分配到哪里
+        
+            for (int i = 0; i < sched->n_splits; i++) {
+                struct ggml_backend_sched_split * split = &sched->splits[i];
+                GGML_LOG_INFO("SPLIT #%d: backend=%s, nodes=[%d, %d), n_inputs=%d\n", i,
+                    ggml_backend_name(sched->backends[split->backend_id]), split->i_start, split->i_end, split->n_inputs);
+            }
+            
+        
     }
 
     if (sched->debug) {

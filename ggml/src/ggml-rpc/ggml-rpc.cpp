@@ -403,7 +403,7 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
 static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
 }
-
+// 将ggml_tensor序列化为rpc_tensor结构体，便于在RPC中传输
 static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     rpc_tensor result;
     if (!tensor) {
@@ -472,6 +472,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        // 发送的信息和接收的信息打印,比如发送接收多少字节
+        //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes, received %zu bytes\n", sizeof(request), sizeof(response));
         RPC_STATUS_ASSERT(status);
         if (response.result) {
             // the server has the same data, no need to send it
@@ -484,6 +486,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+    //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes\n", input.size());
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
 }
@@ -494,6 +497,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
+    GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
 }
@@ -668,7 +672,7 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     add_tensor(tensor->view_src, tensors, visited);
     tensors.push_back(serialize_tensor(tensor));
 }
-
+// 将ggml_cgraph序列化为字节流，便于在RPC中传输
 static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
     uint32_t n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor> tensors;
@@ -708,6 +712,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        GGML_LOG_INFO(
+        "%s: graph reused, uid=%" PRIu64
+        ", sending GRAPH_RECOMPUTE, payload=%zu bytes\n",
+        __func__,
+        cgraph->uid,
+        sizeof(request)
+    );
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
@@ -715,6 +726,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        // 打印发送和接收的字节数，计算图
+        GGML_LOG_INFO("ggml_backend_rpc_graph_compute: sent %zu bytes\n", input.size());
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -921,11 +934,10 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     if (buffer != nullptr) {
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
-            __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+        GGML_LOG_INFO("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
         buffers.insert(buffer);
     } else {
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+        //LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
     return true;
 }
@@ -988,7 +1000,7 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     ggml_backend_buffer_clear(buffer, request.value);
     return true;
 }
-
+// 把收到的rpc_tensor反序列化为ggml_tensor结构体
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
@@ -1062,7 +1074,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
-    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
+    //打印张量信息，包括名字
+    GGML_LOG_INFO("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, name: '%s'\n",
+                   __func__, (void*)tensor->buffer, tensor->data, offset, size, in_tensor->name);
 
     // sanitize tensor->data
     {

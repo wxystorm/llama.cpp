@@ -1819,7 +1819,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
 
     return result;
 }
-
+//创建一个新的张量对象，并将其添加到上下文中。该函数接受上下文、数据类型、维度数量和每个维度的大小作为参数，并返回一个指向新创建的张量的指针。
 struct ggml_tensor * ggml_new_tensor(
         struct ggml_context * ctx,
         enum   ggml_type      type,
@@ -3261,15 +3261,15 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_tensor  * b) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
-
-    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+//矩阵乘法
+    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] }; //结果应该的维度
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
 
-    return result;
+    return result;   //返回
 }
 
 void ggml_mul_mat_set_prec(
@@ -4144,7 +4144,7 @@ struct ggml_tensor * ggml_soft_max_ext_back_inplace(
 }
 
 // ggml_rope
-
+//a：需要执行 RoPE 的 Q 或 K 张量 b：token 的位置 position c：可选的频率因子或频率修正张量
 static struct ggml_tensor * ggml_rope_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -4178,7 +4178,7 @@ static struct ggml_tensor * ggml_rope_impl(
         GGML_ASSERT(c->ne[0] >= n_dims / 2);
     }
 
-    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a); //创建一个副本，用于读取a然后处理写回result
 
     int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
@@ -4265,7 +4265,7 @@ struct ggml_tensor * ggml_rope_inplace(
         ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, true
     );
 }
-
+//这个函数是实现了一个扩展的 RoPE（Rotary Position Embedding）操作，用于在神经网络中对输入张量进行位置编码。它接受多个参数，包括输入张量、位置张量、可选的频率修正张量、维度信息、模式、上下文长度以及频率和衰减因子等。函数内部调用了 `ggml_rope_impl` 来执行实际的 RoPE 操作，并返回处理后的结果张量。
 struct ggml_tensor * ggml_rope_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -6916,7 +6916,7 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
     if (node->op != GGML_OP_NONE && compute) {
         node->flags |= GGML_TENSOR_FLAG_COMPUTE;
     }
-
+//遍历节点所有上游依赖，
     const size_t node_hash_pos = ggml_hash_find(&cgraph->visited_hash_set, node);
     GGML_ASSERT(node_hash_pos != GGML_HASHSET_FULL);
 
