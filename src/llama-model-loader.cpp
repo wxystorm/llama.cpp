@@ -1712,3 +1712,42 @@ void llama_model_loader::print_info() const {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
 }
+
+bool llama_model_loader::get_local_tensor_info(const std::string & name, llama_local_tensor_info & info) {
+    // Implementation for getting local tensor info
+    //从weights_map中查找权重信息
+    auto it = weights_map.find(name);
+    if (it != weights_map.end()) {
+        const auto & weight = it->second;
+        info.name = name;
+        info.file_idx = weight.idx;
+        info.file_offset = weight.offs;
+        info.byte_size = ggml_nbytes(weight.tensor);
+        info.type = weight.tensor->type;
+        return true;
+    }
+    return false;
+}
+
+bool llama_model_loader::read_local_tensor(const std::string & name, void * dest, size_t dest_size) {
+    // Implementation for reading local tensor info from the file
+    // This function would typically read the tensor metadata from the file and populate the info structure
+    // For simplicity, we can call get_local_tensor_info here, but in a real implementation, it would read from the file
+    llama_local_tensor_info info;
+    if (get_local_tensor_info(name, info)) {
+        if (dest_size < info.byte_size) {
+            throw std::runtime_error(format("destination buffer too small for tensor '%s'", name.c_str()));
+            return false;
+        }
+        // Read the tensor data from the file
+        if (info.file_idx >= files.size()) {
+            throw std::runtime_error(format("invalid file index for tensor '%s'", name.c_str()));
+            return false;
+        }
+        const auto & file = files.at(info.file_idx);
+        file->seek(info.file_offset, SEEK_SET);
+        file->read_raw(dest, info.byte_size);
+        return true;
+    }
+    return false;
+}

@@ -175,6 +175,11 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+
+    //本地local GGUF loading
+    std::string              model_path  = "";
+    int                      tp_rank     = 0;
+    int                      tp_world_size = 1;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -186,6 +191,9 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -m, --model MODEL_PATH             path to the model gguf file\n");
+    fprintf(stderr, "  --tp-rank <0|1>                  rank 0 is computer, rank 1 is mobile, default: 0\n");
+    fprintf(stderr, "  --tp-world-size <n>            world size for tensor parallelism, default: 1\n");
     fprintf(stderr, "\n");
 }
 
@@ -236,6 +244,21 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
+        } else if (arg == "-m" || arg == "--model") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.model_path = argv[i];
+        } else if (arg == "--tp-rank") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.tp_rank = std::stoi(argv[i]);
+        } else if (arg == "--tp-world-size") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.tp_world_size = std::stoi(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, params);
@@ -286,7 +309,7 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 
     return devices;
 }
-
+//核心函数
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
 

@@ -72,6 +72,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_COUNT,
+    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, //只发送tensor名称和目标buffer信息
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
@@ -188,6 +189,17 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+//新加的
+struct rpc_msg_set_tensor_from_local_file_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+
+    int32_t split_axis;
+    int64_t split_low;
+    int64_t split_size;
 };
 
 #pragma pack(pop)
@@ -462,7 +474,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+/*static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     if (size > HASH_THRESHOLD) {
@@ -490,6 +502,72 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
 }
+*/
+//用于判断是否需要传权重
+static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->name[0] == '\0') {
+        return false;
+    }
+
+    const char * name = tensor->name;
+
+    // 第一阶段只处理模型权重，先不要处理 KV cache / 临时 tensor
+    if (strncmp(name, "blk.", 4) == 0) {
+        return true;
+    }
+
+    if (strcmp(name, "output.weight") == 0) {
+        return true;
+    }
+
+    if (strcmp(name, "token_embd.weight") == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (size > HASH_THRESHOLD) {
+        rpc_msg_set_tensor_hash_req request;
+        request.tensor = rpc_tensor;
+        request.offset = offset;
+        request.hash = fnv_hash((const uint8_t*)data, size);
+        rpc_msg_set_tensor_hash_rsp response;
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        // 发送的信息和接收的信息打印,比如发送接收多少字节
+        //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes, received %zu bytes\n", sizeof(request), sizeof(response));
+        RPC_STATUS_ASSERT(status);
+        if (response.result) {
+            // the server has the same data, no need to send it
+            return;
+        }
+    }
+    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+    if (should_use_local_file_tensor(tensor)) {
+        // 发送RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE命令，告诉服务器从本地文件读取tensor
+        rpc_msg_set_tensor_from_local_file_req request;
+        request.tensor = rpc_tensor;
+        request.offset = offset;
+        request.size = size;
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, &request, sizeof(request));
+        RPC_STATUS_ASSERT(status);
+        GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE for tensor %s\n", tensor->name);
+        return;
+    } else {
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+        std::vector<uint8_t> input(input_size, 0);
+        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+        //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes\n", input.size());
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+        RPC_STATUS_ASSERT(status);
+}
+    }
+    
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -828,7 +906,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 }
 
 // RPC server-side implementation
-
+#include "llama-model-loader.h" //注意，直接底层include上层不是一个好的做法，之后需要修改
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -853,12 +931,12 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
-
+    bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request); //新加的
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
     };
-
+    std::unique_ptr<llama_model_loader> local_loader; //临时结构
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -1439,6 +1517,35 @@ rpc_server::~rpc_server() {
     }
 }
 
+//新加的函数
+bool rpc_server::set_tensor_from_local_file(
+        const rpc_msg_set_tensor_from_local_file_req & request) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> data(request.size);
+
+    if (!local_loader || !local_loader->read_local_tensor(request.tensor.name, data.data(), data.size())) {
+        GGML_LOG_ERROR("[%s] failed to read local tensor '%s'\n", __func__, request.tensor.name);
+        return false;
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), request.offset, request.size);
+    return true;
+}
+/*
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              socket_ptr sock) {
     rpc_server server(backends, cache_dir);
@@ -1705,8 +1812,281 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         }
     }
 }
+*/
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+//重构
+static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                             socket_ptr sock, std::string model_path, int tp_rank, int tp_size) {
+    rpc_server server(backends, cache_dir);
+    uint8_t cmd;
+    if (!sock->recv_data(&cmd, 1)) {
+        return;
+    }
+    if (cmd != RPC_CMD_HELLO) {
+        GGML_LOG_ERROR("Expected HELLO command, update client\n");
+        return;
+    }
+
+    // Read input_size and validate protocol version
+    uint64_t hello_input_size;
+    if (!sock->recv_data(&hello_input_size, sizeof(hello_input_size))) {
+        return;
+    }
+
+    if (hello_input_size != sizeof(rpc_msg_hello_req)) {
+        GGML_LOG_ERROR("HELLO request size mismatch (%zu vs %zu) — client needs upgrade to protocol v%d.x\n",
+                       (size_t)hello_input_size, sizeof(rpc_msg_hello_req), RPC_PROTO_MAJOR_VERSION);
+        return;
+    }
+
+    rpc_msg_hello_req req = {};
+    if (!sock->recv_data(&req, sizeof(req))) {
+        return;
+    }
+
+    rpc_msg_hello_rsp rsp = {};
+    server.hello(rsp);
+    // Advertise server transport capabilities based on client's caps
+    sock->get_caps(rsp.conn_caps);
+    if (!send_msg(sock, &rsp, sizeof(rsp))) {
+        return;
+    }
+
+    // Activate transport upgrade using client's caps
+    sock->update_caps(req.conn_caps);
+    while (true) {
+        if (!sock->recv_data(&cmd, 1)) {
+            break;
+        }
+        if (cmd >= RPC_CMD_COUNT) {
+            // fail fast if the command is invalid
+            GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+            break;
+        }
+        switch (cmd) {
+            case RPC_CMD_HELLO: {
+                // HELLO command is handled above
+                return;
+            }
+            case RPC_CMD_DEVICE_COUNT: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_device_count_rsp response;
+                response.device_count = backends.size();
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_ALLOC_BUFFER: {
+                rpc_msg_alloc_buffer_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_alloc_buffer_rsp response;
+                if (!server.alloc_buffer(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_ALLOC_SIZE: {
+                rpc_msg_get_alloc_size_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_alloc_size_rsp response;
+                if (!server.get_alloc_size(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_ALIGNMENT: {
+                rpc_msg_get_alignment_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_alignment_rsp response;
+                if (!server.get_alignment(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_MAX_SIZE: {
+                rpc_msg_get_max_size_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_max_size_rsp response;
+                if (!server.get_max_size(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_BUFFER_GET_BASE: {
+                rpc_msg_buffer_get_base_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_buffer_get_base_rsp response;
+                if (!server.buffer_get_base(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_FREE_BUFFER: {
+                rpc_msg_free_buffer_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.free_buffer(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_BUFFER_CLEAR: {
+                rpc_msg_buffer_clear_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.buffer_clear(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH: {
+                rpc_msg_set_tensor_hash_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_set_tensor_hash_rsp response;
+                if (!server.set_tensor_hash(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_INIT_TENSOR: {
+                rpc_msg_init_tensor_req request;
+                if (!recv_msg(sock, &request,sizeof(request))) {
+                    return;
+                }
+                if (!server.init_tensor(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_TENSOR: {
+                rpc_msg_get_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.get_tensor(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_COPY_TENSOR: {
+                rpc_msg_copy_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_copy_tensor_rsp response;
+                if (!server.copy_tensor(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_COMPUTE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.graph_compute(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_RECOMPUTE: {
+                rpc_msg_graph_recompute_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.graph_recompute(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_DEVICE_MEMORY: {
+                rpc_msg_get_device_memory_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_device_memory_rsp response;
+                if (!server.get_device_memory(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE: {
+                //先等着
+                rpc_msg_set_tensor_from_local_file_req request;
+                break;
+            }
+            default: {
+                GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+                return;
+            }
+        }
+    }
+}
+/*void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
@@ -1778,7 +2158,98 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         ggml_backend_free(backend);
     }
 }
+    */
+// Internal extended server entry used for TP-specific experiments.
+static void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir,
+                                             size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                             const char * model_path, int tp_rank, int tp_world_size) {
+    if (n_devices == 0 || devices == nullptr) {
+        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
+        return;
+    }
+    if (model_path != nullptr && model_path[0] != '\0') {
+    if (tp_world_size <= 0 || tp_rank < 0 || tp_rank >= tp_world_size) {
+        fprintf(stderr, "Invalid TP arguments: rank=%d, world_size=%d\n", tp_rank, tp_world_size);
+        return;
+        }
+    }
+    std::vector<ggml_backend_t> backends;
+    printf("Starting RPC server v%d.%d.%d\n",
+        RPC_PROTO_MAJOR_VERSION,
+        RPC_PROTO_MINOR_VERSION,
+        RPC_PROTO_PATCH_VERSION);
+    printf("  model          : %s\n", model_path && model_path[0] ? model_path : "n/a");
+    printf("  tp rank        : %d\n", tp_rank);
+    printf("  tp world size  : %d\n", tp_world_size);
+    printf("  endpoint       : %s\n", endpoint);
+    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("Devices:\n");
+    for (size_t i = 0; i < n_devices; i++) {
+        auto dev = devices[i];
+        size_t free, total;
+        ggml_backend_dev_memory(dev, &free, &total);
+        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+               total / 1024 / 1024, free / 1024 / 1024);
+        auto backend = ggml_backend_dev_init(dev, nullptr);
+        if (!backend) {
+            fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+            return;
+        }
+        backends.push_back(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (ggml_backend_set_n_threads_fn) {
+                ggml_backend_set_n_threads_fn(backend, n_threads);
+            }
+        }
+    }
 
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        return;
+    }
+
+#ifdef GGML_RPC_RDMA
+    printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+#else
+    printf("  transport      : TCP\n");
+#endif // GGML_RPC_RDMA
+    if (!rpc_transport_init()) {
+        fprintf(stderr, "Failed to initialize RPC transport\n");
+        return;
+    }
+    auto server_socket = socket_t::create_server(host.c_str(), port);
+    if (server_socket == nullptr) {
+        fprintf(stderr, "Failed to create server socket\n");
+        return;
+    }
+    while (true) {
+        auto client_socket = server_socket->accept();
+        if (client_socket == nullptr) {
+            fprintf(stderr, "Failed to accept client connection\n");
+            return;
+        }
+        printf("Accepted client connection\n");
+        fflush(stdout);
+        rpc_serve_client(backends, cache_dir, client_socket,
+                         model_path ? std::string(model_path) : std::string(),
+                         tp_rank, tp_world_size);
+        printf("Client connection closed\n");
+        fflush(stdout);
+    }
+    rpc_transport_shutdown();
+    for (auto backend : backends) {
+        ggml_backend_free(backend);
+    }
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    ggml_backend_rpc_start_server_ex(endpoint, cache_dir, n_threads, n_devices, devices,
+                                     nullptr, 0, 1);
+}
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 

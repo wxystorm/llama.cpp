@@ -28,6 +28,17 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+//新加的用于本地手机端加载GGUF模型的结构体
+struct llama_local_tensor_info {
+    std::string name;
+    ggml_type type;
+    std::array<int64_t, GGML_MAX_DIMS> ne; //相当于int64_t ne[GGML_MAX_DIMS]; // number of elements
+
+    uint16_t file_idx;
+    size_t file_offset;
+    size_t byte_size;
+};
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -204,4 +215,10 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+    //根据tensor名字，返回这个tensor在GGUF文件里的元信息
+    bool get_local_tensor_info(const std::string & name, llama_local_tensor_info & info);
+    
+    //根据tensor名字，从本地读取GGUF里面的tensor
+    bool read_local_tensor(const std::string & name, void * dest, size_t dest_size);
 };
