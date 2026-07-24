@@ -21,8 +21,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 //新加的
-#include "E:\llama\llama.cpp\ggml\src\ggml-impl.h"
-#include "E:\llama\llama.cpp\ggml\src\ggml-backend-impl.h"
+#include "../ggml/src/ggml-impl.h"
+#include "../ggml/src/ggml-backend-impl.h"
 //
 #include <algorithm>
 #include <cassert>
