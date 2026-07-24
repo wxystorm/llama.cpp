@@ -194,7 +194,8 @@ struct rpc_msg_graph_recompute_req {
 //新加的
 struct rpc_msg_set_tensor_from_local_file_req {
     rpc_tensor tensor;
-    uint64_t offset;
+    uint64_t src_offset;
+    uint64_t dst_offset;
     uint64_t size;
 
     int32_t split_axis;
@@ -391,13 +392,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return sock;
 }
 
-static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
-    delete ctx;
-}
+static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -527,47 +522,112 @@ static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
     return false;
 }
 
-static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_tensor rpc_tensor = serialize_tensor(tensor);
+static void ggml_backend_rpc_buffer_set_tensor(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size) {
+
+    ggml_backend_rpc_buffer_context * ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(buffer->context);
+
+    rpc_tensor serialized_tensor = serialize_tensor(tensor);
+
     if (size > HASH_THRESHOLD) {
-        rpc_msg_set_tensor_hash_req request;
-        request.tensor = rpc_tensor;
+        rpc_msg_set_tensor_hash_req request {};
+        request.tensor = serialized_tensor;
         request.offset = offset;
-        request.hash = fnv_hash((const uint8_t*)data, size);
-        rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        // 发送的信息和接收的信息打印,比如发送接收多少字节
-        //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes, received %zu bytes\n", sizeof(request), sizeof(response));
+        request.hash   = fnv_hash(
+            static_cast<const uint8_t *>(data),
+            size);
+
+        rpc_msg_set_tensor_hash_rsp response {};
+
+        const bool status = send_rpc_cmd(
+            ctx->sock,
+            RPC_CMD_SET_TENSOR_HASH,
+            &request,
+            sizeof(request),
+            &response,
+            sizeof(response));
+
         RPC_STATUS_ASSERT(status);
+
         if (response.result) {
-            // the server has the same data, no need to send it
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+
     if (should_use_local_file_tensor(tensor)) {
-        // 发送RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE命令，告诉服务器从本地文件读取tensor
-        rpc_msg_set_tensor_from_local_file_req request;
-        request.tensor = rpc_tensor;
-        request.offset = offset;
-        request.size = size;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, &request, sizeof(request));
+        rpc_msg_set_tensor_from_local_file_req request {};
+
+        request.tensor     = serialized_tensor;
+        request.src_offset = static_cast<uint64_t>(offset);
+        request.dst_offset = static_cast<uint64_t>(offset);
+        request.size       = static_cast<uint64_t>(size);
+
+        const bool status = send_rpc_cmd(
+            ctx->sock,
+            RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
+            &request,
+            sizeof(request));
+
         RPC_STATUS_ASSERT(status);
-        GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE for tensor %s\n", tensor->name);
+
+        GGML_LOG_INFO(
+            "%s: local-file tensor='%s', "
+            "src_offset=%" PRIu64 ", dst_offset=%" PRIu64
+            ", size=%" PRIu64 "\n",
+            __func__,
+            tensor->name,
+            request.src_offset,
+            request.dst_offset,
+            request.size);
+
         return;
-    } else {
-        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-        std::vector<uint8_t> input(input_size, 0);
-        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-        memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-        //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes\n", input.size());
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
-}
     }
-    
+
+    const size_t input_size =
+        sizeof(serialized_tensor) +
+        sizeof(uint64_t) +
+        size;
+
+    std::vector<uint8_t> input(input_size, 0);
+
+    memcpy(
+        input.data(),
+        &serialized_tensor,
+        sizeof(serialized_tensor));
+
+    memcpy(
+        input.data() + sizeof(serialized_tensor),
+        &offset,
+        sizeof(offset));
+
+    memcpy(
+        input.data() +
+            sizeof(serialized_tensor) +
+            sizeof(offset),
+        data,
+        size);
+
+    const bool status = send_rpc_cmd(
+        ctx->sock,
+        RPC_CMD_SET_TENSOR,
+        input.data(),
+        input.size());
+
+    RPC_STATUS_ASSERT(status);
+}
+
+static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    RPC_STATUS_ASSERT(status);
+    delete ctx;
+}
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -906,12 +966,14 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 }
 
 // RPC server-side implementation
-#include "llama-model-loader.h" //注意，直接底层include上层不是一个好的做法，之后需要修改
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
+        if (tensor_source != nullptr) {
+            local_tensor_source = *tensor_source;
+        }
     }
     ~rpc_server();
 
@@ -936,7 +998,6 @@ public:
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
     };
-    std::unique_ptr<llama_model_loader> local_loader; //临时结构
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -951,6 +1012,8 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    //新加的
+    ggml_rpc_local_tensor_source local_tensor_source {};
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1520,29 +1583,122 @@ rpc_server::~rpc_server() {
 //新加的函数
 bool rpc_server::set_tensor_from_local_file(
         const rpc_msg_set_tensor_from_local_file_req & request) {
+
     struct ggml_init_params params {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
+        /* .mem_size   = */ ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
     };
 
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
 
-    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    ggml_tensor * tensor =
+        deserialize_tensor(ctx_ptr.get(), &request.tensor);
+
     if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        GGML_LOG_ERROR(
+            "[%s] error deserializing tensor\n",
+            __func__);
         return false;
     }
 
-    std::vector<uint8_t> data(request.size);
-
-    if (!local_loader || !local_loader->read_local_tensor(request.tensor.name, data.data(), data.size())) {
-        GGML_LOG_ERROR("[%s] failed to read local tensor '%s'\n", __func__, request.tensor.name);
+    if (local_tensor_source.read == nullptr) {
+        GGML_LOG_ERROR(
+            "[%s] no local tensor source registered\n",
+            __func__);
         return false;
     }
 
-    ggml_backend_tensor_set(tensor, data.data(), request.offset, request.size);
+    const size_t name_len =
+        strnlen(request.tensor.name, GGML_MAX_NAME);
+
+    if (name_len == GGML_MAX_NAME) {
+        GGML_LOG_ERROR(
+            "[%s] tensor name is not null-terminated\n",
+            __func__);
+        return false;
+    }
+
+    const std::string name(
+        request.tensor.name,
+        name_len);
+
+    const size_t tensor_nbytes = ggml_nbytes(tensor);
+
+    if (request.dst_offset > tensor_nbytes ||
+        request.size > tensor_nbytes - request.dst_offset) {
+        GGML_LOG_ERROR(
+            "[%s] destination range is out of bounds: "
+            "name='%s', offset=%" PRIu64 ", size=%" PRIu64 "\n",
+            __func__,
+            name.c_str(),
+            request.dst_offset,
+            request.size);
+        return false;
+    }
+
+    // 可选：先查询源 tensor 的元信息并进行边界校验。
+    if (local_tensor_source.get_info != nullptr) {
+        ggml_rpc_local_tensor_info info {};
+
+        if (!local_tensor_source.get_info(
+                local_tensor_source.user_data,
+                name.c_str(),
+                &info)) {
+            GGML_LOG_ERROR(
+                "[%s] local tensor '%s' not found\n",
+                __func__,
+                name.c_str());
+            return false;
+        }
+
+        if (request.src_offset > info.nbytes ||
+            request.size > info.nbytes - request.src_offset) {
+            GGML_LOG_ERROR(
+                "[%s] source range is out of bounds: "
+                "name='%s', offset=%" PRIu64 ", size=%" PRIu64
+                ", tensor_size=%" PRIu64 "\n",
+                __func__,
+                name.c_str(),
+                request.src_offset,
+                request.size,
+                info.nbytes);
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> data;
+
+    try {
+        data.resize(static_cast<size_t>(request.size));
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR(
+            "[%s] failed to allocate %" PRIu64 " bytes\n",
+            __func__,
+            request.size);
+        return false;
+    }
+
+    if (!local_tensor_source.read(
+            local_tensor_source.user_data,
+            name.c_str(),
+            request.src_offset,
+            data.data(),
+            data.size())) {
+        GGML_LOG_ERROR(
+            "[%s] failed to read local tensor '%s'\n",
+            __func__,
+            name.c_str());
+        return false;
+    }
+
+    ggml_backend_tensor_set(
+        tensor,
+        data.data(),
+        request.dst_offset,
+        data.size());
+
     return true;
 }
 /*
@@ -1816,8 +1972,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
 //重构
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock, std::string model_path, int tp_rank, int tp_size) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, const ggml_rpc_local_tensor_source * tensor_source,
+                             std::string model_path, int tp_rank, int tp_size) {
+    rpc_server server(backends, cache_dir, tensor_source);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2077,6 +2234,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             case RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE: {
                 //先等着
                 rpc_msg_set_tensor_from_local_file_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.set_tensor_from_local_file(request)) {
+                    return;
+                }
                 break;
             }
             default: {
@@ -2160,9 +2323,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
     */
 // Internal extended server entry used for TP-specific experiments.
-static void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir,
-                                             size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
-                                             const char * model_path, int tp_rank, int tp_world_size) {
+void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir,
+                                      size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                      const ggml_rpc_local_tensor_source * tensor_source,
+                                      const char * model_path, int tp_rank, int tp_world_size) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -2234,6 +2398,7 @@ static void ggml_backend_rpc_start_server_ex(const char * endpoint, const char *
         printf("Accepted client connection\n");
         fflush(stdout);
         rpc_serve_client(backends, cache_dir, client_socket,
+                         tensor_source,
                          model_path ? std::string(model_path) : std::string(),
                          tp_rank, tp_world_size);
         printf("Client connection closed\n");
@@ -2248,7 +2413,7 @@ static void ggml_backend_rpc_start_server_ex(const char * endpoint, const char *
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     ggml_backend_rpc_start_server_ex(endpoint, cache_dir, n_threads, n_devices, devices,
-                                     nullptr, 0, 1);
+                                     nullptr, nullptr, 0, 1);
 }
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;

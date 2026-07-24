@@ -1729,25 +1729,86 @@ bool llama_model_loader::get_local_tensor_info(const std::string & name, llama_l
     return false;
 }
 
-bool llama_model_loader::read_local_tensor(const std::string & name, void * dest, size_t dest_size) {
-    // Implementation for reading local tensor info from the file
-    // This function would typically read the tensor metadata from the file and populate the info structure
-    // For simplicity, we can call get_local_tensor_info here, but in a real implementation, it would read from the file
-    llama_local_tensor_info info;
-    if (get_local_tensor_info(name, info)) {
-        if (dest_size < info.byte_size) {
-            throw std::runtime_error(format("destination buffer too small for tensor '%s'", name.c_str()));
-            return false;
-        }
-        // Read the tensor data from the file
-        if (info.file_idx >= files.size()) {
-            throw std::runtime_error(format("invalid file index for tensor '%s'", name.c_str()));
-            return false;
-        }
-        const auto & file = files.at(info.file_idx);
-        file->seek(info.file_offset, SEEK_SET);
-        file->read_raw(dest, info.byte_size);
+bool llama_model_loader::read_local_tensor(
+        const std::string & name,
+        void * dest,
+        size_t tensor_offset,
+        size_t dest_size) {
+
+    llama_local_tensor_info info {};
+
+    if (!get_local_tensor_info(name, info)) {
+        LLAMA_LOG_ERROR(
+            "%s: tensor '%s' was not found\n",
+            __func__,
+            name.c_str());
+        return false;
+    }
+
+    // 读取 0 字节可以直接认为成功
+    if (dest_size == 0) {
         return true;
     }
-    return false;
+
+    if (dest == nullptr) {
+        LLAMA_LOG_ERROR(
+            "%s: destination buffer is null for tensor '%s'\n",
+            __func__,
+            name.c_str());
+        return false;
+    }
+
+    /*
+     * 检查：
+     * tensor_offset <= info.byte_size
+     * tensor_offset + dest_size <= info.byte_size
+     *
+     * 使用减法形式可以避免 tensor_offset + dest_size 溢出。
+     */
+    if (tensor_offset > info.byte_size ||
+        dest_size > info.byte_size - tensor_offset) {
+
+        LLAMA_LOG_ERROR(
+            "%s: read range is out of bounds for tensor '%s': "
+            "tensor_size=%zu, offset=%zu, size=%zu\n",
+            __func__,
+            name.c_str(),
+            static_cast<size_t>(info.byte_size),
+            tensor_offset,
+            dest_size);
+
+        return false;
+    }
+
+    if (info.file_idx >= files.size()) {
+        LLAMA_LOG_ERROR(
+            "%s: invalid file index for tensor '%s': "
+            "file_idx=%zu, file_count=%zu\n",
+            __func__,
+            name.c_str(),
+            static_cast<size_t>(info.file_idx),
+            files.size());
+
+        return false;
+    }
+
+    const auto & file = files.at(info.file_idx);
+
+    if (file == nullptr) {
+        LLAMA_LOG_ERROR(
+            "%s: file object is null for tensor '%s'\n",
+            __func__,
+            name.c_str());
+        return false;
+    }
+
+    // info.file_offset 是 tensor 在 GGUF 文件中的起始位置
+    // tensor_offset 是 tensor 内部的读取偏移
+    const size_t file_read_offset =
+        static_cast<size_t>(info.file_offset) + tensor_offset;
+
+    file->seek(file_read_offset, SEEK_SET);
+    file->read_raw(dest, dest_size);
+
+    return true;
 }

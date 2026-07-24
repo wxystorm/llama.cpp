@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "llama-model-loader.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -13,12 +14,15 @@
 #include <algorithm>
 #include <clocale>
 #include <codecvt>
+#include <exception>
 #include <filesystem>
 #include <regex>
 #include <stdio.h>
 #include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
+#include <memory>
 
 #if defined(__linux__)
 #include <sys/types.h>
@@ -309,6 +313,77 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 
     return devices;
 }
+struct llama_rpc_local_tensor_context {
+    llama_model_loader * loader = nullptr;
+    std::mutex mutex;
+};
+
+//新
+static bool llama_rpc_read_local_tensor(
+        void * user_data,
+        const char * name,
+        uint64_t tensor_offset,
+        void * dest,
+        size_t size) {
+
+    auto * ctx =
+        static_cast<llama_rpc_local_tensor_context *>(user_data);
+
+    if (ctx == nullptr ||
+        ctx->loader == nullptr ||
+        name == nullptr ||
+        (dest == nullptr && size != 0)) {
+        return false;
+    }
+
+    // read_local_tensor 内部如果还是 seek + read，
+    // 多线程读取时必须保护文件位置。
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    return ctx->loader->read_local_tensor(
+        name,
+        dest,
+        static_cast<size_t>(tensor_offset),
+        size);
+}
+
+static bool llama_rpc_get_local_tensor_info(
+        void * user_data,
+        const char * name,
+        ggml_rpc_local_tensor_info * output) {
+
+    auto * ctx =
+        static_cast<llama_rpc_local_tensor_context *>(user_data);
+
+    if (ctx == nullptr ||
+        ctx->loader == nullptr ||
+        name == nullptr ||
+        output == nullptr) {
+        return false;
+    }
+
+    llama_local_tensor_info llama_info {};
+
+    if (!ctx->loader->get_local_tensor_info(name, llama_info)) {
+        return false;
+    }
+
+    const ggml_tensor * tensor = ctx->loader->get_tensor_meta(name);
+    if (tensor == nullptr) {
+        return false;
+    }
+
+    output->nbytes = llama_info.byte_size;
+    output->type   = static_cast<uint32_t>(llama_info.type);
+    output->n_dims = static_cast<uint32_t>(ggml_n_dims(tensor));
+
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        output->ne[i] = static_cast<uint64_t>(tensor->ne[i]);
+    }
+
+    return true;
+}
+
 //核心函数
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
@@ -348,18 +423,43 @@ int main(int argc, char * argv[]) {
         cache_dir = cache_dir_str.c_str();
     }
 
-    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
-    if (!reg) {
-        fprintf(stderr, "Failed to find RPC backend\n");
-        return 1;
+    std::unique_ptr<llama_model_loader> local_loader;
+    std::vector<std::string> splits;
+
+    if (!params.model_path.empty()) {
+        try {
+            local_loader = std::make_unique<llama_model_loader>(
+                nullptr,
+                nullptr,
+                nullptr,
+                params.model_path,
+                splits,
+                nullptr,
+                false,
+                false,
+                false,
+                true,
+                nullptr,
+                nullptr);
+        } catch (const std::exception & ex) {
+            fprintf(stderr, "Failed to load model from %s: %s\n", params.model_path.c_str(), ex.what());
+            return 1;
+        }
     }
 
-    auto start_server_fn = (decltype(ggml_backend_rpc_start_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
-    if (!start_server_fn) {
-        fprintf(stderr, "Failed to obtain RPC backend start server function\n");
-        return 1;
-    }
+// 2. 创建适配上下文
+llama_rpc_local_tensor_context tensor_context {};
+tensor_context.loader = local_loader.get();
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+// 3. 创建回调接口
+ggml_rpc_local_tensor_source tensor_source {};
+tensor_source.user_data = &tensor_context;
+tensor_source.get_info  = llama_rpc_get_local_tensor_info;
+tensor_source.read      = llama_rpc_read_local_tensor;
+
+// 4. 获取新启动函数
+    ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
+                                     local_loader ? &tensor_source : nullptr,
+                                     params.model_path.c_str(), params.tp_rank, params.tp_world_size);
     return 0;
 }

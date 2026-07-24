@@ -220,5 +220,5 @@ struct llama_model_loader {
     bool get_local_tensor_info(const std::string & name, llama_local_tensor_info & info);
     
     //根据tensor名字，从本地读取GGUF里面的tensor
-    bool read_local_tensor(const std::string & name, void * dest, size_t dest_size);
+    bool read_local_tensor(const std::string & name, void * dest, size_t tensor_offset, size_t dest_size);
 };
