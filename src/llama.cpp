@@ -160,13 +160,25 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             std::vector<ggml_backend_dev_t> devs;
             devs.reserve(ggml_backend_dev_count());
+            ggml_backend_dev_t cpu_dev = nullptr;
+            bool has_rpc = false;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
                 if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
-                    LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                    cpu_dev = dev;
                     continue;
                 }
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (reg != nullptr && ggml_backend_reg_name(reg) == std::string("RPC")) {
+                    has_rpc = true;
+                }
                 devs.push_back(dev);
+            }
+            if (has_rpc && cpu_dev != nullptr) {
+                LLAMA_LOG_INFO("%s: adding %s (%s) for RPC tensor parallelism\n", __func__, ggml_backend_dev_name(cpu_dev), ggml_backend_dev_description(cpu_dev));
+                devs.insert(devs.begin(), cpu_dev);
+            } else if (cpu_dev != nullptr) {
+                LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(cpu_dev), ggml_backend_dev_description(cpu_dev));
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
