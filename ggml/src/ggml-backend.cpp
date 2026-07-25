@@ -1489,9 +1489,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
     }
 
-    // set ids for all splits
+    // set stable ids for all splits when the input graph has a stable id
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        if (graph->uid != 0) {
+            uint64_t uid = graph->uid;
+            uid ^= (uint64_t) (i + 1) * 0x9e3779b97f4a7c15ULL;
+            uid ^= uid >> 30;
+            uid *= 0xbf58476d1ce4e5b9ULL;
+            uid ^= uid >> 27;
+            uid *= 0x94d049bb133111ebULL;
+            uid ^= uid >> 31;
+            sched->splits[i].graph.uid = uid != 0 ? uid : ggml_graph_next_uid();
+        } else {
+            sched->splits[i].graph.uid = ggml_graph_next_uid();
+        }
     }
 }
 
