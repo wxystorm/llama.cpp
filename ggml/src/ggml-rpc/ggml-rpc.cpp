@@ -813,7 +813,41 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     tensors.push_back(serialize_tensor(tensor));
 }
 // 将ggml_cgraph序列化为字节流，便于在RPC中传输
-static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+static uint64_t rpc_hash_u64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+static uint64_t rpc_graph_effective_uid(const ggml_cgraph * cgraph) {
+    if (cgraph->uid != 0) {
+        return cgraph->uid;
+    }
+
+    uint64_t uid = 0x7bf5d03899c4e5b9ULL;
+    uid = rpc_hash_u64(uid, (uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node);
+        uid = rpc_hash_u64(uid, (uint64_t) node->op);
+        uid = rpc_hash_u64(uid, (uint64_t) node->type);
+        uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node->view_src);
+        for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+            uid = rpc_hash_u64(uid, (uint64_t) node->ne[j]);
+            uid = rpc_hash_u64(uid, (uint64_t) node->nb[j]);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            uid = rpc_hash_u64(uid, (uint64_t) (uintptr_t) node->src[j]);
+        }
+    }
+    return uid != 0 ? uid : 0x7bf5d03899c4e5b9ULL;
+}
+
+static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
     uint32_t n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
@@ -828,8 +862,8 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
     uint8_t * dest = output.data();
     memcpy(dest, &device, sizeof(device));
     dest += sizeof(device);
-    memcpy(dest, &cgraph->uid, sizeof(cgraph->uid));
-    dest += sizeof(cgraph->uid);
+    memcpy(dest, &graph_uid, sizeof(graph_uid));
+    dest += sizeof(graph_uid);
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -848,11 +882,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    bool reuse = cgraph->uid != 0 && rpc_dev_ctx->graph_uids.find(cgraph->uid) != rpc_dev_ctx->graph_uids.end();
+    const uint64_t graph_uid = rpc_graph_effective_uid(cgraph);
+    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
-        request.graph_uid = cgraph->uid;
+        request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         GGML_LOG_INFO(
@@ -861,16 +896,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             rpc_ctx->endpoint.c_str(),
             rpc_ctx->device,
             (void *) cgraph,
-            cgraph->uid,
+            graph_uid,
             cgraph->n_nodes,
             sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
-        if (cgraph->uid != 0) {
-            rpc_dev_ctx->graph_uids.insert(cgraph->uid);
-        }
+        rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
-        serialize_graph(rpc_ctx->device, cgraph, input);
+        serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         uint32_t n_tensors = 0;
@@ -886,7 +919,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             rpc_ctx->endpoint.c_str(),
             rpc_ctx->device,
             (void *) cgraph,
-            cgraph->uid,
+            graph_uid,
             cgraph->n_nodes,
             n_tensors,
             input.size());
