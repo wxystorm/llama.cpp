@@ -71,11 +71,12 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
-    RPC_CMD_COUNT,
     RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, //只发送tensor名称和目标buffer信息
+    RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;

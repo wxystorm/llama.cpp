@@ -26,7 +26,7 @@ enum llama_fver {
     GGUF_FILE_VERSION_V3 = 3,
 };
 
-const char * llama_file_version_name(llama_fver version);
+LLAMA_API const char * llama_file_version_name(llama_fver version);
 
 //新加的用于本地手机端加载GGUF模型的结构体
 struct llama_local_tensor_info {
@@ -39,7 +39,7 @@ struct llama_local_tensor_info {
     size_t byte_size;
 };
 
-struct llama_model_loader {
+struct LLAMA_API llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
