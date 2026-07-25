@@ -71,7 +71,7 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
-    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, //只发送tensor名称和目标buffer信息
+    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, 
     RPC_CMD_COUNT,
 };
 
@@ -576,7 +576,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
         RPC_STATUS_ASSERT(status);
 
-        GGML_LOG_INFO(
+        LOG_DBG(
             "%s: local-file tensor='%s', "
             "src_offset=%" PRIu64 ", dst_offset=%" PRIu64
             ", size=%" PRIu64 "\n",
