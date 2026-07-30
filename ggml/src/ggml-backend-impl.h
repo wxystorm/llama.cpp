@@ -62,11 +62,11 @@ extern "C" {
     };
 
     struct ggml_backend_buffer {
-        struct ggml_backend_buffer_i  iface;
+        struct ggml_backend_buffer_i  iface;    //操作接口表，不同的后端操作方式不一样
         ggml_backend_buffer_type_t    buft;
-        void * context;
+        void * context; //自己私有的上下文
         size_t size;
-        enum ggml_backend_buffer_usage usage;
+        enum ggml_backend_buffer_usage usage;   //用途
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(

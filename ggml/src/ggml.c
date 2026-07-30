@@ -955,8 +955,8 @@ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
 //
 
 struct ggml_object {
-    size_t offs;
-    size_t size;
+    size_t offs;    //对象在内存池中的偏移
+    size_t size;    //对象的大小
 
     struct ggml_object * next;
 
@@ -972,14 +972,14 @@ static const size_t GGML_OBJECT_SIZE = sizeof(struct ggml_object);
 //
 
 struct ggml_context {
-    size_t mem_size;
-    void * mem_buffer;
-    bool   mem_buffer_owned;
+    size_t mem_size;    //内存池大小
+    void * mem_buffer;  //内存池起始地址
+    bool   mem_buffer_owned;    //地址是自己的还是外部传入的，决定最后需不需要自己释放
     bool   no_alloc;
 
     int    n_objects;
 
-    struct ggml_object * objects_begin;
+    struct ggml_object * objects_begin; //每个对象内存管理头
     struct ggml_object * objects_end;
 };
 
@@ -7150,14 +7150,14 @@ size_t ggml_graph_overhead(void) {
 }
 
 struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads) {
-    const size_t obj_size = ggml_graph_nbytes(size, grads);
-    struct ggml_object * obj = ggml_new_object(ctx, GGML_OBJECT_TYPE_GRAPH, obj_size);
-    struct ggml_cgraph * cgraph = (struct ggml_cgraph *) ((char *) ctx->mem_buffer + obj->offs);
+    const size_t obj_size = ggml_graph_nbytes(size, grads); //计算对象需要占多少字节
+    struct ggml_object * obj = ggml_new_object(ctx, GGML_OBJECT_TYPE_GRAPH, obj_size);  //注意，这个会预留一块内存空间，大小为obj_size
+    struct ggml_cgraph * cgraph = (struct ggml_cgraph *) ((char *) ctx->mem_buffer + obj->offs);    //把这一部分按照计算图来解读
 
     // the size of the hash table is doubled since it needs to hold both nodes and leafs
     size_t hash_size = ggml_hash_size(size * 2);
 
-    void * p = cgraph + 1;
+    void * p = cgraph + 1;  //指针p指向cgraph对象之后的内存空间，后续会在这块内存空间中分配计算图需要的其他数据结构
 
     struct ggml_tensor ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
     struct ggml_tensor ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
@@ -7183,7 +7183,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
-    };
+    };  //初始化cgraph头
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
     if (grads) {

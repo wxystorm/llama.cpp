@@ -17,17 +17,17 @@ static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO
 #define GGML_RPC_MAX_SERVERS       16
 
 struct ggml_rpc_local_tensor_info {
-    uint64_t nbytes;
-    uint32_t type;
-    uint32_t n_dims;
-    uint64_t ne[GGML_MAX_DIMS];
+    uint64_t nbytes;      //张量的字节数
+    uint32_t type;      //张量的数据类型
+    uint32_t n_dims;    //张量的维度数
+    uint64_t ne[GGML_MAX_DIMS]; //张量的每个维度的大小
 };
 
 typedef bool (*ggml_rpc_get_local_tensor_info_fn)(
         void * user_data,
         const char * name,
         struct ggml_rpc_local_tensor_info * info);
-
+//回调函数模版
 typedef bool (*ggml_rpc_read_local_tensor_fn)(
         void * user_data,
         const char * name,

@@ -34,9 +34,9 @@ struct llama_local_tensor_info {
     ggml_type type;
     std::array<int64_t, GGML_MAX_DIMS> ne; //相当于int64_t ne[GGML_MAX_DIMS]; // number of elements
 
-    uint16_t file_idx;
-    size_t file_offset;
-    size_t byte_size;
+    uint16_t file_idx;  //文件索引，即该tensor所在的GGUF文件的索引
+    size_t file_offset; //该tensor在GGUF文件中的偏移量
+    size_t byte_size;   //该tensor的字节大小
 };
 
 struct LLAMA_API llama_model_loader {

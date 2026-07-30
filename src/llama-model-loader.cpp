@@ -1732,7 +1732,7 @@ bool llama_model_loader::get_local_tensor_info(const std::string & name, llama_l
 bool llama_model_loader::read_local_tensor(
         const std::string & name,
         void * dest,
-        size_t tensor_offset,
+        size_t tensor_offset, // tensor内部的偏移量
         size_t dest_size) {
 
     llama_local_tensor_info info {};

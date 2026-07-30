@@ -327,19 +327,19 @@ enum ggml_cgraph_eval_order {
 };
 
 struct ggml_cgraph {
-    int size;    // maximum number of nodes/leafs/grads/grad_accs
+    int size;    // maximum number of nodes/leafs/grads/grad_accs 
     int n_nodes; // number of nodes currently in use
     int n_leafs; // number of leafs currently in use
-
-    struct ggml_tensor ** nodes;     // tensors with data that can change if the graph is evaluated
+    // 叶子通常包括模型权重，输入数据等
+    struct ggml_tensor ** nodes;     // tensors with data that can change if the graph is evaluated参与计算的张量节点，输出张量
     struct ggml_tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
-    struct ggml_tensor ** grad_accs; // accumulators for node gradients
+    struct ggml_tensor ** grad_accs; // accumulators for node gradients梯度计算相关
     struct ggml_tensor ** leafs;     // tensors with constant data
     int32_t             * use_counts;// number of uses of each tensor, indexed by hash table slot
 
-    struct ggml_hash_set visited_hash_set;
+    struct ggml_hash_set visited_hash_set;  //已访问张量集合，避免重复加入节点
 
-    enum ggml_cgraph_eval_order order;
+    enum ggml_cgraph_eval_order order;  //访问顺序
 
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored

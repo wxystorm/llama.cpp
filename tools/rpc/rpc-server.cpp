@@ -368,7 +368,8 @@ static bool llama_rpc_get_local_tensor_info(
         return false;
     }
 
-    const ggml_tensor * tensor = ctx->loader->get_tensor_meta(name);
+    const ggml_tensor * tensor = ctx->loader->get_tensor_meta(name); 
+    //关于上面的tensor，是为了获取维度
     if (tensor == nullptr) {
         return false;
     }

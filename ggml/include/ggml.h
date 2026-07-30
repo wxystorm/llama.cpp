@@ -669,14 +669,14 @@ extern "C" {
     struct ggml_tensor {
         enum ggml_type type;
 
-        struct ggml_backend_buffer * buffer;
+        struct ggml_backend_buffer * buffer;    //对应哪块后端内存
 
         int64_t ne[GGML_MAX_DIMS]; // number of elements
         size_t  nb[GGML_MAX_DIMS]; // stride in bytes:
                                    // nb[0] = ggml_type_size(type)
                                    // nb[1] = nb[0]   * (ne[0] / ggml_blck_size(type)) + padding
                                    // nb[i] = nb[i-1] * ne[i-1]
-
+        // 量化块的步长，不是逻辑步长
         // compute data
         enum ggml_op op;
 
@@ -695,7 +695,7 @@ extern "C" {
 
         char name[GGML_MAX_NAME];
 
-        void * extra; // extra things e.g. for ggml-cuda.cu
+        void * extra; // extra things e.g. for ggml-cuda.cu进程内指针
 
         char padding[8];
     };

@@ -33,12 +33,12 @@ namespace fs = std::filesystem;
 #pragma pack(push, 1)
 // ggml_tensor is serialized into rpc_tensor
 struct rpc_tensor {
-    uint64_t id;
+    uint64_t id; //服务端会根据id来重建图
     uint32_t type;
     uint64_t buffer;
     uint32_t ne[GGML_MAX_DIMS];
     uint32_t nb[GGML_MAX_DIMS];
-    uint32_t op;
+    uint32_t op;    //张量节点要进行的计算
     int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
     int32_t  flags;
     uint64_t src[GGML_MAX_SRC];
@@ -47,7 +47,7 @@ struct rpc_tensor {
     uint64_t data;
     char name[GGML_MAX_NAME];
 
-    char padding[4];
+    char padding[4]; //填充字段
 };
 
 static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 8");
@@ -196,8 +196,8 @@ struct rpc_msg_graph_recompute_req {
 //新加的
 struct rpc_msg_set_tensor_from_local_file_req {
     rpc_tensor tensor;
-    uint64_t src_offset;
-    uint64_t dst_offset;
+    uint64_t src_offset;    //原数据偏移
+    uint64_t dst_offset;    
     uint64_t size;
 
     int32_t split_axis;
@@ -882,8 +882,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
-    const uint64_t graph_uid = rpc_graph_effective_uid(cgraph);
+    const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    //新的
+    reuse = false;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
@@ -1482,7 +1484,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
                                       std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map) {
     if (tensor_map.find(id) != tensor_map.end()) {
         return tensor_map[id];
-    }
+    }   //如果找到对应的，则返回
     // Safely find the tensor pointer
     auto it_ptr = tensor_ptrs.find(id);
     if (it_ptr == tensor_ptrs.end()) {
@@ -1490,7 +1492,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     }
     const rpc_tensor * tensor = it_ptr->second;
 
-    struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
+    struct ggml_tensor * result = deserialize_tensor(ctx, tensor);  //反序列化rpc_tensor为ggml_tensor
     if (result == nullptr) {
         return nullptr;
     }
@@ -1501,9 +1503,9 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     tensor_map[id] = result;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         // Check if the source ID is 0 before calling create_node recursively
-        if (tensor->src[i] == 0) {
+        if (tensor->src[i] == 0) {  //指针值
             result->src[i] = nullptr;
-        } else {
+        } else {    //递归调用create_node创建源节点
             result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
             // If the recursive call failed for a non-zero ID, propagate the error
             if (result->src[i] == nullptr) {
@@ -1565,8 +1567,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, graph_uid, n_nodes, n_tensors);
 
-    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
-    stored_graph & graph_entry = stored_graphs[device][graph_uid];
+    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
+    stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
     if (graph_entry.buffer.size() < buf_size) {
         graph_entry.buffer.resize(buf_size);
     }
@@ -1575,7 +1577,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         /*.mem_buffer =*/ graph_entry.buffer.data(),
         /*.no_alloc   =*/ true,
     };
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    ggml_context_ptr ctx_ptr { ggml_init(params) }; //智能指针
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
@@ -1599,7 +1601,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             GGML_LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
             return false;
         }
-    }
+    }   //恢复原来的计算图
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     graph_entry.graph = graph;
@@ -2413,7 +2415,7 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
         size_t free, total;
-        ggml_backend_dev_memory(dev, &free, &total);
+        ggml_backend_dev_memory(dev, &free, &total);  //读取设备总内存和可用内存
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
                total / 1024 / 1024, free / 1024 / 1024);
         auto backend = ggml_backend_dev_init(dev, nullptr);
@@ -2426,7 +2428,7 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         if (reg) {
             auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
             if (ggml_backend_set_n_threads_fn) {
-                ggml_backend_set_n_threads_fn(backend, n_threads);
+                ggml_backend_set_n_threads_fn(backend, n_threads); //只要有这个函数，才调用它
             }
         }
     }
@@ -2446,13 +2448,13 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return;
     }
-    auto server_socket = socket_t::create_server(host.c_str(), port);
+    auto server_socket = socket_t::create_server(host.c_str(), port); //这个是监听用的socket
     if (server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
     while (true) {
-        auto client_socket = server_socket->accept();
+        auto client_socket = server_socket->accept();   //这个是接收客户端连接的socket
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             return;
