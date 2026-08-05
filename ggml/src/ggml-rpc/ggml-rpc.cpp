@@ -523,7 +523,7 @@ static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
 
     return false;
 }
-
+// 这个有问题
 static void ggml_backend_rpc_buffer_set_tensor(
         ggml_backend_buffer_t buffer,
         ggml_tensor * tensor,
@@ -885,7 +885,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     //新的
-    reuse = false;
+    //reuse = false;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;

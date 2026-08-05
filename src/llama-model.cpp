@@ -319,7 +319,7 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         auto & devices = model->devices;
         if (!devices.empty() && devices[0].is_meta && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
-        }
+        }   //判断是否支持tensor split
     }
 
     return model;
@@ -1247,11 +1247,11 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
     vocab.load(ml, kv);
 }
-
+//关键函数
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
-    const auto & tensor_split = params.tensor_split;
+    const auto & tensor_split = params.tensor_split;    //指定的分割比例
 
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
@@ -1363,7 +1363,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
 
-            // attention weight scales (per-tensor, shape {1})
+            // attention weight scales (per-tensor, shape {1}) 加载缩放张量
             if (!layer.wq_s && layer.wq) {
                 layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
@@ -1592,7 +1592,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer   context很重要
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1605,7 +1605,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+                buf_map.emplace(idx, buf);  
             }
         }
 

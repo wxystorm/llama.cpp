@@ -2401,7 +2401,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-
+                    // [head_dim, tokens_per_stream, n_head, n_stream]
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -2420,7 +2420,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
-
+        // cur计算节点
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -2438,7 +2438,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_mul_mat(ctx0, v_mla, cur);
+            cur = ggml_mul_mat(ctx0, v_mla, cur);   //这个不会计算出结果
             cb(cur, "fattn_mla", il);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.

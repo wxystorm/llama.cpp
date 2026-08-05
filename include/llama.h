@@ -316,7 +316,7 @@ extern "C" {
         // context pointer passed to the progress callback
         void * progress_callback_user_data;
 
-        // override key-value pairs of the model meta data
+        // override key-valute pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.

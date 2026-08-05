@@ -1260,7 +1260,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return ret;
     }
 
-    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
+    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());   // 大小是4096*32000把词表中的每一个token映射为4096维，提前训练好的
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *

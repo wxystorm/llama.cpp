@@ -4,6 +4,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -174,6 +177,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
             return 1;
         }
+        //调试打印信息，保存logits
 
         n_pos += batch.n_tokens;
 

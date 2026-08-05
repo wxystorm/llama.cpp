@@ -46,7 +46,7 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
     }
 
     for (int i = 0; i < n_layer; ++i) {
-        auto & layer = layers[i];
+        auto & layer = layers[i];   //一个层的张量目录
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
