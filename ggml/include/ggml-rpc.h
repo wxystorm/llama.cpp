@@ -42,6 +42,24 @@ struct ggml_rpc_local_tensor_source {
     ggml_rpc_read_local_tensor_fn     read;
 };
 
+#define GGML_BACKEND_RPC_SET_LOCAL_2D_PROC \
+    "ggml_backend_rpc_set_tensor_from_local_file_2d"
+    
+enum ggml_backend_local_file_result {
+    GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
+    GGML_BACKEND_LOCAL_FILE_HANDLED,
+    GGML_BACKEND_LOCAL_FILE_ERROR,
+};
+
+using ggml_backend_rpc_set_local_2d_t =
+    ggml_backend_local_file_result (*)(
+        ggml_tensor * tensor,
+        uint64_t src_offset,
+        uint64_t dst_offset,
+        uint64_t copy_size,
+        uint64_t n_copies,
+        uint64_t src_stride,
+        uint64_t dst_stride);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);

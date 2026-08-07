@@ -193,16 +193,34 @@ struct rpc_msg_graph_recompute_req {
     uint64_t graph_uid;
 };
 
+struct rpc_msg_set_tensor_from_local_file_rsp {
+    // 0:不支持本地文件加载
+    // 1:已经成功处理
+    // 2:处理失败
+    uint8_t result;
+ };
 //新加的
 struct rpc_msg_set_tensor_from_local_file_req {
+    // 含远端目标 buffer/data、形状、类型、名称等
     rpc_tensor tensor;
-    uint64_t src_offset;    //原数据偏移
-    uint64_t dst_offset;    
-    uint64_t size;
 
-    int32_t split_axis;
-    int64_t split_low;
-    int64_t split_size;
+    // 相对于本地完整源张量起点
+    uint64_t src_offset;
+
+    // 相对于远端目标 tensor.data 起点
+    uint64_t dst_offset;
+
+    // 每次复制的字节数
+    uint64_t copy_size;
+
+    // 复制次数
+    uint64_t n_copies;
+
+    // 相邻两次复制的源起点间距
+    uint64_t src_stride;
+
+    // 相邻两次复制的目标起点间距
+    uint64_t dst_stride;
 };
 
 #pragma pack(pop)
@@ -523,6 +541,62 @@ static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
 
     return false;
 }
+
+static ggml_backend_local_file_result
+ggml_backend_rpc_set_tensor_from_local_file_2d(
+        ggml_tensor * tensor,
+        uint64_t src_offset,
+        uint64_t dst_offset,
+        uint64_t copy_size,
+        uint64_t n_copies,
+        uint64_t src_stride,
+        uint64_t dst_stride) {
+
+    if (tensor == nullptr ||
+        tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    auto * ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            tensor->buffer->context);
+
+    rpc_msg_set_tensor_from_local_file_req request {};
+
+    request.tensor      = serialize_tensor(tensor);
+    request.src_offset  = src_offset;
+    request.dst_offset  = dst_offset;
+    request.copy_size   = copy_size;
+    request.n_copies    = n_copies;
+    request.src_stride  = src_stride;
+    request.dst_stride  = dst_stride;
+
+    rpc_msg_set_tensor_from_local_file_rsp response {};
+
+    const bool status = send_rpc_cmd(
+        ctx->sock,
+        RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
+        &request,
+        sizeof(request),
+        &response,
+        sizeof(response));
+
+    if (!status) {
+        return GGML_BACKEND_LOCAL_FILE_ERROR;
+    }
+
+    switch (response.result) {
+        case 0:
+            return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+        case 1:
+            return GGML_BACKEND_LOCAL_FILE_HANDLED;
+        case 2:
+            return GGML_BACKEND_LOCAL_FILE_ERROR;
+        default:
+            return GGML_BACKEND_LOCAL_FILE_ERROR;
+    }
+}
 // 这个有问题
 static void ggml_backend_rpc_buffer_set_tensor(
         ggml_backend_buffer_t buffer,
@@ -531,15 +605,28 @@ static void ggml_backend_rpc_buffer_set_tensor(
         size_t offset,
         size_t size) {
 
-    ggml_backend_rpc_buffer_context * ctx =
-        static_cast<ggml_backend_rpc_buffer_context *>(buffer->context);
+    GGML_ASSERT(buffer != nullptr);
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(data != nullptr || size == 0);
 
-    rpc_tensor serialized_tensor = serialize_tensor(tensor);
+    auto * ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            buffer->context);
 
+    GGML_ASSERT(ctx != nullptr);
+
+    const rpc_tensor serialized_tensor =
+        serialize_tensor(tensor);
+
+    /*
+     * 保留原有哈希去重逻辑。
+     * 服务端已经有相同数据时，无须再次传输。
+     */
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request {};
+
         request.tensor = serialized_tensor;
-        request.offset = offset;
+        request.offset = static_cast<uint64_t>(offset);
         request.hash   = fnv_hash(
             static_cast<const uint8_t *>(data),
             size);
@@ -561,58 +648,43 @@ static void ggml_backend_rpc_buffer_set_tensor(
         }
     }
 
-    if (should_use_local_file_tensor(tensor)) {
-        rpc_msg_set_tensor_from_local_file_req request {};
-
-        request.tensor     = serialized_tensor;
-        request.src_offset = static_cast<uint64_t>(offset);
-        request.dst_offset = static_cast<uint64_t>(offset);
-        request.size       = static_cast<uint64_t>(size);
-
-        const bool status = send_rpc_cmd(
-            ctx->sock,
-            RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
-            &request,
-            sizeof(request));
-
-        RPC_STATUS_ASSERT(status);
-
-        LOG_DBG(
-            "%s: local-file tensor='%s', "
-            "src_offset=%" PRIu64 ", dst_offset=%" PRIu64
-            ", size=%" PRIu64 "\n",
-            __func__,
-            tensor->name,
-            request.src_offset,
-            request.dst_offset,
-            request.size);
-
-        return;
-    }
+    /*
+     * 普通网络写入协议：
+     *
+     * | rpc_tensor | uint64_t offset | data[size] |
+     */
+    const uint64_t wire_offset =
+        static_cast<uint64_t>(offset);
 
     const size_t input_size =
         sizeof(serialized_tensor) +
-        sizeof(uint64_t) +
+        sizeof(wire_offset) +
         size;
 
-    std::vector<uint8_t> input(input_size, 0);
+    std::vector<uint8_t> input(input_size);
+
+    size_t cursor = 0;
 
     memcpy(
-        input.data(),
+        input.data() + cursor,
         &serialized_tensor,
         sizeof(serialized_tensor));
 
-    memcpy(
-        input.data() + sizeof(serialized_tensor),
-        &offset,
-        sizeof(offset));
+    cursor += sizeof(serialized_tensor);
 
     memcpy(
-        input.data() +
-            sizeof(serialized_tensor) +
-            sizeof(offset),
-        data,
-        size);
+        input.data() + cursor,
+        &wire_offset,
+        sizeof(wire_offset));
+
+    cursor += sizeof(wire_offset);
+
+    if (size > 0) {
+        memcpy(
+            input.data() + cursor,
+            data,
+            size);
+    }
 
     const bool status = send_rpc_cmd(
         ctx->sock,
@@ -622,7 +694,6 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     RPC_STATUS_ASSERT(status);
 }
-
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
@@ -1052,7 +1123,7 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
-    bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request); //新加的
+    bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -1645,14 +1716,52 @@ rpc_server::~rpc_server() {
 }
 
 //新加的函数
+static bool range_2d_fits(
+        uint64_t offset,
+        uint64_t copy_size,
+        uint64_t n_copies,
+        uint64_t stride,
+        uint64_t limit) {
+
+    // 空复制不访问任何数据
+    if (n_copies == 0 || copy_size == 0) {
+        return offset <= limit;
+    }
+
+    if (offset > limit) {
+        return false;
+    }
+
+    // 先检查第一次复制，避免减法下溢
+    if (copy_size > limit - offset) {
+        return false;
+    }
+
+    if (n_copies == 1) {
+        return true;
+    }
+
+    // 最后一次复制的结束位置：
+    // offset + (n_copies - 1) * stride + copy_size
+    //
+    // 使用除法形式避免乘法和加法溢出。
+    const uint64_t remaining =
+        limit - offset - copy_size;
+
+    return stride <= remaining / (n_copies - 1);
+}
+
 bool rpc_server::set_tensor_from_local_file(
-        const rpc_msg_set_tensor_from_local_file_req & request) {
+        const rpc_msg_set_tensor_from_local_file_req & request,
+ rpc_msg_set_tensor_from_local_file_rsp & response) {
 
     struct ggml_init_params params {
         /* .mem_size   = */ ggml_tensor_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
+
+    response.result = 2;
 
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
@@ -1671,7 +1780,8 @@ bool rpc_server::set_tensor_from_local_file(
         GGML_LOG_ERROR(
             "[%s] no local tensor source registered\n",
             __func__);
-        return false;
+        response.result = 0;
+        return true;
     }
 
     const size_t name_len =
@@ -1688,21 +1798,72 @@ bool rpc_server::set_tensor_from_local_file(
         request.tensor.name,
         name_len);
 
-    const size_t tensor_nbytes = ggml_nbytes(tensor);
+    /*
+     * 空操作。
+     *
+     * 与 set_tensor_2d 的语义保持一致：
+     * 没有复制次数或单次大小为 0 时，不访问源和目标。
+     */
+    if (request.n_copies == 0 ||
+        request.copy_size == 0) {
+        return true;
+    }
 
-    if (request.dst_offset > tensor_nbytes ||
-        request.size > tensor_nbytes - request.dst_offset) {
+    /*
+     * 后面需要把 copy_size 和目标偏移传给接受 size_t 的
+     * ggml_backend_tensor_set，因此先检查是否可表示。
+     */
+    if (request.copy_size > SIZE_MAX ||
+        request.dst_offset > SIZE_MAX ||
+        request.dst_stride > SIZE_MAX) {
+
         GGML_LOG_ERROR(
-            "[%s] destination range is out of bounds: "
-            "name='%s', offset=%" PRIu64 ", size=%" PRIu64 "\n",
+            "[%s] request values exceed size_t: "
+            "name='%s'\n",
             __func__,
-            name.c_str(),
-            request.dst_offset,
-            request.size);
+            name.c_str());
         return false;
     }
 
-    // 可选：先查询源 tensor 的元信息并进行边界校验。
+    const uint64_t tensor_nbytes =
+        static_cast<uint64_t>(ggml_nbytes(tensor));
+
+    /*
+     * 验证最后一次目标写入不会越过局部目标张量。
+     *
+     * 最后写入范围：
+     * dst_offset
+     * + (n_copies - 1) * dst_stride
+     * + copy_size
+     */
+    if (!range_2d_fits(
+            request.dst_offset,
+            request.copy_size,
+            request.n_copies,
+            request.dst_stride,
+            tensor_nbytes)) {
+
+        GGML_LOG_ERROR(
+            "[%s] destination 2D range is out of bounds: "
+            "name='%s', dst_offset=%" PRIu64
+            ", copy_size=%" PRIu64
+            ", n_copies=%" PRIu64
+            ", dst_stride=%" PRIu64
+            ", tensor_size=%" PRIu64 "\n",
+            __func__,
+            name.c_str(),
+            request.dst_offset,
+            request.copy_size,
+            request.n_copies,
+            request.dst_stride,
+            tensor_nbytes);
+        return false;
+    }
+
+    /*
+     * 查询服务端本地完整源张量的信息，
+     * 检查最后一次源读取是否越界。
+     */
     if (local_tensor_source.get_info != nullptr) {
         ggml_rpc_local_tensor_info info {};
 
@@ -1710,6 +1871,7 @@ bool rpc_server::set_tensor_from_local_file(
                 local_tensor_source.user_data,
                 name.c_str(),
                 &info)) {
+
             GGML_LOG_ERROR(
                 "[%s] local tensor '%s' not found\n",
                 __func__,
@@ -1717,55 +1879,137 @@ bool rpc_server::set_tensor_from_local_file(
             return false;
         }
 
-        if (request.src_offset > info.nbytes ||
-            request.size > info.nbytes - request.src_offset) {
+        if (!range_2d_fits(
+                request.src_offset,
+                request.copy_size,
+                request.n_copies,
+                request.src_stride,
+                info.nbytes)) {
+
             GGML_LOG_ERROR(
-                "[%s] source range is out of bounds: "
-                "name='%s', offset=%" PRIu64 ", size=%" PRIu64
+                "[%s] source 2D range is out of bounds: "
+                "name='%s', src_offset=%" PRIu64
+                ", copy_size=%" PRIu64
+                ", n_copies=%" PRIu64
+                ", src_stride=%" PRIu64
                 ", tensor_size=%" PRIu64 "\n",
                 __func__,
                 name.c_str(),
                 request.src_offset,
-                request.size,
+                request.copy_size,
+                request.n_copies,
+                request.src_stride,
                 info.nbytes);
             return false;
         }
     }
 
-    std::vector<uint8_t> data;
+    /*
+     * 每次只申请一行/一个 chunk 的临时空间。
+     *
+     * 不需要申请 copy_size * n_copies，
+     * 因为源张量中这些区域可能并不连续。
+     */
+    std::vector<uint8_t> staging;
 
     try {
-        data.resize(static_cast<size_t>(request.size));
+        staging.resize(
+            static_cast<size_t>(request.copy_size));
     } catch (const std::bad_alloc &) {
         GGML_LOG_ERROR(
-            "[%s] failed to allocate %" PRIu64 " bytes\n",
+            "[%s] failed to allocate %" PRIu64
+            " staging bytes\n",
             __func__,
-            request.size);
+            request.copy_size);
         return false;
     }
 
-    if (!local_tensor_source.read(
-            local_tensor_source.user_data,
-            name.c_str(),
-            request.src_offset,
-            data.data(),
-            data.size())) {
-        GGML_LOG_ERROR(
-            "[%s] failed to read local tensor '%s'\n",
-            __func__,
-            name.c_str());
-        return false;
+    for (uint64_t i = 0;
+         i < request.n_copies;
+         ++i) {
+
+        /*
+         * 这些乘加已经由前面的 range_2d_fits()
+         * 验证不会越界或溢出。
+         */
+        const uint64_t src_i =
+            request.src_offset +
+            i * request.src_stride;
+
+        const uint64_t dst_i =
+            request.dst_offset +
+            i * request.dst_stride;
+
+        if (dst_i > SIZE_MAX) {
+            GGML_LOG_ERROR(
+                "[%s] destination offset exceeds size_t: "
+                "name='%s', copy=%" PRIu64
+                ", dst=%" PRIu64 "\n",
+                __func__,
+                name.c_str(),
+                i,
+                dst_i);
+            return false;
+        }
+
+        /*
+         * 从服务端本地完整源张量的第 src_i 字节读取。
+         *
+         * read() 中应当根据 name 找到完整源张量，
+         * 再从它的相对偏移 src_i 开始读取。
+         */
+        if (!local_tensor_source.read(
+                local_tensor_source.user_data,
+                name.c_str(),
+                src_i,
+                staging.data(),
+                staging.size())) {
+
+            GGML_LOG_ERROR(
+                "[%s] failed to read local tensor: "
+                "name='%s', copy=%" PRIu64
+                ", src=%" PRIu64
+                ", size=%" PRIu64 "\n",
+                __func__,
+                name.c_str(),
+                i,
+                src_i,
+                request.copy_size);
+            return false;
+        }
+
+        /*
+         * tensor->data 已经是远端目标张量基址。
+         * dst_i 是相对于该基址的目标偏移。
+         */
+        ggml_backend_tensor_set(
+            tensor,
+            staging.data(),
+            static_cast<size_t>(dst_i),
+            staging.size());
     }
 
-    ggml_backend_tensor_set(
-        tensor,
-        data.data(),
+    GGML_LOG_DEBUG(
+        "[%s] loaded local tensor: "
+        "name='%s', src_offset=%" PRIu64
+        ", dst_offset=%" PRIu64
+        ", copy_size=%" PRIu64
+        ", n_copies=%" PRIu64
+        ", src_stride=%" PRIu64
+        ", dst_stride=%" PRIu64 "\n",
+        __func__,
+        name.c_str(),
+        request.src_offset,
         request.dst_offset,
-        data.size());
-
+        request.copy_size,
+        request.n_copies,
+        request.src_stride,
+        request.dst_stride);
+    
+    response.result = 1;
+    
     return true;
-}
-/*
+}/*
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              socket_ptr sock) {
     rpc_server server(backends, cache_dir);
@@ -2296,14 +2540,30 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE: {
-                //先等着
-                rpc_msg_set_tensor_from_local_file_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                rpc_msg_set_tensor_from_local_file_req request {};
+
+                if (!recv_msg(
+                        sock,
+                        &request,
+                        sizeof(request))) {
                     return;
                 }
-                if (!server.set_tensor_from_local_file(request)) {
+
+                rpc_msg_set_tensor_from_local_file_rsp response {};
+
+                if (!server.set_tensor_from_local_file(
+                        request,
+                        response)) {
                     return;
                 }
+
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+
                 break;
             }
             default: {
@@ -2601,9 +2861,16 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
-    return NULL;
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_LOCAL_2D_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_tensor_from_local_file_2d);
+    }
 
     GGML_UNUSED(reg);
+
+    return NULL;
 }
 
 static const struct ggml_backend_reg_i ggml_backend_rpc_reg_i = {

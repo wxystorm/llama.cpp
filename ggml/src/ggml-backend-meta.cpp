@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
 #include <cassert>
@@ -18,6 +19,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <cinttypes>
 
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
@@ -1248,6 +1250,64 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+static enum ggml_backend_local_file_result
+ggml_backend_meta_try_set_local_file_2d(
+        ggml_tensor * tensor,
+        uint64_t src_offset,
+        uint64_t dst_offset,
+        uint64_t copy_size,
+        uint64_t n_copies,
+        uint64_t src_stride,
+        uint64_t dst_stride) {
+
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_buffer_get_type(tensor->buffer);
+
+    if (buft == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_dev_t dev =
+        ggml_backend_buft_get_device(buft);
+
+    if (dev == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_reg_t reg =
+        ggml_backend_dev_backend_reg(dev);
+
+    if (reg == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    void * proc =
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_SET_LOCAL_2D_PROC);
+
+    if (proc == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    auto fn =
+        reinterpret_cast<ggml_backend_rpc_set_local_2d_t>(
+            proc);
+
+    return fn(
+        tensor,
+        src_offset,
+        dst_offset,
+        copy_size,
+        n_copies,
+        src_stride,
+        dst_stride);
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -1315,51 +1375,239 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
 
     switch (split_state.axis) {
-        case GGML_BACKEND_SPLIT_AXIS_0:
-        case GGML_BACKEND_SPLIT_AXIS_1:
-        case GGML_BACKEND_SPLIT_AXIS_2: {
-            // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            GGML_ASSERT(offset % chunk_size_full == 0);
-            GGML_ASSERT(size   % chunk_size_full == 0);
-            const int64_t i_start =  offset        /chunk_size_full;
-            const int64_t i_stop  = (offset + size)/chunk_size_full;
-            size_t offset_j = 0;
-            for (size_t j = 0; j < n_bufs; j++) {
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
-                if (chunk_size_j == 0) {
-                    continue;
+    case GGML_BACKEND_SPLIT_AXIS_0:
+    case GGML_BACKEND_SPLIT_AXIS_1:
+    case GGML_BACKEND_SPLIT_AXIS_2: {
+        // 完整 Meta tensor 中，一个完整 chunk 的字节数
+        const size_t chunk_size_full =
+            tensor->nb[split_state.axis + 1];
+
+        GGML_ASSERT(chunk_size_full != 0);
+        GGML_ASSERT(offset % chunk_size_full == 0);
+        GGML_ASSERT(size   % chunk_size_full == 0);
+
+        const int64_t i_start =
+            offset / chunk_size_full;
+
+        const int64_t i_stop =
+            (offset + size) / chunk_size_full;
+
+        GGML_ASSERT(i_start >= 0);
+        GGML_ASSERT(i_stop >= i_start);
+
+        size_t offset_j = 0;
+
+        for (size_t j = 0; j < n_bufs; ++j) {
+            ggml_tensor * simple_tensor =
+                ggml_backend_meta_buffer_simple_tensor(
+                    tensor,
+                    j);
+
+            GGML_ASSERT(simple_tensor != nullptr);
+
+            const size_t chunk_size_j =
+                simple_tensor->nb[split_state.axis + 1];
+
+            if (chunk_size_j == 0) {
+                continue;
+            }
+
+            /*
+             * 本次写入在局部目标张量中的起始偏移。
+             */
+            const size_t simple_offset =
+                static_cast<size_t>(i_start) *
+                chunk_size_j;
+
+            /*
+             * 本地文件源偏移必须是相对于“完整源张量起点”的偏移。
+             *
+             * offset：
+             *   当前写入区域在完整 Meta tensor 中的起始偏移。
+             *
+             * offset_j：
+             *   当前设备分片在每个完整 chunk 内的偏移。
+             */
+            const uint64_t src_offset =
+                static_cast<uint64_t>(offset) +
+                static_cast<uint64_t>(offset_j);
+
+            const uint64_t dst_offset =
+                static_cast<uint64_t>(simple_offset);
+
+            const uint64_t copy_size =
+                static_cast<uint64_t>(chunk_size_j);
+
+            const uint64_t n_copies =
+                static_cast<uint64_t>(i_stop - i_start);
+
+            const uint64_t src_stride =
+                static_cast<uint64_t>(chunk_size_full);
+
+            const uint64_t dst_stride =
+                static_cast<uint64_t>(chunk_size_j);
+
+            const ggml_backend_local_file_result result =
+                ggml_backend_meta_try_set_local_file_2d(
+                    simple_tensor,
+                    src_offset,
+                    dst_offset,
+                    copy_size,
+                    n_copies,
+                    src_stride,
+                    dst_stride);
+
+            switch (result) {
+                case GGML_BACKEND_LOCAL_FILE_HANDLED: {
+                    /*
+                     * RPC 服务端已经从本地 GGUF 读取并写入，
+                     * 不再发送 data 中的权重。
+                     */
+                } break;
+
+                case GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED: {
+                    /*
+                     * CPU、CUDA、旧版 RPC，或者服务端没有本地模型，
+                     * 使用 llama.cpp 原来的内存复制路径。
+                     */
+                    ggml_backend_tensor_set_2d(
+                        simple_tensor,
+                        static_cast<const char *>(data) +
+                            offset_j,
+                        simple_offset,
+                        chunk_size_j,
+                        static_cast<size_t>(
+                            i_stop - i_start),
+                        chunk_size_j,
+                        chunk_size_full);
+                } break;
+
+                case GGML_BACKEND_LOCAL_FILE_ERROR: {
+                    GGML_ABORT(
+                        "failed to load tensor '%s' "
+                        "from RPC local file: "
+                        "src_offset=%" PRIu64
+                        ", dst_offset=%" PRIu64
+                        ", copy_size=%" PRIu64
+                        ", n_copies=%" PRIu64,
+                        simple_tensor->name,
+                        src_offset,
+                        dst_offset,
+                        copy_size,
+                        n_copies);
+                } break;
+
+                default: {
+                    GGML_ABORT(
+                        "invalid RPC local-file result");
                 }
-                const size_t simple_offset = i_start * chunk_size_j;
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
-                offset_j += chunk_size_j;
             }
-            GGML_ASSERT(offset_j == chunk_size_full);
-        } break;
-        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            for (size_t j = 0; j < n_bufs; j++) {
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                ggml_backend_tensor_set(simple_tensor, data, offset, size);
-            }
-        } break;
-        case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
-            GGML_ASSERT(tensor->type == GGML_TYPE_F32);
-            const int64_t ne = ggml_nelements(tensor);
-            std::vector<float> tmp;
-            tmp.reserve(ne);
-            for (int64_t i = 0; i < ne; i++) {
-                tmp.push_back(((const float *) data)[i] / n_bufs);
-            }
-            for (size_t j = 0; j < n_bufs; j++) {
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                ggml_backend_tensor_set(simple_tensor, tmp.data(), offset, size);
-            }
-        } break;
-        default: {
-            GGML_ABORT("fatal error");
+
+            /*
+             * 注意：无论本地加载还是普通复制，
+             * 都要继续累计下一个设备的源分片偏移。
+             */
+            offset_j += chunk_size_j;
         }
+
+        /*
+         * 检查所有设备的局部分片是否刚好组成完整 chunk。
+         */
+        GGML_ASSERT(offset_j == chunk_size_full);
+    } break;
+
+    case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+        for (size_t j = 0; j < n_bufs; ++j) {
+            ggml_tensor * simple_tensor =
+                ggml_backend_meta_buffer_simple_tensor(
+                    tensor,
+                    j);
+
+            GGML_ASSERT(simple_tensor != nullptr);
+
+            /*
+             * MIRRORED 的源布局和目标布局相同。
+             *
+             * 如果上层只写入完整张量的一部分，
+             * 源和目标都使用同一个 offset。
+             */
+            const ggml_backend_local_file_result result =
+                ggml_backend_meta_try_set_local_file_2d(
+                    simple_tensor,
+                    /* src_offset = */ static_cast<uint64_t>(offset),
+                    /* dst_offset = */ static_cast<uint64_t>(offset),
+                    /* copy_size  = */ static_cast<uint64_t>(size),
+                    /* n_copies   = */ 1,
+                    /* src_stride = */ static_cast<uint64_t>(size),
+                    /* dst_stride = */ static_cast<uint64_t>(size));
+
+            switch (result) {
+                case GGML_BACKEND_LOCAL_FILE_HANDLED: {
+                    // 已由 RPC 服务端本地加载
+                } break;
+
+                case GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED: {
+                    ggml_backend_tensor_set(
+                        simple_tensor,
+                        data,
+                        offset,
+                        size);
+                } break;
+
+                case GGML_BACKEND_LOCAL_FILE_ERROR: {
+                    GGML_ABORT(
+                        "failed to load mirrored tensor '%s' "
+                        "from RPC local file",
+                        simple_tensor->name);
+                } break;
+
+                default: {
+                    GGML_ABORT(
+                        "invalid RPC local-file result");
+                }
+            }
+        }
+    } break;
+
+    case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+        /*
+         * 这里不能直接从本地 GGUF 加载。
+         *
+         * 写入的数据不是文件中的原始数据，
+         * 而是原始 F32 数据除以 n_bufs 后产生的新数据。
+         */
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+
+        const int64_t ne =
+            ggml_nelements(tensor);
+
+        std::vector<float> tmp;
+        tmp.reserve(ne);
+
+        for (int64_t i = 0; i < ne; ++i) {
+            tmp.push_back(
+                static_cast<const float *>(data)[i] /
+                n_bufs);
+        }
+
+        for (size_t j = 0; j < n_bufs; ++j) {
+            ggml_tensor * simple_tensor =
+                ggml_backend_meta_buffer_simple_tensor(
+                    tensor,
+                    j);
+
+            ggml_backend_tensor_set(
+                simple_tensor,
+                tmp.data(),
+                offset,
+                size);
+        }
+    } break;
+
+    default: {
+        GGML_ABORT("fatal error");
     }
+}
 }
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
