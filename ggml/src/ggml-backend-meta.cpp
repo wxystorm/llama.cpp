@@ -484,6 +484,23 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     }
     return it->second[index];
 }
+// 判断一个张量是否是静态的，即是否在静态简单张量容器中存在
+static bool ggml_backend_meta_tensor_is_static(
+        const ggml_tensor * tensor) {
+
+    if (tensor == nullptr ||
+        tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return false;
+    }
+
+    auto * buf_ctx =
+        static_cast<ggml_backend_meta_buffer_context *>(
+            tensor->buffer->context);
+
+    return buf_ctx->stc_static.simple_tensors.find(tensor) !=
+           buf_ctx->stc_static.simple_tensors.end();
+}
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
@@ -1373,6 +1390,18 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         GGML_ASSERT(offset_data*row_count == size);
         return;
     }
+    const bool is_static_tensor =
+                    ggml_backend_meta_tensor_is_static(tensor);
+
+                /*
+                * 再增加几项防御性限制：
+                * 本地文件快速路径只处理原始、非 view 的静态张量。
+                */
+                const bool can_use_local_file =
+                    is_static_tensor &&
+                    tensor->op == GGML_OP_NONE &&
+                    tensor->view_src == nullptr &&
+                    tensor->name[0] != '\0';
 
     switch (split_state.axis) {
     case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1447,15 +1476,20 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const uint64_t dst_stride =
                 static_cast<uint64_t>(chunk_size_j);
 
-            const ggml_backend_local_file_result result =
-                ggml_backend_meta_try_set_local_file_2d(
-                    simple_tensor,
-                    src_offset,
-                    dst_offset,
-                    copy_size,
-                    n_copies,
-                    src_stride,
-                    dst_stride);
+            ggml_backend_local_file_result result =
+    GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+            // 只有是静态才走
+            if (can_use_local_file) {
+                result =
+                    ggml_backend_meta_try_set_local_file_2d(
+                        simple_tensor,
+                        src_offset,
+                        dst_offset,
+                        copy_size,
+                        n_copies,
+                        src_stride,
+                        dst_stride);
+            }
 
             switch (result) {
                 case GGML_BACKEND_LOCAL_FILE_HANDLED: {
@@ -1517,21 +1551,25 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     } break;
 
     case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-        for (size_t j = 0; j < n_bufs; ++j) {
-            ggml_tensor * simple_tensor =
-                ggml_backend_meta_buffer_simple_tensor(
-                    tensor,
-                    j);
+    for (size_t j = 0; j < n_bufs; ++j) {
+        ggml_tensor * simple_tensor =
+            ggml_backend_meta_buffer_simple_tensor(
+                tensor,
+                j);
 
-            GGML_ASSERT(simple_tensor != nullptr);
+        GGML_ASSERT(simple_tensor != nullptr);
 
-            /*
-             * MIRRORED 的源布局和目标布局相同。
-             *
-             * 如果上层只写入完整张量的一部分，
-             * 源和目标都使用同一个 offset。
-             */
-            const ggml_backend_local_file_result result =
+        ggml_backend_local_file_result result =
+            GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+
+        /*
+         * 只有静态模型权重才尝试 RPC 本地 GGUF。
+         *
+         * 运行时 embd、tokens、mask 等直接保持
+         * NOT_SUPPORTED，然后进入普通 set_tensor。
+         */
+        if (can_use_local_file) {
+            result =
                 ggml_backend_meta_try_set_local_file_2d(
                     simple_tensor,
                     /* src_offset = */ static_cast<uint64_t>(offset),
@@ -1540,34 +1578,42 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     /* n_copies   = */ 1,
                     /* src_stride = */ static_cast<uint64_t>(size),
                     /* dst_stride = */ static_cast<uint64_t>(size));
+        }
 
-            switch (result) {
-                case GGML_BACKEND_LOCAL_FILE_HANDLED: {
-                    // 已由 RPC 服务端本地加载
-                } break;
+        switch (result) {
+            case GGML_BACKEND_LOCAL_FILE_HANDLED: {
+                // RPC服务端已经从本地GGUF加载完成
+            } break;
 
-                case GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED: {
-                    ggml_backend_tensor_set(
-                        simple_tensor,
-                        data,
-                        offset,
-                        size);
-                } break;
+            case GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED: {
+                /*
+                 * 包括：
+                 * 1. CPU/CUDA后端；
+                 * 2. 运行时计算张量；
+                 * 3. RPC不支持本地文件扩展；
+                 * 4. 非静态张量。
+                 */
+                ggml_backend_tensor_set(
+                    simple_tensor,
+                    data,
+                    offset,
+                    size);
+            } break;
 
-                case GGML_BACKEND_LOCAL_FILE_ERROR: {
-                    GGML_ABORT(
-                        "failed to load mirrored tensor '%s' "
-                        "from RPC local file",
-                        simple_tensor->name);
-                } break;
+            case GGML_BACKEND_LOCAL_FILE_ERROR: {
+                GGML_ABORT(
+                    "failed to load mirrored tensor '%s' "
+                    "from RPC local file",
+                    simple_tensor->name);
+            } break;
 
-                default: {
-                    GGML_ABORT(
-                        "invalid RPC local-file result");
-                }
+            default: {
+                GGML_ABORT(
+                    "invalid RPC local-file result");
             }
         }
-    } break;
+    }
+} break;
 
     case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
         /*
