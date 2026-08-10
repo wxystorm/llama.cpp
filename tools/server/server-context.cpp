@@ -3721,68 +3721,15 @@ private:
             }
 
             // shifted according to the current sub-batch
-            /*const int tok_idx = slot.i_batch - off;
+            const int tok_idx = slot.i_batch - off;
 
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
-            */
-           const int tok_idx = slot.i_batch - off;
-
-            // 只打印每个请求的第一个生成 token
-            if (slot.n_decoded == 0) {
-                const float * logits =
-                    llama_get_logits_ith(slot.ctx_tgt, tok_idx);
-
-                const llama_model * model =
-                    llama_get_model(slot.ctx_tgt);
-
-                const llama_vocab * vocab =
-                    llama_model_get_vocab(model);
-
-                const int32_t n_vocab =
-                    llama_vocab_n_tokens(vocab);
-
-                std::vector<int32_t> ids(n_vocab);
-                std::iota(ids.begin(), ids.end(), 0);
-
-                std::partial_sort(
-                    ids.begin(),
-                    ids.begin() + 10,
-                    ids.end(),
-                    [&](int32_t a, int32_t b) {
-                        return logits[a] > logits[b];
-                    });
-
-                fprintf(stderr,
-                    "\n========== FIRST TOKEN TOP 10 ==========\n");
-
-                for (int i = 0; i < 10; ++i) {
-                    const int32_t token = ids[i];
-
-                    fprintf(
-                        stderr,
-                        "top[%d]: token=%d logit=%.9f\n",
-                        i,
-                        token,
-                        logits[token]);
-                }
-
-                fprintf(stderr,
-                    "========================================\n");
-            }
-
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-
-                id = common_sampler_sample(
-                    slot.smpl.get(),
-                    slot.ctx_tgt,
-                    tok_idx);
-            }
+            
+           
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
