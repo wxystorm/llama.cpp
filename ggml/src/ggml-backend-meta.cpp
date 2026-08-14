@@ -2329,7 +2329,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                cgraph_ij->uid = ggml_graph_next_uid();
+                if (cgraph->uid != 0) {
+                    uint64_t uid = cgraph->uid;
+                    uid ^= (uint64_t) (j + 1)       * 0x9e3779b97f4a7c15ULL;
+                    uid ^= (uint64_t) (i_graph + 1) * 0xbf58476d1ce4e5b9ULL;
+                    uid ^= uid >> 30;
+                    uid *= 0xbf58476d1ce4e5b9ULL;
+                    uid ^= uid >> 27;
+                    uid *= 0x94d049bb133111ebULL;
+                    uid ^= uid >> 31;
+                    cgraph_ij->uid = uid != 0 ? uid : ggml_graph_next_uid();
+                } else {
+                    cgraph_ij->uid = ggml_graph_next_uid();
+                }
             }
         }
     }

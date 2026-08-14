@@ -238,7 +238,6 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
-    std::unordered_map<uint64_t, uint64_t> graph_hashes;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -955,38 +954,26 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-     std::vector<uint8_t> input;
-
-    serialize_graph(
-        rpc_ctx->device,
-        graph_uid,
-        cgraph,
-        input);
-
-    // ② 计算当前graph的hash
-    const uint64_t graph_hash =
-        fnv_hash(
-            input.data(),
-            input.size());
-
-    // ③ 查询这个UID上一次对应的hash
-    auto it =
-        rpc_dev_ctx->graph_hashes.find(graph_uid);
-
-    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end() &&
-                 it != rpc_dev_ctx->graph_hashes.end() &&
-                 it->second == graph_hash;
+    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     //新的
-    
+    //reuse = false;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-               
+        GGML_LOG_INFO(
+            "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
+            " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
+            rpc_ctx->endpoint.c_str(),
+            rpc_ctx->device,
+            (void *) cgraph,
+            graph_uid,
+            cgraph->n_nodes,
+            sizeof(request));
+        RPC_STATUS_ASSERT(status);
     } else {
-        rpc_dev_ctx->graph_hashes[graph_uid] = graph_hash;
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
@@ -1155,8 +1142,6 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-    // 存hash
-    std::unordered_map<uint64_t, uint64_t> tensor_hashes;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
 };
@@ -1667,8 +1652,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
-    // 保存hash
-    
     graph->n_nodes = n_nodes;
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     tensor_ptrs.reserve(n_tensors);
