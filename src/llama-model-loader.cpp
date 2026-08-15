@@ -1681,7 +1681,12 @@ bool llama_model_loader::load_all_data(
             // this can happen with split experts models
             continue;
         }
-
+        // 先做一个简单的，第一层ffn不加载
+        const char * name = ggml_get_name(cur);
+        if (strcmp(name, "blk.0.ffn_up.weight") == 0) {
+            LLAMA_LOG_INFO("%s: skipping tensor %s\n", __func__, name);
+            continue;
+        }
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
