@@ -1682,11 +1682,6 @@ bool llama_model_loader::load_all_data(
             continue;
         }
         // 先做一个简单的，第一层ffn不加载
-        const char * name = ggml_get_name(cur);
-        if (strcmp(name, "blk.0.ffn_up.weight") == 0) {
-            LLAMA_LOG_INFO("%s: skipping tensor %s\n", __func__, name);
-            continue;
-        }
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
@@ -1694,7 +1689,13 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
-
+            const char * name = ggml_get_name(cur);
+        if (strcmp(name, "blk.0.ffn_up.weight") == 0) {
+            LLAMA_LOG_ERROR("%s: skipping tensor %s\n", __func__, name);
+            // 虽然没有加载，但是也要把size_done加上，否则进度条会不准确
+            size_done += n_size;
+            continue;
+        }
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
@@ -1733,7 +1734,7 @@ bool llama_model_loader::load_all_data(
         }
         } else {
             const auto & file = files.at(weight->idx);
-
+           
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
