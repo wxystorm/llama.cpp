@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
 #include <array>
@@ -1415,6 +1416,150 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+static bool try_rpc_local_weight(
+        ggml_tensor * tensor,
+        size_t src_offset,
+        size_t dst_offset,
+        size_t size) {
+
+    ggml_backend_buffer_t buffer =
+        tensor->buffer;
+
+    if (buffer == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_buffer_get_type(buffer);
+
+    ggml_backend_dev_t dev =
+        ggml_backend_buft_get_device(buft);
+
+    if (dev == nullptr) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg =
+        ggml_backend_dev_backend_reg(dev);
+
+    auto fn =
+        (ggml_backend_rpc_set_local_2d_t)
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_SET_LOCAL_2D_PROC);
+
+    if (fn == nullptr) {
+        return false;
+    }
+
+    const auto result = fn(
+        tensor,
+
+        src_offset,
+        dst_offset,
+
+        size,       // copy_size
+        1,          // n_copies
+
+        size,       // src_stride
+        size);      // dst_stride
+
+    if (result == GGML_BACKEND_LOCAL_FILE_HANDLED) {
+        return true;
+    }
+
+    if (result == GGML_BACKEND_LOCAL_FILE_ERROR) {
+        GGML_ABORT("RPC local weight load failed");
+    }
+
+    return false;
+}
+static enum ggml_backend_local_file_result
+llama_model_loader_try_set_local_file_2d(
+        ggml_tensor * tensor,
+        uint64_t src_offset,
+        uint64_t dst_offset,
+        uint64_t copy_size,
+        uint64_t n_copies,
+        uint64_t src_stride,
+        uint64_t dst_stride) {
+
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_buffer_type_t buft =
+        ggml_backend_buffer_get_type(tensor->buffer);
+
+    if (buft == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_dev_t dev =
+        ggml_backend_buft_get_device(buft);
+
+    if (dev == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    ggml_backend_reg_t reg =
+        ggml_backend_dev_backend_reg(dev);
+
+    if (reg == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    void * proc =
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_SET_LOCAL_2D_PROC);
+
+    if (proc == nullptr) {
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
+    auto fn =
+        reinterpret_cast<ggml_backend_rpc_set_local_2d_t>(proc);
+
+    return fn(
+        tensor,
+        src_offset,
+        dst_offset,
+        copy_size,
+        n_copies,
+        src_stride,
+        dst_stride);
+}
+static bool llama_model_loader_try_set_local_weight(
+        ggml_tensor * tensor,
+        uint64_t src_offset,
+        uint64_t dst_offset,
+        uint64_t size) {
+
+    const auto result =
+        llama_model_loader_try_set_local_file_2d(
+            tensor,
+            src_offset,
+            dst_offset,
+            size,
+            1,
+            size,
+            size);
+
+    if (result == GGML_BACKEND_LOCAL_FILE_HANDLED) {
+        return true;
+    }
+
+    if (result == GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED) {
+        return false;
+    }
+
+    GGML_ABORT(
+        "failed to load tensor '%s' from local RPC model file",
+        tensor ? tensor->name : "(null)");
+
+    return false;
+}
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1562,6 +1707,7 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
+
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
@@ -1570,9 +1716,16 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else {
+        }  else {
+            if (!llama_model_loader_try_set_local_weight(
+                    cur,
+                    0,          // src_offset：相对于这个 tensor
+                    0,          // dst_offset
+                    n_size)) {
+
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
+        }
         } else {
             const auto & file = files.at(weight->idx);
 
