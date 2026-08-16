@@ -3064,6 +3064,27 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        // blk.0.ffn_up.weight is intentionally left uninitialized during
+        // non-mmap model loading. Load it exactly once, immediately before
+        // the first CPU operation that consumes it. Only worker 0 performs
+        // file I/O; the barrier publishes the completed bytes to all workers.
+        if (node->op == GGML_OP_MUL_MAT &&
+            node->src[0] != NULL &&
+            strcmp(node->src[0]->name, "blk.0.ffn_up.weight") == 0) {
+            if (state->ith == 0) {
+                if (!ggml_cpu_ensure_lazy_tensor_loaded(node->src[0])) {
+                    GGML_LOG_ERROR("%s: failed to lazily load tensor '%s' (data=%p, size=%zu)\n",
+                            __func__, node->src[0]->name, node->src[0]->data, ggml_nbytes(node->src[0]));
+                    tp->ec = GGML_STATUS_FAILED;
+                }
+            }
+
+            ggml_barrier(state->threadpool);
+            if (tp->ec != GGML_STATUS_SUCCESS) {
+                break;
+            }
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);

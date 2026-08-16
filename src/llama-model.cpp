@@ -20,6 +20,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 //新加的
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-backend-impl.h"
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -999,6 +1001,37 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_lazy_cpu_tensor_record {
+    ggml_tensor * tensor = nullptr;
+    llama_file * file = nullptr;
+    size_t file_offset = 0;
+    size_t size = 0;
+    std::mutex mutex;
+};
+
+static bool llama_load_lazy_cpu_tensor(void * user_data, ggml_tensor * tensor) {
+    auto * record = static_cast<llama_lazy_cpu_tensor_record *>(user_data);
+    if (record == nullptr ||
+        record->tensor != tensor ||
+        record->file == nullptr ||
+        tensor == nullptr ||
+        tensor->data == nullptr ||
+        ggml_nbytes(tensor) != record->size) {
+        return false;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        record->file->seek(record->file_offset, SEEK_SET);
+        record->file->read_raw(tensor->data, record->size);
+        return true;
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_ERROR("%s: failed reading tensor '%s': %s\n",
+                __func__, ggml_get_name(tensor), ex.what());
+        return false;
+    }
+}
+
 struct llama_model::impl {
     // 内部实现细节
     impl() = default;
@@ -1014,6 +1047,11 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+
+    // Keep non-mmap GGUF files open for weights registered for on-demand CPU
+    // loading. The records hold non-owning pointers into this vector.
+    llama_files lazy_weight_files;
+    std::vector<std::unique_ptr<llama_lazy_cpu_tensor_record>> lazy_cpu_tensors;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1050,6 +1088,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    for (const auto & record : pimpl->lazy_cpu_tensors) {
+        ggml_cpu_unregister_lazy_tensor(record->tensor);
+    }
+
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1658,6 +1700,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // Preserve the GGUF file object after llama_model_loader is destroyed and
+    // register the skipped CPU weight for one-time loading at first use.
+    if (!ml.use_mmap) {
+        constexpr const char * lazy_name = "blk.0.ffn_up.weight";
+        auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+                [lazy_name](const auto & item) { return item.first == lazy_name; });
+
+        if (it != tensors_by_name.end()) {
+            ggml_tensor * tensor = it->second;
+            if (tensor->buffer != nullptr &&
+                tensor->data != nullptr &&
+                ggml_backend_buffer_is_host(tensor->buffer)) {
+                llama_local_tensor_info info {};
+                if (!ml.get_local_tensor_info(lazy_name, info)) {
+                    throw std::runtime_error(format("missing lazy tensor metadata for '%s'", lazy_name));
+                }
+                if (info.file_idx >= ml.files.size()) {
+                    throw std::runtime_error(format("invalid lazy tensor file index for '%s'", lazy_name));
+                }
+
+                pimpl->lazy_weight_files = std::move(ml.files);
+
+                auto record = std::make_unique<llama_lazy_cpu_tensor_record>();
+                record->tensor      = tensor;
+                record->file        = pimpl->lazy_weight_files.at(info.file_idx).get();
+                record->file_offset = info.file_offset;
+                record->size        = info.byte_size;
+
+                ggml_cpu_register_lazy_tensor(tensor, llama_load_lazy_cpu_tensor, record.get());
+                pimpl->lazy_cpu_tensors.emplace_back(std::move(record));
+
+                LLAMA_LOG_INFO("%s: registered lazy CPU tensor '%s' (file=%zu, offset=%zu, size=%zu)\n",
+                        __func__, lazy_name, info.file_idx, info.file_offset, info.byte_size);
+            }
         }
     }
     // 创建分配并加载模型权重

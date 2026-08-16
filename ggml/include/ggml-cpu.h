@@ -69,6 +69,24 @@ extern "C" {
                     struct ggml_threadpool * threadpool /* = NULL */ );
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
+    // Experimental on-demand loading for CPU weight tensors. The owner of the
+    // tensor and user_data must keep both alive until the tensor is
+    // unregistered. The loader is called at most once by the CPU graph
+    // executor, immediately before the tensor is first used.
+    typedef bool (*ggml_cpu_lazy_tensor_loader_t)(
+            void * user_data,
+            struct ggml_tensor * tensor);
+
+    GGML_BACKEND_API void ggml_cpu_register_lazy_tensor(
+            struct ggml_tensor * tensor,
+            ggml_cpu_lazy_tensor_loader_t loader,
+            void * user_data);
+
+    GGML_BACKEND_API void ggml_cpu_unregister_lazy_tensor(struct ggml_tensor * tensor);
+
+    // Returns false only when a registered tensor failed to load.
+    GGML_BACKEND_API bool ggml_cpu_ensure_lazy_tensor_loaded(struct ggml_tensor * tensor);
+
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads);

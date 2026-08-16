@@ -7,7 +7,9 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef GGML_USE_CPU_HBM
@@ -92,6 +94,64 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
         }
     }
     return false;
+}
+
+struct ggml_cpu_lazy_tensor_entry {
+    ggml_cpu_lazy_tensor_loader_t loader;
+    void * user_data;
+    bool loaded;
+};
+
+static std::mutex ggml_cpu_lazy_tensor_mutex;
+static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_lazy_tensors;
+
+void ggml_cpu_register_lazy_tensor(
+        ggml_tensor * tensor,
+        ggml_cpu_lazy_tensor_loader_t loader,
+        void * user_data) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(loader != nullptr);
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    ggml_cpu_lazy_tensors[tensor] = { loader, user_data, false };
+}
+
+void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    ggml_cpu_lazy_tensors.erase(tensor);
+}
+
+bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+
+    // Keep the lock while loading. This is intentionally a cold, one-time
+    // path and prevents another graph execution from reading the tensor while
+    // its file data is only partially initialized.
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    auto it = ggml_cpu_lazy_tensors.find(tensor);
+    if (it == ggml_cpu_lazy_tensors.end()) {
+        return true;
+    }
+
+    auto & entry = it->second;
+    if (entry.loaded) {
+        return true;
+    }
+
+    if (!entry.loader(entry.user_data, tensor)) {
+        return false;
+    }
+
+    entry.loaded = true;
+    GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
+            __func__, tensor->name, tensor->data, ggml_nbytes(tensor));
+    return true;
 }
 
 // CPU backend - backend (stream)
