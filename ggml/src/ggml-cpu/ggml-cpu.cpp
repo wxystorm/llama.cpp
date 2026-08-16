@@ -149,7 +149,7 @@ bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
     }
 
     entry.loaded = true;
-    GGML_LOG_ERROR("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
+    GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
             __func__, tensor->name, tensor->data, ggml_nbytes(tensor));
     return true;
 }
