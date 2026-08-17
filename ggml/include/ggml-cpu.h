@@ -91,6 +91,15 @@ extern "C" {
     // tensor is loaded again on its next use.
     GGML_BACKEND_API bool ggml_cpu_release_lazy_tensor(struct ggml_tensor * tensor);
 
+    struct ggml_cpu_flash_stats {
+        uint64_t load_count;
+        uint64_t read_bytes;
+        uint64_t io_time_us;
+    };
+
+    // Logical file reads performed by registered lazy tensor loaders.
+    GGML_BACKEND_API void ggml_cpu_get_flash_stats(struct ggml_cpu_flash_stats * stats);
+
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads);

@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -289,6 +290,10 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
 
+    ggml_cpu_flash_stats flash_decode_start = {};
+    ggml_cpu_flash_stats flash_decode_stats = {};
+    uint64_t flash_decode_steps = 0;
+
     std::function<void(int /* id_slot */)> callback_on_release;
 
     // Speculative decoding stats
@@ -309,6 +314,9 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        flash_decode_start = {};
+        flash_decode_stats = {};
+        flash_decode_steps = 0;
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -610,6 +618,32 @@ struct server_slot {
         SLT_INF(*this,
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
+
+        if (flash_decode_steps > 0) {
+            const double mib = 1024.0 * 1024.0;
+            const double read_mib_per_token = flash_decode_stats.read_bytes / mib / flash_decode_steps;
+            const double io_ms_per_token = flash_decode_stats.io_time_us / 1000.0 / flash_decode_steps;
+            const double effective_mib_s = flash_decode_stats.io_time_us > 0
+                    ? (flash_decode_stats.read_bytes / mib) / (flash_decode_stats.io_time_us / 1000000.0)
+                    : 0.0;
+
+            SLT_INF(*this,
+                    "\n[FLASH STAT]\n"
+                    "decode steps          = %" PRIu64 "\n"
+                    "load count            = %" PRIu64 "\n"
+                    "total logical read    = %.3f MiB\n"
+                    "Flash read bytes/token = %.3f MiB/token\n"
+                    "total Flash I/O time  = %.3f s\n"
+                    "Flash I/O time/token  = %.3f ms/token\n"
+                    "effective bandwidth   = %.2f MiB/s\n",
+                    flash_decode_steps,
+                    flash_decode_stats.load_count,
+                    flash_decode_stats.read_bytes / mib,
+                    read_mib_per_token,
+                    flash_decode_stats.io_time_us / 1000000.0,
+                    io_ms_per_token,
+                    effective_mib_s);
+        }
 
         if (n_draft_total > 0) {
             const float  draft_ratio  = (float) n_draft_accepted / n_draft_total;
@@ -3688,7 +3722,8 @@ private:
                 return;
             }
 
-            if (slot.state == SLOT_STATE_DONE_PROMPT) {
+            const bool completed_prompt = slot.state == SLOT_STATE_DONE_PROMPT;
+            if (completed_prompt) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
@@ -3708,6 +3743,9 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                ggml_cpu_get_flash_stats(&slot.flash_decode_start);
+                slot.flash_decode_stats = {};
+                slot.flash_decode_steps = 0;
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -3791,6 +3829,15 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.n_decoded += 1;
+
+            if (!completed_prompt) {
+                ggml_cpu_flash_stats current = {};
+                ggml_cpu_get_flash_stats(&current);
+                slot.flash_decode_stats.load_count = current.load_count - slot.flash_decode_start.load_count;
+                slot.flash_decode_stats.read_bytes = current.read_bytes - slot.flash_decode_start.read_bytes;
+                slot.flash_decode_stats.io_time_us = current.io_time_us - slot.flash_decode_start.io_time_us;
+                slot.flash_decode_steps += 1;
+            }
 
             if (slot.n_decoded == 1) {
                 slot.t_start_generation = t_now;

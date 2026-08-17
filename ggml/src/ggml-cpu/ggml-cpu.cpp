@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -108,6 +109,7 @@ struct ggml_cpu_lazy_tensor_entry {
 
 static std::mutex ggml_cpu_lazy_tensor_mutex;
 static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_lazy_tensors;
+static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
 
 void ggml_cpu_register_lazy_tensor(
         ggml_tensor * tensor,
@@ -148,14 +150,30 @@ bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
         return true;
     }
 
+    const auto io_start = std::chrono::steady_clock::now();
     if (!entry.loader(entry.user_data, tensor)) {
         return false;
     }
+    const auto io_end = std::chrono::steady_clock::now();
+
+    ggml_cpu_flash_stats_total.load_count += 1;
+    ggml_cpu_flash_stats_total.read_bytes += ggml_nbytes(tensor);
+    ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            io_end - io_start).count();
 
     entry.loaded = true;
     GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
             __func__, tensor->name, tensor->data, ggml_nbytes(tensor));
     return true;
+}
+
+void ggml_cpu_get_flash_stats(ggml_cpu_flash_stats * stats) {
+    if (stats == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    *stats = ggml_cpu_flash_stats_total;
 }
 
 static size_t ggml_cpu_get_page_size() {
