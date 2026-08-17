@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -105,9 +106,12 @@ struct ggml_cpu_lazy_tensor_entry {
     ggml_cpu_lazy_tensor_loader_t loader;
     void * user_data;
     bool loaded;
+    bool loading;
 };
 
 static std::mutex ggml_cpu_lazy_tensor_mutex;
+static std::mutex ggml_cpu_lazy_tensor_io_mutex;
+static std::condition_variable ggml_cpu_lazy_tensor_cond;
 static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_lazy_tensors;
 static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
 
@@ -118,8 +122,12 @@ void ggml_cpu_register_lazy_tensor(
     GGML_ASSERT(tensor != nullptr);
     GGML_ASSERT(loader != nullptr);
 
-    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
-    ggml_cpu_lazy_tensors[tensor] = { loader, user_data, false };
+    std::unique_lock<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    ggml_cpu_lazy_tensor_cond.wait(lock, [tensor] {
+        auto it = ggml_cpu_lazy_tensors.find(tensor);
+        return it == ggml_cpu_lazy_tensors.end() || !it->second.loading;
+    });
+    ggml_cpu_lazy_tensors[tensor] = { loader, user_data, false, false };
 }
 
 void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {
@@ -127,7 +135,11 @@ void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    std::unique_lock<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    ggml_cpu_lazy_tensor_cond.wait(lock, [tensor] {
+        auto it = ggml_cpu_lazy_tensors.find(tensor);
+        return it == ggml_cpu_lazy_tensors.end() || !it->second.loading;
+    });
     ggml_cpu_lazy_tensors.erase(tensor);
 }
 
@@ -136,32 +148,58 @@ bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
         return false;
     }
 
-    // Keep the lock while loading. This is intentionally a cold, one-time
-    // path and prevents another graph execution from reading the tensor while
-    // its file data is only partially initialized.
-    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
-    auto it = ggml_cpu_lazy_tensors.find(tensor);
-    if (it == ggml_cpu_lazy_tensors.end()) {
-        return true;
+    ggml_cpu_lazy_tensor_loader_t loader = nullptr;
+    void * user_data = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+        while (true) {
+            auto it = ggml_cpu_lazy_tensors.find(tensor);
+            if (it == ggml_cpu_lazy_tensors.end()) {
+                return true;
+            }
+            if (it->second.loaded) {
+                return true;
+            }
+            if (!it->second.loading) {
+                it->second.loading = true;
+                loader = it->second.loader;
+                user_data = it->second.user_data;
+                break;
+            }
+            ggml_cpu_lazy_tensor_cond.wait(lock);
+        }
     }
 
-    auto & entry = it->second;
-    if (entry.loaded) {
-        return true;
+    bool loaded = false;
+    std::chrono::steady_clock::time_point io_start;
+    std::chrono::steady_clock::time_point io_end;
+    {
+        std::lock_guard<std::mutex> io_lock(ggml_cpu_lazy_tensor_io_mutex);
+        io_start = std::chrono::steady_clock::now();
+        loaded = loader(user_data, tensor);
+        io_end = std::chrono::steady_clock::now();
     }
 
-    const auto io_start = std::chrono::steady_clock::now();
-    if (!entry.loader(entry.user_data, tensor)) {
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+        auto it = ggml_cpu_lazy_tensors.find(tensor);
+        GGML_ASSERT(it != ggml_cpu_lazy_tensors.end());
+        it->second.loaded = loaded;
+        it->second.loading = false;
+
+        if (loaded) {
+            ggml_cpu_flash_stats_total.load_count += 1;
+            ggml_cpu_flash_stats_total.read_bytes += ggml_nbytes(tensor);
+            ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                    io_end - io_start).count();
+        }
+    }
+    ggml_cpu_lazy_tensor_cond.notify_all();
+
+    if (!loaded) {
         return false;
     }
-    const auto io_end = std::chrono::steady_clock::now();
 
-    ggml_cpu_flash_stats_total.load_count += 1;
-    ggml_cpu_flash_stats_total.read_bytes += ggml_nbytes(tensor);
-    ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
-            io_end - io_start).count();
-
-    entry.loaded = true;
     GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
             __func__, tensor->name, tensor->data, ggml_nbytes(tensor));
     return true;
@@ -234,18 +272,39 @@ bool ggml_cpu_release_lazy_tensor(ggml_tensor * tensor) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
-    auto it = ggml_cpu_lazy_tensors.find(tensor);
-    if (it == ggml_cpu_lazy_tensors.end() || !it->second.loaded) {
-        return true;
+    {
+        std::unique_lock<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+        while (true) {
+            auto it = ggml_cpu_lazy_tensors.find(tensor);
+            if (it == ggml_cpu_lazy_tensors.end() || !it->second.loaded) {
+                return true;
+            }
+            if (!it->second.loading) {
+                it->second.loading = true;
+                break;
+            }
+            ggml_cpu_lazy_tensor_cond.wait(lock);
+        }
     }
 
     size_t discarded = 0;
-    if (!ggml_cpu_discard_tensor_pages(tensor, &discarded)) {
+    const bool released = ggml_cpu_discard_tensor_pages(tensor, &discarded);
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+        auto it = ggml_cpu_lazy_tensors.find(tensor);
+        GGML_ASSERT(it != ggml_cpu_lazy_tensors.end());
+        if (released) {
+            it->second.loaded = false;
+        }
+        it->second.loading = false;
+    }
+    ggml_cpu_lazy_tensor_cond.notify_all();
+
+    if (!released) {
         return false;
     }
 
-    it->second.loaded = false;
     GGML_LOG_INFO("%s: released tensor '%s' (data=%p, discarded=%zu)\n",
             __func__, tensor->name, tensor->data, discarded);
     return true;

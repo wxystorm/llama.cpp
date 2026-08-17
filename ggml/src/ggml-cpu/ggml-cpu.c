@@ -3059,6 +3059,125 @@ static void ggml_cpu_release_lazy_ffn_sources(struct ggml_tensor * node) {
     }
 }
 
+struct ggml_cpu_ffn_prefetch {
+    ggml_mutex_t mutex;
+    ggml_cond_t cond;
+    ggml_thread_t thread;
+    struct ggml_tensor * task;
+    bool running;
+    bool busy;
+    bool stop;
+};
+
+static void ggml_cpu_ffn_prefetch_wait(struct ggml_cpu_ffn_prefetch * prefetch) {
+#if defined(_WIN32)
+    SleepConditionVariableSRW(&prefetch->cond, &prefetch->mutex, INFINITE, 0);
+#else
+    pthread_cond_wait(&prefetch->cond, &prefetch->mutex);
+#endif
+}
+
+static thread_ret_t ggml_cpu_ffn_prefetch_thread(void * data) {
+    struct ggml_cpu_ffn_prefetch * prefetch = (struct ggml_cpu_ffn_prefetch *) data;
+
+    ggml_mutex_lock(&prefetch->mutex);
+    while (!prefetch->stop) {
+        while (prefetch->task == NULL && !prefetch->stop) {
+            ggml_cpu_ffn_prefetch_wait(prefetch);
+        }
+        if (prefetch->stop) {
+            break;
+        }
+
+        struct ggml_tensor * tensor = prefetch->task;
+        prefetch->task = NULL;
+        prefetch->busy = true;
+        ggml_mutex_unlock(&prefetch->mutex);
+
+        GGML_LOG_INFO("%s: prefetching tensor '%s'\n", __func__, tensor->name);
+        if (!ggml_cpu_ensure_lazy_tensor_loaded(tensor)) {
+            GGML_LOG_ERROR("%s: failed to prefetch tensor '%s'\n", __func__, tensor->name);
+        }
+
+        ggml_mutex_lock(&prefetch->mutex);
+        prefetch->busy = false;
+        ggml_cond_broadcast(&prefetch->cond);
+    }
+    ggml_mutex_unlock(&prefetch->mutex);
+
+    return (thread_ret_t) 0;
+}
+
+static bool ggml_cpu_ffn_prefetch_init(struct ggml_cpu_ffn_prefetch * prefetch) {
+    memset(prefetch, 0, sizeof(*prefetch));
+    ggml_mutex_init(&prefetch->mutex);
+    ggml_cond_init(&prefetch->cond);
+
+    const int rc = ggml_thread_create(&prefetch->thread, NULL, ggml_cpu_ffn_prefetch_thread, prefetch);
+    if (rc != 0) {
+        ggml_cond_destroy(&prefetch->cond);
+        ggml_mutex_destroy(&prefetch->mutex);
+        GGML_LOG_WARN("%s: failed to create FFN prefetch thread: %d\n", __func__, rc);
+        return false;
+    }
+
+    prefetch->running = true;
+    return true;
+}
+
+static void ggml_cpu_ffn_prefetch_schedule(
+        struct ggml_cpu_ffn_prefetch * prefetch,
+        struct ggml_tensor * tensor) {
+    if (!prefetch->running || tensor == NULL) {
+        return;
+    }
+
+    ggml_mutex_lock(&prefetch->mutex);
+    while (prefetch->busy || prefetch->task != NULL) {
+        ggml_cpu_ffn_prefetch_wait(prefetch);
+    }
+    prefetch->task = tensor;
+    ggml_cond_broadcast(&prefetch->cond);
+    ggml_mutex_unlock(&prefetch->mutex);
+}
+
+static void ggml_cpu_ffn_prefetch_destroy(struct ggml_cpu_ffn_prefetch * prefetch) {
+    if (!prefetch->running) {
+        return;
+    }
+
+    ggml_mutex_lock(&prefetch->mutex);
+    prefetch->stop = true;
+    prefetch->task = NULL;
+    ggml_cond_broadcast(&prefetch->cond);
+    ggml_mutex_unlock(&prefetch->mutex);
+
+    ggml_thread_join(prefetch->thread, NULL);
+    ggml_cond_destroy(&prefetch->cond);
+    ggml_mutex_destroy(&prefetch->mutex);
+    prefetch->running = false;
+}
+
+static struct ggml_tensor * ggml_cpu_find_next_lazy_ffn(
+        const struct ggml_cgraph * cgraph,
+        int first_node) {
+    for (int node_n = first_node; node_n < cgraph->n_nodes; ++node_n) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        if (ggml_op_is_empty(node->op) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            struct ggml_tensor * src = node->src[i];
+            if (src != NULL && strstr(src->name, "ffn") != NULL) {
+                return src;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3086,6 +3205,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    struct ggml_cpu_ffn_prefetch ffn_prefetch = { 0 };
+    if (state->ith == 0) {
+        struct ggml_tensor * first_ffn = ggml_cpu_find_next_lazy_ffn(cgraph, 0);
+        if (first_ffn != NULL && ggml_cpu_ffn_prefetch_init(&ffn_prefetch)) {
+            ggml_cpu_ffn_prefetch_schedule(&ffn_prefetch, first_ffn);
+        }
+    }
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3120,6 +3247,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (tp->ec != GGML_STATUS_SUCCESS) {
                 break;
             }
+
+            if (state->ith == 0) {
+                const int first_prefetch_node = fused_mul != NULL ? node_n + 2 : node_n + 1;
+                ggml_cpu_ffn_prefetch_schedule(
+                        &ffn_prefetch,
+                        ggml_cpu_find_next_lazy_ffn(cgraph, first_prefetch_node));
+            }
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
@@ -3150,6 +3284,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             }
             ggml_barrier(state->threadpool);
         }
+    }
+
+    if (state->ith == 0) {
+        ggml_cpu_ffn_prefetch_destroy(&ffn_prefetch);
     }
 
 #ifdef GGML_USE_OPENMP
