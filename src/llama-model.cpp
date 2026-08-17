@@ -1702,39 +1702,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (!ml.use_mmap) {
-        constexpr const char * lazy_name = "blk.0.ffn_up.weight";
-        auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
-                [lazy_name](const auto & item) { return item.first == lazy_name; });
+    std::vector<std::pair<ggml_tensor *, llama_local_tensor_info>> lazy_tensors;
 
-        if (it != tensors_by_name.end()) {
-            ggml_tensor * tensor = it->second;
-            if (tensor->buffer != nullptr &&
-                tensor->data != nullptr &&
-                ggml_backend_buffer_is_host(tensor->buffer)) {
-                llama_local_tensor_info info {};
-                if (!ml.get_local_tensor_info(lazy_name, info)) {
-                    throw std::runtime_error(format("missing lazy tensor metadata for '%s'", lazy_name));
-                }
-                if (info.file_idx >= ml.files.size()) {
-                    throw std::runtime_error(format("invalid lazy tensor file index for '%s'", lazy_name));
-                }
+    for (const auto & item : tensors_by_name) {
+        if (item.first.find("ffn") == std::string::npos) {
+            continue;
+        }
 
-                pimpl->lazy_weight_files = std::move(ml.files);
+        ggml_tensor * tensor = item.second;
+        if (tensor->buffer == nullptr ||
+            tensor->data == nullptr ||
+            !ggml_backend_buffer_is_host(tensor->buffer)) {
+            continue;
+        }
 
-                auto record = std::make_unique<llama_lazy_cpu_tensor_record>();
-                record->tensor      = tensor;
-                record->file        = pimpl->lazy_weight_files.at(info.file_idx).get();
-                record->file_offset = info.file_offset;
-                record->size        = info.byte_size;
+        llama_local_tensor_info info {};
+        if (!ml.get_local_tensor_info(item.first, info)) {
+            throw std::runtime_error(
+                format("missing lazy tensor metadata for '%s'", item.first.c_str()));
+        }
 
-                ggml_cpu_register_lazy_tensor(tensor, llama_load_lazy_cpu_tensor, record.get());
-                pimpl->lazy_cpu_tensors.emplace_back(std::move(record));
+        lazy_tensors.emplace_back(tensor, std::move(info));
+    }
 
-                LLAMA_LOG_INFO("%s: registered lazy CPU tensor '%s' (file=%zu, offset=%zu, size=%zu)\n",
-                        __func__, lazy_name, info.file_idx, info.file_offset, info.byte_size);
+    if (!lazy_tensors.empty()) {
+        // 只能 move 一次，不能放进循环
+        pimpl->lazy_weight_files = std::move(ml.files);
+
+        for (auto & item : lazy_tensors) {
+            ggml_tensor * tensor = item.first;
+            const auto & info = item.second;
+
+            if (info.file_idx >= pimpl->lazy_weight_files.size()) {
+                throw std::runtime_error(
+                    format("invalid file index for '%s'", info.name.c_str()));
             }
+
+            auto record = std::make_unique<llama_lazy_cpu_tensor_record>();
+            record->tensor      = tensor;
+            record->file        = pimpl->lazy_weight_files.at(info.file_idx).get();
+            record->file_offset = info.file_offset;
+            record->size        = info.byte_size;
+
+            ggml_cpu_register_lazy_tensor(
+                tensor,
+                llama_load_lazy_cpu_tensor,
+                record.get());
+
+            pimpl->lazy_cpu_tensors.emplace_back(std::move(record));
+
+            LLAMA_LOG_INFO("%s: registered lazy tensor '%s'\n",
+                    __func__, info.name.c_str());
         }
     }
+}
     // 创建分配并加载模型权重
     return true;
 }

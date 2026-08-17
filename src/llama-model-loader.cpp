@@ -1690,7 +1690,9 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
             const char * name = ggml_get_name(cur);
-        if (strcmp(name, "blk.0.ffn_up.weight") == 0) {
+        if (!use_mmap &&
+            ggml_backend_buffer_is_host(cur->buffer) &&
+            strstr(name, "ffn") != 0) {
             LLAMA_LOG_ERROR("%s: skipping tensor %s\n", __func__, name);
             // 虽然没有加载，但是也要把size_done加上，否则进度条会不准确
             size_done += n_size;

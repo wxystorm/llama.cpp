@@ -71,8 +71,8 @@ extern "C" {
 
     // Experimental on-demand loading for CPU weight tensors. The owner of the
     // tensor and user_data must keep both alive until the tensor is
-    // unregistered. The loader is called at most once by the CPU graph
-    // executor, immediately before the tensor is first used.
+    // unregistered. The loader is called before the tensor is used whenever
+    // its pages have been released.
     typedef bool (*ggml_cpu_lazy_tensor_loader_t)(
             void * user_data,
             struct ggml_tensor * tensor);
@@ -86,6 +86,10 @@ extern "C" {
 
     // Returns false only when a registered tensor failed to load.
     GGML_BACKEND_API bool ggml_cpu_ensure_lazy_tensor_loaded(struct ggml_tensor * tensor);
+
+    // Releases physical pages while preserving tensor->data. A released
+    // tensor is loaded again on its next use.
+    GGML_BACKEND_API bool ggml_cpu_release_lazy_tensor(struct ggml_tensor * tensor);
 
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data

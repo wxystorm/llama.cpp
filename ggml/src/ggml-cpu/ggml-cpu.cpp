@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -31,6 +32,9 @@
 #    endif
 #    include <windows.h>
 #else
+#    if defined(__linux__) || defined(__ANDROID__)
+#        include <sys/mman.h>
+#    endif
 #    include <unistd.h>
 #endif
 
@@ -149,8 +153,83 @@ bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
     }
 
     entry.loaded = true;
-    GGML_LOG_ERROR("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
+    GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
             __func__, tensor->name, tensor->data, ggml_nbytes(tensor));
+    return true;
+}
+
+static size_t ggml_cpu_get_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+#elif defined(__linux__) || defined(__ANDROID__)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? (size_t) page_size : 0;
+#else
+    return 0;
+#endif
+}
+
+static bool ggml_cpu_discard_tensor_pages(ggml_tensor * tensor, size_t * discarded) {
+    const size_t page_size = ggml_cpu_get_page_size();
+    if (page_size == 0) {
+        return false;
+    }
+
+    const uintptr_t begin = (uintptr_t) tensor->data;
+    const uintptr_t end   = begin + ggml_nbytes(tensor);
+    if (end < begin) {
+        return false;
+    }
+
+    uintptr_t page_begin = begin - begin % page_size;
+    if (page_begin != begin) {
+        page_begin += page_size;
+    }
+    const uintptr_t page_end = end - end % page_size;
+
+    if (page_begin >= page_end) {
+        *discarded = 0;
+        return true;
+    }
+
+    const size_t size = page_end - page_begin;
+#if defined(_WIN32)
+    if (VirtualAlloc((void *) page_begin, size, MEM_RESET, PAGE_READWRITE) == nullptr) {
+        return false;
+    }
+#elif defined(__linux__) || defined(__ANDROID__)
+    if (madvise((void *) page_begin, size, MADV_DONTNEED) != 0) {
+        return false;
+    }
+#else
+    return false;
+#endif
+
+    *discarded = size;
+    return true;
+}
+
+bool ggml_cpu_release_lazy_tensor(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    auto it = ggml_cpu_lazy_tensors.find(tensor);
+    if (it == ggml_cpu_lazy_tensors.end() || !it->second.loaded) {
+        return true;
+    }
+
+    size_t discarded = 0;
+    if (!ggml_cpu_discard_tensor_pages(tensor, &discarded)) {
+        return false;
+    }
+
+    it->second.loaded = false;
+    GGML_LOG_INFO("%s: released tensor '%s' (data=%p, discarded=%zu)\n",
+            __func__, tensor->name, tensor->data, discarded);
     return true;
 }
 

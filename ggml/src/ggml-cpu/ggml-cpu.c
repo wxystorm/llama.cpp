@@ -3024,6 +3024,41 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+static bool ggml_cpu_node_has_lazy_ffn_source(const struct ggml_tensor * node) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * src = node->src[i];
+        if (src != NULL && strstr(src->name, "ffn") != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cpu_load_lazy_ffn_sources(struct ggml_tensor * node) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        struct ggml_tensor * src = node->src[i];
+        if (src != NULL &&
+            strstr(src->name, "ffn") != NULL &&
+            !ggml_cpu_ensure_lazy_tensor_loaded(src)) {
+            GGML_LOG_ERROR("%s: failed to lazily load tensor '%s' (data=%p, size=%zu)\n",
+                    __func__, src->name, src->data, ggml_nbytes(src));
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_cpu_release_lazy_ffn_sources(struct ggml_tensor * node) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        struct ggml_tensor * src = node->src[i];
+        if (src != NULL &&
+            strstr(src->name, "ffn") != NULL &&
+            !ggml_cpu_release_lazy_tensor(src)) {
+            GGML_LOG_WARN("%s: failed to release lazy tensor '%s'\n", __func__, src->name);
+        }
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3064,13 +3099,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        if (node->op == GGML_OP_MUL_MAT &&
-            node->src[0] != NULL &&
-            strcmp(node->src[0]->name, "blk.0.ffn_up.weight") == 0) {
+        struct ggml_tensor * fused_mul = NULL;
+        if (node->op == GGML_OP_RMS_NORM &&
+            node_n + 1 < cgraph->n_nodes &&
+            cgraph->nodes[node_n + 1]->op == GGML_OP_MUL) {
+            fused_mul = cgraph->nodes[node_n + 1];
+        }
+
+        const bool has_lazy_ffn = ggml_cpu_node_has_lazy_ffn_source(node) ||
+                (fused_mul != NULL && ggml_cpu_node_has_lazy_ffn_source(fused_mul));
+        if (has_lazy_ffn) {
             if (state->ith == 0) {
-                if (!ggml_cpu_ensure_lazy_tensor_loaded(node->src[0])) {
-                    GGML_LOG_ERROR("%s: failed to lazily load tensor '%s' (data=%p, size=%zu)\n",
-                            __func__, node->src[0]->name, node->src[0]->data, ggml_nbytes(node->src[0]));
+                if (!ggml_cpu_load_lazy_ffn_sources(node) ||
+                    (fused_mul != NULL && !ggml_cpu_load_lazy_ffn_sources(fused_mul))) {
                     tp->ec = GGML_STATUS_FAILED;
                 }
             }
@@ -3096,7 +3137,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (node_n + 1 < cgraph->n_nodes || has_lazy_ffn) {
+            ggml_barrier(state->threadpool);
+        }
+
+        if (has_lazy_ffn) {
+            if (state->ith == 0) {
+                ggml_cpu_release_lazy_ffn_sources(node);
+                if (fused_mul != NULL) {
+                    ggml_cpu_release_lazy_ffn_sources(fused_mul);
+                }
+            }
             ggml_barrier(state->threadpool);
         }
     }
