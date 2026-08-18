@@ -9,6 +9,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -110,6 +112,29 @@ struct ggml_cpu_lazy_tensor_entry {
 static std::mutex ggml_cpu_lazy_tensor_mutex;
 static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_lazy_tensors;
 static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
+
+bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
+    static constexpr int resident_ffn_layers = 12;
+    static constexpr char block_prefix[] = "blk.";
+
+    if (tensor_name == nullptr || std::strncmp(tensor_name, block_prefix, sizeof(block_prefix) - 1) != 0) {
+        return false;
+    }
+
+    char * suffix = nullptr;
+    const long layer = std::strtol(tensor_name + sizeof(block_prefix) - 1, &suffix, 10);
+    if (suffix == tensor_name + sizeof(block_prefix) - 1 || suffix == nullptr || *suffix != '.') {
+        return false;
+    }
+
+    ++suffix;
+    const bool is_ffn_projection =
+            std::strcmp(suffix, "ffn_up.weight") == 0 ||
+            std::strcmp(suffix, "ffn_gate.weight") == 0 ||
+            std::strcmp(suffix, "ffn_down.weight") == 0;
+
+    return is_ffn_projection && layer >= resident_ffn_layers;
+}
 
 void ggml_cpu_register_lazy_tensor(
         ggml_tensor * tensor,

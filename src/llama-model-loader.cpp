@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1692,7 +1693,7 @@ bool llama_model_loader::load_all_data(
             const char * name = ggml_get_name(cur);
         if (!use_mmap &&
             ggml_backend_buffer_is_host(cur->buffer) &&
-            strstr(name, "ffn") != 0) {
+            ggml_cpu_should_stream_ffn_tensor(name)) {
             LLAMA_LOG_ERROR("%s: skipping tensor %s\n", __func__, name);
             // 虽然没有加载，但是也要把size_done加上，否则进度条会不准确
             size_done += n_size;

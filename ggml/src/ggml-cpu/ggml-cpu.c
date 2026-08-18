@@ -3027,7 +3027,7 @@ static int ggml_cpu_try_fuse_ops(
 static bool ggml_cpu_node_has_lazy_ffn_source(const struct ggml_tensor * node) {
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const struct ggml_tensor * src = node->src[i];
-        if (src != NULL && strstr(src->name, "ffn") != NULL) {
+        if (src != NULL && ggml_cpu_should_stream_ffn_tensor(src->name)) {
             return true;
         }
     }
@@ -3038,7 +3038,7 @@ static bool ggml_cpu_load_lazy_ffn_sources(struct ggml_tensor * node) {
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         struct ggml_tensor * src = node->src[i];
         if (src != NULL &&
-            strstr(src->name, "ffn") != NULL &&
+            ggml_cpu_should_stream_ffn_tensor(src->name) &&
             !ggml_cpu_ensure_lazy_tensor_loaded(src)) {
             GGML_LOG_ERROR("%s: failed to lazily load tensor '%s' (data=%p, size=%zu)\n",
                     __func__, src->name, src->data, ggml_nbytes(src));
@@ -3052,7 +3052,7 @@ static void ggml_cpu_release_lazy_ffn_sources(struct ggml_tensor * node) {
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         struct ggml_tensor * src = node->src[i];
         if (src != NULL &&
-            strstr(src->name, "ffn") != NULL &&
+            ggml_cpu_should_stream_ffn_tensor(src->name) &&
             !ggml_cpu_release_lazy_tensor(src)) {
             GGML_LOG_WARN("%s: failed to release lazy tensor '%s'\n", __func__, src->name);
         }

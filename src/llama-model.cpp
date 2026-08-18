@@ -1705,7 +1705,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<std::pair<ggml_tensor *, llama_local_tensor_info>> lazy_tensors;
 
     for (const auto & item : tensors_by_name) {
-        if (item.first.find("ffn") == std::string::npos) {
+        if (!ggml_cpu_should_stream_ffn_tensor(item.first.c_str())) {
             continue;
         }
 
