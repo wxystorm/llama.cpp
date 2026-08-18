@@ -77,9 +77,19 @@ extern "C" {
             void * user_data,
             struct ggml_tensor * tensor);
 
+    typedef bool (*ggml_cpu_lazy_tensor_slice_loader_t)(
+            void * user_data,
+            struct ggml_tensor * tensor,
+            void * dst,
+            int64_t ne0_begin,
+            int64_t ne0_count,
+            int64_t ne1_begin,
+            int64_t ne1_count);
+
     GGML_BACKEND_API void ggml_cpu_register_lazy_tensor(
             struct ggml_tensor * tensor,
             ggml_cpu_lazy_tensor_loader_t loader,
+            ggml_cpu_lazy_tensor_slice_loader_t slice_loader,
             void * user_data);
 
     GGML_BACKEND_API void ggml_cpu_unregister_lazy_tensor(struct ggml_tensor * tensor);
@@ -90,6 +100,14 @@ extern "C" {
     // Releases physical pages while preserving tensor->data. A released
     // tensor is loaded again on its next use.
     GGML_BACKEND_API bool ggml_cpu_release_lazy_tensor(struct ggml_tensor * tensor);
+
+    GGML_BACKEND_API bool ggml_cpu_read_lazy_tensor_2d(
+            struct ggml_tensor * tensor,
+            void * dst,
+            int64_t ne0_begin,
+            int64_t ne0_count,
+            int64_t ne1_begin,
+            int64_t ne1_count);
 
     struct ggml_cpu_flash_stats {
         uint64_t load_count;

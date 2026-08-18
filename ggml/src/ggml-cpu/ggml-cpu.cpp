@@ -103,6 +103,7 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 
 struct ggml_cpu_lazy_tensor_entry {
     ggml_cpu_lazy_tensor_loader_t loader;
+    ggml_cpu_lazy_tensor_slice_loader_t slice_loader;
     void * user_data;
     bool loaded;
 };
@@ -114,12 +115,13 @@ static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
 void ggml_cpu_register_lazy_tensor(
         ggml_tensor * tensor,
         ggml_cpu_lazy_tensor_loader_t loader,
+        ggml_cpu_lazy_tensor_slice_loader_t slice_loader,
         void * user_data) {
     GGML_ASSERT(tensor != nullptr);
     GGML_ASSERT(loader != nullptr);
 
     std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
-    ggml_cpu_lazy_tensors[tensor] = { loader, user_data, false };
+    ggml_cpu_lazy_tensors[tensor] = { loader, slice_loader, user_data, false };
 }
 
 void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {
@@ -248,6 +250,40 @@ bool ggml_cpu_release_lazy_tensor(ggml_tensor * tensor) {
     it->second.loaded = false;
     GGML_LOG_INFO("%s: released tensor '%s' (data=%p, discarded=%zu)\n",
             __func__, tensor->name, tensor->data, discarded);
+    return true;
+}
+
+bool ggml_cpu_read_lazy_tensor_2d(
+        ggml_tensor * tensor,
+        void * dst,
+        int64_t ne0_begin,
+        int64_t ne0_count,
+        int64_t ne1_begin,
+        int64_t ne1_count) {
+    if (tensor == nullptr || dst == nullptr ||
+        ne0_begin < 0 || ne0_count <= 0 || ne0_begin + ne0_count > tensor->ne[0] ||
+        ne1_begin < 0 || ne1_count <= 0 || ne1_begin + ne1_count > tensor->ne[1]) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    auto it = ggml_cpu_lazy_tensors.find(tensor);
+    if (it == ggml_cpu_lazy_tensors.end() || it->second.slice_loader == nullptr) {
+        return false;
+    }
+
+    const auto io_start = std::chrono::steady_clock::now();
+    if (!it->second.slice_loader(
+            it->second.user_data, tensor, dst,
+            ne0_begin, ne0_count, ne1_begin, ne1_count)) {
+        return false;
+    }
+    const auto io_end = std::chrono::steady_clock::now();
+
+    ggml_cpu_flash_stats_total.load_count += 1;
+    ggml_cpu_flash_stats_total.read_bytes += ggml_row_size(tensor->type, ne0_count) * ne1_count;
+    ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            io_end - io_start).count();
     return true;
 }
 

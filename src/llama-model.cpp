@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -1032,6 +1033,52 @@ static bool llama_load_lazy_cpu_tensor(void * user_data, ggml_tensor * tensor) {
     }
 }
 
+static bool llama_load_lazy_cpu_tensor_2d(
+        void * user_data,
+        ggml_tensor * tensor,
+        void * dst,
+        int64_t ne0_begin,
+        int64_t ne0_count,
+        int64_t ne1_begin,
+        int64_t ne1_count) {
+    auto * record = static_cast<llama_lazy_cpu_tensor_record *>(user_data);
+    if (record == nullptr || record->tensor != tensor || record->file == nullptr || dst == nullptr ||
+        ne0_begin < 0 || ne0_count <= 0 || ne0_begin + ne0_count > tensor->ne[0] ||
+        ne1_begin < 0 || ne1_count <= 0 || ne1_begin + ne1_count > tensor->ne[1]) {
+        return false;
+    }
+
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    if (ne0_begin % block_size != 0 || ne0_count % block_size != 0) {
+        LLAMA_LOG_ERROR("%s: tensor '%s' slice [" PRId64 ", " PRId64 ") is not block aligned (%" PRId64 ")\n",
+                __func__, ggml_get_name(tensor), ne0_begin, ne0_begin + ne0_count, block_size);
+        return false;
+    }
+
+    const size_t row_offset = ggml_row_size(tensor->type, ne0_begin);
+    const size_t row_size = ggml_row_size(tensor->type, ne0_count);
+
+    try {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (ne0_begin == 0 && ne0_count == tensor->ne[0]) {
+            record->file->seek(record->file_offset + ne1_begin * tensor->nb[1], SEEK_SET);
+            record->file->read_raw(dst, row_size * ne1_count);
+        } else {
+            for (int64_t row = 0; row < ne1_count; ++row) {
+                const size_t src_offset = record->file_offset +
+                        (ne1_begin + row) * tensor->nb[1] + row_offset;
+                record->file->seek(src_offset, SEEK_SET);
+                record->file->read_raw((char *) dst + row * row_size, row_size);
+            }
+        }
+        return true;
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_ERROR("%s: failed reading tensor '%s': %s\n",
+                __func__, ggml_get_name(tensor), ex.what());
+        return false;
+    }
+}
+
 struct llama_model::impl {
     // 内部实现细节
     impl() = default;
@@ -1747,6 +1794,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_cpu_register_lazy_tensor(
                 tensor,
                 llama_load_lazy_cpu_tensor,
+                llama_load_lazy_cpu_tensor_2d,
                 record.get());
 
             pimpl->lazy_cpu_tensors.emplace_back(std::move(record));
@@ -1806,6 +1854,10 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+bool llama_model::grouped_ffn_enabled() const {
+    return !params.use_mmap && n_gpu_layers() == 0;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

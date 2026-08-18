@@ -1021,6 +1021,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "FLASH_FFN",
     "OUT_PROD",
 
     "SCALE",
@@ -1096,7 +1097,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1132,6 +1133,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "grouped_swiglu(up,gate,down,x)",
     "X*Y",
 
     "x*v",
@@ -1207,7 +1209,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3270,6 +3272,34 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[1] = b;
 
     return result;   //返回
+}
+
+struct ggml_tensor * ggml_flash_ffn_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * input,
+        int32_t               group_size) {
+    GGML_ASSERT(up != NULL && gate != NULL && down != NULL && input != NULL);
+    GGML_ASSERT(group_size > 0);
+    GGML_ASSERT(up->ne[0] == input->ne[0]);
+    GGML_ASSERT(gate->ne[0] == input->ne[0]);
+    GGML_ASSERT(up->ne[1] == gate->ne[1]);
+    GGML_ASSERT(down->ne[0] == up->ne[1]);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+
+    const int64_t ne[4] = { down->ne[1], input->ne[1], input->ne[2], input->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, group_size);
+    result->op     = GGML_OP_FLASH_FFN;
+    result->src[0] = up;
+    result->src[1] = gate;
+    result->src[2] = down;
+    result->src[3] = input;
+
+    return result;
 }
 
 void ggml_mul_mat_set_prec(

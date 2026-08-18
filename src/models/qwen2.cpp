@@ -1,5 +1,13 @@
 #include "models.h"
 
+#include <cstdlib>
+#include <cstring>
+
+static bool qwen2_use_grouped_ffn(const llama_model & model) {
+    const char * value = std::getenv("LLAMA_FLASH_GROUPED_FFN");
+    return model.grouped_ffn_enabled() && (value == nullptr || std::strcmp(value, "0") != 0);
+}
+
 void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -116,12 +124,27 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        constexpr int32_t ffn_group_size = 512;
+        const ggml_tensor * ffn_down = model.layers[il].ffn_down;
+        const bool grouped_ffn = qwen2_use_grouped_ffn(model) && loras->empty() &&
+                ffn_down->ne[0] % ggml_blck_size(ffn_down->type) == 0 &&
+                ffn_group_size % ggml_blck_size(ffn_down->type) == 0;
+
+        if (grouped_ffn) {
+            cur = ggml_flash_ffn_swiglu(ctx0,
+                    model.layers[il].ffn_up,
+                    model.layers[il].ffn_gate,
+                    model.layers[il].ffn_down,
+                    cur,
+                    ffn_group_size);
+        } else {
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, NULL,
+                    model.layers[il].ffn_gate, NULL, NULL,
+                    model.layers[il].ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

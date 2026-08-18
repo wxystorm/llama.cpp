@@ -1451,6 +1451,195 @@ UseGgmlGemm2:;
     }
 }
 
+static size_t ggml_flash_ffn_work_size(const struct ggml_tensor * dst) {
+    const struct ggml_tensor * up    = dst->src[0];
+    const struct ggml_tensor * gate  = dst->src[1];
+    const struct ggml_tensor * down  = dst->src[2];
+    const struct ggml_tensor * input = dst->src[3];
+
+    const int64_t group_size = MIN((int64_t) ggml_get_op_params_i32(dst, 0), up->ne[1]);
+    const int64_t n_cols = ggml_nelements(input) / input->ne[0];
+
+    const size_t up_weight   = ggml_row_size(up->type, up->ne[0]) * group_size;
+    const size_t gate_weight = ggml_row_size(gate->type, gate->ne[0]) * group_size;
+    const size_t down_weight = ggml_row_size(down->type, group_size) * down->ne[1];
+    const size_t group_act   = sizeof(float) * group_size * n_cols;
+    const size_t partial     = sizeof(float) * down->ne[1] * n_cols;
+
+    const enum ggml_type up_vec_type = type_traits_cpu[up->type].vec_dot_type;
+    const enum ggml_type gate_vec_type = type_traits_cpu[gate->type].vec_dot_type;
+    const enum ggml_type down_vec_type = type_traits_cpu[down->type].vec_dot_type;
+    const size_t scratch = MAX(
+            MAX(ggml_row_size(up_vec_type, ggml_nelements(input)),
+                ggml_row_size(gate_vec_type, ggml_nelements(input))),
+            ggml_row_size(down_vec_type, group_size * n_cols));
+
+    size_t size = GGML_PAD(sizeof(int), GGML_MEM_ALIGN);
+    size += GGML_PAD(up_weight, GGML_MEM_ALIGN);
+    size += GGML_PAD(gate_weight, GGML_MEM_ALIGN);
+    size += GGML_PAD(down_weight, GGML_MEM_ALIGN);
+    size += GGML_PAD(group_act, GGML_MEM_ALIGN) * 2;
+    size += GGML_PAD(partial, GGML_MEM_ALIGN);
+    size += GGML_PAD(scratch, GGML_MEM_ALIGN);
+    return size;
+}
+
+static void ggml_flash_ffn_init_weight(
+        struct ggml_tensor * group,
+        const struct ggml_tensor * base,
+        void * data,
+        int64_t ne0,
+        int64_t ne1) {
+    *group = *base;
+    group->data = data;
+    group->ne[0] = ne0;
+    group->ne[1] = ne1;
+    group->ne[2] = 1;
+    group->ne[3] = 1;
+    group->nb[0] = ggml_type_size(group->type);
+    group->nb[1] = ggml_row_size(group->type, ne0);
+    group->nb[2] = group->nb[1] * ne1;
+    group->nb[3] = group->nb[2];
+}
+
+static void ggml_flash_ffn_init_output(
+        struct ggml_tensor * output,
+        const struct ggml_tensor * shape,
+        void * data,
+        int64_t ne0) {
+    *output = *shape;
+    output->type = GGML_TYPE_F32;
+    output->data = data;
+    output->ne[0] = ne0;
+    output->nb[0] = sizeof(float);
+    output->nb[1] = output->nb[0] * output->ne[0];
+    output->nb[2] = output->nb[1] * output->ne[1];
+    output->nb[3] = output->nb[2] * output->ne[2];
+    memset(output->op_params, 0, sizeof(output->op_params));
+    output->op = GGML_OP_MUL_MAT;
+}
+
+static void ggml_compute_forward_flash_ffn(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    struct ggml_tensor * up    = dst->src[0];
+    struct ggml_tensor * gate  = dst->src[1];
+    struct ggml_tensor * down  = dst->src[2];
+    struct ggml_tensor * input = dst->src[3];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n_ff = up->ne[1];
+    const int64_t n_embd = input->ne[0];
+    const int64_t n_out = down->ne[1];
+    const int64_t n_cols = ggml_nelements(input) / n_embd;
+    const int64_t group_size = ggml_get_op_params_i32(dst, 0);
+    const int64_t down_block = ggml_blck_size(down->type);
+
+    GGML_ASSERT(params->wdata != NULL);
+    GGML_ASSERT(params->wsize >= ggml_flash_ffn_work_size(dst));
+    GGML_ASSERT(up->ne[0] == n_embd && gate->ne[0] == n_embd);
+    GGML_ASSERT(gate->ne[1] == n_ff && down->ne[0] == n_ff);
+    GGML_ASSERT(group_size > 0 && group_size % down_block == 0 && n_ff % down_block == 0);
+
+    const int64_t max_group = MIN(group_size, n_ff);
+    const size_t up_weight_size = ggml_row_size(up->type, n_embd) * max_group;
+    const size_t gate_weight_size = ggml_row_size(gate->type, n_embd) * max_group;
+    const size_t down_weight_size = ggml_row_size(down->type, max_group) * n_out;
+    const size_t group_act_size = sizeof(float) * max_group * n_cols;
+    const size_t partial_size = sizeof(float) * n_out * n_cols;
+
+    char * work = (char *) params->wdata;
+    int * load_ok = (int *) work;
+    work += GGML_PAD(sizeof(int), GGML_MEM_ALIGN);
+    void * up_weight_data = work;
+    work += GGML_PAD(up_weight_size, GGML_MEM_ALIGN);
+    void * gate_weight_data = work;
+    work += GGML_PAD(gate_weight_size, GGML_MEM_ALIGN);
+    void * down_weight_data = work;
+    work += GGML_PAD(down_weight_size, GGML_MEM_ALIGN);
+    float * up_act = (float *) work;
+    work += GGML_PAD(group_act_size, GGML_MEM_ALIGN);
+    float * gate_act = (float *) work;
+    work += GGML_PAD(group_act_size, GGML_MEM_ALIGN);
+    float * partial = (float *) work;
+    work += GGML_PAD(partial_size, GGML_MEM_ALIGN);
+    void * mm_scratch = work;
+    const size_t mm_scratch_size = params->wsize - (size_t) (work - (char *) params->wdata);
+
+    for (int64_t i = ith; i < n_out * n_cols; i += nth) {
+        ((float *) dst->data)[i] = 0.0f;
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t group_begin = 0; group_begin < n_ff; group_begin += group_size) {
+        const int64_t group_count = MIN(group_size, n_ff - group_begin);
+        GGML_ASSERT(group_begin % down_block == 0 && group_count % down_block == 0);
+
+        if (ith == 0) {
+            *load_ok =
+                    ggml_cpu_read_lazy_tensor_2d(up, up_weight_data,
+                            0, n_embd, group_begin, group_count) &&
+                    ggml_cpu_read_lazy_tensor_2d(gate, gate_weight_data,
+                            0, n_embd, group_begin, group_count) &&
+                    ggml_cpu_read_lazy_tensor_2d(down, down_weight_data,
+                            group_begin, group_count, 0, n_out);
+            if (!*load_ok) {
+                params->threadpool->ec = GGML_STATUS_FAILED;
+                GGML_LOG_ERROR("%s: failed loading FFN group [" PRId64 ", " PRId64 ")\n",
+                        __func__, group_begin, group_begin + group_count);
+            }
+        }
+        ggml_barrier(params->threadpool);
+        if (!*load_ok) {
+            return;
+        }
+
+        struct ggml_tensor up_group;
+        struct ggml_tensor gate_group;
+        struct ggml_tensor down_group;
+        ggml_flash_ffn_init_weight(&up_group, up, up_weight_data, n_embd, group_count);
+        ggml_flash_ffn_init_weight(&gate_group, gate, gate_weight_data, n_embd, group_count);
+        ggml_flash_ffn_init_weight(&down_group, down, down_weight_data, group_count, n_out);
+
+        struct ggml_tensor up_output;
+        struct ggml_tensor gate_output;
+        struct ggml_tensor partial_output;
+        ggml_flash_ffn_init_output(&up_output, input, up_act, group_count);
+        ggml_flash_ffn_init_output(&gate_output, input, gate_act, group_count);
+        ggml_flash_ffn_init_output(&partial_output, dst, partial, n_out);
+        up_output.src[0] = &up_group;
+        up_output.src[1] = input;
+        gate_output.src[0] = &gate_group;
+        gate_output.src[1] = input;
+
+        struct ggml_compute_params mm_params = *params;
+        mm_params.wdata = mm_scratch;
+        mm_params.wsize = mm_scratch_size;
+
+        ggml_compute_forward_mul_mat(&mm_params, &up_output);
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward_mul_mat(&mm_params, &gate_output);
+        ggml_barrier(params->threadpool);
+
+        const int64_t n_group_values = group_count * n_cols;
+        for (int64_t i = ith; i < n_group_values; i += nth) {
+            up_act[i] *= ggml_silu_f32(gate_act[i]);
+        }
+        ggml_barrier(params->threadpool);
+
+        partial_output.src[0] = &down_group;
+        partial_output.src[1] = &up_output;
+        ggml_compute_forward_mul_mat(&mm_params, &partial_output);
+        ggml_barrier(params->threadpool);
+
+        for (int64_t i = ith; i < n_out * n_cols; i += nth) {
+            ((float *) dst->data)[i] += partial[i];
+        }
+        ggml_barrier(params->threadpool);
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1836,6 +2025,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_FLASH_FFN:
+            {
+                ggml_compute_forward_flash_ffn(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2310,6 +2503,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_FLASH_FFN:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2833,6 +3027,10 @@ struct ggml_cplan ggml_graph_plan(
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
                     } break;
+                case GGML_OP_FLASH_FFN:
+                    {
+                        cur = ggml_flash_ffn_work_size(node);
+                    } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
                         cur = 0;
@@ -3025,6 +3223,10 @@ static int ggml_cpu_try_fuse_ops(
 }
 
 static bool ggml_cpu_node_has_lazy_ffn_source(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_FLASH_FFN) {
+        return false;
+    }
+
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const struct ggml_tensor * src = node->src[i];
         if (src != NULL && strstr(src->name, "ffn") != NULL) {
