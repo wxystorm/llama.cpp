@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -1002,9 +1003,127 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_ffnpack_header {
+    char magic[8];
+    uint32_t version;
+    uint32_t group_size;
+    uint32_t alignment;
+    uint32_t n_entries;
+    uint64_t data_offset;
+};
+
+struct llama_ffnpack_entry {
+    uint32_t layer;
+    uint32_t group;
+    uint32_t neuron_begin;
+    uint32_t neuron_count;
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint32_t reserved;
+    uint64_t bundle_offset;
+    uint64_t bundle_size;
+    uint64_t gate_offset;
+    uint64_t gate_size;
+    uint64_t up_offset;
+    uint64_t up_size;
+    uint64_t down_offset;
+    uint64_t down_size;
+};
+
+static_assert(sizeof(llama_ffnpack_header) == 32, "invalid ffnpack header layout");
+static_assert(sizeof(llama_ffnpack_entry) == 96, "invalid ffnpack entry layout");
+
+struct llama_ffnpack_context {
+    std::unique_ptr<llama_file> file;
+    std::unordered_map<uint64_t, llama_ffnpack_entry> entries;
+    uint32_t group_size = 0;
+    uint64_t cached_key = std::numeric_limits<uint64_t>::max();
+    std::vector<uint8_t> cached_bundle;
+    std::mutex mutex;
+};
+
+enum llama_ffnpack_tensor_kind {
+    LLAMA_FFNPACK_NONE,
+    LLAMA_FFNPACK_GATE,
+    LLAMA_FFNPACK_UP,
+    LLAMA_FFNPACK_DOWN,
+};
+
+static uint64_t llama_ffnpack_key(uint32_t layer, uint32_t group) {
+    return ((uint64_t) layer << 32) | group;
+}
+
+static std::string llama_ffnpack_path(const std::string & model_path) {
+    const char * override_path = std::getenv("LLAMA_FFNPACK");
+    if (override_path != nullptr && override_path[0] != '\0') {
+        return override_path;
+    }
+
+    const size_t dot = model_path.find_last_of('.');
+    return (dot == std::string::npos ? model_path : model_path.substr(0, dot)) + ".ffnpack";
+}
+
+static std::unique_ptr<llama_ffnpack_context> llama_ffnpack_open(const std::string & model_path) {
+    if (model_path.empty()) {
+        return nullptr;
+    }
+
+    const std::string path = llama_ffnpack_path(model_path);
+    try {
+        auto context = std::make_unique<llama_ffnpack_context>();
+        context->file = std::make_unique<llama_file>(path.c_str(), "rb");
+
+        llama_ffnpack_header header {};
+        context->file->read_raw(&header, sizeof(header));
+        if (memcmp(header.magic, "FFNPACK1", 8) != 0 || header.version != 1 ||
+            header.group_size == 0 || header.alignment == 0 ||
+            (header.alignment & (header.alignment - 1)) != 0 ||
+            header.n_entries == 0 || header.n_entries > 1000000) {
+            throw std::runtime_error("invalid ffnpack header");
+        }
+
+        const uint64_t index_end = sizeof(header) + (uint64_t) header.n_entries * sizeof(llama_ffnpack_entry);
+        if (header.data_offset < index_end || header.data_offset > context->file->size()) {
+            throw std::runtime_error("ffnpack index is outside the file");
+        }
+
+        context->group_size = header.group_size;
+        for (uint32_t i = 0; i < header.n_entries; ++i) {
+            llama_ffnpack_entry entry {};
+            context->file->read_raw(&entry, sizeof(entry));
+
+            if (entry.neuron_count == 0 || entry.bundle_offset < header.data_offset ||
+                entry.bundle_offset + entry.bundle_size < entry.bundle_offset ||
+                entry.bundle_offset + entry.bundle_size > context->file->size() ||
+                entry.gate_offset + entry.gate_size > entry.bundle_size ||
+                entry.up_offset + entry.up_size > entry.bundle_size ||
+                entry.down_offset + entry.down_size > entry.bundle_size) {
+                throw std::runtime_error("invalid ffnpack entry bounds");
+            }
+
+            const uint64_t key = llama_ffnpack_key(entry.layer, entry.group);
+            if (!context->entries.emplace(key, entry).second) {
+                throw std::runtime_error("duplicate ffnpack layer/group entry");
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: using '%s' (%u groups, group_size=%u)\n",
+                __func__, path.c_str(), header.n_entries, header.group_size);
+        return context;
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_WARN("%s: cannot use '%s': %s; falling back to GGUF slices\n",
+                __func__, path.c_str(), ex.what());
+        return nullptr;
+    }
+}
+
 struct llama_lazy_cpu_tensor_record {
     ggml_tensor * tensor = nullptr;
     llama_file * file = nullptr;
+    llama_ffnpack_context * ffnpack = nullptr;
+    llama_ffnpack_tensor_kind ffnpack_kind = LLAMA_FFNPACK_NONE;
+    uint32_t layer = 0;
     size_t file_offset = 0;
     size_t size = 0;
     std::mutex mutex;
@@ -1033,6 +1152,100 @@ static bool llama_load_lazy_cpu_tensor(void * user_data, ggml_tensor * tensor) {
     }
 }
 
+static bool llama_load_ffnpack_tensor_2d(
+        llama_lazy_cpu_tensor_record * record,
+        ggml_tensor * tensor,
+        void * dst,
+        int64_t ne0_begin,
+        int64_t ne0_count,
+        int64_t ne1_begin,
+        int64_t ne1_count,
+        bool & handled) {
+    handled = false;
+    if (record->ffnpack == nullptr || record->ffnpack_kind == LLAMA_FFNPACK_NONE) {
+        return false;
+    }
+
+    uint32_t neuron_begin = 0;
+    uint32_t neuron_count = 0;
+    if (record->ffnpack_kind == LLAMA_FFNPACK_DOWN) {
+        if (ne1_begin != 0 || ne1_count != tensor->ne[1]) {
+            return false;
+        }
+        neuron_begin = (uint32_t) ne0_begin;
+        neuron_count = (uint32_t) ne0_count;
+    } else {
+        if (ne0_begin != 0 || ne0_count != tensor->ne[0]) {
+            return false;
+        }
+        neuron_begin = (uint32_t) ne1_begin;
+        neuron_count = (uint32_t) ne1_count;
+    }
+
+    if (neuron_begin % record->ffnpack->group_size != 0) {
+        return false;
+    }
+
+    const uint32_t group = neuron_begin / record->ffnpack->group_size;
+    const uint64_t key = llama_ffnpack_key(record->layer, group);
+    auto entry_it = record->ffnpack->entries.find(key);
+    if (entry_it == record->ffnpack->entries.end()) {
+        return false;
+    }
+
+    const llama_ffnpack_entry & entry = entry_it->second;
+    if (entry.neuron_begin != neuron_begin || entry.neuron_count != neuron_count) {
+        return false;
+    }
+
+    uint32_t packed_type = 0;
+    uint64_t part_offset = 0;
+    uint64_t part_size = 0;
+    switch (record->ffnpack_kind) {
+        case LLAMA_FFNPACK_GATE:
+            packed_type = entry.gate_type;
+            part_offset = entry.gate_offset;
+            part_size = entry.gate_size;
+            break;
+        case LLAMA_FFNPACK_UP:
+            packed_type = entry.up_type;
+            part_offset = entry.up_offset;
+            part_size = entry.up_size;
+            break;
+        case LLAMA_FFNPACK_DOWN:
+            packed_type = entry.down_type;
+            part_offset = entry.down_offset;
+            part_size = entry.down_size;
+            break;
+        default:
+            return false;
+    }
+
+    const uint64_t expected_size = ggml_row_size(tensor->type, ne0_count) * ne1_count;
+    if (packed_type != (uint32_t) tensor->type || part_size != expected_size) {
+        return false;
+    }
+
+    handled = true;
+    try {
+        std::lock_guard<std::mutex> lock(record->ffnpack->mutex);
+        if (record->ffnpack->cached_key != key) {
+            record->ffnpack->cached_bundle.resize(entry.bundle_size);
+            record->ffnpack->file->seek(entry.bundle_offset, SEEK_SET);
+            record->ffnpack->file->read_raw(
+                    record->ffnpack->cached_bundle.data(), entry.bundle_size);
+            record->ffnpack->cached_key = key;
+        }
+
+        memcpy(dst, record->ffnpack->cached_bundle.data() + part_offset, part_size);
+        return true;
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_ERROR("%s: failed reading layer %u group %u: %s\n",
+                __func__, record->layer, group, ex.what());
+        return false;
+    }
+}
+
 static bool llama_load_lazy_cpu_tensor_2d(
         void * user_data,
         ggml_tensor * tensor,
@@ -1057,6 +1270,15 @@ static bool llama_load_lazy_cpu_tensor_2d(
 
     const size_t row_offset = ggml_row_size(tensor->type, ne0_begin);
     const size_t row_size = ggml_row_size(tensor->type, ne0_count);
+
+    bool ffnpack_handled = false;
+    const bool ffnpack_loaded = llama_load_ffnpack_tensor_2d(
+            record, tensor, dst,
+            ne0_begin, ne0_count, ne1_begin, ne1_count,
+            ffnpack_handled);
+    if (ffnpack_handled) {
+        return ffnpack_loaded;
+    }
 
     try {
         std::lock_guard<std::mutex> lock(record->mutex);
@@ -1095,6 +1317,7 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    std::unique_ptr<llama_ffnpack_context> ffnpack;
     llama_files lazy_weight_files;
     std::vector<std::unique_ptr<llama_lazy_cpu_tensor_record>> lazy_cpu_tensors;
 
@@ -1775,6 +1998,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!lazy_tensors.empty()) {
         // 只能 move 一次，不能放进循环
         pimpl->lazy_weight_files = std::move(ml.files);
+        pimpl->ffnpack = llama_ffnpack_open(ml.model_path);
 
         for (auto & item : lazy_tensors) {
             ggml_tensor * tensor = item.first;
@@ -1790,6 +2014,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             record->file        = pimpl->lazy_weight_files.at(info.file_idx).get();
             record->file_offset = info.file_offset;
             record->size        = info.byte_size;
+
+            if (pimpl->ffnpack != nullptr) {
+                unsigned int layer = 0;
+                char kind[16] = {};
+                char extra = 0;
+                if (sscanf(info.name.c_str(), "blk.%u.ffn_%15[^.].weight%c", &layer, kind, &extra) == 2) {
+                    if (strcmp(kind, "gate") == 0) {
+                        record->ffnpack_kind = LLAMA_FFNPACK_GATE;
+                    } else if (strcmp(kind, "up") == 0) {
+                        record->ffnpack_kind = LLAMA_FFNPACK_UP;
+                    } else if (strcmp(kind, "down") == 0) {
+                        record->ffnpack_kind = LLAMA_FFNPACK_DOWN;
+                    }
+                    if (record->ffnpack_kind != LLAMA_FFNPACK_NONE) {
+                        record->ffnpack = pimpl->ffnpack.get();
+                        record->layer = layer;
+                    }
+                }
+            }
 
             ggml_cpu_register_lazy_tensor(
                 tensor,
