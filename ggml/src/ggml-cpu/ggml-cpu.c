@@ -1524,7 +1524,9 @@ static int ggml_flash_ffn_compare_group_score_desc(const void * a, const void * 
 static atomic_int ggml_flash_ffn_next_token = 0;
 static atomic_int ggml_flash_ffn_token_base = 0;
 
-static struct {
+#define GGML_FLASH_FFN_PREDICTION_DISTANCE 4
+
+struct ggml_flash_ffn_layer_scores {
     double * h_scores;
     size_t capacity;
     int layer;
@@ -1532,7 +1534,10 @@ static struct {
     int64_t n_groups;
     int64_t n_cols;
     bool valid;
-} ggml_flash_ffn_previous_layer = { NULL, 0, -1, 0, 0, 0, false };
+};
+
+static struct ggml_flash_ffn_layer_scores
+        ggml_flash_ffn_layer_history[GGML_FLASH_FFN_PREDICTION_DISTANCE] = { 0 };
 
 static void ggml_flash_ffn_profile_prediction(
         FILE * file,
@@ -1542,16 +1547,12 @@ static void ggml_flash_ffn_profile_prediction(
         int64_t n_cols,
         const double * h_scores,
         const double * y_scores) {
-    const int predict_percent[] = { 20, 40, 60 };
+    const int predict_percent[] = { 20, 40, 60, 80 };
     const int actual_percent = 20;
     const size_t score_count = (size_t) n_groups * n_cols;
+    bool wrote_prediction = false;
 
-    if (file != NULL &&
-            ggml_flash_ffn_previous_layer.valid &&
-            ggml_flash_ffn_previous_layer.layer + 1 == layer &&
-            ggml_flash_ffn_previous_layer.token_base == token_base &&
-            ggml_flash_ffn_previous_layer.n_groups == n_groups &&
-            ggml_flash_ffn_previous_layer.n_cols == n_cols) {
+    if (file != NULL) {
         struct ggml_flash_ffn_group_score * ranks =
                 (struct ggml_flash_ffn_group_score *) malloc(sizeof(*ranks) * (size_t) n_groups * 2);
         if (ranks == NULL) {
@@ -1563,61 +1564,85 @@ static void ggml_flash_ffn_profile_prediction(
 
             for (int64_t col = 0; col < n_cols; ++col) {
                 for (int64_t group = 0; group < n_groups; ++group) {
-                    predicted[group].score = ggml_flash_ffn_previous_layer.h_scores[group * n_cols + col];
-                    predicted[group].group = group;
                     actual[group].score = y_scores[group * n_cols + col];
                     actual[group].group = group;
                 }
-                qsort(predicted, n_groups, sizeof(*predicted), ggml_flash_ffn_compare_group_score_desc);
                 qsort(actual, n_groups, sizeof(*actual), ggml_flash_ffn_compare_group_score_desc);
 
-                for (size_t p = 0; p < sizeof(predict_percent) / sizeof(predict_percent[0]); ++p) {
-                    const int64_t predicted_count = (n_groups * predict_percent[p] + 99) / 100;
-                    int64_t hit_count = 0;
-                    for (int64_t i = 0; i < actual_count; ++i) {
-                        for (int64_t j = 0; j < predicted_count; ++j) {
-                            if (actual[i].group == predicted[j].group) {
-                                ++hit_count;
-                                break;
+                for (int distance = 1; distance <= GGML_FLASH_FFN_PREDICTION_DISTANCE; ++distance) {
+                    const int source_layer = layer - distance;
+                    if (source_layer < 0) {
+                        continue;
+                    }
+                    const struct ggml_flash_ffn_layer_scores * source =
+                            &ggml_flash_ffn_layer_history[source_layer % GGML_FLASH_FFN_PREDICTION_DISTANCE];
+                    if (!source->valid ||
+                            source->layer != source_layer ||
+                            source->token_base != token_base ||
+                            source->n_groups != n_groups ||
+                            source->n_cols != n_cols) {
+                        continue;
+                    }
+
+                    for (int64_t group = 0; group < n_groups; ++group) {
+                        predicted[group].score = source->h_scores[group * n_cols + col];
+                        predicted[group].group = group;
+                    }
+                    qsort(predicted, n_groups, sizeof(*predicted), ggml_flash_ffn_compare_group_score_desc);
+
+                    for (size_t p = 0; p < sizeof(predict_percent) / sizeof(predict_percent[0]); ++p) {
+                        const int64_t predicted_count = (n_groups * predict_percent[p] + 99) / 100;
+                        int64_t hit_count = 0;
+                        for (int64_t i = 0; i < actual_count; ++i) {
+                            for (int64_t j = 0; j < predicted_count; ++j) {
+                                if (actual[i].group == predicted[j].group) {
+                                    ++hit_count;
+                                    break;
+                                }
                             }
                         }
+                        const double recall = actual_count > 0 ? (double) hit_count / actual_count : 1.0;
+                        fprintf(file, "%d,%d,%d,%.2f,%.2f,%" PRId64 ",%" PRId64 ",%" PRId64 ",%.9g\n",
+                                token_base + (int) col,
+                                source_layer,
+                                layer,
+                                predict_percent[p] / 100.0,
+                                actual_percent / 100.0,
+                                predicted_count,
+                                actual_count,
+                                hit_count,
+                                recall);
+                        wrote_prediction = true;
                     }
-                    const double recall = actual_count > 0 ? (double) hit_count / actual_count : 1.0;
-                    fprintf(file, "%d,%d,%d,%.2f,%.2f,%" PRId64 ",%" PRId64 ",%" PRId64 ",%.9g\n",
-                            token_base + (int) col,
-                            ggml_flash_ffn_previous_layer.layer,
-                            layer,
-                            predict_percent[p] / 100.0,
-                            actual_percent / 100.0,
-                            predicted_count,
-                            actual_count,
-                            hit_count,
-                            recall);
                 }
             }
             free(ranks);
-            fflush(file);
+            if (wrote_prediction) {
+                fflush(file);
+            }
         }
     }
 
-    if (score_count > ggml_flash_ffn_previous_layer.capacity) {
+    struct ggml_flash_ffn_layer_scores * current =
+            &ggml_flash_ffn_layer_history[layer % GGML_FLASH_FFN_PREDICTION_DISTANCE];
+    if (score_count > current->capacity) {
         double * scores = (double *) realloc(
-                ggml_flash_ffn_previous_layer.h_scores, sizeof(double) * score_count);
+                current->h_scores, sizeof(double) * score_count);
         if (scores == NULL) {
-            GGML_LOG_ERROR("%s: failed to allocate previous-layer activation buffer\n", __func__);
-            ggml_flash_ffn_previous_layer.valid = false;
+            GGML_LOG_ERROR("%s: failed to allocate layer activation history buffer\n", __func__);
+            current->valid = false;
             return;
         }
-        ggml_flash_ffn_previous_layer.h_scores = scores;
-        ggml_flash_ffn_previous_layer.capacity = score_count;
+        current->h_scores = scores;
+        current->capacity = score_count;
     }
 
-    memcpy(ggml_flash_ffn_previous_layer.h_scores, h_scores, sizeof(double) * score_count);
-    ggml_flash_ffn_previous_layer.layer = layer;
-    ggml_flash_ffn_previous_layer.token_base = token_base;
-    ggml_flash_ffn_previous_layer.n_groups = n_groups;
-    ggml_flash_ffn_previous_layer.n_cols = n_cols;
-    ggml_flash_ffn_previous_layer.valid = true;
+    memcpy(current->h_scores, h_scores, sizeof(double) * score_count);
+    current->layer = layer;
+    current->token_base = token_base;
+    current->n_groups = n_groups;
+    current->n_cols = n_cols;
+    current->valid = true;
 }
 
 static size_t ggml_flash_ffn_work_size(const struct ggml_tensor * dst) {
