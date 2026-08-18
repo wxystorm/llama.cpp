@@ -77,7 +77,7 @@ extern "C" {
             void * user_data,
             struct ggml_tensor * tensor);
 
-    // Keep the first 12 dense FFN layers resident and stream the remaining
+    // Keep the first 20 dense FFN layers resident and stream the remaining
     // gate, up, and down projection weights.
     GGML_BACKEND_API bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name);
 
