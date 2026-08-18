@@ -3280,7 +3280,8 @@ struct ggml_tensor * ggml_flash_ffn_swiglu(
         struct ggml_tensor  * gate,
         struct ggml_tensor  * down,
         struct ggml_tensor  * input,
-        int32_t               group_size) {
+        int32_t               group_size,
+        int32_t               layer) {
     GGML_ASSERT(up != NULL && gate != NULL && down != NULL && input != NULL);
     GGML_ASSERT(group_size > 0);
     GGML_ASSERT(up->ne[0] == input->ne[0]);
@@ -3293,6 +3294,7 @@ struct ggml_tensor * ggml_flash_ffn_swiglu(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, group_size);
+    ggml_set_op_params_i32(result, 1, layer);
     result->op     = GGML_OP_FLASH_FFN;
     result->src[0] = up;
     result->src[1] = gate;

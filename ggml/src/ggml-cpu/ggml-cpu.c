@@ -1451,6 +1451,46 @@ UseGgmlGemm2:;
     }
 }
 
+static FILE * ggml_flash_ffn_profile_file(void) {
+    static bool initialized = false;
+    static FILE * file = NULL;
+    if (initialized) {
+        return file;
+    }
+
+    initialized = true;
+    const char * path = getenv("LLAMA_FLASH_GROUP_PROFILE");
+    if (path == NULL || path[0] == '\0' || strcmp(path, "0") == 0) {
+        return NULL;
+    }
+    if (strcmp(path, "1") == 0) {
+        path = "ffn-group-profile.csv";
+    }
+
+    file = fopen(path, "a+");
+    if (file == NULL) {
+        GGML_LOG_ERROR("%s: failed to open profile output '%s': %s\n", __func__, path, strerror(errno));
+        return NULL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    if (ftell(file) == 0) {
+        fprintf(file, "record,token,layer,group,h_l2,y_l2,top_fraction,contribution\n");
+        fflush(file);
+    }
+    GGML_LOG_INFO("%s: writing group activation profile to '%s'\n", __func__, path);
+    return file;
+}
+
+static int ggml_flash_ffn_compare_double_desc(const void * a, const void * b) {
+    const double lhs = *(const double *) a;
+    const double rhs = *(const double *) b;
+    return lhs < rhs ? 1 : lhs > rhs ? -1 : 0;
+}
+
+static atomic_int ggml_flash_ffn_next_token = 0;
+static atomic_int ggml_flash_ffn_token_base = 0;
+
 static size_t ggml_flash_ffn_work_size(const struct ggml_tensor * dst) {
     const struct ggml_tensor * up    = dst->src[0];
     const struct ggml_tensor * gate  = dst->src[1];
@@ -1465,6 +1505,8 @@ static size_t ggml_flash_ffn_work_size(const struct ggml_tensor * dst) {
     const size_t down_weight = ggml_row_size(down->type, group_size) * down->ne[1];
     const size_t group_act   = sizeof(float) * group_size * n_cols;
     const size_t partial     = sizeof(float) * down->ne[1] * n_cols;
+    const int64_t n_groups   = (up->ne[1] + group_size - 1) / group_size;
+    const size_t profile     = sizeof(double) * n_groups * (2 * n_cols + 1);
 
     const enum ggml_type up_vec_type = type_traits_cpu[up->type].vec_dot_type;
     const enum ggml_type gate_vec_type = type_traits_cpu[gate->type].vec_dot_type;
@@ -1480,6 +1522,7 @@ static size_t ggml_flash_ffn_work_size(const struct ggml_tensor * dst) {
     size += GGML_PAD(down_weight, GGML_MEM_ALIGN);
     size += GGML_PAD(group_act, GGML_MEM_ALIGN) * 2;
     size += GGML_PAD(partial, GGML_MEM_ALIGN);
+    size += GGML_PAD(profile, GGML_MEM_ALIGN);
     size += GGML_PAD(scratch, GGML_MEM_ALIGN);
     return size;
 }
@@ -1534,7 +1577,9 @@ static void ggml_compute_forward_flash_ffn(
     const int64_t n_out = down->ne[1];
     const int64_t n_cols = ggml_nelements(input) / n_embd;
     const int64_t group_size = ggml_get_op_params_i32(dst, 0);
+    const int layer = ggml_get_op_params_i32(dst, 1);
     const int64_t down_block = ggml_blck_size(down->type);
+    const int64_t n_groups = (n_ff + group_size - 1) / group_size;
 
     GGML_ASSERT(params->wdata != NULL);
     GGML_ASSERT(params->wsize >= ggml_flash_ffn_work_size(dst));
@@ -1564,8 +1609,23 @@ static void ggml_compute_forward_flash_ffn(
     work += GGML_PAD(group_act_size, GGML_MEM_ALIGN);
     float * partial = (float *) work;
     work += GGML_PAD(partial_size, GGML_MEM_ALIGN);
+    double * h_scores = (double *) work;
+    double * y_scores = h_scores + n_groups * n_cols;
+    double * sorted_scores = y_scores + n_groups * n_cols;
+    work += GGML_PAD(sizeof(double) * n_groups * (2 * n_cols + 1), GGML_MEM_ALIGN);
     void * mm_scratch = work;
     const size_t mm_scratch_size = params->wsize - (size_t) (work - (char *) params->wdata);
+
+    FILE * profile_file = ith == 0 ? ggml_flash_ffn_profile_file() : NULL;
+    int token_base = 0;
+    if (ith == 0 && profile_file != NULL) {
+        if (layer == 0) {
+            token_base = atomic_fetch_add(&ggml_flash_ffn_next_token, (int) n_cols);
+            atomic_store(&ggml_flash_ffn_token_base, token_base);
+        } else {
+            token_base = atomic_load(&ggml_flash_ffn_token_base);
+        }
+    }
 
     for (int64_t i = ith; i < n_out * n_cols; i += nth) {
         ((float *) dst->data)[i] = 0.0f;
@@ -1628,15 +1688,69 @@ static void ggml_compute_forward_flash_ffn(
         }
         ggml_barrier(params->threadpool);
 
+        const int64_t group = group_begin / group_size;
+        if (ith == 0 && profile_file != NULL) {
+            for (int64_t col = 0; col < n_cols; ++col) {
+                double sum_sq = 0.0;
+                const float * values = up_act + col * group_count;
+                for (int64_t i = 0; i < group_count; ++i) {
+                    const double value = values[i];
+                    sum_sq += value * value;
+                }
+                h_scores[group * n_cols + col] = sqrt(sum_sq);
+            }
+        }
+
         partial_output.src[0] = &down_group;
         partial_output.src[1] = &up_output;
         ggml_compute_forward_mul_mat(&mm_params, &partial_output);
         ggml_barrier(params->threadpool);
 
+        if (ith == 0 && profile_file != NULL) {
+            for (int64_t col = 0; col < n_cols; ++col) {
+                double sum_sq = 0.0;
+                const float * values = partial + col * n_out;
+                for (int64_t i = 0; i < n_out; ++i) {
+                    const double value = values[i];
+                    sum_sq += value * value;
+                }
+                const double y_l2 = sqrt(sum_sq);
+                y_scores[group * n_cols + col] = y_l2;
+                fprintf(profile_file, "group,%d,%d,%" PRId64 ",%.9g,%.9g,,\n",
+                        token_base + (int) col, layer, group,
+                        h_scores[group * n_cols + col], y_l2);
+            }
+        }
+
         for (int64_t i = ith; i < n_out * n_cols; i += nth) {
             ((float *) dst->data)[i] += partial[i];
         }
         ggml_barrier(params->threadpool);
+    }
+
+    if (ith == 0 && profile_file != NULL) {
+        const int top_percent[] = { 20, 40, 60 };
+        for (int64_t col = 0; col < n_cols; ++col) {
+            double total = 0.0;
+            for (int64_t group = 0; group < n_groups; ++group) {
+                const double score = y_scores[group * n_cols + col];
+                sorted_scores[group] = score;
+                total += score;
+            }
+            qsort(sorted_scores, n_groups, sizeof(double), ggml_flash_ffn_compare_double_desc);
+
+            for (size_t p = 0; p < sizeof(top_percent) / sizeof(top_percent[0]); ++p) {
+                const int64_t top_count = (n_groups * top_percent[p] + 99) / 100;
+                double top_sum = 0.0;
+                for (int64_t group = 0; group < top_count; ++group) {
+                    top_sum += sorted_scores[group];
+                }
+                const double contribution = total > 0.0 ? top_sum / total : 0.0;
+                fprintf(profile_file, "summary,%d,%d,-1,,,%.2f,%.9g\n",
+                        token_base + (int) col, layer, top_percent[p] / 100.0, contribution);
+            }
+        }
+        fflush(profile_file);
     }
 }
 

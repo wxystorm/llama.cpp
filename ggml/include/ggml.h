@@ -1429,7 +1429,8 @@ extern "C" {
             struct ggml_tensor  * gate,
             struct ggml_tensor  * down,
             struct ggml_tensor  * input,
-            int32_t               group_size);
+            int32_t               group_size,
+            int32_t               layer);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

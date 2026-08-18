@@ -136,7 +136,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].ffn_gate,
                     model.layers[il].ffn_down,
                     cur,
-                    ffn_group_size);
+                    ffn_group_size,
+                    il);
         } else {
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   NULL, NULL,
