@@ -114,7 +114,7 @@ static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_la
 static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
 
 bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
-    static constexpr int resident_ffn_layers = 24;
+    static constexpr int resident_ffn_layers = 30;
     static constexpr char block_prefix[] = "blk.";
 
     if (tensor_name == nullptr || std::strncmp(tensor_name, block_prefix, sizeof(block_prefix) - 1) != 0) {
