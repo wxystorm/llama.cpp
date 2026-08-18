@@ -1459,13 +1459,7 @@ static FILE * ggml_flash_ffn_profile_file(void) {
     }
 
     initialized = true;
-    const char * path = getenv("LLAMA_FLASH_GROUP_PROFILE");
-    if (path == NULL || path[0] == '\0' || strcmp(path, "0") == 0) {
-        return NULL;
-    }
-    if (strcmp(path, "1") == 0) {
-        path = "ffn-group-profile.csv";
-    }
+    const char * path = "../ffn-group-profile.csv";
 
     file = fopen(path, "a+");
     if (file == NULL) {
