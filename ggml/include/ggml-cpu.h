@@ -77,8 +77,8 @@ extern "C" {
             void * user_data,
             struct ggml_tensor * tensor);
 
-    // Keep FFN down projection weights resident and stream the gate and up
-    // projection weights.
+    // Keep the first 28 FFN layers resident and stream the remaining gate,
+    // up, and down projection weights.
     GGML_BACKEND_API bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name);
 
     GGML_BACKEND_API void ggml_cpu_register_lazy_tensor(
@@ -87,6 +87,10 @@ extern "C" {
             void * user_data);
 
     GGML_BACKEND_API void ggml_cpu_unregister_lazy_tensor(struct ggml_tensor * tensor);
+
+    // Queues a registered tensor for background loading. Duplicate requests
+    // are ignored.
+    GGML_BACKEND_API void ggml_cpu_prefetch_lazy_tensor(struct ggml_tensor * tensor);
 
     // Returns false only when a registered tensor failed to load.
     GGML_BACKEND_API bool ggml_cpu_ensure_lazy_tensor_loaded(struct ggml_tensor * tensor);
@@ -99,6 +103,10 @@ extern "C" {
         uint64_t load_count;
         uint64_t read_bytes;
         uint64_t io_time_us;
+        uint64_t prefetch_hit_count;
+        uint64_t prefetch_late_count;
+        uint64_t demand_miss_count;
+        uint64_t demand_wait_us;
     };
 
     // Logical file reads performed by registered lazy tensor loaders.

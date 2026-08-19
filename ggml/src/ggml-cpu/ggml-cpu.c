@@ -3059,6 +3059,22 @@ static void ggml_cpu_release_lazy_ffn_sources(struct ggml_tensor * node) {
     }
 }
 
+static void ggml_cpu_prefetch_graph_lazy_ffn(const struct ggml_cgraph * cgraph) {
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_op_is_empty(node->op)) {
+            continue;
+        }
+
+        for (int src_n = 0; src_n < GGML_MAX_SRC; ++src_n) {
+            struct ggml_tensor * src = node->src[src_n];
+            if (src != NULL && ggml_cpu_should_stream_ffn_tensor(src->name)) {
+                ggml_cpu_prefetch_lazy_tensor(src);
+            }
+        }
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3086,6 +3102,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    if (state->ith == 0) {
+        ggml_cpu_prefetch_graph_lazy_ffn(cgraph);
+    }
+    ggml_barrier(state->threadpool);
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];

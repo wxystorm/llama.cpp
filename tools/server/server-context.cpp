@@ -623,8 +623,16 @@ struct server_slot {
             const double mib = 1024.0 * 1024.0;
             const double read_mib_per_token = flash_decode_stats.read_bytes / mib / flash_decode_steps;
             const double io_ms_per_token = flash_decode_stats.io_time_us / 1000.0 / flash_decode_steps;
+            const double demand_wait_ms_per_token = flash_decode_stats.demand_wait_us / 1000.0 / flash_decode_steps;
             const double effective_mib_s = flash_decode_stats.io_time_us > 0
                     ? (flash_decode_stats.read_bytes / mib) / (flash_decode_stats.io_time_us / 1000000.0)
+                    : 0.0;
+            const uint64_t prefetch_accesses =
+                    flash_decode_stats.prefetch_hit_count +
+                    flash_decode_stats.prefetch_late_count +
+                    flash_decode_stats.demand_miss_count;
+            const double prefetch_hit_rate = prefetch_accesses > 0
+                    ? 100.0 * flash_decode_stats.prefetch_hit_count / prefetch_accesses
                     : 0.0;
 
             SLT_INF(*this,
@@ -635,14 +643,22 @@ struct server_slot {
                     "Flash read bytes/token = %.3f MiB/token\n"
                     "total Flash I/O time  = %.3f s\n"
                     "Flash I/O time/token  = %.3f ms/token\n"
-                    "effective bandwidth   = %.2f MiB/s\n",
+                    "effective bandwidth   = %.2f MiB/s\n"
+                    "prefetch hit/late/miss = %" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n"
+                    "prefetch hit rate      = %.2f%%\n"
+                    "demand wait/token      = %.3f ms/token\n",
                     flash_decode_steps,
                     flash_decode_stats.load_count,
                     flash_decode_stats.read_bytes / mib,
                     read_mib_per_token,
                     flash_decode_stats.io_time_us / 1000000.0,
                     io_ms_per_token,
-                    effective_mib_s);
+                    effective_mib_s,
+                    flash_decode_stats.prefetch_hit_count,
+                    flash_decode_stats.prefetch_late_count,
+                    flash_decode_stats.demand_miss_count,
+                    prefetch_hit_rate,
+                    demand_wait_ms_per_token);
         }
 
         if (n_draft_total > 0) {
@@ -3836,6 +3852,10 @@ private:
                 slot.flash_decode_stats.load_count = current.load_count - slot.flash_decode_start.load_count;
                 slot.flash_decode_stats.read_bytes = current.read_bytes - slot.flash_decode_start.read_bytes;
                 slot.flash_decode_stats.io_time_us = current.io_time_us - slot.flash_decode_start.io_time_us;
+                slot.flash_decode_stats.prefetch_hit_count = current.prefetch_hit_count - slot.flash_decode_start.prefetch_hit_count;
+                slot.flash_decode_stats.prefetch_late_count = current.prefetch_late_count - slot.flash_decode_start.prefetch_late_count;
+                slot.flash_decode_stats.demand_miss_count = current.demand_miss_count - slot.flash_decode_start.demand_miss_count;
+                slot.flash_decode_stats.demand_wait_us = current.demand_wait_us - slot.flash_decode_start.demand_wait_us;
                 slot.flash_decode_steps += 1;
             }
 
