@@ -8,9 +8,13 @@
 
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -110,7 +114,202 @@ struct ggml_cpu_lazy_tensor_entry {
 
 static std::mutex ggml_cpu_lazy_tensor_mutex;
 static std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_entry> ggml_cpu_lazy_tensors;
+static std::mutex ggml_cpu_flash_stats_mutex;
 static ggml_cpu_flash_stats ggml_cpu_flash_stats_total = {};
+
+struct ggml_cpu_prefetch_key {
+    ggml_tensor * tensor;
+    int64_t ne0_begin;
+    int64_t ne0_count;
+    int64_t ne1_begin;
+    int64_t ne1_count;
+
+    bool operator==(const ggml_cpu_prefetch_key & other) const {
+        return tensor == other.tensor &&
+                ne0_begin == other.ne0_begin && ne0_count == other.ne0_count &&
+                ne1_begin == other.ne1_begin && ne1_count == other.ne1_count;
+    }
+};
+
+struct ggml_cpu_prefetch_key_hash {
+    size_t operator()(const ggml_cpu_prefetch_key & key) const {
+        size_t hash = std::hash<void *>()(key.tensor);
+        hash ^= std::hash<int64_t>()(key.ne0_begin) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int64_t>()(key.ne0_count) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int64_t>()(key.ne1_begin) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int64_t>()(key.ne1_count) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+enum ggml_cpu_prefetch_state {
+    GGML_CPU_PREFETCH_QUEUED,
+    GGML_CPU_PREFETCH_LOADING,
+    GGML_CPU_PREFETCH_READY,
+    GGML_CPU_PREFETCH_FAILED,
+};
+
+struct ggml_cpu_prefetch_request {
+    ggml_cpu_prefetch_key key;
+    ggml_cpu_lazy_tensor_slice_loader_t loader;
+    void * user_data;
+    std::vector<uint8_t> data;
+    ggml_cpu_prefetch_state state = GGML_CPU_PREFETCH_QUEUED;
+    bool cancelled = false;
+    std::condition_variable cv;
+};
+
+enum ggml_cpu_prefetch_result {
+    GGML_CPU_PREFETCH_MISS,
+    GGML_CPU_PREFETCH_HIT,
+    GGML_CPU_PREFETCH_WAIT,
+};
+
+class ggml_cpu_prefetch_manager {
+public:
+    ~ggml_cpu_prefetch_manager() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        queue_cv.notify_one();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    bool enqueue(
+            const ggml_cpu_prefetch_key & key,
+            ggml_cpu_lazy_tensor_slice_loader_t loader,
+            void * user_data,
+            size_t size) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (requests.find(key) != requests.end()) {
+            return true;
+        }
+
+        auto request = std::make_shared<ggml_cpu_prefetch_request>();
+        request->key = key;
+        request->loader = loader;
+        request->user_data = user_data;
+        try {
+            request->data.resize(size);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+
+        if (!worker.joinable()) {
+            worker = std::thread(&ggml_cpu_prefetch_manager::run, this);
+        }
+        requests.emplace(key, request);
+        queue.push_back(request);
+        queue_cv.notify_one();
+        return true;
+    }
+
+    ggml_cpu_prefetch_result consume(const ggml_cpu_prefetch_key & key, void * dst, size_t size) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto it = requests.find(key);
+        if (it == requests.end()) {
+            return GGML_CPU_PREFETCH_MISS;
+        }
+
+        const auto request = it->second;
+        const bool waited = request->state != GGML_CPU_PREFETCH_READY;
+        while (request->state == GGML_CPU_PREFETCH_QUEUED ||
+                request->state == GGML_CPU_PREFETCH_LOADING) {
+            request->cv.wait(lock);
+        }
+
+        if (request->state != GGML_CPU_PREFETCH_READY || request->data.size() != size) {
+            requests.erase(key);
+            return GGML_CPU_PREFETCH_MISS;
+        }
+
+        memcpy(dst, request->data.data(), size);
+        requests.erase(key);
+        return waited ? GGML_CPU_PREFETCH_WAIT : GGML_CPU_PREFETCH_HIT;
+    }
+
+    void cancel(ggml_tensor * tensor) {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (auto it = requests.begin(); it != requests.end();) {
+            const auto request = it->second;
+            if (request->key.tensor != tensor) {
+                ++it;
+                continue;
+            }
+
+            request->cancelled = true;
+            while (request->state == GGML_CPU_PREFETCH_LOADING) {
+                request->cv.wait(lock);
+            }
+            it = requests.erase(it);
+        }
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::shared_ptr<ggml_cpu_prefetch_request> request;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                queue_cv.wait(lock, [this]() { return stop || !queue.empty(); });
+                if (stop) {
+                    return;
+                }
+                request = queue.front();
+                queue.pop_front();
+                if (request->cancelled) {
+                    request->state = GGML_CPU_PREFETCH_FAILED;
+                    request->cv.notify_all();
+                    continue;
+                }
+                request->state = GGML_CPU_PREFETCH_LOADING;
+            }
+
+            const auto io_start = std::chrono::steady_clock::now();
+            const bool loaded = request->loader(
+                    request->user_data,
+                    request->key.tensor,
+                    request->data.data(),
+                    request->key.ne0_begin,
+                    request->key.ne0_count,
+                    request->key.ne1_begin,
+                    request->key.ne1_count);
+            const auto io_end = std::chrono::steady_clock::now();
+            const uint64_t io_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    io_end - io_start).count();
+
+            {
+                std::lock_guard<std::mutex> stats_lock(ggml_cpu_flash_stats_mutex);
+                ggml_cpu_flash_stats_total.load_count += 1;
+                ggml_cpu_flash_stats_total.read_bytes += request->data.size();
+                ggml_cpu_flash_stats_total.io_time_us += io_time_us;
+                ggml_cpu_flash_stats_total.prefetch_read_bytes += request->data.size();
+                ggml_cpu_flash_stats_total.prefetch_io_time_us += io_time_us;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                request->state = loaded && !request->cancelled ?
+                        GGML_CPU_PREFETCH_READY : GGML_CPU_PREFETCH_FAILED;
+                request->cv.notify_all();
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable queue_cv;
+    std::deque<std::shared_ptr<ggml_cpu_prefetch_request>> queue;
+    std::unordered_map<ggml_cpu_prefetch_key,
+            std::shared_ptr<ggml_cpu_prefetch_request>,
+            ggml_cpu_prefetch_key_hash> requests;
+    std::thread worker;
+    bool stop = false;
+};
+
+static ggml_cpu_prefetch_manager ggml_cpu_down_prefetch;
 
 void ggml_cpu_register_lazy_tensor(
         ggml_tensor * tensor,
@@ -129,6 +328,7 @@ void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {
         return;
     }
 
+    ggml_cpu_down_prefetch.cancel(tensor);
     std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
     ggml_cpu_lazy_tensors.erase(tensor);
 }
@@ -158,10 +358,13 @@ bool ggml_cpu_ensure_lazy_tensor_loaded(ggml_tensor * tensor) {
     }
     const auto io_end = std::chrono::steady_clock::now();
 
-    ggml_cpu_flash_stats_total.load_count += 1;
-    ggml_cpu_flash_stats_total.read_bytes += ggml_nbytes(tensor);
-    ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
-            io_end - io_start).count();
+    {
+        std::lock_guard<std::mutex> stats_lock(ggml_cpu_flash_stats_mutex);
+        ggml_cpu_flash_stats_total.load_count += 1;
+        ggml_cpu_flash_stats_total.read_bytes += ggml_nbytes(tensor);
+        ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                io_end - io_start).count();
+    }
 
     entry.loaded = true;
     GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
@@ -174,7 +377,7 @@ void ggml_cpu_get_flash_stats(ggml_cpu_flash_stats * stats) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+    std::lock_guard<std::mutex> lock(ggml_cpu_flash_stats_mutex);
     *stats = ggml_cpu_flash_stats_total;
 }
 
@@ -266,6 +469,22 @@ bool ggml_cpu_read_lazy_tensor_2d(
         return false;
     }
 
+    const size_t read_size = ggml_row_size(tensor->type, ne0_count) * ne1_count;
+    const ggml_cpu_prefetch_key key = {
+        tensor, ne0_begin, ne0_count, ne1_begin, ne1_count,
+    };
+    const ggml_cpu_prefetch_result prefetch_result =
+            ggml_cpu_down_prefetch.consume(key, dst, read_size);
+    if (prefetch_result != GGML_CPU_PREFETCH_MISS) {
+        std::lock_guard<std::mutex> stats_lock(ggml_cpu_flash_stats_mutex);
+        if (prefetch_result == GGML_CPU_PREFETCH_HIT) {
+            ggml_cpu_flash_stats_total.prefetch_hit_count += 1;
+        } else {
+            ggml_cpu_flash_stats_total.prefetch_wait_count += 1;
+        }
+        return true;
+    }
+
     std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
     auto it = ggml_cpu_lazy_tensors.find(tensor);
     if (it == ggml_cpu_lazy_tensors.end() || it->second.slice_loader == nullptr) {
@@ -280,11 +499,49 @@ bool ggml_cpu_read_lazy_tensor_2d(
     }
     const auto io_end = std::chrono::steady_clock::now();
 
-    ggml_cpu_flash_stats_total.load_count += 1;
-    ggml_cpu_flash_stats_total.read_bytes += ggml_row_size(tensor->type, ne0_count) * ne1_count;
-    ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
-            io_end - io_start).count();
+    {
+        std::lock_guard<std::mutex> stats_lock(ggml_cpu_flash_stats_mutex);
+        ggml_cpu_flash_stats_total.load_count += 1;
+        ggml_cpu_flash_stats_total.read_bytes += read_size;
+        ggml_cpu_flash_stats_total.io_time_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                io_end - io_start).count();
+        ggml_cpu_flash_stats_total.prefetch_miss_count += 1;
+    }
     return true;
+}
+
+bool ggml_cpu_prefetch_lazy_tensor_2d(
+        ggml_tensor * tensor,
+        int64_t ne0_begin,
+        int64_t ne0_count,
+        int64_t ne1_begin,
+        int64_t ne1_count) {
+    if (tensor == nullptr ||
+        ne0_begin < 0 || ne0_count <= 0 || ne0_begin + ne0_count > tensor->ne[0] ||
+        ne1_begin < 0 || ne1_count <= 0 || ne1_begin + ne1_count > tensor->ne[1]) {
+        return false;
+    }
+
+    ggml_cpu_lazy_tensor_entry entry;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_lazy_tensor_mutex);
+        auto it = ggml_cpu_lazy_tensors.find(tensor);
+        if (it == ggml_cpu_lazy_tensors.end() || it->second.slice_loader == nullptr) {
+            return false;
+        }
+        entry = it->second;
+    }
+
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    if (ne0_begin % block_size != 0 || ne0_count % block_size != 0) {
+        return false;
+    }
+
+    const ggml_cpu_prefetch_key key = {
+        tensor, ne0_begin, ne0_count, ne1_begin, ne1_count,
+    };
+    const size_t read_size = ggml_row_size(tensor->type, ne0_count) * ne1_count;
+    return ggml_cpu_down_prefetch.enqueue(key, entry.slice_loader, entry.user_data, read_size);
 }
 
 // CPU backend - backend (stream)

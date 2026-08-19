@@ -1525,6 +1525,8 @@ static atomic_int ggml_flash_ffn_next_token = 0;
 static atomic_int ggml_flash_ffn_token_base = 0;
 
 #define GGML_FLASH_FFN_PREDICTION_DISTANCE 4
+#define GGML_FLASH_FFN_MAX_LAYERS 1024
+#define GGML_FLASH_FFN_PREFETCH_PERCENT 60
 
 struct ggml_flash_ffn_layer_scores {
     double * h_scores;
@@ -1538,6 +1540,84 @@ struct ggml_flash_ffn_layer_scores {
 
 static struct ggml_flash_ffn_layer_scores
         ggml_flash_ffn_layer_history[GGML_FLASH_FFN_PREDICTION_DISTANCE] = { 0 };
+static struct ggml_tensor * ggml_flash_ffn_graph_down[GGML_FLASH_FFN_MAX_LAYERS] = { 0 };
+
+static void ggml_flash_ffn_register_graph(const struct ggml_cgraph * cgraph) {
+    memset(ggml_flash_ffn_graph_down, 0, sizeof(ggml_flash_ffn_graph_down));
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        if (node->op != GGML_OP_FLASH_FFN) {
+            continue;
+        }
+
+        const int layer = ggml_get_op_params_i32(node, 1);
+        if (layer >= 0 && layer < GGML_FLASH_FFN_MAX_LAYERS) {
+            ggml_flash_ffn_graph_down[layer] = node->src[2];
+        }
+    }
+}
+
+static void ggml_flash_ffn_submit_down_prefetch(
+        int layer,
+        int64_t group_size,
+        int64_t n_groups,
+        int64_t n_cols,
+        const double * h_scores) {
+    struct ggml_flash_ffn_group_score * ranks =
+            (struct ggml_flash_ffn_group_score *) malloc(sizeof(*ranks) * (size_t) n_groups);
+    bool * selected = (bool *) calloc((size_t) n_groups, sizeof(bool));
+    if (ranks == NULL || selected == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate prefetch ranking buffer\n", __func__);
+        free(ranks);
+        free(selected);
+        return;
+    }
+
+    const int64_t predicted_count =
+            (n_groups * GGML_FLASH_FFN_PREFETCH_PERCENT + 99) / 100;
+    for (int64_t col = 0; col < n_cols; ++col) {
+        for (int64_t group = 0; group < n_groups; ++group) {
+            ranks[group].score = h_scores[group * n_cols + col];
+            ranks[group].group = group;
+        }
+        qsort(ranks, n_groups, sizeof(*ranks), ggml_flash_ffn_compare_group_score_desc);
+        for (int64_t i = 0; i < predicted_count; ++i) {
+            selected[ranks[i].group] = true;
+        }
+    }
+
+    for (int distance = 1; distance <= GGML_FLASH_FFN_PREDICTION_DISTANCE; ++distance) {
+        const int target_layer = layer + distance;
+        if (target_layer >= GGML_FLASH_FFN_MAX_LAYERS) {
+            break;
+        }
+
+        struct ggml_tensor * down = ggml_flash_ffn_graph_down[target_layer];
+        if (down == NULL || (down->ne[0] + group_size - 1) / group_size != n_groups) {
+            continue;
+        }
+
+        for (int64_t group = 0; group < n_groups; ++group) {
+            if (!selected[group]) {
+                continue;
+            }
+            const int64_t group_begin = group * group_size;
+            const int64_t group_count = MIN(group_size, down->ne[0] - group_begin);
+            if (!ggml_cpu_prefetch_lazy_tensor_2d(
+                        down,
+                        group_begin,
+                        group_count,
+                        0,
+                        down->ne[1])) {
+                GGML_LOG_WARN("%s: failed to queue down prefetch for layer %d group %" PRId64 "\n",
+                        __func__, target_layer, group);
+            }
+        }
+    }
+
+    free(ranks);
+    free(selected);
+}
 
 static void ggml_flash_ffn_profile_prediction(
         FILE * file,
@@ -1913,6 +1993,12 @@ static void ggml_compute_forward_flash_ffn(
                 n_cols,
                 h_scores,
                 y_scores);
+        ggml_flash_ffn_submit_down_prefetch(
+                layer,
+                group_size,
+                n_groups,
+                n_cols,
+                h_scores);
     }
 }
 
@@ -3564,6 +3650,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    if (state->ith == 0) {
+        ggml_flash_ffn_register_graph(cgraph);
+    }
+    ggml_barrier(state->threadpool);
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];

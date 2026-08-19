@@ -1229,11 +1229,18 @@ static bool llama_load_ffnpack_tensor_2d(
     handled = true;
     try {
         std::lock_guard<std::mutex> lock(record->ffnpack->mutex);
+        if (record->ffnpack_kind == LLAMA_FFNPACK_DOWN) {
+            record->ffnpack->file->seek(entry.bundle_offset + part_offset, SEEK_SET);
+            record->ffnpack->file->read_raw(dst, part_size);
+            return true;
+        }
+
+        const uint64_t gate_up_size = entry.up_offset + entry.up_size;
         if (record->ffnpack->cached_key != key) {
-            record->ffnpack->cached_bundle.resize(entry.bundle_size);
+            record->ffnpack->cached_bundle.resize(gate_up_size);
             record->ffnpack->file->seek(entry.bundle_offset, SEEK_SET);
             record->ffnpack->file->read_raw(
-                    record->ffnpack->cached_bundle.data(), entry.bundle_size);
+                    record->ffnpack->cached_bundle.data(), gate_up_size);
             record->ffnpack->cached_key = key;
         }
 

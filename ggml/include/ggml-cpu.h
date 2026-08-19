@@ -109,10 +109,22 @@ extern "C" {
             int64_t ne1_begin,
             int64_t ne1_count);
 
+    GGML_BACKEND_API bool ggml_cpu_prefetch_lazy_tensor_2d(
+            struct ggml_tensor * tensor,
+            int64_t ne0_begin,
+            int64_t ne0_count,
+            int64_t ne1_begin,
+            int64_t ne1_count);
+
     struct ggml_cpu_flash_stats {
         uint64_t load_count;
         uint64_t read_bytes;
         uint64_t io_time_us;
+        uint64_t prefetch_hit_count;
+        uint64_t prefetch_wait_count;
+        uint64_t prefetch_miss_count;
+        uint64_t prefetch_read_bytes;
+        uint64_t prefetch_io_time_us;
     };
 
     // Logical file reads performed by registered lazy tensor loaders.
