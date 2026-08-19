@@ -315,7 +315,7 @@ public:
     }
 
 private:
-    static constexpr size_t prefetch_budget = 768ull * 1024 * 1024;
+    static constexpr size_t prefetch_budget = 2048ull * 1024 * 1024;
 
     static uint64_t elapsed_us(const std::chrono::steady_clock::time_point & start) {
         return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -425,7 +425,7 @@ static ggml_cpu_lazy_tensor_manager & ggml_cpu_get_lazy_tensor_manager() {
 }
 
 bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
-    static constexpr long resident_ffn_layers = 28;
+    static constexpr long resident_ffn_layers = 26;
     static constexpr char block_prefix[] = "blk.";
 
     if (tensor_name == nullptr || std::strncmp(tensor_name, block_prefix, sizeof(block_prefix) - 1) != 0) {
