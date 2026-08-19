@@ -458,6 +458,7 @@ struct common_params {
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
+    int32_t ffn_keep_percent      =   100; // percent of FFN down groups kept during decode
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
     float   rope_freq_base        =  0.0f; // RoPE base frequency
     float   rope_freq_scale       =  0.0f; // RoPE frequency scaling factor

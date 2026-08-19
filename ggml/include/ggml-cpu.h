@@ -109,6 +109,10 @@ extern "C" {
             int64_t ne1_begin,
             int64_t ne1_count);
 
+    // Experimental decode-only FFN down projection selection. A value of 100
+    // keeps the dense grouped FFN path.
+    GGML_BACKEND_API void ggml_cpu_set_flash_ffn_keep_percent(int percent);
+
     struct ggml_cpu_flash_stats {
         uint64_t load_count;
         uint64_t read_bytes;

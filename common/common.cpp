@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1345,6 +1346,7 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    ggml_cpu_set_flash_ffn_keep_percent(params.ffn_keep_percent);
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
