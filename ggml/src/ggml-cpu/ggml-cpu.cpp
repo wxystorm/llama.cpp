@@ -425,7 +425,6 @@ static ggml_cpu_lazy_tensor_manager & ggml_cpu_get_lazy_tensor_manager() {
 }
 
 bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
-    static constexpr long resident_ffn_layers = 24;
     static constexpr char block_prefix[] = "blk.";
 
     if (tensor_name == nullptr || std::strncmp(tensor_name, block_prefix, sizeof(block_prefix) - 1) != 0) {
@@ -433,18 +432,14 @@ bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
     }
 
     char * suffix = nullptr;
-    const long layer = std::strtol(tensor_name + sizeof(block_prefix) - 1, &suffix, 10);
+    std::strtol(tensor_name + sizeof(block_prefix) - 1, &suffix, 10);
     if (suffix == tensor_name + sizeof(block_prefix) - 1 || suffix == nullptr || *suffix != '.') {
         return false;
     }
 
     ++suffix;
-    const bool is_ffn_projection =
-            std::strcmp(suffix, "ffn_up.weight") == 0 ||
-            std::strcmp(suffix, "ffn_gate.weight") == 0 ||
-            std::strcmp(suffix, "ffn_down.weight") == 0;
-
-    return is_ffn_projection && layer >= resident_ffn_layers;
+    return std::strcmp(suffix, "ffn_up.weight") == 0 ||
+           std::strcmp(suffix, "ffn_gate.weight") == 0;
 }
 
 void ggml_cpu_register_lazy_tensor(
