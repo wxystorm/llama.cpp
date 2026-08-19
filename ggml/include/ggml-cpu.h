@@ -77,7 +77,7 @@ extern "C" {
             void * user_data,
             struct ggml_tensor * tensor);
 
-    // Keep the first 26 FFN layers resident and stream the remaining gate,
+    // Keep the first 24 FFN layers resident and stream the remaining gate,
     // up, and down projection weights.
     GGML_BACKEND_API bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name);
 
