@@ -364,7 +364,9 @@ public:
     }
 
 private:
-    static constexpr size_t prefetch_budget = 2048ull * 1024 * 1024;
+    // A single batch is one complete FFN layer. For Qwen2.5-32B, 1 GiB holds
+    // four consecutive layer batches but not five.
+    static constexpr size_t prefetch_budget = 1024ull * 1024 * 1024;
 
     static uint64_t elapsed_us(const std::chrono::steady_clock::time_point & start) {
         return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
