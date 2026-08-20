@@ -1830,7 +1830,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (int layer = batch_begin; layer < batch_begin + layers_per_batch && layer <= last_stream_layer; ++layer) {
                 for (const char * suffix : tensor_suffixes) {
                     const std::string name = format("blk.%d.%s", layer, suffix);
-                    const auto tensor_it = tensors_by_name.find(name);
+                    const auto tensor_it = std::find_if(
+                            tensors_by_name.begin(), tensors_by_name.end(),
+                            [&name](const auto & item) { return item.first == name; });
                     if (tensor_it == tensors_by_name.end()) {
                         throw std::runtime_error(format(
                                 "model tensor '%s' required by FFN sidecar is missing", name.c_str()));
