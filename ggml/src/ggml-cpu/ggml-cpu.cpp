@@ -485,7 +485,7 @@ bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
     }
 
     ++suffix;
-    return layer >= 24 && layer <= 63 &&
+    return layer >= 28 && layer <= 63 &&
            (std::strcmp(suffix, "ffn_up.weight") == 0 ||
             std::strcmp(suffix, "ffn_gate.weight") == 0 ||
             std::strcmp(suffix, "ffn_down.weight") == 0);

@@ -1819,7 +1819,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         static const char * tensor_suffixes[] = {
             "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
         };
-        constexpr int first_stream_layer = 24;
+        constexpr int first_stream_layer = 28;
         constexpr int last_stream_layer = 63;
         // One physical I/O request covers one complete FFN layer (gate, up and
         // down). The 1 GiB lazy-loader budget limits the window to four layers.
