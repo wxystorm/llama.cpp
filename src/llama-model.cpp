@@ -1821,10 +1821,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         };
         constexpr int first_stream_layer = 24;
         constexpr int last_stream_layer = 63;
-        // One physical I/O request covers two complete FFN layers. With the
-        // 2 GiB lazy-loader budget, at most four batches (eight layers) can be
-        // resident/prefetched at once for this model.
-        constexpr int layers_per_batch = 2;
+        // One physical I/O request covers one complete FFN layer (gate, up and
+        // down). The 2 GiB lazy-loader budget limits the prefetch window.
+        constexpr int layers_per_batch = 1;
 
         for (int batch_begin = first_stream_layer; batch_begin <= last_stream_layer; batch_begin += layers_per_batch) {
             auto batch = std::make_unique<llama_lazy_cpu_tensor_batch>();
