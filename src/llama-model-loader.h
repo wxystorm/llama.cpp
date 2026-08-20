@@ -108,6 +108,7 @@ struct LLAMA_API llama_model_loader {
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
+    std::string model_path;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
     size_t size_done = 0;

@@ -108,8 +108,13 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 }
 
 struct ggml_cpu_lazy_tensor_entry {
-    ggml_cpu_lazy_tensor_loader_t loader;
+    std::vector<ggml_tensor *> tensors;
+    std::vector<bool> available;
+    ggml_cpu_lazy_tensor_loader_t tensor_loader = nullptr;
+    ggml_cpu_lazy_tensor_batch_loader_t batch_loader = nullptr;
     void * user_data;
+    size_t total_size = 0;
+    size_t available_count = 0;
     enum state {
         UNLOADED,
         QUEUED,
@@ -120,6 +125,11 @@ struct ggml_cpu_lazy_tensor_entry {
     } state = UNLOADED;
     bool demand = false;
     bool loaded_by_prefetch = false;
+};
+
+struct ggml_cpu_lazy_tensor_binding {
+    std::shared_ptr<ggml_cpu_lazy_tensor_entry> entry;
+    size_t index;
 };
 
 static bool ggml_cpu_discard_tensor_pages(ggml_tensor * tensor, size_t * discarded);
@@ -146,11 +156,35 @@ public:
             ggml_cpu_lazy_tensor_loader_t loader,
             void * user_data) {
         auto entry = std::make_shared<ggml_cpu_lazy_tensor_entry>();
-        entry->loader = loader;
+        entry->tensors = { tensor };
+        entry->available = { false };
+        entry->tensor_loader = loader;
         entry->user_data = user_data;
+        entry->total_size = ggml_nbytes(tensor);
 
         std::lock_guard<std::mutex> lock(mutex);
-        tensors[tensor] = std::move(entry);
+        tensors[tensor] = { std::move(entry), 0 };
+    }
+
+    void register_batch(
+            ggml_tensor ** batch_tensors,
+            size_t tensor_count,
+            ggml_cpu_lazy_tensor_batch_loader_t loader,
+            void * user_data) {
+        auto entry = std::make_shared<ggml_cpu_lazy_tensor_entry>();
+        entry->batch_loader = loader;
+        entry->user_data = user_data;
+        entry->tensors.assign(batch_tensors, batch_tensors + tensor_count);
+        entry->available.assign(tensor_count, false);
+        for (ggml_tensor * tensor : entry->tensors) {
+            GGML_ASSERT(tensor != nullptr && tensor->data != nullptr);
+            entry->total_size += ggml_nbytes(tensor);
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < tensor_count; ++i) {
+            tensors[batch_tensors[i]] = { entry, i };
+        }
     }
 
     void unregister_tensor(ggml_tensor * tensor) {
@@ -160,9 +194,10 @@ public:
             return;
         }
 
-        const auto entry = it->second;
+        const auto binding = it->second;
+        const auto entry = binding.entry;
         if (entry->state == ggml_cpu_lazy_tensor_entry::QUEUED) {
-            remove_from_queue_locked(tensor);
+            remove_from_queue_locked(entry);
             entry->state = ggml_cpu_lazy_tensor_entry::UNLOADED;
         }
 
@@ -171,9 +206,13 @@ public:
                    entry->state != ggml_cpu_lazy_tensor_entry::RELEASING;
         });
 
-        if (entry->state == ggml_cpu_lazy_tensor_entry::LOADED) {
+        if (binding.index < entry->available.size() && entry->available[binding.index]) {
             const size_t size = ggml_nbytes(tensor);
             active_bytes = active_bytes >= size ? active_bytes - size : 0;
+            entry->available[binding.index] = false;
+            if (entry->available_count > 0) {
+                --entry->available_count;
+            }
         }
         tensors.erase(it);
         condition.notify_all();
@@ -190,14 +229,14 @@ public:
             return;
         }
 
-        auto & entry = *it->second;
+        auto & entry = *it->second.entry;
         if (entry.state != ggml_cpu_lazy_tensor_entry::UNLOADED) {
             return;
         }
 
         entry.state = ggml_cpu_lazy_tensor_entry::QUEUED;
         entry.demand = false;
-        queue.push_back(tensor);
+        queue.push_back(it->second.entry);
         condition.notify_all();
     }
 
@@ -215,10 +254,11 @@ public:
         if (it == tensors.end()) {
             return true;
         }
-        const auto entry = it->second;
+        const auto binding = it->second;
+        const auto entry = binding.entry;
 
         for (;;) {
-            if (entry->state == ggml_cpu_lazy_tensor_entry::LOADED) {
+            if (entry->state == ggml_cpu_lazy_tensor_entry::LOADED && entry->available[binding.index]) {
                 if (!classified && entry->loaded_by_prefetch) {
                     stats.prefetch_hit_count += 1;
                 }
@@ -246,18 +286,18 @@ public:
             if (entry->state == ggml_cpu_lazy_tensor_entry::UNLOADED) {
                 entry->state = ggml_cpu_lazy_tensor_entry::QUEUED;
                 entry->demand = true;
-                queue.push_front(tensor);
+                queue.push_front(entry);
                 condition.notify_all();
             } else if (entry->state == ggml_cpu_lazy_tensor_entry::QUEUED) {
                 entry->demand = true;
-                remove_from_queue_locked(tensor);
-                queue.push_front(tensor);
+                remove_from_queue_locked(entry);
+                queue.push_front(entry);
                 condition.notify_all();
             }
 
             waited = true;
-            condition.wait(lock, [&entry] {
-                return entry->state == ggml_cpu_lazy_tensor_entry::LOADED ||
+            condition.wait(lock, [&entry, &binding] {
+                return (entry->state == ggml_cpu_lazy_tensor_entry::LOADED && entry->available[binding.index]) ||
                        entry->state == ggml_cpu_lazy_tensor_entry::FAILED ||
                        entry->state == ggml_cpu_lazy_tensor_entry::UNLOADED;
             });
@@ -274,13 +314,14 @@ public:
         if (it == tensors.end()) {
             return true;
         }
-        const auto entry = it->second;
+        const auto binding = it->second;
+        const auto entry = binding.entry;
 
         condition.wait(lock, [&entry] {
             return entry->state != ggml_cpu_lazy_tensor_entry::LOADING &&
                    entry->state != ggml_cpu_lazy_tensor_entry::RELEASING;
         });
-        if (entry->state != ggml_cpu_lazy_tensor_entry::LOADED) {
+        if (entry->state != ggml_cpu_lazy_tensor_entry::LOADED || !entry->available[binding.index]) {
             return entry->state != ggml_cpu_lazy_tensor_entry::FAILED;
         }
 
@@ -294,8 +335,16 @@ public:
         lock.lock();
         if (ok) {
             active_bytes = active_bytes >= size ? active_bytes - size : 0;
-            entry->state = ggml_cpu_lazy_tensor_entry::UNLOADED;
-            entry->loaded_by_prefetch = false;
+            entry->available[binding.index] = false;
+            if (entry->available_count > 0) {
+                --entry->available_count;
+            }
+            if (entry->available_count == 0) {
+                entry->state = ggml_cpu_lazy_tensor_entry::UNLOADED;
+                entry->loaded_by_prefetch = false;
+            } else {
+                entry->state = ggml_cpu_lazy_tensor_entry::LOADED;
+            }
         } else {
             entry->state = ggml_cpu_lazy_tensor_entry::LOADED;
         }
@@ -322,9 +371,9 @@ private:
                 std::chrono::steady_clock::now() - start).count();
     }
 
-    void remove_from_queue_locked(ggml_tensor * tensor) {
+    void remove_from_queue_locked(const std::shared_ptr<ggml_cpu_lazy_tensor_entry> & entry) {
         for (auto it = queue.begin(); it != queue.end(); ++it) {
-            if (*it == tensor) {
+            if (*it == entry) {
                 queue.erase(it);
                 return;
             }
@@ -333,8 +382,7 @@ private:
 
     void discard_stale_tasks_locked() {
         while (!queue.empty()) {
-            auto it = tensors.find(queue.front());
-            if (it != tensors.end() && it->second->state == ggml_cpu_lazy_tensor_entry::QUEUED) {
+            if (queue.front()->state == ggml_cpu_lazy_tensor_entry::QUEUED) {
                 break;
             }
             queue.pop_front();
@@ -346,13 +394,8 @@ private:
         if (queue.empty()) {
             return false;
         }
-        auto it = tensors.find(queue.front());
-        if (it == tensors.end()) {
-            return true;
-        }
-        const auto & entry = *it->second;
-        const size_t size = ggml_nbytes(queue.front());
-        return entry.demand || active_bytes + size <= prefetch_budget;
+        const auto & entry = *queue.front();
+        return entry.demand || active_bytes + entry.total_size <= prefetch_budget;
     }
 
     void worker_main() {
@@ -370,15 +413,13 @@ private:
                 continue;
             }
 
-            ggml_tensor * tensor = queue.front();
+            const auto entry = queue.front();
             queue.pop_front();
-            auto it = tensors.find(tensor);
-            if (it == tensors.end() || it->second->state != ggml_cpu_lazy_tensor_entry::QUEUED) {
+            if (entry->state != ggml_cpu_lazy_tensor_entry::QUEUED) {
                 continue;
             }
 
-            const auto entry = it->second;
-            const size_t size = ggml_nbytes(tensor);
+            const size_t size = entry->total_size;
             entry->loaded_by_prefetch = !entry->demand;
             entry->demand = false;
             entry->state = ggml_cpu_lazy_tensor_entry::LOADING;
@@ -386,7 +427,9 @@ private:
             lock.unlock();
 
             const auto io_start = std::chrono::steady_clock::now();
-            const bool ok = entry->loader(entry->user_data, tensor);
+            const bool ok = entry->batch_loader != nullptr
+                ? entry->batch_loader(entry->user_data)
+                : entry->tensor_loader(entry->user_data, entry->tensors.front());
             const uint64_t io_time_us = elapsed_us(io_start);
 
             lock.lock();
@@ -394,6 +437,8 @@ private:
                 stats.load_count += 1;
                 stats.read_bytes += size;
                 stats.io_time_us += io_time_us;
+                std::fill(entry->available.begin(), entry->available.end(), true);
+                entry->available_count = entry->available.size();
                 entry->state = ggml_cpu_lazy_tensor_entry::LOADED;
             } else {
                 active_bytes = active_bytes >= size ? active_bytes - size : 0;
@@ -403,16 +448,16 @@ private:
             lock.unlock();
 
             if (ok) {
-                GGML_LOG_INFO("%s: loaded tensor '%s' (data=%p, size=%zu)\n",
-                        __func__, tensor->name, tensor->data, size);
+                GGML_LOG_INFO("%s: loaded batch '%s' (%zu tensors, size=%zu)\n",
+                        __func__, entry->tensors.front()->name, entry->tensors.size(), size);
             }
         }
     }
 
     std::mutex mutex;
     std::condition_variable condition;
-    std::unordered_map<ggml_tensor *, std::shared_ptr<ggml_cpu_lazy_tensor_entry>> tensors;
-    std::deque<ggml_tensor *> queue;
+    std::unordered_map<ggml_tensor *, ggml_cpu_lazy_tensor_binding> tensors;
+    std::deque<std::shared_ptr<ggml_cpu_lazy_tensor_entry>> queue;
     std::thread worker;
     bool stopping = false;
     size_t active_bytes = 0;
@@ -432,14 +477,16 @@ bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name) {
     }
 
     char * suffix = nullptr;
-    std::strtol(tensor_name + sizeof(block_prefix) - 1, &suffix, 10);
+    const long layer = std::strtol(tensor_name + sizeof(block_prefix) - 1, &suffix, 10);
     if (suffix == tensor_name + sizeof(block_prefix) - 1 || suffix == nullptr || *suffix != '.') {
         return false;
     }
 
     ++suffix;
-    return std::strcmp(suffix, "ffn_up.weight") == 0 ||
-           std::strcmp(suffix, "ffn_gate.weight") == 0;
+    return layer >= 24 && layer <= 63 &&
+           (std::strcmp(suffix, "ffn_up.weight") == 0 ||
+            std::strcmp(suffix, "ffn_gate.weight") == 0 ||
+            std::strcmp(suffix, "ffn_down.weight") == 0);
 }
 
 void ggml_cpu_register_lazy_tensor(
@@ -449,6 +496,17 @@ void ggml_cpu_register_lazy_tensor(
     GGML_ASSERT(tensor != nullptr);
     GGML_ASSERT(loader != nullptr);
     ggml_cpu_get_lazy_tensor_manager().register_tensor(tensor, loader, user_data);
+}
+
+void ggml_cpu_register_lazy_tensor_batch(
+        ggml_tensor ** tensors,
+        size_t tensor_count,
+        ggml_cpu_lazy_tensor_batch_loader_t loader,
+        void * user_data) {
+    GGML_ASSERT(tensors != nullptr);
+    GGML_ASSERT(tensor_count > 0);
+    GGML_ASSERT(loader != nullptr);
+    ggml_cpu_get_lazy_tensor_manager().register_batch(tensors, tensor_count, loader, user_data);
 }
 
 void ggml_cpu_unregister_lazy_tensor(ggml_tensor * tensor) {

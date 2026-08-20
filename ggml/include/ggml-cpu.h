@@ -77,6 +77,8 @@ extern "C" {
             void * user_data,
             struct ggml_tensor * tensor);
 
+    typedef bool (*ggml_cpu_lazy_tensor_batch_loader_t)(void * user_data);
+
     // Keep FFN down projection weights resident and stream the gate and up
     // projection weights.
     GGML_BACKEND_API bool ggml_cpu_should_stream_ffn_tensor(const char * tensor_name);
@@ -84,6 +86,15 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_register_lazy_tensor(
             struct ggml_tensor * tensor,
             ggml_cpu_lazy_tensor_loader_t loader,
+            void * user_data);
+
+    // Registers tensors which are populated by one physical I/O request. Any
+    // tensor in the batch queues/awaits the whole batch; tensors are still
+    // released independently after their last use.
+    GGML_BACKEND_API void ggml_cpu_register_lazy_tensor_batch(
+            struct ggml_tensor ** tensors,
+            size_t tensor_count,
+            ggml_cpu_lazy_tensor_batch_loader_t loader,
             void * user_data);
 
     GGML_BACKEND_API void ggml_cpu_unregister_lazy_tensor(struct ggml_tensor * tensor);

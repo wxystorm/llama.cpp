@@ -27,11 +27,14 @@
 //
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -40,6 +43,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <cerrno>
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1001,35 +1010,124 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
-struct llama_lazy_cpu_tensor_record {
+struct llama_lazy_cpu_tensor_item {
     ggml_tensor * tensor = nullptr;
-    llama_file * file = nullptr;
-    size_t file_offset = 0;
+    uint64_t file_offset = 0;
     size_t size = 0;
+};
+
+struct llama_lazy_cpu_tensor_batch {
+    llama_file * file = nullptr;
+    std::vector<llama_lazy_cpu_tensor_item> items;
     std::mutex mutex;
 };
 
-static bool llama_load_lazy_cpu_tensor(void * user_data, ggml_tensor * tensor) {
-    auto * record = static_cast<llama_lazy_cpu_tensor_record *>(user_data);
-    if (record == nullptr ||
-        record->tensor != tensor ||
-        record->file == nullptr ||
-        tensor == nullptr ||
-        tensor->data == nullptr ||
-        ggml_nbytes(tensor) != record->size) {
+static bool llama_load_lazy_cpu_tensor_batch(void * user_data) {
+    auto * batch = static_cast<llama_lazy_cpu_tensor_batch *>(user_data);
+    if (batch == nullptr || batch->file == nullptr || batch->items.empty()) {
         return false;
     }
 
     try {
-        std::lock_guard<std::mutex> lock(record->mutex);
-        record->file->seek(record->file_offset, SEEK_SET);
-        record->file->read_raw(tensor->data, record->size);
+        std::lock_guard<std::mutex> lock(batch->mutex);
+        uint64_t expected_offset = batch->items.front().file_offset;
+        for (const auto & item : batch->items) {
+            if (item.tensor == nullptr || item.tensor->data == nullptr ||
+                ggml_nbytes(item.tensor) != item.size || item.file_offset != expected_offset) {
+                return false;
+            }
+            expected_offset += item.size;
+        }
+
+#if defined(__linux__) || defined(__ANDROID__)
+        std::vector<struct iovec> iovecs;
+        iovecs.reserve(batch->items.size());
+        for (const auto & item : batch->items) {
+            iovecs.push_back({ item.tensor->data, item.size });
+        }
+
+        size_t iov_index = 0;
+        uint64_t offset = batch->items.front().file_offset;
+        while (iov_index < iovecs.size()) {
+            const ssize_t nread = preadv(
+                    batch->file->file_id(),
+                    iovecs.data() + iov_index,
+                    (int) (iovecs.size() - iov_index),
+                    (off_t) offset);
+            if (nread < 0 && errno == EINTR) {
+                continue;
+            }
+            if (nread <= 0) {
+                throw std::runtime_error(format("preadv failed: errno=%d", errno));
+            }
+
+            size_t consumed = (size_t) nread;
+            offset += consumed;
+            while (iov_index < iovecs.size() && consumed >= iovecs[iov_index].iov_len) {
+                consumed -= iovecs[iov_index].iov_len;
+                ++iov_index;
+            }
+            if (consumed > 0 && iov_index < iovecs.size()) {
+                iovecs[iov_index].iov_base = (char *) iovecs[iov_index].iov_base + consumed;
+                iovecs[iov_index].iov_len -= consumed;
+            }
+        }
+#else
+        // Development fallback. Android/Linux uses the single preadv request above.
+        for (const auto & item : batch->items) {
+            batch->file->seek((size_t) item.file_offset, SEEK_SET);
+            batch->file->read_raw(item.tensor->data, item.size);
+        }
+#endif
         return true;
     } catch (const std::exception & ex) {
-        LLAMA_LOG_ERROR("%s: failed reading tensor '%s': %s\n",
-                __func__, ggml_get_name(tensor), ex.what());
+        LLAMA_LOG_ERROR("%s: failed reading batch beginning at '%s': %s\n",
+                __func__, ggml_get_name(batch->items.front().tensor), ex.what());
         return false;
     }
+}
+
+static uint64_t llama_parse_json_uint_after(
+        const std::string & json, size_t begin, size_t end, const char * key) {
+    const size_t key_pos = json.find(key, begin);
+    if (key_pos == std::string::npos || key_pos >= end) {
+        throw std::runtime_error(format("missing JSON key %s", key));
+    }
+    const size_t colon = json.find(':', key_pos + std::strlen(key));
+    if (colon == std::string::npos || colon >= end) {
+        throw std::runtime_error(format("missing value for JSON key %s", key));
+    }
+    size_t pos = colon + 1;
+    while (pos < end && std::isspace((unsigned char) json[pos])) {
+        ++pos;
+    }
+    size_t value_end = pos;
+    while (value_end < end && std::isdigit((unsigned char) json[value_end])) {
+        ++value_end;
+    }
+    if (value_end == pos) {
+        throw std::runtime_error(format("invalid integer for JSON key %s", key));
+    }
+    return std::stoull(json.substr(pos, value_end - pos));
+}
+
+static std::pair<uint64_t, size_t> llama_find_sidecar_tensor(
+        const std::string & json, const std::string & tensor_name) {
+    const std::string needle = "\"name\": \"" + tensor_name + "\"";
+    const size_t name_pos = json.find(needle);
+    if (name_pos == std::string::npos) {
+        throw std::runtime_error(format("tensor '%s' is absent from sidecar index", tensor_name.c_str()));
+    }
+    const size_t object_end = json.find('}', name_pos + needle.size());
+    if (object_end == std::string::npos) {
+        throw std::runtime_error(format("unterminated index entry for '%s'", tensor_name.c_str()));
+    }
+    const uint64_t offset = llama_parse_json_uint_after(json, name_pos, object_end, "\"offset\"");
+    const uint64_t size = llama_parse_json_uint_after(json, name_pos, object_end, "\"size\"");
+    if (size > SIZE_MAX) {
+        throw std::runtime_error(format("sidecar tensor '%s' is too large", tensor_name.c_str()));
+    }
+    return { offset, (size_t) size };
 }
 
 struct llama_model::impl {
@@ -1048,8 +1146,8 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
-    llama_files lazy_weight_files;
-    std::vector<std::unique_ptr<llama_lazy_cpu_tensor_record>> lazy_cpu_tensors;
+    std::unique_ptr<llama_file> lazy_weight_file;
+    std::vector<std::unique_ptr<llama_lazy_cpu_tensor_batch>> lazy_cpu_batches;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1086,8 +1184,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
-    for (const auto & record : pimpl->lazy_cpu_tensors) {
-        ggml_cpu_unregister_lazy_tensor(record->tensor);
+    for (const auto & batch : pimpl->lazy_cpu_batches) {
+        for (const auto & item : batch->items) {
+            ggml_cpu_unregister_lazy_tensor(item.tensor);
+        }
     }
 
     for (auto * lora : loras) {
@@ -1702,60 +1802,88 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (!ml.use_mmap) {
-    std::vector<std::pair<ggml_tensor *, llama_local_tensor_info>> lazy_tensors;
+        const std::filesystem::path model_dir = std::filesystem::path(ml.model_path).parent_path();
+        const std::filesystem::path sidecar_path = model_dir / "qwen32b_ffn_stream.bin";
+        const std::filesystem::path index_path = model_dir / "qwen32b_ffn_stream_index.json";
 
-    for (const auto & item : tensors_by_name) {
-        if (!ggml_cpu_should_stream_ffn_tensor(item.first.c_str())) {
-            continue;
+        std::ifstream index_file(index_path, std::ios::binary);
+        if (!index_file) {
+            throw std::runtime_error(format(
+                    "failed to open FFN sidecar index '%s'", index_path.string().c_str()));
         }
+        const std::string index_json(
+                (std::istreambuf_iterator<char>(index_file)),
+                std::istreambuf_iterator<char>());
+        pimpl->lazy_weight_file = std::make_unique<llama_file>(sidecar_path.string().c_str(), "rb");
 
-        ggml_tensor * tensor = item.second;
-        if (tensor->buffer == nullptr ||
-            tensor->data == nullptr ||
-            !ggml_backend_buffer_is_host(tensor->buffer)) {
-            continue;
-        }
+        static const char * tensor_suffixes[] = {
+            "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        };
+        constexpr int first_stream_layer = 24;
+        constexpr int last_stream_layer = 63;
+        constexpr int layers_per_batch = 8;
 
-        llama_local_tensor_info info {};
-        if (!ml.get_local_tensor_info(item.first, info)) {
-            throw std::runtime_error(
-                format("missing lazy tensor metadata for '%s'", item.first.c_str()));
-        }
+        for (int batch_begin = first_stream_layer; batch_begin <= last_stream_layer; batch_begin += layers_per_batch) {
+            auto batch = std::make_unique<llama_lazy_cpu_tensor_batch>();
+            batch->file = pimpl->lazy_weight_file.get();
 
-        lazy_tensors.emplace_back(tensor, std::move(info));
-    }
+            for (int layer = batch_begin; layer < batch_begin + layers_per_batch && layer <= last_stream_layer; ++layer) {
+                for (const char * suffix : tensor_suffixes) {
+                    const std::string name = format("blk.%d.%s", layer, suffix);
+                    const auto tensor_it = tensors_by_name.find(name);
+                    if (tensor_it == tensors_by_name.end()) {
+                        throw std::runtime_error(format(
+                                "model tensor '%s' required by FFN sidecar is missing", name.c_str()));
+                    }
 
-    if (!lazy_tensors.empty()) {
-        // 只能 move 一次，不能放进循环
-        pimpl->lazy_weight_files = std::move(ml.files);
+                    ggml_tensor * tensor = tensor_it->second;
+                    if (tensor->buffer == nullptr || tensor->data == nullptr ||
+                        !ggml_backend_buffer_is_host(tensor->buffer)) {
+                        throw std::runtime_error(format(
+                                "FFN sidecar tensor '%s' is not in a host buffer", name.c_str()));
+                    }
 
-        for (auto & item : lazy_tensors) {
-            ggml_tensor * tensor = item.first;
-            const auto & info = item.second;
-
-            if (info.file_idx >= pimpl->lazy_weight_files.size()) {
-                throw std::runtime_error(
-                    format("invalid file index for '%s'", info.name.c_str()));
+                    const auto indexed = llama_find_sidecar_tensor(index_json, name);
+                    if (indexed.second != ggml_nbytes(tensor)) {
+                        throw std::runtime_error(format(
+                                "FFN sidecar size mismatch for '%s': index=%zu model=%zu",
+                                name.c_str(), indexed.second, ggml_nbytes(tensor)));
+                    }
+                    if (!batch->items.empty()) {
+                        const auto & previous = batch->items.back();
+                        if (indexed.first != previous.file_offset + previous.size) {
+                            throw std::runtime_error(format(
+                                    "FFN sidecar is not contiguous before '%s'", name.c_str()));
+                        }
+                    }
+                    batch->items.push_back({ tensor, indexed.first, indexed.second });
+                }
             }
 
-            auto record = std::make_unique<llama_lazy_cpu_tensor_record>();
-            record->tensor      = tensor;
-            record->file        = pimpl->lazy_weight_files.at(info.file_idx).get();
-            record->file_offset = info.file_offset;
-            record->size        = info.byte_size;
+            const auto & last = batch->items.back();
+            if (last.file_offset + last.size > pimpl->lazy_weight_file->size()) {
+                throw std::runtime_error(format(
+                        "FFN sidecar is truncated at batch beginning with layer %d", batch_begin));
+            }
 
-            ggml_cpu_register_lazy_tensor(
-                tensor,
-                llama_load_lazy_cpu_tensor,
-                record.get());
+            std::vector<ggml_tensor *> batch_tensors;
+            batch_tensors.reserve(batch->items.size());
+            size_t batch_bytes = 0;
+            for (const auto & item : batch->items) {
+                batch_tensors.push_back(item.tensor);
+                batch_bytes += item.size;
+            }
+            ggml_cpu_register_lazy_tensor_batch(
+                    batch_tensors.data(), batch_tensors.size(),
+                    llama_load_lazy_cpu_tensor_batch, batch.get());
 
-            pimpl->lazy_cpu_tensors.emplace_back(std::move(record));
-
-            LLAMA_LOG_INFO("%s: registered lazy tensor '%s'\n",
-                    __func__, info.name.c_str());
+            LLAMA_LOG_INFO(
+                    "%s: registered FFN sidecar batch layers %d-%d, tensors=%zu, size=%.2f MiB\n",
+                    __func__, batch_begin, batch_begin + layers_per_batch - 1,
+                    batch->items.size(), batch_bytes / 1024.0 / 1024.0);
+            pimpl->lazy_cpu_batches.emplace_back(std::move(batch));
         }
     }
-}
     // 创建分配并加载模型权重
     return true;
 }
