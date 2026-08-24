@@ -8,13 +8,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1879,7 +1883,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
-    static constexpr size_t n_pipeline_chunks = 4;
+    static constexpr size_t n_pipeline_chunks = 3;
 
     struct chunk_config {
         size_t token_start = 0;
@@ -2426,7 +2430,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         auto & chunk = config.chunks[i_chunk];
                         chunk.token_start = token_start;
                         chunk.n_tokens = tokens_per_chunk +
-                            (i_chunk >= ggml_backend_meta_context::n_pipeline_chunks - remainder ? 1 : 0);
+                            (i_chunk + 1 == ggml_backend_meta_context::n_pipeline_chunks ? remainder : 0);
 
                         chunk.input = *input;
                         chunk.input.op = GGML_OP_NONE;
@@ -2621,7 +2625,145 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         return GGML_STATUS_SUCCESS;
     };
+    // Split the two-backend fallback reduction into preparation, transfer, and ADD stages.
+    // The same temporary tensor must be shared by all three stages.
+    struct reduce_transfer {
+        size_t        j_src     = 0;
+        size_t        j_dst     = 0;
+        ggml_tensor * node_src  = nullptr;
+        ggml_tensor * node_tmp  = nullptr;
+        ggml_cgraph * add_graph = nullptr;
+    };
 
+    struct reduce_state {
+        std::vector<reduce_transfer> transfers;
+    };
+
+    [[maybe_unused]] auto prepare_reduce = [&](const std::vector<ggml_tensor *> & nodes, reduce_state & state) -> ggml_status {
+        GGML_ASSERT(nodes.size() == n_backends);
+        GGML_ASSERT(n_backends == 2);
+        GGML_ASSERT(state.transfers.empty());
+
+        // Zero out nodes that were disabled due to having a zero-sized slice.
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = nodes[j];
+            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                continue;
+            }
+
+            ggml_tensor * node_zero = get_node_aux(node);
+            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->src[0] = node;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+            ggml_cgraph * zero_graph = get_cgraph_aux();
+            zero_graph->nodes[0] = node_zero;
+            zero_graph->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, zero_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
+        auto prepare_pair = [&](const size_t j_src, const size_t j_dst) {
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
+            GGML_ASSERT(ggml_is_contiguous(node_src));
+            GGML_ASSERT(ggml_is_contiguous(node_dst));
+
+            // Two backends have one butterfly step, so both destinations use buffer 0.
+            ggml_tensor * node_tmp = get_node_aux(node_dst);
+            set_tmp_data(node_tmp, j_dst, /*i_buf =*/ 0);
+
+            ggml_tensor * node_red = get_node_aux(node_dst);
+            node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+            node_red->view_offs = node_dst->view_offs;
+            node_red->op = GGML_OP_ADD;
+            node_red->src[0] = node_dst;
+            node_red->src[1] = node_tmp;
+            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red);
+
+            ggml_cgraph * add_graph = get_cgraph_aux();
+            add_graph->nodes[0] = node_red;
+            add_graph->n_nodes = 1;
+
+            state.transfers.push_back({j_src, j_dst, node_src, node_tmp, add_graph});
+        };
+
+        prepare_pair(/*j_src =*/ 0, /*j_dst =*/ 1);
+        prepare_pair(/*j_src =*/ 1, /*j_dst =*/ 0);
+        return GGML_STATUS_SUCCESS;
+    };
+
+    // This function runs in a transfer thread. It deliberately spells out the generic
+    // fallback so synchronization and blocking-copy time can be traced independently.
+    auto transfer_data = [&](const reduce_state & state, const size_t chunk, const auto & trace_event) -> ggml_status {
+        GGML_ASSERT(state.transfers.size() == n_backends);
+        for (const reduce_transfer & transfer : state.transfers) {
+            auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
+            const size_t nbytes = ggml_nbytes(transfer.node_src);
+            GGML_ASSERT(nbytes == ggml_nbytes(transfer.node_tmp));
+
+            trace_event("synchronize_src_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            ggml_backend_synchronize(bcj_src.backend);
+            trace_event("synchronize_src_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+            trace_event("synchronize_dst_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            ggml_backend_synchronize(bcj_dst.backend);
+            trace_event("synchronize_dst_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+            trace_event("blocking_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            if (ggml_backend_buffer_is_host(transfer.node_src->buffer)) {
+                // Host -> device/RPC: transport is performed by the destination tensor_set.
+                trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                ggml_backend_tensor_set(transfer.node_tmp, transfer.node_src->data, 0, nbytes);
+                trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
+                // Device/RPC -> host: transport is performed by the source tensor_get.
+                trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
+                trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            } else {
+                trace_event("buffer_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                const bool copied = ggml_backend_buffer_copy_tensor(transfer.node_src, transfer.node_tmp);
+                trace_event("buffer_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+                if (!copied) {
+                    trace_event("staging_alloc_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                    std::vector<uint8_t> staging(nbytes);
+                    trace_event("staging_alloc_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+                    trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                    ggml_backend_tensor_get(transfer.node_src, staging.data(), 0, nbytes);
+                    trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+                    trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                    ggml_backend_tensor_set(transfer.node_tmp, staging.data(), 0, nbytes);
+                    trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                }
+            }
+            trace_event("blocking_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    [[maybe_unused]] auto compute_graph = [&](const reduce_state & state) -> ggml_status {
+        GGML_ASSERT(state.transfers.size() == n_backends);
+        for (const reduce_transfer & transfer : state.transfers) {
+            auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
+            const ggml_status status = ggml_backend_graph_compute_async(bcj_dst.backend, transfer.add_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
     auto allreduce = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
         GGML_ASSERT(nodes.size() == n_backends);
         if (backend_ctx->comm_ctx && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data())) {
@@ -2631,63 +2773,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     static constexpr bool enable_pipeline_chunks = true;
-    bool pipeline_active = false;
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        pipeline_active = pipeline_active || backend_ctx->backend_configs[0].cgraphs[i].pipeline_chunks;
-    }
-    pipeline_active = pipeline_active && enable_pipeline_chunks;
-
-    auto dump_ffn3_partials = [&](const size_t i) {
-        ggml_cgraph * graph0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
-        if (graph0->n_nodes < 1) {
-            return;
-        }
-        ggml_tensor * output0 = graph0->nodes[graph0->n_nodes - 1];
-        if (strcmp(output0->name, "ffn_out-3") != 0 ||
-                output0->type != GGML_TYPE_F32 || output0->ne[0] != 4096 || output0->ne[1] != 35 ||
-                output0->ne[2] != 1 || output0->ne[3] != 1) {
-            return;
-        }
-
-        for (size_t j = 0; j < n_backends; j++) {
-            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-        }
-
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            ggml_cgraph * graph = bcj.cgraphs[i].cgraph_main;
-            ggml_tensor * output = graph->nodes[graph->n_nodes - 1];
-            if (strcmp(output->name, "ffn_out-3") != 0 ||
-                output->type != GGML_TYPE_F32 || output->ne[0] != 4096 || output->ne[1] != 35 ||
-                output->ne[2] != 1 || output->ne[3] != 1) {
-                fprintf(stderr, "[FFN_PARTIAL_DUMP] backend=%zu tensor shape mismatch\n", j);
-                continue;
-            }
-
-            const size_t nbytes = ggml_nbytes(output);
-            std::vector<uint8_t> data(nbytes);
-            ggml_backend_tensor_get(output, data.data(), 0, nbytes);
-
-            const std::string filename = "pre-ffn3-b" + std::to_string(j) +
-                (pipeline_active ? "-chunk.bin" : ".bin");
-            FILE * file = fopen(filename.c_str(), "wb");
-            if (file == nullptr) {
-                fprintf(stderr, "[FFN_PARTIAL_DUMP] failed to open %s\n", filename.c_str());
-                continue;
-            }
-            const size_t nwritten = fwrite(data.data(), 1, nbytes, file);
-            fclose(file);
-            if (nwritten != nbytes) {
-                fprintf(stderr, "[FFN_PARTIAL_DUMP] short write file=%s expected=%zu actual=%zu\n",
-                    filename.c_str(), nbytes, nwritten);
-                continue;
-            }
-            fprintf(stderr,
-                "[FFN_PARTIAL_DUMP] wrote %s subgraph=%zu backend=%zu mode=%s shape=[%" PRId64 ",%" PRId64 "] bytes=%zu\n",
-                filename.c_str(), i, j, pipeline_active ? "chunk" : "nonchunk",
-                output->ne[0], output->ne[1], nbytes);
-        }
-    };
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const bool pipeline_chunks = backend_ctx->backend_configs[0].cgraphs[i].pipeline_chunks;
@@ -2705,42 +2790,152 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            std::array<std::vector<ggml_tensor *>, ggml_backend_meta_context::n_pipeline_chunks> chunk_nodes;
-            for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
-                chunk_nodes[i_chunk].reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
-                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
+            // The generic and dedicated-communication paths retain their original ordering.
+            // The CPU/RPC two-backend fallback uses one blocking transfer worker so that
+            // transfer of chunk N can overlap submission/execution of chunk N + 1.
+            const bool threaded_chunk_reduce = n_backends == 2 && backend_ctx->comm_ctx == nullptr &&
+                backend_ctx->backend_configs[0].backend->iface.cpy_tensor_async == nullptr &&
+                backend_ctx->backend_configs[1].backend->iface.cpy_tensor_async == nullptr;
+            if (!threaded_chunk_reduce) {
+                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
+                        const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
+                        nodes.push_back(&chunk.output);
+                    }
+
+                    const ggml_status status = allreduce(nodes);
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
                     }
-                    chunk_nodes[i_chunk].push_back(&chunk.output);
                 }
-            }
+            } else {
+                struct pipeline_trace_event {
+                    const char * phase;
+                    size_t       chunk;
+                    size_t       j_src;
+                    size_t       j_dst;
+                    size_t       nbytes;
+                    int64_t      time_us;
+                };
 
-            dump_ffn3_partials(i);
+                static std::atomic<bool> pipeline_trace_claimed(false);
+                const bool trace_pipeline = !pipeline_trace_claimed.exchange(true);
+                const auto trace_start = std::chrono::steady_clock::now();
+                std::mutex trace_mutex;
+                std::vector<pipeline_trace_event> trace_events;
 
-            for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
-                const ggml_status status = allreduce(chunk_nodes[i_chunk]);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
+                auto trace_event = [&](const char * phase, const size_t chunk, const size_t j_src, const size_t j_dst, const size_t nbytes) {
+                    if (!trace_pipeline) {
+                        return;
+                    }
+                    const int64_t time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - trace_start).count();
+                    std::lock_guard<std::mutex> lock(trace_mutex);
+                    trace_events.push_back({phase, chunk, j_src, j_dst, nbytes, time_us});
+                };
+
+                auto trace_chunk_event = [&](const char * phase, const size_t chunk) {
+                    trace_event(phase, chunk, SIZE_MAX, SIZE_MAX, 0);
+                };
+
+                std::unique_ptr<reduce_state> pending_state;
+                std::future<ggml_status>       pending_transfer;
+                size_t                         pending_chunk = 0;
+
+                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    trace_chunk_event("compute_call_begin", i_chunk);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
+                        const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
+                        nodes.push_back(&chunk.output);
+                    }
+                    trace_chunk_event("compute_call_end", i_chunk);
+
+                    // The current chunk is now queued while the previous chunk is transferring.
+                    // Before reusing the reduction buffer, finish that transfer and queue its ADD.
+                    if (pending_state) {
+                        trace_chunk_event("transfer_wait_begin", pending_chunk);
+                        const ggml_status transfer_status = pending_transfer.get();
+                        trace_chunk_event("transfer_wait_end", pending_chunk);
+                        if (transfer_status != GGML_STATUS_SUCCESS) {
+                            return transfer_status;
+                        }
+                        trace_chunk_event("add_call_begin", pending_chunk);
+                        const ggml_status compute_status = compute_graph(*pending_state);
+                        trace_chunk_event("add_call_end", pending_chunk);
+                        if (compute_status != GGML_STATUS_SUCCESS) {
+                            return compute_status;
+                        }
+                    }
+
+                    auto current_state = std::make_unique<reduce_state>();
+                    const ggml_status prepare_status = prepare_reduce(nodes, *current_state);
+                    if (prepare_status != GGML_STATUS_SUCCESS) {
+                        return prepare_status;
+                    }
+
+                    pending_state = std::move(current_state);
+                    reduce_state * state = pending_state.get();
+                    pending_chunk = i_chunk;
+                    pending_transfer = std::async(std::launch::async, [&, state, i_chunk]() {
+                        trace_chunk_event("transfer_begin", i_chunk);
+                        const ggml_status status = transfer_data(*state, i_chunk, trace_event);
+                        trace_chunk_event("transfer_end", i_chunk);
+                        return status;
+                    });
+                }
+
+                // No following chunk exists to drain the final transfer.
+                if (pending_state) {
+                    trace_chunk_event("transfer_wait_begin", pending_chunk);
+                    const ggml_status transfer_status = pending_transfer.get();
+                    trace_chunk_event("transfer_wait_end", pending_chunk);
+                    if (transfer_status != GGML_STATUS_SUCCESS) {
+                        return transfer_status;
+                    }
+                    trace_chunk_event("add_call_begin", pending_chunk);
+                    const ggml_status compute_status = compute_graph(*pending_state);
+                    trace_chunk_event("add_call_end", pending_chunk);
+                    if (compute_status != GGML_STATUS_SUCCESS) {
+                        return compute_status;
+                    }
+                }
+
+                if (trace_pipeline) {
+                    std::sort(trace_events.begin(), trace_events.end(), [](const pipeline_trace_event & a, const pipeline_trace_event & b) {
+                        return a.time_us < b.time_us;
+                    });
+                    fprintf(stderr, "[META_PIPELINE_TIMING] one-shot trace, times are relative microseconds\n");
+                    for (const pipeline_trace_event & event : trace_events) {
+                        if (event.j_src == SIZE_MAX) {
+                            fprintf(stderr, "[META_PIPELINE_TIMING] t=%" PRId64 " us chunk=%zu phase=%s\n",
+                                event.time_us, event.chunk, event.phase);
+                        } else {
+                            fprintf(stderr, "[META_PIPELINE_TIMING] t=%" PRId64 " us chunk=%zu dir=%zu->%zu bytes=%zu phase=%s\n",
+                                event.time_us, event.chunk, event.j_src, event.j_dst, event.nbytes, event.phase);
+                        }
+                    }
                 }
             }
 
             continue;
         }
 
-        //fprintf(stderr, "\n=== SUBGRAPH %zu ===\n", i);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            ggml_cgraph * g = bcj.cgraphs[i].cgraph_main;
-          //          printf( "backend %zu, n_nodes %d\n", j, g->n_nodes);
-                    for (int k = 0; k < g->n_nodes; k++) {
-                        ggml_tensor * node = g->nodes[k];
-            //            printf("  node %d: op %s, ne[0] %lld, ne[1] %lld, ne[2] %lld, ne[3] %lld\n",
-             //               k, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
-                    }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
@@ -2755,9 +2950,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                 nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes - 1]);
             }
-
-            dump_ffn3_partials(i);
-
             const ggml_status status = allreduce(nodes);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;

@@ -8,10 +8,9 @@ a = a.reshape(35, 4096)
 b = b.reshape(35, 4096)
 
 ranges = [
-    ("chunk0", 0, 8),
-    ("chunk1", 8, 17),
-    ("chunk2", 17, 26),
-    ("chunk3", 26, 35),
+    ("chunk0", 0, 11),
+    ("chunk1", 11, 22),
+    ("chunk2", 22, 35),
 ]
 
 for name, start, end in ranges:

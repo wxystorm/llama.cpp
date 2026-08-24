@@ -5,6 +5,8 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -22,6 +24,10 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
+
+static bool is_pipeline_chunk_tensor_name(const char * name) {
+    return name != nullptr && strstr(name, ".chunk.") != nullptr;
+}
 
 
 namespace fs = std::filesystem;
@@ -737,7 +743,49 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+
+    static std::atomic<size_t> pipeline_get_trace_count(0);
+    const bool trace_get = is_pipeline_chunk_tensor_name(tensor->name) &&
+        pipeline_get_trace_count.fetch_add(1) < 3;
+
+    bool status = false;
+    if (!trace_get) {
+        status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    } else {
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+
+        const uint8_t cmd = RPC_CMD_GET_TENSOR;
+        const size_t input_size = sizeof(request);
+        status = ctx->sock->send_data(&cmd, sizeof(cmd)) &&
+                 ctx->sock->send_data(&input_size, sizeof(input_size)) &&
+                 ctx->sock->send_data(&request, sizeof(request));
+        const auto t_request_sent = clock::now();
+
+        uint64_t output_size = 0;
+        if (status) {
+            status = ctx->sock->recv_data(&output_size, sizeof(output_size)) && output_size == size;
+        }
+        const auto t_header_received = clock::now();
+
+        if (status) {
+            status = ctx->sock->recv_data(data, size);
+        }
+        const auto t_payload_received = clock::now();
+
+        const int64_t request_send_us = std::chrono::duration_cast<std::chrono::microseconds>(t_request_sent - t0).count();
+        const int64_t response_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(t_header_received - t_request_sent).count();
+        const int64_t payload_recv_us = std::chrono::duration_cast<std::chrono::microseconds>(t_payload_received - t_header_received).count();
+        const int64_t total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_payload_received - t0).count();
+        const double payload_mib_s = payload_recv_us > 0 ?
+            (double) size * 1000000.0 / (double) payload_recv_us / (1024.0 * 1024.0) : 0.0;
+
+        GGML_LOG_INFO(
+            "[RPC_GET_CLIENT_PROFILE] name=\"%s\" bytes=%zu request_send_us=%" PRId64
+            " response_header_wait_us=%" PRId64 " payload_recv_us=%" PRId64
+            " payload_mib_s=%.2f total_us=%" PRId64 "\n",
+            tensor->name, size, request_send_us, response_wait_us, payload_recv_us, payload_mib_s, total_us);
+    }
     RPC_STATUS_ASSERT(status);
     GGML_LOG_INFO(
         "[RPC_RECV_TENSOR] name=\"%s\" type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
@@ -1486,6 +1534,12 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 }
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+    using clock = std::chrono::steady_clock;
+    const bool pipeline_chunk = is_pipeline_chunk_tensor_name(request.tensor.name);
+    static std::atomic<size_t> pipeline_get_trace_count(0);
+    const bool trace_get = pipeline_chunk && pipeline_get_trace_count.fetch_add(1) < 3;
+    const auto t0 = clock::now();
+
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1515,8 +1569,21 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
         }
     }
 
+    const auto t_setup_done = clock::now();
     response.resize(request.size, 0);
+    const auto t_alloc_done = clock::now();
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    const auto t_backend_get_done = clock::now();
+
+    if (trace_get) {
+        const int64_t setup_us = std::chrono::duration_cast<std::chrono::microseconds>(t_setup_done - t0).count();
+        const int64_t response_alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(t_alloc_done - t_setup_done).count();
+        const int64_t backend_get_us = std::chrono::duration_cast<std::chrono::microseconds>(t_backend_get_done - t_alloc_done).count();
+        GGML_LOG_INFO(
+            "[RPC_GET_SERVER_BACKEND_PROFILE] name=\"%s\" bytes=%" PRIu64
+            " setup_us=%" PRId64 " response_alloc_us=%" PRId64 " backend_get_us=%" PRId64 "\n",
+            request.tensor.name, request.size, setup_us, response_alloc_us, backend_get_us);
+    }
     return true;
 }
 
@@ -2490,16 +2557,39 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GET_TENSOR: {
+                using clock = std::chrono::steady_clock;
+                const auto t_request_begin = clock::now();
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const auto t_request_received = clock::now();
+                static std::atomic<size_t> pipeline_get_trace_count(0);
+                const bool trace_get = is_pipeline_chunk_tensor_name(request.tensor.name) &&
+                    pipeline_get_trace_count.fetch_add(1) < 3;
+
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
+                const auto t_backend_get_done = clock::now();
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+                const auto t_response_sent = clock::now();
+
+                if (trace_get) {
+                    const int64_t request_recv_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_request_received - t_request_begin).count();
+                    const int64_t server_get_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_backend_get_done - t_request_received).count();
+                    const int64_t response_send_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_response_sent - t_backend_get_done).count();
+                    GGML_LOG_INFO(
+                        "[RPC_GET_SERVER_PROFILE] name=\"%s\" bytes=%" PRIu64
+                        " request_recv_us=%" PRId64 " server_get_us=%" PRId64
+                        " response_send_us=%" PRId64 "\n",
+                        request.tensor.name, request.size, request_recv_us, server_get_us, response_send_us);
                 }
                 break;
             }
