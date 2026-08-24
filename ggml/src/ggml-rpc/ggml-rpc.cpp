@@ -781,10 +781,10 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             (double) size * 1000000.0 / (double) payload_recv_us / (1024.0 * 1024.0) : 0.0;
 
         GGML_LOG_INFO(
-            "[RPC_GET_CLIENT_PROFILE] name=\"%s\" bytes=%zu request_send_us=%" PRId64
+            "[RPC_GET_CLIENT_PROFILE] rpc_id=0x%" PRIx64 " name=\"%s\" bytes=%zu request_send_us=%" PRId64
             " response_header_wait_us=%" PRId64 " payload_recv_us=%" PRId64
             " payload_mib_s=%.2f total_us=%" PRId64 "\n",
-            tensor->name, size, request_send_us, response_wait_us, payload_recv_us, payload_mib_s, total_us);
+            request.tensor.id, tensor->name, size, request_send_us, response_wait_us, payload_recv_us, payload_mib_s, total_us);
     }
     RPC_STATUS_ASSERT(status);
     GGML_LOG_INFO(
@@ -1580,9 +1580,9 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
         const int64_t response_alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(t_alloc_done - t_setup_done).count();
         const int64_t backend_get_us = std::chrono::duration_cast<std::chrono::microseconds>(t_backend_get_done - t_alloc_done).count();
         GGML_LOG_INFO(
-            "[RPC_GET_SERVER_BACKEND_PROFILE] name=\"%s\" bytes=%" PRIu64
+            "[RPC_GET_SERVER_BACKEND_PROFILE] rpc_id=0x%" PRIx64 " name=\"%s\" bytes=%" PRIu64
             " setup_us=%" PRId64 " response_alloc_us=%" PRId64 " backend_get_us=%" PRId64 "\n",
-            request.tensor.name, request.size, setup_us, response_alloc_us, backend_get_us);
+            request.tensor.id, request.tensor.name, request.size, setup_us, response_alloc_us, backend_get_us);
     }
     return true;
 }
@@ -2586,10 +2586,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     const int64_t response_send_us = std::chrono::duration_cast<std::chrono::microseconds>(
                         t_response_sent - t_backend_get_done).count();
                     GGML_LOG_INFO(
-                        "[RPC_GET_SERVER_PROFILE] name=\"%s\" bytes=%" PRIu64
+                        "[RPC_GET_SERVER_PROFILE] rpc_id=0x%" PRIx64 " name=\"%s\" bytes=%" PRIu64
                         " request_recv_us=%" PRId64 " server_get_us=%" PRId64
                         " response_send_us=%" PRId64 "\n",
-                        request.tensor.name, request.size, request_recv_us, server_get_us, response_send_us);
+                        request.tensor.id, request.tensor.name, request.size, request_recv_us, server_get_us, response_send_us);
                 }
                 break;
             }
