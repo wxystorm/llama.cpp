@@ -12,6 +12,7 @@
 #include "arch-fallback.h"
 
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
@@ -4236,6 +4237,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t ncols = src0_end - src0_start;
 
         GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
+
+        if (params->ith == 0 &&
+                (strcmp(dst->name, "ffn_out-3") == 0 || strncmp(dst->name, "ffn_out-3.chunk.", 16) == 0)) {
+            fprintf(stderr,
+                "[MUL_MAT_PATH] impl=repack path=gemm+gemv name=\"%s\" "
+                "src0_type=%s src1_type=%s src0=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "src1=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "dst=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "nth=%d inter=%d nb_cols=%d nrows=%" PRId64 " gemm_rows=%" PRId64 " gemv_rows=%" PRId64 "\n",
+                dst->name, ggml_type_name(src0->type), ggml_type_name(src1->type),
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                params->nth, (int) INTER_SIZE, (int) NB_COLS, nrows, nrows - (nrows % 4), nrows % 4);
+            fflush(stderr);
+        }
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {

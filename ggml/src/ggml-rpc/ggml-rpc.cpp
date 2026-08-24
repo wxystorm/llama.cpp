@@ -75,6 +75,31 @@ enum rpc_cmd {
     RPC_CMD_COUNT,
 };
 
+static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:              return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:             return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:              return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:            return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:                return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:               return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:                 return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:            return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:                 return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:                return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:              return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY:          return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:                return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:             return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:                      return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:               return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:            return "GRAPH_RECOMPUTE";
+        case RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE: return "SET_TENSOR_FROM_LOCAL_FILE";
+        case RPC_CMD_COUNT:                      return "COUNT";
+    }
+    return "UNKNOWN";
+}
+
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
 
@@ -333,6 +358,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    GGML_LOG_INFO("[RPC_SEND] cmd=%s payload_bytes=%zu wire_bytes=%zu\n",
+                  rpc_cmd_name(cmd), input_size, sizeof(cmd_byte) + sizeof(input_size) + input_size);
     return true;
 }
 
@@ -352,6 +379,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->recv_data(output, output_size)) {
         return false;
     }
+    GGML_LOG_INFO("[RPC_RECV] cmd=%s payload_bytes=%zu wire_bytes=%zu\n",
+                  rpc_cmd_name(cmd), output_size, sizeof(out_size) + output_size);
     return true;
 }
 
@@ -708,9 +737,16 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
-    GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
+    GGML_LOG_INFO(
+        "[RPC_RECV_TENSOR] name=\"%s\" type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+        "] offset=%zu bytes=%zu\n",
+        tensor->name,
+        ggml_type_name(tensor->type),
+        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+        offset,
+        size);
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -953,8 +989,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    const bool cacheable = cgraph->uid != 0;
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     //新的
     //reuse = false;
     if (reuse) {
@@ -963,15 +1000,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        GGML_LOG_INFO(
-            "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
-            " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            (void *) cgraph,
-            graph_uid,
-            cgraph->n_nodes,
-            sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->graph_uids.insert(graph_uid);
@@ -979,23 +1007,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        uint32_t n_tensors = 0;
-        const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
-        if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
-            memcpy(&n_tensors, input.data() + n_tensors_offset, sizeof(n_tensors));
-        }
         // 打印发送和接收的字节数，计算图
-        //GGML_LOG_INFO("ggml_backend_rpc_graph_compute: sent %zu bytes\n", input.size());
-        GGML_LOG_INFO(
-            "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
-            " nodes=%d tensors=%u bytes=%zu cmd=GRAPH_COMPUTE\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            (void *) cgraph,
-            graph_uid,
-            cgraph->n_nodes,
-            n_tensors,
-            input.size());
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -2671,6 +2683,8 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
     printf("  tp world size  : %d\n", tp_world_size);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("[RPC_THREADS] requested=%zu\n", n_threads);
+    fflush(stdout);
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];

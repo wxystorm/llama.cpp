@@ -133,7 +133,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         cur = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
                 LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        cb(cur, "attn_norm", il);  // RMS归一化
             //归一化
         // self-attention
         {

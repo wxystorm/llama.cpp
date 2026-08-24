@@ -7197,8 +7197,27 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
 struct ggml_cgraph * ggml_new_graph(struct ggml_context * ctx) {
     return ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, false);
 }
+static uint64_t ggml_graph_view_uid(
+        uint64_t parent_uid,
+        int i0,
+        int i1) {
+    if (parent_uid == 0) {
+        return 0;
+    }
 
+    uint64_t uid = parent_uid;
+    uid ^= (uint64_t) (i0 + 1) * 0x9e3779b97f4a7c15ULL;
+    uid ^= (uint64_t) (i1 + 1) * 0xbf58476d1ce4e5b9ULL;
+    uid ^= uid >> 30;
+    uid *= 0xbf58476d1ce4e5b9ULL;
+    uid ^= uid >> 27;
+    uid *= 0x94d049bb133111ebULL;
+    uid ^= uid >> 31;
+
+    return uid != 0 ? uid : ggml_graph_next_uid();
+}
 struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1) {
+    uint64_t uid = ggml_graph_view_uid(cgraph0->uid, i0, i1);
     struct ggml_cgraph cgraph = {
         /*.size             =*/ 0,
         /*.n_nodes          =*/ i1 - i0,
@@ -7210,7 +7229,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ uid,
     };
 
     return cgraph;

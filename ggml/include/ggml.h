@@ -685,7 +685,7 @@ extern "C" {
 
         int32_t flags;
 
-        struct ggml_tensor * src[GGML_MAX_SRC];
+        struct ggml_tensor * src[GGML_MAX_SRC]; // 
 
         // source tensor and offset for views
         struct ggml_tensor * view_src;

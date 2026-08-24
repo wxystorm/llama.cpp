@@ -3732,7 +3732,7 @@ private:
            const int tok_idx = slot.i_batch - off;
 
             // 只打印每个请求的第一个生成 token
-            if (slot.n_decoded == 0) {
+            if (slot.n_decoded == 0 || slot.n_decoded == 1 || slot.n_decoded == 2 || slot.n_decoded == 3 || slot.n_decoded == 4 || slot.n_decoded == 5) {
                 const float * logits =
                     llama_get_logits_ith(slot.ctx_tgt, tok_idx);
 

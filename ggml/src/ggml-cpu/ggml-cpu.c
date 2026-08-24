@@ -1161,6 +1161,10 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+static bool ggml_mul_mat_path_trace(const struct ggml_tensor * dst) {
+    return strcmp(dst->name, "ffn_out-3") == 0 || strncmp(dst->name, "ffn_out-3.chunk.", 16) == 0;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1419,6 +1423,26 @@ UseGgmlGemm2:;
     // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+    if (ith == 0 && ggml_mul_mat_path_trace(dst)) {
+        int64_t effective_vec_dot_rows = vec_dot_num_rows;
+        if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || (dr0 % 2 != 0) || (dr1 % 2 != 0)) {
+            effective_vec_dot_rows = 1;
+        }
+        fprintf(stderr,
+            "[MUL_MAT_PATH] impl=generic path=vec_dot name=\"%s\" "
+            "src0_type=%s src1_type=%s src0=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "src1=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "dst=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nth=%d nchunk=[%" PRId64 ",%" PRId64 "] dr=[%" PRId64 ",%" PRId64 "] "
+            "vec_dot_rows=%" PRId64 " effective_vec_dot_rows=%" PRId64 "\n",
+            dst->name, ggml_type_name(src0->type), ggml_type_name(src1->type),
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            nth, nchunk0, nchunk1, dr0, dr1, vec_dot_num_rows, effective_vec_dot_rows);
+        fflush(stderr);
+    }
 
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;

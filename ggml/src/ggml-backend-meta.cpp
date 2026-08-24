@@ -7,6 +7,7 @@
 #include "ggml-rpc.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -1878,9 +1879,26 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
+    static constexpr size_t n_pipeline_chunks = 4;
+
+    struct chunk_config {
+        size_t token_start = 0;
+        size_t n_tokens    = 0;
+
+        ggml_tensor input  = {};
+        ggml_tensor output = {};
+
+        std::array<ggml_tensor *, 1> nodes = {};
+        ggml_cgraph cgraph = {};
+    };
+
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+
+        bool pipeline_chunks = false;
+        ggml_cgraph cgraph_prefix = {};
+        std::array<chunk_config, n_pipeline_chunks> chunks = {};
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -2287,11 +2305,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
+            // One FFN subgraph can replace one full-tensor reduction with multiple chunk reductions.
+            //const size_t max_reduce_calls = backend_ctx->max_subgraphs + ggml_backend_meta_context::n_pipeline_chunks - 1;
+            const size_t max_reduce_calls = backend_ctx->max_subgraphs * ggml_backend_meta_context::n_pipeline_chunks;
             const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
-            const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
-            const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
+            const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*max_reduce_calls*ggml_graph_overhead_custom(1, cgraph->grads);
+            const size_t mem_per_device_nodes_aux = n_nodes_per_device*max_reduce_calls*ggml_tensor_overhead();
             const ggml_init_params params = {
                 /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
@@ -2304,11 +2325,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
                 }
             }
-            backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
+            backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*max_reduce_calls);
             for (size_t k = 0; k < backend_ctx->cgraphs_aux.size(); k++) {
                 backend_ctx->cgraphs_aux[k] = ggml_new_graph_custom(backend_ctx->ctx.get(), 1, cgraph->grads);
             }
-            backend_ctx->nodes_aux.resize(n_backends*n_nodes_per_device*backend_ctx->max_subgraphs);
+            backend_ctx->nodes_aux.resize(n_backends*n_nodes_per_device*max_reduce_calls);
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                 backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
             }
@@ -2317,6 +2338,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
+                bcj.cgraphs[i_graph].pipeline_chunks = false;
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
@@ -2342,6 +2364,114 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 } else {
                     cgraph_ij->uid = ggml_graph_next_uid();
                 }
+            }
+        }
+
+        // Prototype token pipeline: split one strictly matched FFN down-projection into stable chunk graphs.
+        // The prefix runs once, then each MUL_MAT chunk writes directly into its full output tensor slice.
+        if (n_backends > 1) {
+            bool pipeline_configured = false;
+            for (size_t i_graph = 0; i_graph + 1 < n_subgraphs && !pipeline_configured; i_graph++) {
+                ggml_cgraph * main0 = backend_ctx->backend_configs[0].cgraphs[i_graph].cgraph_main;
+                if (main0->n_nodes < 2) {
+                    continue;
+                }
+
+                ggml_tensor * output0 = main0->nodes[main0->n_nodes - 1];
+                ggml_tensor * input0  = output0->src[1];
+                const size_t i_node_stop = i_graph + 1 < n_subgraphs ?
+                    backend_ctx->backend_configs[0].cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                const bool is_partial = ggml_backend_meta_get_split_state(
+                    cgraph->nodes[i_node_stop - 1], /*assume_sync =*/ false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool name_matches = strncmp(output0->name, "ffn_out-", 8) == 0;
+                const bool shape_matches = output0->op == GGML_OP_MUL_MAT && output0->type == GGML_TYPE_F32 &&
+                    input0 != nullptr && output0->src[0] != nullptr && output0->src[0]->ne[0] == input0->ne[0] &&
+                    output0->ne[0] == output0->src[0]->ne[1] && output0->ne[1] == input0->ne[1] &&
+                    output0->ne[1] >= (int64_t) ggml_backend_meta_context::n_pipeline_chunks &&
+                    output0->ne[2] == 1 && output0->ne[3] == 1 && input0->ne[2] == 1 && input0->ne[3] == 1 &&
+                    ggml_is_contiguous(output0) && ggml_is_contiguous(input0);
+                if (!is_partial || !name_matches || !shape_matches) {
+                    continue;
+                }
+
+                bool all_backends_match = true;
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_cgraph * main = backend_ctx->backend_configs[j].cgraphs[i_graph].cgraph_main;
+                    ggml_tensor * output = main->nodes[main->n_nodes - 1];
+                    ggml_tensor * input  = output->src[1];
+                    all_backends_match = all_backends_match && output->op == GGML_OP_MUL_MAT && input != nullptr && output->src[0] != nullptr &&
+                        output->src[0]->ne[0] == input->ne[0] && output->ne[0] == output->src[0]->ne[1] &&
+                        output->type == GGML_TYPE_F32 && output->ne[1] == output0->ne[1] && input->ne[1] == output0->ne[1] &&
+                        output->ne[2] == 1 && output->ne[3] == 1 && input->ne[2] == 1 && input->ne[3] == 1 &&
+                        ggml_is_contiguous(output) && ggml_is_contiguous(input);
+                }
+                if (!all_backends_match) {
+                    continue;
+                }
+
+                const size_t n_tokens = output0->ne[1];
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & config = backend_ctx->backend_configs[j].cgraphs[i_graph];
+                    ggml_cgraph * main = config.cgraph_main;
+                    ggml_tensor * output = main->nodes[main->n_nodes - 1];
+                    ggml_tensor * input  = output->src[1];
+
+                    config.pipeline_chunks = true;
+                    config.cgraph_prefix = ggml_graph_view(main, 0, main->n_nodes - 1);
+
+                    size_t token_start = 0;
+                    const size_t tokens_per_chunk = n_tokens / ggml_backend_meta_context::n_pipeline_chunks;
+                    const size_t remainder = n_tokens % ggml_backend_meta_context::n_pipeline_chunks;
+                    for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                        auto & chunk = config.chunks[i_chunk];
+                        chunk.token_start = token_start;
+                        chunk.n_tokens = tokens_per_chunk +
+                            (i_chunk >= ggml_backend_meta_context::n_pipeline_chunks - remainder ? 1 : 0);
+
+                        chunk.input = *input;
+                        chunk.input.op = GGML_OP_NONE;
+                        memset(chunk.input.src, 0, sizeof(chunk.input.src));
+                        chunk.input.view_src = nullptr;
+                        chunk.input.view_offs = 0;
+                        chunk.input.ne[1] = chunk.n_tokens;
+                        chunk.input.nb[2] = chunk.input.nb[1] * chunk.n_tokens;
+                        chunk.input.nb[3] = chunk.input.nb[2];
+                        chunk.input.data = (char *) input->data + token_start * input->nb[1];
+                        snprintf(chunk.input.name, sizeof(chunk.input.name), "%.48s.in.%zu", input->name, i_chunk);
+
+                        chunk.output = *output;
+                        memset(chunk.output.src, 0, sizeof(chunk.output.src));
+                        chunk.output.src[0] = output->src[0];
+                        chunk.output.src[1] = &chunk.input;
+                        chunk.output.view_src = nullptr;
+                        chunk.output.view_offs = 0;
+                        chunk.output.ne[1] = chunk.n_tokens;
+                        chunk.output.nb[2] = chunk.output.nb[1] * chunk.n_tokens;
+                        chunk.output.nb[3] = chunk.output.nb[2];
+                        chunk.output.data = (char *) output->data + token_start * output->nb[1];
+                        snprintf(chunk.output.name, sizeof(chunk.output.name), "%.48s.chunk.%zu", output->name, i_chunk);
+
+                        chunk.nodes[0] = &chunk.output;
+                        chunk.cgraph = ggml_graph_view(main, main->n_nodes - 1, main->n_nodes);
+                        chunk.cgraph.nodes = chunk.nodes.data();
+                        chunk.cgraph.n_nodes = 1;
+                        chunk.cgraph.uid ^= (uint64_t) (i_chunk + 1) * 0x9e3779b97f4a7c15ULL;
+                        chunk.cgraph.uid ^= chunk.cgraph.uid >> 30;
+                        chunk.cgraph.uid *= 0xbf58476d1ce4e5b9ULL;
+                        chunk.cgraph.uid ^= chunk.cgraph.uid >> 27;
+                        chunk.cgraph.uid *= 0x94d049bb133111ebULL;
+                        chunk.cgraph.uid ^= chunk.cgraph.uid >> 31;
+                        if (chunk.cgraph.uid == 0) {
+                            chunk.cgraph.uid = ggml_graph_next_uid();
+                        }
+
+                        token_start += chunk.n_tokens;
+                    }
+                    GGML_ASSERT(token_start == n_tokens);
+                }
+                pipeline_configured = false;
+                GGML_LOG_INFO("[META_PIPELINE] subgraph=%zu tensor=%s tokens=%zu chunks=%zu\n",
+                    i_graph, output0->name, n_tokens, ggml_backend_meta_context::n_pipeline_chunks);
             }
         }
     }
@@ -2376,13 +2506,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
+    auto allreduce_fallback = [&](const std::vector<ggml_tensor *> & nodes) -> ggml_status {
+        GGML_ASSERT(nodes.size() == n_backends);
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node = nodes[j];
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
@@ -2409,8 +2540,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
 
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
@@ -2483,42 +2614,153 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
             auto & bcj_dst = backend_ctx->backend_configs[j];
 
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_src = nodes[j - 2*offset_j_max];
+            ggml_tensor * node_dst = nodes[j];
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
         }
 
         return GGML_STATUS_SUCCESS;
     };
 
+    auto allreduce = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
+        GGML_ASSERT(nodes.size() == n_backends);
+        if (backend_ctx->comm_ctx && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data())) {
+            return GGML_STATUS_SUCCESS;
+        }
+        return allreduce_fallback(nodes);
+    };
 
+    static constexpr bool enable_pipeline_chunks = true;
+    bool pipeline_active = false;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        pipeline_active = pipeline_active || backend_ctx->backend_configs[0].cgraphs[i].pipeline_chunks;
+    }
+    pipeline_active = pipeline_active && enable_pipeline_chunks;
+
+    auto dump_ffn3_partials = [&](const size_t i) {
+        ggml_cgraph * graph0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        if (graph0->n_nodes < 1) {
+            return;
+        }
+        ggml_tensor * output0 = graph0->nodes[graph0->n_nodes - 1];
+        if (strcmp(output0->name, "ffn_out-3") != 0 ||
+                output0->type != GGML_TYPE_F32 || output0->ne[0] != 4096 || output0->ne[1] != 35 ||
+                output0->ne[2] != 1 || output0->ne[3] != 1) {
+            return;
+        }
+
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * graph = bcj.cgraphs[i].cgraph_main;
+            ggml_tensor * output = graph->nodes[graph->n_nodes - 1];
+            if (strcmp(output->name, "ffn_out-3") != 0 ||
+                output->type != GGML_TYPE_F32 || output->ne[0] != 4096 || output->ne[1] != 35 ||
+                output->ne[2] != 1 || output->ne[3] != 1) {
+                fprintf(stderr, "[FFN_PARTIAL_DUMP] backend=%zu tensor shape mismatch\n", j);
+                continue;
+            }
+
+            const size_t nbytes = ggml_nbytes(output);
+            std::vector<uint8_t> data(nbytes);
+            ggml_backend_tensor_get(output, data.data(), 0, nbytes);
+
+            const std::string filename = "pre-ffn3-b" + std::to_string(j) +
+                (pipeline_active ? "-chunk.bin" : ".bin");
+            FILE * file = fopen(filename.c_str(), "wb");
+            if (file == nullptr) {
+                fprintf(stderr, "[FFN_PARTIAL_DUMP] failed to open %s\n", filename.c_str());
+                continue;
+            }
+            const size_t nwritten = fwrite(data.data(), 1, nbytes, file);
+            fclose(file);
+            if (nwritten != nbytes) {
+                fprintf(stderr, "[FFN_PARTIAL_DUMP] short write file=%s expected=%zu actual=%zu\n",
+                    filename.c_str(), nbytes, nwritten);
+                continue;
+            }
+            fprintf(stderr,
+                "[FFN_PARTIAL_DUMP] wrote %s subgraph=%zu backend=%zu mode=%s shape=[%" PRId64 ",%" PRId64 "] bytes=%zu\n",
+                filename.c_str(), i, j, pipeline_active ? "chunk" : "nonchunk",
+                output->ne[0], output->ne[1], nbytes);
+        }
+    };
+
+    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const bool pipeline_chunks = backend_ctx->backend_configs[0].cgraphs[i].pipeline_chunks;
+        // 该
+        if (pipeline_chunks && enable_pipeline_chunks) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & config = backend_ctx->backend_configs[j].cgraphs[i];
+                if (config.cgraph_prefix.n_nodes == 0) {
+                    continue;
+                }
+                const ggml_status status = ggml_backend_graph_compute_async(
+                    backend_ctx->backend_configs[j].backend, &config.cgraph_prefix);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+
+            std::array<std::vector<ggml_tensor *>, ggml_backend_meta_context::n_pipeline_chunks> chunk_nodes;
+            for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                chunk_nodes[i_chunk].reserve(n_backends);
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
+                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                    chunk_nodes[i_chunk].push_back(&chunk.output);
+                }
+            }
+
+            dump_ffn3_partials(i);
+
+            for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                const ggml_status status = allreduce(chunk_nodes[i_chunk]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+
+            continue;
+        }
+
+        //fprintf(stderr, "\n=== SUBGRAPH %zu ===\n", i);
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * g = bcj.cgraphs[i].cgraph_main;
+          //          printf( "backend %zu, n_nodes %d\n", j, g->n_nodes);
+                    for (int k = 0; k < g->n_nodes; k++) {
+                        ggml_tensor * node = g->nodes[k];
+            //            printf("  node %d: op %s, ne[0] %lld, ne[1] %lld, ne[2] %lld, ne[3] %lld\n",
+             //               k, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                    }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
         }
-
+        // 同理
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
-                std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
-                }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+            std::vector<ggml_tensor *> nodes;
+            nodes.reserve(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes - 1]);
             }
 
-            if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
+            dump_ffn3_partials(i);
+
+            const ggml_status status = allreduce(nodes);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
             }
         }
     }

@@ -1689,7 +1689,7 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
-
+         // 跳过第一层ffn的权重加载
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
