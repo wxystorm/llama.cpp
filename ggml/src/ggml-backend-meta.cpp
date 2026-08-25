@@ -2863,6 +2863,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::deque<transfer_task> transfer_queue;
                 std::array<std::array<bool, 2>, n_chunks> compute_done = {};
                 std::array<std::array<bool, 2>, n_chunks> incoming_done = {};
+                std::array<std::array<bool, 2>, n_chunks> outgoing_done = {};
                 std::array<std::array<bool, 2>, n_chunks> add_queued = {};
                 size_t completed_adds = 0;
                 bool stopping = false;
@@ -2875,7 +2876,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 auto enqueue_add_locked = [&](const size_t chunk, const size_t backend_index) {
-                    if (add_queued[chunk][backend_index]) {
+                    if (add_queued[chunk][backend_index] ||
+                        !compute_done[chunk][backend_index] ||
+                        !incoming_done[chunk][backend_index] ||
+                        !outgoing_done[chunk][backend_index]) {
                         return;
                     }
                     add_queued[chunk][backend_index] = true;
@@ -2963,9 +2967,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             trace_event("transfer_ready", task.chunk, transfer.j_src, transfer.j_dst,
                                         ggml_nbytes(transfer.node_src));
                             transfer_queue.push_back({task.chunk, transfer_index});
-                            if (incoming_done[task.chunk][backend_index]) {
-                                enqueue_add_locked(task.chunk, backend_index);
-                            }
+                            enqueue_add_locked(task.chunk, backend_index);
                         }
                         scheduler_cv.notify_all();
                     }
@@ -3004,9 +3006,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             return;
                         }
                         incoming_done[task.chunk][transfer.j_dst] = true;
-                        if (compute_done[task.chunk][transfer.j_dst]) {
-                            enqueue_add_locked(task.chunk, transfer.j_dst);
-                        }
+                        outgoing_done[task.chunk][transfer.j_src] = true;
+                        enqueue_add_locked(task.chunk, transfer.j_dst);
+                        enqueue_add_locked(task.chunk, transfer.j_src);
                         scheduler_cv.notify_all();
                     }
                 };

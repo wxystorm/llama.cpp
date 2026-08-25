@@ -284,7 +284,6 @@ struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
-    std::shared_ptr<socket_t> compute_sock;
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -422,16 +421,49 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
-enum class rpc_channel {
-    compute,
-    transfer,
-};
-
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint, rpc_channel channel) {
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    const std::string key = endpoint + "_" + std::to_string(static_cast<int>(channel));
+
+    auto it = sockets.find(endpoint);
+    if (it != sockets.end()) {
+        if (auto sock = it->second.lock()) {
+            return sock;
+        }
+    }
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
+        return nullptr;
+    }
+
+    if (!rpc_transport_init()) {
+        return nullptr;
+    }
+    auto sock = socket_t::connect(host.c_str(), port);
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    if (!negotiate_hello(sock)) {
+        return nullptr;
+    }
+    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    sockets[endpoint] = sock;
+    return sock;
+}
+
+enum rpc_channel {
+    compute,
+    transfer,
+};
+// 重新写一个
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint, enum rpc_channel channel) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    std::string key = endpoint + "_" + std::to_string(channel);
     auto it = sockets.find(key);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
@@ -738,9 +770,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
         ctx->sock,
         RPC_CMD_SET_TENSOR,
         input.data(),
-        input.size(),
-        nullptr,
-        0);
+        input.size());
 
     RPC_STATUS_ASSERT(status);
 }
@@ -888,7 +918,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
-    auto sock = get_socket(buft_ctx->endpoint, rpc_channel::transfer);
+    auto sock = get_socket(buft_ctx->endpoint, transfer);
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
@@ -942,7 +972,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-        auto sock = get_socket(buft_ctx->endpoint, rpc_channel::transfer);
+        auto sock = get_socket(buft_ctx->endpoint, transfer);
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -1085,15 +1115,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
-        bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_RECOMPUTE,
-                                   &request, sizeof(request), nullptr, 0);
+        auto sock = get_socket(rpc_ctx->endpoint, compute);
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-        bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_COMPUTE,
-                                   input.data(), input.size(), nullptr, 0);
+        auto sock = get_socket(rpc_ctx->endpoint, compute);
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr, 0);
         // 打印发送和接收的字节数，计算图
         RPC_STATUS_ASSERT(status);
     }
@@ -1129,7 +1159,7 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     if (it != buft_map.end()) {
         return it->second;
     }
-    auto sock = get_socket(endpoint, rpc_channel::transfer);
+    auto sock = get_socket(endpoint, transfer);
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return nullptr;
@@ -1155,16 +1185,10 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
 
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
-    auto compute_sock = get_socket(endpoint, rpc_channel::compute);
-    if (compute_sock == nullptr) {
-        GGML_LOG_ERROR("Failed to connect compute channel to %s\n", endpoint);
-        return nullptr;
-    }
     ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
         /* .endpoint       = */ endpoint,
         /* .device         = */ device,
         /* .name           = */ dev_name,
-        /* .compute_sock   = */ std::move(compute_sock),
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
@@ -1191,7 +1215,7 @@ static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t d
 }
 
 void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
-    auto sock = get_socket(endpoint, rpc_channel::transfer);
+    auto sock = get_socket(endpoint, transfer);
     if (sock == nullptr) {
         *free = 0;
         *total = 0;
@@ -2306,9 +2330,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
@@ -2374,9 +2395,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2385,9 +2403,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2585,9 +2600,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
@@ -2676,9 +2688,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2687,9 +2696,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2911,9 +2917,6 @@ static void rpc_serve_client(rpc_server & server,
                     return;
                 }
                 if (!server.set_tensor(input)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -3400,7 +3403,7 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
 }
 
 static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
-    auto sock = get_socket(endpoint, rpc_channel::transfer);
+    auto sock = get_socket(endpoint, transfer);
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return 0;
