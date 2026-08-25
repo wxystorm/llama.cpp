@@ -1116,6 +1116,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
+        // Wait for the empty response so that this request is fully ordered before
+        // another RPC connection starts reading tensors produced by the graph.
         bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_RECOMPUTE,
                                    &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
@@ -1123,6 +1125,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
+        // The response is empty, but receiving its header is the cross-connection
+        // completion fence used by the transfer connection.
         bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_COMPUTE,
                                    input.data(), input.size(), nullptr, 0);
         // 打印发送和接收的字节数，计算图
@@ -2402,6 +2406,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2410,6 +2417,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2695,6 +2705,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2703,6 +2716,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
