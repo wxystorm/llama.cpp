@@ -2856,7 +2856,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     for (size_t j = 0; j < n_backends; j++) {
                         auto & bcj = backend_ctx->backend_configs[j];
                         auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
+                        if (j == 0) {
+                            trace_chunk_event("compute_begin 0", i_chunk);
+                        }
+                        if (j == 1) {
+                            trace_chunk_event("compute_begin 1", i_chunk);
+                        }
                         const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
+                        if (j == 0) {
+                            trace_chunk_event("compute_end 0", i_chunk);
+                        }
+                        if (j == 1) {
+                            trace_chunk_event("compute_end 1", i_chunk);
+                        }
                         if (status != GGML_STATUS_SUCCESS) {
                             return status;
                         }
