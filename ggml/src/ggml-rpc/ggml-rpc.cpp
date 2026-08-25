@@ -284,6 +284,7 @@ struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
+    std::shared_ptr<socket_t> compute_sock;
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -1115,15 +1116,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
-        auto sock = get_socket(rpc_ctx->endpoint, compute);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_RECOMPUTE,
+                                   &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint, compute);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr, 0);
+        bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_COMPUTE,
+                                   input.data(), input.size(), nullptr, 0);
         // 打印发送和接收的字节数，计算图
         RPC_STATUS_ASSERT(status);
     }
@@ -1185,10 +1186,16 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
 
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
+    auto compute_sock = get_socket(endpoint, compute);
+    if (compute_sock == nullptr) {
+        GGML_LOG_ERROR("Failed to connect compute channel to %s\n", endpoint);
+        return nullptr;
+    }
     ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
         /* .endpoint       = */ endpoint,
         /* .device         = */ device,
         /* .name           = */ dev_name,
+        /* .compute_sock   = */ std::move(compute_sock),
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
