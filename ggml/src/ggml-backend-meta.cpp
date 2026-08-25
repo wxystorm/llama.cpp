@@ -12,16 +12,18 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <future>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <cinttypes>
@@ -1914,7 +1916,7 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
-            bufs.resize(n_reduce_steps);
+            bufs.resize(n_reduce_steps * n_pipeline_chunks);
         }
     };
     std::string                 name;
@@ -2639,7 +2641,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         std::vector<reduce_transfer> transfers;
     };
 
-    [[maybe_unused]] auto prepare_reduce = [&](const std::vector<ggml_tensor *> & nodes, reduce_state & state) -> ggml_status {
+    [[maybe_unused]] auto prepare_reduce = [&](const std::vector<ggml_tensor *> & nodes, reduce_state & state,
+                                               const size_t buffer_slot) -> ggml_status {
         GGML_ASSERT(nodes.size() == n_backends);
         GGML_ASSERT(n_backends == 2);
         GGML_ASSERT(state.transfers.empty());
@@ -2675,9 +2678,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
-            // Two backends have one butterfly step, so both destinations use buffer 0.
+            // Each in-flight chunk needs a distinct temporary reduction buffer.
             ggml_tensor * node_tmp = get_node_aux(node_dst);
-            set_tmp_data(node_tmp, j_dst, /*i_buf =*/ 0);
+            set_tmp_data(node_tmp, j_dst, buffer_slot * backend_ctx->n_reduce_steps);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -2700,68 +2703,52 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
-    // This function runs in a transfer thread. It deliberately spells out the generic
-    // fallback so synchronization and blocking-copy time can be traced independently.
-    auto transfer_data = [&](const reduce_state & state, const size_t chunk, const auto & trace_event) -> ggml_status {
-        GGML_ASSERT(state.transfers.size() == n_backends);
-        for (const reduce_transfer & transfer : state.transfers) {
-            auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
-            auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
-            const size_t nbytes = ggml_nbytes(transfer.node_src);
-            GGML_ASSERT(nbytes == ggml_nbytes(transfer.node_tmp));
+    // One transfer worker owns this path. Compute completion is a dependency of the
+    // transfer task, so its ACK/synchronize does not block the scheduler thread.
+    auto transfer_one = [&](const reduce_transfer & transfer, const size_t chunk,
+                            const auto & trace_event) -> ggml_status {
+        auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
+        auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
+        const size_t nbytes = ggml_nbytes(transfer.node_src);
+        GGML_ASSERT(nbytes == ggml_nbytes(transfer.node_tmp));
 
-            trace_event("synchronize_src_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            ggml_backend_synchronize(bcj_src.backend);
-            trace_event("synchronize_src_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        trace_event("synchronize_src_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        ggml_backend_synchronize(bcj_src.backend);
+        trace_event("synchronize_src_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
-            trace_event("synchronize_dst_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            ggml_backend_synchronize(bcj_dst.backend);
-            trace_event("synchronize_dst_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        trace_event("synchronize_dst_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        ggml_backend_synchronize(bcj_dst.backend);
+        trace_event("synchronize_dst_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
-            trace_event("blocking_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            if (ggml_backend_buffer_is_host(transfer.node_src->buffer)) {
-                // Host -> device/RPC: transport is performed by the destination tensor_set.
-                trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                ggml_backend_tensor_set(transfer.node_tmp, transfer.node_src->data, 0, nbytes);
-                trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
-                // Device/RPC -> host: transport is performed by the source tensor_get.
+        trace_event("blocking_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        if (ggml_backend_buffer_is_host(transfer.node_src->buffer)) {
+            trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            ggml_backend_tensor_set(transfer.node_tmp, transfer.node_src->data, 0, nbytes);
+            trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
+            trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
+            trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+        } else {
+            trace_event("buffer_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+            const bool copied = ggml_backend_buffer_copy_tensor(transfer.node_src, transfer.node_tmp);
+            trace_event("buffer_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
+            if (!copied) {
+                trace_event("staging_alloc_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                std::vector<uint8_t> staging(nbytes);
+                trace_event("staging_alloc_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
+
                 trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
+                ggml_backend_tensor_get(transfer.node_src, staging.data(), 0, nbytes);
                 trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            } else {
-                trace_event("buffer_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                const bool copied = ggml_backend_buffer_copy_tensor(transfer.node_src, transfer.node_tmp);
-                trace_event("buffer_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
-                if (!copied) {
-                    trace_event("staging_alloc_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                    std::vector<uint8_t> staging(nbytes);
-                    trace_event("staging_alloc_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-
-                    trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                    ggml_backend_tensor_get(transfer.node_src, staging.data(), 0, nbytes);
-                    trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-
-                    trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                    ggml_backend_tensor_set(transfer.node_tmp, staging.data(), 0, nbytes);
-                    trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                }
-            }
-            trace_event("blocking_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
-        }
-        return GGML_STATUS_SUCCESS;
-    };
-
-    [[maybe_unused]] auto compute_graph = [&](const reduce_state & state) -> ggml_status {
-        GGML_ASSERT(state.transfers.size() == n_backends);
-        for (const reduce_transfer & transfer : state.transfers) {
-            auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj_dst.backend, transfer.add_graph);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+                trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
+                ggml_backend_tensor_set(transfer.node_tmp, staging.data(), 0, nbytes);
+                trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
             }
         }
+        trace_event("blocking_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         return GGML_STATUS_SUCCESS;
     };
     auto allreduce = [&](std::vector<ggml_tensor *> & nodes) -> ggml_status {
@@ -2845,85 +2832,199 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     trace_event(phase, chunk, SIZE_MAX, SIZE_MAX, 0);
                 };
 
-                std::unique_ptr<reduce_state> pending_state;
-                std::future<ggml_status>       pending_transfer;
-                size_t                         pending_chunk = 0;
+                static constexpr size_t n_chunks = ggml_backend_meta_context::n_pipeline_chunks;
 
-                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
+                struct compute_task {
+                    size_t chunk = 0;
+                    bool   add   = false;
+                };
+                struct transfer_task {
+                    size_t chunk         = 0;
+                    size_t transfer_index = 0;
+                };
+
+                std::array<reduce_state, n_chunks> reduce_states;
+                for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
                     std::vector<ggml_tensor *> nodes;
                     nodes.reserve(n_backends);
-                    trace_chunk_event("compute_call_begin", i_chunk);
                     for (size_t j = 0; j < n_backends; j++) {
-                        auto & bcj = backend_ctx->backend_configs[j];
-                        auto & chunk = bcj.cgraphs[i].chunks[i_chunk];
-                        if (j == 0) {
-                            trace_chunk_event("compute_begin 0", i_chunk);
-                        }
-                        if (j == 1) {
-                            trace_chunk_event("compute_begin 1", i_chunk);
-                        }
-                        const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &chunk.cgraph);
-                        if (j == 0) {
-                            trace_chunk_event("compute_end 0", i_chunk);
-                        }
-                        if (j == 1) {
-                            trace_chunk_event("compute_end 1", i_chunk);
-                        }
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
-                        }
-                        nodes.push_back(&chunk.output);
+                        nodes.push_back(&backend_ctx->backend_configs[j].cgraphs[i].chunks[i_chunk].output);
                     }
-                    trace_chunk_event("compute_call_end", i_chunk);
-
-                    // The current chunk is now queued while the previous chunk is transferring.
-                    // Before reusing the reduction buffer, finish that transfer and queue its ADD.
-                    if (pending_state) {
-                        trace_chunk_event("transfer_wait_begin", pending_chunk);
-                        const ggml_status transfer_status = pending_transfer.get();
-                        trace_chunk_event("transfer_wait_end", pending_chunk);
-                        if (transfer_status != GGML_STATUS_SUCCESS) {
-                            return transfer_status;
-                        }
-                        trace_chunk_event("add_call_begin", pending_chunk);
-                        const ggml_status compute_status = compute_graph(*pending_state);
-                        trace_chunk_event("add_call_end", pending_chunk);
-                        if (compute_status != GGML_STATUS_SUCCESS) {
-                            return compute_status;
-                        }
-                    }
-
-                    auto current_state = std::make_unique<reduce_state>();
-                    const ggml_status prepare_status = prepare_reduce(nodes, *current_state);
+                    const ggml_status prepare_status = prepare_reduce(nodes, reduce_states[i_chunk], i_chunk);
                     if (prepare_status != GGML_STATUS_SUCCESS) {
                         return prepare_status;
                     }
-
-                    pending_state = std::move(current_state);
-                    reduce_state * state = pending_state.get();
-                    pending_chunk = i_chunk;
-                    pending_transfer = std::async(std::launch::async, [&, state, i_chunk]() {
-                        trace_chunk_event("transfer_begin", i_chunk);
-                        const ggml_status status = transfer_data(*state, i_chunk, trace_event);
-                        trace_chunk_event("transfer_end", i_chunk);
-                        return status;
-                    });
                 }
 
-                // No following chunk exists to drain the final transfer.
-                if (pending_state) {
-                    trace_chunk_event("transfer_wait_begin", pending_chunk);
-                    const ggml_status transfer_status = pending_transfer.get();
-                    trace_chunk_event("transfer_wait_end", pending_chunk);
-                    if (transfer_status != GGML_STATUS_SUCCESS) {
-                        return transfer_status;
+                std::mutex scheduler_mutex;
+                std::condition_variable scheduler_cv;
+                std::array<std::deque<compute_task>, 2> compute_queues;
+                std::array<std::deque<compute_task>, 2> add_queues;
+                std::deque<transfer_task> transfer_queue;
+                std::array<std::array<bool, 2>, n_chunks> compute_done = {};
+                std::array<std::array<bool, 2>, n_chunks> incoming_done = {};
+                std::array<std::array<bool, 2>, n_chunks> add_queued = {};
+                size_t completed_adds = 0;
+                bool stopping = false;
+                ggml_status pipeline_status = GGML_STATUS_SUCCESS;
+
+                for (size_t j = 0; j < n_backends; j++) {
+                    for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
+                        compute_queues[j].push_back({i_chunk, false});
                     }
-                    trace_chunk_event("add_call_begin", pending_chunk);
-                    const ggml_status compute_status = compute_graph(*pending_state);
-                    trace_chunk_event("add_call_end", pending_chunk);
-                    if (compute_status != GGML_STATUS_SUCCESS) {
-                        return compute_status;
+                }
+
+                auto enqueue_add_locked = [&](const size_t chunk, const size_t backend_index) {
+                    if (add_queued[chunk][backend_index]) {
+                        return;
                     }
+                    add_queued[chunk][backend_index] = true;
+                    trace_chunk_event(backend_index == 0 ? "add_ready 0" : "add_ready 1", chunk);
+                    auto & queue = add_queues[backend_index];
+                    const auto pos = std::find_if(queue.begin(), queue.end(), [&](const compute_task & task) {
+                        return task.chunk > chunk;
+                    });
+                    queue.insert(pos, {chunk, true});
+                };
+
+                auto set_failure_locked = [&](const ggml_status status) {
+                    if (pipeline_status == GGML_STATUS_SUCCESS) {
+                        pipeline_status = status;
+                    }
+                    stopping = true;
+                    scheduler_cv.notify_all();
+                };
+
+                auto find_transfer = [&](const size_t chunk, const size_t backend_index, const bool by_source) -> size_t {
+                    const auto & transfers = reduce_states[chunk].transfers;
+                    for (size_t k = 0; k < transfers.size(); k++) {
+                        if ((by_source ? transfers[k].j_src : transfers[k].j_dst) == backend_index) {
+                            return k;
+                        }
+                    }
+                    GGML_ABORT("missing reduction transfer for backend %zu", backend_index);
+                };
+
+                auto compute_worker = [&](const size_t backend_index) {
+                    const char * compute_begin_phase = backend_index == 0 ? "compute_begin 0" : "compute_begin 1";
+                    const char * compute_end_phase   = backend_index == 0 ? "compute_end 0"   : "compute_end 1";
+                    const char * add_begin_phase     = backend_index == 0 ? "add_begin 0"     : "add_begin 1";
+                    const char * add_end_phase       = backend_index == 0 ? "add_end 0"       : "add_end 1";
+
+                    while (true) {
+                        compute_task task;
+                        {
+                            std::unique_lock<std::mutex> lock(scheduler_mutex);
+                            scheduler_cv.wait(lock, [&]() {
+                                return stopping || !add_queues[backend_index].empty() || !compute_queues[backend_index].empty();
+                            });
+                            if (stopping) {
+                                return;
+                            }
+                            if (!add_queues[backend_index].empty()) {
+                                task = add_queues[backend_index].front();
+                                add_queues[backend_index].pop_front();
+                            } else {
+                                task = compute_queues[backend_index].front();
+                                compute_queues[backend_index].pop_front();
+                            }
+                        }
+
+                        ggml_status status;
+                        if (task.add) {
+                            const size_t transfer_index = find_transfer(task.chunk, backend_index, /*by_source =*/ false);
+                            trace_chunk_event(add_begin_phase, task.chunk);
+                            status = ggml_backend_graph_compute_async(
+                                backend_ctx->backend_configs[backend_index].backend,
+                                reduce_states[task.chunk].transfers[transfer_index].add_graph);
+                            trace_chunk_event(add_end_phase, task.chunk);
+                        } else {
+                            auto & chunk = backend_ctx->backend_configs[backend_index].cgraphs[i].chunks[task.chunk];
+                            trace_chunk_event(compute_begin_phase, task.chunk);
+                            status = ggml_backend_graph_compute_async(
+                                backend_ctx->backend_configs[backend_index].backend, &chunk.cgraph);
+                            trace_chunk_event(compute_end_phase, task.chunk);
+                        }
+
+                        std::lock_guard<std::mutex> lock(scheduler_mutex);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            set_failure_locked(status);
+                            return;
+                        }
+                        if (task.add) {
+                            completed_adds++;
+                            if (completed_adds == n_chunks * n_backends) {
+                                stopping = true;
+                            }
+                        } else {
+                            compute_done[task.chunk][backend_index] = true;
+                            const size_t transfer_index = find_transfer(task.chunk, backend_index, /*by_source =*/ true);
+                            const reduce_transfer & transfer = reduce_states[task.chunk].transfers[transfer_index];
+                            trace_event("transfer_ready", task.chunk, transfer.j_src, transfer.j_dst,
+                                        ggml_nbytes(transfer.node_src));
+                            transfer_queue.push_back({task.chunk, transfer_index});
+                            if (incoming_done[task.chunk][backend_index]) {
+                                enqueue_add_locked(task.chunk, backend_index);
+                            }
+                        }
+                        scheduler_cv.notify_all();
+                    }
+                };
+
+                auto transfer_worker = [&]() {
+                    while (true) {
+                        transfer_task task;
+                        {
+                            std::unique_lock<std::mutex> lock(scheduler_mutex);
+                            scheduler_cv.wait(lock, [&]() {
+                                return stopping || !transfer_queue.empty();
+                            });
+                            if (stopping) {
+                                return;
+                            }
+                            const auto pos = std::min_element(
+                                transfer_queue.begin(), transfer_queue.end(),
+                                [](const transfer_task & a, const transfer_task & b) {
+                                    return a.chunk < b.chunk;
+                                });
+                            task = *pos;
+                            transfer_queue.erase(pos);
+                        }
+
+                        const reduce_transfer & transfer = reduce_states[task.chunk].transfers[task.transfer_index];
+                        trace_event("transfer_begin", task.chunk, transfer.j_src, transfer.j_dst,
+                                    ggml_nbytes(transfer.node_src));
+                        const ggml_status status = transfer_one(transfer, task.chunk, trace_event);
+                        trace_event("transfer_end", task.chunk, transfer.j_src, transfer.j_dst,
+                                    ggml_nbytes(transfer.node_src));
+
+                        std::lock_guard<std::mutex> lock(scheduler_mutex);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            set_failure_locked(status);
+                            return;
+                        }
+                        incoming_done[task.chunk][transfer.j_dst] = true;
+                        if (compute_done[task.chunk][transfer.j_dst]) {
+                            enqueue_add_locked(task.chunk, transfer.j_dst);
+                        }
+                        scheduler_cv.notify_all();
+                    }
+                };
+
+                std::array<std::thread, 2> compute_threads = {
+                    std::thread(compute_worker, 0),
+                    std::thread(compute_worker, 1),
+                };
+                std::thread transfer_thread(transfer_worker);
+                scheduler_cv.notify_all();
+
+                for (std::thread & thread : compute_threads) {
+                    thread.join();
+                }
+                transfer_thread.join();
+
+                if (pipeline_status != GGML_STATUS_SUCCESS) {
+                    return pipeline_status;
                 }
 
                 if (trace_pipeline) {

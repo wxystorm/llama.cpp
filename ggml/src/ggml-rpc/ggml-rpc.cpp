@@ -738,7 +738,9 @@ static void ggml_backend_rpc_buffer_set_tensor(
         ctx->sock,
         RPC_CMD_SET_TENSOR,
         input.data(),
-        input.size());
+        input.size(),
+        nullptr,
+        0);
 
     RPC_STATUS_ASSERT(status);
 }
@@ -2304,6 +2306,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
@@ -2578,6 +2583,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2903,6 +2911,9 @@ static void rpc_serve_client(rpc_server & server,
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
