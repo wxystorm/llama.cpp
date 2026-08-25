@@ -1916,8 +1916,7 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
-            // One incoming-reduction buffer and one outbound-snapshot buffer per chunk.
-            bufs.resize(2 * n_reduce_steps * n_pipeline_chunks);
+            bufs.resize(n_reduce_steps * n_pipeline_chunks);
         }
     };
     std::string                 name;
@@ -2315,8 +2314,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // One FFN subgraph can replace one full-tensor reduction with multiple chunk reductions.
             //const size_t max_reduce_calls = backend_ctx->max_subgraphs + ggml_backend_meta_context::n_pipeline_chunks - 1;
             const size_t max_reduce_calls = backend_ctx->max_subgraphs * ggml_backend_meta_context::n_pipeline_chunks;
-            const size_t n_nodes_per_device = 4 * backend_ctx->n_reduce_steps; // tmp + snapshot + ADD (+zeroing) per step and device
-            const size_t n_cgraphs_per_device = 3 * backend_ctx->n_reduce_steps; // snapshot + ADD (+ zeroing) per step and device
+            const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
+            const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*max_reduce_calls*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*max_reduce_calls*ggml_tensor_overhead();
@@ -2628,16 +2627,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         return GGML_STATUS_SUCCESS;
     };
-    // Split the two-backend fallback reduction into snapshot, transfer, and ADD stages.
-    // Outbound snapshots keep in-place ADD from modifying data still needed by transfer.
+    // Split the two-backend fallback reduction into preparation, transfer, and ADD stages.
+    // The same temporary tensor must be shared by all three stages.
     struct reduce_transfer {
-        size_t        j_src         = 0;
-        size_t        j_dst         = 0;
-        ggml_tensor * node_src      = nullptr;
-        ggml_tensor * node_snapshot = nullptr;
-        ggml_tensor * node_tmp      = nullptr;
-        ggml_cgraph * snapshot_graph = nullptr;
-        ggml_cgraph * add_graph     = nullptr;
+        size_t        j_src     = 0;
+        size_t        j_dst     = 0;
+        ggml_tensor * node_src  = nullptr;
+        ggml_tensor * node_tmp  = nullptr;
+        ggml_cgraph * add_graph = nullptr;
     };
 
     struct reduce_state {
@@ -2681,19 +2678,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
-            ggml_tensor * node_snapshot = get_node_aux(node_src);
-            const size_t snapshot_slot = ggml_backend_meta_context::n_pipeline_chunks * backend_ctx->n_reduce_steps +
-                buffer_slot * backend_ctx->n_reduce_steps;
-            set_tmp_data(node_snapshot, j_src, snapshot_slot);
-            node_snapshot->op = GGML_OP_DUP;
-            node_snapshot->src[0] = node_src;
-            node_snapshot->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            snprintf(node_snapshot->name, sizeof(node_snapshot->name), "%.48s.snapshot", node_src->name);
-
-            ggml_cgraph * snapshot_graph = get_cgraph_aux();
-            snapshot_graph->nodes[0] = node_snapshot;
-            snapshot_graph->n_nodes = 1;
-
             // Each in-flight chunk needs a distinct temporary reduction buffer.
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, buffer_slot * backend_ctx->n_reduce_steps);
@@ -2711,7 +2695,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             add_graph->nodes[0] = node_red;
             add_graph->n_nodes = 1;
 
-            state.transfers.push_back({j_src, j_dst, node_src, node_snapshot, node_tmp, snapshot_graph, add_graph});
+            state.transfers.push_back({j_src, j_dst, node_src, node_tmp, add_graph});
         };
 
         prepare_pair(/*j_src =*/ 0, /*j_dst =*/ 1);
@@ -2725,8 +2709,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             const auto & trace_event) -> ggml_status {
         auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
         auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
-        const ggml_tensor * node_transfer_src = transfer.node_snapshot;
-        const size_t nbytes = ggml_nbytes(node_transfer_src);
+        const size_t nbytes = ggml_nbytes(transfer.node_src);
         GGML_ASSERT(nbytes == ggml_nbytes(transfer.node_tmp));
 
         trace_event("synchronize_src_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
@@ -2738,17 +2721,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         trace_event("synchronize_dst_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
         trace_event("blocking_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-        if (ggml_backend_buffer_is_host(node_transfer_src->buffer)) {
+        if (ggml_backend_buffer_is_host(transfer.node_src->buffer)) {
             trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            ggml_backend_tensor_set(transfer.node_tmp, node_transfer_src->data, 0, nbytes);
+            ggml_backend_tensor_set(transfer.node_tmp, transfer.node_src->data, 0, nbytes);
             trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
             trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            ggml_backend_tensor_get(node_transfer_src, transfer.node_tmp->data, 0, nbytes);
+            ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
             trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         } else {
             trace_event("buffer_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            const bool copied = ggml_backend_buffer_copy_tensor(node_transfer_src, transfer.node_tmp);
+            const bool copied = ggml_backend_buffer_copy_tensor(transfer.node_src, transfer.node_tmp);
             trace_event("buffer_copy_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
             if (!copied) {
@@ -2757,7 +2740,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 trace_event("staging_alloc_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
                 trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-                ggml_backend_tensor_get(node_transfer_src, staging.data(), 0, nbytes);
+                ggml_backend_tensor_get(transfer.node_src, staging.data(), 0, nbytes);
                 trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
 
                 trace_event("dst_tensor_set_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
@@ -2880,7 +2863,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::deque<transfer_task> transfer_queue;
                 std::array<std::array<bool, 2>, n_chunks> compute_done = {};
                 std::array<std::array<bool, 2>, n_chunks> incoming_done = {};
-                std::array<std::array<bool, 2>, n_chunks> snapshot_done = {};
                 std::array<std::array<bool, 2>, n_chunks> add_queued = {};
                 size_t completed_adds = 0;
                 bool stopping = false;
@@ -2893,10 +2875,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 auto enqueue_add_locked = [&](const size_t chunk, const size_t backend_index) {
-                    if (add_queued[chunk][backend_index] ||
-                        !compute_done[chunk][backend_index] ||
-                        !incoming_done[chunk][backend_index] ||
-                        !snapshot_done[chunk][backend_index]) {
+                    if (add_queued[chunk][backend_index]) {
                         return;
                     }
                     add_queued[chunk][backend_index] = true;
@@ -2965,16 +2944,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             status = ggml_backend_graph_compute_async(
                                 backend_ctx->backend_configs[backend_index].backend, &chunk.cgraph);
                             trace_chunk_event(compute_end_phase, task.chunk);
-
-                            if (status == GGML_STATUS_SUCCESS) {
-                                const size_t transfer_index = find_transfer(task.chunk, backend_index, /*by_source =*/ true);
-                                const reduce_transfer & transfer = reduce_states[task.chunk].transfers[transfer_index];
-                                const size_t nbytes = ggml_nbytes(transfer.node_src);
-                                trace_event("snapshot_begin", task.chunk, transfer.j_src, transfer.j_dst, nbytes);
-                                status = ggml_backend_graph_compute_async(
-                                    backend_ctx->backend_configs[backend_index].backend, transfer.snapshot_graph);
-                                trace_event("snapshot_end", task.chunk, transfer.j_src, transfer.j_dst, nbytes);
-                            }
                         }
 
                         std::lock_guard<std::mutex> lock(scheduler_mutex);
@@ -2989,13 +2958,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             }
                         } else {
                             compute_done[task.chunk][backend_index] = true;
-                            snapshot_done[task.chunk][backend_index] = true;
                             const size_t transfer_index = find_transfer(task.chunk, backend_index, /*by_source =*/ true);
                             const reduce_transfer & transfer = reduce_states[task.chunk].transfers[transfer_index];
                             trace_event("transfer_ready", task.chunk, transfer.j_src, transfer.j_dst,
                                         ggml_nbytes(transfer.node_src));
                             transfer_queue.push_back({task.chunk, transfer_index});
-                            enqueue_add_locked(task.chunk, backend_index);
+                            if (incoming_done[task.chunk][backend_index]) {
+                                enqueue_add_locked(task.chunk, backend_index);
+                            }
                         }
                         scheduler_cv.notify_all();
                     }
@@ -3034,7 +3004,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             return;
                         }
                         incoming_done[task.chunk][transfer.j_dst] = true;
-                        enqueue_add_locked(task.chunk, transfer.j_dst);
+                        if (compute_done[task.chunk][transfer.j_dst]) {
+                            enqueue_add_locked(task.chunk, transfer.j_dst);
+                        }
                         scheduler_cv.notify_all();
                     }
                 };
