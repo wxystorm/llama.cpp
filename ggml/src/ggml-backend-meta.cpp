@@ -2854,6 +2854,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (prepare_status != GGML_STATUS_SUCCESS) {
                         return prepare_status;
                     }
+                    if (trace_pipeline) {
+                        const size_t i_buf = i_chunk * backend_ctx->n_reduce_steps;
+                        for (const reduce_transfer & transfer : reduce_states[i_chunk].transfers) {
+                            fprintf(stderr,
+                                    "[META_PIPELINE_TMP] chunk=%zu dir=%zu->%zu i_buf=%zu buffer=%p data=%p\n",
+                                    i_chunk, transfer.j_src, transfer.j_dst, i_buf,
+                                    (void *) transfer.node_tmp->buffer, transfer.node_tmp->data);
+                        }
+                    }
                 }
 
                 std::mutex scheduler_mutex;
