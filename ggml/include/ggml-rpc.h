@@ -64,6 +64,16 @@ using ggml_backend_rpc_set_local_2d_t =
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
+typedef void (*ggml_backend_rpc_snapshot_callback)(void * user_data);
+
+GGML_BACKEND_API void ggml_backend_rpc_tensor_get_with_snapshot(
+        const struct ggml_tensor * tensor,
+        void * data,
+        size_t offset,
+        size_t size,
+        ggml_backend_rpc_snapshot_callback callback,
+        void * user_data);
+
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);

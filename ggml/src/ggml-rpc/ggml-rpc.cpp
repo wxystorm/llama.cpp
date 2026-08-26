@@ -794,7 +794,14 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     delete ctx;
 }
 
-static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static bool ggml_backend_rpc_buffer_get_tensor_impl(
+        ggml_backend_buffer_t buffer,
+        const ggml_tensor * tensor,
+        void * data,
+        size_t offset,
+        size_t size,
+        ggml_backend_rpc_snapshot_callback callback,
+        void * user_data) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
@@ -805,39 +812,39 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     const bool trace_get = is_pipeline_chunk_tensor_name(tensor->name) &&
         pipeline_get_trace_count.fetch_add(1) < 3;
 
-    bool status = false;
-    if (!trace_get) {
-        status = send_rpc_cmd(ctx->download_sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    } else {
-        using clock = std::chrono::steady_clock;
-        const auto t_tensor_get_begin = clock::now();
-        const auto t_lock_wait_begin = clock::now();
-        std::unique_lock<std::mutex> rpc_lock(ctx->download_sock->rpc_mutex());
-        const auto t_lock_acquired = clock::now();
+    using clock = std::chrono::steady_clock;
+    const auto t_tensor_get_begin = clock::now();
+    const auto t_lock_wait_begin = clock::now();
+    std::unique_lock<std::mutex> rpc_lock(ctx->download_sock->rpc_mutex());
+    const auto t_lock_acquired = clock::now();
 
-        const uint8_t cmd = RPC_CMD_GET_TENSOR;
-        const size_t input_size = sizeof(request);
-        const auto t_request_send_begin = clock::now();
-        status = ctx->download_sock->send_data(&cmd, sizeof(cmd)) &&
-                 ctx->download_sock->send_data(&input_size, sizeof(input_size)) &&
-                 ctx->download_sock->send_data(&request, sizeof(request));
-        const auto t_request_send_end = clock::now();
+    const uint8_t cmd = RPC_CMD_GET_TENSOR;
+    const size_t input_size = sizeof(request);
+    const auto t_request_send_begin = clock::now();
+    bool status = ctx->download_sock->send_data(&cmd, sizeof(cmd)) &&
+                  ctx->download_sock->send_data(&input_size, sizeof(input_size)) &&
+                  ctx->download_sock->send_data(&request, sizeof(request));
+    const auto t_request_send_end = clock::now();
 
-        uint64_t output_size = 0;
-        const auto t_response_header_recv_begin = clock::now();
-        if (status) {
-            status = ctx->download_sock->recv_data(&output_size, sizeof(output_size)) && output_size == size;
-        }
-        const auto t_response_header_recv_end = clock::now();
+    uint64_t output_size = 0;
+    const auto t_response_header_recv_begin = clock::now();
+    if (status) {
+        status = ctx->download_sock->recv_data(&output_size, sizeof(output_size)) && output_size == size;
+    }
+    const auto t_response_header_recv_end = clock::now();
+    if (status && callback != nullptr) {
+        callback(user_data);
+    }
 
-        const auto t_response_body_recv_begin = clock::now();
-        if (status) {
-            status = ctx->download_sock->recv_data(data, size);
-        }
-        const auto t_response_body_recv_end = clock::now();
-        rpc_lock.unlock();
-        const auto t_tensor_get_end = clock::now();
+    const auto t_response_body_recv_begin = clock::now();
+    if (status) {
+        status = ctx->download_sock->recv_data(data, size);
+    }
+    const auto t_response_body_recv_end = clock::now();
+    rpc_lock.unlock();
+    const auto t_tensor_get_end = clock::now();
 
+    if (trace_get) {
         auto relative_us = [&](const clock::time_point time) {
             return std::chrono::duration_cast<std::chrono::microseconds>(time - t_tensor_get_begin).count();
         };
@@ -867,6 +874,12 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             "[RPC_GET_CLIENT_TIMELINE] rpc_id=0x%" PRIx64 " payload_mib_s=%.2f\n",
             request.tensor.id, payload_mib_s);
     }
+    return status;
+}
+
+static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    const bool status = ggml_backend_rpc_buffer_get_tensor_impl(
+        buffer, tensor, data, offset, size, nullptr, nullptr);
     RPC_STATUS_ASSERT(status);
     GGML_LOG_INFO(
         "[RPC_RECV_TENSOR] name=\"%s\" type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
@@ -876,6 +889,20 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
         offset,
         size);
+}
+
+void ggml_backend_rpc_tensor_get_with_snapshot(
+        const ggml_tensor * tensor,
+        void * data,
+        size_t offset,
+        size_t size,
+        ggml_backend_rpc_snapshot_callback callback,
+        void * user_data) {
+    GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr);
+    GGML_ASSERT(ggml_backend_buffer_is_rpc(tensor->buffer));
+    const bool status = ggml_backend_rpc_buffer_get_tensor_impl(
+        tensor->buffer, tensor, data, offset, size, callback, user_data);
+    RPC_STATUS_ASSERT(status);
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {

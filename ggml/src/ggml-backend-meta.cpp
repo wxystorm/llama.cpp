@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1921,7 +1922,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
-    static constexpr size_t n_pipeline_chunks = 2;
+    static constexpr size_t n_pipeline_chunks = 1;
 
     struct chunk_config {
         size_t token_start = 0;
@@ -2742,7 +2743,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Compute completion is a dependency of each transfer task, so its
     // ACK/synchronize does not block the scheduler thread.
     auto transfer_one = [&](const reduce_transfer & transfer, const size_t chunk,
-                            const auto & trace_event) -> ggml_status {
+                            const auto & trace_event,
+                            ggml_backend_rpc_snapshot_callback snapshot_callback,
+                            void * snapshot_user_data) -> ggml_status {
         auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
         auto & bcj_dst = backend_ctx->backend_configs[transfer.j_dst];
         const size_t nbytes = ggml_nbytes(transfer.node_src);
@@ -2763,7 +2766,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
             trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
+            if (ggml_backend_is_rpc(bcj_src.backend) && snapshot_callback != nullptr) {
+                ggml_backend_rpc_tensor_get_with_snapshot(
+                    transfer.node_src, transfer.node_tmp->data, 0, nbytes,
+                    snapshot_callback, snapshot_user_data);
+            } else {
+                ggml_backend_tensor_get(transfer.node_src, transfer.node_tmp->data, 0, nbytes);
+            }
             trace_event("src_tensor_get_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         } else {
             trace_event("buffer_copy_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
@@ -3040,9 +3049,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
 
                         const reduce_transfer & transfer = reduce_states[task.chunk].transfers[task.transfer_index];
+                        bool outgoing_released = false;
+                        std::function<void()> notify_snapshot = [&]() {
+                            std::lock_guard<std::mutex> lock(scheduler_mutex);
+                            outgoing_released = true;
+                            outgoing_done[task.chunk][transfer.j_src] = true;
+                            trace_event("snapshot_ready", task.chunk, transfer.j_src, transfer.j_dst,
+                                        ggml_nbytes(transfer.node_src));
+                            enqueue_add_locked(task.chunk, transfer.j_src);
+                            scheduler_cv.notify_all();
+                        };
+                        auto snapshot_callback = [](void * user_data) {
+                            (*static_cast<std::function<void()> *>(user_data))();
+                        };
                         trace_event("transfer_begin", task.chunk, transfer.j_src, transfer.j_dst,
                                     ggml_nbytes(transfer.node_src));
-                        const ggml_status status = transfer_one(transfer, task.chunk, trace_event);
+                        const ggml_status status = transfer_one(
+                            transfer, task.chunk, trace_event,
+                            snapshot_callback, &notify_snapshot);
                         trace_event("transfer_end", task.chunk, transfer.j_src, transfer.j_dst,
                                     ggml_nbytes(transfer.node_src));
 
@@ -3052,7 +3076,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             return;
                         }
                         incoming_done[task.chunk][transfer.j_dst] = true;
-                        outgoing_done[task.chunk][transfer.j_src] = true;
+                        if (!outgoing_released) {
+                            outgoing_done[task.chunk][transfer.j_src] = true;
+                        }
                         enqueue_add_locked(task.chunk, transfer.j_dst);
                         enqueue_add_locked(task.chunk, transfer.j_src);
                         scheduler_cv.notify_all();
