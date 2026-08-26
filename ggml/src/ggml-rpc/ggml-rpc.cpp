@@ -293,7 +293,8 @@ struct ggml_backend_rpc_context {
 };
 
 struct ggml_backend_rpc_buffer_context {
-    std::shared_ptr<socket_t> sock;
+    std::shared_ptr<socket_t> upload_sock;
+    std::shared_ptr<socket_t> download_sock;
     void * base_ptr;
     uint64_t remote_ptr;
 };
@@ -464,7 +465,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 enum rpc_channel {
     compute,
-    transfer,
+    upload,
+    download,
 };
 // 重新写一个
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint, enum rpc_channel channel) {
@@ -509,7 +511,7 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     }
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+    bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -571,7 +573,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -586,7 +588,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
         request.offset = offset;
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         // 发送的信息和接收的信息打印,比如发送接收多少字节
         //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes, received %zu bytes\n", sizeof(request), sizeof(response));
         RPC_STATUS_ASSERT(status);
@@ -602,7 +604,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     //GGML_LOG_INFO("ggml_backend_rpc_buffer_set_tensor: sent %zu bytes\n", input.size());
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
 }
 */
@@ -663,7 +665,7 @@ ggml_backend_rpc_set_tensor_from_local_file_2d(
     rpc_msg_set_tensor_from_local_file_rsp response {};
 
     const bool status = send_rpc_cmd(
-        ctx->sock,
+        ctx->upload_sock,
         RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
         &request,
         sizeof(request),
@@ -722,7 +724,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
         rpc_msg_set_tensor_hash_rsp response {};
 
         const bool status = send_rpc_cmd(
-            ctx->sock,
+            ctx->upload_sock,
             RPC_CMD_SET_TENSOR_HASH,
             &request,
             sizeof(request),
@@ -775,7 +777,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
     }
 
     const bool status = send_rpc_cmd(
-        ctx->sock,
+        ctx->upload_sock,
         RPC_CMD_SET_TENSOR,
         input.data(),
         input.size(),
@@ -787,7 +789,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
     delete ctx;
 }
@@ -805,32 +807,32 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
     bool status = false;
     if (!trace_get) {
-        status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+        status = send_rpc_cmd(ctx->download_sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     } else {
         using clock = std::chrono::steady_clock;
         const auto t_tensor_get_begin = clock::now();
         const auto t_lock_wait_begin = clock::now();
-        std::unique_lock<std::mutex> rpc_lock(ctx->sock->rpc_mutex());
+        std::unique_lock<std::mutex> rpc_lock(ctx->download_sock->rpc_mutex());
         const auto t_lock_acquired = clock::now();
 
         const uint8_t cmd = RPC_CMD_GET_TENSOR;
         const size_t input_size = sizeof(request);
         const auto t_request_send_begin = clock::now();
-        status = ctx->sock->send_data(&cmd, sizeof(cmd)) &&
-                 ctx->sock->send_data(&input_size, sizeof(input_size)) &&
-                 ctx->sock->send_data(&request, sizeof(request));
+        status = ctx->download_sock->send_data(&cmd, sizeof(cmd)) &&
+                 ctx->download_sock->send_data(&input_size, sizeof(input_size)) &&
+                 ctx->download_sock->send_data(&request, sizeof(request));
         const auto t_request_send_end = clock::now();
 
         uint64_t output_size = 0;
         const auto t_response_header_recv_begin = clock::now();
         if (status) {
-            status = ctx->sock->recv_data(&output_size, sizeof(output_size)) && output_size == size;
+            status = ctx->download_sock->recv_data(&output_size, sizeof(output_size)) && output_size == size;
         }
         const auto t_response_header_recv_end = clock::now();
 
         const auto t_response_body_recv_begin = clock::now();
         if (status) {
-            status = ctx->sock->recv_data(data, size);
+            status = ctx->download_sock->recv_data(data, size);
         }
         const auto t_response_body_recv_end = clock::now();
         rpc_lock.unlock();
@@ -883,7 +885,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
-        if (src_ctx->sock != dst_ctx->sock) {
+        if (src_ctx->upload_sock != dst_ctx->upload_sock) {
             return false;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -891,7 +893,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         request.src = serialize_tensor(src);
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+        bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
         return response.result;
     }
@@ -901,7 +903,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    bool status = send_rpc_cmd(ctx->upload_sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -928,13 +930,15 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
-    auto sock = get_socket(buft_ctx->endpoint, transfer);
-    bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+    auto upload_sock = get_socket(buft_ctx->endpoint, upload);
+    auto download_sock = get_socket(buft_ctx->endpoint, download);
+    RPC_STATUS_ASSERT(upload_sock != nullptr && download_sock != nullptr);
+    bool status = send_rpc_cmd(upload_sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{upload_sock, download_sock, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -982,7 +986,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-        auto sock = get_socket(buft_ctx->endpoint, transfer);
+        auto sock = get_socket(buft_ctx->endpoint, upload);
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -1135,7 +1139,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         // The response is empty, but receiving its header is the cross-connection
-        // completion fence used by the transfer connection.
+        // completion fence used by the transfer connections.
         bool status = send_rpc_cmd(rpc_ctx->compute_sock, RPC_CMD_GRAPH_COMPUTE,
                                    input.data(), input.size(), nullptr, 0);
         // 打印发送和接收的字节数，计算图
@@ -1173,7 +1177,7 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     if (it != buft_map.end()) {
         return it->second;
     }
-    auto sock = get_socket(endpoint, transfer);
+    auto sock = get_socket(endpoint, upload);
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return nullptr;
@@ -1235,7 +1239,7 @@ static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t d
 }
 
 void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total) {
-    auto sock = get_socket(endpoint, transfer);
+    auto sock = get_socket(endpoint, upload);
     if (sock == nullptr) {
         *free = 0;
         *total = 0;
@@ -3462,7 +3466,7 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
 }
 
 static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
-    auto sock = get_socket(endpoint, transfer);
+    auto sock = get_socket(endpoint, upload);
     if (sock == nullptr) {
         GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
         return 0;

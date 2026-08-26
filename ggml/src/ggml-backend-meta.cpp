@@ -1921,7 +1921,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
-    static constexpr size_t n_pipeline_chunks = 3;
+    static constexpr size_t n_pipeline_chunks = 2;
 
     struct chunk_config {
         size_t token_start = 0;
@@ -2739,8 +2739,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
-    // One transfer worker owns this path. Compute completion is a dependency of the
-    // transfer task, so its ACK/synchronize does not block the scheduler thread.
+    // Compute completion is a dependency of each transfer task, so its
+    // ACK/synchronize does not block the scheduler thread.
     auto transfer_one = [&](const reduce_transfer & transfer, const size_t chunk,
                             const auto & trace_event) -> ggml_status {
         auto & bcj_src = backend_ctx->backend_configs[transfer.j_src];
@@ -2905,7 +2905,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::condition_variable scheduler_cv;
                 std::array<std::deque<compute_task>, 2> compute_queues;
                 std::array<std::deque<compute_task>, 2> add_queues;
-                std::deque<transfer_task> transfer_queue;
+                std::array<std::deque<transfer_task>, 2> transfer_queues;
                 std::array<std::array<bool, 2>, n_chunks> compute_done = {};
                 std::array<std::array<bool, 2>, n_chunks> incoming_done = {};
                 std::array<std::array<bool, 2>, n_chunks> outgoing_done = {};
@@ -3011,24 +3011,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             const reduce_transfer & transfer = reduce_states[task.chunk].transfers[transfer_index];
                             trace_event("transfer_ready", task.chunk, transfer.j_src, transfer.j_dst,
                                         ggml_nbytes(transfer.node_src));
-                            transfer_queue.push_back({task.chunk, transfer_index});
+                            transfer_queues[transfer.j_src].push_back({task.chunk, transfer_index});
                             enqueue_add_locked(task.chunk, backend_index);
                         }
                         scheduler_cv.notify_all();
                     }
                 };
 
-                auto transfer_worker = [&]() {
+                auto transfer_worker = [&](const size_t direction) {
                     while (true) {
                         transfer_task task;
                         {
                             std::unique_lock<std::mutex> lock(scheduler_mutex);
                             scheduler_cv.wait(lock, [&]() {
-                                return stopping || !transfer_queue.empty();
+                                return stopping || !transfer_queues[direction].empty();
                             });
                             if (stopping) {
                                 return;
                             }
+                            auto & transfer_queue = transfer_queues[direction];
                             const auto pos = std::min_element(
                                 transfer_queue.begin(), transfer_queue.end(),
                                 [](const transfer_task & a, const transfer_task & b) {
@@ -3062,13 +3063,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     std::thread(compute_worker, 0),
                     std::thread(compute_worker, 1),
                 };
-                std::thread transfer_thread(transfer_worker);
+                std::array<std::thread, 2> transfer_threads = {
+                    std::thread(transfer_worker, 0),
+                    std::thread(transfer_worker, 1),
+                };
                 scheduler_cv.notify_all();
 
                 for (std::thread & thread : compute_threads) {
                     thread.join();
                 }
-                transfer_thread.join();
+                for (std::thread & thread : transfer_threads) {
+                    thread.join();
+                }
 
                 if (pipeline_status != GGML_STATUS_SUCCESS) {
                     return pipeline_status;
