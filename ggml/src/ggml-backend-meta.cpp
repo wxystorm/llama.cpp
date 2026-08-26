@@ -33,6 +33,20 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+static bool ggml_backend_meta_local_check_name(const char * name) {
+    return name != nullptr &&
+        (strstr(name, "ffn_down.weight") != nullptr || strstr(name, "ffn_out.weight") != nullptr);
+}
+
+static uint64_t ggml_backend_meta_fnv1a_update(uint64_t hash, const uint8_t * data, size_t size) {
+    static constexpr uint64_t fnv_prime = 0x100000001b3ULL;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= fnv_prime;
+    }
+    return hash;
+}
+
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1500,6 +1514,28 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
             switch (result) {
                 case GGML_BACKEND_LOCAL_FILE_HANDLED: {
+                    static std::atomic<size_t> local_check_count(0);
+                    const bool trace_local_check = ggml_backend_meta_local_check_name(tensor->name) &&
+                        local_check_count.fetch_add(1) < 4;
+                    if (trace_local_check) {
+                        uint64_t hash = 0xcbf29ce484222325ULL;
+                        const uint8_t * input = static_cast<const uint8_t *>(data);
+                        for (uint64_t i = 0; i < n_copies; ++i) {
+                            hash = ggml_backend_meta_fnv1a_update(
+                                hash,
+                                input + offset_j + static_cast<size_t>(i) * chunk_size_full,
+                                chunk_size_j);
+                        }
+                        GGML_LOG_INFO(
+                            "[LOCAL_CHECK_CLIENT] name=\"%s\" backend=%zu axis=%d full_ne0=%" PRId64
+                            " simple_ne0=%" PRId64 " offset_j=%zu chunk_size_full=%zu chunk_size_j=%zu"
+                            " src_offset=%" PRIu64 " dst_offset=%" PRIu64 " copy_size=%" PRIu64
+                            " n_copies=%" PRIu64 " src_stride=%" PRIu64 " dst_stride=%" PRIu64
+                            " hash=0x%016" PRIx64 "\n",
+                            tensor->name, j, split_state.axis, tensor->ne[0], simple_tensor->ne[0],
+                            offset_j, chunk_size_full, chunk_size_j, src_offset, dst_offset, copy_size,
+                            n_copies, src_stride, dst_stride, hash);
+                    }
                     /*
                      * RPC 服务端已经从本地 GGUF 读取并写入，
                      * 不再发送 data 中的权重。

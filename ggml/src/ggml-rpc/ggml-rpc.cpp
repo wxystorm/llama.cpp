@@ -30,6 +30,11 @@ static bool is_pipeline_chunk_tensor_name(const char * name) {
     return name != nullptr && strstr(name, ".chunk.") != nullptr;
 }
 
+static bool is_local_check_tensor_name(const char * name) {
+    return name != nullptr &&
+        (strstr(name, "ffn_down.weight") != nullptr || strstr(name, "ffn_out.weight") != nullptr);
+}
+
 
 namespace fs = std::filesystem;
 
@@ -295,16 +300,18 @@ struct ggml_backend_rpc_buffer_context {
 
 // RPC helper functions
 
-// Computes FNV-1a hash of the data
-static uint64_t fnv_hash(const uint8_t * data, size_t len) {
+static uint64_t fnv_hash_update(uint64_t hash, const uint8_t * data, size_t len) {
     const uint64_t fnv_prime = 0x100000001b3ULL;
-    uint64_t hash = 0xcbf29ce484222325ULL;
-
     for (size_t i = 0; i < len; ++i) {
         hash ^= data[i];
         hash *= fnv_prime;
     }
     return hash;
+}
+
+// Computes FNV-1a hash of the data
+static uint64_t fnv_hash(const uint8_t * data, size_t len) {
+    return fnv_hash_update(0xcbf29ce484222325ULL, data, len);
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
@@ -1963,6 +1970,11 @@ bool rpc_server::set_tensor_from_local_file(
         request.tensor.name,
         name_len);
 
+    static std::atomic<size_t> local_check_count(0);
+    const bool trace_local_check = is_local_check_tensor_name(name.c_str()) &&
+        local_check_count.fetch_add(1) < 4;
+    uint64_t local_check_hash = 0xcbf29ce484222325ULL;
+
     /*
      * 空操作。
      *
@@ -2143,6 +2155,10 @@ bool rpc_server::set_tensor_from_local_file(
             return false;
         }
 
+        if (trace_local_check) {
+            local_check_hash = fnv_hash_update(local_check_hash, staging.data(), staging.size());
+        }
+
         /*
          * tensor->data 已经是远端目标张量基址。
          * dst_i 是相对于该基址的目标偏移。
@@ -2152,6 +2168,15 @@ bool rpc_server::set_tensor_from_local_file(
             staging.data(),
             static_cast<size_t>(dst_i),
             staging.size());
+    }
+
+    if (trace_local_check) {
+        GGML_LOG_INFO(
+            "[LOCAL_CHECK_SERVER] name=\"%s\" src_offset=%" PRIu64 " dst_offset=%" PRIu64
+            " copy_size=%" PRIu64 " n_copies=%" PRIu64 " src_stride=%" PRIu64
+            " dst_stride=%" PRIu64 " hash=0x%016" PRIx64 "\n",
+            name.c_str(), request.src_offset, request.dst_offset, request.copy_size,
+            request.n_copies, request.src_stride, request.dst_stride, local_check_hash);
     }
 
     GGML_LOG_DEBUG(
