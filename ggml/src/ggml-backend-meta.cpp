@@ -2766,8 +2766,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             trace_event("dst_tensor_set_end", chunk, transfer.j_src, transfer.j_dst, nbytes);
         } else if (ggml_backend_buffer_is_host(transfer.node_tmp->buffer)) {
             trace_event("src_tensor_get_begin", chunk, transfer.j_src, transfer.j_dst, nbytes);
-            if (ggml_backend_is_rpc(bcj_src.backend) && snapshot_callback != nullptr) {
-                ggml_backend_rpc_tensor_get_with_snapshot(
+            ggml_backend_rpc_tensor_get_with_snapshot_t rpc_get_with_snapshot = nullptr;
+            if (snapshot_callback != nullptr) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(bcj_src.backend));
+                rpc_get_with_snapshot = reinterpret_cast<ggml_backend_rpc_tensor_get_with_snapshot_t>(
+                    ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_GET_WITH_SNAPSHOT_PROC));
+            }
+            if (rpc_get_with_snapshot != nullptr) {
+                rpc_get_with_snapshot(
                     transfer.node_src, transfer.node_tmp->data, 0, nbytes,
                     snapshot_callback, snapshot_user_data);
             } else {

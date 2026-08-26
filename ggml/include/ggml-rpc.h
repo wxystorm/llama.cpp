@@ -66,6 +66,17 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
 typedef void (*ggml_backend_rpc_snapshot_callback)(void * user_data);
 
+#define GGML_BACKEND_RPC_GET_WITH_SNAPSHOT_PROC \
+    "ggml_backend_rpc_tensor_get_with_snapshot"
+
+typedef void (*ggml_backend_rpc_tensor_get_with_snapshot_t)(
+        const struct ggml_tensor * tensor,
+        void * data,
+        size_t offset,
+        size_t size,
+        ggml_backend_rpc_snapshot_callback callback,
+        void * user_data);
+
 GGML_BACKEND_API void ggml_backend_rpc_tensor_get_with_snapshot(
         const struct ggml_tensor * tensor,
         void * data,

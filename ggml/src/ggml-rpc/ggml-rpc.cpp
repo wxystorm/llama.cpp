@@ -3469,6 +3469,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_from_local_file_2d);
     }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_WITH_SNAPSHOT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_tensor_get_with_snapshot);
+    }
 
     GGML_UNUSED(reg);
 
