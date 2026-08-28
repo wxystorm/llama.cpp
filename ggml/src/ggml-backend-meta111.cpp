@@ -5,7 +5,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
-
+// 8.26
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,20 +33,6 @@ struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
-
-static bool ggml_backend_meta_local_check_name(const char * name) {
-    return name != nullptr &&
-        (strstr(name, "ffn_down.weight") != nullptr || strstr(name, "ffn_out.weight") != nullptr);
-}
-
-static uint64_t ggml_backend_meta_fnv1a_update(uint64_t hash, const uint8_t * data, size_t size) {
-    static constexpr uint64_t fnv_prime = 0x100000001b3ULL;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= data[i];
-        hash *= fnv_prime;
-    }
-    return hash;
-}
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
@@ -1255,6 +1241,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
         simple_tensors.push_back(t_ij);
     }
+
     // If one of the sources has a zero-sized slice, disable the computation:
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i] == nullptr || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
@@ -1514,28 +1501,6 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
             switch (result) {
                 case GGML_BACKEND_LOCAL_FILE_HANDLED: {
-                    static std::atomic<size_t> local_check_count(0);
-                    const bool trace_local_check = ggml_backend_meta_local_check_name(tensor->name) &&
-                        local_check_count.fetch_add(1) < 4;
-                    if (trace_local_check) {
-                        uint64_t hash = 0xcbf29ce484222325ULL;
-                        const uint8_t * input = static_cast<const uint8_t *>(data);
-                        for (uint64_t i = 0; i < n_copies; ++i) {
-                            hash = ggml_backend_meta_fnv1a_update(
-                                hash,
-                                input + offset_j + static_cast<size_t>(i) * chunk_size_full,
-                                chunk_size_j);
-                        }
-                        GGML_LOG_INFO(
-                            "[LOCAL_CHECK_CLIENT] name=\"%s\" backend=%zu axis=%d full_ne0=%" PRId64
-                            " simple_ne0=%" PRId64 " offset_j=%zu chunk_size_full=%zu chunk_size_j=%zu"
-                            " src_offset=%" PRIu64 " dst_offset=%" PRIu64 " copy_size=%" PRIu64
-                            " n_copies=%" PRIu64 " src_stride=%" PRIu64 " dst_stride=%" PRIu64
-                            " hash=0x%016" PRIx64 "\n",
-                            tensor->name, j, split_state.axis, tensor->ne[0], simple_tensor->ne[0],
-                            offset_j, chunk_size_full, chunk_size_j, src_offset, dst_offset, copy_size,
-                            n_copies, src_stride, dst_stride, hash);
-                    }
                     /*
                      * RPC 服务端已经从本地 GGUF 读取并写入，
                      * 不再发送 data 中的权重。
@@ -1921,42 +1886,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
-    static constexpr size_t max_pipeline_chunks = 3;
-    static constexpr size_t configured_pipeline_chunks = max_pipeline_chunks;
-
-    struct pipeline_adaptive_state {
-        enum mode_t {
-            CONSERVATIVE,
-            BALANCED,
-            AGGRESSIVE,
-        } mode = BALANCED;
-
-        double compute1_ewma = 0.0;
-        double down_tail_ewma = 0.0;
-        double wall_ewma = 0.0;
-        size_t sample_count = 0;
-        int pressure_streak = 0;
-        int healthy_streak = 0;
-        bool initial_logged = false;
-
-        size_t chunks() const {
-            switch (mode) {
-                case CONSERVATIVE: return 1;
-                case BALANCED:     return 2;
-                case AGGRESSIVE:   return 3;
-            }
-            GGML_ABORT("invalid pipeline adaptive mode");
-        }
-
-        static const char * mode_name(mode_t value) {
-            switch (value) {
-                case CONSERVATIVE: return "CONSERVATIVE";
-                case BALANCED:     return "BALANCED";
-                case AGGRESSIVE:   return "AGGRESSIVE";
-            }
-            return "UNKNOWN";
-        }
-    } pipeline_adaptive;
+    static constexpr size_t n_pipeline_chunks = 3;
 
     struct chunk_config {
         size_t token_start = 0;
@@ -1974,11 +1904,8 @@ struct ggml_backend_meta_context {
         int           offset      = 0; // Node offset vs. original graph
 
         bool pipeline_chunks = false;
-        size_t n_pipeline_tokens = 0;
-        size_t n_pipeline_chunks = 0;
-        std::string pipeline_tensor_name;
         ggml_cgraph cgraph_prefix = {};
-        std::array<chunk_config, max_pipeline_chunks> chunks = {};
+        std::array<chunk_config, n_pipeline_chunks> chunks = {};
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -1990,7 +1917,7 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
-            bufs.resize(n_reduce_steps * max_pipeline_chunks);
+            bufs.resize(n_reduce_steps * n_pipeline_chunks);
         }
     };
     std::string                 name;
@@ -2386,8 +2313,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
             // One FFN subgraph can replace one full-tensor reduction with multiple chunk reductions.
-            //const size_t max_reduce_calls = backend_ctx->max_subgraphs + ggml_backend_meta_context::max_pipeline_chunks - 1;
-            const size_t max_reduce_calls = backend_ctx->max_subgraphs * ggml_backend_meta_context::max_pipeline_chunks;
+            //const size_t max_reduce_calls = backend_ctx->max_subgraphs + ggml_backend_meta_context::n_pipeline_chunks - 1;
+            const size_t max_reduce_calls = backend_ctx->max_subgraphs * ggml_backend_meta_context::n_pipeline_chunks;
             const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
@@ -2464,12 +2391,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const bool is_partial = ggml_backend_meta_get_split_state(
                     cgraph->nodes[i_node_stop - 1], /*assume_sync =*/ false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 const bool name_matches = strncmp(output0->name, "ffn_out-", 8) == 0;
-                const size_t n_tokens = output0->ne[1];
-                const size_t active_chunks = ggml_backend_meta_context::configured_pipeline_chunks;
                 const bool shape_matches = output0->op == GGML_OP_MUL_MAT && output0->type == GGML_TYPE_F32 &&
                     input0 != nullptr && output0->src[0] != nullptr && output0->src[0]->ne[0] == input0->ne[0] &&
                     output0->ne[0] == output0->src[0]->ne[1] && output0->ne[1] == input0->ne[1] &&
-                    output0->ne[1] >= (int64_t) active_chunks &&
+                    output0->ne[1] >= (int64_t) ggml_backend_meta_context::n_pipeline_chunks &&
                     output0->ne[2] == 1 && output0->ne[3] == 1 && input0->ne[2] == 1 && input0->ne[3] == 1 &&
                     ggml_is_contiguous(output0) && ggml_is_contiguous(input0);
                 if (!is_partial || !name_matches || !shape_matches) {
@@ -2491,6 +2416,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
 
+                const size_t n_tokens = output0->ne[1];
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & config = backend_ctx->backend_configs[j].cgraphs[i_graph];
                     ggml_cgraph * main = config.cgraph_main;
@@ -2498,19 +2424,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_tensor * input  = output->src[1];
 
                     config.pipeline_chunks = true;
-                    config.n_pipeline_tokens = n_tokens;
-                    config.n_pipeline_chunks = active_chunks;
-                    config.pipeline_tensor_name = output->name;
                     config.cgraph_prefix = ggml_graph_view(main, 0, main->n_nodes - 1);
 
                     size_t token_start = 0;
-                    const size_t tokens_per_chunk = n_tokens / active_chunks;
-                    const size_t remainder = n_tokens % active_chunks;
-                    for (size_t i_chunk = 0; i_chunk < active_chunks; i_chunk++) {
+                    const size_t tokens_per_chunk = n_tokens / ggml_backend_meta_context::n_pipeline_chunks;
+                    const size_t remainder = n_tokens % ggml_backend_meta_context::n_pipeline_chunks;
+                    for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
                         auto & chunk = config.chunks[i_chunk];
                         chunk.token_start = token_start;
                         chunk.n_tokens = tokens_per_chunk +
-                            (i_chunk + 1 == active_chunks ? remainder : 0);
+                            (i_chunk + 1 == ggml_backend_meta_context::n_pipeline_chunks ? remainder : 0);
 
                         chunk.input = *input;
                         chunk.input.op = GGML_OP_NONE;
@@ -2555,7 +2478,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 pipeline_configured = false;
                 GGML_LOG_INFO("[META_PIPELINE] subgraph=%zu tensor=%s tokens=%zu chunks=%zu\n",
-                    i_graph, output0->name, n_tokens, active_chunks);
+                    i_graph, output0->name, n_tokens, ggml_backend_meta_context::n_pipeline_chunks);
             }
         }
     }
@@ -2781,8 +2704,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
-    // Compute completion is a dependency of each transfer task, so its
-    // ACK/synchronize does not block the scheduler thread.
+    // One transfer worker owns this path. Compute completion is a dependency of the
+    // transfer task, so its ACK/synchronize does not block the scheduler thread.
     auto transfer_one = [&](const reduce_transfer & transfer, const size_t chunk,
                             const auto & trace_event,
                             ggml_backend_rpc_snapshot_callback snapshot_callback,
@@ -2855,59 +2778,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     static constexpr bool enable_pipeline_chunks = true;
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        auto & pipeline_config = backend_ctx->backend_configs[0].cgraphs[i];
-        const bool pipeline_chunks = pipeline_config.pipeline_chunks;
+        const bool pipeline_chunks = backend_ctx->backend_configs[0].cgraphs[i].pipeline_chunks;
         // 该
         if (pipeline_chunks && enable_pipeline_chunks) {
-            auto & adaptive = backend_ctx->pipeline_adaptive;
-            const size_t n_chunks = std::min(adaptive.chunks(), pipeline_config.n_pipeline_tokens);
-            if (!adaptive.initial_logged) {
-                GGML_LOG_ERROR("[META_ADAPT] init state=%s chunks=%zu\n",
-                    ggml_backend_meta_context::pipeline_adaptive_state::mode_name(adaptive.mode), n_chunks);
-                adaptive.initial_logged = true;
-            }
-
             for (size_t j = 0; j < n_backends; j++) {
                 auto & config = backend_ctx->backend_configs[j].cgraphs[i];
-                ggml_tensor * output = config.cgraph_main->nodes[config.cgraph_main->n_nodes - 1];
-                ggml_tensor * input = output->src[1];
-                size_t token_start = 0;
-                const size_t tokens_per_chunk = config.n_pipeline_tokens / n_chunks;
-                const size_t remainder = config.n_pipeline_tokens % n_chunks;
-                config.n_pipeline_chunks = n_chunks;
-                for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
-                    auto & chunk = config.chunks[i_chunk];
-                    chunk.token_start = token_start;
-                    chunk.n_tokens = tokens_per_chunk + (i_chunk + 1 == n_chunks ? remainder : 0);
-
-                    chunk.input = *input;
-                    chunk.input.op = GGML_OP_NONE;
-                    memset(chunk.input.src, 0, sizeof(chunk.input.src));
-                    chunk.input.view_src = nullptr;
-                    chunk.input.view_offs = 0;
-                    chunk.input.ne[1] = chunk.n_tokens;
-                    chunk.input.nb[2] = chunk.input.nb[1] * chunk.n_tokens;
-                    chunk.input.nb[3] = chunk.input.nb[2];
-                    chunk.input.data = (char *) input->data + token_start * input->nb[1];
-                    snprintf(chunk.input.name, sizeof(chunk.input.name), "%.48s.in.%zu", input->name, i_chunk);
-
-                    chunk.output = *output;
-                    memset(chunk.output.src, 0, sizeof(chunk.output.src));
-                    chunk.output.src[0] = output->src[0];
-                    chunk.output.src[1] = &chunk.input;
-                    chunk.output.view_src = nullptr;
-                    chunk.output.view_offs = 0;
-                    chunk.output.ne[1] = chunk.n_tokens;
-                    chunk.output.nb[2] = chunk.output.nb[1] * chunk.n_tokens;
-                    chunk.output.nb[3] = chunk.output.nb[2];
-                    chunk.output.data = (char *) output->data + token_start * output->nb[1];
-                    snprintf(chunk.output.name, sizeof(chunk.output.name), "%.48s.chunk.%zu", output->name, i_chunk);
-                    chunk.nodes[0] = &chunk.output;
-                    chunk.cgraph.nodes = chunk.nodes.data();
-
-                    token_start += chunk.n_tokens;
-                }
-                GGML_ASSERT(token_start == config.n_pipeline_tokens);
                 if (config.cgraph_prefix.n_nodes == 0) {
                     continue;
                 }
@@ -2925,7 +2800,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 backend_ctx->backend_configs[0].backend->iface.cpy_tensor_async == nullptr &&
                 backend_ctx->backend_configs[1].backend->iface.cpy_tensor_async == nullptr;
             if (!threaded_chunk_reduce) {
-                for (size_t i_chunk = 0; i_chunk < pipeline_config.n_pipeline_chunks; i_chunk++) {
+                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::n_pipeline_chunks; i_chunk++) {
                     std::vector<ggml_tensor *> nodes;
                     nodes.reserve(n_backends);
                     for (size_t j = 0; j < n_backends; j++) {
@@ -2953,11 +2828,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     int64_t      time_us;
                 };
 
-                const size_t n_tokens = pipeline_config.n_pipeline_tokens;
-                static std::atomic<uint64_t> pipeline_invocation_id(0);
                 static std::atomic<bool> pipeline_trace_claimed(false);
-                const uint64_t invocation_id = pipeline_invocation_id.fetch_add(1);
-                const bool trace_pipeline = n_tokens >= 32 && !pipeline_trace_claimed.exchange(true);
+                const bool trace_pipeline = !pipeline_trace_claimed.exchange(true);
                 const auto trace_start = std::chrono::steady_clock::now();
                 std::mutex trace_mutex;
                 std::vector<pipeline_trace_event> trace_events;
@@ -2973,6 +2845,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     trace_event(phase, chunk, SIZE_MAX, SIZE_MAX, 0);
                 };
 
+                static constexpr size_t n_chunks = ggml_backend_meta_context::n_pipeline_chunks;
+
                 struct compute_task {
                     size_t chunk = 0;
                     bool   add   = false;
@@ -2982,7 +2856,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     size_t transfer_index = 0;
                 };
 
-                std::array<reduce_state, ggml_backend_meta_context::max_pipeline_chunks> reduce_states;
+                std::array<reduce_state, n_chunks> reduce_states;
                 for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
                     std::vector<ggml_tensor *> nodes;
                     nodes.reserve(n_backends);
@@ -3009,10 +2883,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::array<std::deque<compute_task>, 2> compute_queues;
                 std::array<std::deque<compute_task>, 2> add_queues;
                 std::array<std::deque<transfer_task>, 2> transfer_queues;
-                std::array<std::array<bool, 2>, ggml_backend_meta_context::max_pipeline_chunks> compute_done = {};
-                std::array<std::array<bool, 2>, ggml_backend_meta_context::max_pipeline_chunks> incoming_done = {};
-                std::array<std::array<bool, 2>, ggml_backend_meta_context::max_pipeline_chunks> outgoing_done = {};
-                std::array<std::array<bool, 2>, ggml_backend_meta_context::max_pipeline_chunks> add_queued = {};
+                std::array<std::array<bool, 2>, n_chunks> compute_done = {};
+                std::array<std::array<bool, 2>, n_chunks> incoming_done = {};
+                std::array<std::array<bool, 2>, n_chunks> outgoing_done = {};
+                std::array<std::array<bool, 2>, n_chunks> add_queued = {};
                 size_t completed_adds = 0;
                 bool stopping = false;
                 ggml_status pipeline_status = GGML_STATUS_SUCCESS;
@@ -3143,15 +3017,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
 
                         const reduce_transfer & transfer = reduce_states[task.chunk].transfers[task.transfer_index];
-                        bool outgoing_released = false;
                         std::function<void()> notify_snapshot = [&]() {
-                            std::lock_guard<std::mutex> lock(scheduler_mutex);
-                            outgoing_released = true;
-                            outgoing_done[task.chunk][transfer.j_src] = true;
                             trace_event("snapshot_ready", task.chunk, transfer.j_src, transfer.j_dst,
                                         ggml_nbytes(transfer.node_src));
-                            enqueue_add_locked(task.chunk, transfer.j_src);
-                            scheduler_cv.notify_all();
                         };
                         auto snapshot_callback = [](void * user_data) {
                             (*static_cast<std::function<void()> *>(user_data))();
@@ -3170,9 +3038,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             return;
                         }
                         incoming_done[task.chunk][transfer.j_dst] = true;
-                        if (!outgoing_released) {
-                            outgoing_done[task.chunk][transfer.j_src] = true;
-                        }
+                        outgoing_done[task.chunk][transfer.j_src] = true;
                         enqueue_add_locked(task.chunk, transfer.j_dst);
                         enqueue_add_locked(task.chunk, transfer.j_src);
                         scheduler_cv.notify_all();
@@ -3200,13 +3066,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return pipeline_status;
                 }
 
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> compute_start = {};
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> transfer_ready = {};
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> transfer_start = {};
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> tensor_get_start = {};
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> snapshot_ready = {};
-                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> add_start = {};
-                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::max_pipeline_chunks; i_chunk++) {
+                static std::atomic<uint64_t> pipeline_invocation_id(0);
+                const uint64_t invocation_id = pipeline_invocation_id.fetch_add(1);
+                const ggml_cgraph * main = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                const ggml_tensor * output = main->nodes[main->n_nodes - 1];
+
+                std::array<std::array<int64_t, 2>, n_chunks> compute_start = {};
+                std::array<std::array<int64_t, 2>, n_chunks> transfer_ready = {};
+                std::array<std::array<int64_t, 2>, n_chunks> transfer_start = {};
+                std::array<std::array<int64_t, 2>, n_chunks> tensor_get_start = {};
+                std::array<std::array<int64_t, 2>, n_chunks> snapshot_ready = {};
+                std::array<std::array<int64_t, 2>, n_chunks> add_start = {};
+                for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
                     compute_start[i_chunk].fill(-1);
                     transfer_ready[i_chunk].fill(-1);
                     transfer_start[i_chunk].fill(-1);
@@ -3269,78 +3140,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 GGML_LOG_ERROR(
-                    "[META_PIPELINE_SUMMARY] id=%" PRIu64 " subgraph=%zu tensor=%s n_tokens=%zu chunks=%zu"
+                    "[META_PIPELINE_SUMMARY] id=%" PRIu64 " subgraph=%zu tensor=%s n_tokens=%" PRId64 " chunks=%zu"
                     " bytes_up=%" PRId64 " bytes_down=%" PRId64 " wall_us=%" PRId64
                     " compute0_us=%" PRId64 " compute1_us=%" PRId64
                     " upload_busy_us=%" PRId64 " download_busy_us=%" PRId64
                     " download_snapshot_us=%" PRId64 " download_tail_us=%" PRId64
                     " upload_queue_wait_us=%" PRId64 " download_queue_wait_us=%" PRId64
                     " add0_us=%" PRId64 " add1_us=%" PRId64 "\n",
-                    invocation_id, i, pipeline_config.pipeline_tensor_name.c_str(), n_tokens, n_chunks,
+                    invocation_id, i, output->name, output->ne[1], n_chunks,
                     transfer_bytes[0], transfer_bytes[1],
                     total_start >= 0 && total_end >= total_start ? total_end - total_start : 0,
-                    compute_us[0], compute_us[1], transfer_us[0], transfer_us[1], snapshot_us[1], tail_us[1], queue_wait_us[0], queue_wait_us[1],
-                    add_us[0], add_us[1]);
-
-                const int64_t wall_us = total_start >= 0 && total_end >= total_start ? total_end - total_start : 0;
-                const double qwait_ratio = (double) queue_wait_us[1] / std::max<double>(transfer_us[1], 1.0);
-                const bool has_baseline = adaptive.sample_count > 0;
-                const bool compute_bad = has_baseline && adaptive.compute1_ewma > 0.0 &&
-                    compute_us[1] > adaptive.compute1_ewma * 1.5;
-                const bool tail_bad = has_baseline && adaptive.down_tail_ewma > 0.0 &&
-                    tail_us[1] > adaptive.down_tail_ewma * 1.5;
-                const bool pressure = qwait_ratio > 0.5 || (compute_bad && tail_bad);
-                const bool tail_healthy = !has_baseline || adaptive.down_tail_ewma <= 0.0 ||
-                    tail_us[1] < adaptive.down_tail_ewma * 1.2;
-                const bool healthy = qwait_ratio < 0.25 && tail_healthy;
-
-                adaptive.pressure_streak = pressure ? adaptive.pressure_streak + 1 : 0;
-                adaptive.healthy_streak = healthy ? adaptive.healthy_streak + 1 : 0;
-
-                const auto previous_mode = adaptive.mode;
-                const char * reason = nullptr;
-                if (adaptive.pressure_streak >= 3 && adaptive.mode != ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE) {
-                    adaptive.mode = adaptive.mode == ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE ?
-                        ggml_backend_meta_context::pipeline_adaptive_state::BALANCED :
-                        ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE;
-                    reason = "pressure";
-                } else if (adaptive.healthy_streak >= 3 && adaptive.mode != ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE) {
-                    adaptive.mode = adaptive.mode == ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE ?
-                        ggml_backend_meta_context::pipeline_adaptive_state::BALANCED :
-                        ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE;
-                    reason = "healthy";
-                }
-
-                if (adaptive.mode != previous_mode) {
-                    GGML_LOG_ERROR(
-                        "[META_ADAPT] state=%s->%s chunks=%zu->%zu reason=%s qwait_ratio=%.3f"
-                        " download_tail_us=%" PRId64 " baseline_tail_us=%.0f compute1_us=%" PRId64
-                        " baseline_compute1_us=%.0f wall_us=%" PRId64 " pressure_streak=%d healthy_streak=%d\n",
-                        ggml_backend_meta_context::pipeline_adaptive_state::mode_name(previous_mode),
-                        ggml_backend_meta_context::pipeline_adaptive_state::mode_name(adaptive.mode),
-                        previous_mode == ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE ? 1 :
-                            previous_mode == ggml_backend_meta_context::pipeline_adaptive_state::BALANCED ? 2 : 3,
-                        adaptive.chunks(), reason, qwait_ratio, tail_us[1], adaptive.down_tail_ewma,
-                        compute_us[1], adaptive.compute1_ewma, wall_us,
-                        adaptive.pressure_streak, adaptive.healthy_streak);
-                    adaptive.pressure_streak = 0;
-                    adaptive.healthy_streak = 0;
-                }
-
-                if (!has_baseline || healthy) {
-                    constexpr double ewma_old = 0.8;
-                    constexpr double ewma_new = 1.0 - ewma_old;
-                    if (!has_baseline) {
-                        adaptive.compute1_ewma = compute_us[1];
-                        adaptive.down_tail_ewma = tail_us[1];
-                        adaptive.wall_ewma = wall_us;
-                    } else {
-                        adaptive.compute1_ewma = ewma_old * adaptive.compute1_ewma + ewma_new * compute_us[1];
-                        adaptive.down_tail_ewma = ewma_old * adaptive.down_tail_ewma + ewma_new * tail_us[1];
-                        adaptive.wall_ewma = ewma_old * adaptive.wall_ewma + ewma_new * wall_us;
-                    }
-                    adaptive.sample_count++;
-                }
+                    compute_us[0], compute_us[1], transfer_us[0], transfer_us[1], snapshot_us[1], tail_us[1],
+                    queue_wait_us[0], queue_wait_us[1], add_us[0], add_us[1]);
 
                 if (trace_pipeline) {
                     std::sort(trace_events.begin(), trace_events.end(), [](const pipeline_trace_event & a, const pipeline_trace_event & b) {

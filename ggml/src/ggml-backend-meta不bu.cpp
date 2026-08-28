@@ -2781,6 +2781,93 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // Experimental two-backend reduction topology:
+    //   backend 1 (RPC/phone) partial -> backend 0 (PC)
+    //   backend 0 performs the only ADD
+    //   backend 0 broadcasts the final reduced chunk back to backend 1
+    // This avoids executing the reduction ADD graph on the RPC backend.
+    struct root_reduce_state {
+        reduce_transfer reduce_to_pc;
+        reduce_transfer broadcast_to_phone;
+    };
+
+    [[maybe_unused]] auto prepare_reduce_to_pc = [&](
+            const std::vector<ggml_tensor *> & nodes,
+            root_reduce_state & state,
+            const size_t buffer_slot) -> ggml_status {
+        GGML_ASSERT(nodes.size() == n_backends);
+        GGML_ASSERT(n_backends == 2);
+
+        // Keep the same zero-slice behavior as the generic fallback path.
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = nodes[j];
+            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                continue;
+            }
+
+            ggml_tensor * node_zero = get_node_aux(node);
+            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->src[0] = node;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+            ggml_cgraph * zero_graph = get_cgraph_aux();
+            zero_graph->nodes[0] = node_zero;
+            zero_graph->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, zero_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
+        ggml_tensor * node_pc    = nodes[0];
+        ggml_tensor * node_phone = nodes[1];
+        GGML_ASSERT(ggml_is_contiguous(node_pc));
+        GGML_ASSERT(ggml_is_contiguous(node_phone));
+        GGML_ASSERT(ggml_nbytes(node_pc) == ggml_nbytes(node_phone));
+
+        // Phone/RPC partial is downloaded into a per-chunk PC temporary buffer.
+        ggml_tensor * node_tmp_pc = get_node_aux(node_pc);
+        set_tmp_data(node_tmp_pc, /*j = PC*/ 0, buffer_slot * backend_ctx->n_reduce_steps);
+
+        // The only reduction ADD runs on backend 0 and writes in-place to node_pc.
+        ggml_tensor * node_red_pc = get_node_aux(node_pc);
+        node_red_pc->view_src  = node_pc->view_src == nullptr ? node_pc : node_pc->view_src;
+        node_red_pc->view_offs = node_pc->view_offs;
+        node_red_pc->op        = GGML_OP_ADD;
+        node_red_pc->src[0]    = node_pc;
+        node_red_pc->src[1]    = node_tmp_pc;
+        node_red_pc->flags    |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_backend_view_init(node_red_pc);
+
+        ggml_cgraph * add_graph_pc = get_cgraph_aux();
+        add_graph_pc->nodes[0] = node_red_pc;
+        add_graph_pc->n_nodes  = 1;
+
+        state.reduce_to_pc = {
+            /* .j_src     = */ 1,
+            /* .j_dst     = */ 0,
+            /* .node_src  = */ node_phone,
+            /* .node_tmp  = */ node_tmp_pc,
+            /* .add_graph = */ add_graph_pc,
+        };
+
+        // After the PC ADD completes, node_pc contains the final reduced value.
+        // Broadcast it directly over the phone partial output; no RPC-side ADD is needed.
+        state.broadcast_to_phone = {
+            /* .j_src     = */ 0,
+            /* .j_dst     = */ 1,
+            /* .node_src  = */ node_pc,
+            /* .node_tmp  = */ node_phone,
+            /* .add_graph = */ nullptr,
+        };
+
+        return GGML_STATUS_SUCCESS;
+    };
+
     // Compute completion is a dependency of each transfer task, so its
     // ACK/synchronize does not block the scheduler thread.
     auto transfer_one = [&](const reduce_transfer & transfer, const size_t chunk,
@@ -2853,6 +2940,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     static constexpr bool enable_pipeline_chunks = true;
+    // A/B switch for the two-backend CPU/RPC chunk reduction topology.
+    // true : phone partial -> PC ADD -> final broadcast back to phone
+    // false: original bidirectional partial exchange + local ADD on both backends
+    static constexpr bool enable_reduce_to_pc_broadcast = true;
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         auto & pipeline_config = backend_ctx->backend_configs[0].cgraphs[i];
@@ -2941,6 +3032,498 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const ggml_status status = allreduce(nodes);
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
+                    }
+                }
+            } else if (enable_reduce_to_pc_broadcast) {
+                // -----------------------------------------------------------------
+                // reduce-to-PC + broadcast pipeline
+                // -----------------------------------------------------------------
+                // Per chunk dependency:
+                //   compute(0) ---------------------+
+                //                                    +-> ADD on backend 0 -> broadcast 0->1
+                //   compute(1) -> transfer 1->0 ----+
+                //
+                // Only the RPC/phone partial is reduced into the PC.  The final PC
+                // result is then copied back to the phone, so backend 1 never runs
+                // a reduction ADD graph.
+                struct pipeline_trace_event {
+                    const char * phase;
+                    size_t       chunk;
+                    size_t       j_src;
+                    size_t       j_dst;
+                    size_t       nbytes;
+                    int64_t      time_us;
+                };
+
+                enum class root_transfer_kind {
+                    REDUCE_TO_PC,
+                    BROADCAST_TO_PHONE,
+                };
+
+                struct compute_task {
+                    size_t chunk = 0;
+                    bool   add   = false;
+                };
+
+                struct transfer_task {
+                    size_t             chunk = 0;
+                    root_transfer_kind kind  = root_transfer_kind::REDUCE_TO_PC;
+                };
+
+                const size_t n_tokens = pipeline_config.n_pipeline_tokens;
+                static std::atomic<uint64_t> pipeline_invocation_id_root(0);
+                static std::atomic<bool> pipeline_trace_claimed_root(false);
+                const uint64_t invocation_id = pipeline_invocation_id_root.fetch_add(1);
+                const bool trace_pipeline = n_tokens >= 32 && !pipeline_trace_claimed_root.exchange(true);
+                const auto trace_start = std::chrono::steady_clock::now();
+                std::mutex trace_mutex;
+                std::vector<pipeline_trace_event> trace_events;
+
+                auto trace_event = [&](const char * phase, const size_t chunk,
+                                       const size_t j_src, const size_t j_dst, const size_t nbytes) {
+                    const int64_t time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - trace_start).count();
+                    std::lock_guard<std::mutex> lock(trace_mutex);
+                    trace_events.push_back({phase, chunk, j_src, j_dst, nbytes, time_us});
+                };
+
+                auto trace_chunk_event = [&](const char * phase, const size_t chunk) {
+                    trace_event(phase, chunk, SIZE_MAX, SIZE_MAX, 0);
+                };
+
+                std::array<root_reduce_state, ggml_backend_meta_context::max_pipeline_chunks> reduce_states;
+                for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        nodes.push_back(&backend_ctx->backend_configs[j].cgraphs[i].chunks[i_chunk].output);
+                    }
+
+                    const ggml_status prepare_status = prepare_reduce_to_pc(nodes, reduce_states[i_chunk], i_chunk);
+                    if (prepare_status != GGML_STATUS_SUCCESS) {
+                        return prepare_status;
+                    }
+
+                    if (trace_pipeline) {
+                        const auto & reduce = reduce_states[i_chunk].reduce_to_pc;
+                        const auto & bcast  = reduce_states[i_chunk].broadcast_to_phone;
+                        const size_t i_buf = i_chunk * backend_ctx->n_reduce_steps;
+                        fprintf(stderr,
+                            "[META_PIPELINE_ROOT_TMP] chunk=%zu reduce=%zu->%zu i_buf=%zu buffer=%p data=%p\n",
+                            i_chunk, reduce.j_src, reduce.j_dst, i_buf,
+                            (void *) reduce.node_tmp->buffer, reduce.node_tmp->data);
+                        fprintf(stderr,
+                            "[META_PIPELINE_ROOT_BCAST] chunk=%zu broadcast=%zu->%zu src=%p dst=%p\n",
+                            i_chunk, bcast.j_src, bcast.j_dst,
+                            bcast.node_src->data, bcast.node_tmp->data);
+                    }
+                }
+
+                GGML_LOG_ERROR("[META_PIPELINE_ROOT] enabled root=0 subgraph=%zu tensor=%s chunks=%zu\n",
+                    i, pipeline_config.pipeline_tensor_name.c_str(), n_chunks);
+
+                std::mutex scheduler_mutex;
+                std::condition_variable scheduler_cv;
+                std::array<std::deque<compute_task>, 2> compute_queues;
+                std::array<std::deque<compute_task>, 2> add_queues;
+                std::array<std::deque<transfer_task>, 2> transfer_queues;
+
+                std::array<std::array<bool, 2>, ggml_backend_meta_context::max_pipeline_chunks> compute_done = {};
+                std::array<bool, ggml_backend_meta_context::max_pipeline_chunks> reduce_done    = {};
+                std::array<bool, ggml_backend_meta_context::max_pipeline_chunks> add_queued     = {};
+                std::array<bool, ggml_backend_meta_context::max_pipeline_chunks> add_done       = {};
+                std::array<bool, ggml_backend_meta_context::max_pipeline_chunks> broadcast_done = {};
+
+                size_t completed_broadcasts = 0;
+                bool stopping = false;
+                ggml_status pipeline_status = GGML_STATUS_SUCCESS;
+
+                for (size_t j = 0; j < n_backends; j++) {
+                    for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
+                        compute_queues[j].push_back({i_chunk, false});
+                    }
+                }
+
+                auto set_failure_locked = [&](const ggml_status status) {
+                    if (pipeline_status == GGML_STATUS_SUCCESS) {
+                        pipeline_status = status;
+                    }
+                    stopping = true;
+                    scheduler_cv.notify_all();
+                };
+
+                auto enqueue_pc_add_locked = [&](const size_t chunk) {
+                    if (add_queued[chunk] || !compute_done[chunk][0] || !reduce_done[chunk]) {
+                        return;
+                    }
+
+                    add_queued[chunk] = true;
+                    trace_chunk_event("add_ready 0", chunk);
+
+                    auto & queue = add_queues[0];
+                    const auto pos = std::find_if(queue.begin(), queue.end(), [&](const compute_task & task) {
+                        return task.chunk > chunk;
+                    });
+                    queue.insert(pos, {chunk, true});
+                };
+
+                auto compute_worker = [&](const size_t backend_index) {
+                    const char * compute_begin_phase = backend_index == 0 ? "compute_begin 0" : "compute_begin 1";
+                    const char * compute_end_phase   = backend_index == 0 ? "compute_end 0"   : "compute_end 1";
+
+                    while (true) {
+                        compute_task task;
+                        {
+                            std::unique_lock<std::mutex> lock(scheduler_mutex);
+                            scheduler_cv.wait(lock, [&]() {
+                                return stopping || !add_queues[backend_index].empty() || !compute_queues[backend_index].empty();
+                            });
+                            if (stopping) {
+                                return;
+                            }
+
+                            // Keep completed reductions moving: PC ADD has priority over
+                            // submitting another PC chunk compute.
+                            if (!add_queues[backend_index].empty()) {
+                                task = add_queues[backend_index].front();
+                                add_queues[backend_index].pop_front();
+                            } else {
+                                task = compute_queues[backend_index].front();
+                                compute_queues[backend_index].pop_front();
+                            }
+                        }
+
+                        ggml_status status;
+                        if (task.add) {
+                            GGML_ASSERT(backend_index == 0);
+                            trace_chunk_event("add_begin 0", task.chunk);
+                            status = ggml_backend_graph_compute_async(
+                                backend_ctx->backend_configs[0].backend,
+                                reduce_states[task.chunk].reduce_to_pc.add_graph);
+                            trace_chunk_event("add_end 0", task.chunk);
+                        } else {
+                            auto & chunk = backend_ctx->backend_configs[backend_index].cgraphs[i].chunks[task.chunk];
+                            trace_chunk_event(compute_begin_phase, task.chunk);
+                            status = ggml_backend_graph_compute_async(
+                                backend_ctx->backend_configs[backend_index].backend, &chunk.cgraph);
+                            trace_chunk_event(compute_end_phase, task.chunk);
+                        }
+
+                        std::lock_guard<std::mutex> lock(scheduler_mutex);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            set_failure_locked(status);
+                            return;
+                        }
+
+                        if (task.add) {
+                            add_done[task.chunk] = true;
+
+                            // node_pc now holds the final reduced value.  Queue the
+                            // final 0->1 broadcast only after the PC ADD has completed.
+                            const reduce_transfer & bcast = reduce_states[task.chunk].broadcast_to_phone;
+                            trace_event("broadcast_ready", task.chunk, bcast.j_src, bcast.j_dst,
+                                        ggml_nbytes(bcast.node_src));
+                            transfer_queues[0].push_back({task.chunk, root_transfer_kind::BROADCAST_TO_PHONE});
+                        } else {
+                            compute_done[task.chunk][backend_index] = true;
+
+                            if (backend_index == 1) {
+                                // The phone/RPC partial is the only partial that crosses
+                                // to the reduction root.
+                                const reduce_transfer & reduce = reduce_states[task.chunk].reduce_to_pc;
+                                trace_event("reduce_ready", task.chunk, reduce.j_src, reduce.j_dst,
+                                            ggml_nbytes(reduce.node_src));
+                                transfer_queues[1].push_back({task.chunk, root_transfer_kind::REDUCE_TO_PC});
+                            } else {
+                                // PC partial stays local; ADD becomes runnable once the
+                                // phone partial has fully arrived.
+                                enqueue_pc_add_locked(task.chunk);
+                            }
+                        }
+
+                        scheduler_cv.notify_all();
+                    }
+                };
+
+                auto transfer_worker = [&](const size_t direction) {
+                    while (true) {
+                        transfer_task task;
+                        {
+                            std::unique_lock<std::mutex> lock(scheduler_mutex);
+                            scheduler_cv.wait(lock, [&]() {
+                                return stopping || !transfer_queues[direction].empty();
+                            });
+                            if (stopping) {
+                                return;
+                            }
+
+                            auto & queue = transfer_queues[direction];
+                            const auto pos = std::min_element(
+                                queue.begin(), queue.end(),
+                                [](const transfer_task & a, const transfer_task & b) {
+                                    return a.chunk < b.chunk;
+                                });
+                            task = *pos;
+                            queue.erase(pos);
+                        }
+
+                        const bool is_reduce = task.kind == root_transfer_kind::REDUCE_TO_PC;
+                        GGML_ASSERT((is_reduce && direction == 1) || (!is_reduce && direction == 0));
+
+                        const reduce_transfer & transfer = is_reduce
+                            ? reduce_states[task.chunk].reduce_to_pc
+                            : reduce_states[task.chunk].broadcast_to_phone;
+
+                        // Snapshot notification is useful only for RPC -> PC download.
+                        // It is intentionally diagnostic here: PC ADD still waits for the
+                        // complete transfer because node_tmp must contain the full tensor.
+                        std::function<void()> notify_snapshot = [&]() {
+                            trace_event("snapshot_ready", task.chunk, transfer.j_src, transfer.j_dst,
+                                        ggml_nbytes(transfer.node_src));
+                        };
+
+                        // Use the exact callback function-pointer type expected by transfer_one().
+                        // MSVC cannot form a conditional expression between a lambda object and nullptr.
+                        ggml_backend_rpc_snapshot_callback snapshot_callback = nullptr;
+                        void * snapshot_user_data = nullptr;
+                        if (is_reduce) {
+                            snapshot_callback = [](void * user_data) {
+                                (*static_cast<std::function<void()> *>(user_data))();
+                            };
+                            snapshot_user_data = static_cast<void *>(&notify_snapshot);
+                        }
+
+                        trace_event(is_reduce ? "reduce_begin" : "broadcast_begin",
+                                    task.chunk, transfer.j_src, transfer.j_dst,
+                                    ggml_nbytes(transfer.node_src));
+
+                        const ggml_status status = transfer_one(
+                            transfer,
+                            task.chunk,
+                            trace_event,
+                            snapshot_callback,
+                            snapshot_user_data);
+
+                        trace_event(is_reduce ? "reduce_end" : "broadcast_end",
+                                    task.chunk, transfer.j_src, transfer.j_dst,
+                                    ggml_nbytes(transfer.node_src));
+
+                        std::lock_guard<std::mutex> lock(scheduler_mutex);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            set_failure_locked(status);
+                            return;
+                        }
+
+                        if (is_reduce) {
+                            // Full phone partial is now present in the PC temporary buffer.
+                            reduce_done[task.chunk] = true;
+                            enqueue_pc_add_locked(task.chunk);
+                        } else {
+                            GGML_ASSERT(add_done[task.chunk]);
+                            broadcast_done[task.chunk] = true;
+                            completed_broadcasts++;
+
+                            if (completed_broadcasts == n_chunks) {
+                                stopping = true;
+                            }
+                        }
+
+                        scheduler_cv.notify_all();
+                    }
+                };
+
+                std::array<std::thread, 2> compute_threads = {
+                    std::thread(compute_worker, 0),
+                    std::thread(compute_worker, 1),
+                };
+                std::array<std::thread, 2> transfer_threads = {
+                    std::thread(transfer_worker, 0), // final PC -> phone broadcast
+                    std::thread(transfer_worker, 1), // phone -> PC partial reduction
+                };
+                scheduler_cv.notify_all();
+
+                for (std::thread & thread : compute_threads) {
+                    thread.join();
+                }
+                for (std::thread & thread : transfer_threads) {
+                    thread.join();
+                }
+
+                if (pipeline_status != GGML_STATUS_SUCCESS) {
+                    return pipeline_status;
+                }
+
+                for (size_t i_chunk = 0; i_chunk < n_chunks; i_chunk++) {
+                    GGML_ASSERT(compute_done[i_chunk][0]);
+                    GGML_ASSERT(compute_done[i_chunk][1]);
+                    GGML_ASSERT(reduce_done[i_chunk]);
+                    GGML_ASSERT(add_done[i_chunk]);
+                    GGML_ASSERT(broadcast_done[i_chunk]);
+                }
+
+                // -------------------------------------------------------------
+                // Profiling / adaptive chunk policy.  Keep the same directional
+                // meaning as before:
+                //   index 0 = upload/broadcast PC -> phone
+                //   index 1 = download/reduce phone -> PC
+                // -------------------------------------------------------------
+                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> compute_start = {};
+                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> transfer_ready = {};
+                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> transfer_start = {};
+                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> tensor_get_start = {};
+                std::array<std::array<int64_t, 2>, ggml_backend_meta_context::max_pipeline_chunks> snapshot_ready = {};
+                std::array<int64_t, ggml_backend_meta_context::max_pipeline_chunks> add_start = {};
+
+                for (size_t i_chunk = 0; i_chunk < ggml_backend_meta_context::max_pipeline_chunks; i_chunk++) {
+                    compute_start[i_chunk].fill(-1);
+                    transfer_ready[i_chunk].fill(-1);
+                    transfer_start[i_chunk].fill(-1);
+                    tensor_get_start[i_chunk].fill(-1);
+                    snapshot_ready[i_chunk].fill(-1);
+                    add_start[i_chunk] = -1;
+                }
+
+                std::array<int64_t, 2> compute_us = {};
+                std::array<int64_t, 2> transfer_bytes = {};
+                std::array<int64_t, 2> queue_wait_us = {};
+                std::array<int64_t, 2> transfer_us = {};
+                std::array<int64_t, 2> snapshot_us = {};
+                std::array<int64_t, 2> tail_us = {};
+                std::array<int64_t, 2> add_us = {};
+                int64_t total_start = -1;
+                int64_t total_end = -1;
+
+                for (const pipeline_trace_event & event : trace_events) {
+                    if (strcmp(event.phase, "compute_begin 0") == 0) {
+                        compute_start[event.chunk][0] = event.time_us;
+                        total_start = total_start < 0 ? event.time_us : std::min(total_start, event.time_us);
+                    } else if (strcmp(event.phase, "compute_begin 1") == 0) {
+                        compute_start[event.chunk][1] = event.time_us;
+                        total_start = total_start < 0 ? event.time_us : std::min(total_start, event.time_us);
+                    } else if (strcmp(event.phase, "compute_end 0") == 0 && compute_start[event.chunk][0] >= 0) {
+                        compute_us[0] += event.time_us - compute_start[event.chunk][0];
+                    } else if (strcmp(event.phase, "compute_end 1") == 0 && compute_start[event.chunk][1] >= 0) {
+                        compute_us[1] += event.time_us - compute_start[event.chunk][1];
+                    } else if (strcmp(event.phase, "reduce_ready") == 0 || strcmp(event.phase, "broadcast_ready") == 0) {
+                        transfer_ready[event.chunk][event.j_src] = event.time_us;
+                    } else if (strcmp(event.phase, "reduce_begin") == 0 || strcmp(event.phase, "broadcast_begin") == 0) {
+                        transfer_start[event.chunk][event.j_src] = event.time_us;
+                        transfer_bytes[event.j_src] += event.nbytes;
+                        if (transfer_ready[event.chunk][event.j_src] >= 0) {
+                            queue_wait_us[event.j_src] += event.time_us - transfer_ready[event.chunk][event.j_src];
+                        }
+                    } else if ((strcmp(event.phase, "reduce_end") == 0 || strcmp(event.phase, "broadcast_end") == 0) &&
+                               transfer_start[event.chunk][event.j_src] >= 0) {
+                        transfer_us[event.j_src] += event.time_us - transfer_start[event.chunk][event.j_src];
+                        if (strcmp(event.phase, "broadcast_end") == 0) {
+                            total_end = std::max(total_end, event.time_us);
+                        }
+                    } else if (strcmp(event.phase, "src_tensor_get_begin") == 0) {
+                        tensor_get_start[event.chunk][event.j_src] = event.time_us;
+                    } else if (strcmp(event.phase, "snapshot_ready") == 0) {
+                        snapshot_ready[event.chunk][event.j_src] = event.time_us;
+                    } else if (strcmp(event.phase, "src_tensor_get_end") == 0 &&
+                               tensor_get_start[event.chunk][event.j_src] >= 0 &&
+                               snapshot_ready[event.chunk][event.j_src] >= 0) {
+                        snapshot_us[event.j_src] += snapshot_ready[event.chunk][event.j_src] - tensor_get_start[event.chunk][event.j_src];
+                        tail_us[event.j_src] += event.time_us - snapshot_ready[event.chunk][event.j_src];
+                    } else if (strcmp(event.phase, "add_begin 0") == 0) {
+                        add_start[event.chunk] = event.time_us;
+                    } else if (strcmp(event.phase, "add_end 0") == 0 && add_start[event.chunk] >= 0) {
+                        add_us[0] += event.time_us - add_start[event.chunk];
+                    }
+                }
+
+                const int64_t wall_us = total_start >= 0 && total_end >= total_start ? total_end - total_start : 0;
+                GGML_LOG_ERROR(
+                    "[META_PIPELINE_ROOT_SUMMARY] id=%" PRIu64 " subgraph=%zu tensor=%s n_tokens=%zu chunks=%zu"
+                    " bytes_broadcast=%" PRId64 " bytes_reduce=%" PRId64 " wall_us=%" PRId64
+                    " compute0_us=%" PRId64 " compute1_us=%" PRId64
+                    " broadcast_busy_us=%" PRId64 " reduce_busy_us=%" PRId64
+                    " reduce_snapshot_us=%" PRId64 " reduce_tail_us=%" PRId64
+                    " broadcast_queue_wait_us=%" PRId64 " reduce_queue_wait_us=%" PRId64
+                    " add0_us=%" PRId64 " add1_us=%" PRId64 "\n",
+                    invocation_id, i, pipeline_config.pipeline_tensor_name.c_str(), n_tokens, n_chunks,
+                    transfer_bytes[0], transfer_bytes[1], wall_us,
+                    compute_us[0], compute_us[1], transfer_us[0], transfer_us[1],
+                    snapshot_us[1], tail_us[1], queue_wait_us[0], queue_wait_us[1],
+                    add_us[0], add_us[1]);
+
+                // Reuse the existing adaptive policy, now treating direction 1 as
+                // the phone->PC reduction/download path.
+                const double qwait_ratio = (double) queue_wait_us[1] / std::max<double>(transfer_us[1], 1.0);
+                const bool has_baseline = adaptive.sample_count > 0;
+                const bool compute_bad = has_baseline && adaptive.compute1_ewma > 0.0 &&
+                    compute_us[1] > adaptive.compute1_ewma * 1.5;
+                const bool tail_bad = has_baseline && adaptive.down_tail_ewma > 0.0 &&
+                    tail_us[1] > adaptive.down_tail_ewma * 1.5;
+                const bool pressure = qwait_ratio > 0.5 || (compute_bad && tail_bad);
+                const bool tail_healthy = !has_baseline || adaptive.down_tail_ewma <= 0.0 ||
+                    tail_us[1] < adaptive.down_tail_ewma * 1.2;
+                const bool healthy = qwait_ratio < 0.25 && tail_healthy;
+
+                adaptive.pressure_streak = pressure ? adaptive.pressure_streak + 1 : 0;
+                adaptive.healthy_streak = healthy ? adaptive.healthy_streak + 1 : 0;
+
+                const auto previous_mode = adaptive.mode;
+                const char * reason = nullptr;
+                if (adaptive.pressure_streak >= 3 && adaptive.mode != ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE) {
+                    adaptive.mode = adaptive.mode == ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE
+                        ? ggml_backend_meta_context::pipeline_adaptive_state::BALANCED
+                        : ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE;
+                    reason = "pressure";
+                } else if (adaptive.healthy_streak >= 3 && adaptive.mode != ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE) {
+                    adaptive.mode = adaptive.mode == ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE
+                        ? ggml_backend_meta_context::pipeline_adaptive_state::BALANCED
+                        : ggml_backend_meta_context::pipeline_adaptive_state::AGGRESSIVE;
+                    reason = "healthy";
+                }
+
+                if (adaptive.mode != previous_mode) {
+                    GGML_LOG_ERROR(
+                        "[META_ADAPT_ROOT] state=%s->%s chunks=%zu->%zu reason=%s qwait_ratio=%.3f"
+                        " reduce_tail_us=%" PRId64 " baseline_tail_us=%.0f compute1_us=%" PRId64
+                        " baseline_compute1_us=%.0f wall_us=%" PRId64 " pressure_streak=%d healthy_streak=%d\n",
+                        ggml_backend_meta_context::pipeline_adaptive_state::mode_name(previous_mode),
+                        ggml_backend_meta_context::pipeline_adaptive_state::mode_name(adaptive.mode),
+                        previous_mode == ggml_backend_meta_context::pipeline_adaptive_state::CONSERVATIVE ? 1 :
+                            previous_mode == ggml_backend_meta_context::pipeline_adaptive_state::BALANCED ? 2 : 3,
+                        adaptive.chunks(), reason, qwait_ratio, tail_us[1], adaptive.down_tail_ewma,
+                        compute_us[1], adaptive.compute1_ewma, wall_us,
+                        adaptive.pressure_streak, adaptive.healthy_streak);
+                    adaptive.pressure_streak = 0;
+                    adaptive.healthy_streak = 0;
+                }
+
+                if (!has_baseline || healthy) {
+                    constexpr double ewma_old = 0.8;
+                    constexpr double ewma_new = 1.0 - ewma_old;
+                    if (!has_baseline) {
+                        adaptive.compute1_ewma = compute_us[1];
+                        adaptive.down_tail_ewma = tail_us[1];
+                        adaptive.wall_ewma = wall_us;
+                    } else {
+                        adaptive.compute1_ewma = ewma_old * adaptive.compute1_ewma + ewma_new * compute_us[1];
+                        adaptive.down_tail_ewma = ewma_old * adaptive.down_tail_ewma + ewma_new * tail_us[1];
+                        adaptive.wall_ewma = ewma_old * adaptive.wall_ewma + ewma_new * wall_us;
+                    }
+                    adaptive.sample_count++;
+                }
+
+                if (trace_pipeline) {
+                    std::sort(trace_events.begin(), trace_events.end(), [](const pipeline_trace_event & a, const pipeline_trace_event & b) {
+                        return a.time_us < b.time_us;
+                    });
+                    fprintf(stderr, "[META_PIPELINE_ROOT_TIMING] one-shot trace, times are relative microseconds\n");
+                    for (const pipeline_trace_event & event : trace_events) {
+                        if (event.j_src == SIZE_MAX) {
+                            fprintf(stderr, "[META_PIPELINE_ROOT_TIMING] t=%" PRId64 " us chunk=%zu phase=%s\n",
+                                event.time_us, event.chunk, event.phase);
+                        } else {
+                            fprintf(stderr,
+                                "[META_PIPELINE_ROOT_TIMING] t=%" PRId64 " us chunk=%zu dir=%zu->%zu bytes=%zu phase=%s\n",
+                                event.time_us, event.chunk, event.j_src, event.j_dst, event.nbytes, event.phase);
+                        }
                     }
                 }
             } else {
