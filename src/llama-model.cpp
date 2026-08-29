@@ -690,6 +690,48 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.n_segments = 1;
     }
     //如果是q,k,v权重，打印切分信息
+    const bool attention_primary_only =
+        std::regex_match(tensor_name, pattern_q_weight) ||
+        std::regex_match(tensor_name, pattern_kv_weight) ||
+        std::regex_match(tensor_name, pattern_qkv_weight) ||
+        std::regex_match(tensor_name, pattern_q_bias) ||
+        std::regex_match(tensor_name, pattern_kv_bias) ||
+        std::regex_match(tensor_name, pattern_qkv_bias) ||
+        std::regex_match(tensor_name, pattern_kv_cache) ||
+        std::regex_match(tensor_name, pattern_attn_sinks) ||
+        std::regex_match(tensor_name, pattern_attn_out_weight) ||
+        std::regex_match(tensor_name, pattern_attn_gate_weight);
+
+    // Keep attention on the primary device. FFN tensors retain the regular
+    // tensor split, so the remote device returns one complete partial result.
+    if (attention_primary_only && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        for (size_t is = 0; is < split_state.n_segments; ++is) {
+            int64_t ne_primary = 0;
+            for (size_t j = 0; j < ud->n_devices; ++j) {
+                ne_primary += split_state.ne[is*ud->n_devices + j];
+                split_state.ne[is*ud->n_devices + j] = 0;
+            }
+            split_state.ne[is*ud->n_devices] = ne_primary;
+        }
+    }
+
+    if (tensor_name.rfind("blk.0.", 0) == 0 &&
+            (attention_primary_only ||
+             std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+             std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+             std::regex_match(tensor_name, pattern_ffn_down_weight))) {
+        std::string placement;
+        for (size_t j = 0; j < ud->n_devices; ++j) {
+            int64_t ne_device = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                ne_device += split_state.ne[is*ud->n_devices + j] * split_state.nr[is];
+            }
+            placement += (j == 0 ? "" : ",") + std::to_string(j) + ":" + std::to_string(ne_device);
+        }
+        LLAMA_LOG_INFO("tensor placement: %s -> %s (axis %d; %s)\n",
+                tensor_name.c_str(), attention_primary_only ? "primary" : "split", split_state.axis, placement.c_str());
+    }
+
     if (std::regex_match(tensor_name, std::regex("blk\\.\\d*\\.attn_(q|k|v)\\.weight"))) {
         GGML_LOG_INFO("llama_meta_device_get_split_state: tensor_name: %s, axis: %d, ne[0]: %lld, ne[1]: %lld, ne[2]: %lld, ne[3]: %lld\n",
             tensor_name.c_str(), split_state.axis,
