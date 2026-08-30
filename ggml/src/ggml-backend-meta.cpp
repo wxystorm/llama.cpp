@@ -9,13 +9,17 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1877,6 +1881,8 @@ static ggml_guid_t ggml_backend_meta_guid() {
     return &guid;
 }
 
+struct ggml_backend_meta_compute_workers;
+
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -1906,6 +1912,8 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+
+    ggml_backend_meta_compute_workers * compute_workers = nullptr;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -1943,18 +1951,119 @@ struct ggml_backend_meta_context {
         }
     }
 
-    ~ggml_backend_meta_context() {
-        if (comm_ctx != nullptr) {
-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
-            GGML_ASSERT(comm_free != nullptr);
-            comm_free(comm_ctx);
+    ~ggml_backend_meta_context();
+};
+
+struct ggml_backend_meta_compute_workers {
+    ggml_backend_meta_context * backend_ctx;
+    size_t n_backends;
+
+    std::vector<std::thread> workers;
+    std::vector<ggml_status> statuses;
+    std::vector<int64_t> backend_time_us;
+
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    size_t generation = 0;
+    size_t task_index = 0;
+    size_t done = 0;
+    bool stop = false;
+
+    ggml_backend_meta_compute_workers(ggml_backend_meta_context * backend_ctx, size_t n_backends) :
+        backend_ctx(backend_ctx),
+        n_backends(n_backends),
+        statuses(n_backends, GGML_STATUS_SUCCESS),
+        backend_time_us(n_backends, 0) {
+        if (n_backends <= 1) {
+            return;
         }
-        for (auto & bc : backend_configs) {
-            ggml_backend_free(bc.backend);
+
+        workers.reserve(n_backends);
+        for (size_t j = 0; j < n_backends; ++j) {
+            workers.emplace_back([this, j]() {
+                size_t seen_generation = 0;
+                std::unique_lock<std::mutex> lock(mutex);
+                while (true) {
+                    task_cv.wait(lock, [&]() { return stop || generation != seen_generation; });
+                    if (stop) {
+                        return;
+                    }
+
+                    seen_generation = generation;
+                    const size_t i = task_index;
+                    lock.unlock();
+
+                    auto & bcj = this->backend_ctx->backend_configs[j];
+                    const int64_t start_us = ggml_time_us();
+                    const ggml_status status = ggml_backend_graph_compute_async(
+                            bcj.backend, bcj.cgraphs[i].cgraph_main);
+                    const int64_t elapsed_us = ggml_time_us() - start_us;
+
+                    lock.lock();
+                    statuses[j] = status;
+                    backend_time_us[j] += elapsed_us;
+                    if (++done == this->n_backends) {
+                        done_cv.notify_one();
+                    }
+                }
+            });
         }
     }
+
+    ~ggml_backend_meta_compute_workers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_all();
+        for (auto & worker : workers) {
+            worker.join();
+        }
+    }
+
+    ggml_status compute(size_t i) {
+        if (n_backends == 1) {
+            auto & bcj = backend_ctx->backend_configs[0];
+            const int64_t start_us = ggml_time_us();
+            const ggml_status status = ggml_backend_graph_compute_async(
+                    bcj.backend, bcj.cgraphs[i].cgraph_main);
+            backend_time_us[0] += ggml_time_us() - start_us;
+            return status;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex);
+        task_index = i;
+        done = 0;
+        ++generation;
+        task_cv.notify_all();
+        done_cv.wait(lock, [&]() { return done == n_backends; });
+
+        for (const ggml_status status : statuses) {
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    void reset_timings() {
+        std::fill(backend_time_us.begin(), backend_time_us.end(), 0);
+    }
 };
+
+ggml_backend_meta_context::~ggml_backend_meta_context() {
+    delete compute_workers;
+    if (comm_ctx != nullptr) {
+        ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+        GGML_ASSERT(comm_free != nullptr);
+        comm_free(comm_ctx);
+    }
+    for (auto & bc : backend_configs) {
+        ggml_backend_free(bc.backend);
+    }
+}
 
 static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
@@ -2492,16 +2601,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    if (backend_ctx->compute_workers == nullptr) {
+        backend_ctx->compute_workers = new ggml_backend_meta_compute_workers(backend_ctx, n_backends);
+    }
+    ggml_backend_meta_compute_workers & compute_workers = *backend_ctx->compute_workers;
+    compute_workers.reset_timings();
+    int64_t compute_wall_us = 0;
+    int64_t reduce_wall_us  = 0;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
+        const int64_t compute_start_us = ggml_time_us();
+        const ggml_status compute_status = compute_workers.compute(i);
+        compute_wall_us += ggml_time_us() - compute_start_us;
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            return compute_status;
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            const int64_t reduce_start_us = ggml_time_us();
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2520,7 +2637,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            reduce_wall_us += ggml_time_us() - reduce_start_us;
         }
+    }
+
+    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+        std::string backend_times;
+        for (size_t j = 0; j < n_backends; ++j) {
+            backend_times += (j == 0 ? "" : ",") + std::to_string(j) + ":" +
+                std::to_string(compute_workers.backend_time_us[j] / 1000.0);
+        }
+        GGML_LOG_INFO("[META_PIPELINE] uid=%" PRIu64 " subgraphs=%zu compute=%.3f ms reduce=%.3f ms backends_ms={%s}\n",
+                cgraph->uid, backend_ctx->n_subgraphs, compute_wall_us / 1000.0,
+                reduce_wall_us / 1000.0, backend_times.c_str());
     }
     return GGML_STATUS_SUCCESS;
 }
