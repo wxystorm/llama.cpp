@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1882,6 +1884,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_compute_workers;
+struct ggml_backend_meta_transfer_worker;
 
 struct ggml_backend_meta_context {
     struct cgraph_config {
@@ -1914,6 +1917,7 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
+    ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -1965,16 +1969,19 @@ struct ggml_backend_meta_compute_workers {
     std::mutex mutex;
     std::condition_variable task_cv;
     std::condition_variable done_cv;
-    size_t generation = 0;
-    size_t task_index = 0;
-    size_t done = 0;
+    std::vector<size_t> generation;
+    std::vector<size_t> completed_generation;
+    std::vector<size_t> task_index;
     bool stop = false;
 
     ggml_backend_meta_compute_workers(ggml_backend_meta_context * backend_ctx, size_t n_backends) :
         backend_ctx(backend_ctx),
         n_backends(n_backends),
         statuses(n_backends, GGML_STATUS_SUCCESS),
-        backend_time_us(n_backends, 0) {
+        backend_time_us(n_backends, 0),
+        generation(n_backends, 0),
+        completed_generation(n_backends, 0),
+        task_index(n_backends, 0) {
         if (n_backends <= 1) {
             return;
         }
@@ -1985,13 +1992,13 @@ struct ggml_backend_meta_compute_workers {
                 size_t seen_generation = 0;
                 std::unique_lock<std::mutex> lock(mutex);
                 while (true) {
-                    task_cv.wait(lock, [&]() { return stop || generation != seen_generation; });
+                    task_cv.wait(lock, [&]() { return stop || generation[j] != seen_generation; });
                     if (stop) {
                         return;
                     }
 
-                    seen_generation = generation;
-                    const size_t i = task_index;
+                    seen_generation = generation[j];
+                    const size_t i = task_index[j];
                     lock.unlock();
 
                     auto & bcj = this->backend_ctx->backend_configs[j];
@@ -2003,9 +2010,8 @@ struct ggml_backend_meta_compute_workers {
                     lock.lock();
                     statuses[j] = status;
                     backend_time_us[j] += elapsed_us;
-                    if (++done == this->n_backends) {
-                        done_cv.notify_one();
-                    }
+                    completed_generation[j] = seen_generation;
+                    done_cv.notify_all();
                 }
             });
         }
@@ -2032,14 +2038,12 @@ struct ggml_backend_meta_compute_workers {
             return status;
         }
 
-        std::unique_lock<std::mutex> lock(mutex);
-        task_index = i;
-        done = 0;
-        ++generation;
-        task_cv.notify_all();
-        done_cv.wait(lock, [&]() { return done == n_backends; });
+        for (size_t j = 0; j < n_backends; ++j) {
+            start(j, i);
+        }
 
-        for (const ggml_status status : statuses) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            const ggml_status status = wait(j);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2047,13 +2051,90 @@ struct ggml_backend_meta_compute_workers {
         return GGML_STATUS_SUCCESS;
     }
 
+    void start(size_t j, size_t i) {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(completed_generation[j] == generation[j]);
+        task_index[j] = i;
+        ++generation[j];
+        task_cv.notify_all();
+    }
+
+    ggml_status wait(size_t j) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const size_t target_generation = generation[j];
+        done_cv.wait(lock, [&]() { return completed_generation[j] == target_generation; });
+        return statuses[j];
+    }
+
     void reset_timings() {
         std::fill(backend_time_us.begin(), backend_time_us.end(), 0);
     }
 };
 
+struct ggml_backend_meta_transfer_worker {
+    struct task {
+        uint64_t id;
+        std::function<ggml_status()> run;
+    };
+
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    std::deque<task> tasks;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    ggml_status status = GGML_STATUS_SUCCESS;
+    bool stop = false;
+
+    ggml_backend_meta_transfer_worker() : worker([this]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            task_cv.wait(lock, [&]() { return stop || !tasks.empty(); });
+            if (stop && tasks.empty()) {
+                return;
+            }
+
+            task current = std::move(tasks.front());
+            tasks.pop_front();
+            lock.unlock();
+            const ggml_status task_status = current.run();
+            lock.lock();
+            if (status == GGML_STATUS_SUCCESS) {
+                status = task_status;
+            }
+            completed = current.id;
+            done_cv.notify_all();
+        }
+    }) {}
+
+    ~ggml_backend_meta_transfer_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_one();
+        worker.join();
+    }
+
+    uint64_t enqueue(std::function<ggml_status()> run) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint64_t id = ++submitted;
+        tasks.push_back({ id, std::move(run) });
+        task_cv.notify_one();
+        return id;
+    }
+
+    ggml_status wait(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&]() { return completed >= id; });
+        return status;
+    }
+};
+
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
+    delete transfer_worker;
     if (comm_ctx != nullptr) {
         ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2484,10 +2565,161 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return ret;
     };
 
+    int64_t reduce_copy_wait_us = 0;
+    int64_t reduce_add_us       = 0;
+    int64_t reduce_zero_us      = 0;
+    int64_t reduce_comm_us      = 0;
+    size_t  reduce_count        = 0;
+    size_t  reduce_comm_count   = 0;
+    size_t  reduce_fallback_count = 0;
+    size_t  direct_copy_count   = 0;
+    size_t  reduce_to_primary_count = 0;
+    size_t  reduce_zero_copy_skips = 0;
+    int64_t reduce_max_us       = 0;
+    struct reduce_copy_stats {
+        size_t   count    = 0;
+        uint64_t bytes    = 0;
+        int64_t  total_us = 0;
+        int64_t  max_us   = 0;
+    };
+    std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
+    const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    size_t reduce_copy_detail_count = 0;
+
+    auto record_meta_copy = [&](size_t i, size_t j_src, size_t j_dst, const ggml_tensor * node_src, int64_t copy_us) {
+        const size_t copy_bytes = ggml_nbytes(node_src);
+        auto & stats = reduce_copy_by_direction[j_src*n_backends + j_dst];
+        ++stats.count;
+        stats.bytes += copy_bytes;
+        stats.total_us += copy_us;
+        stats.max_us = std::max(stats.max_us, copy_us);
+
+        if (pipeline_debug && reduce_copy_detail_count < 4) {
+            printf("[META_COPY] sg=%zu %zu->%zu tensor=%s bytes=%zu "
+                   "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] time=%.3f ms\n",
+                   i, j_src, j_dst, node_src->name, copy_bytes,
+                   node_src->ne[0], node_src->ne[1], node_src->ne[2], node_src->ne[3],
+                   copy_us / 1000.0);
+            ++reduce_copy_detail_count;
+        }
+    };
+
+    auto specialized_communication = [&](size_t i, bool & handled) -> ggml_status {
+        std::vector<ggml_tensor *> nodes(n_backends, nullptr);
+        size_t active_count = 0;
+        size_t active_backend = 0;
+        for (size_t j = 0; j < n_backends; ++j) {
+            const auto & bcj = backend_ctx->backend_configs[j];
+            nodes[j] = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if (nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                ++active_count;
+                active_backend = j;
+            }
+        }
+
+        if (active_count == 1) {
+            handled = true;
+            auto & bcj_src = backend_ctx->backend_configs[active_backend];
+            GGML_ASSERT(ggml_is_contiguous(nodes[active_backend]));
+            for (size_t j_dst = 0; j_dst < n_backends; ++j_dst) {
+                if (j_dst == active_backend) {
+                    continue;
+                }
+                auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+                GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
+                const int64_t copy_start_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                        bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
+                const int64_t copy_us = ggml_time_us() - copy_start_us;
+                reduce_copy_wait_us += copy_us;
+                record_meta_copy(i, active_backend, j_dst, nodes[active_backend], copy_us);
+            }
+            ++direct_copy_count;
+            return GGML_STATUS_SUCCESS;
+        }
+
+        const bool is_ffn_down_chunk = n_backends == 2 && active_count == 2 &&
+            (std::strstr(nodes[0]->name, "ffn_down_chunk") != nullptr ||
+             std::strstr(nodes[1]->name, "ffn_down_chunk") != nullptr);
+        const bool is_prefill_ffn_boundary =
+            n_backends == 2 &&
+            active_count == 2 &&
+            nodes[0]->ne[1] > 1 &&
+            nodes[1]->ne[1] > 1;
+
+        if (!is_ffn_down_chunk ) {
+            return GGML_STATUS_SUCCESS;
+        }
+
+        handled = true;
+        constexpr size_t j_src = 1;
+        constexpr size_t j_dst = 0;
+        auto & bcj_src = backend_ctx->backend_configs[j_src];
+        auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+        GGML_ASSERT(ggml_is_contiguous(nodes[j_src]));
+        GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
+
+        ggml_tensor * node_tmp = get_node_aux(nodes[j_dst]);
+        set_tmp_data(node_tmp, j_dst, 0);
+        const int64_t copy_start_us = ggml_time_us();
+        ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, nodes[j_src], node_tmp);
+        const int64_t copy_us = ggml_time_us() - copy_start_us;
+        reduce_copy_wait_us += copy_us;
+        record_meta_copy(i, j_src, j_dst, nodes[j_src], copy_us);
+
+        ggml_tensor * node_red = get_node_aux(nodes[j_dst]);
+        node_red->view_src = nodes[j_dst]->view_src == nullptr ? nodes[j_dst] : nodes[j_dst]->view_src;
+        node_red->view_offs = nodes[j_dst]->view_offs;
+        node_red->op = GGML_OP_ADD;
+        node_red->src[0] = nodes[j_dst];
+        node_red->src[1] = node_tmp;
+        node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_backend_view_init(node_red);
+
+        ggml_cgraph * cgraph_aux = get_cgraph_aux();
+        cgraph_aux->nodes[0] = node_red;
+        cgraph_aux->n_nodes = 1;
+        const int64_t add_start_us = ggml_time_us();
+        const ggml_status status = ggml_backend_graph_compute_async(bcj_dst.backend, cgraph_aux);
+        reduce_add_us += ggml_time_us() - add_start_us;
+        if (status == GGML_STATUS_SUCCESS) {
+            ++reduce_to_primary_count;
+        }
+        return status;
+    };
+
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
+        std::vector<uint8_t> has_data(n_backends, 0);
+        for (size_t j = 0; j < n_backends; ++j) {
+            const auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            has_data[j] = (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        }
+        if (i < 6) {
+    auto * n0 = backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[0]
+                            .cgraphs[i].cgraph_main->n_nodes - 1];
 
+    auto * n1 = backend_ctx->backend_configs[1]
+                    .cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[i].cgraph_main->n_nodes - 1];
+
+    printf(
+        "[REDUCE_ACTIVE] sg=%zu "
+        "name0=%s compute0=%d bytes0=%zu "
+        "name1=%s compute1=%d bytes1=%zu\n",
+        i,
+        n0->name,
+        !!(n0->flags & GGML_TENSOR_FLAG_COMPUTE),
+        ggml_nbytes(n0),
+        n1->name,
+        !!(n1->flags & GGML_TENSOR_FLAG_COMPUTE),
+        ggml_nbytes(n1));
+}
         // Zero out nodes that were disabled due to having a zero-sized slice:
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2506,7 +2738,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             step_cgraphs[j] = get_cgraph_aux();
             step_cgraphs[j]->nodes[0] = node_zero;
             step_cgraphs[j]->n_nodes = 1;
+            const int64_t zero_start_us = ggml_time_us();
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            reduce_zero_us += ggml_time_us() - zero_start_us;
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2526,7 +2760,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
+            const int64_t copy_start_us = ggml_time_us();
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            const int64_t copy_us = ggml_time_us() - copy_start_us;
+            reduce_copy_wait_us += copy_us;
+            record_meta_copy(i, j_src, j_dst, node_src, copy_us);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -2553,21 +2791,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
+            if (!has_data[j_src]) {
+                ++reduce_zero_copy_skips;
+                continue;
+            }
             push_data(j_src, j_dst, i_buf);
+            const int64_t add_start_us = ggml_time_us();
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
+            reduce_add_us += ggml_time_us() - add_start_us;
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+            has_data[j_dst] = 1;
+        }
+        if (2*offset_j_max < n_backends) {
             i_buf = 1;
         }
 
         // Butterfly reduction:
         for (; offset_j >= 1; offset_j /= 2) {
             std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+            const std::vector<uint8_t> step_has_data = has_data;
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
                 const size_t j_other = j ^ offset_j;
                 if (j_other >= n_backends) {
+                    continue;
+                }
+                if (!step_has_data[j]) {
+                    ++reduce_zero_copy_skips;
                     continue;
                 }
                 push_data(j, j_other, i_buf);
@@ -2578,9 +2830,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 auto & bcj = backend_ctx->backend_configs[j];
+                const int64_t add_start_us = ggml_time_us();
                 const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                reduce_add_us += ggml_time_us() - add_start_us;
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
+                }
+            }
+            for (size_t j = 0; j < 2*offset_j_max; ++j) {
+                const size_t j_other = j ^ offset_j;
+                if (j_other < n_backends) {
+                    has_data[j] = step_has_data[j] || step_has_data[j_other];
                 }
             }
             i_buf++;
@@ -2589,12 +2849,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
         for (size_t j = 2*offset_j_max; j < n_backends; j++) {
-            auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
+            const size_t j_src = j - 2*offset_j_max;
+            if (!has_data[j_src]) {
+                ++reduce_zero_copy_skips;
+                continue;
+            }
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j];
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            const int64_t copy_start_us = ggml_time_us();
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            const int64_t copy_us = ggml_time_us() - copy_start_us;
+            reduce_copy_wait_us += copy_us;
+            record_meta_copy(i, j_src, j, node_src, copy_us);
+            has_data[j] = 1;
         }
 
         return GGML_STATUS_SUCCESS;
@@ -2608,7 +2878,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     compute_workers.reset_timings();
     int64_t compute_wall_us = 0;
     int64_t reduce_wall_us  = 0;
-
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t compute_start_us = ggml_time_us();
         const ggml_status compute_status = compute_workers.compute(i);
@@ -2619,8 +2888,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             const int64_t reduce_start_us = ggml_time_us();
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
+            bool communication_complete = false;
+            const ggml_status specialized_status = specialized_communication(i, communication_complete);
+            if (specialized_status != GGML_STATUS_SUCCESS) {
+                return specialized_status;
+            }
+            if (!communication_complete && backend_ctx->comm_ctx) {
+                ++reduce_comm_count;
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {
@@ -2628,28 +2902,56 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                const int64_t comm_start_us = ggml_time_us();
+                communication_complete = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                reduce_comm_us += ggml_time_us() - comm_start_us;
             }
 
-            if (!backend_allreduce_success) {
+            if (!communication_complete) {
+                ++reduce_fallback_count;
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
-            reduce_wall_us += ggml_time_us() - reduce_start_us;
+            ++reduce_count;
+            const int64_t reduce_us = ggml_time_us() - reduce_start_us;
+            reduce_wall_us += reduce_us;
+            reduce_max_us = std::max(reduce_max_us, reduce_us);
         }
     }
 
-    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+    if (pipeline_debug) {
         std::string backend_times;
         for (size_t j = 0; j < n_backends; ++j) {
             backend_times += (j == 0 ? "" : ",") + std::to_string(j) + ":" +
                 std::to_string(compute_workers.backend_time_us[j] / 1000.0);
         }
-        GGML_LOG_INFO("[META_PIPELINE] uid=%" PRIu64 " subgraphs=%zu compute=%.3f ms reduce=%.3f ms backends_ms={%s}\n",
+        const double reduce_avg_us = reduce_count > 0 ? double(reduce_wall_us) / reduce_count : 0.0;
+        const int64_t reduce_profiled_us = reduce_copy_wait_us + reduce_add_us + reduce_zero_us + reduce_comm_us;
+        const int64_t reduce_other_us = std::max<int64_t>(0, reduce_wall_us - reduce_profiled_us);
+        printf("[META_PIPELINE] uid=%" PRIu64 " subgraphs=%zu compute=%.3f ms backends_ms={%s} "
+                "reduce_total=%.3f ms count=%zu avg=%.3f ms max=%.3f ms comm=%.3f ms(%zu) "
+                "direct=%zu reduce_to_primary=%zu fallback=%zu copy_wait=%.3f ms zero_copy_skips=%zu "
+                "add=%.3f ms zero=%.3f ms other=%.3f ms\n",
                 cgraph->uid, backend_ctx->n_subgraphs, compute_wall_us / 1000.0,
-                reduce_wall_us / 1000.0, backend_times.c_str());
+                backend_times.c_str(), reduce_wall_us / 1000.0, reduce_count, reduce_avg_us / 1000.0,
+                reduce_max_us / 1000.0, reduce_comm_us / 1000.0, reduce_comm_count,
+                direct_copy_count, reduce_to_primary_count, reduce_fallback_count,
+                reduce_copy_wait_us / 1000.0, reduce_zero_copy_skips, reduce_add_us / 1000.0,
+                reduce_zero_us / 1000.0, reduce_other_us / 1000.0);
+        for (size_t j_src = 0; j_src < n_backends; ++j_src) {
+            for (size_t j_dst = 0; j_dst < n_backends; ++j_dst) {
+                const auto & stats = reduce_copy_by_direction[j_src*n_backends + j_dst];
+                if (stats.count == 0) {
+                    continue;
+                }
+                printf("[META_COPY_SUM] %zu->%zu count=%zu total=%.3f ms avg=%.3f ms max=%.3f ms bytes=%.3f MiB\n",
+                       j_src, j_dst, stats.count, stats.total_us / 1000.0,
+                       (double(stats.total_us) / stats.count) / 1000.0, stats.max_us / 1000.0,
+                       stats.bytes / (1024.0 * 1024.0));
+            }
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

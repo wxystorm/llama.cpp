@@ -2298,8 +2298,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     if (model.arch == LLM_ARCH_LLAMA && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        constexpr uint32_t default_chunks = 4;
-        const char * value = std::getenv("LLAMA_FFN_CHUNKS");
+        constexpr uint32_t default_chunks = 2;
+        const char * value = std::getenv("LLAMA_CHUNKS");
         const int configured_chunks = value == nullptr ? default_chunks : std::atoi(value);
         const uint32_t n_chunks = std::min<uint32_t>(
                 configured_chunks > 0 ? configured_chunks : default_chunks, model.hparams.n_embd);
