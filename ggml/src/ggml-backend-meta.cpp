@@ -1915,6 +1915,7 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    uint64_t                    next_snapshot_seq = 1;
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
@@ -2185,6 +2186,36 @@ static ggml_backend_rpc_fence_t ggml_backend_meta_get_rpc_fence(ggml_backend_t b
 
     return reinterpret_cast<ggml_backend_rpc_fence_t>(
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_FENCE_PROC));
+}
+
+static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_snapshot_arm_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC));
+}
+
+static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_setter(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_set_snapshot_read_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC));
 }
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
@@ -2743,6 +2774,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
         const ggml_backend_rpc_fence_t rpc_fence =
             ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+        const ggml_backend_rpc_snapshot_arm_t snapshot_arm =
+            ggml_backend_meta_get_snapshot_arm(bcj_src.backend);
+        const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
+            ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
+
+        const bool use_snapshot_pipeline =
+            snapshot_arm != nullptr && set_snapshot_read != nullptr;
+        const uint64_t snapshot_seq =
+            use_snapshot_pipeline ? backend_ctx->next_snapshot_seq++ : 0;
+        const uint32_t snapshot_slot = snapshot_seq & 1;
 
         GGML_ASSERT(ggml_is_contiguous(nodes[j_src]));
         GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
@@ -2783,7 +2824,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const uint64_t task_id =
             backend_ctx->transfer_worker->enqueue(
-                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i, set_stage_ready, rpc_fence](uint64_t task_id) -> ggml_status {
+                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i,
+                    set_stage_ready, rpc_fence, set_snapshot_read,
+                    use_snapshot_pipeline, snapshot_slot, snapshot_seq](uint64_t task_id) -> ggml_status {
 
                     // Phone -> PC
                     ggml_backend_meta_stage_ready_context stage_context {
@@ -2791,22 +2834,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         task_id,
                     };
 
-                    const int64_t fence_start_us = ggml_time_us();
-                    if (rpc_fence != nullptr) {
-                        rpc_fence(bcj_src.backend);
+                    if (use_snapshot_pipeline) {
+                        set_snapshot_read(true, snapshot_slot, snapshot_seq);
                     } else {
-                        ggml_backend_synchronize(bcj_src.backend);
-                    }
-                    const int64_t fence_us = ggml_time_us() - fence_start_us;
+                        const int64_t fence_start_us = ggml_time_us();
+                        if (rpc_fence != nullptr) {
+                            rpc_fence(bcj_src.backend);
+                        } else {
+                            ggml_backend_synchronize(bcj_src.backend);
+                        }
+                        const int64_t fence_us = ggml_time_us() - fence_start_us;
 
-                    if (pipeline_debug && reduce_copy_detail_count < 4) {
-                        printf("[META_FENCE] sg=%zu %zu->%zu time=%.3f ms\n",
-                               i, j_src, j_dst, fence_us / 1000.0);
+                        if (pipeline_debug && reduce_copy_detail_count < 4) {
+                            printf("[META_FENCE] sg=%zu %zu->%zu time=%.3f ms\n",
+                                   i, j_src, j_dst, fence_us / 1000.0);
+                        }
                     }
 
                     const int64_t copy_start_us = ggml_time_us();
 
-                    if (set_stage_ready != nullptr) {
+                    if (!use_snapshot_pipeline && set_stage_ready != nullptr) {
                         set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
                     }
 
@@ -2816,7 +2863,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             node_src,
                             node_tmp);
 
-                    if (set_stage_ready != nullptr) {
+                    if (use_snapshot_pipeline) {
+                        set_snapshot_read(false, 0, 0);
+                    } else if (set_stage_ready != nullptr) {
                         set_stage_ready(nullptr, nullptr);
                     }
 
@@ -2850,16 +2899,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 });
 
-        if (!next_is_ffn_down_chunk || set_stage_ready == nullptr || rpc_fence == nullptr) {
+        if (use_snapshot_pipeline) {
+            const bool armed = snapshot_arm(
+                bcj_src.backend,
+                node_src,
+                0,
+                ggml_nbytes(node_src),
+                snapshot_slot,
+                snapshot_seq);
+            GGML_ASSERT(armed);
+            if (!next_is_ffn_down_chunk) {
+                return backend_ctx->transfer_worker->wait(task_id);
+            }
+            backend_ctx->compute_workers->start(j_src, i + 1);
+        } else if (!next_is_ffn_down_chunk || set_stage_ready == nullptr || rpc_fence == nullptr) {
             return backend_ctx->transfer_worker->wait(task_id);
+        } else {
+            const ggml_status status = backend_ctx->transfer_worker->wait_stage_ready(task_id);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            backend_ctx->compute_workers->start(j_src, i + 1);
         }
-
-        ggml_status status = backend_ctx->transfer_worker->wait_stage_ready(task_id);
-        if (status != GGML_STATUS_SUCCESS) {
-            return status;
-        }
-
-        backend_ctx->compute_workers->start(j_src, i + 1);
 
         const ggml_status transfer_status = backend_ctx->transfer_worker->wait(task_id);
         if (transfer_status == GGML_STATUS_SUCCESS) {
