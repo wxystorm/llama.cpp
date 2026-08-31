@@ -2921,6 +2921,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 });
 
+        const bool primary_mirror_back = std::getenv("GGML_META_PRIMARY_MIRROR_BACK") != nullptr;
+        if (primary_mirror_back) {
+            if (use_snapshot_pipeline) {
+                const bool armed = snapshot_arm(
+                        bcj_src.backend,
+                        node_src,
+                        0,
+                        ggml_nbytes(node_src),
+                        snapshot_slot,
+                        snapshot_seq);
+                GGML_ASSERT(armed);
+            }
+
+            const ggml_status status = backend_ctx->transfer_worker->wait(task_id);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+
+            ggml_backend_synchronize(bcj_dst.backend);
+
+            const size_t nbytes = ggml_nbytes(node_dst);
+            GGML_ASSERT(ggml_nbytes(node_src) == nbytes);
+            std::vector<uint8_t> full_data(nbytes);
+
+            ggml_backend_tensor_get(node_dst, full_data.data(), 0, nbytes);
+            ggml_backend_tensor_set(node_src, full_data.data(), 0, nbytes);
+
+            return GGML_STATUS_SUCCESS;
+        }
+
         if (use_snapshot_pipeline) {
             const int64_t snapshot_arm_us = ggml_time_us();
             if (pipeline_gap.valid && pipeline_gap.subgraph == i) {
