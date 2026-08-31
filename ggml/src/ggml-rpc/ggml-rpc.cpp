@@ -923,6 +923,10 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    GGML_UNUSED(backend);
+}
+
+static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     rpc_msg_synchronize_req request {};
     request.device = rpc_ctx->device;
@@ -2966,6 +2970,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_STAGE_READY_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_stage_ready_callback);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_FENCE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_fence);
     }
 
     GGML_UNUSED(reg);

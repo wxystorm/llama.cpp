@@ -47,6 +47,9 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_SET_STAGE_READY_PROC \
     "ggml_backend_rpc_set_stage_ready_callback"
+
+#define GGML_BACKEND_RPC_FENCE_PROC \
+    "ggml_backend_rpc_fence"
     
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
@@ -68,6 +71,8 @@ using ggml_backend_rpc_stage_ready_callback_t = void (*)(void * user_data);
 using ggml_backend_rpc_set_stage_ready_t = void (*)(
         ggml_backend_rpc_stage_ready_callback_t callback,
         void * user_data);
+
+using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
