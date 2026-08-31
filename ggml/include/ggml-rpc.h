@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    2
+#define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -50,6 +50,12 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_FENCE_PROC \
     "ggml_backend_rpc_fence"
+
+#define GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC \
+    "ggml_backend_rpc_snapshot_arm"
+
+#define GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC \
+    "ggml_backend_rpc_set_snapshot_read"
     
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
@@ -73,6 +79,19 @@ using ggml_backend_rpc_set_stage_ready_t = void (*)(
         void * user_data);
 
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
+
+using ggml_backend_rpc_snapshot_arm_t = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        size_t offset,
+        size_t size,
+        uint32_t slot,
+        uint64_t seq);
+
+using ggml_backend_rpc_set_snapshot_read_t = void (*)(
+        bool enabled,
+        uint32_t slot,
+        uint64_t seq);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
