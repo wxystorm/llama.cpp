@@ -1966,6 +1966,7 @@ struct ggml_backend_meta_compute_workers {
     std::vector<std::thread> workers;
     std::vector<ggml_status> statuses;
     std::vector<int64_t> backend_time_us;
+    std::vector<int64_t> completed_time_us;
 
     std::mutex mutex;
     std::condition_variable task_cv;
@@ -1980,6 +1981,7 @@ struct ggml_backend_meta_compute_workers {
         n_backends(n_backends),
         statuses(n_backends, GGML_STATUS_SUCCESS),
         backend_time_us(n_backends, 0),
+        completed_time_us(n_backends, 0),
         generation(n_backends, 0),
         completed_generation(n_backends, 0),
         task_index(n_backends, 0) {
@@ -2007,10 +2009,12 @@ struct ggml_backend_meta_compute_workers {
                     const ggml_status status = ggml_backend_graph_compute_async(
                             bcj.backend, bcj.cgraphs[i].cgraph_main);
                     const int64_t elapsed_us = ggml_time_us() - start_us;
+                    const int64_t completed_us = ggml_time_us();
 
                     lock.lock();
                     statuses[j] = status;
                     backend_time_us[j] += elapsed_us;
+                    completed_time_us[j] = completed_us;
                     completed_generation[j] = seen_generation;
                     done_cv.notify_all();
                 }
@@ -2065,6 +2069,11 @@ struct ggml_backend_meta_compute_workers {
         const size_t target_generation = generation[j];
         done_cv.wait(lock, [&]() { return completed_generation[j] == target_generation; });
         return statuses[j];
+    }
+
+    int64_t completed_at(size_t j) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completed_time_us[j];
     }
 
     void reset_timings() {
@@ -2671,6 +2680,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
     size_t reduce_copy_detail_count = 0;
+    int64_t pipeline_submit_sum_us = 0;
+    int64_t pipeline_gap_sum_us    = 0;
+    int64_t pipeline_gap_max_us    = 0;
+    size_t  pipeline_gap_count     = 0;
+    struct pipeline_gap_timing {
+        bool valid = false;
+
+        size_t subgraph = SIZE_MAX;
+
+        int64_t pc_start_us  = 0;
+        int64_t pc_submit_us = 0;
+    };
+    pipeline_gap_timing pipeline_gap;
 
     auto record_meta_copy = [&](size_t i, size_t j_src, size_t j_dst, const ggml_tensor * node_src, int64_t copy_us) {
         const size_t copy_bytes = ggml_nbytes(node_src);
@@ -2900,6 +2922,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 });
 
         if (use_snapshot_pipeline) {
+            const int64_t snapshot_arm_us = ggml_time_us();
+            if (pipeline_gap.valid && pipeline_gap.subgraph == i) {
+                if (pipeline_debug) {
+                    const int64_t submit_us = pipeline_gap.pc_submit_us - pipeline_gap.pc_start_us;
+                    const int64_t gap_us = snapshot_arm_us - pipeline_gap.pc_submit_us;
+                    pipeline_submit_sum_us += submit_us;
+                    pipeline_gap_sum_us += gap_us;
+                    pipeline_gap_max_us = std::max(pipeline_gap_max_us, gap_us);
+                    ++pipeline_gap_count;
+                }
+                pipeline_gap.valid = false;
+            }
             const bool armed = snapshot_arm(
                 bcj_src.backend,
                 node_src,
@@ -2922,8 +2956,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->compute_workers->start(j_src, i + 1);
         }
 
+        int64_t pc_start_us = 0;
         const ggml_status transfer_status = backend_ctx->transfer_worker->wait(task_id);
         if (transfer_status == GGML_STATUS_SUCCESS) {
+            pc_start_us = ggml_time_us();
             backend_ctx->compute_workers->start(j_dst, i + 1);
         }
 
@@ -2938,6 +2974,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const ggml_status pc_status = backend_ctx->compute_workers->wait(j_dst);
         if (pc_status != GGML_STATUS_SUCCESS) {
             return pc_status;
+        }
+
+        if (use_snapshot_pipeline) {
+            pipeline_gap.valid        = true;
+            pipeline_gap.subgraph     = i + 1;
+            pipeline_gap.pc_start_us  = pc_start_us;
+            pipeline_gap.pc_submit_us = backend_ctx->compute_workers->completed_at(j_dst);
         }
 
         next_compute_complete = true;
@@ -3213,6 +3256,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                        (double(stats.total_us) / stats.count) / 1000.0, stats.max_us / 1000.0,
                        stats.bytes / (1024.0 * 1024.0));
             }
+        }
+        if (pipeline_gap_count > 0) {
+            printf("[META_PIPELINE_GAP_SUM] count=%zu submit_avg=%.3f ms gap_avg=%.3f ms max=%.3f ms\n",
+                   pipeline_gap_count,
+                   pipeline_submit_sum_us / 1000.0 / pipeline_gap_count,
+                   pipeline_gap_sum_us / 1000.0 / pipeline_gap_count,
+                   pipeline_gap_max_us / 1000.0);
         }
     }
     return GGML_STATUS_SUCCESS;
