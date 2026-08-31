@@ -2637,7 +2637,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ++direct_copy_count;
             return GGML_STATUS_SUCCESS;
         }
+        if (backend_ctx->compute_workers == nullptr) {
+            backend_ctx->compute_workers =
+                new ggml_backend_meta_compute_workers(backend_ctx, n_backends);
+        }
 
+        if (backend_ctx->transfer_worker == nullptr) {
+            backend_ctx->transfer_worker =
+                new ggml_backend_meta_transfer_worker();
+        }
         const bool is_ffn_down_chunk = n_backends == 2 && active_count == 2 &&
             (std::strstr(nodes[0]->name, "ffn_down_chunk") != nullptr ||
              std::strstr(nodes[1]->name, "ffn_down_chunk") != nullptr);
@@ -2647,44 +2655,106 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             nodes[0]->ne[1] > 1 &&
             nodes[1]->ne[1] > 1;
 
-        if (!is_ffn_down_chunk ) {
+        if (!is_ffn_down_chunk) {
             return GGML_STATUS_SUCCESS;
         }
 
         handled = true;
-        constexpr size_t j_src = 1;
-        constexpr size_t j_dst = 0;
+
+        constexpr size_t j_src = 1; // Phone
+        constexpr size_t j_dst = 0; // PC
+
         auto & bcj_src = backend_ctx->backend_configs[j_src];
         auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+
         GGML_ASSERT(ggml_is_contiguous(nodes[j_src]));
         GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
 
-        ggml_tensor * node_tmp = get_node_aux(nodes[j_dst]);
-        set_tmp_data(node_tmp, j_dst, 0);
-        const int64_t copy_start_us = ggml_time_us();
-        ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, nodes[j_src], node_tmp);
-        const int64_t copy_us = ggml_time_us() - copy_start_us;
-        reduce_copy_wait_us += copy_us;
-        record_meta_copy(i, j_src, j_dst, nodes[j_src], copy_us);
+        // -----------------------------------------------------
+        // 这些对象仍然由主线程准备，不要放进 transfer worker
+        // -----------------------------------------------------
 
-        ggml_tensor * node_red = get_node_aux(nodes[j_dst]);
-        node_red->view_src = nodes[j_dst]->view_src == nullptr ? nodes[j_dst] : nodes[j_dst]->view_src;
-        node_red->view_offs = nodes[j_dst]->view_offs;
-        node_red->op = GGML_OP_ADD;
-        node_red->src[0] = nodes[j_dst];
+        ggml_tensor * node_src = nodes[j_src];
+        ggml_tensor * node_dst = nodes[j_dst];
+
+        ggml_tensor * node_tmp = get_node_aux(node_dst);
+        set_tmp_data(node_tmp, j_dst, 0);
+
+        ggml_tensor * node_red = get_node_aux(node_dst);
+
+        node_red->view_src =
+            node_dst->view_src == nullptr ?
+                node_dst :
+                node_dst->view_src;
+
+        node_red->view_offs = node_dst->view_offs;
+
+        node_red->op     = GGML_OP_ADD;
+        node_red->src[0] = node_dst;
         node_red->src[1] = node_tmp;
         node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
         ggml_backend_view_init(node_red);
 
         ggml_cgraph * cgraph_aux = get_cgraph_aux();
         cgraph_aux->nodes[0] = node_red;
-        cgraph_aux->n_nodes = 1;
-        const int64_t add_start_us = ggml_time_us();
-        const ggml_status status = ggml_backend_graph_compute_async(bcj_dst.backend, cgraph_aux);
-        reduce_add_us += ggml_time_us() - add_start_us;
-        if (status == GGML_STATUS_SUCCESS) {
-            ++reduce_to_primary_count;
-        }
+        cgraph_aux->n_nodes  = 1;
+
+        // -----------------------------------------------------
+        // 真正的传输 + reduce 放到 transfer worker
+        // -----------------------------------------------------
+
+        const uint64_t task_id =
+            backend_ctx->transfer_worker->enqueue(
+                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i]() -> ggml_status {
+
+                    // Phone -> PC
+                    const int64_t copy_start_us = ggml_time_us();
+
+                    ggml_backend_tensor_copy_async(
+                            bcj_src.backend,
+                            bcj_dst.backend,
+                            node_src,
+                            node_tmp);
+
+                    const int64_t copy_us =
+                        ggml_time_us() - copy_start_us;
+
+                    reduce_copy_wait_us += copy_us;
+
+                    record_meta_copy(
+                            i,
+                            j_src,
+                            j_dst,
+                            node_src,
+                            copy_us);
+
+                    // PC local result + Phone result
+                    const int64_t add_start_us = ggml_time_us();
+
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(
+                                bcj_dst.backend,
+                                cgraph_aux);
+
+                    reduce_add_us +=
+                        ggml_time_us() - add_start_us;
+
+                    if (status == GGML_STATUS_SUCCESS) {
+                        ++reduce_to_primary_count;
+                    }
+
+                    return status;
+                });
+
+        // -----------------------------------------------------
+        // 第一版：立刻等待！
+        // 不允许产生任何流水
+        // -----------------------------------------------------
+
+        const ggml_status status =
+            backend_ctx->transfer_worker->wait(task_id);
+
         return status;
     };
 
