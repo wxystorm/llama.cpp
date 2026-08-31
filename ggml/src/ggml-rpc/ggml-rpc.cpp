@@ -263,6 +263,7 @@ struct ggml_backend_rpc_context {
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
+    std::shared_ptr<socket_t> transfer_sock;
     std::string endpoint;
     void * base_ptr;
     uint64_t remote_ptr;
@@ -797,12 +798,32 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
     bool status;
     if (rpc_stage_ready_callback != nullptr) {
-        auto sock = get_transfer_socket(ctx->endpoint);
-        RPC_STATUS_ASSERT(sock != nullptr);
-        status = send_rpc_cmd_staged(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    } else {
-        status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+
+    if (ctx->transfer_sock == nullptr) {
+        ctx->transfer_sock =
+            get_transfer_socket(ctx->endpoint);
+
+        RPC_STATUS_ASSERT(
+            ctx->transfer_sock != nullptr);
     }
+
+    status = send_rpc_cmd_staged(
+        ctx->transfer_sock,
+        RPC_CMD_GET_TENSOR,
+        &request,
+        sizeof(request),
+        data,
+        size);
+
+} else {
+    status = send_rpc_cmd(
+        ctx->sock,
+        RPC_CMD_GET_TENSOR,
+        &request,
+        sizeof(request),
+        data,
+        size);
+}
 
     RPC_STATUS_ASSERT(status);
 }
@@ -865,7 +886,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, buft_ctx->endpoint, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, buft_ctx->endpoint, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
