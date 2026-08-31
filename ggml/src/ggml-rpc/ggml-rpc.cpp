@@ -380,23 +380,52 @@ static bool send_rpc_cmd_staged(
         size_t input_size,
         void * output,
         size_t output_size) {
+
+    const int64_t t0 = ggml_time_us();
+
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+
+    const int64_t t_request_done = ggml_time_us();
 
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
     }
+
+    const int64_t t_stage = ggml_time_us();
+
     if (out_size != output_size) {
         return false;
     }
 
     if (rpc_stage_ready_callback != nullptr) {
-        rpc_stage_ready_callback(rpc_stage_ready_user_data);
+        rpc_stage_ready_callback(
+            rpc_stage_ready_user_data);
     }
 
-    return sock->recv_data(output, output_size);
+    if (!sock->recv_data(output, output_size)) {
+        return false;
+    }
+
+    const int64_t t_done = ggml_time_us();
+
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_STAGED_GET] bytes=%zu "
+            "request=%.3f ms "
+            "to_stage=%.3f ms "
+            "payload=%.3f ms "
+            "total=%.3f ms\n",
+            output_size,
+            (t_request_done - t0) / 1000.0,
+            (t_stage - t_request_done) / 1000.0,
+            (t_done - t_stage) / 1000.0,
+            (t_done - t0) / 1000.0);
+    }
+
+    return true;
 }
 
 // RPC client-side implementation
