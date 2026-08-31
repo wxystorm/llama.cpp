@@ -2776,6 +2776,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         task_id,
                     };
 
+                    ggml_backend_synchronize(bcj_src.backend);
+
                     if (set_stage_ready != nullptr) {
                         set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
                     }

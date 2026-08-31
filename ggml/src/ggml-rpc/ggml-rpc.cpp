@@ -72,12 +72,14 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
-    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, 
+    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
+    RPC_CMD_SYNCHRONIZE,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SYNCHRONIZE == 18, "RPC_CMD_SYNCHRONIZE must be before RPC_CMD_COUNT");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -192,6 +194,10 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t graph_uid;
+};
+
+struct rpc_msg_synchronize_req {
+    uint32_t device;
 };
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
@@ -917,8 +923,21 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    rpc_msg_synchronize_req request {};
+    request.device = rpc_ctx->device;
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_SYNCHRONIZE,
+        &request,
+        sizeof(request),
+        nullptr,
+        0);
+    RPC_STATUS_ASSERT(status);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -1015,7 +1034,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
@@ -1033,7 +1052,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr, 0);
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
@@ -1175,6 +1194,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool synchronize(uint32_t device);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -1747,6 +1767,15 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    return true;
+}
+
+bool rpc_server::synchronize(uint32_t device) {
+    if (device >= backends.size()) {
+        return false;
+    }
+
+    ggml_backend_synchronize(backends[device]);
     return true;
 }
 
@@ -2565,9 +2594,6 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!server.graph_compute(input)) {
                     return;
                 }
-                if (!send_msg(sock, nullptr, 0)) {
-                    return;
-                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2576,9 +2602,6 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 if (!server.graph_recompute(request)) {
-                    return;
-                }
-                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2622,6 +2645,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
 
+                break;
+            }
+            case RPC_CMD_SYNCHRONIZE: {
+                rpc_msg_synchronize_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.synchronize(request.device)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
                 break;
             }
             default: {
