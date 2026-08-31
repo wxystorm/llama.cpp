@@ -2074,16 +2074,18 @@ struct ggml_backend_meta_compute_workers {
 struct ggml_backend_meta_transfer_worker {
     struct task {
         uint64_t id;
-        std::function<ggml_status()> run;
+        std::function<ggml_status(uint64_t)> run;
     };
 
     std::thread worker;
     std::mutex mutex;
     std::condition_variable task_cv;
     std::condition_variable done_cv;
+    std::condition_variable stage_cv;
     std::deque<task> tasks;
     uint64_t submitted = 0;
     uint64_t completed = 0;
+    uint64_t stage_ready = 0;
     ggml_status status = GGML_STATUS_SUCCESS;
     bool stop = false;
 
@@ -2098,13 +2100,14 @@ struct ggml_backend_meta_transfer_worker {
             task current = std::move(tasks.front());
             tasks.pop_front();
             lock.unlock();
-            const ggml_status task_status = current.run();
+            const ggml_status task_status = current.run(current.id);
             lock.lock();
             if (status == GGML_STATUS_SUCCESS) {
                 status = task_status;
             }
             completed = current.id;
             done_cv.notify_all();
+            stage_cv.notify_all();
         }
     }) {}
 
@@ -2117,7 +2120,7 @@ struct ggml_backend_meta_transfer_worker {
         worker.join();
     }
 
-    uint64_t enqueue(std::function<ggml_status()> run) {
+    uint64_t enqueue(std::function<ggml_status(uint64_t)> run) {
         std::lock_guard<std::mutex> lock(mutex);
         const uint64_t id = ++submitted;
         tasks.push_back({ id, std::move(run) });
@@ -2130,7 +2133,44 @@ struct ggml_backend_meta_transfer_worker {
         done_cv.wait(lock, [&]() { return completed >= id; });
         return status;
     }
+
+    void mark_stage_ready(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        stage_ready = std::max(stage_ready, id);
+        stage_cv.notify_all();
+    }
+
+    ggml_status wait_stage_ready(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mutex);
+        stage_cv.wait(lock, [&]() { return stage_ready >= id || completed >= id; });
+        return status;
+    }
 };
+
+struct ggml_backend_meta_stage_ready_context {
+    ggml_backend_meta_transfer_worker * worker;
+    uint64_t task_id;
+};
+
+static void ggml_backend_meta_stage_ready(void * user_data) {
+    auto * context = static_cast<ggml_backend_meta_stage_ready_context *>(user_data);
+    context->worker->mark_stage_ready(context->task_id);
+}
+
+static ggml_backend_rpc_set_stage_ready_t ggml_backend_meta_get_stage_ready_setter(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_set_stage_ready_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_STAGE_READY_PROC));
+}
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
@@ -2604,7 +2644,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     };
 
-    auto specialized_communication = [&](size_t i, bool & handled) -> ggml_status {
+    auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
         size_t active_count = 0;
         size_t active_backend = 0;
@@ -2667,6 +2707,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto & bcj_src = backend_ctx->backend_configs[j_src];
         auto & bcj_dst = backend_ctx->backend_configs[j_dst];
 
+        size_t next_active_count = 0;
+        bool next_is_ffn_down_chunk = i + 1 < backend_ctx->n_subgraphs;
+        bool next_has_ffn_down_chunk = false;
+        if (next_is_ffn_down_chunk) {
+            for (size_t j = 0; j < n_backends; ++j) {
+                const auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * next_graph = bcj.cgraphs[i + 1].cgraph_main;
+                ggml_tensor * next_node = next_graph->nodes[next_graph->n_nodes - 1];
+                if (next_node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    ++next_active_count;
+                }
+                next_has_ffn_down_chunk = next_has_ffn_down_chunk ||
+                    std::strstr(next_node->name, "ffn_down_chunk") != nullptr;
+            }
+            next_is_ffn_down_chunk = next_active_count == n_backends && next_has_ffn_down_chunk;
+        }
+
+        const ggml_backend_rpc_set_stage_ready_t set_stage_ready =
+            ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
+
         GGML_ASSERT(ggml_is_contiguous(nodes[j_src]));
         GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
 
@@ -2706,16 +2766,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const uint64_t task_id =
             backend_ctx->transfer_worker->enqueue(
-                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i]() -> ggml_status {
+                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i, set_stage_ready](uint64_t task_id) -> ggml_status {
 
                     // Phone -> PC
                     const int64_t copy_start_us = ggml_time_us();
+
+                    ggml_backend_meta_stage_ready_context stage_context {
+                        backend_ctx->transfer_worker,
+                        task_id,
+                    };
+
+                    if (set_stage_ready != nullptr) {
+                        set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
+                    }
 
                     ggml_backend_tensor_copy_async(
                             bcj_src.backend,
                             bcj_dst.backend,
                             node_src,
                             node_tmp);
+
+                    if (set_stage_ready != nullptr) {
+                        set_stage_ready(nullptr, nullptr);
+                    }
 
                     const int64_t copy_us =
                         ggml_time_us() - copy_start_us;
@@ -2747,15 +2820,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 });
 
-        // -----------------------------------------------------
-        // 第一版：立刻等待！
-        // 不允许产生任何流水
-        // -----------------------------------------------------
+        if (!next_is_ffn_down_chunk || set_stage_ready == nullptr) {
+            return backend_ctx->transfer_worker->wait(task_id);
+        }
 
-        const ggml_status status =
-            backend_ctx->transfer_worker->wait(task_id);
+        ggml_status status = backend_ctx->transfer_worker->wait_stage_ready(task_id);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
 
-        return status;
+        backend_ctx->compute_workers->start(j_src, i + 1);
+
+        const ggml_status transfer_status = backend_ctx->transfer_worker->wait(task_id);
+        if (transfer_status == GGML_STATUS_SUCCESS) {
+            backend_ctx->compute_workers->start(j_dst, i + 1);
+        }
+
+        const ggml_status phone_status = backend_ctx->compute_workers->wait(j_src);
+        if (transfer_status != GGML_STATUS_SUCCESS) {
+            return transfer_status;
+        }
+        if (phone_status != GGML_STATUS_SUCCESS) {
+            return phone_status;
+        }
+
+        const ggml_status pc_status = backend_ctx->compute_workers->wait(j_dst);
+        if (pc_status != GGML_STATUS_SUCCESS) {
+            return pc_status;
+        }
+
+        next_compute_complete = true;
+        return GGML_STATUS_SUCCESS;
     };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
@@ -2948,18 +3043,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     compute_workers.reset_timings();
     int64_t compute_wall_us = 0;
     int64_t reduce_wall_us  = 0;
+    bool compute_complete = false;
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        const int64_t compute_start_us = ggml_time_us();
-        const ggml_status compute_status = compute_workers.compute(i);
-        compute_wall_us += ggml_time_us() - compute_start_us;
-        if (compute_status != GGML_STATUS_SUCCESS) {
-            return compute_status;
+        if (!compute_complete) {
+            const int64_t compute_start_us = ggml_time_us();
+            const ggml_status compute_status = compute_workers.compute(i);
+            compute_wall_us += ggml_time_us() - compute_start_us;
+            if (compute_status != GGML_STATUS_SUCCESS) {
+                return compute_status;
+            }
+        } else {
+            compute_complete = false;
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
-            const ggml_status specialized_status = specialized_communication(i, communication_complete);
+            const ggml_status specialized_status =
+                specialized_communication(i, communication_complete, compute_complete);
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
             }

@@ -357,6 +357,42 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return true;
 }
 
+static thread_local ggml_backend_rpc_stage_ready_callback_t rpc_stage_ready_callback = nullptr;
+static thread_local void * rpc_stage_ready_user_data = nullptr;
+
+static void ggml_backend_rpc_set_stage_ready_callback(
+        ggml_backend_rpc_stage_ready_callback_t callback,
+        void * user_data) {
+    rpc_stage_ready_callback = callback;
+    rpc_stage_ready_user_data = user_data;
+}
+
+static bool send_rpc_cmd_staged(
+        socket_ptr sock,
+        enum rpc_cmd cmd,
+        const void * input,
+        size_t input_size,
+        void * output,
+        size_t output_size) {
+    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+        return false;
+    }
+
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    if (out_size != output_size) {
+        return false;
+    }
+
+    if (rpc_stage_ready_callback != nullptr) {
+        rpc_stage_ready_callback(rpc_stage_ready_user_data);
+    }
+
+    return sock->recv_data(output, output_size);
+}
+
 // RPC client-side implementation
 
 // Performs HELLO handshake with transport auto-negotiation.
@@ -725,7 +761,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
     auto sock = get_transfer_socket(ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
-    bool status = send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    bool status = send_rpc_cmd_staged(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -2888,6 +2924,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_LOCAL_2D_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_from_local_file_2d);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_STAGE_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_stage_ready_callback);
     }
 
     GGML_UNUSED(reg);
