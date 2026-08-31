@@ -239,10 +239,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                         LLM_FFN_SILU, LLM_FFN_PAR, il);
 
                 std::vector<ggml_tensor *> hidden_chunks;
-                std::vector<ggml_tensor *> down_chunks;
                 std::vector<ggml_tensor *> norm_pre_chunks;
                 hidden_chunks.reserve(n_chunks);
-                down_chunks.reserve(n_chunks);
                 norm_pre_chunks.reserve(n_chunks);
 
                 ggml_tensor * sum_sq = nullptr;
@@ -290,22 +288,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     if (model.layers[il].ffn_down_s != nullptr) {
                         out = ggml_mul(ctx0, out, model.layers[il].ffn_down_s);
                     }
-
-                    down_chunks.push_back(out);
-                }
-
-                ggml_tensor * ffn_down = down_chunks[0];
-                for (int i = 1; i < n_chunks; ++i) {
-                    ffn_down = ggml_concat(ctx0, ffn_down, down_chunks[i], 0);
-                }
-
-                for (int i = 0; i < n_chunks; ++i) {
-                    const int64_t offset = n_embd * i / n_chunks;
-                    const int64_t end    = n_embd * (i + 1) / n_chunks;
-                    const int64_t length = end - offset;
-
-                    ggml_tensor * out = ggml_view_2d(ctx0, ffn_down,
-                            length, ffn_down->ne[1], ffn_down->nb[1], offset * ffn_down->nb[0]);
 
                     ggml_tensor * residual = ggml_view_2d(ctx0, ffn_inp,
                             length, ffn_inp->ne[1], ffn_inp->nb[1], offset * ffn_inp->nb[0]);
