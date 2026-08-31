@@ -11,6 +11,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -256,6 +257,7 @@ struct ggml_backend_rpc_context {
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
+    std::string endpoint;
     void * base_ptr;
     uint64_t remote_ptr;
 };
@@ -378,13 +380,17 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     sock->update_caps(response.conn_caps);
     return true;
 }
+enum class rpc_socket_role {
+    COMPUTE,
+    TRANSFER,
+};
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-
-    auto it = sockets.find(endpoint);
+    std::string key = endpoint + (role == rpc_socket_role::COMPUTE ? "_compute" : "_transfer");
+    auto it = sockets.find(key);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
             return sock;
@@ -408,8 +414,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    sockets[key] = sock;
     return sock;
+}
+
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+    return get_socket_role(endpoint, rpc_socket_role::COMPUTE);
+}
+
+static std::shared_ptr<socket_t> get_transfer_socket(const std::string & endpoint) {
+    return get_socket_role(endpoint, rpc_socket_role::TRANSFER);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -709,7 +723,9 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.offset = offset;
     request.size = size;
     GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    auto sock = get_transfer_socket(ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+    bool status = send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -771,7 +787,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, buft_ctx->endpoint, nullptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -963,7 +979,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), nullptr, 0);
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
@@ -981,7 +997,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), nullptr, 0);
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
@@ -2281,11 +2297,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 */
 
-//重构
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock, const ggml_rpc_local_tensor_source * tensor_source,
-                             std::string model_path, int tp_rank, int tp_size) {
-    rpc_server server(backends, cache_dir, tensor_source);
+static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr sock, size_t device_count) {
+    rpc_server & server = *server_ptr;
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2341,7 +2354,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_device_count_rsp response;
-                response.device_count = backends.size();
+                response.device_count = device_count;
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
@@ -2516,6 +2529,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2524,6 +2540,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -2716,20 +2735,20 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+    auto shared_server = std::make_shared<rpc_server>(backends, cache_dir, tensor_source);
     while (true) {
-        auto client_socket = server_socket->accept();   //这个是接收客户端连接的socket
+        auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             return;
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket,
-                         tensor_source,
-                         model_path ? std::string(model_path) : std::string(),
-                         tp_rank, tp_world_size);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        std::thread([shared_server, client_socket, n_devices]() {
+            rpc_serve_client(shared_server, client_socket, n_devices);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
     rpc_transport_shutdown();
     for (auto backend : backends) {
