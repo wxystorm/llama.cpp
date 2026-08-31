@@ -759,15 +759,22 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_get_tensor_req request;
+    auto * ctx = static_cast<ggml_backend_rpc_buffer_context *>(buffer->context);
+    rpc_msg_get_tensor_req request {};
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
     GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
-    auto sock = get_transfer_socket(ctx->endpoint);
-    RPC_STATUS_ASSERT(sock != nullptr);
-    bool status = send_rpc_cmd_staged(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+
+    bool status;
+    if (rpc_stage_ready_callback != nullptr) {
+        auto sock = get_transfer_socket(ctx->endpoint);
+        RPC_STATUS_ASSERT(sock != nullptr);
+        status = send_rpc_cmd_staged(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    } else {
+        status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    }
+
     RPC_STATUS_ASSERT(status);
 }
 
