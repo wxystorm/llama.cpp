@@ -412,7 +412,7 @@ static bool send_rpc_cmd_staged(
     const int64_t t_done = ggml_time_us();
 
     if (RPC_DEBUG) {
-        GGML_LOG_INFO(
+        printf(
             "[RPC_STAGED_GET] bytes=%zu "
             "request=%.3f ms "
             "to_stage=%.3f ms "
@@ -1619,7 +1619,24 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
-    ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    const int64_t t0 = ggml_time_us();
+
+ggml_backend_tensor_get(
+    tensor,
+    response.data(),
+    request.offset,
+    request.size);
+
+const int64_t get_us = ggml_time_us() - t0;
+
+if (RPC_DEBUG) {
+    GGML_LOG_INFO(
+        "[RPC_SERVER_GET] tensor=%s bytes=%" PRIu64
+        " tensor_get=%.3f ms\n",
+        tensor->name,
+        request.size,
+        get_us / 1000.0);
+}
     return true;
 }
 
