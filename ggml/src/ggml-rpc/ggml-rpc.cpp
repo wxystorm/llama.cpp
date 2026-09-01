@@ -888,6 +888,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
                 (t_done - t_header) / 1000.0,
                 (t_done - t0) / 1000.0);
         }
+        return;
     }
 
     rpc_msg_get_tensor_req request {};
