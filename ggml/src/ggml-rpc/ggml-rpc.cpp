@@ -389,18 +389,41 @@ static bool send_rpc_cmd_compact_small(
 }
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+static bool send_rpc_cmd(
+        socket_ptr sock,
+        enum rpc_cmd cmd,
+        const void * input,
+        size_t input_size) {
+
+    std::array<uint8_t, 1 + sizeof(uint64_t)> header {};
+
+    header[0] =
+        static_cast<uint8_t>(cmd);
+
+    const uint64_t wire_size =
+        static_cast<uint64_t>(input_size);
+
+    memcpy(
+        header.data() + 1,
+        &wire_size,
+        sizeof(wire_size));
+
+    // cmd + request_size 一次发送
+    if (!sock->send_data(
+            header.data(),
+            header.size())) {
         return false;
     }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
+
+    // payload 为空时不要再调用 send_data
+    if (input_size == 0) {
+        return true;
     }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
-    return true;
+
+    // payload 单独一次发送
+    return sock->send_data(
+        input,
+        input_size);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
