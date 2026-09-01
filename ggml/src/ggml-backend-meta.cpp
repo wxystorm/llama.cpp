@@ -2417,6 +2417,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * node = cgraph->nodes[i];
+            const bool is_decode_result_norm =
+                node->ne[1] == 1 &&
+                std::strncmp(node->name, "result_norm", 11) == 0;
+            if (!is_decode_result_norm) {
+                continue;
+            }
+            for (size_t j = 1; j < n_backends; ++j) {
+                backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+            }
+        }
+
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed = [&](const int i) -> int {
@@ -2587,7 +2600,14 @@ if (decode_pc_only_attn) {
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool is_decode_result_norm =
+                    node->ne[1] == 1 &&
+                    std::strncmp(node->name, "result_norm", 11) == 0;
+
+                const bool new_subgraph =
+                    i + 1 == cgraph->n_nodes ||
+                    split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                    is_decode_result_norm;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2772,13 +2792,17 @@ if (decode_pc_only_attn) {
         stats.total_us += copy_us;
         stats.max_us = std::max(stats.max_us, copy_us);
 
-        if (pipeline_debug && reduce_copy_detail_count < 4) {
+        const bool is_result_norm =
+            std::strncmp(node_src->name, "result_norm", 11) == 0;
+        if (pipeline_debug && (reduce_copy_detail_count < 4 || is_result_norm)) {
             printf("[META_COPY] sg=%zu %zu->%zu tensor=%s bytes=%zu "
                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] time=%.3f ms\n",
                    i, j_src, j_dst, node_src->name, copy_bytes,
                    node_src->ne[0], node_src->ne[1], node_src->ne[2], node_src->ne[3],
                    copy_us / 1000.0);
-            ++reduce_copy_detail_count;
+            if (!is_result_norm) {
+                ++reduce_copy_detail_count;
+            }
         }
     };
 
@@ -3285,7 +3309,7 @@ if (decode_pc_only_attn) {
     int64_t compute_wall_us = 0;
     int64_t reduce_wall_us  = 0;
     bool compute_complete = false;
-    auto is_decode_pc_only_ffn_norm_sg = [&](size_t i) -> bool {
+    auto is_decode_pc_only_norm_sg = [&](size_t i) -> bool {
     if (n_backends != 2) {
         return false;
     }
@@ -3312,8 +3336,13 @@ if (decode_pc_only_attn) {
         return false;
     }
 
-    if (std::strncmp(pc_last->name, "ffn_norm-", 9) != 0 ||
-            std::strncmp(phone_last->name, "ffn_norm-", 9) != 0) {
+    const bool pc_is_norm =
+        std::strncmp(pc_last->name, "ffn_norm-", 9) == 0 ||
+        std::strncmp(pc_last->name, "result_norm", 11) == 0;
+    const bool phone_is_norm =
+        std::strncmp(phone_last->name, "ffn_norm-", 9) == 0 ||
+        std::strncmp(phone_last->name, "result_norm", 11) == 0;
+    if (!pc_is_norm || !phone_is_norm) {
         return false;
     }
 
@@ -3331,12 +3360,12 @@ if (decode_pc_only_attn) {
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
 
-    if (is_decode_pc_only_ffn_norm_sg(i)) {
+    if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
 
-        if (pipeline_debug && i < 8) {
+        if (pipeline_debug) {
             auto * g =
                 backend_ctx->backend_configs[0]
                     .cgraphs[i].cgraph_main;
