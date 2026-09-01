@@ -3062,7 +3062,7 @@ if (decode_pc_only_attn) {
 
             return GGML_STATUS_SUCCESS;
         }
-
+        bool phone_early_started = false;
         if (use_snapshot_pipeline) {
             const int64_t snapshot_arm_us = ggml_time_us();
             if (pipeline_gap.valid && pipeline_gap.subgraph == i) {
@@ -3084,28 +3084,63 @@ if (decode_pc_only_attn) {
                 snapshot_slot,
                 snapshot_seq);
             GGML_ASSERT(armed);
+            if (phone_early_graph != nullptr) {
+            backend_ctx->compute_workers->start_graph(
+            j_src,
+            phone_early_graph);
+
+        phone_early_started = true;
+    }
         }
 
-        const ggml_status transfer_status = backend_ctx->transfer_worker->wait(task_id);
-        if (transfer_status != GGML_STATUS_SUCCESS) {
-            return transfer_status;
-        }
-        if (phone_early_graph == nullptr) {
-            return GGML_STATUS_SUCCESS;
-        }
+        const ggml_status transfer_status =
+    backend_ctx->transfer_worker->wait(task_id);
 
-        backend_ctx->compute_workers->start_graph(j_src, phone_early_graph);
-        const ggml_status phone_status = backend_ctx->compute_workers->wait(j_src);
-        if (phone_status != GGML_STATUS_SUCCESS) {
-            return phone_status;
-        }
+if (transfer_status != GGML_STATUS_SUCCESS) {
+    if (phone_early_started) {
+        backend_ctx->compute_workers->wait(j_src);
+    }
 
-        const int64_t pc_start_us = ggml_time_us();
-        backend_ctx->compute_workers->start(j_dst, i + 1);
-        const ggml_status pc_status = backend_ctx->compute_workers->wait(j_dst);
-        if (pc_status != GGML_STATUS_SUCCESS) {
-            return pc_status;
-        }
+    return transfer_status;
+}
+
+if (phone_early_graph == nullptr) {
+    return GGML_STATUS_SUCCESS;
+}
+
+// 非 snapshot 路径下，Phone 还没有启动。
+// 此时 transfer 已经完成，可以安全启动。
+if (!phone_early_started) {
+    backend_ctx->compute_workers->start_graph(
+        j_src,
+        phone_early_graph);
+
+    phone_early_started = true;
+}
+
+// transfer + PC reduce 已完成，
+// PC 现在可以消费完整 chunk k。
+const int64_t pc_start_us = ggml_time_us();
+
+backend_ctx->compute_workers->start(
+    j_dst,
+    i + 1);
+
+// 注意：这里不再先 wait Phone。
+// PC / Phone 同时运行。
+const ggml_status pc_status =
+    backend_ctx->compute_workers->wait(j_dst);
+
+const ggml_status phone_status =
+    backend_ctx->compute_workers->wait(j_src);
+
+if (pc_status != GGML_STATUS_SUCCESS) {
+    return pc_status;
+}
+
+if (phone_status != GGML_STATUS_SUCCESS) {
+    return phone_status;
+}
 
         if (use_snapshot_pipeline) {
             pipeline_gap.valid        = true;
