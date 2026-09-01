@@ -77,6 +77,7 @@ enum rpc_cmd {
     RPC_CMD_SYNCHRONIZE,
     RPC_CMD_SNAPSHOT_TENSOR,
     RPC_CMD_GET_SNAPSHOT,
+    RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
     RPC_CMD_COUNT,
 };
 
@@ -85,6 +86,7 @@ static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM
 static_assert(RPC_CMD_SYNCHRONIZE == 18, "RPC_CMD_SYNCHRONIZE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SNAPSHOT_TENSOR == 19, "RPC_CMD_SNAPSHOT_TENSOR must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_SNAPSHOT == 20, "RPC_CMD_GET_SNAPSHOT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT == 21, "RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -201,6 +203,16 @@ struct rpc_msg_graph_recompute_req {
     uint64_t graph_uid;
 };
 
+struct rpc_msg_graph_recompute_snapshot_req {
+    uint32_t device;
+    uint32_t slot;
+    uint64_t graph_uid;
+    uint64_t seq;
+    uint32_t output_node;
+    uint64_t offset;
+    uint64_t size;
+};
+
 struct rpc_msg_synchronize_req {
     uint32_t device;
 };
@@ -276,10 +288,19 @@ struct ggml_backend_rpc_buffer_type_context {
     size_t      max_size;
 };
 
+struct rpc_pending_recompute_snapshot {
+    std::mutex mutex;
+    bool active = false;
+    uint64_t graph_uid = 0;
+    uint32_t output_node = 0;
+    const ggml_tensor * tensor = nullptr;
+};
+
 struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
+    rpc_pending_recompute_snapshot pending_snapshot;
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -386,6 +407,36 @@ static bool send_rpc_cmd_compact_small(
     return sock->send_data(
         packet.data(),
         packet.size());
+}
+
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint);
+
+static bool rpc_flush_pending_recompute(
+        ggml_backend_rpc_context * rpc_ctx) {
+    rpc_msg_graph_recompute_req request {};
+
+    {
+        auto & pending = rpc_ctx->pending_snapshot;
+        std::lock_guard<std::mutex> lock(pending.mutex);
+
+        if (!pending.active) {
+            return true;
+        }
+
+        request.device = rpc_ctx->device;
+        request.graph_uid = pending.graph_uid;
+
+        pending.active = false;
+        pending.tensor = nullptr;
+    }
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    return send_rpc_cmd_compact_small(
+        sock,
+        RPC_CMD_GRAPH_RECOMPUTE,
+        request);
 }
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
@@ -1164,6 +1215,42 @@ static bool ggml_backend_rpc_snapshot_arm(
         uint64_t seq) {
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
 
+    rpc_msg_graph_recompute_snapshot_req fused_request {};
+    bool use_fused = false;
+
+    {
+        auto & pending = rpc_ctx->pending_snapshot;
+        std::lock_guard<std::mutex> lock(pending.mutex);
+
+        if (pending.active && pending.tensor == tensor) {
+            fused_request.device = rpc_ctx->device;
+            fused_request.slot = slot;
+            fused_request.graph_uid = pending.graph_uid;
+            fused_request.seq = seq;
+            fused_request.output_node = pending.output_node;
+            fused_request.offset = offset;
+            fused_request.size = size;
+
+            pending.active = false;
+            pending.tensor = nullptr;
+            use_fused = true;
+        }
+    }
+
+    if (!use_fused && !rpc_flush_pending_recompute(rpc_ctx)) {
+        return false;
+    }
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    if (use_fused) {
+        return send_rpc_cmd_compact_small(
+            sock,
+            RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
+            fused_request);
+    }
+
     rpc_msg_snapshot_tensor_req request {};
     request.device = rpc_ctx->device;
     request.slot = slot;
@@ -1171,9 +1258,6 @@ static bool ggml_backend_rpc_snapshot_arm(
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
-
-    auto sock = get_socket(rpc_ctx->endpoint);
-    RPC_STATUS_ASSERT(sock != nullptr);
 
     return send_rpc_cmd_compact_small(
         sock,
@@ -1259,6 +1343,31 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 }
 
+static int rpc_find_decode_ffn_down_output(const ggml_cgraph * graph) {
+    int found = -1;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+
+        const bool is_ffn_down = std::strncmp(node->name, "ffn_down_chunk_", 15) == 0;
+        const bool is_decode = node->ne[1] == 1;
+        if (!is_ffn_down || !is_decode) {
+            continue;
+        }
+
+        if (found != -1) {
+            return -1;
+        }
+
+        found = i;
+    }
+
+    return found;
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
@@ -1268,9 +1377,23 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     const bool cacheable = cgraph->uid != 0;
     bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    RPC_STATUS_ASSERT(rpc_flush_pending_recompute(rpc_ctx));
     //新的
     //reuse = false;
     if (reuse) {
+        const int output_node = rpc_find_decode_ffn_down_output(cgraph);
+        if (output_node >= 0) {
+            auto & pending = rpc_ctx->pending_snapshot;
+            std::lock_guard<std::mutex> lock(pending.mutex);
+
+            pending.active = true;
+            pending.graph_uid = graph_uid;
+            pending.output_node = output_node;
+            pending.tensor = cgraph->nodes[output_node];
+
+            return GGML_STATUS_SUCCESS;
+        }
+
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
@@ -1461,8 +1584,10 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
+    bool snapshot_tensor_direct(uint32_t device, uint32_t slot, uint64_t seq, ggml_tensor * tensor, uint64_t offset, uint64_t size);
     bool send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -1888,21 +2013,41 @@ bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
         return false;
     }
 
-    const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-    const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-    if (request.tensor.data + request.offset < p0 ||
-        request.tensor.data + request.offset >= p1 ||
-        request.size > p1 - request.tensor.data - request.offset) {
+    return snapshot_tensor_direct(
+        request.device,
+        request.slot,
+        request.seq,
+        tensor,
+        request.offset,
+        request.size);
+}
+
+bool rpc_server::snapshot_tensor_direct(
+        uint32_t device,
+        uint32_t slot_id,
+        uint64_t seq,
+        ggml_tensor * tensor,
+        uint64_t offset,
+        uint64_t size) {
+    if (device >= backends.size() ||
+        slot_id >= 2 ||
+        tensor == nullptr ||
+        tensor->buffer == nullptr) {
         return false;
     }
 
-    rpc_snapshot_slot & slot = snapshot_devices[request.device]->slots[request.slot];
+    const uint64_t tensor_size = ggml_nbytes(tensor);
+    if (offset > tensor_size || size > tensor_size - offset) {
+        return false;
+    }
+
+    rpc_snapshot_slot & slot = snapshot_devices[device]->slots[slot_id];
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(lock, [&]() { return slot.state == rpc_snapshot_state::FREE; });
         slot.state = rpc_snapshot_state::FILLING;
-        slot.seq = request.seq;
-        slot.data.resize(request.size);
+        slot.seq = seq;
+        slot.data.resize(size);
     }
 
     const int64_t t0 = ggml_time_us();
@@ -1910,8 +2055,8 @@ bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
     ggml_backend_tensor_get(
         tensor,
         slot.data.data(),
-        request.offset,
-        request.size);
+        offset,
+        size);
 
     const int64_t t1 = ggml_time_us();
 
@@ -1920,8 +2065,8 @@ bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
             "[RPC_SNAPSHOT_FILL] "
             "seq=%" PRIu64 " bytes=%" PRIu64
             " tensor_get=%.3f ms\n",
-            request.seq,
-            request.size,
+            seq,
+            size,
             (t1 - t0) / 1000.0);
     }
 
@@ -2225,6 +2370,54 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
+}
+
+bool rpc_server::graph_recompute_snapshot(
+        const rpc_msg_graph_recompute_snapshot_req & request) {
+    if (request.device >= backends.size() || request.slot >= 2) {
+        return false;
+    }
+
+    auto it = stored_graphs[request.device].find(request.graph_uid);
+    if (it == stored_graphs[request.device].end() || it->second.graph == nullptr) {
+        return false;
+    }
+
+    ggml_cgraph * graph = it->second.graph;
+    if (request.output_node >= static_cast<uint32_t>(graph->n_nodes)) {
+        return false;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const ggml_status status = ggml_backend_graph_compute(backends[request.device], graph);
+    const int64_t t1 = ggml_time_us();
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    ggml_tensor * output = graph->nodes[request.output_node];
+    const bool snapshot_ok = snapshot_tensor_direct(
+        request.device,
+        request.slot,
+        request.seq,
+        output,
+        request.offset,
+        request.size);
+    const int64_t t2 = ggml_time_us();
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_GRAPH_SNAPSHOT_SERVER] uid=%" PRIu64
+            " node=%u seq=%" PRIu64
+            " compute=%.3f ms snapshot=%.3f ms\n",
+            request.graph_uid,
+            request.output_node,
+            request.seq,
+            (t1 - t0) / 1000.0,
+            (t2 - t1) / 1000.0);
+    }
+
+    return snapshot_ok;
 }
 
 bool rpc_server::synchronize(uint32_t device) {
@@ -3133,6 +3326,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 if (!server.send_snapshot(request, sock)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT: {
+                rpc_msg_graph_recompute_snapshot_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.graph_recompute_snapshot(request)) {
                     return;
                 }
                 break;
