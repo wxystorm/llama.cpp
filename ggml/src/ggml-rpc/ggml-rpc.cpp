@@ -1895,8 +1895,6 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         const int64_t ready_us =
         ggml_time_us();
 
-    const bool status =
-        send_msg(sock, data, size);
 
     const int64_t send_done_us =
         ggml_time_us();
