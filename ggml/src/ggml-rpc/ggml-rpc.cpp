@@ -350,20 +350,20 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     }
     return true;
 }
-static bool send_get_snapshot_request_compact(
+template <typename T>
+static bool send_rpc_cmd_compact_small(
         socket_ptr sock,
-        const rpc_msg_get_snapshot_req & request) {
+        enum rpc_cmd cmd,
+        const T & request) {
 
-    constexpr size_t request_size =
-        sizeof(rpc_msg_get_snapshot_req);
+    constexpr size_t request_size = sizeof(T);
 
     std::array<uint8_t,
         1 + sizeof(uint64_t) + request_size> packet {};
 
     size_t pos = 0;
 
-    packet[pos++] =
-        static_cast<uint8_t>(RPC_CMD_GET_SNAPSHOT);
+    packet[pos++] = static_cast<uint8_t>(cmd);
 
     const uint64_t size64 = request_size;
 
@@ -885,8 +885,9 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         const int64_t t0 = ggml_time_us();
 
         bool status =
-            send_get_snapshot_request_compact(
+            send_rpc_cmd_compact_small(
                 ctx->transfer_sock,
+                RPC_CMD_GET_SNAPSHOT,
                 request);
 
         RPC_STATUS_ASSERT(status);
@@ -1151,11 +1152,10 @@ static bool ggml_backend_rpc_snapshot_arm(
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    return send_rpc_cmd(
+    return send_rpc_cmd_compact_small(
         sock,
         RPC_CMD_SNAPSHOT_TENSOR,
-        &request,
-        sizeof(request));
+        request);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -1252,7 +1252,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        bool status = send_rpc_cmd_compact_small(
+            sock,
+            RPC_CMD_GRAPH_RECOMPUTE,
+            request);
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
