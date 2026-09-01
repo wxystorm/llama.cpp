@@ -2426,6 +2426,64 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[id];
                 int32_t n_used = ggml_node_get_use_count(cgraph, id);
 
+                size_t attn_active_count = 0;
+size_t attn_active_backend = SIZE_MAX;
+
+for (size_t j = 0; j < n_backends; ++j) {
+    if (backend_ctx->backend_configs[j].nodes[id]->flags &
+            GGML_TENSOR_FLAG_COMPUTE) {
+        ++attn_active_count;
+        attn_active_backend = j;
+    }
+}
+
+const bool decode_pc_only_attn =
+    std::strncmp(node->name, "attn_out-", 9) == 0 &&
+    node->ne[1] == 1 &&
+    attn_active_count == 1 &&
+    attn_active_backend == 0;
+
+if (decode_pc_only_attn) {
+    std::set<const ggml_tensor *> delayed_nodes = { node };
+
+    for (int ii = id + 1; ii < cgraph->n_nodes; ++ii) {
+        ggml_tensor * next = cgraph->nodes[ii];
+        bool depends_on_delayed = false;
+
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (next->src[s] == nullptr) {
+                continue;
+            }
+
+            if (delayed_nodes.count(next->src[s]) != 0) {
+                depends_on_delayed = true;
+                continue;
+            }
+
+            if (ggml_backend_meta_get_split_state(
+                    next->src[s], false).axis !=
+                    GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return i;
+            }
+        }
+
+        if (depends_on_delayed) {
+            delayed_nodes.insert(next);
+        }
+
+        if (std::strncmp(next->name, "ffn_norm-", 9) == 0) {
+            return depends_on_delayed ? ii : i;
+        }
+
+        if (ggml_backend_meta_get_split_state(next, false).axis ==
+                GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            return i;
+        }
+    }
+
+    return i;
+}
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
@@ -3227,17 +3285,82 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     int64_t compute_wall_us = 0;
     int64_t reduce_wall_us  = 0;
     bool compute_complete = false;
+    auto is_decode_pc_only_ffn_norm_sg = [&](size_t i) -> bool {
+    if (n_backends != 2) {
+        return false;
+    }
+
+    auto & bc_pc    = backend_ctx->backend_configs[0];
+    auto & bc_phone = backend_ctx->backend_configs[1];
+
+    ggml_cgraph * g_pc    = bc_pc.cgraphs[i].cgraph_main;
+    ggml_cgraph * g_phone = bc_phone.cgraphs[i].cgraph_main;
+
+    if (g_pc == nullptr || g_phone == nullptr ||
+            g_pc->n_nodes == 0 || g_phone->n_nodes == 0) {
+        return false;
+    }
+
+    ggml_tensor * pc_last =
+        g_pc->nodes[g_pc->n_nodes - 1];
+
+    ggml_tensor * phone_last =
+        g_phone->nodes[g_phone->n_nodes - 1];
+
+    // decode only
+    if (pc_last->ne[1] != 1) {
+        return false;
+    }
+
+    if (std::strncmp(pc_last->name, "ffn_norm-", 9) != 0 ||
+            std::strncmp(phone_last->name, "ffn_norm-", 9) != 0) {
+        return false;
+    }
+
+    const bool pc_compute =
+        (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+    const bool phone_compute =
+        (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+    return pc_compute && !phone_compute;
+};
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         if (!compute_complete) {
-            const int64_t compute_start_us = ggml_time_us();
-            const ggml_status compute_status = compute_workers.compute(i);
-            compute_wall_us += ggml_time_us() - compute_start_us;
-            if (compute_status != GGML_STATUS_SUCCESS) {
-                return compute_status;
-            }
-        } else {
-            compute_complete = false;
+    const int64_t compute_start_us = ggml_time_us();
+
+    ggml_status compute_status = GGML_STATUS_SUCCESS;
+
+    if (is_decode_pc_only_ffn_norm_sg(i)) {
+        // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
+        compute_workers.start(0, i);
+        compute_status = compute_workers.wait(0);
+
+        if (pipeline_debug && i < 8) {
+            auto * g =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+
+            printf(
+                "[DECODE_PC_ONLY_SG] sg=%zu "
+                "first=%s last=%s nodes=%d\n",
+                i,
+                g->nodes[0]->name,
+                g->nodes[g->n_nodes - 1]->name,
+                g->n_nodes);
         }
+    } else {
+        compute_status = compute_workers.compute(i);
+    }
+
+    compute_wall_us += ggml_time_us() - compute_start_us;
+
+    if (compute_status != GGML_STATUS_SUCCESS) {
+        return compute_status;
+    }
+} else {
+    compute_complete = false;
+}
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             const int64_t reduce_start_us = ggml_time_us();
