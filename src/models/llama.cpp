@@ -226,7 +226,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 !embed &&
                 n_tokens == 1 &&
                 model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-                n_chunks > 1 &&
+                n_chunks >= 1 &&
                 loras->empty() &&
                 cvec->tensor_for(il) == nullptr;
 

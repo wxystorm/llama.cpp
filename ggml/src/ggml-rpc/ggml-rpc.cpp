@@ -1827,7 +1827,7 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     rpc_snapshot_slot & slot = snapshot_devices[request.device]->slots[request.slot];
     const uint8_t * data;
     size_t size;
-
+    const int64_t wait_start = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(lock, [&]() {
@@ -1846,8 +1846,24 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         size = slot.data.size();
     }
 
-    const bool status = send_msg(sock, data, size);
+        const int64_t ready_us =
+        ggml_time_us();
 
+    const bool status =
+        send_msg(sock, data, size);
+
+    const int64_t send_done_us =
+        ggml_time_us();
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_SNAPSHOT_SEND] bytes=%zu "
+            "wait_ready=%.3f ms "
+            "send=%.3f ms\n",
+            size,
+            (ready_us - wait_start) / 1000.0,
+            (send_done_us - ready_us) / 1000.0);
+    }
     {
         std::lock_guard<std::mutex> lock(slot.mutex);
         slot.state = rpc_snapshot_state::FREE;
@@ -2021,7 +2037,23 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    const int64_t t0 = ggml_time_us();
+
+    ggml_status status =
+        ggml_backend_graph_compute(
+            backends[device],
+            graph);
+
+    const int64_t t1 = ggml_time_us();
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_GRAPH_SERVER] uid=%" PRIu64
+            " nodes=%d compute=%.3f ms\n",
+            graph_uid,
+            graph->n_nodes,
+            (t1 - t0) / 1000.0);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     graph_entry.graph = graph;
     return true;
@@ -2038,7 +2070,23 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+    const int64_t t0 = ggml_time_us();
+
+    ggml_status status =
+        ggml_backend_graph_compute(
+            backends[device],
+            graph);
+
+    const int64_t t1 = ggml_time_us();
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_GRAPH_SERVER] uid=%" PRIu64
+            " nodes=%d compute=%.3f ms\n",
+            request.graph_uid,
+            graph->n_nodes,
+            (t1 - t0) / 1000.0);
+    }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
