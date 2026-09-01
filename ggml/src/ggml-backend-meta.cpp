@@ -1908,6 +1908,7 @@ struct ggml_backend_meta_context {
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
+    std::vector<ggml_cgraph *>  cgraphs_early;
     std::vector<ggml_tensor *>  nodes_aux;
     size_t                      n_reduce_steps;
     int                         max_nnodes    = 0;
@@ -1973,7 +1974,7 @@ struct ggml_backend_meta_compute_workers {
     std::condition_variable done_cv;
     std::vector<size_t> generation;
     std::vector<size_t> completed_generation;
-    std::vector<size_t> task_index;
+    std::vector<ggml_cgraph *> task_graph;
     bool stop = false;
 
     ggml_backend_meta_compute_workers(ggml_backend_meta_context * backend_ctx, size_t n_backends) :
@@ -1984,7 +1985,7 @@ struct ggml_backend_meta_compute_workers {
         completed_time_us(n_backends, 0),
         generation(n_backends, 0),
         completed_generation(n_backends, 0),
-        task_index(n_backends, 0) {
+        task_graph(n_backends, nullptr) {
         if (n_backends <= 1) {
             return;
         }
@@ -2001,13 +2002,13 @@ struct ggml_backend_meta_compute_workers {
                     }
 
                     seen_generation = generation[j];
-                    const size_t i = task_index[j];
+                    ggml_cgraph * graph = task_graph[j];
                     lock.unlock();
 
                     auto & bcj = this->backend_ctx->backend_configs[j];
                     const int64_t start_us = ggml_time_us();
                     const ggml_status status = ggml_backend_graph_compute_async(
-                            bcj.backend, bcj.cgraphs[i].cgraph_main);
+                            bcj.backend, graph);
                     const int64_t elapsed_us = ggml_time_us() - start_us;
                     const int64_t completed_us = ggml_time_us();
 
@@ -2057,9 +2058,14 @@ struct ggml_backend_meta_compute_workers {
     }
 
     void start(size_t j, size_t i) {
+        start_graph(j, backend_ctx->backend_configs[j].cgraphs[i].cgraph_main);
+    }
+
+    void start_graph(size_t j, ggml_cgraph * graph) {
         std::lock_guard<std::mutex> lock(mutex);
         GGML_ASSERT(completed_generation[j] == generation[j]);
-        task_index[j] = i;
+        GGML_ASSERT(graph != nullptr);
+        task_graph[j] = graph;
         ++generation[j];
         task_cv.notify_all();
     }
@@ -2576,9 +2582,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
+            const size_t mem_per_device_graphs_early = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, false);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux +
+                                                mem_per_device_graphs_early + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -2592,6 +2600,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
             for (size_t k = 0; k < backend_ctx->cgraphs_aux.size(); k++) {
                 backend_ctx->cgraphs_aux[k] = ggml_new_graph_custom(backend_ctx->ctx.get(), 1, cgraph->grads);
+            }
+            backend_ctx->cgraphs_early.resize(n_backends*backend_ctx->max_subgraphs);
+            for (size_t k = 0; k < backend_ctx->cgraphs_early.size(); k++) {
+                backend_ctx->cgraphs_early[k] = ggml_new_graph_custom(backend_ctx->ctx.get(), 1, false);
             }
             backend_ctx->nodes_aux.resize(n_backends*n_nodes_per_device*backend_ctx->max_subgraphs);
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
@@ -2712,6 +2724,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     };
 
+    auto get_ffn_down_boundary_node = [&](size_t j, size_t sg) -> ggml_tensor * {
+        if (j >= n_backends || sg >= backend_ctx->n_subgraphs) {
+            return nullptr;
+        }
+
+        ggml_cgraph * graph = backend_ctx->backend_configs[j].cgraphs[sg].cgraph_main;
+        if (graph == nullptr || graph->n_nodes == 0) {
+            return nullptr;
+        }
+
+        ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
+        if (std::strstr(node->name, "ffn_down_chunk") == nullptr ||
+                !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return nullptr;
+        }
+
+        return node;
+    };
+
+    auto get_early_graph = [&](size_t j, size_t sg) -> ggml_cgraph * {
+        GGML_ASSERT(j < n_backends);
+        GGML_ASSERT(sg < backend_ctx->max_subgraphs);
+        return backend_ctx->cgraphs_early[j*backend_ctx->max_subgraphs + sg];
+    };
+
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
         size_t active_count = 0;
@@ -2775,21 +2812,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto & bcj_src = backend_ctx->backend_configs[j_src];
         auto & bcj_dst = backend_ctx->backend_configs[j_dst];
 
-        size_t next_active_count = 0;
-        bool next_is_ffn_down_chunk = i + 1 < backend_ctx->n_subgraphs;
-        bool next_has_ffn_down_chunk = false;
+        ggml_tensor * phone_next_wdown = get_ffn_down_boundary_node(j_src, i + 1);
+        const bool next_is_ffn_down_chunk =
+            phone_next_wdown != nullptr && get_ffn_down_boundary_node(j_dst, i + 1) != nullptr;
+        ggml_cgraph * phone_early_graph = nullptr;
         if (next_is_ffn_down_chunk) {
-            for (size_t j = 0; j < n_backends; ++j) {
-                const auto & bcj = backend_ctx->backend_configs[j];
-                ggml_cgraph * next_graph = bcj.cgraphs[i + 1].cgraph_main;
-                ggml_tensor * next_node = next_graph->nodes[next_graph->n_nodes - 1];
-                if (next_node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                    ++next_active_count;
-                }
-                next_has_ffn_down_chunk = next_has_ffn_down_chunk ||
-                    std::strstr(next_node->name, "ffn_down_chunk") != nullptr;
-            }
-            next_is_ffn_down_chunk = next_active_count == n_backends && next_has_ffn_down_chunk;
+            phone_early_graph = get_early_graph(j_src, i + 1);
+            phone_early_graph->nodes[0] = phone_next_wdown;
+            phone_early_graph->n_nodes = 1;
         }
 
         const ggml_backend_rpc_set_stage_ready_t set_stage_ready =
@@ -2972,35 +3002,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 snapshot_slot,
                 snapshot_seq);
             GGML_ASSERT(armed);
-            if (!next_is_ffn_down_chunk) {
-                return backend_ctx->transfer_worker->wait(task_id);
-            }
-            backend_ctx->compute_workers->start(j_src, i + 1);
-        } else if (!next_is_ffn_down_chunk || set_stage_ready == nullptr || rpc_fence == nullptr) {
-            return backend_ctx->transfer_worker->wait(task_id);
-        } else {
-            const ggml_status status = backend_ctx->transfer_worker->wait_stage_ready(task_id);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-            backend_ctx->compute_workers->start(j_src, i + 1);
         }
 
-        int64_t pc_start_us = 0;
         const ggml_status transfer_status = backend_ctx->transfer_worker->wait(task_id);
-        if (transfer_status == GGML_STATUS_SUCCESS) {
-            pc_start_us = ggml_time_us();
-            backend_ctx->compute_workers->start(j_dst, i + 1);
-        }
-
-        const ggml_status phone_status = backend_ctx->compute_workers->wait(j_src);
         if (transfer_status != GGML_STATUS_SUCCESS) {
             return transfer_status;
         }
+        if (phone_early_graph == nullptr) {
+            return GGML_STATUS_SUCCESS;
+        }
+
+        backend_ctx->compute_workers->start_graph(j_src, phone_early_graph);
+        const ggml_status phone_status = backend_ctx->compute_workers->wait(j_src);
         if (phone_status != GGML_STATUS_SUCCESS) {
             return phone_status;
         }
 
+        const int64_t pc_start_us = ggml_time_us();
+        backend_ctx->compute_workers->start(j_dst, i + 1);
         const ggml_status pc_status = backend_ctx->compute_workers->wait(j_dst);
         if (pc_status != GGML_STATUS_SUCCESS) {
             return pc_status;
