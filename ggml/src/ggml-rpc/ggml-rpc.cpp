@@ -839,15 +839,55 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             RPC_STATUS_ASSERT(ctx->transfer_sock != nullptr);
         }
 
-        const bool status = send_rpc_cmd(
+        const int64_t t0 = ggml_time_us();
+
+        // 1. 只发送 GET_SNAPSHOT 请求
+        bool status = send_rpc_cmd(
             ctx->transfer_sock,
             RPC_CMD_GET_SNAPSHOT,
             &request,
-            sizeof(request),
+            sizeof(request));
+
+        RPC_STATUS_ASSERT(status);
+
+        const int64_t t_request_done = ggml_time_us();
+
+        // 2. 等服务端 response header
+        uint64_t out_size = 0;
+
+        status = ctx->transfer_sock->recv_data(
+            &out_size,
+            sizeof(out_size));
+
+        RPC_STATUS_ASSERT(status);
+        RPC_STATUS_ASSERT(out_size == size);
+
+        const int64_t t_header = ggml_time_us();
+
+        // 3. 真正收 16 KB
+        status = ctx->transfer_sock->recv_data(
             data,
             size);
+
         RPC_STATUS_ASSERT(status);
-        return;
+
+        const int64_t t_done = ggml_time_us();
+
+        if (RPC_DEBUG) {
+            printf(
+                "[RPC_SNAPSHOT_CLIENT] "
+                "seq=%" PRIu64 " bytes=%zu "
+                "request=%.3f ms "
+                "header_wait=%.3f ms "
+                "payload=%.3f ms "
+                "total=%.3f ms\n",
+                request.seq,
+                size,
+                (t_request_done - t0) / 1000.0,
+                (t_header - t_request_done) / 1000.0,
+                (t_done - t_header) / 1000.0,
+                (t_done - t0) / 1000.0);
+        }
     }
 
     rpc_msg_get_tensor_req request {};
@@ -1051,7 +1091,7 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    const bool status = send_rpc_cmd(
+    const bool status = (
         sock,
         RPC_CMD_SYNCHRONIZE,
         &request,
@@ -1809,7 +1849,25 @@ bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
         slot.data.resize(request.size);
     }
 
-    ggml_backend_tensor_get(tensor, slot.data.data(), request.offset, request.size);
+    const int64_t t0 = ggml_time_us();
+
+    ggml_backend_tensor_get(
+        tensor,
+        slot.data.data(),
+        request.offset,
+        request.size);
+
+    const int64_t t1 = ggml_time_us();
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_SNAPSHOT_FILL] "
+            "seq=%" PRIu64 " bytes=%" PRIu64
+            " tensor_get=%.3f ms\n",
+            request.seq,
+            request.size,
+            (t1 - t0) / 1000.0);
+    }
 
     {
         std::lock_guard<std::mutex> lock(slot.mutex);
@@ -1858,9 +1916,11 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     if (RPC_DEBUG) {
         printf(
             "[RPC_SNAPSHOT_SEND] bytes=%zu "
+            "seq=%" PRIu64
             "wait_ready=%.3f ms "
             "send=%.3f ms\n",
             size,
+            request.seq,
             (ready_us - wait_start) / 1000.0,
             (send_done_us - ready_us) / 1000.0);
     }
