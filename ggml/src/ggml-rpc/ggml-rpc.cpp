@@ -841,7 +841,6 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t t0 = ggml_time_us();
 
-        // 1. 只发送 GET_SNAPSHOT 请求
         bool status = send_rpc_cmd(
             ctx->transfer_sock,
             RPC_CMD_GET_SNAPSHOT,
@@ -852,19 +851,8 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t t_request_done = ggml_time_us();
 
-        // 2. 等服务端 response header
-        uint64_t out_size = 0;
-
-        status = ctx->transfer_sock->recv_data(
-            &out_size,
-            sizeof(out_size));
-
-        RPC_STATUS_ASSERT(status);
-        RPC_STATUS_ASSERT(out_size == size);
-
-        const int64_t t_header = ggml_time_us();
-
-        // 3. 真正收 16 KB
+        // GET_SNAPSHOT raw response:
+        // server 直接发送 request.size 字节。
         status = ctx->transfer_sock->recv_data(
             data,
             size);
@@ -875,19 +863,18 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         if (RPC_DEBUG) {
             printf(
-                "[RPC_SNAPSHOT_CLIENT] "
+                "[RPC_SNAPSHOT_RAW_CLIENT] "
                 "seq=%" PRIu64 " bytes=%zu "
                 "request=%.3f ms "
-                "header_wait=%.3f ms "
-                "payload=%.3f ms "
+                "recv=%.3f ms "
                 "total=%.3f ms\n",
                 request.seq,
                 size,
                 (t_request_done - t0) / 1000.0,
-                (t_header - t_request_done) / 1000.0,
-                (t_done - t_header) / 1000.0,
+                (t_done - t_request_done) / 1000.0,
                 (t_done - t0) / 1000.0);
         }
+
         return;
     }
 
@@ -1925,13 +1912,35 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
             (ready_us - wait_start) / 1000.0,
             (send_done_us - ready_us) / 1000.0);
     }
-    {
-        std::lock_guard<std::mutex> lock(slot.mutex);
-        slot.state = rpc_snapshot_state::FREE;
-    }
-    slot.cv.notify_all();
-    return status;
-}
+    const int64_t send_start_us = ggml_time_us();
+
+        // GET_SNAPSHOT 是固定长度协议。
+        // request.size 已经由 client 和 server 校验过，
+        // 不再额外发送 uint64_t response_size。
+        const bool status = sock->send_data(data, size);
+
+        const int64_t send_us =
+            ggml_time_us() - send_start_us;
+
+        if (RPC_DEBUG) {
+            GGML_LOG_INFO(
+                "[RPC_SNAPSHOT_RAW_SEND] "
+                "seq=%" PRIu64
+                " bytes=%zu "
+                "send=%.3f ms\n",
+                request.seq,
+                size,
+                send_us / 1000.0);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(slot.mutex);
+            slot.state = rpc_snapshot_state::FREE;
+        }
+
+        slot.cv.notify_all();
+        return status;
+        }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
     struct ggml_init_params params {
