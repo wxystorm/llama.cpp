@@ -641,7 +641,14 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = (ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        bool status = send_rpc_cmd(
+            ctx->sock,
+            RPC_CMD_INIT_TENSOR,
+            &request,
+            sizeof(request),
+            nullptr,
+            0);
+
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -1113,14 +1120,15 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    const bool status = (
-        sock,
-        RPC_CMD_SYNCHRONIZE,
-        &request,
-        sizeof(request),
-        nullptr,
-        0);
-    RPC_STATUS_ASSERT(status);
+    const bool status = send_rpc_cmd(
+    sock,
+    RPC_CMD_SYNCHRONIZE,
+    &request,
+    sizeof(request),
+    nullptr,
+    0);
+
+RPC_STATUS_ASSERT(status);
 }
 
 static bool ggml_backend_rpc_snapshot_arm(
