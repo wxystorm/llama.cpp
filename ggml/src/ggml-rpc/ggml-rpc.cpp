@@ -350,7 +350,43 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     }
     return true;
 }
+static bool send_get_snapshot_request_compact(
+        socket_ptr sock,
+        const rpc_msg_get_snapshot_req & request) {
 
+    constexpr size_t request_size =
+        sizeof(rpc_msg_get_snapshot_req);
+
+    std::array<uint8_t,
+        1 + sizeof(uint64_t) + request_size> packet {};
+
+    size_t pos = 0;
+
+    packet[pos++] =
+        static_cast<uint8_t>(RPC_CMD_GET_SNAPSHOT);
+
+    const uint64_t size64 = request_size;
+
+    memcpy(
+        packet.data() + pos,
+        &size64,
+        sizeof(size64));
+
+    pos += sizeof(size64);
+
+    memcpy(
+        packet.data() + pos,
+        &request,
+        request_size);
+
+    pos += request_size;
+
+    GGML_ASSERT(pos == packet.size());
+
+    return sock->send_data(
+        packet.data(),
+        packet.size());
+}
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
@@ -605,7 +641,7 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        bool status = (ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -841,38 +877,36 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t t0 = ggml_time_us();
 
-        bool status = send_rpc_cmd(
-            ctx->transfer_sock,
-            RPC_CMD_GET_SNAPSHOT,
-            &request,
-            sizeof(request));
+        bool status =
+            send_get_snapshot_request_compact(
+                ctx->transfer_sock,
+                request);
 
         RPC_STATUS_ASSERT(status);
 
-        const int64_t t_request_done = ggml_time_us();
+        const int64_t request_done_us = ggml_time_us();
 
-        // GET_SNAPSHOT raw response:
-        // server 直接发送 request.size 字节。
         status = ctx->transfer_sock->recv_data(
             data,
             size);
 
         RPC_STATUS_ASSERT(status);
 
-        const int64_t t_done = ggml_time_us();
+        const int64_t done_us = ggml_time_us();
 
         if (RPC_DEBUG) {
             printf(
-                "[RPC_SNAPSHOT_RAW_CLIENT] "
-                "seq=%" PRIu64 " bytes=%zu "
+                "[RPC_SNAPSHOT_COMPACT_CLIENT] "
+                "seq=%" PRIu64
+                " bytes=%zu "
                 "request=%.3f ms "
                 "recv=%.3f ms "
                 "total=%.3f ms\n",
                 request.seq,
                 size,
-                (t_request_done - t0) / 1000.0,
-                (t_done - t_request_done) / 1000.0,
-                (t_done - t0) / 1000.0);
+                (request_done_us - t0) / 1000.0,
+                (done_us - request_done_us) / 1000.0,
+                (done_us - t0) / 1000.0);
         }
 
         return;
