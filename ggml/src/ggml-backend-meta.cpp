@@ -2233,6 +2233,21 @@ static ggml_backend_rpc_prepare_graph_snapshot_t ggml_backend_meta_get_graph_sna
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_PREPARE_GRAPH_SNAPSHOT_PROC));
 }
 
+static ggml_backend_rpc_prepare_fused_ffn_input_t ggml_backend_meta_get_fused_ffn_input_preparer(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_prepare_fused_ffn_input_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC));
+}
+
 static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_setter(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -2905,6 +2920,25 @@ if (decode_pc_only_attn) {
                 }
                 auto & bcj_dst = backend_ctx->backend_configs[j_dst];
                 GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
+
+                const bool decode_pc_to_phone_ffn_norm =
+                    n_backends == 2 &&
+                    active_backend == 0 &&
+                    j_dst == 1 &&
+                    nodes[active_backend]->ne[1] == 1 &&
+                    std::strncmp(nodes[active_backend]->name, "ffn_norm-", 9) == 0 &&
+                    get_ffn_down_boundary_node(0, i + 1) != nullptr &&
+                    get_ffn_down_boundary_node(1, i + 1) != nullptr;
+
+                if (decode_pc_to_phone_ffn_norm) {
+                    const auto prepare_fused_input =
+                        ggml_backend_meta_get_fused_ffn_input_preparer(bcj_dst.backend);
+                    if (prepare_fused_input != nullptr) {
+                        const bool prepared = prepare_fused_input(bcj_dst.backend, nodes[j_dst]);
+                        GGML_ASSERT(prepared);
+                    }
+                }
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);

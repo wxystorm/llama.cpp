@@ -78,6 +78,7 @@ enum rpc_cmd {
     RPC_CMD_SNAPSHOT_TENSOR,
     RPC_CMD_GET_SNAPSHOT,
     RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
+    RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
     RPC_CMD_COUNT,
 };
 
@@ -87,7 +88,7 @@ static_assert(RPC_CMD_SYNCHRONIZE == 18, "RPC_CMD_SYNCHRONIZE must be before RPC
 static_assert(RPC_CMD_SNAPSHOT_TENSOR == 19, "RPC_CMD_SNAPSHOT_TENSOR must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_SNAPSHOT == 20, "RPC_CMD_GET_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT == 21, "RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
-
+static_assert(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT == 22,"RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -213,6 +214,13 @@ struct rpc_msg_graph_recompute_snapshot_req {
     uint64_t size;
 };
 
+struct rpc_msg_set_tensor_recompute_snapshot_req {
+    rpc_msg_graph_recompute_snapshot_req graph;
+    rpc_tensor input_tensor;
+    uint64_t input_offset;
+    uint64_t input_size;
+};
+
 struct rpc_msg_synchronize_req {
     uint32_t device;
 };
@@ -272,12 +280,31 @@ static ggml_guid_t ggml_backend_rpc_guid() {
     return &guid;
 }
 
+struct rpc_pending_fused_ffn_input {
+    std::mutex mutex;
+
+    // Meta 告诉 RPC：
+    // 下一次针对这个 tensor 的 SET_TENSOR 要暂存。
+    bool capture_next_set = false;
+    const ggml_tensor * expected_tensor = nullptr;
+
+    // 已经截获到的数据
+    bool pending = false;
+
+    const ggml_tensor * tensor = nullptr;
+    rpc_tensor serialized_tensor {};
+
+    uint64_t offset = 0;
+    std::vector<uint8_t> data;
+};
+
 struct ggml_backend_rpc_device_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
+    rpc_pending_fused_ffn_input fused_ffn;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -310,12 +337,38 @@ struct ggml_backend_rpc_context {
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     std::shared_ptr<socket_t> transfer_sock;
+
     std::string endpoint;
     uint32_t device;
+
     void * base_ptr;
     uint64_t remote_ptr;
+
+    ggml_backend_rpc_device_context * device_ctx = nullptr;
 };
 
+static bool ggml_backend_rpc_prepare_fused_ffn_input(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor) {
+
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend)->context);
+
+    auto & fused = rpc_dev_ctx->fused_ffn;
+
+    std::lock_guard<std::mutex> lock(
+        fused.mutex);
+
+    // 第一版这里严格一点，发现旧状态说明时序有问题。
+    GGML_ASSERT(!fused.capture_next_set);
+    GGML_ASSERT(!fused.pending);
+
+    fused.capture_next_set = true;
+    fused.expected_tensor = tensor;
+
+    return true;
+}
 // RPC helper functions
 
 // Computes FNV-1a hash of the data
@@ -832,6 +885,29 @@ static void ggml_backend_rpc_buffer_set_tensor(
     const rpc_tensor serialized_tensor =
         serialize_tensor(tensor);
 
+    if (ctx->device_ctx != nullptr) {
+        auto & fused = ctx->device_ctx->fused_ffn;
+        std::lock_guard<std::mutex> lock(fused.mutex);
+
+        if (fused.capture_next_set && fused.expected_tensor == tensor) {
+            GGML_ASSERT(!fused.pending);
+
+            fused.capture_next_set = false;
+            fused.expected_tensor = nullptr;
+            fused.pending = true;
+            fused.tensor = tensor;
+            fused.serialized_tensor = serialized_tensor;
+            fused.offset = static_cast<uint64_t>(offset);
+            fused.data.resize(size);
+
+            if (size > 0) {
+                memcpy(fused.data.data(), data, size);
+            }
+
+            return;
+        }
+    }
+
     /*
      * 保留原有哈希去重逻辑。
      * 服务端已经有相同数据时，无须再次传输。
@@ -1057,6 +1133,12 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+    ggml_backend_dev_t dev =
+    ggml_backend_buft_get_device(buft);
+
+auto * dev_ctx =
+    static_cast<ggml_backend_rpc_device_context *>(
+        dev->context);
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
@@ -1065,7 +1147,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, buft_ctx->endpoint, buft_ctx->device, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, buft_ctx->endpoint, buft_ctx->device, nullptr, response.remote_ptr, dev_ctx},
             response.remote_size);
         return buffer;
     } else {
@@ -1331,6 +1413,79 @@ static int rpc_find_graph_node(
     return -1;
 }
 
+struct rpc_fused_ffn_input_data {
+    const ggml_tensor * tensor = nullptr;
+    rpc_tensor serialized_tensor {};
+    uint64_t offset = 0;
+    std::vector<uint8_t> data;
+};
+
+static bool rpc_tensor_depends_on(
+        const ggml_tensor * tensor,
+        const ggml_tensor * target,
+        std::unordered_set<const ggml_tensor *> & visited) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    if (tensor == target) {
+        return true;
+    }
+    if (!visited.insert(tensor).second) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (rpc_tensor_depends_on(tensor->src[i], target, visited)) {
+            return true;
+        }
+    }
+    return rpc_tensor_depends_on(tensor->view_src, target, visited);
+}
+
+static bool rpc_graph_uses_tensor(
+        const ggml_cgraph * graph,
+        const ggml_tensor * tensor) {
+    std::unordered_set<const ggml_tensor *> visited;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (rpc_tensor_depends_on(graph->nodes[i], tensor, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rpc_flush_pending_fused_input(
+        ggml_backend_rpc_device_context * rpc_dev_ctx) {
+    rpc_fused_ffn_input_data pending {};
+
+    {
+        auto & fused = rpc_dev_ctx->fused_ffn;
+        std::lock_guard<std::mutex> lock(fused.mutex);
+        if (!fused.pending) {
+            return true;
+        }
+
+        pending.tensor = fused.tensor;
+        pending.serialized_tensor = fused.serialized_tensor;
+        pending.offset = fused.offset;
+        pending.data = std::move(fused.data);
+
+        fused.pending = false;
+        fused.tensor = nullptr;
+    }
+
+    const size_t input_size = sizeof(pending.serialized_tensor) + sizeof(pending.offset) + pending.data.size();
+    std::vector<uint8_t> input(input_size);
+    memcpy(input.data(), &pending.serialized_tensor, sizeof(pending.serialized_tensor));
+    memcpy(input.data() + sizeof(pending.serialized_tensor), &pending.offset, sizeof(pending.offset));
+    if (!pending.data.empty()) {
+        memcpy(input.data() + sizeof(pending.serialized_tensor) + sizeof(pending.offset), pending.data.data(), pending.data.size());
+    }
+
+    auto sock = get_socket(rpc_dev_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+    return send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
@@ -1346,26 +1501,85 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_graph_snapshot_context graph_snapshot {};
         bool use_fused = false;
 
+       int output_node = -1;
+
         {
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
 
             if (prepared.active) {
-                graph_snapshot.active = true;
-                graph_snapshot.tensor = prepared.tensor;
-                graph_snapshot.offset = prepared.offset;
-                graph_snapshot.size = prepared.size;
-                graph_snapshot.slot = prepared.slot;
-                graph_snapshot.seq = prepared.seq;
+                output_node =
+                    rpc_find_graph_node(
+                        cgraph,
+                        prepared.tensor);
+
+                if (output_node >= 0) {
+                    graph_snapshot.tensor = prepared.tensor;
+                    graph_snapshot.offset = prepared.offset;
+                    graph_snapshot.size   = prepared.size;
+                    graph_snapshot.slot   = prepared.slot;
+                    graph_snapshot.seq    = prepared.seq;
+                    use_fused = true;
+                }
 
                 prepared.active = false;
                 prepared.tensor = nullptr;
-                use_fused = true;
+            }
+        }
+        rpc_fused_ffn_input_data fused_input {};
+        bool have_fused_input = false;
+        if (use_fused && output_node >= 0) {
+            auto & pending = rpc_dev_ctx->fused_ffn;
+            std::lock_guard<std::mutex> lock(pending.mutex);
+            if (pending.pending && rpc_graph_uses_tensor(cgraph, pending.tensor)) {
+                fused_input.tensor = pending.tensor;
+                fused_input.serialized_tensor = pending.serialized_tensor;
+                fused_input.offset = pending.offset;
+                fused_input.data = std::move(pending.data);
+
+                pending.pending = false;
+                pending.tensor = nullptr;
+                have_fused_input = true;
             }
         }
 
-        const int output_node = use_fused ?
-            rpc_find_graph_node(cgraph, graph_snapshot.tensor) : -1;
+        if (output_node >= 0 && have_fused_input) {
+            rpc_msg_set_tensor_recompute_snapshot_req request {};
+            request.graph.device = rpc_ctx->device;
+            request.graph.slot = graph_snapshot.slot;
+            request.graph.graph_uid = graph_uid;
+            request.graph.seq = graph_snapshot.seq;
+            request.graph.output_node = output_node;
+            request.graph.offset = graph_snapshot.offset;
+            request.graph.size = graph_snapshot.size;
+            request.input_tensor = fused_input.serialized_tensor;
+            request.input_offset = fused_input.offset;
+            request.input_size = fused_input.data.size();
+
+            std::vector<uint8_t> payload(sizeof(request) + fused_input.data.size());
+            memcpy(payload.data(), &request, sizeof(request));
+            if (!fused_input.data.empty()) {
+                memcpy(payload.data() + sizeof(request), fused_input.data.data(), fused_input.data.size());
+            }
+
+            auto sock = get_socket(rpc_ctx->endpoint);
+            const bool status = send_rpc_cmd(
+                sock,
+                RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
+                payload.data(),
+                payload.size());
+            RPC_STATUS_ASSERT(status);
+
+            auto & prepared = rpc_ctx->graph_snapshot;
+            std::lock_guard<std::mutex> lock(prepared.mutex);
+            prepared.snapshot_was_fused = true;
+            prepared.fused_snapshot_seq = request.graph.seq;
+
+            return GGML_STATUS_SUCCESS;
+        }
+
+        RPC_STATUS_ASSERT(rpc_flush_pending_fused_input(rpc_dev_ctx));
+
         if (output_node >= 0) {
             rpc_msg_graph_recompute_snapshot_req request {};
             request.device = rpc_ctx->device;
@@ -1410,6 +1624,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
+        RPC_STATUS_ASSERT(rpc_flush_pending_fused_input(rpc_dev_ctx));
+
         {
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
@@ -1583,6 +1799,8 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
+    bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1805,6 +2023,26 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     uint64_t offset;
     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
+
+    if (cache_dir && size > HASH_THRESHOLD) {
+        uint64_t hash = fnv_hash((const uint8_t*)data, size);
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+        fs::path cache_file = fs::path(cache_dir) / hash_str;
+        std::ofstream ofs(cache_file, std::ios::binary);
+        ofs.write((const char *)data, size);
+        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+    }
+
+    return set_tensor_direct(*in_tensor, offset, data, size);
+}
+
+bool rpc_server::set_tensor_direct(
+        const rpc_tensor & in_tensor,
+        uint64_t offset,
+        const void * data,
+        size_t size) {
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1814,40 +2052,53 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
     //打印张量信息，包括名字
     GGML_LOG_INFO("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, name: '%s'\n",
-                   __func__, (void*)tensor->buffer, tensor->data, offset, size, in_tensor->name);
+                   __func__, (void*)tensor->buffer, tensor->data, offset, size, in_tensor.name);
 
     // sanitize tensor->data
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
             GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
+                           __func__, in_tensor.data, offset, size, p0, p1);
             return false;
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
-        char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-        // save to cache_dir/hash_str
-        fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
-    }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
+}
+
+bool rpc_server::set_tensor_recompute_snapshot(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_msg_set_tensor_recompute_snapshot_req)) {
+        return false;
+    }
+
+    rpc_msg_set_tensor_recompute_snapshot_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+
+    const size_t data_size = input.size() - sizeof(request);
+    if (data_size != request.input_size) {
+        return false;
+    }
+
+    if (!set_tensor_direct(
+            request.input_tensor,
+            request.input_offset,
+            input.data() + sizeof(request),
+            data_size)) {
+        return false;
+    }
+
+    return graph_recompute_snapshot(request.graph);
 }
 
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
@@ -3344,6 +3595,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_recompute_snapshot(input)) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -3671,7 +3932,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_set_snapshot_read);
     }
-
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_prepare_fused_ffn_input);
+    }
     GGML_UNUSED(reg);
 
     return NULL;

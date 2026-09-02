@@ -60,6 +60,13 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC \
     "ggml_backend_rpc_set_snapshot_read"
     
+#define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
+    "ggml_backend_rpc_prepare_fused_ffn_input"
+
+typedef bool (*ggml_backend_rpc_prepare_fused_ffn_input_t)(
+    ggml_backend_t backend,
+    const ggml_tensor * tensor);
+
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
     GGML_BACKEND_LOCAL_FILE_HANDLED,
