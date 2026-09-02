@@ -486,6 +486,9 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     }
 #endif
     size_t bytes_recv = 0;
+    const int64_t recv_start_us = ggml_time_us();
+    int64_t first_recv_done_us = 0;
+    size_t first_recv_bytes = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
@@ -498,8 +501,19 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
             LOG_DBG("recv returned 0 (peer closed?)\n");
             return false;
         }
+        if (first_recv_done_us == 0) {
+            first_recv_done_us = ggml_time_us();
+            first_recv_bytes = (size_t)n;
+        }
         bytes_recv += (size_t)n;
     }
+    const int64_t recv_done_us = ggml_time_us();
+    LOG_DBG("[RPC_TRANSPORT_RECV] bytes=%zu first_bytes=%zu first_byte_wait=%.3f ms remaining=%.3f ms total=%.3f ms\n",
+            size,
+            first_recv_bytes,
+            (first_recv_done_us - recv_start_us) / 1000.0,
+            (recv_done_us - first_recv_done_us) / 1000.0,
+            (recv_done_us - recv_start_us) / 1000.0);
     return true;
 }
 
