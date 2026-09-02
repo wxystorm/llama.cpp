@@ -221,6 +221,10 @@ struct rpc_msg_set_tensor_recompute_snapshot_req {
     uint64_t input_size;
 };
 
+static constexpr size_t FUSED_RPC_PREFIX = 1 + sizeof(uint64_t);
+static constexpr size_t FUSED_REQ_OFFSET = FUSED_RPC_PREFIX;
+static constexpr size_t FUSED_DATA_OFFSET = FUSED_REQ_OFFSET + sizeof(rpc_msg_set_tensor_recompute_snapshot_req);
+
 struct rpc_msg_synchronize_req {
     uint32_t device;
 };
@@ -292,10 +296,8 @@ struct rpc_pending_fused_ffn_input {
     bool pending = false;
 
     const ggml_tensor * tensor = nullptr;
-    rpc_tensor serialized_tensor {};
-
-    uint64_t offset = 0;
-    std::vector<uint8_t> data;
+    size_t data_size = 0;
+    std::vector<uint8_t> packet;
 };
 
 struct ggml_backend_rpc_device_context {
@@ -896,13 +898,23 @@ static void ggml_backend_rpc_buffer_set_tensor(
             fused.expected_tensor = nullptr;
             fused.pending = true;
             fused.tensor = tensor;
-            fused.serialized_tensor = serialized_tensor;
-            fused.offset = static_cast<uint64_t>(offset);
-            fused.data.resize(size);
+
+            rpc_msg_set_tensor_recompute_snapshot_req request {};
+            request.input_tensor = serialized_tensor;
+            request.input_offset = static_cast<uint64_t>(offset);
+            request.input_size = size;
+
+            const uint64_t payload_size = sizeof(request) + size;
+            fused.packet.resize(FUSED_RPC_PREFIX + payload_size);
+            fused.packet[0] = static_cast<uint8_t>(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT);
+            memcpy(fused.packet.data() + 1, &payload_size, sizeof(payload_size));
+            memcpy(fused.packet.data() + FUSED_REQ_OFFSET, &request, sizeof(request));
 
             if (size > 0) {
-                memcpy(fused.data.data(), data, size);
+                memcpy(fused.packet.data() + FUSED_DATA_OFFSET, data, size);
             }
+
+            fused.data_size = size;
 
             return;
         }
@@ -1415,9 +1427,8 @@ static int rpc_find_graph_node(
 
 struct rpc_fused_ffn_input_data {
     const ggml_tensor * tensor = nullptr;
-    rpc_tensor serialized_tensor {};
-    uint64_t offset = 0;
-    std::vector<uint8_t> data;
+    size_t data_size = 0;
+    std::vector<uint8_t> packet;
 };
 
 static bool rpc_tensor_depends_on(
@@ -1465,20 +1476,29 @@ static bool rpc_flush_pending_fused_input(
         }
 
         pending.tensor = fused.tensor;
-        pending.serialized_tensor = fused.serialized_tensor;
-        pending.offset = fused.offset;
-        pending.data = std::move(fused.data);
+        pending.data_size = fused.data_size;
+        pending.packet = std::move(fused.packet);
 
         fused.pending = false;
         fused.tensor = nullptr;
     }
 
-    const size_t input_size = sizeof(pending.serialized_tensor) + sizeof(pending.offset) + pending.data.size();
+    if (pending.packet.size() != FUSED_DATA_OFFSET + pending.data_size) {
+        return false;
+    }
+
+    rpc_msg_set_tensor_recompute_snapshot_req request {};
+    memcpy(&request, pending.packet.data() + FUSED_REQ_OFFSET, sizeof(request));
+
+    const size_t input_size = sizeof(request.input_tensor) + sizeof(request.input_offset) + pending.data_size;
     std::vector<uint8_t> input(input_size);
-    memcpy(input.data(), &pending.serialized_tensor, sizeof(pending.serialized_tensor));
-    memcpy(input.data() + sizeof(pending.serialized_tensor), &pending.offset, sizeof(pending.offset));
-    if (!pending.data.empty()) {
-        memcpy(input.data() + sizeof(pending.serialized_tensor) + sizeof(pending.offset), pending.data.data(), pending.data.size());
+    memcpy(input.data(), &request.input_tensor, sizeof(request.input_tensor));
+    memcpy(input.data() + sizeof(request.input_tensor), &request.input_offset, sizeof(request.input_offset));
+    if (pending.data_size > 0) {
+        memcpy(
+            input.data() + sizeof(request.input_tensor) + sizeof(request.input_offset),
+            pending.packet.data() + FUSED_DATA_OFFSET,
+            pending.data_size);
     }
 
     auto sock = get_socket(rpc_dev_ctx->endpoint);
@@ -1533,9 +1553,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             std::lock_guard<std::mutex> lock(pending.mutex);
             if (pending.pending && rpc_graph_uses_tensor(cgraph, pending.tensor)) {
                 fused_input.tensor = pending.tensor;
-                fused_input.serialized_tensor = pending.serialized_tensor;
-                fused_input.offset = pending.offset;
-                fused_input.data = std::move(pending.data);
+                fused_input.data_size = pending.data_size;
+                fused_input.packet = std::move(pending.packet);
 
                 pending.pending = false;
                 pending.tensor = nullptr;
@@ -1544,7 +1563,11 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         }
 
         if (output_node >= 0 && have_fused_input) {
+            RPC_STATUS_ASSERT(fused_input.packet.size() == FUSED_DATA_OFFSET + fused_input.data_size);
+
             rpc_msg_set_tensor_recompute_snapshot_req request {};
+            memcpy(&request, fused_input.packet.data() + FUSED_REQ_OFFSET, sizeof(request));
+
             request.graph.device = rpc_ctx->device;
             request.graph.slot = graph_snapshot.slot;
             request.graph.graph_uid = graph_uid;
@@ -1552,22 +1575,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             request.graph.output_node = output_node;
             request.graph.offset = graph_snapshot.offset;
             request.graph.size = graph_snapshot.size;
-            request.input_tensor = fused_input.serialized_tensor;
-            request.input_offset = fused_input.offset;
-            request.input_size = fused_input.data.size();
-
-            std::vector<uint8_t> payload(sizeof(request) + fused_input.data.size());
-            memcpy(payload.data(), &request, sizeof(request));
-            if (!fused_input.data.empty()) {
-                memcpy(payload.data() + sizeof(request), fused_input.data.data(), fused_input.data.size());
-            }
+            memcpy(fused_input.packet.data() + FUSED_REQ_OFFSET, &request, sizeof(request));
 
             auto sock = get_socket(rpc_ctx->endpoint);
-            const bool status = send_rpc_cmd(
-                sock,
-                RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
-                payload.data(),
-                payload.size());
+            const bool status = sock->send_data(
+                fused_input.packet.data(),
+                fused_input.packet.size());
             RPC_STATUS_ASSERT(status);
 
             auto & prepared = rpc_ctx->graph_snapshot;
@@ -2058,8 +2071,13 @@ bool rpc_server::set_tensor_direct(
         return false;
     }
     //打印张量信息，包括名字
-    GGML_LOG_INFO("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, name: '%s'\n",
-                   __func__, (void*)tensor->buffer, tensor->data, offset, size, in_tensor.name);
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_SET_DIRECT] offset=%" PRIu64 " size=%zu name=%s\n",
+            offset,
+            size,
+            in_tensor.name);
+    }
 
     // sanitize tensor->data
     {
