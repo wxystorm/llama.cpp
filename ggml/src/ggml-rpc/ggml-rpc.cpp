@@ -288,19 +288,23 @@ struct ggml_backend_rpc_buffer_type_context {
     size_t      max_size;
 };
 
-struct rpc_pending_recompute_snapshot {
+struct rpc_graph_snapshot_context {
     std::mutex mutex;
     bool active = false;
-    uint64_t graph_uid = 0;
-    uint32_t output_node = 0;
     const ggml_tensor * tensor = nullptr;
+    size_t offset = 0;
+    size_t size = 0;
+    uint32_t slot = 0;
+    uint64_t seq = 0;
+    bool snapshot_was_fused = false;
+    uint64_t fused_snapshot_seq = 0;
 };
 
 struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
-    rpc_pending_recompute_snapshot pending_snapshot;
+    rpc_graph_snapshot_context graph_snapshot;
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -409,35 +413,6 @@ static bool send_rpc_cmd_compact_small(
         packet.size());
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint);
-
-static bool rpc_flush_pending_recompute(
-        ggml_backend_rpc_context * rpc_ctx) {
-    rpc_msg_graph_recompute_req request {};
-
-    {
-        auto & pending = rpc_ctx->pending_snapshot;
-        std::lock_guard<std::mutex> lock(pending.mutex);
-
-        if (!pending.active) {
-            return true;
-        }
-
-        request.device = rpc_ctx->device;
-        request.graph_uid = pending.graph_uid;
-
-        pending.active = false;
-        pending.tensor = nullptr;
-    }
-
-    auto sock = get_socket(rpc_ctx->endpoint);
-    RPC_STATUS_ASSERT(sock != nullptr);
-
-    return send_rpc_cmd_compact_small(
-        sock,
-        RPC_CMD_GRAPH_RECOMPUTE,
-        request);
-}
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(
@@ -1215,41 +1190,19 @@ static bool ggml_backend_rpc_snapshot_arm(
         uint64_t seq) {
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
 
-    rpc_msg_graph_recompute_snapshot_req fused_request {};
-    bool use_fused = false;
-
     {
-        auto & pending = rpc_ctx->pending_snapshot;
-        std::lock_guard<std::mutex> lock(pending.mutex);
+        auto & graph_snapshot = rpc_ctx->graph_snapshot;
+        std::lock_guard<std::mutex> lock(graph_snapshot.mutex);
 
-        if (pending.active && pending.tensor == tensor) {
-            fused_request.device = rpc_ctx->device;
-            fused_request.slot = slot;
-            fused_request.graph_uid = pending.graph_uid;
-            fused_request.seq = seq;
-            fused_request.output_node = pending.output_node;
-            fused_request.offset = offset;
-            fused_request.size = size;
-
-            pending.active = false;
-            pending.tensor = nullptr;
-            use_fused = true;
+        if (graph_snapshot.snapshot_was_fused &&
+            graph_snapshot.fused_snapshot_seq == seq) {
+            graph_snapshot.snapshot_was_fused = false;
+            return true;
         }
-    }
-
-    if (!use_fused && !rpc_flush_pending_recompute(rpc_ctx)) {
-        return false;
     }
 
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
-
-    if (use_fused) {
-        return send_rpc_cmd_compact_small(
-            sock,
-            RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
-            fused_request);
-    }
 
     rpc_msg_snapshot_tensor_req request {};
     request.device = rpc_ctx->device;
@@ -1263,6 +1216,29 @@ static bool ggml_backend_rpc_snapshot_arm(
         sock,
         RPC_CMD_SNAPSHOT_TENSOR,
         request);
+}
+
+static bool ggml_backend_rpc_prepare_graph_snapshot(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        size_t offset,
+        size_t size,
+        uint32_t slot,
+        uint64_t seq) {
+    auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto & graph_snapshot = rpc_ctx->graph_snapshot;
+    std::lock_guard<std::mutex> lock(graph_snapshot.mutex);
+
+    GGML_ASSERT(!graph_snapshot.active);
+
+    graph_snapshot.active = true;
+    graph_snapshot.tensor = tensor;
+    graph_snapshot.offset = offset;
+    graph_snapshot.size = size;
+    graph_snapshot.slot = slot;
+    graph_snapshot.seq = seq;
+
+    return true;
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -1343,29 +1319,16 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 }
 
-static int rpc_find_decode_ffn_down_output(const ggml_cgraph * graph) {
-    int found = -1;
-
+static int rpc_find_graph_node(
+        const ggml_cgraph * graph,
+        const ggml_tensor * target) {
     for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
-        if (node == nullptr) {
-            continue;
+        if (graph->nodes[i] == target) {
+            return i;
         }
-
-        const bool is_ffn_down = std::strncmp(node->name, "ffn_down_chunk_", 15) == 0;
-        const bool is_decode = node->ne[1] == 1;
-        if (!is_ffn_down || !is_decode) {
-            continue;
-        }
-
-        if (found != -1) {
-            return -1;
-        }
-
-        found = i;
     }
 
-    return found;
+    return -1;
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -1377,19 +1340,53 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     const bool cacheable = cgraph->uid != 0;
     bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
-    RPC_STATUS_ASSERT(rpc_flush_pending_recompute(rpc_ctx));
     //新的
     //reuse = false;
     if (reuse) {
-        const int output_node = rpc_find_decode_ffn_down_output(cgraph);
-        if (output_node >= 0) {
-            auto & pending = rpc_ctx->pending_snapshot;
-            std::lock_guard<std::mutex> lock(pending.mutex);
+        rpc_graph_snapshot_context graph_snapshot {};
+        bool use_fused = false;
 
-            pending.active = true;
-            pending.graph_uid = graph_uid;
-            pending.output_node = output_node;
-            pending.tensor = cgraph->nodes[output_node];
+        {
+            auto & prepared = rpc_ctx->graph_snapshot;
+            std::lock_guard<std::mutex> lock(prepared.mutex);
+
+            if (prepared.active) {
+                graph_snapshot.active = true;
+                graph_snapshot.tensor = prepared.tensor;
+                graph_snapshot.offset = prepared.offset;
+                graph_snapshot.size = prepared.size;
+                graph_snapshot.slot = prepared.slot;
+                graph_snapshot.seq = prepared.seq;
+
+                prepared.active = false;
+                prepared.tensor = nullptr;
+                use_fused = true;
+            }
+        }
+
+        const int output_node = use_fused ?
+            rpc_find_graph_node(cgraph, graph_snapshot.tensor) : -1;
+        if (output_node >= 0) {
+            rpc_msg_graph_recompute_snapshot_req request {};
+            request.device = rpc_ctx->device;
+            request.slot = graph_snapshot.slot;
+            request.graph_uid = graph_uid;
+            request.seq = graph_snapshot.seq;
+            request.output_node = output_node;
+            request.offset = graph_snapshot.offset;
+            request.size = graph_snapshot.size;
+
+            auto sock = get_socket(rpc_ctx->endpoint);
+            const bool status = send_rpc_cmd_compact_small(
+                sock,
+                RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
+                request);
+            RPC_STATUS_ASSERT(status);
+
+            auto & prepared = rpc_ctx->graph_snapshot;
+            std::lock_guard<std::mutex> lock(prepared.mutex);
+            prepared.snapshot_was_fused = true;
+            prepared.fused_snapshot_seq = request.seq;
 
             return GGML_STATUS_SUCCESS;
         }
@@ -1413,6 +1410,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
+        {
+            auto & prepared = rpc_ctx->graph_snapshot;
+            std::lock_guard<std::mutex> lock(prepared.mutex);
+            prepared.active = false;
+            prepared.tensor = nullptr;
+        }
+
         if (cacheable) {
             rpc_dev_ctx->graph_uids.insert(graph_uid);
         }
@@ -3656,6 +3660,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_snapshot_arm);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PREPARE_GRAPH_SNAPSHOT_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_prepare_graph_snapshot);
     }
     if (std::strcmp(
             name,

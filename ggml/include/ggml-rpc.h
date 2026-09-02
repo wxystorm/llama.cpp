@@ -54,6 +54,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC \
     "ggml_backend_rpc_snapshot_arm"
 
+#define GGML_BACKEND_RPC_PREPARE_GRAPH_SNAPSHOT_PROC \
+    "ggml_backend_rpc_prepare_graph_snapshot"
+
 #define GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC \
     "ggml_backend_rpc_set_snapshot_read"
     
@@ -81,6 +84,14 @@ using ggml_backend_rpc_set_stage_ready_t = void (*)(
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
 
 using ggml_backend_rpc_snapshot_arm_t = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        size_t offset,
+        size_t size,
+        uint32_t slot,
+        uint64_t seq);
+
+using ggml_backend_rpc_prepare_graph_snapshot_t = bool (*)(
         ggml_backend_t backend,
         const ggml_tensor * tensor,
         size_t offset,

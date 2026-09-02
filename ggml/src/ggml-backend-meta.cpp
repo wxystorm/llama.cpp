@@ -2218,6 +2218,21 @@ static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_b
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC));
 }
 
+static ggml_backend_rpc_prepare_graph_snapshot_t ggml_backend_meta_get_graph_snapshot_preparer(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_prepare_graph_snapshot_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_PREPARE_GRAPH_SNAPSHOT_PROC));
+}
+
 static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_setter(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -2806,6 +2821,13 @@ if (decode_pc_only_attn) {
         }
     };
 
+    struct meta_snapshot_prepare {
+        bool prepared = false;
+        uint32_t slot = 0;
+        uint64_t seq = 0;
+    };
+    std::vector<meta_snapshot_prepare> snapshot_prepares(backend_ctx->n_subgraphs);
+
     auto get_ffn_down_boundary_node = [&](size_t j, size_t sg) -> ggml_tensor * {
         if (j >= n_backends || sg >= backend_ctx->n_subgraphs) {
             return nullptr;
@@ -2829,6 +2851,35 @@ if (decode_pc_only_attn) {
         GGML_ASSERT(j < n_backends);
         GGML_ASSERT(sg < backend_ctx->max_subgraphs);
         return backend_ctx->cgraphs_early[j*backend_ctx->max_subgraphs + sg];
+    };
+
+    auto prepare_graph_snapshot = [&](size_t sg, ggml_tensor * tensor) {
+        if (sg >= snapshot_prepares.size() || snapshot_prepares[sg].prepared) {
+            return;
+        }
+
+        auto & bc_phone = backend_ctx->backend_configs[1];
+        const auto prepare = ggml_backend_meta_get_graph_snapshot_preparer(bc_phone.backend);
+        const auto snapshot_arm = ggml_backend_meta_get_snapshot_arm(bc_phone.backend);
+        const auto set_snapshot_read = ggml_backend_meta_get_snapshot_read_setter(bc_phone.backend);
+        if (prepare == nullptr || snapshot_arm == nullptr || set_snapshot_read == nullptr) {
+            return;
+        }
+
+        const uint64_t seq = backend_ctx->next_snapshot_seq++;
+        const uint32_t slot = seq & 1;
+        const bool prepared = prepare(
+            bc_phone.backend,
+            tensor,
+            0,
+            ggml_nbytes(tensor),
+            slot,
+            seq);
+        GGML_ASSERT(prepared);
+
+        snapshot_prepares[sg].prepared = true;
+        snapshot_prepares[sg].slot = slot;
+        snapshot_prepares[sg].seq = seq;
     };
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
@@ -2916,8 +2967,13 @@ if (decode_pc_only_attn) {
         const bool use_snapshot_pipeline =
             snapshot_arm != nullptr && set_snapshot_read != nullptr;
         const uint64_t snapshot_seq =
-            use_snapshot_pipeline ? backend_ctx->next_snapshot_seq++ : 0;
-        const uint32_t snapshot_slot = snapshot_seq & 1;
+            snapshot_prepares[i].prepared ?
+                snapshot_prepares[i].seq :
+                (use_snapshot_pipeline ? backend_ctx->next_snapshot_seq++ : 0);
+        const uint32_t snapshot_slot =
+            snapshot_prepares[i].prepared ?
+                snapshot_prepares[i].slot :
+                snapshot_seq & 1;
 
         GGML_ASSERT(ggml_is_contiguous(nodes[j_src]));
         GGML_ASSERT(ggml_is_contiguous(nodes[j_dst]));
@@ -3085,6 +3141,7 @@ if (decode_pc_only_attn) {
                 snapshot_seq);
             GGML_ASSERT(armed);
             if (phone_early_graph != nullptr) {
+            prepare_graph_snapshot(i + 1, phone_next_wdown);
             backend_ctx->compute_workers->start_graph(
             j_src,
             phone_early_graph);
@@ -3391,6 +3448,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 };
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         if (!compute_complete) {
+    if (n_backends == 2) {
+        ggml_tensor * phone_wdown = get_ffn_down_boundary_node(1, i);
+        ggml_tensor * pc_wdown = get_ffn_down_boundary_node(0, i);
+        if (phone_wdown != nullptr && pc_wdown != nullptr &&
+            phone_wdown->ne[1] == 1 &&
+            (phone_wdown->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            prepare_graph_snapshot(i, phone_wdown);
+        }
+    }
+
     const int64_t compute_start_us = ggml_time_us();
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
