@@ -15,8 +15,10 @@ static int llama_ffn_chunk_count() {
 
 static int llama_prefill_ffn_chunk_count() {
     const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");
+
+    // 0 = 不启用新的 Prefill token pipeline
     if (value == nullptr) {
-        return 1;
+        return 0;
     }
 
     return std::max(1, std::atoi(value));
@@ -250,7 +252,7 @@ const bool use_prefill_chunked_ffn =
     n_tokens > 1 &&
     n_ffn_tokens > 1 &&
     model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-    n_prefill_chunks > 1 &&
+    n_prefill_chunks >= 1 &&
     loras->empty() &&
     cvec->tensor_for(il) == nullptr;
 
@@ -413,8 +415,13 @@ const bool use_prefill_chunked_ffn =
                 down_chunks.reserve(n_prefill_chunks);
 
                 for (int i = 0; i < n_prefill_chunks; ++i) {
-                    const int64_t token_begin = n_tokens * i / n_prefill_chunks;
-                    const int64_t token_end   = n_tokens * (i + 1) / n_prefill_chunks;
+                    int64_t token_begin = n_tokens * i / n_prefill_chunks;
+                    int64_t token_end   = n_tokens * (i + 1) / n_prefill_chunks;
+                    if (n_prefill_chunks == 2) {
+                        const int64_t token_split = std::max<int64_t>(1, n_tokens * 2 / 5);
+                        token_begin = i == 0 ? 0 : token_split;
+                        token_end   = i == 0 ? token_split : n_tokens;
+                    }
                     const int64_t token_count = token_end - token_begin;
 
                    GGML_ASSERT(token_begin >= 0);
@@ -447,9 +454,10 @@ const bool use_prefill_chunked_ffn =
                     down_chunks.push_back(down_chunk);
                 }
 
-                cur = down_chunks[0];
-                for (int i = 1; i < n_prefill_chunks; ++i) {
-                    cur = ggml_concat(ctx0, cur, down_chunks[i], 1);
+                GGML_ASSERT(!down_chunks.empty());
+                cur = down_chunks.back();
+                for (int i = (int) down_chunks.size() - 2; i >= 0; --i) {
+                    cur = ggml_concat(ctx0, down_chunks[i], cur, 1);
                 }
                 cur = ggml_add(ctx0, cur, ffn_inp);
                 inpL_attn_norm = nullptr;
