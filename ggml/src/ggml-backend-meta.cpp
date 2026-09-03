@@ -3809,8 +3809,26 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const ggml_status phone_status = compute_workers.wait(1);
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
     } else if (is_prefill_norm_sg) {
-         compute_status = compute_workers.compute(i);
-    } else if (is_decode_pc_only_norm_sg(i)) {
+    //
+    // Correctness A/B only:
+    // Phone compute must not overlap the previous chunk's rpc_fence(),
+    // because both use the RPC COMPUTE socket.
+    //
+    if (pending_prefill_reduce_task != 0) {
+        const ggml_status reduce_status =
+            backend_ctx->transfer_worker->wait(
+                pending_prefill_reduce_task);
+
+        pending_prefill_reduce_task = 0;
+        pending_prefill_reduce_layer = -1;
+
+        if (reduce_status != GGML_STATUS_SUCCESS) {
+            return reduce_status;
+        }
+    }
+
+    compute_status = compute_workers.compute(i);
+}else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
