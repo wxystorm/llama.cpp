@@ -1942,6 +1942,7 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
+    ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2288,6 +2289,7 @@ static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
+    delete prefill_input_worker;
     if (comm_ctx != nullptr) {
         ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2868,8 +2870,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int64_t pc_submit_us = 0;
     };
     pipeline_gap_timing pipeline_gap;
+    std::mutex meta_copy_stats_mutex;
+
+    auto record_copy_wait = [&](int64_t copy_us) {
+        std::lock_guard<std::mutex> lock(meta_copy_stats_mutex);
+        reduce_copy_wait_us += copy_us;
+    };
+
+    auto has_copy_detail_budget = [&]() {
+        std::lock_guard<std::mutex> lock(meta_copy_stats_mutex);
+        return reduce_copy_detail_count < 4;
+    };
 
     auto record_meta_copy = [&](size_t i, size_t j_src, size_t j_dst, const ggml_tensor * node_src, int64_t copy_us) {
+        std::lock_guard<std::mutex> lock(meta_copy_stats_mutex);
         const size_t copy_bytes = ggml_nbytes(node_src);
         auto & stats = reduce_copy_by_direction[j_src*n_backends + j_dst];
         ++stats.count;
@@ -3016,8 +3030,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 pc_next_down->name, next_chunk, next_layer));
             GGML_ASSERT(next_chunk == prefill_norm_chunk && next_layer == prefill_norm_layer);
 
-            if (backend_ctx->transfer_worker == nullptr) {
-                backend_ctx->transfer_worker = new ggml_backend_meta_transfer_worker();
+            if (backend_ctx->prefill_input_worker == nullptr) {
+                backend_ctx->prefill_input_worker = new ggml_backend_meta_transfer_worker();
             }
 
             handled = true;
@@ -3028,12 +3042,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(ggml_is_contiguous(src));
             GGML_ASSERT(ggml_is_contiguous(dst));
 
-            pending_prefill_input_task = backend_ctx->transfer_worker->enqueue(
+            pending_prefill_input_task = backend_ctx->prefill_input_worker->enqueue(
                 [&, src, dst, i](uint64_t) -> ggml_status {
                     const int64_t copy_start_us = ggml_time_us();
                     ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, src, dst);
                     const int64_t copy_us = ggml_time_us() - copy_start_us;
-                    reduce_copy_wait_us += copy_us;
+                    record_copy_wait(copy_us);
                     record_meta_copy(i, 0, 1, src, copy_us);
                     return GGML_STATUS_SUCCESS;
                 });
@@ -3083,7 +3097,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
-                reduce_copy_wait_us += copy_us;
+                record_copy_wait(copy_us);
                 record_meta_copy(i, active_backend, j_dst, nodes[active_backend], copy_us);
             }
             ++direct_copy_count;
@@ -3157,38 +3171,59 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
             const ggml_backend_rpc_fence_t rpc_fence =
                 ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+            const ggml_backend_rpc_snapshot_arm_t snapshot_arm =
+                ggml_backend_meta_get_snapshot_arm(bcj_src.backend);
+            const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
+                ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
+            const bool use_snapshot_pipeline =
+                snapshot_prepares[i].prepared &&
+                snapshot_arm != nullptr &&
+                set_snapshot_read != nullptr;
+            const uint64_t snapshot_seq =
+                use_snapshot_pipeline ? snapshot_prepares[i].seq : 0;
+            const uint32_t snapshot_slot =
+                use_snapshot_pipeline ? snapshot_prepares[i].slot : 0;
 
             pending_prefill_reduce_task = backend_ctx->transfer_worker->enqueue(
-                [&, node_src, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence](uint64_t task_id) -> ggml_status {
-                    const int64_t fence_start_us = ggml_time_us();
-                    if (rpc_fence != nullptr) {
-                        rpc_fence(bcj_src.backend);
-                    } else {
-                        ggml_backend_synchronize(bcj_src.backend);
-                    }
-                    const int64_t fence_us = ggml_time_us() - fence_start_us;
-                    if (pipeline_debug && reduce_copy_detail_count < 4) {
-                        printf("[META_FENCE] sg=%zu 1->0 time=%.3f ms\n",
-                               i, fence_us / 1000.0);
-                    }
-
+                [&, node_src, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence,
+                    set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
+                    snapshot_seq](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
                         backend_ctx->transfer_worker,
                         task_id,
                     };
-                    if (set_stage_ready != nullptr) {
-                        set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
+
+                    if (use_snapshot_pipeline) {
+                        set_snapshot_read(true, snapshot_slot, snapshot_seq);
+                    } else {
+                        const int64_t fence_start_us = ggml_time_us();
+                        if (rpc_fence != nullptr) {
+                            rpc_fence(bcj_src.backend);
+                        } else {
+                            ggml_backend_synchronize(bcj_src.backend);
+                        }
+                        const int64_t fence_us = ggml_time_us() - fence_start_us;
+                        if (pipeline_debug && has_copy_detail_budget()) {
+                            printf("[META_FENCE] sg=%zu 1->0 time=%.3f ms\n",
+                                   i, fence_us / 1000.0);
+                        }
                     }
 
                     const int64_t copy_start_us = ggml_time_us();
+                    if (!use_snapshot_pipeline && set_stage_ready != nullptr) {
+                        set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
+                    }
+
                     ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
-                    const int64_t copy_us = ggml_time_us() - copy_start_us;
 
-                    if (set_stage_ready != nullptr) {
+                    if (use_snapshot_pipeline) {
+                        set_snapshot_read(false, 0, 0);
+                    } else if (set_stage_ready != nullptr) {
                         set_stage_ready(nullptr, nullptr);
                     }
-                    reduce_copy_wait_us += copy_us;
+                    const int64_t copy_us = ggml_time_us() - copy_start_us;
+                    record_copy_wait(copy_us);
                     record_meta_copy(i, 1, 0, node_src, copy_us);
 
                     const int64_t add_start_us = ggml_time_us();
@@ -3200,6 +3235,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                     return status;
                 });
+
+            if (use_snapshot_pipeline) {
+                const bool armed = snapshot_arm(
+                    bcj_src.backend,
+                    node_src,
+                    0,
+                    ggml_nbytes(node_src),
+                    snapshot_slot,
+                    snapshot_seq);
+                GGML_ASSERT(armed);
+
+                if (pipeline_debug) {
+                    printf("[PREFILL_SNAPSHOT_ARM] sg=%zu layer=%d chunk=%d "
+                           "slot=%u seq=%" PRIu64 " bytes=%zu\n",
+                           i, prefill_down_layer_0, prefill_down_chunk_0,
+                           snapshot_slot, snapshot_seq, ggml_nbytes(node_src));
+                }
+            }
             pending_prefill_reduce_layer = prefill_down_layer_0;
 
             if (pipeline_debug) {
@@ -3313,7 +3366,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         }
                         const int64_t fence_us = ggml_time_us() - fence_start_us;
 
-                        if (pipeline_debug && reduce_copy_detail_count < 4) {
+                        if (pipeline_debug && has_copy_detail_budget()) {
                             printf("[META_FENCE] sg=%zu %zu->%zu time=%.3f ms\n",
                                    i, j_src, j_dst, fence_us / 1000.0);
                         }
@@ -3340,7 +3393,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const int64_t copy_us =
                         ggml_time_us() - copy_start_us;
 
-                    reduce_copy_wait_us += copy_us;
+                    record_copy_wait(copy_us);
 
                     record_meta_copy(
                             i,
@@ -3563,7 +3616,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const int64_t copy_start_us = ggml_time_us();
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
             const int64_t copy_us = ggml_time_us() - copy_start_us;
-            reduce_copy_wait_us += copy_us;
+            record_copy_wait(copy_us);
             record_meta_copy(i, j_src, j_dst, node_src, copy_us);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
@@ -3662,7 +3715,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const int64_t copy_start_us = ggml_time_us();
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
             const int64_t copy_us = ggml_time_us() - copy_start_us;
-            reduce_copy_wait_us += copy_us;
+            record_copy_wait(copy_us);
             record_meta_copy(i, j_src, j, node_src, copy_us);
             has_data[j] = 1;
         }
@@ -3759,10 +3812,101 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
             i, false, prefill_down_chunk, prefill_down_layer);
+if (pipeline_debug && is_prefill_norm_sg) {
+    auto * g_pc =
+        backend_ctx->backend_configs[0]
+            .cgraphs[i].cgraph_main;
 
-        const bool continues_prefill_layer =
-            (is_prefill_norm_sg && prefill_norm_layer == pending_prefill_reduce_layer) ||
-            (is_prefill_down_sg && prefill_down_layer == pending_prefill_reduce_layer);
+    auto * g_phone =
+        backend_ctx->backend_configs[1]
+            .cgraphs[i].cgraph_main;
+
+    int pc_active = 0;
+    int phone_active = 0;
+
+     for (int k = 0; k < g_phone->n_nodes; ++k) {
+        ggml_tensor * pn = g_phone->nodes[k];
+        ggml_tensor * cn = g_pc->nodes[k];
+
+        const bool phone_compute =
+            (pn->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+        if (!phone_compute) {
+            continue;
+        }
+
+        printf(
+            "[PREFILL_PHONE_NODE] "
+            "sg=%zu layer=%d chunk=%d k=%d "
+            "name=%s op=%s "
+            "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "pc_compute=%d phone_compute=%d\n",
+            i,
+            prefill_norm_layer,
+            prefill_norm_chunk,
+            k,
+            pn->name,
+            ggml_op_name(pn->op),
+            pn->ne[0],
+            pn->ne[1],
+            pn->ne[2],
+            pn->ne[3],
+            !!(cn->flags & GGML_TENSOR_FLAG_COMPUTE),
+            !!(pn->flags & GGML_TENSOR_FLAG_COMPUTE));
+    }
+
+    printf(
+        "[PREFILL_NORM_SG] sg=%zu "
+        "layer=%d chunk=%d "
+        "first=%s last=%s nodes=%d "
+        "pc_active=%d phone_active=%d\n",
+        i,
+        prefill_norm_layer,
+        prefill_norm_chunk,
+        g_pc->nodes[0]->name,
+        g_pc->nodes[g_pc->n_nodes - 1]->name,
+        g_pc->n_nodes,
+        pc_active,
+        phone_active);
+}
+auto prefill_norm_sg_has_prework =
+    [&](size_t sg) -> bool {
+        if (sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        ggml_cgraph * graph =
+            backend_ctx->backend_configs[0]
+                .cgraphs[sg].cgraph_main;
+
+        if (graph == nullptr || graph->n_nodes <= 1) {
+            return false;
+        }
+
+        // 最后一个节点是 prefill_ffn_norm_chunk。
+        // 如果它前面还有 PC COMPUTE 节点，
+        // 那么这个 SG 不能假设与之前的 reduce 无关。
+        for (int k = 0; k < graph->n_nodes - 1; ++k) {
+            if (graph->nodes[k]->flags &
+                    GGML_TENSOR_FLAG_COMPUTE) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+        const bool norm_can_overlap =
+    is_prefill_norm_sg &&
+    prefill_norm_layer == pending_prefill_reduce_layer &&
+    !prefill_norm_sg_has_prework(i);
+
+const bool down_can_overlap =
+    is_prefill_down_sg &&
+    prefill_down_layer == pending_prefill_reduce_layer;
+
+const bool continues_prefill_layer =
+    norm_can_overlap ||
+    down_can_overlap;
         if (pending_prefill_reduce_task != 0 && !continues_prefill_layer) {
             const ggml_status status = backend_ctx->transfer_worker->wait(
                 pending_prefill_reduce_task);
@@ -3784,6 +3928,22 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
     }
 
+    if (n_backends == 2 && is_prefill_down_sg) {
+        ggml_tensor * phone_prefill_down = get_prefill_down_boundary_node(1, i);
+        ggml_tensor * pc_prefill_down = get_prefill_down_boundary_node(0, i);
+        if (phone_prefill_down != nullptr && pc_prefill_down != nullptr &&
+                (phone_prefill_down->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            prepare_graph_snapshot(i, phone_prefill_down);
+
+            if (pipeline_debug) {
+                printf("[PREFILL_SNAPSHOT_PREPARE] sg=%zu layer=%d chunk=%d "
+                       "tensor=%s bytes=%zu\n",
+                       i, prefill_down_layer, prefill_down_chunk,
+                       phone_prefill_down->name, ggml_nbytes(phone_prefill_down));
+            }
+        }
+    }
+
     const int64_t compute_start_us = ggml_time_us();
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
@@ -3794,13 +3954,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
 
         compute_workers.start(0, i);
-        const ggml_status input_status = backend_ctx->transfer_worker->wait(
+        GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
+        const ggml_status input_status = backend_ctx->prefill_input_worker->wait(
             pending_prefill_input_task);
         pending_prefill_input_task = 0;
         pending_prefill_input_layer = -1;
         pending_prefill_input_chunk = -1;
         if (input_status != GGML_STATUS_SUCCESS) {
             compute_workers.wait(0);
+            if (pending_prefill_reduce_task != 0) {
+                backend_ctx->transfer_worker->wait(pending_prefill_reduce_task);
+                pending_prefill_reduce_task = 0;
+                pending_prefill_reduce_layer = -1;
+            }
             return input_status;
         }
 
@@ -3809,26 +3975,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const ggml_status phone_status = compute_workers.wait(1);
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
     } else if (is_prefill_norm_sg) {
-    //
-    // Correctness A/B only:
-    // Phone compute must not overlap the previous chunk's rpc_fence(),
-    // because both use the RPC COMPUTE socket.
-    //
-    if (pending_prefill_reduce_task != 0) {
-        const ggml_status reduce_status =
-            backend_ctx->transfer_worker->wait(
-                pending_prefill_reduce_task);
-
-        pending_prefill_reduce_task = 0;
-        pending_prefill_reduce_layer = -1;
-
-        if (reduce_status != GGML_STATUS_SUCCESS) {
-            return reduce_status;
-        }
-    }
-
-    compute_status = compute_workers.compute(i);
-}else if (is_decode_pc_only_norm_sg(i)) {
+    compute_workers.start(0, i);
+    compute_status = compute_workers.wait(0);
+} else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
@@ -3853,6 +4002,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     compute_wall_us += ggml_time_us() - compute_start_us;
 
     if (compute_status != GGML_STATUS_SUCCESS) {
+        if (pending_prefill_reduce_task != 0) {
+            backend_ctx->transfer_worker->wait(pending_prefill_reduce_task);
+            pending_prefill_reduce_task = 0;
+            pending_prefill_reduce_layer = -1;
+        }
         return compute_status;
     }
 } else {
