@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -31,6 +32,27 @@ struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
+
+static bool ggml_backend_meta_parse_decode_ffn_chunk(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    return std::sscanf(name, "ffn_down_chunk_%d-%d", &chunk, &layer) == 2;
+}
+
+static bool ggml_backend_meta_parse_prefill_norm_chunk(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    return std::sscanf(name, "prefill_ffn_norm_chunk_%d-%d", &chunk, &layer) == 2;
+}
+
+static bool ggml_backend_meta_parse_prefill_down_chunk(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    return std::sscanf(name, "prefill_ffn_down_chunk_%d-%d", &chunk, &layer) == 2;
+}
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
@@ -2460,6 +2482,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            int chunk = -1;
+            int layer = -1;
+            if (!ggml_backend_meta_parse_prefill_norm_chunk(cgraph->nodes[i]->name, chunk, layer)) {
+                continue;
+            }
+            for (size_t j = 1; j < n_backends; ++j) {
+                backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+            }
+        }
+
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed = [&](const int i) -> int {
@@ -2480,13 +2513,15 @@ for (size_t j = 0; j < n_backends; ++j) {
     }
 }
 
-const bool decode_pc_only_attn =
+const bool pc_only_attn =
     std::strncmp(node->name, "attn_out-", 9) == 0 &&
-    node->ne[1] == 1 &&
     attn_active_count == 1 &&
     attn_active_backend == 0;
 
-if (decode_pc_only_attn) {
+const bool decode_pc_only_attn = pc_only_attn && node->ne[1] == 1;
+const bool prefill_pc_only_attn = pc_only_attn && node->ne[1] > 1;
+
+if (decode_pc_only_attn || prefill_pc_only_attn) {
     std::set<const ggml_tensor *> delayed_nodes = { node };
 
     for (int ii = id + 1; ii < cgraph->n_nodes; ++ii) {
@@ -2514,7 +2549,15 @@ if (decode_pc_only_attn) {
             delayed_nodes.insert(next);
         }
 
-        if (std::strncmp(next->name, "ffn_norm-", 9) == 0) {
+        if (decode_pc_only_attn && std::strncmp(next->name, "ffn_norm-", 9) == 0) {
+            return depends_on_delayed ? ii : i;
+        }
+
+        int chunk = -1;
+        int layer = -1;
+        if (prefill_pc_only_attn &&
+                ggml_backend_meta_parse_prefill_norm_chunk(next->name, chunk, layer) &&
+                chunk == 0) {
             return depends_on_delayed ? ii : i;
         }
 
@@ -2531,6 +2574,12 @@ if (decode_pc_only_attn) {
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        int next_prefill_chunk = -1;
+                        int next_prefill_layer = -1;
+                        if (ggml_backend_meta_parse_prefill_norm_chunk(
+                                next->name, next_prefill_chunk, next_prefill_layer)) {
+                            break;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -2633,11 +2682,17 @@ if (decode_pc_only_attn) {
                 const bool is_decode_result_norm =
                     node->ne[1] == 1 &&
                     std::strncmp(node->name, "result_norm", 11) == 0;
+                int prefill_chunk = -1;
+                int prefill_layer = -1;
+                const bool is_prefill_norm_chunk =
+                    ggml_backend_meta_parse_prefill_norm_chunk(
+                        node->name, prefill_chunk, prefill_layer);
 
                 const bool new_subgraph =
                     i + 1 == cgraph->n_nodes ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
-                    is_decode_result_norm;
+                    is_decode_result_norm ||
+                    is_prefill_norm_chunk;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2854,7 +2909,30 @@ if (decode_pc_only_attn) {
         }
 
         ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
-        if (std::strstr(node->name, "ffn_down_chunk") == nullptr ||
+        int chunk = -1;
+        int layer = -1;
+        if (!ggml_backend_meta_parse_decode_ffn_chunk(node->name, chunk, layer) ||
+                !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return nullptr;
+        }
+
+        return node;
+    };
+
+    auto get_prefill_down_boundary_node = [&](size_t j, size_t sg) -> ggml_tensor * {
+        if (j >= n_backends || sg >= backend_ctx->n_subgraphs) {
+            return nullptr;
+        }
+
+        ggml_cgraph * graph = backend_ctx->backend_configs[j].cgraphs[sg].cgraph_main;
+        if (graph == nullptr || graph->n_nodes == 0) {
+            return nullptr;
+        }
+
+        ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
+        int chunk = -1;
+        int layer = -1;
+        if (!ggml_backend_meta_parse_prefill_down_chunk(node->name, chunk, layer) ||
                 !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
             return nullptr;
         }
@@ -2897,6 +2975,12 @@ if (decode_pc_only_attn) {
         snapshot_prepares[sg].seq = seq;
     };
 
+    uint64_t pending_prefill_input_task = 0;
+    int pending_prefill_input_layer = -1;
+    int pending_prefill_input_chunk = -1;
+    uint64_t pending_prefill_reduce_task = 0;
+    int pending_prefill_reduce_layer = -1;
+
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
         size_t active_count = 0;
@@ -2908,6 +2992,62 @@ if (decode_pc_only_attn) {
                 ++active_count;
                 active_backend = j;
             }
+        }
+
+        int prefill_norm_chunk = -1;
+        int prefill_norm_layer = -1;
+        const bool is_prefill_norm_input =
+            n_backends == 2 &&
+            active_count == 1 &&
+            active_backend == 0 &&
+            ggml_backend_meta_parse_prefill_norm_chunk(
+                nodes[active_backend]->name, prefill_norm_chunk, prefill_norm_layer);
+
+        if (is_prefill_norm_input) {
+            GGML_ASSERT(pending_prefill_input_task == 0);
+            GGML_ASSERT(i + 1 < backend_ctx->n_subgraphs);
+
+            ggml_tensor * pc_next_down = get_prefill_down_boundary_node(0, i + 1);
+            ggml_tensor * phone_next_down = get_prefill_down_boundary_node(1, i + 1);
+            int next_chunk = -1;
+            int next_layer = -1;
+            GGML_ASSERT(pc_next_down != nullptr && phone_next_down != nullptr);
+            GGML_ASSERT(ggml_backend_meta_parse_prefill_down_chunk(
+                pc_next_down->name, next_chunk, next_layer));
+            GGML_ASSERT(next_chunk == prefill_norm_chunk && next_layer == prefill_norm_layer);
+
+            if (backend_ctx->transfer_worker == nullptr) {
+                backend_ctx->transfer_worker = new ggml_backend_meta_transfer_worker();
+            }
+
+            handled = true;
+            auto & bcj_src = backend_ctx->backend_configs[0];
+            auto & bcj_dst = backend_ctx->backend_configs[1];
+            ggml_tensor * src = nodes[0];
+            ggml_tensor * dst = nodes[1];
+            GGML_ASSERT(ggml_is_contiguous(src));
+            GGML_ASSERT(ggml_is_contiguous(dst));
+
+            pending_prefill_input_task = backend_ctx->transfer_worker->enqueue(
+                [&, src, dst, i](uint64_t) -> ggml_status {
+                    const int64_t copy_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, src, dst);
+                    const int64_t copy_us = ggml_time_us() - copy_start_us;
+                    reduce_copy_wait_us += copy_us;
+                    record_meta_copy(i, 0, 1, src, copy_us);
+                    return GGML_STATUS_SUCCESS;
+                });
+            pending_prefill_input_layer = prefill_norm_layer;
+            pending_prefill_input_chunk = prefill_norm_chunk;
+            ++direct_copy_count;
+
+            if (pipeline_debug) {
+                printf("[PREFILL_INPUT] layer=%d chunk=%d tensor=%s "
+                       "ne=[%" PRId64 ",%" PRId64 "]\n",
+                       prefill_norm_layer, prefill_norm_chunk, src->name,
+                       src->ne[0], src->ne[1]);
+            }
+            return GGML_STATUS_SUCCESS;
         }
 
         if (active_count == 1) {
@@ -2958,14 +3098,118 @@ if (decode_pc_only_attn) {
             backend_ctx->transfer_worker =
                 new ggml_backend_meta_transfer_worker();
         }
-        const bool is_ffn_down_chunk = n_backends == 2 && active_count == 2 &&
-            (std::strstr(nodes[0]->name, "ffn_down_chunk") != nullptr ||
-             std::strstr(nodes[1]->name, "ffn_down_chunk") != nullptr);
-        const bool is_prefill_ffn_boundary =
+        int decode_chunk_0 = -1;
+        int decode_layer_0 = -1;
+        int decode_chunk_1 = -1;
+        int decode_layer_1 = -1;
+        const bool is_ffn_down_chunk =
             n_backends == 2 &&
             active_count == 2 &&
-            nodes[0]->ne[1] > 1 &&
-            nodes[1]->ne[1] > 1;
+            ggml_backend_meta_parse_decode_ffn_chunk(
+                nodes[0]->name, decode_chunk_0, decode_layer_0) &&
+            ggml_backend_meta_parse_decode_ffn_chunk(
+                nodes[1]->name, decode_chunk_1, decode_layer_1);
+
+        int prefill_down_chunk_0 = -1;
+        int prefill_down_layer_0 = -1;
+        int prefill_down_chunk_1 = -1;
+        int prefill_down_layer_1 = -1;
+        const bool is_prefill_down_chunk =
+            n_backends == 2 &&
+            active_count == 2 &&
+            ggml_backend_meta_parse_prefill_down_chunk(
+                nodes[0]->name, prefill_down_chunk_0, prefill_down_layer_0) &&
+            ggml_backend_meta_parse_prefill_down_chunk(
+                nodes[1]->name, prefill_down_chunk_1, prefill_down_layer_1) &&
+            prefill_down_chunk_0 == prefill_down_chunk_1 &&
+            prefill_down_layer_0 == prefill_down_layer_1;
+
+        if (is_prefill_down_chunk) {
+            GGML_ASSERT(pending_prefill_input_task == 0);
+            handled = true;
+
+            constexpr size_t j_src = 1;
+            constexpr size_t j_dst = 0;
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
+            GGML_ASSERT(ggml_is_contiguous(node_src));
+            GGML_ASSERT(ggml_is_contiguous(node_dst));
+
+            ggml_tensor * node_tmp = get_node_aux(node_dst);
+            set_tmp_data(node_tmp, j_dst, 0);
+
+            ggml_tensor * node_red = get_node_aux(node_dst);
+            node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+            node_red->view_offs = node_dst->view_offs;
+            node_red->op = GGML_OP_ADD;
+            node_red->src[0] = node_dst;
+            node_red->src[1] = node_tmp;
+            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red);
+
+            ggml_cgraph * cgraph_aux = get_cgraph_aux();
+            cgraph_aux->nodes[0] = node_red;
+            cgraph_aux->n_nodes = 1;
+
+            const ggml_backend_rpc_set_stage_ready_t set_stage_ready =
+                ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
+            const ggml_backend_rpc_fence_t rpc_fence =
+                ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+
+            pending_prefill_reduce_task = backend_ctx->transfer_worker->enqueue(
+                [&, node_src, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence](uint64_t task_id) -> ggml_status {
+                    const int64_t fence_start_us = ggml_time_us();
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(bcj_src.backend);
+                    } else {
+                        ggml_backend_synchronize(bcj_src.backend);
+                    }
+                    const int64_t fence_us = ggml_time_us() - fence_start_us;
+                    if (pipeline_debug && reduce_copy_detail_count < 4) {
+                        printf("[META_FENCE] sg=%zu 1->0 time=%.3f ms\n",
+                               i, fence_us / 1000.0);
+                    }
+
+                    ggml_backend_meta_stage_ready_context stage_context {
+                        backend_ctx->transfer_worker,
+                        task_id,
+                    };
+                    if (set_stage_ready != nullptr) {
+                        set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
+                    }
+
+                    const int64_t copy_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+                    const int64_t copy_us = ggml_time_us() - copy_start_us;
+
+                    if (set_stage_ready != nullptr) {
+                        set_stage_ready(nullptr, nullptr);
+                    }
+                    reduce_copy_wait_us += copy_us;
+                    record_meta_copy(i, 1, 0, node_src, copy_us);
+
+                    const int64_t add_start_us = ggml_time_us();
+                    const ggml_status status = ggml_backend_graph_compute_async(
+                        bcj_dst.backend, cgraph_aux);
+                    reduce_add_us += ggml_time_us() - add_start_us;
+                    if (status == GGML_STATUS_SUCCESS) {
+                        ++reduce_to_primary_count;
+                    }
+                    return status;
+                });
+            pending_prefill_reduce_layer = prefill_down_layer_0;
+
+            if (pipeline_debug) {
+                printf("[PREFILL_REDUCE] layer=%d chunk=%d tensor=%s "
+                       "ne=[%" PRId64 ",%" PRId64 "]\n",
+                       prefill_down_layer_0, prefill_down_chunk_0, node_src->name,
+                       node_src->ne[0], node_src->ne[1]);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
 
         if (!is_ffn_down_chunk) {
             return GGML_STATUS_SUCCESS;
@@ -3480,7 +3724,55 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     return pc_compute && !phone_compute;
 };
+    auto parse_prefill_sg = [&](size_t i, bool norm, int & chunk, int & layer) -> bool {
+        if (n_backends != 2) {
+            return false;
+        }
+
+        ggml_cgraph * pc_graph = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        ggml_cgraph * phone_graph = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (pc_graph == nullptr || phone_graph == nullptr ||
+                pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+            return false;
+        }
+
+        ggml_tensor * pc_last = pc_graph->nodes[pc_graph->n_nodes - 1];
+        ggml_tensor * phone_last = phone_graph->nodes[phone_graph->n_nodes - 1];
+        int phone_chunk = -1;
+        int phone_layer = -1;
+        const bool parsed = norm ?
+            ggml_backend_meta_parse_prefill_norm_chunk(pc_last->name, chunk, layer) &&
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    phone_last->name, phone_chunk, phone_layer) :
+            ggml_backend_meta_parse_prefill_down_chunk(pc_last->name, chunk, layer) &&
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    phone_last->name, phone_chunk, phone_layer);
+        return parsed && chunk == phone_chunk && layer == phone_layer;
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        int prefill_norm_chunk = -1;
+        int prefill_norm_layer = -1;
+        int prefill_down_chunk = -1;
+        int prefill_down_layer = -1;
+        const bool is_prefill_norm_sg = parse_prefill_sg(
+            i, true, prefill_norm_chunk, prefill_norm_layer);
+        const bool is_prefill_down_sg = parse_prefill_sg(
+            i, false, prefill_down_chunk, prefill_down_layer);
+
+        const bool continues_prefill_layer =
+            (is_prefill_norm_sg && prefill_norm_layer == pending_prefill_reduce_layer) ||
+            (is_prefill_down_sg && prefill_down_layer == pending_prefill_reduce_layer);
+        if (pending_prefill_reduce_task != 0 && !continues_prefill_layer) {
+            const ggml_status status = backend_ctx->transfer_worker->wait(
+                pending_prefill_reduce_task);
+            pending_prefill_reduce_task = 0;
+            pending_prefill_reduce_layer = -1;
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
         if (!compute_complete) {
     if (n_backends == 2) {
         ggml_tensor * phone_wdown = get_ffn_down_boundary_node(1, i);
@@ -3496,7 +3788,30 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
 
-    if (is_decode_pc_only_norm_sg(i)) {
+    if (is_prefill_down_sg) {
+        GGML_ASSERT(pending_prefill_input_task != 0);
+        GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
+        GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
+
+        compute_workers.start(0, i);
+        const ggml_status input_status = backend_ctx->transfer_worker->wait(
+            pending_prefill_input_task);
+        pending_prefill_input_task = 0;
+        pending_prefill_input_layer = -1;
+        pending_prefill_input_chunk = -1;
+        if (input_status != GGML_STATUS_SUCCESS) {
+            compute_workers.wait(0);
+            return input_status;
+        }
+
+        compute_workers.start(1, i);
+        const ggml_status pc_status = compute_workers.wait(0);
+        const ggml_status phone_status = compute_workers.wait(1);
+        compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
+    } else if (is_prefill_norm_sg) {
+        compute_workers.start(0, i);
+        compute_status = compute_workers.wait(0);
+    } else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
@@ -3560,6 +3875,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const int64_t reduce_us = ggml_time_us() - reduce_start_us;
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
+        }
+    }
+
+    if (pending_prefill_reduce_task != 0) {
+        const ggml_status status = backend_ctx->transfer_worker->wait(
+            pending_prefill_reduce_task);
+        pending_prefill_reduce_task = 0;
+        pending_prefill_reduce_layer = -1;
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
         }
     }
 
