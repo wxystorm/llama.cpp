@@ -13,6 +13,15 @@ static int llama_ffn_chunk_count() {
     return chunks > 0 ? chunks : default_chunks;
 }
 
+static int llama_prefill_ffn_chunk_count() {
+    const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");
+    if (value == nullptr) {
+        return 1;
+    }
+
+    return std::max(1, std::atoi(value));
+}
+
 void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     uint32_t n_vocab = 0;
     ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, n_vocab, false);
@@ -222,15 +231,23 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             cb(cur, "ffn_norm", il);
 
             const int n_chunks = std::min<int64_t>(llama_ffn_chunk_count(), n_embd);
-            const bool use_chunked_ffn =
+            const bool use_decode_chunked_ffn =
                 !embed &&
                 n_tokens == 1 &&
                 model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                 n_chunks >= 1 &&
                 loras->empty() &&
                 cvec->tensor_for(il) == nullptr;
+            const int n_prefill_chunks = std::min<int64_t>(llama_prefill_ffn_chunk_count(), n_tokens);
+            const bool use_prefill_chunked_ffn =
+                !embed &&
+                n_tokens > 1 &&
+                model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+                n_prefill_chunks > 1 &&
+                loras->empty() &&
+                cvec->tensor_for(il) == nullptr;
 
-            if (use_chunked_ffn) {
+            if (use_decode_chunked_ffn) {
                 ggml_tensor * ffn_hidden = build_ffn(cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
                         model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
@@ -384,6 +401,38 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     inpL_attn_norm = nullptr;
                     inpL_qkv = { nullptr, nullptr, nullptr };
                 }
+            } else if (use_prefill_chunked_ffn) {
+                std::vector<ggml_tensor *> down_chunks;
+                down_chunks.reserve(n_prefill_chunks);
+
+                for (int i = 0; i < n_prefill_chunks; ++i) {
+                    const int64_t token_begin = n_tokens * i / n_prefill_chunks;
+                    const int64_t token_end   = n_tokens * (i + 1) / n_prefill_chunks;
+                    const int64_t token_count = token_end - token_begin;
+
+                    ggml_tensor * ffn_norm_chunk = ggml_view_2d(ctx0, cur,
+                            cur->ne[0], token_count, cur->nb[1], token_begin * cur->nb[1]);
+                    const std::string norm_name = "prefill_ffn_norm_chunk_" + std::to_string(i);
+                    cb(ffn_norm_chunk, norm_name.c_str(), il);
+
+                    ggml_tensor * down_chunk = build_ffn(ffn_norm_chunk,
+                            model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
+                            model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
+                            model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    const std::string down_name = "prefill_ffn_down_chunk_" + std::to_string(i);
+                    cb(down_chunk, down_name.c_str(), il);
+                    down_chunks.push_back(down_chunk);
+                }
+
+                cur = down_chunks[0];
+                for (int i = 1; i < n_prefill_chunks; ++i) {
+                    cur = ggml_concat(ctx0, cur, down_chunks[i], 1);
+                }
+                cur = ggml_add(ctx0, cur, ffn_inp);
+                inpL_attn_norm = nullptr;
+                inpL_qkv = { nullptr, nullptr, nullptr };
             } else {
                 cur = build_ffn(cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
