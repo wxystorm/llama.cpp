@@ -238,14 +238,21 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 n_chunks >= 1 &&
                 loras->empty() &&
                 cvec->tensor_for(il) == nullptr;
-            const int n_prefill_chunks = std::min<int64_t>(llama_prefill_ffn_chunk_count(), n_tokens);
-            const bool use_prefill_chunked_ffn =
-                !embed &&
-                n_tokens > 1 &&
-                model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-                n_prefill_chunks > 1 &&
-                loras->empty() &&
-                cvec->tensor_for(il) == nullptr;
+            const int64_t n_ffn_tokens = cur->ne[1];
+
+const int n_prefill_chunks =
+    std::min<int64_t>(
+        llama_prefill_ffn_chunk_count(),
+        n_ffn_tokens);
+
+const bool use_prefill_chunked_ffn =
+    !embed &&
+    n_tokens > 1 &&
+    n_ffn_tokens > 1 &&
+    model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+    n_prefill_chunks > 1 &&
+    loras->empty() &&
+    cvec->tensor_for(il) == nullptr;
 
             if (use_decode_chunked_ffn) {
                 ggml_tensor * ffn_hidden = build_ffn(cur,
@@ -410,10 +417,24 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     const int64_t token_end   = n_tokens * (i + 1) / n_prefill_chunks;
                     const int64_t token_count = token_end - token_begin;
 
-                    ggml_tensor * ffn_norm_chunk = ggml_view_2d(ctx0, cur,
-                            cur->ne[0], token_count, cur->nb[1], token_begin * cur->nb[1]);
-                    const std::string norm_name = "prefill_ffn_norm_chunk_" + std::to_string(i);
-                    cb(ffn_norm_chunk, norm_name.c_str(), il);
+                   GGML_ASSERT(token_begin >= 0);
+    GGML_ASSERT(token_end <= cur->ne[1]);
+    GGML_ASSERT(token_count > 0);
+
+    ggml_tensor * ffn_norm_chunk =
+        ggml_view_2d(
+            ctx0,
+            cur,
+            cur->ne[0],
+            token_count,
+            cur->nb[1],
+            token_begin * cur->nb[1]);
+
+    const std::string norm_name =
+        "prefill_ffn_norm_chunk_" +
+        std::to_string(i);
+
+    cb(ffn_norm_chunk, norm_name.c_str(), il);
 
                     ggml_tensor * down_chunk = build_ffn(ffn_norm_chunk,
                             model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,

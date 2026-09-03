@@ -3809,8 +3809,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const ggml_status phone_status = compute_workers.wait(1);
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
     } else if (is_prefill_norm_sg) {
-        compute_workers.start(0, i);
-        compute_status = compute_workers.wait(0);
+         compute_status = compute_workers.compute(i);
     } else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
