@@ -353,16 +353,29 @@ static std::string llama_hybrid_pc_layout() {
     return value;
 }
 
-static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
-        int n_layer, int pc_layers, const std::string & layout) {
-    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
-
-    if (pc_layers <= 0) {
-        return policy;
+static int llama_hybrid_phone_layers() {
+    const char * value = std::getenv("LLAMA_HYBRID_PHONE_LAYERS");
+    if (value == nullptr) {
+        return 0;
     }
 
-    if (pc_layers >= n_layer) {
-        std::fill(policy.begin(), policy.end(), llama_hybrid_layer_mode::PC_ONLY);
+    return std::max(0, std::atoi(value));
+}
+
+static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
+        int n_layer, int pc_layers, int phone_layers, const std::string & layout) {
+    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
+
+    pc_layers = std::clamp(pc_layers, 0, n_layer);
+    phone_layers = std::clamp(phone_layers, 0, n_layer - pc_layers);
+
+    if (phone_layers > 0) {
+        const int pc_begin = n_layer - pc_layers;
+        const int phone_begin = pc_begin - phone_layers;
+        std::fill(policy.begin() + phone_begin, policy.begin() + pc_begin,
+                  llama_hybrid_layer_mode::PHONE_ONLY);
+        std::fill(policy.begin() + pc_begin, policy.end(),
+                  llama_hybrid_layer_mode::PC_ONLY);
         return policy;
     }
 
@@ -740,7 +753,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.n_segments = 1;
     }
     //如果是q,k,v权重，打印切分信息
-    const bool attention_primary_only =
+    const bool is_attention_tensor =
         std::regex_match(tensor_name, pattern_q_weight) ||
         std::regex_match(tensor_name, pattern_kv_weight) ||
         std::regex_match(tensor_name, pattern_qkv_weight) ||
@@ -757,26 +770,40 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
-    const bool ffn_primary_only =
-        ud->model->arch == LLM_ARCH_LLAMA &&
-        ud->model->hybrid_layer_mode(tc.il) == llama_hybrid_layer_mode::PC_ONLY &&
-        is_ffn_split_tensor;
+    const llama_hybrid_layer_mode mode = ud->model->arch == LLM_ARCH_LLAMA ?
+        ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
+    const bool force_primary =
+        (is_attention_tensor && mode != llama_hybrid_layer_mode::PHONE_ONLY) ||
+        (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY);
+    const bool force_phone =
+        mode == llama_hybrid_layer_mode::PHONE_ONLY &&
+        (is_attention_tensor || is_ffn_split_tensor);
 
-    // Keep attention and selected hybrid FFN layers on the primary device.
-    if ((attention_primary_only || ffn_primary_only) &&
-            split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+    auto force_to_device = [&](size_t device) {
+        GGML_ASSERT(device < ud->n_devices);
+        if (split_state.axis < 0 || split_state.axis >= GGML_MAX_DIMS) {
+            return;
+        }
+
         for (size_t is = 0; is < split_state.n_segments; ++is) {
-            int64_t ne_primary = 0;
+            int64_t ne_total = 0;
             for (size_t j = 0; j < ud->n_devices; ++j) {
-                ne_primary += split_state.ne[is*ud->n_devices + j];
+                ne_total += split_state.ne[is*ud->n_devices + j];
                 split_state.ne[is*ud->n_devices + j] = 0;
             }
-            split_state.ne[is*ud->n_devices] = ne_primary;
+            split_state.ne[is*ud->n_devices + device] = ne_total;
         }
+    };
+
+    if (force_phone) {
+        GGML_ASSERT(ud->n_devices == 2);
+        force_to_device(1);
+    } else if (force_primary) {
+        force_to_device(0);
     }
 
     if (tensor_name.rfind("blk.0.", 0) == 0 &&
-            (attention_primary_only ||
+            (is_attention_tensor ||
              std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
              std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
              std::regex_match(tensor_name, pattern_ffn_down_weight))) {
@@ -789,7 +816,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             placement += (j == 0 ? "" : ",") + std::to_string(j) + ":" + std::to_string(ne_device);
         }
         LLAMA_LOG_INFO("tensor placement: %s -> %s (axis %d; %s)\n",
-                tensor_name.c_str(), attention_primary_only || ffn_primary_only ? "primary" : "split",
+                tensor_name.c_str(), force_phone ? "phone" : force_primary ? "primary" : "split",
                 split_state.axis, placement.c_str());
     }
 
@@ -1337,18 +1364,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const double pc_pct = llama_hybrid_pc_pct();
         const int pc_layers = std::clamp(
             (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
-        const std::string pc_layout = llama_hybrid_pc_layout();
-        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, pc_layout);
+        const int phone_layers = std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
+        const std::string pc_layout = phone_layers > 0 ? "tail" : llama_hybrid_pc_layout();
+        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
         std::string pc_layer_list;
+        std::string phone_layer_list;
         for (int il = 0; il < n_layer; ++il) {
-            if (hybrid_layer_modes[il] != llama_hybrid_layer_mode::PC_ONLY) {
-                continue;
+            if (hybrid_layer_modes[il] == llama_hybrid_layer_mode::PC_ONLY) {
+                pc_layer_list += (pc_layer_list.empty() ? "" : ",") + std::to_string(il);
+            } else if (hybrid_layer_modes[il] == llama_hybrid_layer_mode::PHONE_ONLY) {
+                phone_layer_list += (phone_layer_list.empty() ? "" : ",") + std::to_string(il);
             }
-            pc_layer_list += (pc_layer_list.empty() ? "" : ",") + std::to_string(il);
         }
-        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g layout=%s n_layer=%d pc_only=%d tensor_split=%d pc_layers=[%s]\n",
-            pc_pct, pc_layout.c_str(), n_layer, pc_layers, n_layer - pc_layers, pc_layer_list.c_str());
+        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g layout=%s n_layer=%d tensor_split=%d phone_only=%d pc_only=%d phone_layers=[%s] pc_layers=[%s]\n",
+            pc_pct, pc_layout.c_str(), n_layer, n_layer - phone_layers - pc_layers, phone_layers, pc_layers,
+            phone_layer_list.c_str(), pc_layer_list.c_str());
     }
 
     pimpl->n_bytes = ml.n_bytes;

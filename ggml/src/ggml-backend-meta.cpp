@@ -3137,6 +3137,43 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     return subgraph_has_compute(1, sg);
 };
+    auto subgraph_will_execute_pc = [&](size_t sg) -> bool {
+        return subgraph_has_compute(0, sg);
+    };
+    auto subgraph_is_phone_only = [&](size_t sg) -> bool {
+        return n_backends == 2 &&
+               !subgraph_will_execute_pc(sg) &&
+               subgraph_will_execute_phone(sg);
+    };
+    auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
+        for (size_t next = sg + 1; next < backend_ctx->n_subgraphs; ++next) {
+            ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
+            if (graph == nullptr || graph->n_nodes == 0) {
+                continue;
+            }
+
+            ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
+            int next_chunk = -1;
+            int next_layer = -1;
+            const bool is_prefill_chunk =
+                ggml_backend_meta_parse_prefill_norm_chunk(last->name, next_chunk, next_layer) ||
+                ggml_backend_meta_parse_prefill_down_chunk(last->name, next_chunk, next_layer);
+            if (is_prefill_chunk) {
+                if (next_layer > layer) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (subgraph_is_phone_only(next)) {
+                return true;
+            }
+            if (subgraph_is_prefill_pc_only(next)) {
+                return false;
+            }
+        }
+        return false;
+    };
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
@@ -3215,6 +3252,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf("[META_KEEP_PRIMARY] sg=%zu tensor=%s bytes=%zu next_phone_compute=0\n",
                            i, nodes[0]->name, ggml_nbytes(nodes[0]));
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
+        if (active_count == 1 && n_backends == 2 && active_backend == 1) {
+            const bool pc_needed_next =
+                i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
+            if (!pc_needed_next) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf("[META_KEEP_PHONE] sg=%zu tensor=%s bytes=%zu next_pc_compute=0\n",
+                           i, nodes[1]->name, ggml_nbytes(nodes[1]));
                 }
                 return GGML_STATUS_SUCCESS;
             }
@@ -3339,11 +3389,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 use_snapshot_pipeline ? snapshot_prepares[i].seq : 0;
             const uint32_t snapshot_slot =
                 use_snapshot_pipeline ? snapshot_prepares[i].slot : 0;
+            const bool handoff_to_phone =
+                prefill_layer_hands_off_to_phone(i, prefill_down_layer_0);
 
             pending_prefill_reduce_task = backend_ctx->transfer_worker->enqueue(
-                [&, node_src, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence,
+                [&, node_src, node_dst, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence,
                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
-                    snapshot_seq](uint64_t task_id) -> ggml_status {
+                    snapshot_seq, handoff_to_phone, prefill_down_layer_0,
+                    prefill_down_chunk_0](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
                         backend_ctx->transfer_worker,
                         task_id,
@@ -3388,6 +3441,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     reduce_add_us += ggml_time_us() - add_start_us;
                     if (status == GGML_STATUS_SUCCESS) {
                         ++reduce_to_primary_count;
+                    }
+
+                    if (status != GGML_STATUS_SUCCESS || !handoff_to_phone) {
+                        return status;
+                    }
+
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    const int64_t handoff_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend, bcj_src.backend, node_dst, node_src);
+                    const int64_t handoff_us = ggml_time_us() - handoff_start_us;
+                    record_copy_wait(handoff_us);
+                    record_meta_copy(i, 0, 1, node_dst, handoff_us);
+                    ++direct_copy_count;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[META_PHONE_HANDOFF] layer=%d chunk=%d tensor=%s bytes=%zu\n",
+                            prefill_down_layer_0, prefill_down_chunk_0,
+                            node_dst->name, ggml_nbytes(node_dst));
                     }
                     return status;
                 });
@@ -3494,6 +3567,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         ggml_cgraph * cgraph_aux = get_cgraph_aux();
         cgraph_aux->nodes[0] = node_red;
         cgraph_aux->n_nodes  = 1;
+        const bool handoff_to_phone =
+            i + 1 < backend_ctx->n_subgraphs && subgraph_is_phone_only(i + 1);
 
         // -----------------------------------------------------
         // 真正的传输 + reduce 放到 transfer worker
@@ -3501,9 +3576,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
         const uint64_t task_id =
             backend_ctx->transfer_worker->enqueue(
-                [&, node_src, node_tmp, cgraph_aux, j_src, j_dst, i,
+                [&, node_src, node_dst, node_tmp, cgraph_aux, j_src, j_dst, i,
                     set_stage_ready, rpc_fence, set_snapshot_read,
-                    use_snapshot_pipeline, snapshot_slot, snapshot_seq](uint64_t task_id) -> ggml_status {
+                    use_snapshot_pipeline, snapshot_slot, snapshot_seq,
+                    handoff_to_phone, decode_layer_0,
+                    decode_chunk_0](uint64_t task_id) -> ggml_status {
 
                     // Phone -> PC
                     ggml_backend_meta_stage_ready_context stage_context {
@@ -3571,6 +3648,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     if (status == GGML_STATUS_SUCCESS) {
                         ++reduce_to_primary_count;
+                    }
+
+                    if (status != GGML_STATUS_SUCCESS || !handoff_to_phone) {
+                        return status;
+                    }
+
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    const int64_t handoff_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend, bcj_src.backend, node_dst, node_src);
+                    const int64_t handoff_us = ggml_time_us() - handoff_start_us;
+                    record_copy_wait(handoff_us);
+                    record_meta_copy(i, j_dst, j_src, node_dst, handoff_us);
+                    ++direct_copy_count;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[META_PHONE_HANDOFF] layer=%d chunk=%d tensor=%s bytes=%zu\n",
+                            decode_layer_0, decode_chunk_0,
+                            node_dst->name, ggml_nbytes(node_dst));
                     }
 
                     return status;
@@ -3926,6 +4023,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
             i, false, prefill_down_chunk, prefill_down_layer);
+        const bool is_phone_only_sg =
+            n_backends == 2 &&
+            !subgraph_has_compute(0, i) &&
+            subgraph_has_compute(1, i);
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
         backend_ctx->backend_configs[0]
@@ -4117,7 +4218,7 @@ const bool continues_prefill_layer =
             g->n_nodes);
     }
 
-} else if (is_decode_pc_only_norm_sg(i)) {
+    } else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
@@ -4134,6 +4235,16 @@ const bool continues_prefill_layer =
                 g->nodes[0]->name,
                 g->nodes[g->n_nodes - 1]->name,
                 g->n_nodes);
+        }
+    } else if (is_phone_only_sg) {
+        compute_workers.start(1, i);
+        compute_status = compute_workers.wait(1);
+
+        if (pipeline_debug) {
+            auto * g = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            printf(
+                "[PHONE_ONLY_SG] sg=%zu first=%s last=%s nodes=%d\n",
+                i, g->nodes[0]->name, g->nodes[g->n_nodes - 1]->name, g->n_nodes);
         }
     } else {
         compute_status = compute_workers.compute(i);
