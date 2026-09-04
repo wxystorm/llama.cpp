@@ -508,7 +508,7 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         bytes_recv += (size_t)n;
     }
     const int64_t recv_done_us = ggml_time_us();
-    printf("[RPC_TRANSPORT_RECV] bytes=%zu first_bytes=%zu first_byte_wait=%.3f ms remaining=%.3f ms total=%.3f ms\n",
+    LOG_DBG("[RPC_TRANSPORT_RECV] bytes=%zu first_bytes=%zu first_byte_wait=%.3f ms remaining=%.3f ms total=%.3f ms\n",
             size,
             first_recv_bytes,
             (first_recv_done_us - recv_start_us) / 1000.0,

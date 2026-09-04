@@ -2994,6 +2994,150 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int pending_prefill_input_chunk = -1;
     uint64_t pending_prefill_reduce_task = 0;
     int pending_prefill_reduce_layer = -1;
+    auto subgraph_is_prefill_pc_only_attn = [&](size_t sg) -> bool {
+    if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
+        return false;
+    }
+
+    auto * pc_graph =
+        backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+    auto * phone_graph =
+        backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+
+    if (pc_graph == nullptr || phone_graph == nullptr ||
+            pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+        return false;
+    }
+
+    ggml_tensor * pc_last =
+        pc_graph->nodes[pc_graph->n_nodes - 1];
+
+    ggml_tensor * phone_last =
+        phone_graph->nodes[phone_graph->n_nodes - 1];
+
+    return
+        pc_last->ne[1] > 1 &&
+        std::strncmp(pc_last->name, "attn_out-", 9) == 0 &&
+        (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+        (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+};
+    auto subgraph_is_prefill_pc_only_ffn = [&](size_t sg) -> bool {
+    if (sg == 0 || n_backends != 2 ||
+            sg >= backend_ctx->n_subgraphs) {
+        return false;
+    }
+
+    if (!subgraph_is_prefill_pc_only_attn(sg - 1)) {
+        return false;
+    }
+
+    auto * pc_graph =
+        backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+    auto * phone_graph =
+        backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+
+    if (pc_graph == nullptr || phone_graph == nullptr ||
+            pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+        return false;
+    }
+
+    ggml_tensor * pc_last =
+        pc_graph->nodes[pc_graph->n_nodes - 1];
+
+    ggml_tensor * phone_last =
+        phone_graph->nodes[phone_graph->n_nodes - 1];
+
+    return
+        pc_last->ne[1] > 1 &&
+        (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+        (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+};
+
+    auto subgraph_has_compute = [&](size_t backend, size_t sg) -> bool {
+        if (backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        ggml_cgraph * graph = backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+        if (graph == nullptr) {
+            return false;
+        }
+
+        for (int k = 0; k < graph->n_nodes; ++k) {
+            if (graph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto subgraph_is_prefill_norm_pc_only = [&](size_t sg) -> bool {
+        if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        ggml_cgraph * pc_graph = backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+        ggml_cgraph * phone_graph = backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+        if (pc_graph == nullptr || phone_graph == nullptr ||
+                pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+            return false;
+        }
+
+        ggml_tensor * pc_last = pc_graph->nodes[pc_graph->n_nodes - 1];
+        ggml_tensor * phone_last = phone_graph->nodes[phone_graph->n_nodes - 1];
+        int pc_chunk = -1;
+        int pc_layer = -1;
+        int phone_chunk = -1;
+        int phone_layer = -1;
+        return ggml_backend_meta_parse_prefill_norm_chunk(
+                   pc_last->name, pc_chunk, pc_layer) &&
+               ggml_backend_meta_parse_prefill_norm_chunk(
+                   phone_last->name, phone_chunk, phone_layer) &&
+               pc_chunk == phone_chunk && pc_layer == phone_layer;
+    };
+
+    auto subgraph_is_decode_pc_only_norm = [&](size_t sg) -> bool {
+        if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        ggml_cgraph * pc_graph = backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+        ggml_cgraph * phone_graph = backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+        if (pc_graph == nullptr || phone_graph == nullptr ||
+                pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+            return false;
+        }
+
+        ggml_tensor * pc_last = pc_graph->nodes[pc_graph->n_nodes - 1];
+        ggml_tensor * phone_last = phone_graph->nodes[phone_graph->n_nodes - 1];
+        if (pc_last->ne[1] != 1) {
+            return false;
+        }
+
+        const bool pc_is_norm =
+            std::strncmp(pc_last->name, "ffn_norm-", 9) == 0 ||
+            std::strncmp(pc_last->name, "result_norm", 11) == 0;
+        const bool phone_is_norm =
+            std::strncmp(phone_last->name, "ffn_norm-", 9) == 0 ||
+            std::strncmp(phone_last->name, "result_norm", 11) == 0;
+        return pc_is_norm && phone_is_norm &&
+               (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+               (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+    };
+    auto subgraph_is_prefill_pc_only = [&](size_t sg) -> bool {
+    return
+        subgraph_is_prefill_pc_only_attn(sg) ||
+        subgraph_is_prefill_pc_only_ffn(sg);
+};
+    auto subgraph_will_execute_phone = [&](size_t sg) -> bool {
+    if (subgraph_is_prefill_pc_only(sg) ||
+            subgraph_is_prefill_norm_pc_only(sg) ||
+            subgraph_is_decode_pc_only_norm(sg)) {
+        return false;
+    }
+
+    return subgraph_has_compute(1, sg);
+};
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
@@ -3062,6 +3206,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                        src->ne[0], src->ne[1]);
             }
             return GGML_STATUS_SUCCESS;
+        }
+
+        if (active_count == 1 && n_backends == 2 && active_backend == 0) {
+            const bool phone_needed_next =
+                i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_phone(i + 1);
+            if (!phone_needed_next) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf("[META_KEEP_PRIMARY] sg=%zu tensor=%s bytes=%zu next_phone_compute=0\n",
+                           i, nodes[0]->name, ggml_nbytes(nodes[0]));
+                }
+                return GGML_STATUS_SUCCESS;
+            }
         }
 
         if (active_count == 1) {
@@ -3733,50 +3890,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     int64_t reduce_wall_us  = 0;
     bool compute_complete = false;
     auto is_decode_pc_only_norm_sg = [&](size_t i) -> bool {
-    if (n_backends != 2) {
-        return false;
-    }
-
-    auto & bc_pc    = backend_ctx->backend_configs[0];
-    auto & bc_phone = backend_ctx->backend_configs[1];
-
-    ggml_cgraph * g_pc    = bc_pc.cgraphs[i].cgraph_main;
-    ggml_cgraph * g_phone = bc_phone.cgraphs[i].cgraph_main;
-
-    if (g_pc == nullptr || g_phone == nullptr ||
-            g_pc->n_nodes == 0 || g_phone->n_nodes == 0) {
-        return false;
-    }
-
-    ggml_tensor * pc_last =
-        g_pc->nodes[g_pc->n_nodes - 1];
-
-    ggml_tensor * phone_last =
-        g_phone->nodes[g_phone->n_nodes - 1];
-
-    // decode only
-    if (pc_last->ne[1] != 1) {
-        return false;
-    }
-
-    const bool pc_is_norm =
-        std::strncmp(pc_last->name, "ffn_norm-", 9) == 0 ||
-        std::strncmp(pc_last->name, "result_norm", 11) == 0;
-    const bool phone_is_norm =
-        std::strncmp(phone_last->name, "ffn_norm-", 9) == 0 ||
-        std::strncmp(phone_last->name, "result_norm", 11) == 0;
-    if (!pc_is_norm || !phone_is_norm) {
-        return false;
-    }
-
-    const bool pc_compute =
-        (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
-
-    const bool phone_compute =
-        (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
-
-    return pc_compute && !phone_compute;
-};
+        return subgraph_is_decode_pc_only_norm(i);
+    };
     auto parse_prefill_sg = [&](size_t i, bool norm, int & chunk, int & layer) -> bool {
         if (n_backends != 2) {
             return false;
@@ -3828,8 +3943,17 @@ if (pipeline_debug && is_prefill_norm_sg) {
         ggml_tensor * pn = g_phone->nodes[k];
         ggml_tensor * cn = g_pc->nodes[k];
 
+        const bool pc_compute =
+            (cn->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
         const bool phone_compute =
             (pn->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+        if (pc_compute) {
+            ++pc_active;
+        }
+        if (phone_compute) {
+            ++phone_active;
+        }
 
         if (!phone_compute) {
             continue;
@@ -3947,7 +4071,6 @@ const bool continues_prefill_layer =
     const int64_t compute_start_us = ggml_time_us();
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
-
     if (is_prefill_down_sg) {
         GGML_ASSERT(pending_prefill_input_task != 0);
         GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
@@ -3974,9 +4097,27 @@ const bool continues_prefill_layer =
         const ggml_status pc_status = compute_workers.wait(0);
         const ggml_status phone_status = compute_workers.wait(1);
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
-    } else if (is_prefill_norm_sg) {
+    } else if (is_prefill_norm_sg ||
+           subgraph_is_prefill_pc_only(i)) {
+
     compute_workers.start(0, i);
     compute_status = compute_workers.wait(0);
+
+    if (pipeline_debug &&
+            subgraph_is_prefill_pc_only(i)) {
+        auto * g =
+            backend_ctx->backend_configs[0]
+                .cgraphs[i].cgraph_main;
+
+        printf(
+            "[PREFILL_PC_ONLY_SG] sg=%zu "
+            "first=%s last=%s nodes=%d\n",
+            i,
+            g->nodes[0]->name,
+            g->nodes[g->n_nodes - 1]->name,
+            g->n_nodes);
+    }
+
 } else if (is_decode_pc_only_norm_sg(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
         compute_workers.start(0, i);

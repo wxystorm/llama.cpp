@@ -344,12 +344,43 @@ static double llama_hybrid_pc_pct() {
     return std::clamp(std::strtod(value, nullptr), 0.0, 100.0);
 }
 
-static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(int n_layer, int pc_layers) {
-    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
-    for (int k = 0; k < pc_layers; ++k) {
-        const int il = (int) ((int64_t) k * n_layer / pc_layers);
-        policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+static std::string llama_hybrid_pc_layout() {
+    const char * value = std::getenv("LLAMA_HYBRID_PC_LAYOUT");
+    if (value == nullptr || (std::strcmp(value, "head") != 0 && std::strcmp(value, "tail") != 0)) {
+        return "uniform";
     }
+
+    return value;
+}
+
+static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
+        int n_layer, int pc_layers, const std::string & layout) {
+    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
+
+    if (pc_layers <= 0) {
+        return policy;
+    }
+
+    if (pc_layers >= n_layer) {
+        std::fill(policy.begin(), policy.end(), llama_hybrid_layer_mode::PC_ONLY);
+        return policy;
+    }
+
+    if (layout == "tail") {
+        for (int il = n_layer - pc_layers; il < n_layer; ++il) {
+            policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+        }
+    } else if (layout == "head") {
+        for (int il = 0; il < pc_layers; ++il) {
+            policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+        }
+    } else {
+        for (int k = 0; k < pc_layers; ++k) {
+            const int il = (int) ((int64_t) k * n_layer / pc_layers);
+            policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+        }
+    }
+
     return policy;
 }
 
@@ -1306,7 +1337,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const double pc_pct = llama_hybrid_pc_pct();
         const int pc_layers = std::clamp(
             (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
-        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers);
+        const std::string pc_layout = llama_hybrid_pc_layout();
+        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, pc_layout);
 
         std::string pc_layer_list;
         for (int il = 0; il < n_layer; ++il) {
@@ -1315,8 +1347,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
             pc_layer_list += (pc_layer_list.empty() ? "" : ",") + std::to_string(il);
         }
-        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g n_layer=%d pc_only=%d tensor_split=%d pc_layers=[%s]\n",
-            pc_pct, n_layer, pc_layers, n_layer - pc_layers, pc_layer_list.c_str());
+        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g layout=%s n_layer=%d pc_only=%d tensor_split=%d pc_layers=[%s]\n",
+            pc_pct, pc_layout.c_str(), n_layer, pc_layers, n_layer - pc_layers, pc_layer_list.c_str());
     }
 
     pimpl->n_bytes = ml.n_bytes;
