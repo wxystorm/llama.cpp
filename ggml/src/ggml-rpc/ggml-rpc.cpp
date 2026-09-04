@@ -1340,7 +1340,11 @@ static bool rpc_is_prefill_external_input(const ggml_tensor * tensor) {
     return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
 }
 
-static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+static void add_tensor(
+        ggml_tensor * tensor,
+        std::vector<rpc_tensor> & tensors,
+        std::unordered_set<ggml_tensor *> & visited,
+        const std::unordered_set<ggml_tensor *> & graph_nodes) {
     if (tensor == nullptr) {
         return;
     }
@@ -1369,10 +1373,29 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
         return;
     }
 
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        add_tensor(tensor->src[i], tensors, visited);
+    const bool external_input =
+        graph_nodes.find(tensor) == graph_nodes.end() &&
+        tensor->buffer != nullptr &&
+        ggml_backend_buffer_is_rpc(tensor->buffer);
+    if (external_input) {
+        if (tensor->view_src != nullptr) {
+            add_tensor(tensor->view_src, tensors, visited, graph_nodes);
+        }
+
+        rpc_tensor result = serialize_tensor(tensor);
+        result.op = GGML_OP_NONE;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            result.src[i] = 0;
+        }
+        result.flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        tensors.push_back(result);
+        return;
     }
-    add_tensor(tensor->view_src, tensors, visited);
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        add_tensor(tensor->src[i], tensors, visited, graph_nodes);
+    }
+    add_tensor(tensor->view_src, tensors, visited, graph_nodes);
     tensors.push_back(serialize_tensor(tensor));
 }
 // 将ggml_cgraph序列化为字节流，便于在RPC中传输
@@ -1414,8 +1437,13 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     uint32_t n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
+    std::unordered_set<ggml_tensor *> graph_nodes;
+    graph_nodes.reserve(n_nodes);
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        graph_nodes.insert(cgraph->nodes[i]);
+    }
     for (uint32_t i = 0; i < n_nodes; i++) {
-        add_tensor(cgraph->nodes[i], tensors, visited);
+        add_tensor(cgraph->nodes[i], tensors, visited, graph_nodes);
     }
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -1439,9 +1467,12 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 
     if (RPC_DEBUG) {
+        const char * first = n_nodes > 0 ? cgraph->nodes[0]->name : "";
+        const char * last = n_nodes > 0 ? cgraph->nodes[n_nodes - 1]->name : "";
         printf(
-            "[RPC_GRAPH_SERIALIZE] uid=%" PRIu64 " nodes=%u tensors=%zu bytes=%zu\n",
-            graph_uid, n_nodes, tensors.size(), output.size());
+            "[RPC_GRAPH_SERIALIZE] uid=%" PRIu64
+            " nodes=%u tensors=%zu bytes=%zu first=%s last=%s\n",
+            graph_uid, n_nodes, tensors.size(), output.size(), first, last);
     }
 }
 
