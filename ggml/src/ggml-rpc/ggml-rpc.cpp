@@ -1437,6 +1437,12 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     dest += sizeof(n_tensors);
     rpc_tensor * out_tensors = (rpc_tensor *)dest;
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
+
+    if (RPC_DEBUG) {
+        printf(
+            "[RPC_GRAPH_SERIALIZE] uid=%" PRIu64 " nodes=%u tensors=%zu bytes=%zu\n",
+            graph_uid, n_nodes, tensors.size(), output.size());
+    }
 }
 
 static int rpc_find_graph_node(

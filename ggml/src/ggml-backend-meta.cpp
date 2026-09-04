@@ -3048,7 +3048,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_graph->nodes[phone_graph->n_nodes - 1];
 
     return
-        pc_last->ne[1] > 1 &&
         (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
         (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
 };
