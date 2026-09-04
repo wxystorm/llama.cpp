@@ -1335,14 +1335,40 @@ static bool ggml_backend_rpc_prepare_graph_snapshot(
     return true;
 }
 
+static bool rpc_is_prefill_external_input(const ggml_tensor * tensor) {
+    static constexpr const char * prefix = "prefill_ffn_norm_chunk_";
+    return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+}
+
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
     if (tensor == nullptr) {
         return;
     }
-    if (visited.find(tensor) != visited.end()) {
+    if (!visited.insert(tensor).second) {
         return;
     }
-    visited.insert(tensor);
+
+    if (rpc_is_prefill_external_input(tensor)) {
+        GGML_ASSERT(tensor->buffer != nullptr && ggml_backend_buffer_is_rpc(tensor->buffer));
+
+        rpc_tensor result = serialize_tensor(tensor);
+        result.op = GGML_OP_NONE;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            result.src[i] = 0;
+        }
+        result.view_src = 0;
+        result.view_offs = 0;
+        result.flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        tensors.push_back(result);
+
+        if (RPC_DEBUG) {
+            printf(
+                "[RPC_GRAPH_CUT_INPUT] name=%s ne=[%u,%u,%u,%u]\n",
+                result.name, result.ne[0], result.ne[1], result.ne[2], result.ne[3]);
+        }
+        return;
+    }
+
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         add_tensor(tensor->src[i], tensors, visited);
     }
