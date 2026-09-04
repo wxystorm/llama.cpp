@@ -538,6 +538,12 @@ struct llama_meta_device_get_split_state_userdata {
     const struct llama_model * model;
 };
 
+enum class llama_hybrid_layer_mode {
+    PC_ONLY,
+    TENSOR_SPLIT,
+    PHONE_ONLY,
+};
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
@@ -602,6 +608,8 @@ struct llama_model {
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
+    std::vector<llama_hybrid_layer_mode> hybrid_layer_modes;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
@@ -646,6 +654,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    llama_hybrid_layer_mode hybrid_layer_mode(int il) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

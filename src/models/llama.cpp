@@ -233,10 +233,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             cb(cur, "ffn_norm", il);
 
             const int n_chunks = std::min<int64_t>(llama_ffn_chunk_count(), n_embd);
+            const llama_hybrid_layer_mode hybrid_mode = model.hybrid_layer_mode(il);
             const bool use_decode_chunked_ffn =
                 !embed &&
                 n_tokens == 1 &&
                 model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+                hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
                 n_chunks >= 1 &&
                 loras->empty() &&
                 cvec->tensor_for(il) == nullptr;
@@ -252,6 +254,7 @@ const bool use_prefill_chunked_ffn =
     n_tokens > 1 &&
     n_ffn_tokens > 1 &&
     model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+    hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
     n_prefill_chunks >= 1 &&
     loras->empty() &&
     cvec->tensor_for(il) == nullptr;

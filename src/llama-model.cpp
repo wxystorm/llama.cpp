@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -332,6 +333,24 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     }
 
     return llama_model_create(arch, params);
+}
+
+static double llama_hybrid_pc_pct() {
+    const char * value = std::getenv("LLAMA_HYBRID_PC_PCT");
+    if (value == nullptr) {
+        return 0.0;
+    }
+
+    return std::clamp(std::strtod(value, nullptr), 0.0, 100.0);
+}
+
+static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(int n_layer, int pc_layers) {
+    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
+    for (int k = 0; k < pc_layers; ++k) {
+        const int il = (int) ((int64_t) k * n_layer / pc_layers);
+        policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+    }
+    return policy;
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -701,10 +720,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_attn_sinks) ||
         std::regex_match(tensor_name, pattern_attn_out_weight) ||
         std::regex_match(tensor_name, pattern_attn_gate_weight);
+    const bool is_ffn_split_tensor =
+        std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
+        std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+    const bool ffn_primary_only =
+        ud->model->arch == LLM_ARCH_LLAMA &&
+        ud->model->hybrid_layer_mode(tc.il) == llama_hybrid_layer_mode::PC_ONLY &&
+        is_ffn_split_tensor;
 
-    // Keep attention on the primary device. FFN tensors retain the regular
-    // tensor split, so the remote device returns one complete partial result.
-    if (attention_primary_only && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+    // Keep attention and selected hybrid FFN layers on the primary device.
+    if ((attention_primary_only || ffn_primary_only) &&
+            split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         for (size_t is = 0; is < split_state.n_segments; ++is) {
             int64_t ne_primary = 0;
             for (size_t j = 0; j < ud->n_devices; ++j) {
@@ -729,7 +758,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             placement += (j == 0 ? "" : ",") + std::to_string(j) + ":" + std::to_string(ne_device);
         }
         LLAMA_LOG_INFO("tensor placement: %s -> %s (axis %d; %s)\n",
-                tensor_name.c_str(), attention_primary_only ? "primary" : "split", split_state.axis, placement.c_str());
+                tensor_name.c_str(), attention_primary_only || ffn_primary_only ? "primary" : "split",
+                split_state.axis, placement.c_str());
     }
 
     if (std::regex_match(tensor_name, std::regex("blk\\.\\d*\\.attn_(q|k|v)\\.weight"))) {
@@ -1271,6 +1301,24 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    if (arch == LLM_ARCH_LLAMA && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        const int n_layer = hparams.n_layer();
+        const double pc_pct = llama_hybrid_pc_pct();
+        const int pc_layers = std::clamp(
+            (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
+        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers);
+
+        std::string pc_layer_list;
+        for (int il = 0; il < n_layer; ++il) {
+            if (hybrid_layer_modes[il] != llama_hybrid_layer_mode::PC_ONLY) {
+                continue;
+            }
+            pc_layer_list += (pc_layer_list.empty() ? "" : ",") + std::to_string(il);
+        }
+        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g n_layer=%d pc_only=%d tensor_split=%d pc_layers=[%s]\n",
+            pc_pct, n_layer, pc_layers, n_layer - pc_layers, pc_layer_list.c_str());
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1752,6 +1800,13 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+llama_hybrid_layer_mode llama_model::hybrid_layer_mode(int il) const {
+    if (il < 0 || il >= (int) hybrid_layer_modes.size()) {
+        return llama_hybrid_layer_mode::TENSOR_SPLIT;
+    }
+    return hybrid_layer_modes[il];
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
