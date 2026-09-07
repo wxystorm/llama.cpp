@@ -1,5 +1,22 @@
 #include "models.h"
 
+#include <cstdlib>
+
+static int qwen3_ffn_chunk_count() {
+    constexpr int default_chunks = 2;
+    const char * value = std::getenv("LLAMA_CHUNKS");
+    if (value == nullptr) {
+        return default_chunks;
+    }
+    const int chunks = std::atoi(value);
+    return chunks > 0 ? chunks : default_chunks;
+}
+
+static int qwen3_prefill_ffn_chunk_count() {
+    const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");
+    return value == nullptr ? 0 : std::max(1, std::atoi(value));
+}
+
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -110,6 +127,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
@@ -124,15 +142,93 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(cur, "ffn_out", il);
+        const llama_hybrid_layer_mode hybrid_mode = model.hybrid_layer_mode(il);
+        const int n_decode_chunks = std::min<int64_t>(qwen3_ffn_chunk_count(), n_embd);
+        const int n_prefill_chunks =
+            std::min<int64_t>(qwen3_prefill_ffn_chunk_count(), cur->ne[1]);
+        const bool use_decode_chunked_ffn =
+            n_tokens == 1 &&
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            n_decode_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
+        const bool use_prefill_chunked_ffn =
+            n_tokens > 1 && cur->ne[1] > 1 &&
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            n_prefill_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        if (use_decode_chunked_ffn) {
+            ggml_tensor * ffn_hidden = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    nullptr, nullptr, nullptr,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            std::vector<ggml_tensor *> chunks;
+            chunks.reserve(n_decode_chunks);
+            for (int i = 0; i < n_decode_chunks; ++i) {
+                const int64_t offset = n_embd * i / n_decode_chunks;
+                const int64_t end = n_embd * (i + 1) / n_decode_chunks;
+                const int64_t length = end - offset;
+                ggml_tensor * down = ggml_view_2d(ctx0, model.layers[il].ffn_down,
+                        model.layers[il].ffn_down->ne[0], length,
+                        model.layers[il].ffn_down->nb[1], offset * model.layers[il].ffn_down->nb[1]);
+                ggml_tensor * out = build_lora_mm(down, ffn_hidden);
+                const std::string chunk_name = "ffn_down_chunk_" + std::to_string(i);
+                cb(out, chunk_name.c_str(), il);
+                if (model.layers[il].ffn_down_s != nullptr) {
+                    out = ggml_mul(ctx0, out, model.layers[il].ffn_down_s);
+                }
+                ggml_tensor * residual = ggml_view_2d(ctx0, ffn_inp,
+                        length, ffn_inp->ne[1], ffn_inp->nb[1], offset * ffn_inp->nb[0]);
+                chunks.push_back(ggml_add(ctx0, out, residual));
+            }
+            cur = chunks[0];
+            for (int i = 1; i < n_decode_chunks; ++i) {
+                cur = ggml_concat(ctx0, cur, chunks[i], 0);
+            }
+        } else if (use_prefill_chunked_ffn) {
+            std::vector<ggml_tensor *> chunks;
+            chunks.reserve(n_prefill_chunks);
+            for (int i = 0; i < n_prefill_chunks; ++i) {
+                int64_t token_begin = n_tokens * i / n_prefill_chunks;
+                int64_t token_end = n_tokens * (i + 1) / n_prefill_chunks;
+                if (n_prefill_chunks == 2) {
+                    const int64_t token_split = std::max<int64_t>(1, n_tokens * 2 / 5);
+                    token_begin = i == 0 ? 0 : token_split;
+                    token_end = i == 0 ? token_split : n_tokens;
+                }
+                const int64_t token_count = token_end - token_begin;
+                GGML_ASSERT(token_count > 0);
+                ggml_tensor * norm_chunk = ggml_view_2d(ctx0, cur, cur->ne[0], token_count,
+                        cur->nb[1], token_begin * cur->nb[1]);
+                const std::string norm_name = "prefill_ffn_norm_chunk_" + std::to_string(i);
+                cb(norm_chunk, norm_name.c_str(), il);
+                ggml_tensor * down_chunk = build_ffn(norm_chunk,
+                        model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, il);
+                const std::string down_name = "prefill_ffn_down_chunk_" + std::to_string(i);
+                cb(down_chunk, down_name.c_str(), il);
+                chunks.push_back(down_chunk);
+            }
+            cur = chunks.back();
+            for (int i = (int) chunks.size() - 2; i >= 0; --i) {
+                cur = ggml_concat(ctx0, chunks[i], cur, 1);
+            }
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        } else {
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        }
+        cb(cur, "ffn_out", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);

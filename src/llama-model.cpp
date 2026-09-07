@@ -770,7 +770,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
-    const llama_hybrid_layer_mode mode = ud->model->arch == LLM_ARCH_LLAMA ?
+    const bool hybrid_arch =
+        ud->model->arch == LLM_ARCH_LLAMA ||
+        ud->model->arch == LLM_ARCH_QWEN2 ||
+        ud->model->arch == LLM_ARCH_QWEN3;
+    const llama_hybrid_layer_mode mode = hybrid_arch ?
         ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool force_primary =
         (is_attention_tensor && mode != llama_hybrid_layer_mode::PHONE_ONLY) ||
@@ -1359,7 +1363,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
-    if (arch == LLM_ARCH_LLAMA && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+    const bool hybrid_arch =
+        arch == LLM_ARCH_LLAMA ||
+        arch == LLM_ARCH_QWEN2 ||
+        arch == LLM_ARCH_QWEN3;
+    if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
         const double pc_pct = llama_hybrid_pc_pct();
         const int pc_layers = std::clamp(

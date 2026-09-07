@@ -33,6 +33,46 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+static void meta_debug_tensor(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        const char * tag) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    ggml_backend_synchronize(backend);
+
+    const size_t n = ggml_nelements(tensor);
+    std::vector<float> data(n);
+    ggml_backend_tensor_get(tensor, data.data(), 0, n * sizeof(float));
+
+    double sum = 0.0;
+    double l2 = 0.0;
+    double max_abs = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double x = data[i];
+        sum += x;
+        l2 += x * x;
+        max_abs = std::max(max_abs, std::abs(x));
+    }
+
+    printf(
+        "[NUMDBG] %s tensor=%s n=%zu "
+        "sum=%.9f l2=%.9f max=%.9f "
+        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+        tag,
+        tensor->name,
+        n,
+        sum,
+        std::sqrt(l2),
+        max_abs,
+        n > 0 ? data[0] : 0.0f,
+        n > 1 ? data[1] : 0.0f,
+        n > 2 ? data[2] : 0.0f,
+        n > 3 ? data[3] : 0.0f);
+}
+
 static bool ggml_backend_meta_parse_decode_ffn_chunk(
         const char * name,
         int & chunk,
@@ -4234,6 +4274,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
             has_data[j] = (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
         }
+        if (pipeline_debug && i == 1 && n_backends == 2) {
+            for (size_t j = 0; j < n_backends; ++j) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * graph = bcj.cgraphs[i].cgraph_main;
+                ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
+                meta_debug_tensor(bcj.backend, node,
+                        j == 0 ? "B pre-reduce backend0" : "C pre-reduce backend1");
+            }
+        }
         if (i < 6) {
     auto * n0 = backend_ctx->backend_configs[0]
                     .cgraphs[i].cgraph_main->nodes[
@@ -4383,6 +4432,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i_buf++;
         }
         assert(i_buf == backend_ctx->n_reduce_steps);
+
+        if (pipeline_debug && i == 1 && n_backends == 2) {
+            auto & bcj = backend_ctx->backend_configs[0];
+            ggml_cgraph * graph = bcj.cgraphs[i].cgraph_main;
+            ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
+            meta_debug_tensor(bcj.backend, node, "D post-reduce backend0");
+        }
 
         // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
         for (size_t j = 2*offset_j_max; j < n_backends; j++) {
@@ -4786,6 +4842,15 @@ const bool continues_prefill_layer =
 } else {
     compute_complete = false;
 }
+
+        if (pipeline_debug && communication_sg == 0) {
+            auto & bcj = backend_ctx->backend_configs[0];
+            ggml_cgraph * graph = bcj.cgraphs[communication_sg].cgraph_main;
+            ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
+            if (std::strcmp(node->name, "attn_out-0") == 0) {
+                meta_debug_tensor(bcj.backend, node, "A attn_out-0 backend0");
+            }
+        }
 
         if (n_backends > 1 && communication_sg < backend_ctx->n_subgraphs - 1) {
             const int64_t reduce_start_us = ggml_time_us();
