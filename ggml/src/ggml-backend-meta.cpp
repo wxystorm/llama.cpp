@@ -3336,9 +3336,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return nullptr;
         }
 
-        char prefix[64];
-        std::snprintf(prefix, sizeof(prefix), "ffn_inp-%d", layer);
-        const size_t prefix_len = std::strlen(prefix);
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "ffn_inp-%d", layer);
 
         for (int64_t s = (int64_t) sg; s >= 0; --s) {
             ggml_cgraph * graph =
@@ -3348,7 +3347,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
             for (int k = graph->n_nodes - 1; k >= 0; --k) {
                 ggml_tensor * tensor = graph->nodes[k];
-                if (std::strncmp(tensor->name, prefix, prefix_len) == 0) {
+                if (std::strcmp(tensor->name, expected) == 0) {
                     return tensor;
                 }
             }
