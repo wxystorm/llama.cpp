@@ -278,6 +278,9 @@ const bool use_prefill_chunked_ffn =
                 ggml_tensor * v_acc  = nullptr;
 
                 const llama_layer * next_layer = il + 1 < n_layer ? &model.layers[il + 1] : nullptr;
+                const bool prepare_next_layer =
+                    next_layer != nullptr &&
+                    model.hybrid_layer_mode(il + 1) != llama_hybrid_layer_mode::PHONE_ONLY;
                 auto can_slice_input = [&](const ggml_tensor * weight) {
                     if (weight == nullptr || weight->ne[0] != n_embd) {
                         return false;
@@ -291,7 +294,7 @@ const bool use_prefill_chunked_ffn =
                     return true;
                 };
                 const bool use_partial_qkv =
-                    next_layer != nullptr &&
+                    prepare_next_layer &&
                     next_layer->wqkv == nullptr &&
                     can_slice_input(next_layer->wq) &&
                     can_slice_input(next_layer->wk) &&
@@ -327,7 +330,7 @@ const bool use_prefill_chunked_ffn =
                     ggml_tensor * chunk_sum_sq = ggml_sum_rows(ctx0, ggml_sqr(ctx0, hidden));
                     sum_sq = sum_sq == nullptr ? chunk_sum_sq : ggml_add(ctx0, sum_sq, chunk_sum_sq);
 
-                    if (il + 1 < n_layer) {
+                    if (prepare_next_layer) {
                         ggml_tensor * norm_weight = ggml_view_1d(ctx0, model.layers[il + 1].attn_norm,
                                 length, offset * model.layers[il + 1].attn_norm->nb[0]);
                         ggml_tensor * norm_pre = ggml_mul(ctx0, hidden, norm_weight);
@@ -373,7 +376,7 @@ const bool use_prefill_chunked_ffn =
                     cur = ggml_concat(ctx0, cur, hidden_chunks[i], 0);
                 }
 
-                if (il + 1 < n_layer) {
+                if (prepare_next_layer) {
                     inpL_attn_norm = norm_pre_chunks[0];
                     for (int i = 1; i < n_chunks; ++i) {
                         inpL_attn_norm = ggml_concat(ctx0, inpL_attn_norm, norm_pre_chunks[i], 0);
