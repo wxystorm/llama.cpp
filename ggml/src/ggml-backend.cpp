@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1558,6 +1559,44 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_backend_sched_debug_tensor(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        const char * tag) {
+    if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    ggml_backend_synchronize(backend);
+    const size_t n = ggml_nelements(tensor);
+    std::vector<float> data(n);
+    ggml_backend_tensor_get(tensor, data.data(), 0, n * sizeof(float));
+
+    double sum = 0.0;
+    double l2 = 0.0;
+    double max_abs = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double x = data[i];
+        sum += x;
+        l2 += x * x;
+        max_abs = std::max(max_abs, std::abs(x));
+    }
+
+    printf(
+        "[NUMDBG] %s tensor=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
+        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f "
+        "v4=%.9f v5=%.9f v6=%.9f v7=%.9f\n",
+        tag, tensor->name, n, sum, std::sqrt(l2), max_abs,
+        n > 0 ? data[0] : 0.0f,
+        n > 1 ? data[1] : 0.0f,
+        n > 2 ? data[2] : 0.0f,
+        n > 3 ? data[3] : 0.0f,
+        n > 4 ? data[4] : 0.0f,
+        n > 5 ? data[5] : 0.0f,
+        n > 6 ? data[6] : 0.0f,
+        n > 7 ? data[7] : 0.0f);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1694,6 +1733,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (getenv("GGML_META_PIPELINE_DEBUG") != NULL) {
+            for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+                ggml_tensor * norm = split->graph.nodes[node_id];
+                if (strcmp(norm->name, "norm-24") != 0) {
+                    continue;
+                }
+
+                ggml_tensor * src0 = norm->src[0];
+                printf(
+                    "[EXT_INPUT] layer=24 norm=%s src0=%s "
+                    "src0_ptr=%p src0_buf=%p bytes=%zu\n",
+                    norm->name, src0 != NULL ? src0->name : "(null)",
+                    (void *) src0, src0 != NULL ? (void *) src0->buffer : NULL,
+                    src0 != NULL ? ggml_nbytes(src0) : 0);
+
+                ggml_backend_sched_debug_tensor(
+                    split_backend, src0, "layer24 external norm input");
+                break;
+            }
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1730,6 +1790,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+        }
+
+        if (getenv("GGML_META_PIPELINE_DEBUG") != NULL) {
+            for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+                ggml_tensor * output = split->graph.nodes[node_id];
+                if (strcmp(output->name, "l_out-24") != 0) {
+                    continue;
+                }
+
+                printf(
+                    "[EXT_OUTPUT] layer=24 backend=%s tensor=%s ptr=%p "
+                    "buffer=%p bytes=%zu\n",
+                    ggml_backend_name(split_backend), output->name,
+                    (void *) output, (void *) output->buffer, ggml_nbytes(output));
+                ggml_backend_sched_debug_tensor(
+                    split_backend, output, "layer24 external output");
+                break;
             }
         }
 

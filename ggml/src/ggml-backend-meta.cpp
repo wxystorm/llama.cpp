@@ -33,15 +33,10 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
-static void meta_debug_tensor(
-        ggml_backend_t backend,
-        const ggml_tensor * tensor,
-        const char * tag) {
+static void meta_debug_tensor_data(const ggml_tensor * tensor, const char * tag) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
         return;
     }
-
-    ggml_backend_synchronize(backend);
 
     const size_t n = ggml_nelements(tensor);
     std::vector<float> data(n);
@@ -60,7 +55,8 @@ static void meta_debug_tensor(
     printf(
         "[NUMDBG] %s tensor=%s n=%zu "
         "sum=%.9f l2=%.9f max=%.9f "
-        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f "
+        "v4=%.9f v5=%.9f v6=%.9f v7=%.9f\n",
         tag,
         tensor->name,
         n,
@@ -70,7 +66,23 @@ static void meta_debug_tensor(
         n > 0 ? data[0] : 0.0f,
         n > 1 ? data[1] : 0.0f,
         n > 2 ? data[2] : 0.0f,
-        n > 3 ? data[3] : 0.0f);
+        n > 3 ? data[3] : 0.0f,
+        n > 4 ? data[4] : 0.0f,
+        n > 5 ? data[5] : 0.0f,
+        n > 6 ? data[6] : 0.0f,
+        n > 7 ? data[7] : 0.0f);
+}
+
+static void meta_debug_tensor(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        const char * tag) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    ggml_backend_synchronize(backend);
+    meta_debug_tensor_data(tensor, tag);
 }
 
 static bool ggml_backend_meta_parse_decode_ffn_chunk(
@@ -1729,6 +1741,24 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
+    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr &&
+            std::strcmp(tensor->name, "l_out-23") == 0) {
+        const ggml_tensor * simple0 = n_bufs > 0 ?
+            ggml_backend_meta_buffer_simple_tensor(tensor, 0) : nullptr;
+        const ggml_tensor * simple1 = n_bufs > 1 ?
+            ggml_backend_meta_buffer_simple_tensor(tensor, 1) : nullptr;
+        printf(
+            "[META_EXPORT] tensor=%s ptr=%p axis=%s simple0=%p simple1=%p "
+            "s0=%s s1=%s\n",
+            tensor->name, (const void *) tensor,
+            ggml_backend_meta_split_axis_name(split_state.axis),
+            (const void *) simple0, (const void *) simple1,
+            simple0 != nullptr ? simple0->name : "(null)",
+            simple1 != nullptr ? simple1->name : "(null)");
+        meta_debug_tensor_data(simple0, "EXPORT simple0");
+        meta_debug_tensor_data(simple1, "EXPORT simple1");
+    }
+
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -3042,6 +3072,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int pending_prefill_input_chunk = -1;
     uint64_t pending_prefill_reduce_task = 0;
     int pending_prefill_reduce_layer = -1;
+    int deferred_phone_exit_layer = -1;
+    ggml_tensor * debug_terminal_handoff_dst = nullptr;
+    auto debug_handoff_watch = [&](const char * tag) {
+        if (!pipeline_debug || debug_terminal_handoff_dst == nullptr) {
+            return;
+        }
+
+        printf(
+            "[HANDOFF_WATCH] %s tensor=%p data=%p buffer=%p "
+            "view_src=%p view_offs=%zu\n",
+            tag, (void *) debug_terminal_handoff_dst,
+            debug_terminal_handoff_dst->data,
+            (void *) debug_terminal_handoff_dst->buffer,
+            (void *) debug_terminal_handoff_dst->view_src,
+            debug_terminal_handoff_dst->view_offs);
+        meta_debug_tensor(
+            backend_ctx->backend_configs[0].backend,
+            debug_terminal_handoff_dst, tag);
+    };
     auto subgraph_is_prefill_pc_only_attn = [&](size_t sg) -> bool {
     if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
         return false;
@@ -3395,27 +3444,111 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
+    auto find_exact_named_tensor = [&](size_t backend, const char * expected) -> ggml_tensor * {
+        if (backend >= n_backends) {
+            return nullptr;
+        }
+
+        for (int64_t sg = (int64_t) backend_ctx->n_subgraphs - 1; sg >= 0; --sg) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[backend].cgraphs[(size_t) sg].cgraph_main;
+            if (graph == nullptr) {
+                continue;
+            }
+            for (int k = graph->n_nodes - 1; k >= 0; --k) {
+                ggml_tensor * tensor = graph->nodes[k];
+                if (tensor != nullptr && std::strcmp(tensor->name, expected) == 0) {
+                    return tensor;
+                }
+            }
+            for (int k = graph->n_leafs - 1; k >= 0; --k) {
+                ggml_tensor * tensor = graph->leafs[k];
+                if (tensor != nullptr && std::strcmp(tensor->name, expected) == 0) {
+                    return tensor;
+                }
+            }
+        }
+        return nullptr;
+    };
+    auto debug_layer_input = [&](size_t backend, size_t sg, int layer) {
+        if (!pipeline_debug || backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
+            return;
+        }
+
+        ggml_cgraph * graph = backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+        if (graph == nullptr) {
+            return;
+        }
+
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "norm-%d", layer);
+        for (int k = 0; k < graph->n_nodes; ++k) {
+            ggml_tensor * norm = graph->nodes[k];
+            if (std::strcmp(norm->name, expected) != 0 ||
+                    !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                continue;
+            }
+
+            ggml_tensor * src0 = norm->src[0];
+            printf(
+                "[META_INPUT] layer=%d norm=%s src0=%s "
+                "src0_ptr=%p src0_buf=%p bytes=%zu\n",
+                layer, norm->name, src0 != nullptr ? src0->name : "(null)",
+                (void *) src0, src0 != nullptr ? (void *) src0->buffer : nullptr,
+                src0 != nullptr ? ggml_nbytes(src0) : 0);
+            meta_debug_tensor(
+                backend_ctx->backend_configs[backend].backend, src0,
+                "layer24 meta norm input");
+            return;
+        }
+    };
     auto disable_layer_output_producers = [&](size_t backend, size_t start_sg, int layer) -> ggml_tensor * {
         if (backend >= n_backends) {
             return nullptr;
         }
+
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
         for (size_t sg = start_sg; sg < backend_ctx->n_subgraphs; ++sg) {
             ggml_cgraph * graph = backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
             if (graph == nullptr) {
                 continue;
             }
             for (int k = 0; k < graph->n_nodes; ++k) {
-                int parsed_layer = -1;
-                if (std::sscanf(graph->nodes[k]->name, "l_out-%d", &parsed_layer) == 1 &&
-                        parsed_layer == layer) {
-                    for (int disabled = 0; disabled <= k; ++disabled) {
-                        graph->nodes[disabled]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
-                    }
-                    return graph->nodes[k];
+                ggml_tensor * tensor = graph->nodes[k];
+                if (std::strcmp(tensor->name, expected) != 0) {
+                    continue;
                 }
+                for (int disabled = 0; disabled <= k; ++disabled) {
+                    graph->nodes[disabled]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[DISABLE_L_OUT_PRODUCER] sg=%zu layer=%d "
+                        "through=%d tensor=%s\n",
+                        sg, layer, k, tensor->name);
+                }
+                return tensor;
             }
         }
         return nullptr;
+    };
+    auto subgraph_is_exact_l_out_bridge = [&](size_t sg, int layer) -> bool {
+        if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
+        for (size_t backend = 0; backend < n_backends; ++backend) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+            if (graph == nullptr || graph->n_nodes != 1 ||
+                    std::strcmp(graph->nodes[0]->name, expected) != 0) {
+                return false;
+            }
+        }
+        return true;
     };
     auto find_down_chunk = [&](size_t backend, bool prefill, int layer, int chunk) -> ggml_tensor * {
         if (backend >= n_backends) {
@@ -3557,6 +3690,68 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (active_count == 1) {
             handled = true;
             auto & bcj_src = backend_ctx->backend_configs[active_backend];
+            const bool defer_to_terminal_l_out =
+                active_backend == 1 && force_phone_block_exit &&
+                subgraph_is_exact_l_out_bridge(i + 1, force_phone_block_layer);
+            if (defer_to_terminal_l_out) {
+                ggml_tensor * disabled_l_out = disable_layer_output_producers(
+                    0, i + 1, force_phone_block_layer);
+                GGML_ASSERT(disabled_l_out != nullptr);
+
+                deferred_phone_exit_layer = force_phone_block_layer;
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_EXIT_DEFER] layer=%d sg=%zu->%zu tensor=%s\n",
+                        deferred_phone_exit_layer, i, i + 1, disabled_l_out->name);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
+            if (active_backend == 1 && deferred_phone_exit_layer >= 0) {
+                char expected[64];
+                std::snprintf(
+                    expected, sizeof(expected), "l_out-%d", deferred_phone_exit_layer);
+                const bool already_final_l_out =
+                    std::strcmp(nodes[1]->name, expected) == 0;
+                if (already_final_l_out) {
+                    ggml_tensor * dst_l_out = find_exact_named_tensor(0, expected);
+                    GGML_ASSERT(dst_l_out != nullptr);
+                    GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
+
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(bcj_src.backend);
+                    } else {
+                        ggml_backend_synchronize(bcj_src.backend);
+                    }
+
+                    auto & bcj_dst = backend_ctx->backend_configs[0];
+                    const int64_t copy_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_src.backend, bcj_dst.backend, nodes[1], dst_l_out);
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    const int64_t copy_us = ggml_time_us() - copy_start_us;
+                    record_copy_wait(copy_us);
+                    record_meta_copy(i, 1, 0, dst_l_out, copy_us);
+                    ++direct_copy_count;
+
+                    if (pipeline_debug) {
+                        meta_debug_tensor(
+                            bcj_src.backend, nodes[1], "PHONE FINAL_L_OUT");
+                        meta_debug_tensor(
+                            bcj_dst.backend, dst_l_out, "PC FINAL_L_OUT");
+                        printf(
+                            "[META_FINAL_L_OUT_HANDOFF] layer=%d 1->0 tensor=%s\n",
+                            deferred_phone_exit_layer, dst_l_out->name);
+                    }
+
+                    debug_terminal_handoff_dst = dst_l_out;
+                    deferred_phone_exit_layer = -1;
+                    return GGML_STATUS_SUCCESS;
+                }
+            }
+
             const bool internal_pc_handoff =
                 n_backends == 2 && active_backend == 1 &&
                 i + 1 < backend_ctx->n_subgraphs &&
@@ -3569,16 +3764,74 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     find_recent_ffn_inp(1, i, layer) :
                     find_recent_ffn_inp_layer(1, i, layer);
             }
-            ggml_tensor * dst_l_out = internal_pc_handoff ?
-                disable_layer_output_producers(0, i + 1, layer) :
-                (phone_owner_exit ? nodes[0] : nullptr);
+            ggml_tensor * dst_l_out = nullptr;
+            if (internal_pc_handoff) {
+                dst_l_out = disable_layer_output_producers(0, i + 1, layer);
+            } else if (phone_owner_exit && src_residual != nullptr) {
+                char expected[64];
+                std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
+                dst_l_out = find_exact_named_tensor(0, expected);
+                GGML_ASSERT(dst_l_out != nullptr);
+                GGML_ASSERT(std::strcmp(dst_l_out->name, expected) == 0);
+                GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
+            }
             const bool external_backend_handoff =
                 phone_owner_exit && !internal_pc_handoff &&
                 src_residual != nullptr && dst_l_out != nullptr &&
                 ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
                 ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+
+            if (external_backend_handoff && i + 1 < backend_ctx->n_subgraphs) {
+                ggml_tensor * disabled_l_out =
+                    disable_layer_output_producers(0, i + 1, layer);
+                GGML_ASSERT(disabled_l_out != nullptr);
+                GGML_ASSERT(disabled_l_out == dst_l_out);
+
+                if (pipeline_debug) {
+                    printf(
+                        "[EXT_DISABLE_PRODUCER] sg=%zu layer=%d tensor=%s\n",
+                        i + 1, layer, disabled_l_out->name);
+                }
+            }
+
             const bool layer_handoff_to_pc =
                 internal_pc_handoff || external_backend_handoff;
+
+            if (pipeline_debug && external_backend_handoff) {
+                char expected[64];
+                std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
+
+                ggml_tensor * outer_l_out = nullptr;
+                for (int k = 0; k < cgraph->n_nodes; ++k) {
+                    if (std::strcmp(cgraph->nodes[k]->name, expected) == 0) {
+                        outer_l_out = cgraph->nodes[k];
+                        break;
+                    }
+                }
+                GGML_ASSERT(outer_l_out != nullptr);
+
+                ggml_tensor * outer_simple0 =
+                    ggml_backend_meta_buffer_simple_tensor(outer_l_out, 0);
+                ggml_tensor * outer_simple1 = n_backends > 1 ?
+                    ggml_backend_meta_buffer_simple_tensor(outer_l_out, 1) : nullptr;
+                printf(
+                    "[OUTER_MAP] layer=%d outer=%p dst=%p simple0=%p simple1=%p "
+                    "outer_name=%s s0=%s s1=%s\n",
+                    layer, (void *) outer_l_out, (void *) dst_l_out,
+                    (void *) outer_simple0, (void *) outer_simple1,
+                    outer_l_out->name,
+                    outer_simple0 != nullptr ? outer_simple0->name : "(null)",
+                    outer_simple1 != nullptr ? outer_simple1->name : "(null)");
+            }
+
+            if (pipeline_debug && dst_l_out != nullptr) {
+                char expected[64];
+                std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
+                printf(
+                    "[HANDOFF_DST_CHECK] layer=%d dst=%s expected=%s ptr=%p\n",
+                    layer, dst_l_out->name, expected, (void *) dst_l_out);
+                GGML_ASSERT(std::strcmp(dst_l_out->name, expected) == 0);
+            }
 
             if (pipeline_debug && phone_owner_exit) {
                 printf(
@@ -3599,7 +3852,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                  ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
                  ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out)));
             if (layer_handoff_to_pc) {
-                ggml_backend_synchronize(bcj_src.backend);
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                auto fence_src = [&]() {
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(bcj_src.backend);
+                    } else {
+                        ggml_backend_synchronize(bcj_src.backend);
+                    }
+                };
+
+                fence_src();
+
+                if (pipeline_debug) {
+                    meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE BEFORE_ADD");
+                }
 
                 ggml_tensor * node_layer = get_node_aux(nodes[1]);
                 node_layer->view_src = nodes[1]->view_src == nullptr ? nodes[1] : nodes[1]->view_src;
@@ -3618,16 +3885,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
-                ggml_backend_synchronize(bcj_src.backend);
+                fence_src();
+
+                if (pipeline_debug) {
+                    meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE POST_ADD");
+                }
 
                 auto & bcj_dst = backend_ctx->backend_configs[0];
+                if (pipeline_debug && external_backend_handoff) {
+                    printf(
+                        "[EXT_HANDOFF_MAP] layer=%d phone_node=%s dst=%s "
+                        "phone_ptr=%p dst_ptr=%p\n",
+                        layer, nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                        dst_l_out != nullptr ? dst_l_out->name : "(null)",
+                        (void *) nodes[1], (void *) dst_l_out);
+                }
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                     bcj_src.backend, bcj_dst.backend, nodes[1], dst_l_out);
+                ggml_backend_synchronize(bcj_dst.backend);
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
                 record_copy_wait(copy_us);
                 record_meta_copy(i, 1, 0, dst_l_out, copy_us);
                 ++direct_copy_count;
+
+                if (pipeline_debug) {
+                    meta_debug_tensor(bcj_dst.backend, dst_l_out, "PC POST_COPY");
+                }
+                if (external_backend_handoff) {
+                    debug_terminal_handoff_dst = dst_l_out;
+                }
 
                 if (pipeline_debug) {
                     printf(
@@ -4765,6 +5052,10 @@ const bool continues_prefill_layer =
 
     const int64_t compute_start_us = ggml_time_us();
 
+    for (size_t backend = 0; backend < n_backends; ++backend) {
+        debug_layer_input(backend, i, 24);
+    }
+
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
         GGML_ASSERT(pending_prefill_input_task != 0);
@@ -4797,6 +5088,17 @@ const bool continues_prefill_layer =
 
     compute_workers.start(0, i);
     compute_status = compute_workers.wait(0);
+
+    if (pipeline_debug) {
+        ggml_cgraph * graph =
+            backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        if (graph != nullptr && graph->n_nodes > 0 &&
+                std::strcmp(graph->nodes[0]->name, "l_out-24") == 0) {
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                graph->nodes[0], "CPU L24 IMMEDIATE");
+        }
+    }
 
     if (pipeline_debug &&
             subgraph_is_prefill_pc_only(i)) {
@@ -4933,15 +5235,31 @@ const bool continues_prefill_layer =
         }
     }
 
+    debug_handoff_watch("AFTER_META_LOOP");
+
+    if (pipeline_debug && debug_terminal_handoff_dst != nullptr) {
+        printf(
+            "[HANDOFF_PENDING] prefill_reduce=%" PRIu64
+            " prefill_input=%" PRIu64 "\n",
+            pending_prefill_reduce_task, pending_prefill_input_task);
+    }
+
     if (pending_prefill_reduce_task != 0) {
+        debug_handoff_watch("BEFORE_PENDING_REDUCE_WAIT");
+
         const ggml_status status = backend_ctx->transfer_worker->wait(
             pending_prefill_reduce_task);
         pending_prefill_reduce_task = 0;
         pending_prefill_reduce_layer = -1;
+
+        debug_handoff_watch("AFTER_PENDING_REDUCE_WAIT");
+
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
     }
+
+    debug_handoff_watch("BEFORE_META_RETURN");
 
     if (pipeline_debug) {
         std::string backend_times;
