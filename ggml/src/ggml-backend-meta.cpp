@@ -3451,7 +3451,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return offset;
     };
 
-    auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete) -> ggml_status {
+    auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
+                                         bool force_phone_block_exit,
+                                         int force_phone_block_layer) -> ggml_status {
         std::vector<ggml_tensor *> nodes(n_backends, nullptr);
         size_t active_count = 0;
         size_t active_backend = 0;
@@ -3533,10 +3535,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
+        const bool phone_owner_exit =
+            n_backends == 2 && active_count == 1 && active_backend == 1 &&
+            (force_phone_block_exit ||
+             i + 1 >= backend_ctx->n_subgraphs ||
+             !subgraph_will_execute_phone(i + 1));
+
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             const bool pc_needed_next =
                 i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
-            if (!pc_needed_next) {
+            if (!pc_needed_next && !phone_owner_exit) {
                 handled = true;
                 if (pipeline_debug) {
                     printf("[META_KEEP_PHONE] sg=%zu tensor=%s bytes=%zu next_pc_compute=0\n",
@@ -3549,16 +3557,43 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (active_count == 1) {
             handled = true;
             auto & bcj_src = backend_ctx->backend_configs[active_backend];
-            const bool layer_handoff_to_pc =
+            const bool internal_pc_handoff =
                 n_backends == 2 && active_backend == 1 &&
                 i + 1 < backend_ctx->n_subgraphs &&
                 (subgraph_is_prefill_pc_only(i + 1) ||
                  subgraph_is_decode_pc_only_norm(i + 1));
-            int layer = -1;
-            ggml_tensor * src_residual = layer_handoff_to_pc ?
-                find_recent_ffn_inp_layer(1, i, layer) : nullptr;
-            ggml_tensor * dst_l_out = layer_handoff_to_pc ?
-                disable_layer_output_producers(0, i + 1, layer) : nullptr;
+            int layer = force_phone_block_exit ? force_phone_block_layer : -1;
+            ggml_tensor * src_residual = nullptr;
+            if (internal_pc_handoff || phone_owner_exit) {
+                src_residual = force_phone_block_exit ?
+                    find_recent_ffn_inp(1, i, layer) :
+                    find_recent_ffn_inp_layer(1, i, layer);
+            }
+            ggml_tensor * dst_l_out = internal_pc_handoff ?
+                disable_layer_output_producers(0, i + 1, layer) :
+                (phone_owner_exit ? nodes[0] : nullptr);
+            const bool external_backend_handoff =
+                phone_owner_exit && !internal_pc_handoff &&
+                src_residual != nullptr && dst_l_out != nullptr &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+            const bool layer_handoff_to_pc =
+                internal_pc_handoff || external_backend_handoff;
+
+            if (pipeline_debug && phone_owner_exit) {
+                printf(
+                    "[PHONE_EXIT_DBG] sg=%zu layer=%d node=%s residual=%s "
+                    "next_pc=%d next_phone=%d internal=%d external=%d forced=%d\n",
+                    i, layer, nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                    src_residual != nullptr ? src_residual->name : "(null)",
+                    i + 1 < backend_ctx->n_subgraphs ?
+                        (int) subgraph_will_execute_pc(i + 1) : -1,
+                    i + 1 < backend_ctx->n_subgraphs ?
+                        (int) subgraph_will_execute_phone(i + 1) : -1,
+                    (int) internal_pc_handoff, (int) external_backend_handoff,
+                    (int) force_phone_block_exit);
+            }
+
             GGML_ASSERT(!layer_handoff_to_pc ||
                 (src_residual != nullptr && dst_l_out != nullptr &&
                  ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
@@ -4553,6 +4588,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         size_t communication_sg = i;
         bool phone_block_fused = false;
+        int phone_block_last_layer = -1;
         int prefill_norm_chunk = -1;
         int prefill_norm_layer = -1;
         int prefill_down_chunk = -1;
@@ -4799,9 +4835,8 @@ const bool continues_prefill_layer =
     } else if (is_phone_only_sg) {
         size_t phone_block_end = i;
         int first_fused_layer = -1;
-        int last_fused_layer = -1;
         phone_block_fused = find_phone_block(
-            i, phone_block_end, first_fused_layer, last_fused_layer);
+            i, phone_block_end, first_fused_layer, phone_block_last_layer);
         ggml_cgraph * phone_graph = phone_block_fused ?
             build_phone_block_graph(i, phone_block_end) :
             backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
@@ -4815,7 +4850,7 @@ const bool continues_prefill_layer =
                 printf(
                     "[PHONE_BLOCK_FUSED] sg=%zu..%zu layers=%d..%d nodes=%d\n",
                     i, phone_block_end, first_fused_layer,
-                    last_fused_layer, phone_graph->n_nodes);
+                    phone_block_last_layer, phone_graph->n_nodes);
             } else {
                 printf(
                     "[PHONE_ONLY_SG] sg=%zu first=%s last=%s nodes=%d\n",
@@ -4851,11 +4886,19 @@ const bool continues_prefill_layer =
             }
         }
 
-        if (n_backends > 1 && communication_sg < backend_ctx->n_subgraphs - 1) {
+        const bool terminal_phone_exit =
+            communication_sg + 1 >= backend_ctx->n_subgraphs &&
+            subgraph_is_phone_only(communication_sg);
+        const bool force_phone_block_exit =
+            phone_block_fused && phone_block_last_layer >= 0;
+        if (n_backends > 1 &&
+                (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
             const ggml_status specialized_status =
-                specialized_communication(communication_sg, communication_complete, compute_complete);
+                specialized_communication(
+                    communication_sg, communication_complete, compute_complete,
+                    force_phone_block_exit, phone_block_last_layer);
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
             }

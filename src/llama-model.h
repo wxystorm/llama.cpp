@@ -544,6 +544,11 @@ enum class llama_hybrid_layer_mode {
     PHONE_ONLY,
 };
 
+enum class llama_pc_layer_backend {
+    CPU,
+    CUDA,
+};
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
@@ -609,6 +614,7 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_hybrid_layer_mode> hybrid_layer_modes;
+    std::vector<llama_pc_layer_backend>  pc_layer_backends;
 
     std::vector<llama_layer> layers;
 

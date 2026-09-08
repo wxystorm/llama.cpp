@@ -362,6 +362,28 @@ static int llama_hybrid_phone_layers() {
     return std::max(0, std::atoi(value));
 }
 
+static int llama_hybrid_gpu_pc_layers() {
+    const char * value = std::getenv("LLAMA_HYBRID_GPU_PC_LAYERS");
+    if (value == nullptr) {
+        return 0;
+    }
+
+    return std::max(0, std::atoi(value));
+}
+
+static ggml_backend_dev_t llama_hybrid_cuda_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
         int n_layer, int pc_layers, int phone_layers, const std::string & layout) {
     std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
@@ -1376,6 +1398,36 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const std::string pc_layout = phone_layers > 0 ? "tail" : llama_hybrid_pc_layout();
         hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
+        pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
+        std::vector<int> pc_layer_ids;
+        for (int il = 0; il < n_layer; ++il) {
+            if (hybrid_layer_modes[il] == llama_hybrid_layer_mode::PC_ONLY) {
+                pc_layer_ids.push_back(il);
+            }
+        }
+
+        const int n_gpu_pc = std::min<int>(
+            llama_hybrid_gpu_pc_layers(), pc_layer_ids.size());
+        for (int k = 0; k < n_gpu_pc; ++k) {
+            pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+        }
+
+        if (n_gpu_pc > 0) {
+            ggml_backend_dev_t cuda_dev = llama_hybrid_cuda_device();
+            if (cuda_dev == nullptr) {
+                throw std::runtime_error(
+                    "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
+            }
+            const bool already_registered = std::any_of(
+                devices.begin(), devices.end(),
+                [cuda_dev](const llama_device & device) {
+                    return !device.is_meta && device.dev == cuda_dev;
+                });
+            if (!already_registered) {
+                devices.push_back({ false, cuda_dev });
+            }
+        }
+
         std::string pc_layer_list;
         std::string phone_layer_list;
         for (int il = 0; il < n_layer; ++il) {
@@ -1438,6 +1490,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    ggml_backend_dev_t meta_dev = nullptr;
+    for (const llama_device & device : devices) {
+        if (device.is_meta) {
+            meta_dev = device.dev;
+            break;
+        }
+    }
+
+    const bool has_cuda_pc_layers = std::any_of(
+        pc_layer_backends.begin(), pc_layer_backends.end(),
+        [](llama_pc_layer_backend backend) {
+            return backend == llama_pc_layer_backend::CUDA;
+        });
+    ggml_backend_dev_t cuda_dev = has_cuda_pc_layers ? llama_hybrid_cuda_device() : nullptr;
+    if (has_cuda_pc_layers &&
+            (cuda_dev == nullptr || pimpl->gpu_buft_list.find(cuda_dev) == pimpl->gpu_buft_list.end())) {
+        throw std::runtime_error(format("%s: CUDA0 is not available for PC_ONLY layers", __func__));
+    }
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -1475,6 +1546,50 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (il >= 0 && il < n_layer_all && !hybrid_layer_modes.empty()) {
+            const llama_hybrid_layer_mode hybrid_mode = hybrid_layer_mode(il);
+            if (hybrid_mode == llama_hybrid_layer_mode::PC_ONLY) {
+    GGML_ASSERT(il < (int) pc_layer_backends.size());
+
+    const llama_pc_layer_backend pc_backend =
+        pc_layer_backends[il];
+
+    if (pc_backend == llama_pc_layer_backend::CUDA) {
+        LLAMA_LOG_ERROR(
+            "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CUDA device=%s\n",
+            il, ggml_backend_dev_name(cuda_dev));
+
+        return {
+            cuda_dev,
+            &pimpl->gpu_buft_list.at(cuda_dev)
+        };
+    }
+
+    // 关键：CPU PC_ONLY 仍留在原来的 META 中。
+    // split_state 会把它 force 到 primary。
+    if (meta_dev == nullptr) {
+        throw std::runtime_error(format(
+            "%s: no Meta backend found for PC_ONLY layer %d",
+            __func__, il));
+    }
+
+    LLAMA_LOG_ERROR(
+        "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=META_PRIMARY\n",
+        il);
+
+    return {
+        meta_dev,
+        &pimpl->gpu_buft_list.at(meta_dev)
+    };
+}
+
+            if (meta_dev == nullptr) {
+                throw std::runtime_error(format(
+                    "%s: no Meta backend found for hybrid layer %d", __func__, il));
+            }
+            return { meta_dev, &pimpl->gpu_buft_list.at(meta_dev) };
+        }
+
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
