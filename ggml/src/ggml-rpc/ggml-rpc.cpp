@@ -347,6 +347,7 @@ struct ggml_backend_rpc_buffer_context {
     uint64_t remote_ptr;
 
     ggml_backend_rpc_device_context * device_ctx = nullptr;
+    std::array<std::shared_ptr<socket_t>, 2> snapshot_transfer_socks {};
 };
 
 static bool ggml_backend_rpc_prepare_fused_ffn_input(
@@ -631,13 +632,30 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 enum class rpc_socket_role {
     COMPUTE,
     TRANSFER,
+    SNAPSHOT_TRANSFER_0,
+    SNAPSHOT_TRANSFER_1,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    std::string key = endpoint + (role == rpc_socket_role::COMPUTE ? "_compute" : "_transfer");
+    const char * suffix = nullptr;
+    switch (role) {
+        case rpc_socket_role::COMPUTE:
+            suffix = "_compute";
+            break;
+        case rpc_socket_role::TRANSFER:
+            suffix = "_transfer";
+            break;
+        case rpc_socket_role::SNAPSHOT_TRANSFER_0:
+            suffix = "_snapshot_transfer_0";
+            break;
+        case rpc_socket_role::SNAPSHOT_TRANSFER_1:
+            suffix = "_snapshot_transfer_1";
+            break;
+    }
+    std::string key = endpoint + suffix;
     auto it = sockets.find(key);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
@@ -672,6 +690,12 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 static std::shared_ptr<socket_t> get_transfer_socket(const std::string & endpoint) {
     return get_socket_role(endpoint, rpc_socket_role::TRANSFER);
+}
+
+static std::shared_ptr<socket_t> get_snapshot_transfer_socket(const std::string & endpoint, size_t lane) {
+    GGML_ASSERT(lane < 2);
+    return get_socket_role(endpoint, lane == 0 ? rpc_socket_role::SNAPSHOT_TRANSFER_0
+                                               : rpc_socket_role::SNAPSHOT_TRANSFER_1);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -1014,16 +1038,18 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         request.seq = rpc_snapshot_read.seq;
         request.size = size;
 
-        if (ctx->transfer_sock == nullptr) {
-            ctx->transfer_sock = get_transfer_socket(ctx->endpoint);
-            RPC_STATUS_ASSERT(ctx->transfer_sock != nullptr);
+        const size_t lane = rpc_snapshot_read.slot & 1u;
+        auto & snapshot_sock = ctx->snapshot_transfer_socks[lane];
+        if (snapshot_sock == nullptr) {
+            snapshot_sock = get_snapshot_transfer_socket(ctx->endpoint, lane);
+            RPC_STATUS_ASSERT(snapshot_sock != nullptr);
         }
 
         const int64_t t0 = ggml_time_us();
 
         bool status =
             send_rpc_cmd_compact_small(
-                ctx->transfer_sock,
+                snapshot_sock,
                 RPC_CMD_GET_SNAPSHOT,
                 request);
 
@@ -1031,7 +1057,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t request_done_us = ggml_time_us();
 
-        status = ctx->transfer_sock->recv_data(
+        status = snapshot_sock->recv_data(
             data,
             size);
 
