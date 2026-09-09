@@ -494,11 +494,13 @@ struct ggml_backend_meta_buffer_context {
     // Most tensors can simply be stored statically in their own buffer.
     // Externally created views however also need a mapping to simple tensors but they use the buffer of the view source.
     // If external views are simply using that buffer they will slowly deplete its memory.
-    // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
+    // Current solution: rotating set of "compute" containers to hold external views, works correctly for llama.cpp.
     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
     //     currently not possible due to graph-external operations in the backend scheduler.
+    static constexpr int STC_COMPUTE_COUNT = 3;
+
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute[2];
+    ggml_backend_meta_simple_tensor_container stc_compute[STC_COMPUTE_COUNT];
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -515,8 +517,10 @@ struct ggml_backend_meta_buffer_context {
             ggml_backend_meta_simple_tensor_container & stc_static,
             ggml_backend_meta_simple_tensor_container & stc_compute_0,
             ggml_backend_meta_simple_tensor_container & stc_compute_1,
+            ggml_backend_meta_simple_tensor_container & stc_compute_2,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
+            : stc_static(std::move(stc_static)),
+              stc_compute{std::move(stc_compute_0), std::move(stc_compute_1), std::move(stc_compute_2)} {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -530,6 +534,30 @@ struct ggml_backend_meta_buffer_context {
             return stc_static;
         }
         return stc_compute[stc_compute_index];
+    }
+
+    ggml_backend_meta_simple_tensor_container * find_simple_tensor_container(const ggml_tensor * tensor) {
+        if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
+            return &stc_static;
+        }
+
+        auto & current = stc_compute[stc_compute_index];
+        if (current.simple_tensors.find(tensor) != current.simple_tensors.end()) {
+            return &current;
+        }
+
+        for (int i = 0; i < STC_COMPUTE_COUNT; ++i) {
+            if (i == stc_compute_index) {
+                continue;
+            }
+
+            auto & stc = stc_compute[i];
+            if (stc.simple_tensors.find(tensor) != stc.simple_tensors.end()) {
+                return &stc;
+            }
+        }
+
+        return nullptr;
     }
 };
 
@@ -557,9 +585,13 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
-    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
-    auto it = stc.simple_tensors.find(tensor);
-    if (it == stc.simple_tensors.end()) {
+    auto * stc = buf_ctx->find_simple_tensor_container(tensor);
+    if (stc == nullptr) {
+        return nullptr;
+    }
+
+    auto it = stc->simple_tensors.find(tensor);
+    if (it == stc->simple_tensors.end()) {
         return nullptr;
     }
     return it->second[index];
@@ -1212,7 +1244,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
-    return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+    auto * stc = buf_ctx->find_simple_tensor_container(tensor);
+    if (stc == nullptr) {
+        stc = &buf_ctx->get_simple_tensor_container(tensor);
+    }
+    return ggml_backend_meta_get_split_state(*stc, tensor, assume_sync);
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1898,6 +1934,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_2(params, n_simple_bufts);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1907,7 +1944,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx =
+        new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, stc_compute_2, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1929,9 +1967,11 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_2(params_compute, n_simple_bufts);
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx =
+        new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, stc_compute_2, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {    //这里是张量切分主要逻辑
@@ -2516,8 +2556,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+            buf_ctx->stc_compute_index_next =
+                (buf_ctx->stc_compute_index + 1) % ggml_backend_meta_buffer_context::STC_COMPUTE_COUNT;
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
+
+            if (std::getenv("GGML_META_STC_DEBUG") != nullptr) {
+                printf("[META_STC_ROTATE] uid=%" PRIu64 " buf=%p cur=%d next=%d clear_entries=%zu first=%s last=%s\n",
+                       cgraph->uid, (void *) buf, buf_ctx->stc_compute_index, buf_ctx->stc_compute_index_next,
+                       stc.simple_tensors.size(), cgraph->n_nodes > 0 ? cgraph->nodes[0]->name : "(none)",
+                       cgraph->n_nodes > 0 ? cgraph->nodes[cgraph->n_nodes - 1]->name : "(none)");
+            }
+
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
             }
@@ -2538,6 +2587,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
+                if (!bcj.nodes[i]) {
+                    fprintf(stderr,
+                            "[META_MISSING_SIMPLE] j=%zu i=%d name=%s op=%s tensor=%p buffer=%p view_src=%p "
+                            "view_offs=%zu uid=%" PRIu64 "\n",
+                            j, i, node->name, ggml_op_name(node->op), (void *) node, (void *) node->buffer,
+                            (void *) node->view_src, node->view_offs, cgraph->uid);
+                }
                 GGML_ASSERT(bcj.nodes[i]);
             }
         }
@@ -3720,18 +3776,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     const ggml_backend_rpc_fence_t rpc_fence =
                         ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                    const int64_t wait_begin_us = ggml_time_us();
+                    if (pipeline_debug) {
+                        printf("[PHONE_BLOCK_WAIT_BEGIN] layer=%d t=%" PRId64 "\n", deferred_phone_exit_layer,
+                               wait_begin_us);
+                    }
                     if (rpc_fence != nullptr) {
                         rpc_fence(bcj_src.backend);
                     } else {
                         ggml_backend_synchronize(bcj_src.backend);
                     }
+                    const int64_t wait_end_us = ggml_time_us();
+                    if (pipeline_debug) {
+                        printf("[PHONE_BLOCK_WAIT_END] layer=%d t=%" PRId64 " dur=%.3f ms\n",
+                               deferred_phone_exit_layer, wait_end_us, (wait_end_us - wait_begin_us) / 1000.0);
+                    }
 
                     auto & bcj_dst = backend_ctx->backend_configs[0];
                     const int64_t copy_start_us = ggml_time_us();
+                    if (pipeline_debug) {
+                        printf("[PHONE_EXIT_COPY_BEGIN] layer=%d t=%" PRId64 " bytes=%zu\n",
+                               deferred_phone_exit_layer, copy_start_us, ggml_nbytes(dst_l_out));
+                    }
                     ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[1], dst_l_out);
                     ggml_backend_synchronize(bcj_dst.backend);
                     const int64_t copy_us = ggml_time_us() - copy_start_us;
+                    if (pipeline_debug) {
+                        printf("[PHONE_EXIT_COPY_END] layer=%d t=%" PRId64 " dur=%.3f ms\n",
+                               deferred_phone_exit_layer, copy_start_us + copy_us, copy_us / 1000.0);
+                    }
                     record_copy_wait(copy_us);
                     record_meta_copy(i, 1, 0, dst_l_out, copy_us);
                     ++direct_copy_count;
@@ -3862,7 +3936,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 };
 
+                const int64_t wait_begin_us = ggml_time_us();
+                if (pipeline_debug && phone_owner_exit) {
+                    printf("[PHONE_BLOCK_WAIT_BEGIN] layer=%d t=%" PRId64 "\n", layer, wait_begin_us);
+                }
                 fence_src();
+                const int64_t wait_end_us = ggml_time_us();
+                if (pipeline_debug && phone_owner_exit) {
+                    printf("[PHONE_BLOCK_WAIT_END] layer=%d t=%" PRId64 " dur=%.3f ms\n", layer, wait_end_us,
+                           (wait_end_us - wait_begin_us) / 1000.0);
+                }
 
                 if (pipeline_debug) {
                     meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE BEFORE_ADD");
@@ -3901,10 +3984,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         (void *) nodes[1], (void *) dst_l_out);
                 }
                 const int64_t copy_start_us = ggml_time_us();
+                if (pipeline_debug && phone_owner_exit) {
+                    printf("[PHONE_EXIT_COPY_BEGIN] layer=%d t=%" PRId64 " bytes=%zu\n", layer, copy_start_us,
+                           ggml_nbytes(dst_l_out));
+                }
                 ggml_backend_tensor_copy_async(
                     bcj_src.backend, bcj_dst.backend, nodes[1], dst_l_out);
                 ggml_backend_synchronize(bcj_dst.backend);
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
+                if (pipeline_debug && phone_owner_exit) {
+                    printf("[PHONE_EXIT_COPY_END] layer=%d t=%" PRId64 " dur=%.3f ms\n", layer,
+                           copy_start_us + copy_us, copy_us / 1000.0);
+                }
                 record_copy_wait(copy_us);
                 record_meta_copy(i, 1, 0, dst_l_out, copy_us);
                 ++direct_copy_count;
@@ -4099,6 +4190,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         backend_ctx->transfer_worker,
                         task_id,
                     };
+                    const int64_t return_begin_us = ggml_time_us();
+                    if (pipeline_debug) {
+                        printf("[PREFILL_RETURN_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", prefill_down_layer_0,
+                               prefill_down_chunk_0, return_begin_us);
+                    }
+                    auto finish_return = [&](ggml_status result) {
+                        const int64_t return_end_us = ggml_time_us();
+                        if (pipeline_debug) {
+                            printf("[PREFILL_RETURN_END] layer=%d chunk=%d t=%" PRId64 " dur=%.3f ms\n",
+                                   prefill_down_layer_0, prefill_down_chunk_0, return_end_us,
+                                   (return_end_us - return_begin_us) / 1000.0);
+                        }
+                        return result;
+                    };
 
                     if (use_snapshot_pipeline) {
                         set_snapshot_read(true, snapshot_slot, snapshot_seq);
@@ -4142,20 +4247,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
 
                     if (status != GGML_STATUS_SUCCESS || !handoff_to_phone) {
-                        return status;
+                        return finish_return(status);
                     }
 
                     ggml_backend_synchronize(bcj_dst.backend);
                     const ggml_status layer_status =
                         ggml_backend_graph_compute_async(bcj_dst.backend, chunk_layer_graph);
                     if (layer_status != GGML_STATUS_SUCCESS) {
-                        return layer_status;
+                        return finish_return(layer_status);
                     }
                     ggml_backend_synchronize(bcj_dst.backend);
                     ggml_backend_tensor_copy_async(
                         bcj_dst.backend, bcj_dst.backend, node_dst, pc_output_chunk);
                     if (!layer_handoff) {
-                        return status;
+                        return finish_return(status);
                     }
                     ggml_backend_synchronize(bcj_dst.backend);
 
@@ -4172,7 +4277,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             "[META_LAYER_HANDOFF] layer=%d 0->1 tensor=%s bytes=%zu\n",
                             prefill_down_layer_0, pc_l_out->name, ggml_nbytes(pc_l_out));
                     }
-                    return status;
+                    return finish_return(status);
                 });
 
             if (use_snapshot_pipeline) {
@@ -4872,7 +4977,54 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return fused;
     };
 
+    struct meta_layer_timing {
+        int64_t compute_pc_us    = 0;
+        int64_t compute_phone_us = 0;
+        int64_t copy_0to1_us     = 0;
+        int64_t copy_1to0_us     = 0;
+        int64_t total_us         = 0;
+    };
+    std::map<std::pair<int, int>, meta_layer_timing> layer_timings;
+
+    auto subgraph_layer = [&](size_t sg) -> int {
+        for (size_t backend = 0; backend < n_backends; ++backend) {
+            ggml_cgraph * graph = backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+            if (graph == nullptr) {
+                continue;
+            }
+            for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
+                const char * name = graph->nodes[node_id]->name;
+                int chunk = -1;
+                int layer = -1;
+                if (ggml_backend_meta_parse_prefill_norm_chunk(name, chunk, layer) ||
+                    ggml_backend_meta_parse_prefill_down_chunk(name, chunk, layer) ||
+                    std::sscanf(name, "attn_out-%d", &layer) == 1 ||
+                    std::sscanf(name, "ffn_inp-%d", &layer) == 1 ||
+                    std::sscanf(name, "l_out-%d", &layer) == 1) {
+                    return layer;
+                }
+            }
+        }
+        return -1;
+    };
+
+    auto backend_times_snapshot = [&]() {
+        std::lock_guard<std::mutex> lock(compute_workers.mutex);
+        return compute_workers.backend_time_us;
+    };
+    auto copy_time_snapshot = [&](size_t src, size_t dst) {
+        std::lock_guard<std::mutex> lock(meta_copy_stats_mutex);
+        return reduce_copy_by_direction[src*n_backends + dst].total_us;
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const int64_t layer_wall_start_us = ggml_time_us();
+        const auto backend_times_before = backend_times_snapshot();
+        const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
+        const int64_t copy_1to0_before = n_backends > 1 ? copy_time_snapshot(1, 0) : 0;
+        int timing_first_layer = subgraph_layer(i);
+        int timing_last_layer  = timing_first_layer;
+
         size_t communication_sg = i;
         bool phone_block_fused = false;
         int phone_block_last_layer = -1;
@@ -5050,6 +5202,14 @@ const bool continues_prefill_layer =
         }
     }
 
+    const int next_layer = is_prefill_down_sg ? prefill_down_layer : prefill_norm_layer;
+    const int next_chunk = is_prefill_down_sg ? prefill_down_chunk : prefill_norm_chunk;
+    const bool trace_prefill_chunk = pipeline_debug && (is_prefill_down_sg || is_prefill_norm_sg);
+    const int64_t next_begin_us = ggml_time_us();
+    if (trace_prefill_chunk) {
+        printf("[PREFILL_NEXT_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", next_layer, next_chunk, next_begin_us);
+    }
+
     const int64_t compute_start_us = ggml_time_us();
 
     for (size_t backend = 0; backend < n_backends; ++backend) {
@@ -5079,9 +5239,20 @@ const bool continues_prefill_layer =
             return input_status;
         }
 
+        const int64_t chunk_submit_begin_us = ggml_time_us();
+        if (pipeline_debug) {
+            printf("[PREFILL_CHUNK_SUBMIT_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", prefill_down_layer,
+                   prefill_down_chunk, chunk_submit_begin_us);
+        }
         compute_workers.start(1, i);
         const ggml_status pc_status = compute_workers.wait(0);
         const ggml_status phone_status = compute_workers.wait(1);
+        const int64_t chunk_submit_end_us = ggml_time_us();
+        if (pipeline_debug) {
+            printf("[PREFILL_CHUNK_SUBMIT_END] layer=%d chunk=%d t=%" PRId64 " dur=%.3f ms\n",
+                   prefill_down_layer, prefill_down_chunk, chunk_submit_end_us,
+                   (chunk_submit_end_us - chunk_submit_begin_us) / 1000.0);
+        }
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
     } else if (is_prefill_norm_sg ||
            subgraph_is_prefill_pc_only(i)) {
@@ -5139,13 +5310,28 @@ const bool continues_prefill_layer =
         int first_fused_layer = -1;
         phone_block_fused = find_phone_block(
             i, phone_block_end, first_fused_layer, phone_block_last_layer);
+        if (phone_block_fused) {
+            timing_first_layer = first_fused_layer;
+            timing_last_layer  = phone_block_last_layer;
+        }
         ggml_cgraph * phone_graph = phone_block_fused ?
             build_phone_block_graph(i, phone_block_end) :
             backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
         communication_sg = phone_block_fused ? phone_block_end : i;
 
+        const int64_t phone_submit_begin_us = ggml_time_us();
+        if (pipeline_debug && phone_block_fused) {
+            printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
+                   phone_block_last_layer, phone_submit_begin_us);
+        }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
+        const int64_t phone_submit_end_us = ggml_time_us();
+        if (pipeline_debug && phone_block_fused) {
+            printf("[PHONE_BLOCK_SUBMIT_END] layers=%d..%d t=%" PRId64 " dur=%.3f ms\n", first_fused_layer,
+                   phone_block_last_layer, phone_submit_end_us,
+                   (phone_submit_end_us - phone_submit_begin_us) / 1000.0);
+        }
 
         if (pipeline_debug) {
             if (phone_block_fused) {
@@ -5166,6 +5352,12 @@ const bool continues_prefill_layer =
     }
 
     compute_wall_us += ggml_time_us() - compute_start_us;
+
+    if (trace_prefill_chunk) {
+        const int64_t next_end_us = ggml_time_us();
+        printf("[PREFILL_NEXT_END] layer=%d chunk=%d t=%" PRId64 " dur=%.3f ms\n", next_layer, next_chunk,
+               next_end_us, (next_end_us - next_begin_us) / 1000.0);
+    }
 
     if (compute_status != GGML_STATUS_SUCCESS) {
         if (pending_prefill_reduce_task != 0) {
@@ -5233,6 +5425,22 @@ const bool continues_prefill_layer =
         if (phone_block_fused) {
             i = communication_sg;
         }
+
+        if (pipeline_debug && timing_first_layer >= 0) {
+            const auto backend_times_after = backend_times_snapshot();
+            auto & timing = layer_timings[{ timing_first_layer, timing_last_layer }];
+            if (!backend_times_after.empty()) {
+                timing.compute_pc_us += backend_times_after[0] - backend_times_before[0];
+            }
+            if (backend_times_after.size() > 1) {
+                timing.compute_phone_us += backend_times_after[1] - backend_times_before[1];
+            }
+            if (n_backends > 1) {
+                timing.copy_0to1_us += copy_time_snapshot(0, 1) - copy_0to1_before;
+                timing.copy_1to0_us += copy_time_snapshot(1, 0) - copy_1to0_before;
+            }
+            timing.total_us += ggml_time_us() - layer_wall_start_us;
+        }
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
@@ -5291,6 +5499,18 @@ const bool continues_prefill_layer =
                        (double(stats.total_us) / stats.count) / 1000.0, stats.max_us / 1000.0,
                        stats.bytes / (1024.0 * 1024.0));
             }
+        }
+        for (const auto & entry : layer_timings) {
+            const int first_layer = entry.first.first;
+            const int last_layer  = entry.first.second;
+            const auto & timing   = entry.second;
+            printf("[META_LAYER_SUM] layer=%d", first_layer);
+            if (last_layer != first_layer) {
+                printf("..%d", last_layer);
+            }
+            printf(" compute_pc=%.3f compute_phone=%.3f copy_0to1=%.3f copy_1to0=%.3f total=%.3f ms\n",
+                   timing.compute_pc_us / 1000.0, timing.compute_phone_us / 1000.0,
+                   timing.copy_0to1_us / 1000.0, timing.copy_1to0_us / 1000.0, timing.total_us / 1000.0);
         }
         if (pipeline_gap_count > 0) {
             printf("[META_PIPELINE_GAP_SUM] count=%zu submit_avg=%.3f ms gap_avg=%.3f ms max=%.3f ms\n",

@@ -123,22 +123,19 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
-    bool set_adapter_cvec(
-            const float * data,
-                 size_t   len,
-                int32_t   n_embd,
-                int32_t   il_start,
-                int32_t   il_end);
+    bool set_adapter_cvec(const float * data, size_t len, int32_t n_embd, int32_t il_start, int32_t il_end);
 
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
-    llm_graph_result * process_ubatch(
-                const llama_ubatch & ubatch,
-                    llm_graph_type   gtype,
-            llama_memory_context_i * mctx,
-                       ggml_status & ret);
+    llm_graph_result * process_ubatch(const llama_ubatch &     ubatch,
+                                      llm_graph_type           gtype,
+                                      llama_memory_context_i * mctx,
+                                      ggml_backend_sched_t     sched_use,
+                                      llm_graph_result *       res_use,
+                                      int                      ubatch_id,
+                                      ggml_status &            ret);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -232,13 +229,16 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res,
+                              size_t                   token_offset,
+                              size_t                   n_tokens,
+                              ggml_backend_sched_t     sched_use);
 
     //
     // graph
     //
 
-public:
+  public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -248,19 +248,81 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
-    ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+    ggml_cgraph * graph_reserve(uint32_t                       n_tokens,
+                                uint32_t                       n_seqs,
+                                uint32_t                       n_outputs,
+                                const llama_memory_context_i * mctx,
+                                bool                           split_only = false,
+                                size_t *                       sizes      = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
-private:
-    llm_graph_params graph_params(
-                        llm_graph_result * res,
-                      const llama_ubatch & ubatch,
-            const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+  private:
+    struct llama_prefill_pipe_slot {
+        ggml_backend_sched_t sched = nullptr;
+        llm_graph_result *   res   = nullptr;
 
-    llm_graph_cb graph_get_cb() const;
+        int ubatch_id = -1;
+
+        int pre_begin = 0;
+        int pre_end   = 0;
+
+        int gpu_begin = 0;
+        int gpu_end   = 0;
+
+        int post_begin = 0;
+        int post_end   = 0;
+
+        int tail_begin = 0;
+        int tail_end   = 0;
+
+        int64_t t_pre_begin  = 0;
+        int64_t t_pre_end    = 0;
+
+        int64_t t_gpu_begin  = 0;
+        int64_t t_gpu_submit = 0;
+
+        int64_t t_post_begin = 0;
+        int64_t t_post_end   = 0;
+
+        int64_t t_tail_begin = 0;
+        int64_t t_tail_end   = 0;
+
+        bool active        = false;
+        bool post_prepared = false;
+    };
+
+    bool prepare_pipe_slot(llama_prefill_pipe_slot & slot,
+                           const llama_ubatch &      ubatch,
+                           llm_graph_type            gtype,
+                           llama_memory_context_i *  mctx,
+                           int                       ubatch_id,
+                           ggml_status &             ret);
+
+    ggml_status pipe_run_pre(llama_prefill_pipe_slot & slot);
+    ggml_status pipe_run_gpu(llama_prefill_pipe_slot & slot);
+    ggml_status pipe_prepare_post(llama_prefill_pipe_slot & slot);
+    ggml_status pipe_run_post_prepared(llama_prefill_pipe_slot & slot);
+    void        pipe_sync_post(llama_prefill_pipe_slot & slot);
+    ggml_status pipe_run_tail(llama_prefill_pipe_slot & slot);
+
+    llm_graph_result * prepare_ubatch(llm_graph_result *       res,
+                                      ggml_backend_sched_t     sched_use,
+                                      const llama_ubatch &     ubatch,
+                                      llm_graph_type           gtype,
+                                      llama_memory_context_i * mctx,
+                                      ggml_status &            ret,
+                                      bool                     apply_mctx = true);
+
+    ggml_status graph_compute_range(ggml_backend_sched_t sched_use, int first_split, int last_split, bool batched);
+
+    llm_graph_params graph_params(llm_graph_result *             res,
+                                  const llama_ubatch &           ubatch,
+                                  const llama_memory_context_i * mctx,
+                                  llm_graph_type                 gtype,
+                                  ggml_backend_sched_t           sched_use) const;
+
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_use) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -332,7 +394,7 @@ private:
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
-    std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    std::vector<int32_t> output_ids;  // map batch token positions to ids of the logits and embd buffers
 
     struct swap_info {
         uint32_t i0;
@@ -342,10 +404,11 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_pipe;
 
     bool sched_need_reserve = true;
 
-    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t                backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
     // training
@@ -362,10 +425,11 @@ private:
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
-    std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_buf_exp_size;  // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+    llm_graph_result_ptr gf_res_pipe;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

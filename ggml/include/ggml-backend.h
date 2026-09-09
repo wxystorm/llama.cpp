@@ -318,30 +318,46 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
-    GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
-    GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+    GGML_API void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched,
+                                                  struct ggml_cgraph * measure_graph,
+                                                  size_t *             sizes);
+    GGML_API bool ggml_backend_sched_reserve(ggml_backend_sched_t sched,
+                                             struct ggml_cgraph * measure_graph);  // returns success
 
-    GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
-    GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
+    GGML_API int            ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
+    GGML_API ggml_backend_t ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 
     // Get the number of splits of the last graph
-    GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
-    GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    GGML_API int            ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    GGML_API ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
+    GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
-    GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
-    GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,
+                                                                           ggml_backend_t       backend);
+    GGML_API size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
-    GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
-    GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+    GGML_API void           ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched,
+                                                                  struct ggml_tensor * node,
+                                                                  ggml_backend_t       backend);
+    GGML_API ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+                                                                  struct ggml_tensor * node);
 
     // Split graph without allocating it
-    GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
-    GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
-    GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
-    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
-    GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    GGML_API bool             ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched,
+                                                             struct ggml_cgraph * graph);  // returns success
+    // Prepare or compute one split of the currently allocated graph. Split ranges are [first_split, last_split).
+    GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
+    GGML_API enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id);
+    GGML_API enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched,
+                                                               int                  first_split,
+                                                               int                  last_split);
+    GGML_API enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched,
+                                                                     struct ggml_cgraph * graph);
+    GGML_API void             ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
