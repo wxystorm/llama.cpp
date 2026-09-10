@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-hybrid.h"
+
 #include <cstdlib>
 
 static int qwen3_ffn_chunk_count() {
@@ -190,15 +192,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         } else if (use_prefill_chunked_ffn) {
             std::vector<ggml_tensor *> chunks;
             chunks.reserve(n_prefill_chunks);
+            const std::vector<int> chunk_sizes = llama_hybrid_split_chunks(n_tokens, n_prefill_chunks);
+            GGML_ASSERT((int) chunk_sizes.size() == n_prefill_chunks);
+            int64_t token_begin = 0;
             for (int i = 0; i < n_prefill_chunks; ++i) {
-                int64_t token_begin = n_tokens * i / n_prefill_chunks;
-                int64_t token_end = n_tokens * (i + 1) / n_prefill_chunks;
-                if (n_prefill_chunks == 2) {
-                    const int64_t token_split = std::max<int64_t>(1, n_tokens * 2 / 5);
-                    token_begin = i == 0 ? 0 : token_split;
-                    token_end = i == 0 ? token_split : n_tokens;
-                }
-                const int64_t token_count = token_end - token_begin;
+                const int64_t token_count = chunk_sizes[i];
+                const int64_t token_end = token_begin + token_count;
                 GGML_ASSERT(token_count > 0);
                 ggml_tensor * norm_chunk = ggml_view_2d(ctx0, cur, cur->ne[0], token_count,
                         cur->nb[1], token_begin * cur->nb[1]);
@@ -213,6 +212,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 const std::string down_name = "prefill_ffn_down_chunk_" + std::to_string(i);
                 cb(down_chunk, down_name.c_str(), il);
                 chunks.push_back(down_chunk);
+                token_begin = token_end;
             }
             cur = chunks.back();
             for (int i = (int) chunks.size() - 2; i >= 0; --i) {

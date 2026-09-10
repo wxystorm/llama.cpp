@@ -20,6 +20,8 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
+struct llama_hybrid_ffn_desc;
+
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
     GGUF_FILE_VERSION_V2 = 2,
@@ -186,6 +188,8 @@ struct LLAMA_API llama_model_loader {
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
+
+    bool get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & desc) const;
 
     const struct ggml_tensor * check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const;
 

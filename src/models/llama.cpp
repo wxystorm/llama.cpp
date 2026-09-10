@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-hybrid.h"
+
 #include <cstdlib>
 
 static int llama_ffn_chunk_count() {
@@ -419,16 +421,13 @@ const bool use_prefill_chunked_ffn =
             } else if (use_prefill_chunked_ffn) {
                 std::vector<ggml_tensor *> down_chunks;
                 down_chunks.reserve(n_prefill_chunks);
+                const std::vector<int> chunk_sizes = llama_hybrid_split_chunks(n_tokens, n_prefill_chunks);
+                GGML_ASSERT((int) chunk_sizes.size() == n_prefill_chunks);
+                int64_t token_begin = 0;
 
                 for (int i = 0; i < n_prefill_chunks; ++i) {
-                    int64_t token_begin = n_tokens * i / n_prefill_chunks;
-                    int64_t token_end   = n_tokens * (i + 1) / n_prefill_chunks;
-                    if (n_prefill_chunks == 2) {
-                        const int64_t token_split = std::max<int64_t>(1, n_tokens * 2 / 5);
-                        token_begin = i == 0 ? 0 : token_split;
-                        token_end   = i == 0 ? token_split : n_tokens;
-                    }
-                    const int64_t token_count = token_end - token_begin;
+                    const int64_t token_count = chunk_sizes[i];
+                    const int64_t token_end = token_begin + token_count;
 
                    GGML_ASSERT(token_begin >= 0);
     GGML_ASSERT(token_end <= cur->ne[1]);
@@ -458,6 +457,7 @@ const bool use_prefill_chunked_ffn =
                     const std::string down_name = "prefill_ffn_down_chunk_" + std::to_string(i);
                     cb(down_chunk, down_name.c_str(), il);
                     down_chunks.push_back(down_chunk);
+                    token_begin = token_end;
                 }
 
                 GGML_ASSERT(!down_chunks.empty());

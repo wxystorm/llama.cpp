@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
+#include "llama-hybrid.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -733,6 +734,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {1};
     };
 
+    const bool is_ffn_split_tensor =
+        std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
+        std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+        std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
@@ -759,6 +767,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             for (; j < ud->n_devices - 1; j++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
                     ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                const float split_ratio = tensor_split_scan.back() == 0.0f ?
+                    (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
+                if (is_ffn_split_tensor && ud->n_devices == 2 && split_ratio > 0.0f && split_ratio < 1.0f) {
+                    high = llama_hybrid_ffn_shard_size(ne_s, tc.tensor_axis_0->type, split_ratio, 0);
+                }
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
@@ -786,12 +799,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_attn_sinks) ||
         std::regex_match(tensor_name, pattern_attn_out_weight) ||
         std::regex_match(tensor_name, pattern_attn_gate_weight);
-    const bool is_ffn_split_tensor =
-        std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
-        std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
-        std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
-        std::regex_match(tensor_name, pattern_ffn_down_weight) ||
-        std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
     const bool hybrid_arch =
         ud->model->arch == LLM_ARCH_LLAMA ||
         ud->model->arch == LLM_ARCH_QWEN2 ||

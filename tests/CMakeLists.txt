@@ -304,6 +304,10 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build(test-export-graph-ops.cpp)
 target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build(test-hybrid.cpp)
+target_include_directories(test-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-hybrid)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)

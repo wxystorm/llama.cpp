@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-hybrid.h"
 #include "ggml-rpc.h"
 
 #include <algorithm>
@@ -870,6 +871,32 @@ struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string &
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
     return tensor;
+}
+
+bool llama_model_loader::get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & desc) const {
+    if (layer < 0) {
+        return false;
+    }
+
+    const LLM_TN tn(get_arch());
+    const ggml_tensor * gate = get_tensor_meta(tn(LLM_TENSOR_FFN_GATE, "weight", layer).str().c_str());
+    const ggml_tensor * up   = get_tensor_meta(tn(LLM_TENSOR_FFN_UP,   "weight", layer).str().c_str());
+    const ggml_tensor * down = get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "weight", layer).str().c_str());
+    if (gate == nullptr || up == nullptr || down == nullptr) {
+        return false;
+    }
+    if (gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1] ||
+            down->ne[0] != gate->ne[1] || down->ne[1] != gate->ne[0] ||
+            ggml_n_dims(gate) != 2 || ggml_n_dims(up) != 2 || ggml_n_dims(down) != 2) {
+        return false;
+    }
+
+    desc.n_embd = gate->ne[0];
+    desc.n_ff   = gate->ne[1];
+    desc.gate_type = gate->type;
+    desc.up_type   = up->type;
+    desc.down_type = down->type;
+    return true;
 }
 
 const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const {
