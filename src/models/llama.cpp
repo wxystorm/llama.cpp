@@ -15,9 +15,9 @@ static int llama_ffn_chunk_count() {
 }
 
 static int llama_prefill_ffn_chunk_count() {
-    llama_hybrid_plan plan;
-    if (llama_hybrid_runtime_plan_get(plan)) {
-        return plan.tensor_layers == 0 ? 1 : std::max(1, plan.tensor_chunks_per_ubatch);
+    const int planned = llama_hybrid_runtime_prefill_chunks();
+    if (planned > 0) {
+        return planned;
     }
 
     const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");

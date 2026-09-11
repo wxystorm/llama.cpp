@@ -1219,7 +1219,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.hybrid_auto) {
+        mparams.hybrid_auto       = true;
+        mparams.hybrid_target_ctx = cparams.n_ctx;
+    }
+
+    if (params.fit_params && !params.hybrid_auto) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1558,6 +1563,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+    mparams.hybrid_auto     = params.hybrid_auto;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

@@ -194,6 +194,7 @@ struct llama_hybrid_constraints {
 
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
+class llama_model_loader;
 
 LLAMA_API void llama_hybrid_profile_print(const llama_hybrid_profile & profile);
 LLAMA_API void llama_hybrid_plan_print(const llama_hybrid_plan & plan);
@@ -246,3 +247,8 @@ LLAMA_API bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
 LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
+LLAMA_API int  llama_hybrid_runtime_prefill_chunks();
+
+LLAMA_API bool llama_hybrid_autoplan(llama_model_loader &       ml,
+                                     const llama_model_params & params,
+                                     llama_hybrid_plan &        best_plan);

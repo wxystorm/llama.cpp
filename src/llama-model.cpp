@@ -1650,7 +1650,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    if (!hybrid_layer_modes.empty()) {
+        pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
+    } else {
+        pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2647,6 +2651,8 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+        /*.hybrid_auto                 =*/ false,
+        /*.hybrid_target_ctx           =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

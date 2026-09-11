@@ -4,6 +4,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -172,6 +173,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 if (reg != nullptr && ggml_backend_reg_name(reg) == std::string("RPC")) {
                     has_rpc = true;
                 }
+                if (params.hybrid_auto &&
+                    (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC"))) {
+                    continue;
+                }
                 devs.push_back(dev);
             }
             if (has_rpc && cpu_dev != nullptr) {
@@ -300,6 +305,27 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
             return {-1, nullptr};
+        }
+
+        if (params.hybrid_auto && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            llama_hybrid_plan best;
+            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u\n", params.hybrid_target_ctx);
+
+            if (!llama_hybrid_autoplan(ml, params, best)) {
+                LLAMA_LOG_ERROR("[HYBRID_AUTO] planner failed\n");
+                return {-1, nullptr};
+            }
+
+            llama_hybrid_plan_print(best);
+            if (!llama_hybrid_runtime_plan_set(best)) {
+                LLAMA_LOG_ERROR("[HYBRID_AUTO] failed to publish plan\n");
+                return {-1, nullptr};
+            }
+
+            LLAMA_LOG_INFO(
+                "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d K=%d predicted=%.3f ms\n",
+                best.tensor_layers, best.phone_layers, best.pc_layers, best.tensor_pc_ratio, best.gpu_pc_layers,
+                best.tensor_chunks_per_ubatch, best.predicted_ms);
         }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());

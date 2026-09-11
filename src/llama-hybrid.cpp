@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "llama-impl.h"
+#include "llama-model-loader.h"
 
 #include <algorithm>
 #include <array>
@@ -90,6 +91,11 @@ void llama_hybrid_runtime_plan_clear() {
     std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
     g_llama_hybrid_runtime_plan.reset();
     llama_hybrid_runtime_set_dual_return(false);
+}
+
+int llama_hybrid_runtime_prefill_chunks() {
+    std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+    return g_llama_hybrid_runtime_plan.has_value() ? g_llama_hybrid_runtime_plan->tensor_chunks_per_ubatch : 0;
 }
 
 std::vector<int> llama_hybrid_split_chunks(int tokens, int n_chunks) {
@@ -2087,4 +2093,96 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
     }
 
     return true;
+}
+
+bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & params, llama_hybrid_plan & best_plan) {
+    llama_hybrid_runtime_plan_clear();
+
+    ggml_backend_ptr cpu;
+    ggml_backend_ptr phone;
+    ggml_backend_ptr gpu;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev      = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+        const std::string  reg_name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+
+        if (!phone && reg_name == "RPC") {
+            phone.reset(ggml_backend_dev_init(dev, nullptr));
+        } else if (!cpu && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            cpu.reset(ggml_backend_dev_init(dev, nullptr));
+        } else if (!gpu && reg_name == "CUDA" && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu.reset(ggml_backend_dev_init(dev, nullptr));
+        }
+    }
+
+    if (!cpu || !phone) {
+        LLAMA_LOG_ERROR("%s: automatic planning requires CPU and RPC backends\n", __func__);
+        return false;
+    }
+
+    int n_layer = 0;
+    for (int il = 0; il < 1024; ++il) {
+        llama_hybrid_ffn_desc desc;
+        if (!ml.get_hybrid_ffn_desc(il, desc)) {
+            break;
+        }
+        ++n_layer;
+    }
+    if (n_layer <= 0) {
+        LLAMA_LOG_ERROR("%s: model has no supported dense FFN layers\n", __func__);
+        return false;
+    }
+
+    const int              probe_layer = n_layer / 2;
+    llama_hybrid_ffn_desc  ffn_desc;
+    llama_hybrid_attn_desc attn_desc;
+    if (!ml.get_hybrid_ffn_desc(probe_layer, ffn_desc) || !ml.get_hybrid_attn_desc(probe_layer, attn_desc)) {
+        LLAMA_LOG_ERROR("%s: failed to describe probe layer %d\n", __func__, probe_layer);
+        return false;
+    }
+
+    llama_hybrid_profile profile;
+    profile.n_layer                = n_layer;
+    profile.n_embd                 = ffn_desc.n_embd;
+    profile.n_ff                   = ffn_desc.n_ff;
+    profile.probe_tokens           = 16;
+    profile.probe_chunk_min_tokens = 4;
+
+    if (!ml.get_hybrid_weight_bytes(n_layer, profile.model_weight_bytes, profile.non_layer_weight_bytes,
+                                    profile.layer_weight_bytes, profile.layer_attn_forced_bytes,
+                                    profile.layer_ffn_split_bytes, profile.layer_mirrored_bytes) ||
+        !llama_hybrid_profile_memory(profile, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_rpc(profile, cpu.get(), phone.get()) ||
+        !llama_hybrid_profile_ffn(profile, ffn_desc, cpu.get(), phone.get()) ||
+        !llama_hybrid_profile_attention(profile, attn_desc, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_full_layer(profile, attn_desc, ffn_desc, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_phone_blocks(profile, attn_desc, ffn_desc, phone.get())) {
+        LLAMA_LOG_ERROR("%s: profiling failed\n", __func__);
+        return false;
+    }
+
+    llama_hybrid_profile_print(profile);
+
+    llama_hybrid_constraints constraints;
+    constraints.target_ctx      = params.hybrid_target_ctx;
+    constraints.score_kv_tokens = params.hybrid_target_ctx;
+
+    const std::vector<llama_hybrid_plan> feasible = llama_hybrid_enumerate_feasible_plans(profile, constraints);
+    bool                                 found    = false;
+    for (auto plan : feasible) {
+        if (!llama_hybrid_score_plan(profile, constraints, plan)) {
+            continue;
+        }
+        if (!found || plan.predicted_ms < best_plan.predicted_ms ||
+            (plan.predicted_ms == best_plan.predicted_ms && plan.gpu_memory < best_plan.gpu_memory)) {
+            best_plan = plan;
+            found     = true;
+        }
+    }
+
+    if (!found) {
+        LLAMA_LOG_ERROR("%s: no scoreable hybrid plans\n", __func__);
+    }
+    return found;
 }
