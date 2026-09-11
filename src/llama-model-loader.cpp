@@ -879,23 +879,268 @@ bool llama_model_loader::get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & 
     }
 
     const LLM_TN tn(get_arch());
-    const ggml_tensor * gate = get_tensor_meta(tn(LLM_TENSOR_FFN_GATE, "weight", layer).str().c_str());
-    const ggml_tensor * up   = get_tensor_meta(tn(LLM_TENSOR_FFN_UP,   "weight", layer).str().c_str());
-    const ggml_tensor * down = get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "weight", layer).str().c_str());
-    if (gate == nullptr || up == nullptr || down == nullptr) {
+    const ggml_tensor * ffn_norm = get_tensor_meta(tn(LLM_TENSOR_FFN_NORM, "weight", layer).str().c_str());
+    const ggml_tensor * gate     = get_tensor_meta(tn(LLM_TENSOR_FFN_GATE, "weight", layer).str().c_str());
+    const ggml_tensor * up       = get_tensor_meta(tn(LLM_TENSOR_FFN_UP,   "weight", layer).str().c_str());
+    const ggml_tensor * down     = get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "weight", layer).str().c_str());
+    if (ffn_norm == nullptr || gate == nullptr || up == nullptr || down == nullptr) {
         return false;
     }
-    if (gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1] ||
+    if (ggml_n_dims(ffn_norm) != 1 || ggml_n_dims(gate) != 2 || ggml_n_dims(up) != 2 || ggml_n_dims(down) != 2 ||
+            gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1] ||
             down->ne[0] != gate->ne[1] || down->ne[1] != gate->ne[0] ||
-            ggml_n_dims(gate) != 2 || ggml_n_dims(up) != 2 || ggml_n_dims(down) != 2) {
+            ffn_norm->ne[0] != gate->ne[0]) {
         return false;
     }
 
     desc.n_embd = gate->ne[0];
     desc.n_ff   = gate->ne[1];
+    desc.ffn_norm_type = ffn_norm->type;
     desc.gate_type = gate->type;
     desc.up_type   = up->type;
     desc.down_type = down->type;
+    desc.weight_bytes = ggml_nbytes(ffn_norm) + ggml_nbytes(gate) + ggml_nbytes(up) + ggml_nbytes(down);
+    return true;
+}
+bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc & desc) {
+    if (layer < 0) {
+        return false;
+    }
+
+    const LLM_TN tn(get_arch());
+
+    const ggml_tensor * attn_norm = get_tensor_meta(tn(LLM_TENSOR_ATTN_NORM, "weight", layer).str().c_str());
+    const ggml_tensor * wq        = get_tensor_meta(tn(LLM_TENSOR_ATTN_Q,    "weight", layer).str().c_str());
+    const ggml_tensor * wk        = get_tensor_meta(tn(LLM_TENSOR_ATTN_K,    "weight", layer).str().c_str());
+    const ggml_tensor * wv        = get_tensor_meta(tn(LLM_TENSOR_ATTN_V,    "weight", layer).str().c_str());
+    const ggml_tensor * wo        = get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT,  "weight", layer).str().c_str());
+
+    if (attn_norm == nullptr || wq == nullptr || wk == nullptr || wv == nullptr || wo == nullptr) {
+        return false;
+    }
+    if (ggml_n_dims(wq) != 2 || ggml_n_dims(wk) != 2 || ggml_n_dims(wv) != 2 || ggml_n_dims(wo) != 2) {
+        return false;
+    }
+
+    const int64_t n_embd = wq->ne[0];
+    if (wk->ne[0] != n_embd || wv->ne[0] != n_embd || wo->ne[1] != n_embd || attn_norm->ne[0] != n_embd) {
+        return false;
+    }
+
+    uint32_t n_head    = 0;
+    uint32_t n_head_kv = 0;
+    const std::string arch = get_arch_name();
+
+    if (!get_key(arch + ".attention.head_count", n_head, false) || n_head == 0) {
+        return false;
+    }
+    if (!get_key(arch + ".attention.head_count_kv", n_head_kv, false)) {
+        n_head_kv = n_head;
+    }
+    if (n_head_kv == 0) {
+        n_head_kv = n_head;
+    }
+
+    if (wq->ne[1] % n_head != 0 || wk->ne[1] % n_head_kv != 0 || wv->ne[1] % n_head_kv != 0) {
+        return false;
+    }
+
+    const int64_t head_dim_q = wq->ne[1] / n_head;
+    const int64_t head_dim_k = wk->ne[1] / n_head_kv;
+    const int64_t head_dim_v = wv->ne[1] / n_head_kv;
+    if (head_dim_q != head_dim_k || wo->ne[0] != head_dim_v * n_head) {
+        return false;
+    }
+
+    llama_rope_type rope_type = LLAMA_ROPE_TYPE_NONE;
+    switch (get_arch()) {
+        case LLM_ARCH_LLAMA:
+            rope_type = LLAMA_ROPE_TYPE_NORM;
+            break;
+        case LLM_ARCH_QWEN2:
+        case LLM_ARCH_QWEN3:
+            rope_type = LLAMA_ROPE_TYPE_NEOX;
+            break;
+        default:
+            LLAMA_LOG_ERROR("%s: unsupported hybrid attention RoPE arch: %s\n", __func__, get_arch_name().c_str());
+            return false;
+    }
+
+    uint32_t n_ctx_train = 0;
+    if (!get_key(LLM_KV_CONTEXT_LENGTH, n_ctx_train, false) || n_ctx_train == 0) {
+        LLAMA_LOG_ERROR("%s: missing context length\n", __func__);
+        return false;
+    }
+
+    uint32_t n_rot = (uint32_t) head_dim_q;
+    get_key(LLM_KV_ROPE_DIMENSION_COUNT, n_rot, false);
+
+    uint32_t n_ctx_orig = n_ctx_train;
+    get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, n_ctx_orig, false);
+
+    float freq_base = 10000.0f;
+    get_key(LLM_KV_ROPE_FREQ_BASE, freq_base, false);
+
+    float rope_factor = 0.0f;
+    if (!get_key(LLM_KV_ROPE_SCALING_FACTOR, rope_factor, false)) {
+        get_key(LLM_KV_ROPE_SCALE_LINEAR, rope_factor, false);
+    }
+    const float freq_scale = rope_factor == 0.0f ? 1.0f : 1.0f / rope_factor;
+
+    if (n_rot == 0 || n_rot > head_dim_q || n_ctx_orig == 0 || freq_base <= 0.0f || freq_scale <= 0.0f) {
+        return false;
+    }
+
+    float rms_eps = 1e-5f;
+    if (!get_key(arch + ".attention.layer_norm_rms_epsilon", rms_eps, false)) {
+        get_key(arch + ".attention.layer_norm_epsilon", rms_eps, false);
+    }
+
+    const ggml_tensor * q_norm =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", layer).str().c_str());
+    const ggml_tensor * k_norm =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_K_NORM, "weight", layer).str().c_str());
+    if ((q_norm != nullptr && q_norm->ne[0] != head_dim_q) ||
+        (k_norm != nullptr && k_norm->ne[0] != head_dim_k)) {
+        return false;
+    }
+
+    desc.n_embd   = n_embd;
+    desc.q_dim    = wq->ne[1];
+    desc.k_dim    = wk->ne[1];
+    desc.v_dim    = wv->ne[1];
+    desc.o_in_dim = wo->ne[0];
+
+    desc.n_head    = (int) n_head;
+    desc.n_head_kv = (int) n_head_kv;
+    desc.rms_eps   = rms_eps;
+
+    desc.rope_type = rope_type;
+    desc.n_rot      = (int32_t) n_rot;
+    desc.n_ctx_orig = (int32_t) n_ctx_orig;
+    desc.freq_base  = freq_base;
+    desc.freq_scale = freq_scale;
+
+    desc.attn_norm_type = attn_norm->type;
+    desc.q_type          = wq->type;
+    desc.k_type          = wk->type;
+    desc.v_type          = wv->type;
+    desc.o_type          = wo->type;
+
+    desc.has_q_norm = q_norm != nullptr;
+    desc.has_k_norm = k_norm != nullptr;
+    if (q_norm != nullptr) {
+        desc.q_norm_type = q_norm->type;
+    }
+    if (k_norm != nullptr) {
+        desc.k_norm_type = k_norm->type;
+    }
+
+    desc.weight_bytes = ggml_nbytes(attn_norm) + ggml_nbytes(wq) + ggml_nbytes(wk) + ggml_nbytes(wv) +
+                        ggml_nbytes(wo);
+    if (q_norm != nullptr) {
+        desc.weight_bytes += ggml_nbytes(q_norm);
+    }
+    if (k_norm != nullptr) {
+        desc.weight_bytes += ggml_nbytes(k_norm);
+    }
+
+    return true;
+}
+
+bool llama_model_loader::get_hybrid_weight_bytes(int                   n_layer,
+                                                 size_t &              total_bytes,
+                                                 size_t &              non_layer_bytes,
+                                                 std::vector<size_t> & layer_bytes,
+                                                 std::vector<size_t> & layer_attn_forced_bytes,
+                                                 std::vector<size_t> & layer_ffn_split_bytes,
+                                                 std::vector<size_t> & layer_mirrored_bytes) const {
+    if (n_layer <= 0) {
+        return false;
+    }
+
+    total_bytes     = 0;
+    non_layer_bytes = 0;
+    layer_bytes.assign((size_t) n_layer, 0);
+    layer_attn_forced_bytes.assign((size_t) n_layer, 0);
+    layer_ffn_split_bytes.assign((size_t) n_layer, 0);
+    layer_mirrored_bytes.assign((size_t) n_layer, 0);
+
+    static const std::regex pattern_q_weight("blk\\.\\d*\\.attn_q.weight");
+    static const std::regex pattern_kv_weight("blk\\.\\d*\\.attn_(k|v).weight");
+    static const std::regex pattern_qkv_weight("blk\\.\\d*\\.attn_qkv.weight");
+    static const std::regex pattern_q_bias("blk\\.\\d*\\.attn_q\\.bias");
+    static const std::regex pattern_kv_bias("blk\\.\\d*\\.attn_(k|v)\\.bias");
+    static const std::regex pattern_qkv_bias("blk\\.\\d*\\.attn_qkv.bias");
+    static const std::regex pattern_attn_sinks("blk\\.\\d*\\.attn_sinks.weight");
+    static const std::regex pattern_attn_out_weight("blk\\.\\d*\\.attn_output.weight");
+    static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+
+    static const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
+    static const std::regex pattern_ffn_up_gate_bias("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
+    static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
+    static const std::regex pattern_ffn_down_weight("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+
+    for (const auto & entry : weights_map) {
+        const std::string & name   = entry.first;
+        const ggml_tensor * tensor = entry.second.tensor;
+        if (tensor == nullptr) {
+            continue;
+        }
+
+        const size_t bytes = ggml_nbytes(tensor);
+        total_bytes += bytes;
+
+        int layer    = -1;
+        int consumed = 0;
+        const bool is_layer = name.rfind("blk.", 0) == 0 &&
+                              sscanf(name.c_str(), "blk.%d.%n", &layer, &consumed) == 1 && consumed > 0 &&
+                              layer >= 0 && layer < n_layer;
+        if (!is_layer) {
+            non_layer_bytes += bytes;
+            continue;
+        }
+
+        const size_t il = (size_t) layer;
+        layer_bytes[il] += bytes;
+
+        const bool is_attention_forced =
+            std::regex_match(name, pattern_q_weight) || std::regex_match(name, pattern_kv_weight) ||
+            std::regex_match(name, pattern_qkv_weight) || std::regex_match(name, pattern_q_bias) ||
+            std::regex_match(name, pattern_kv_bias) || std::regex_match(name, pattern_qkv_bias) ||
+            std::regex_match(name, pattern_attn_sinks) || std::regex_match(name, pattern_attn_out_weight) ||
+            std::regex_match(name, pattern_attn_gate_weight);
+        const bool is_ffn_split =
+            std::regex_match(name, pattern_ffn_up_gate_weight) || std::regex_match(name, pattern_ffn_up_gate_bias) ||
+            std::regex_match(name, pattern_ffn_gate_up_weight) || std::regex_match(name, pattern_ffn_down_weight) ||
+            std::regex_match(name, pattern_ffn_down_exps_bias);
+
+        if (is_attention_forced) {
+            layer_attn_forced_bytes[il] += bytes;
+        } else if (is_ffn_split) {
+            layer_ffn_split_bytes[il] += bytes;
+        } else {
+            layer_mirrored_bytes[il] += bytes;
+        }
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        const size_t i = (size_t) il;
+        if (layer_bytes[i] == 0) {
+            LLAMA_LOG_ERROR("%s: no weight bytes found for layer %d\n", __func__, il);
+            return false;
+        }
+
+        const size_t classified =
+            layer_attn_forced_bytes[i] + layer_ffn_split_bytes[i] + layer_mirrored_bytes[i];
+        if (classified != layer_bytes[i]) {
+            LLAMA_LOG_ERROR("%s: layer %d accounting mismatch: total=%zu classified=%zu\n", __func__, il,
+                            layer_bytes[i], classified);
+            return false;
+        }
+    }
+
     return true;
 }
 

@@ -1398,11 +1398,31 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         arch == LLM_ARCH_QWEN3;
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
-        const double pc_pct = llama_hybrid_pc_pct();
-        const int pc_layers = std::clamp(
+        llama_hybrid_plan runtime_plan;
+        const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
+
+        if (has_runtime_plan &&
+            runtime_plan.tensor_layers + runtime_plan.phone_layers + runtime_plan.pc_layers != n_layer) {
+            throw std::runtime_error("hybrid runtime plan layer count does not match the model");
+        }
+
+        const double pc_pct = has_runtime_plan ?
+            100.0 * runtime_plan.pc_layers / n_layer : llama_hybrid_pc_pct();
+        const int pc_layers = has_runtime_plan ? runtime_plan.pc_layers : std::clamp(
             (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
-        const int phone_layers = std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
-        const std::string pc_layout = phone_layers > 0 ? "tail" : llama_hybrid_pc_layout();
+        const int phone_layers = has_runtime_plan ? runtime_plan.phone_layers :
+            std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
+        const int gpu_pc_layers = has_runtime_plan ? runtime_plan.gpu_pc_layers : llama_hybrid_gpu_pc_layers();
+        const std::string pc_layout = has_runtime_plan ? "tail" :
+            (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
+
+        if (has_runtime_plan) {
+            pimpl->tensor_split_owned.assign(llama_max_devices(), 0.0f);
+            pimpl->tensor_split_owned[0] = runtime_plan.tensor_pc_ratio;
+            pimpl->tensor_split_owned[1] = 1.0f - runtime_plan.tensor_pc_ratio;
+            this->params.tensor_split = pimpl->tensor_split_owned.data();
+        }
+
         hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
@@ -1414,7 +1434,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         const int n_gpu_pc = std::min<int>(
-            llama_hybrid_gpu_pc_layers(), pc_layer_ids.size());
+            gpu_pc_layers, pc_layer_ids.size());
         for (int k = 0; k < n_gpu_pc; ++k) {
             pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
         }
@@ -1444,8 +1464,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 phone_layer_list += (phone_layer_list.empty() ? "" : ",") + std::to_string(il);
             }
         }
-        LLAMA_LOG_INFO("[HYBRID_SPLIT] pc_pct=%g layout=%s n_layer=%d tensor_split=%d phone_only=%d pc_only=%d phone_layers=[%s] pc_layers=[%s]\n",
-            pc_pct, pc_layout.c_str(), n_layer, n_layer - phone_layers - pc_layers, phone_layers, pc_layers,
+
+        float tensor_pc_ratio = has_runtime_plan ? runtime_plan.tensor_pc_ratio : 0.0f;
+        if (!has_runtime_plan && params.tensor_split != nullptr) {
+            const float split_sum = params.tensor_split[0] + params.tensor_split[1];
+            if (split_sum > 0.0f) {
+                tensor_pc_ratio = params.tensor_split[0] / split_sum;
+            }
+        }
+        LLAMA_LOG_INFO("[HYBRID_SPLIT] source=%s pc_pct=%g layout=%s n_layer=%d tensor_split=%d phone_only=%d "
+                       "pc_only=%d gpu_pc=%d R=%.3f phone_layers=[%s] pc_layers=[%s]\n",
+            has_runtime_plan ? "planner" : "environment", pc_pct, pc_layout.c_str(), n_layer,
+            n_layer - phone_layers - pc_layers, phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
             phone_layer_list.c_str(), pc_layer_list.c_str());
     }
 
