@@ -24,19 +24,16 @@
 #include <utility>
 #include <vector>
 
-static constexpr int LLAMA_HYBRID_RPC_WARMUP_RUNS      = 2;
-static constexpr int LLAMA_HYBRID_RPC_MEASURE_RUNS     = 5;
-static constexpr int LLAMA_HYBRID_COMPUTE_WARMUP_RUNS  = 1;
-static constexpr int LLAMA_HYBRID_COMPUTE_MEASURE_RUNS = 3;
+static constexpr int LLAMA_HYBRID_RPC_WARMUP_RUNS  = 2;
+static constexpr int LLAMA_HYBRID_RPC_MEASURE_RUNS = 5;
 
 static constexpr int                  LLAMA_HYBRID_PROFILE_TOKENS          = 16;
 static constexpr int                  LLAMA_HYBRID_REFERENCE_TOKENS        = 128;
-static constexpr int                  LLAMA_HYBRID_PROFILE_BLOCK_LAYERS    = 5;
-static constexpr std::array<int, 7>   LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20, 24, 32 };
-static constexpr std::array<int, 3>   LLAMA_HYBRID_LAYER_TOKEN_CANDIDATES = { 8, 16, 32 };
-static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
-static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
-static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
+static constexpr std::array<int, 5>   LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20 };
+static constexpr std::array<float, 4> LLAMA_HYBRID_FFN_RATIOS             = { 0.25f, 0.50f, 0.75f, 1.00f };
+static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 16, 256, 1024, 4096 };
+static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, 2, 4, 8, 16 };
+static constexpr std::array<float, 3> LLAMA_HYBRID_PLAN_RATIOS            = { 0.25f, 0.50f, 0.75f };
 
 static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION    = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION = 0.90;
@@ -134,9 +131,8 @@ std::vector<int> llama_hybrid_split_by_chunk_size(int tokens, int chunk_tokens) 
 static std::vector<std::vector<int>> llama_hybrid_probe_chunk_layouts(const llama_hybrid_profile & profile) {
     std::vector<std::vector<int>> result;
 
-    const int reference_tokens = profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS;
     for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
-        std::vector<int> chunks = llama_hybrid_split_by_chunk_size(reference_tokens, chunk_tokens);
+        std::vector<int> chunks = llama_hybrid_split_by_chunk_size(LLAMA_HYBRID_REFERENCE_TOKENS, chunk_tokens);
         if (chunks.empty() || *std::min_element(chunks.begin(), chunks.end()) < profile.probe_chunk_min_tokens) {
             continue;
         }
@@ -146,29 +142,12 @@ static std::vector<std::vector<int>> llama_hybrid_probe_chunk_layouts(const llam
 }
 
 std::vector<int> llama_hybrid_probe_chunk_tokens(const llama_hybrid_profile & profile) {
-    const auto layouts = llama_hybrid_probe_chunk_layouts(profile);
-
     std::vector<int> result;
-    for (const auto & chunks : layouts) {
-        result.insert(result.end(), chunks.begin(), chunks.end());
+    for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
+        if (chunk_tokens >= profile.probe_chunk_min_tokens) {
+            result.push_back(chunk_tokens);
+        }
     }
-
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    return result;
-}
-
-static std::vector<int> llama_hybrid_probe_transfer_tokens(const llama_hybrid_profile & profile) {
-    std::vector<int> result = llama_hybrid_probe_chunk_tokens(profile);
-    const int reference_tokens = profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS;
-    if (profile.probe_tokens > 0) {
-        result.push_back(profile.probe_tokens);
-    }
-    if (reference_tokens > 0) {
-        result.push_back(reference_tokens);
-    }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
 
@@ -184,9 +163,7 @@ static std::vector<std::pair<int, int>> llama_hybrid_probe_dual_chunks(const lla
     return { pairs.begin(), pairs.end() };
 }
 
-template<size_t N>
-static double llama_hybrid_rpc_median(std::array<double, N> samples) {
-    static_assert(N > 0, "median needs at least one sample");
+static double llama_hybrid_rpc_median(std::array<double, LLAMA_HYBRID_RPC_MEASURE_RUNS> samples) {
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
 }
@@ -243,10 +220,10 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
     const auto rpc_fence = reinterpret_cast<ggml_backend_rpc_fence_t>(
         llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_FENCE_PROC));
 
-    std::array<double, LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> wall_samples;
-    std::array<double, LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> compute_samples;
+    std::array<double, LLAMA_HYBRID_RPC_MEASURE_RUNS> wall_samples;
+    std::array<double, LLAMA_HYBRID_RPC_MEASURE_RUNS> compute_samples;
 
-    for (int run = 0; run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS + LLAMA_HYBRID_COMPUTE_MEASURE_RUNS; ++run) {
+    for (int run = 0; run < LLAMA_HYBRID_RPC_WARMUP_RUNS + LLAMA_HYBRID_RPC_MEASURE_RUNS; ++run) {
         double fence_before_ms = 0.0;
         double fence_after_ms  = 0.0;
 
@@ -277,8 +254,8 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
             fence_after_ms       = (end_us - begin_us) / 1000.0;
         }
 
-        if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
-            const int    sample     = run - LLAMA_HYBRID_COMPUTE_WARMUP_RUNS;
+        if (run >= LLAMA_HYBRID_RPC_WARMUP_RUNS) {
+            const int    sample     = run - LLAMA_HYBRID_RPC_WARMUP_RUNS;
             const double wall_ms    = (end_us - begin_us) / 1000.0;
             double       compute_ms = wall_ms;
 
@@ -361,22 +338,18 @@ static void llama_hybrid_transfer_print(const char * label, const std::vector<ll
 }
 
 void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
-    LLAMA_LOG_INFO(
-        "[HYBRID_PROFILE] probe_tokens=%d reference_tokens=%d probe_chunk_min_tokens=%d block_layers=%d\n",
-        profile.probe_tokens, profile.reference_tokens, profile.probe_chunk_min_tokens, profile.profile_block_layers);
-    LLAMA_LOG_INFO("[HYBRID_PROFILE] n_layer=%d n_embd=%d n_ff=%d ffn_granularity=%" PRId64 "\n",
-                   profile.n_layer, profile.n_embd, profile.n_ff, profile.ffn_shard_granularity);
+    LLAMA_LOG_INFO("[HYBRID_PROFILE] probe_tokens=%d probe_chunk_min_tokens=%d\n", profile.probe_tokens,
+                   profile.probe_chunk_min_tokens);
+    LLAMA_LOG_INFO("[HYBRID_PROFILE] n_layer=%d n_embd=%d n_ff=%d\n", profile.n_layer, profile.n_embd, profile.n_ff);
     for (const auto & point : profile.cpu_ffn) {
         LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_COMPUTE] backend=CPU kind=ffn tokens=%d local_ratio=%.5f local_ff=%" PRId64
-            " ms=%.3f runtime_bytes=%zu\n",
-            point.tokens, point.local_ratio, point.local_ff, point.ms, point.runtime_bytes);
+            "[HYBRID_PROFILE_COMPUTE] backend=CPU kind=ffn tokens=%d local_ratio=%.2f ms=%.3f runtime_bytes=%zu\n",
+            point.tokens, point.local_ratio, point.ms, point.runtime_bytes);
     }
     for (const auto & point : profile.phone_ffn) {
         LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_COMPUTE] backend=PHONE kind=ffn tokens=%d local_ratio=%.5f local_ff=%" PRId64
-            " ms=%.3f runtime_bytes=%zu\n",
-            point.tokens, point.local_ratio, point.local_ff, point.ms, point.runtime_bytes);
+            "[HYBRID_PROFILE_COMPUTE] backend=PHONE kind=ffn tokens=%d local_ratio=%.2f ms=%.3f runtime_bytes=%zu\n",
+            point.tokens, point.local_ratio, point.ms, point.runtime_bytes);
     }
     for (const auto & point : profile.cpu_attn) {
         LLAMA_LOG_INFO(
@@ -396,21 +369,6 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
             "runtime_bytes=%zu\n",
             point.tokens, point.kv_tokens, point.ms, point.runtime_bytes);
     }
-    const auto print_layer_blocks = [](const char * backend,
-                                      const std::vector<llama_hybrid_layer_compute_point> & points) {
-        for (const auto & point : points) {
-            const double wall_per_layer = point.layers > 0 ? point.wall_ms / point.layers : 0.0;
-            const double compute_per_layer = point.layers > 0 ? point.compute_est_ms / point.layers : 0.0;
-            LLAMA_LOG_INFO(
-                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block tokens=%d layers=%d "
-                "wall_ms=%.3f compute_est_ms=%.3f wall_per_layer_ms=%.3f compute_per_layer_ms=%.3f\n",
-                backend, point.tokens, point.layers, point.wall_ms, point.compute_est_ms,
-                wall_per_layer, compute_per_layer);
-        }
-    };
-    print_layer_blocks("CPU", profile.cpu_layer_blocks);
-    print_layer_blocks("PHONE", profile.phone_layer_blocks);
-    print_layer_blocks("GPU", profile.gpu_layer_blocks);
     for (const auto & point : profile.phone_blocks) {
         const double per_layer_est_ms = point.layers > 0 ? point.compute_est_ms / point.layers : 0.0;
         LLAMA_LOG_INFO(
@@ -424,7 +382,6 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
                    profile.phone_attn_ms, profile.phone_full_layer_ms, profile.phone_full_layer_compute_est_ms);
     LLAMA_LOG_INFO("[HYBRID_PROFILE] gpu full_layer_ms=%.3f\n", profile.gpu_full_layer_ms);
 
-    llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
     llama_hybrid_transfer_print("phone_to_pc", profile.phone_to_pc);
@@ -500,12 +457,10 @@ static size_t llama_hybrid_ratio_bytes(size_t bytes, float ratio) {
     return std::min(bytes, (size_t) std::ceil(value));
 }
 
-static bool llama_hybrid_ffn_runtime_bytes_at_ratio(
-    const std::vector<llama_hybrid_ffn_compute_point> & points,
-    int                                                   tokens,
-    float                                                 ratio,
-    size_t &                                              result) {
-    const llama_hybrid_ffn_compute_point * exact = nullptr;
+static bool llama_hybrid_ffn_runtime_bytes(const std::vector<llama_hybrid_ffn_compute_point> & points,
+                                           int                                                 tokens,
+                                           float                                               ratio,
+                                           size_t &                                            result) {
     const llama_hybrid_ffn_compute_point * lower = nullptr;
     const llama_hybrid_ffn_compute_point * upper = nullptr;
 
@@ -514,8 +469,8 @@ static bool llama_hybrid_ffn_runtime_bytes_at_ratio(
             continue;
         }
         if (point.tokens == tokens) {
-            exact = &point;
-            break;
+            result = point.runtime_bytes;
+            return true;
         }
         if (point.tokens < tokens && (lower == nullptr || point.tokens > lower->tokens)) {
             lower = &point;
@@ -525,10 +480,6 @@ static bool llama_hybrid_ffn_runtime_bytes_at_ratio(
         }
     }
 
-    if (exact != nullptr) {
-        result = exact->runtime_bytes;
-        return true;
-    }
     if (lower == nullptr && upper == nullptr) {
         return false;
     }
@@ -537,7 +488,7 @@ static bool llama_hybrid_ffn_runtime_bytes_at_ratio(
         return true;
     }
     if (upper == nullptr) {
-        const long double scaled = (long double) lower->runtime_bytes * tokens / std::max(1, lower->tokens);
+        const long double scaled = (long double) lower->runtime_bytes * tokens / lower->tokens;
         if (scaled > std::numeric_limits<size_t>::max()) {
             return false;
         }
@@ -549,123 +500,7 @@ static bool llama_hybrid_ffn_runtime_bytes_at_ratio(
     const long double interpolated =
         (long double) lower->runtime_bytes +
         t * ((long double) upper->runtime_bytes - (long double) lower->runtime_bytes);
-    result = (size_t) std::ceil(std::max<long double>(0.0L, interpolated));
-    return true;
-}
-
-static bool llama_hybrid_ffn_runtime_bytes(const std::vector<llama_hybrid_ffn_compute_point> & points,
-                                           int                                                 tokens,
-                                           float                                               ratio,
-                                           size_t &                                            result) {
-    if (points.empty() || tokens <= 0 || ratio <= 0.0f || ratio > 1.0f) {
-        return false;
-    }
-
-    std::vector<float> ratios;
-    ratios.reserve(points.size());
-    for (const auto & point : points) {
-        if (point.local_ratio > 0.0f && point.local_ratio <= 1.0f) {
-            ratios.push_back(point.local_ratio);
-        }
-    }
-    std::sort(ratios.begin(), ratios.end());
-    ratios.erase(std::unique(ratios.begin(), ratios.end(), [](float a, float b) {
-        return std::fabs(a - b) < 1e-4f;
-    }), ratios.end());
-    if (ratios.empty()) {
-        return false;
-    }
-
-    float lower_ratio = -1.0f;
-    float upper_ratio = -1.0f;
-    for (const float r : ratios) {
-        if (std::fabs(r - ratio) < 1e-4f) {
-            return llama_hybrid_ffn_runtime_bytes_at_ratio(points, tokens, r, result);
-        }
-        if (r < ratio) {
-            lower_ratio = r;
-        } else if (r > ratio && upper_ratio < 0.0f) {
-            upper_ratio = r;
-        }
-    }
-
-    if (lower_ratio < 0.0f) {
-        return llama_hybrid_ffn_runtime_bytes_at_ratio(points, tokens, ratios.front(), result);
-    }
-    if (upper_ratio < 0.0f) {
-        return llama_hybrid_ffn_runtime_bytes_at_ratio(points, tokens, ratios.back(), result);
-    }
-
-    size_t lower_value = 0;
-    size_t upper_value = 0;
-    if (!llama_hybrid_ffn_runtime_bytes_at_ratio(points, tokens, lower_ratio, lower_value) ||
-        !llama_hybrid_ffn_runtime_bytes_at_ratio(points, tokens, upper_ratio, upper_value)) {
-        return false;
-    }
-
-    const long double t = (long double) (ratio - lower_ratio) / (upper_ratio - lower_ratio);
-    const long double value = (long double) lower_value + t * ((long double) upper_value - lower_value);
-    if (value > std::numeric_limits<size_t>::max()) {
-        return false;
-    }
-    result = (size_t) std::ceil(std::max<long double>(0.0L, value));
-    return true;
-}
-
-static bool llama_hybrid_attn_runtime_bytes_at_query(
-    const std::vector<llama_hybrid_attn_compute_point> & points,
-    int                                                   query_tokens,
-    int                                                   kv_tokens,
-    size_t &                                              result) {
-    const llama_hybrid_attn_compute_point * exact = nullptr;
-    const llama_hybrid_attn_compute_point * lower = nullptr;
-    const llama_hybrid_attn_compute_point * upper = nullptr;
-    for (const auto & point : points) {
-        if (point.tokens != query_tokens) {
-            continue;
-        }
-        if (point.kv_tokens == kv_tokens) {
-            exact = &point;
-            break;
-        }
-        if (point.kv_tokens < kv_tokens && (lower == nullptr || point.kv_tokens > lower->kv_tokens)) {
-            lower = &point;
-        }
-        if (point.kv_tokens > kv_tokens && (upper == nullptr || point.kv_tokens < upper->kv_tokens)) {
-            upper = &point;
-        }
-    }
-
-    if (exact != nullptr) {
-        result = exact->runtime_bytes;
-        return true;
-    }
-    if (lower == nullptr && upper == nullptr) {
-        return false;
-    }
-    if (lower == nullptr) {
-        result = upper->runtime_bytes;
-        return true;
-    }
-    if (upper == nullptr) {
-        // Conservatively scale the last measured runtime with KV length.
-        const long double value = (long double) lower->runtime_bytes * kv_tokens /
-                                  std::max(1, lower->kv_tokens);
-        if (value > std::numeric_limits<size_t>::max()) {
-            return false;
-        }
-        result = (size_t) std::ceil(value);
-        return true;
-    }
-
-    const long double t = (long double) (kv_tokens - lower->kv_tokens) /
-                          (upper->kv_tokens - lower->kv_tokens);
-    const long double value = (long double) lower->runtime_bytes +
-                              t * ((long double) upper->runtime_bytes - lower->runtime_bytes);
-    if (value > std::numeric_limits<size_t>::max()) {
-        return false;
-    }
-    result = (size_t) std::ceil(std::max<long double>(0.0L, value));
+    result = (size_t) std::ceil(interpolated);
     return true;
 }
 
@@ -677,61 +512,56 @@ static bool llama_hybrid_attn_runtime_bytes(const std::vector<llama_hybrid_attn_
         return false;
     }
 
-    std::vector<int> queries;
+    const llama_hybrid_attn_compute_point * lower = nullptr;
+    const llama_hybrid_attn_compute_point * upper = nullptr;
     for (const auto & point : points) {
-        if (point.tokens > 0) {
-            queries.push_back(point.tokens);
+        if (point.tokens <= 0 || point.kv_tokens <= 0) {
+            continue;
         }
-    }
-    std::sort(queries.begin(), queries.end());
-    queries.erase(std::unique(queries.begin(), queries.end()), queries.end());
-    if (queries.empty()) {
-        return false;
-    }
-
-    int lower_query = -1;
-    int upper_query = -1;
-    for (const int q : queries) {
-        if (q == query_tokens) {
-            return llama_hybrid_attn_runtime_bytes_at_query(points, q, std::max(kv_tokens, q), result);
+        if (point.kv_tokens == kv_tokens) {
+            const long double scale = std::max<long double>(1.0L, (long double) query_tokens / point.tokens);
+            const long double value = (long double) point.runtime_bytes * scale;
+            if (value > std::numeric_limits<size_t>::max()) {
+                return false;
+            }
+            result = (size_t) std::ceil(value);
+            return true;
         }
-        if (q < query_tokens) {
-            lower_query = q;
-        } else if (q > query_tokens && upper_query < 0) {
-            upper_query = q;
+        if (point.kv_tokens < kv_tokens && (lower == nullptr || point.kv_tokens > lower->kv_tokens)) {
+            lower = &point;
+        }
+        if (point.kv_tokens > kv_tokens && (upper == nullptr || point.kv_tokens < upper->kv_tokens)) {
+            upper = &point;
         }
     }
 
-    if (lower_query < 0) {
-        return llama_hybrid_attn_runtime_bytes_at_query(points, queries.front(),
-                                                        std::max(kv_tokens, queries.front()), result);
-    }
-    if (upper_query < 0) {
-        size_t base = 0;
-        if (!llama_hybrid_attn_runtime_bytes_at_query(points, lower_query,
-                                                       std::max(kv_tokens, lower_query), base)) {
-            return false;
-        }
-        const long double scaled = (long double) base * query_tokens / lower_query;
-        if (scaled > std::numeric_limits<size_t>::max()) {
-            return false;
-        }
-        result = (size_t) std::ceil(scaled);
-        return true;
+    long double base_runtime = 0.0L;
+    int         probe_tokens = points.front().tokens;
+    if (lower != nullptr && upper != nullptr) {
+        const long double t =
+            (long double) (kv_tokens - lower->kv_tokens) / (upper->kv_tokens - lower->kv_tokens);
+        base_runtime = (long double) lower->runtime_bytes +
+                       t * ((long double) upper->runtime_bytes - (long double) lower->runtime_bytes);
+        probe_tokens = lower->tokens;
+    } else if (lower != nullptr) {
+        base_runtime = (long double) lower->runtime_bytes * kv_tokens / lower->kv_tokens;
+        probe_tokens = lower->tokens;
+    } else if (upper != nullptr) {
+        base_runtime = upper->runtime_bytes;
+        probe_tokens = upper->tokens;
+    } else {
+        return false;
     }
 
-    size_t lower_value = 0;
-    size_t upper_value = 0;
-    if (!llama_hybrid_attn_runtime_bytes_at_query(points, lower_query, std::max(kv_tokens, lower_query), lower_value) ||
-        !llama_hybrid_attn_runtime_bytes_at_query(points, upper_query, std::max(kv_tokens, upper_query), upper_value)) {
+    if (probe_tokens <= 0) {
         return false;
     }
-    const long double t = (long double) (query_tokens - lower_query) / (upper_query - lower_query);
-    const long double value = (long double) lower_value + t * ((long double) upper_value - lower_value);
-    if (value > std::numeric_limits<size_t>::max()) {
+    const long double token_scale = std::max<long double>(1.0L, (long double) query_tokens / probe_tokens);
+    const long double value       = base_runtime * token_scale;
+    if (value < 0.0L || value > std::numeric_limits<size_t>::max()) {
         return false;
     }
-    result = (size_t) std::ceil(std::max<long double>(0.0L, value));
+    result = (size_t) std::ceil(value);
     return true;
 }
 
@@ -892,21 +722,19 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
     return true;
 }
 
-static bool llama_hybrid_attn_cost_at_query(const std::vector<llama_hybrid_attn_compute_point> & points,
-                                            int                                                  query_tokens,
-                                            int                                                  kv_tokens,
-                                            double &                                             result_ms) {
-    const llama_hybrid_attn_compute_point * exact = nullptr;
+static bool llama_hybrid_attn_cost(const std::vector<llama_hybrid_attn_compute_point> & points,
+                                   int                                                  kv_tokens,
+                                   double &                                             result_ms) {
+    if (points.empty()) {
+        return false;
+    }
+
     const llama_hybrid_attn_compute_point * lower = nullptr;
     const llama_hybrid_attn_compute_point * upper = nullptr;
-
     for (const auto & point : points) {
-        if (point.tokens != query_tokens) {
-            continue;
-        }
         if (point.kv_tokens == kv_tokens) {
-            exact = &point;
-            break;
+            result_ms = point.ms;
+            return true;
         }
         if (point.kv_tokens < kv_tokens && (lower == nullptr || point.kv_tokens > lower->kv_tokens)) {
             lower = &point;
@@ -916,147 +744,16 @@ static bool llama_hybrid_attn_cost_at_query(const std::vector<llama_hybrid_attn_
         }
     }
 
-    if (exact != nullptr) {
-        result_ms = exact->ms;
-        return true;
-    }
-    if (lower == nullptr && upper == nullptr) {
-        return false;
-    }
     if (lower == nullptr) {
         result_ms = upper->ms;
         return true;
     }
     if (upper == nullptr) {
-        const llama_hybrid_attn_compute_point * prev = nullptr;
-        for (const auto & point : points) {
-            if (point.tokens == query_tokens && point.kv_tokens < lower->kv_tokens &&
-                (prev == nullptr || point.kv_tokens > prev->kv_tokens)) {
-                prev = &point;
-            }
-        }
-        if (prev == nullptr || lower->kv_tokens == prev->kv_tokens) {
-            result_ms = lower->ms;
-            return true;
-        }
-        const double slope = std::max(0.0, (lower->ms - prev->ms) /
-                                               (double) (lower->kv_tokens - prev->kv_tokens));
-        result_ms = lower->ms + slope * (kv_tokens - lower->kv_tokens);
+        result_ms = lower->ms;
         return true;
     }
 
-    const double t = (double) (kv_tokens - lower->kv_tokens) / (upper->kv_tokens - lower->kv_tokens);
-    result_ms      = lower->ms + t * (upper->ms - lower->ms);
-    return true;
-}
-
-static bool llama_hybrid_attn_cost(const std::vector<llama_hybrid_attn_compute_point> & points,
-                                   int                                                  query_tokens,
-                                   int                                                  kv_tokens,
-                                   double &                                             result_ms) {
-    if (points.empty() || query_tokens <= 0 || kv_tokens <= 0) {
-        return false;
-    }
-
-    std::vector<int> queries;
-    queries.reserve(points.size());
-    for (const auto & point : points) {
-        if (point.tokens > 0) {
-            queries.push_back(point.tokens);
-        }
-    }
-    std::sort(queries.begin(), queries.end());
-    queries.erase(std::unique(queries.begin(), queries.end()), queries.end());
-    if (queries.empty()) {
-        return false;
-    }
-
-    int lower_query = -1;
-    int upper_query = -1;
-    for (const int q : queries) {
-        if (q == query_tokens) {
-            return llama_hybrid_attn_cost_at_query(points, q, std::max(kv_tokens, q), result_ms);
-        }
-        if (q < query_tokens) {
-            lower_query = q;
-        } else if (q > query_tokens && upper_query < 0) {
-            upper_query = q;
-        }
-    }
-
-    if (lower_query < 0) {
-        return llama_hybrid_attn_cost_at_query(points, queries.front(), std::max(kv_tokens, queries.front()), result_ms);
-    }
-    if (upper_query < 0) {
-        // Extrapolate query-token cost from the last two measured query sizes. This is safer
-        // than assuming perfect proportionality while still allowing a larger reference chunk.
-        if (queries.size() < 2) {
-            return llama_hybrid_attn_cost_at_query(points, lower_query, std::max(kv_tokens, lower_query), result_ms);
-        }
-        const int prev_query = queries[queries.size() - 2];
-        double prev_ms = 0.0;
-        double lower_ms = 0.0;
-        if (!llama_hybrid_attn_cost_at_query(points, prev_query, std::max(kv_tokens, prev_query), prev_ms) ||
-            !llama_hybrid_attn_cost_at_query(points, lower_query, std::max(kv_tokens, lower_query), lower_ms)) {
-            return false;
-        }
-        const double slope = std::max(0.0, (lower_ms - prev_ms) / (double) (lower_query - prev_query));
-        result_ms = lower_ms + slope * (query_tokens - lower_query);
-        return true;
-    }
-
-    double lower_ms = 0.0;
-    double upper_ms = 0.0;
-    if (!llama_hybrid_attn_cost_at_query(points, lower_query, std::max(kv_tokens, lower_query), lower_ms) ||
-        !llama_hybrid_attn_cost_at_query(points, upper_query, std::max(kv_tokens, upper_query), upper_ms)) {
-        return false;
-    }
-    const double t = (double) (query_tokens - lower_query) / (upper_query - lower_query);
-    result_ms      = lower_ms + t * (upper_ms - lower_ms);
-    return true;
-}
-
-static bool llama_hybrid_ffn_cost_at_ratio(const std::vector<llama_hybrid_ffn_compute_point> & points,
-                                           int                                                 tokens,
-                                           float                                               ratio,
-                                           double &                                            result_ms) {
-    const llama_hybrid_ffn_compute_point * exact = nullptr;
-    const llama_hybrid_ffn_compute_point * lower = nullptr;
-    const llama_hybrid_ffn_compute_point * upper = nullptr;
-
-    for (const auto & point : points) {
-        if (std::fabs(point.local_ratio - ratio) >= 1e-4f) {
-            continue;
-        }
-        if (point.tokens == tokens) {
-            exact = &point;
-            break;
-        }
-        if (point.tokens < tokens && (lower == nullptr || point.tokens > lower->tokens)) {
-            lower = &point;
-        }
-        if (point.tokens > tokens && (upper == nullptr || point.tokens < upper->tokens)) {
-            upper = &point;
-        }
-    }
-
-    if (exact != nullptr) {
-        result_ms = exact->ms;
-        return true;
-    }
-    if (lower == nullptr && upper == nullptr) {
-        return false;
-    }
-    if (lower == nullptr) {
-        result_ms = upper->ms;
-        return true;
-    }
-    if (upper == nullptr) {
-        result_ms = lower->tokens > 0 ? lower->ms * (double) tokens / lower->tokens : lower->ms;
-        return true;
-    }
-
-    const double t = (double) (tokens - lower->tokens) / (double) (upper->tokens - lower->tokens);
+    const double t = (double) (kv_tokens - lower->kv_tokens) / (double) (upper->kv_tokens - lower->kv_tokens);
     result_ms      = lower->ms + t * (upper->ms - lower->ms);
     return true;
 }
@@ -1065,55 +762,13 @@ static bool llama_hybrid_ffn_cost(const std::vector<llama_hybrid_ffn_compute_poi
                                   int                                                 tokens,
                                   float                                               ratio,
                                   double &                                            result_ms) {
-    if (points.empty() || tokens <= 0 || ratio <= 0.0f || ratio > 1.0f) {
-        return false;
-    }
-
-    std::vector<float> ratios;
-    ratios.reserve(points.size());
     for (const auto & point : points) {
-        if (point.local_ratio > 0.0f && point.local_ratio <= 1.0f) {
-            ratios.push_back(point.local_ratio);
+        if (point.tokens == tokens && std::fabs(point.local_ratio - ratio) < 1e-4f) {
+            result_ms = point.ms;
+            return true;
         }
     }
-    std::sort(ratios.begin(), ratios.end());
-    ratios.erase(std::unique(ratios.begin(), ratios.end(), [](float a, float b) {
-        return std::fabs(a - b) < 1e-4f;
-    }), ratios.end());
-    if (ratios.empty()) {
-        return false;
-    }
-
-    float lower_ratio = -1.0f;
-    float upper_ratio = -1.0f;
-    for (const float r : ratios) {
-        if (std::fabs(r - ratio) < 1e-4f) {
-            return llama_hybrid_ffn_cost_at_ratio(points, tokens, r, result_ms);
-        }
-        if (r < ratio) {
-            lower_ratio = r;
-        } else if (r > ratio && upper_ratio < 0.0f) {
-            upper_ratio = r;
-        }
-    }
-
-    if (lower_ratio < 0.0f) {
-        return llama_hybrid_ffn_cost_at_ratio(points, tokens, ratios.front(), result_ms);
-    }
-    if (upper_ratio < 0.0f) {
-        return llama_hybrid_ffn_cost_at_ratio(points, tokens, ratios.back(), result_ms);
-    }
-
-    double lower_ms = 0.0;
-    double upper_ms = 0.0;
-    if (!llama_hybrid_ffn_cost_at_ratio(points, tokens, lower_ratio, lower_ms) ||
-        !llama_hybrid_ffn_cost_at_ratio(points, tokens, upper_ratio, upper_ms)) {
-        return false;
-    }
-
-    const double t = (double) (ratio - lower_ratio) / (double) (upper_ratio - lower_ratio);
-    result_ms      = lower_ms + t * (upper_ms - lower_ms);
-    return true;
+    return false;
 }
 
 static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_point> & points,
@@ -1147,18 +802,7 @@ static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_p
         return true;
     }
     if (upper == nullptr) {
-        const llama_hybrid_transfer_point * prev = nullptr;
-        for (const auto & point : points) {
-            if (point.bytes < lower->bytes && (prev == nullptr || point.bytes > prev->bytes)) {
-                prev = &point;
-            }
-        }
-        if (prev == nullptr || lower->bytes == prev->bytes) {
-            result_ms = lower->ms;
-            return true;
-        }
-        const double slope = std::max(0.0, (lower->ms - prev->ms) / (double) (lower->bytes - prev->bytes));
-        result_ms = lower->ms + slope * (double) (bytes - lower->bytes);
+        result_ms = lower->ms;
         return true;
     }
 
@@ -1178,75 +822,6 @@ static bool llama_hybrid_dual_transfer_cost(const llama_hybrid_profile & profile
         }
     }
     return false;
-}
-
-static bool llama_hybrid_layer_block_cost(const std::vector<llama_hybrid_layer_compute_point> & points,
-                                          int                                                    tokens,
-                                          bool                                                   use_compute_est,
-                                          double &                                               per_layer_ms) {
-    if (points.empty() || tokens <= 0) {
-        return false;
-    }
-
-    const llama_hybrid_layer_compute_point * exact = nullptr;
-    const llama_hybrid_layer_compute_point * lower = nullptr;
-    const llama_hybrid_layer_compute_point * upper = nullptr;
-    for (const auto & point : points) {
-        if (point.layers <= 0) {
-            continue;
-        }
-        if (point.tokens == tokens) {
-            exact = &point;
-            break;
-        }
-        if (point.tokens < tokens && (lower == nullptr || point.tokens > lower->tokens)) {
-            lower = &point;
-        }
-        if (point.tokens > tokens && (upper == nullptr || point.tokens < upper->tokens)) {
-            upper = &point;
-        }
-    }
-
-    const auto value = [&](const llama_hybrid_layer_compute_point * point) {
-        const double total = use_compute_est ? point->compute_est_ms : point->wall_ms;
-        return total / point->layers;
-    };
-
-    if (exact != nullptr) {
-        per_layer_ms = value(exact);
-        return true;
-    }
-    if (lower == nullptr && upper == nullptr) {
-        return false;
-    }
-    if (lower == nullptr) {
-        per_layer_ms = value(upper);
-        return true;
-    }
-    if (upper == nullptr) {
-        const llama_hybrid_layer_compute_point * prev = nullptr;
-        for (const auto & point : points) {
-            if (point.layers > 0 && point.tokens < lower->tokens &&
-                (prev == nullptr || point.tokens > prev->tokens)) {
-                prev = &point;
-            }
-        }
-        if (prev == nullptr || lower->tokens == prev->tokens) {
-            per_layer_ms = value(lower);
-            return true;
-        }
-        const double lower_ms = value(lower);
-        const double prev_ms  = value(prev);
-        const double slope    = std::max(0.0, (lower_ms - prev_ms) / (double) (lower->tokens - prev->tokens));
-        per_layer_ms = lower_ms + slope * (tokens - lower->tokens);
-        return true;
-    }
-
-    const double lower_ms = value(lower);
-    const double upper_ms = value(upper);
-    const double t        = (double) (tokens - lower->tokens) / (upper->tokens - lower->tokens);
-    per_layer_ms          = lower_ms + t * (upper_ms - lower_ms);
-    return true;
 }
 
 static bool llama_hybrid_phone_block_cost(const llama_hybrid_profile & profile, int layers, double & result_ms) {
@@ -1369,111 +944,42 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
     return true;
 }
 
-static double llama_hybrid_tensor_misc_cost(const llama_hybrid_profile & profile,
-                                             int                          tokens,
-                                             double                       cpu_layer_base_ms,
-                                             double                       cpu_attn_base_ms) {
-    double full_ffn_ms = 0.0;
-    if (!llama_hybrid_ffn_cost(profile.cpu_ffn, tokens, 1.0f, full_ffn_ms)) {
-        return 0.0;
+bool llama_hybrid_prepare_tensor_costs(llama_hybrid_profile & profile) {
+    profile.tensor_ffn_costs.clear();
+    profile.tensor_ffn_costs.reserve(LLAMA_HYBRID_PLAN_RATIOS.size() * LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES.size());
+
+    for (const float ratio : LLAMA_HYBRID_PLAN_RATIOS) {
+        for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
+            double ms = 0.0;
+            if (!llama_hybrid_tensor_ffn_cost(profile, ratio, LLAMA_HYBRID_REFERENCE_TOKENS, chunk_tokens, ms)) {
+                profile.tensor_ffn_costs.clear();
+                return false;
+            }
+            profile.tensor_ffn_costs.push_back({ ratio, chunk_tokens, ms });
+        }
     }
-    return std::max(0.0, cpu_layer_base_ms - cpu_attn_base_ms - full_ffn_ms);
-}
-
-static float llama_hybrid_align_pc_ratio(const llama_hybrid_profile & profile, float ratio) {
-    if (profile.n_ff <= 0 || profile.ffn_shard_granularity <= 0) {
-        return std::clamp(ratio, 0.01f, 0.99f);
-    }
-
-    const int64_t granularity = profile.ffn_shard_granularity;
-    const int64_t max_width   = std::max<int64_t>(granularity,
-        ((int64_t) profile.n_ff / granularity - 1) * granularity);
-    int64_t width             = (int64_t) std::floor((double) profile.n_ff * ratio);
-    width -= width % granularity;
-    width = std::clamp<int64_t>(width, granularity, max_width);
-    return (float) ((double) width / (double) profile.n_ff);
-}
-
-static bool llama_hybrid_tensor_balance_diff(const llama_hybrid_profile & profile,
-                                             int                          chunk_tokens,
-                                             float                        pc_ratio,
-                                             double &                     diff_ms) {
-    if (profile.n_embd <= 0 || chunk_tokens <= 0) {
-        return false;
-    }
-
-    double pc_ms    = 0.0;
-    double phone_ms = 0.0;
-    double return_ms = 0.0;
-    const size_t bytes = (size_t) profile.n_embd * (size_t) chunk_tokens * sizeof(float);
-    if (!llama_hybrid_ffn_cost(profile.cpu_ffn, chunk_tokens, pc_ratio, pc_ms) ||
-        !llama_hybrid_ffn_cost(profile.phone_ffn, chunk_tokens, 1.0f - pc_ratio, phone_ms) ||
-        !llama_hybrid_transfer_cost(profile.snapshot_phone_to_pc, bytes, return_ms)) {
-        return false;
-    }
-
-    // PC->Phone is intentionally not included in the steady-state balance equation: the
-    // transfer worker can prefetch the next chunk while the phone computes the current one.
-    // The full tensor pipeline simulator still accounts for the actual H2D timeline.
-    diff_ms = pc_ms - (phone_ms + return_ms);
     return true;
 }
 
-static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_profile & profile) {
-    std::vector<float> anchors;
-    for (const auto & point : profile.cpu_ffn) {
-        if (point.local_ratio > 0.0f && point.local_ratio < 1.0f) {
-            anchors.push_back(point.local_ratio);
+static bool llama_hybrid_cached_tensor_ffn_cost(const llama_hybrid_profile & profile,
+                                                float                        pc_ratio,
+                                                int                          chunk_tokens,
+                                                double &                     result_ms) {
+    for (const auto & point : profile.tensor_ffn_costs) {
+        if (point.chunk_tokens == chunk_tokens && std::fabs(point.pc_ratio - pc_ratio) < 1e-4f) {
+            result_ms = point.ms;
+            return true;
         }
     }
-    std::sort(anchors.begin(), anchors.end());
-    anchors.erase(std::unique(anchors.begin(), anchors.end(), [](float a, float b) {
-        return std::fabs(a - b) < 1e-4f;
-    }), anchors.end());
+    return llama_hybrid_tensor_ffn_cost(profile, pc_ratio, LLAMA_HYBRID_REFERENCE_TOKENS, chunk_tokens, result_ms);
+}
 
-    std::vector<float> result = anchors;
-    const float ratio_step = profile.n_ff > 0 && profile.ffn_shard_granularity > 0 ?
-        (float) ((double) profile.ffn_shard_granularity / (double) profile.n_ff) : 0.0f;
-
-    for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
-        for (size_t i = 0; i + 1 < anchors.size(); ++i) {
-            const float q0 = anchors[i];
-            const float q1 = anchors[i + 1];
-            double d0 = 0.0;
-            double d1 = 0.0;
-            if (!llama_hybrid_tensor_balance_diff(profile, chunk_tokens, q0, d0) ||
-                !llama_hybrid_tensor_balance_diff(profile, chunk_tokens, q1, d1)) {
-                continue;
-            }
-            if (d0 == 0.0) {
-                result.push_back(q0);
-                continue;
-            }
-            if (d1 == 0.0) {
-                result.push_back(q1);
-                continue;
-            }
-            if ((d0 < 0.0) == (d1 < 0.0)) {
-                continue;
-            }
-
-            const double t = std::clamp(-d0 / (d1 - d0), 0.0, 1.0);
-            const float q_cross = llama_hybrid_align_pc_ratio(profile, (float) (q0 + t * (q1 - q0)));
-            result.push_back(q_cross);
-            if (ratio_step > 0.0f) {
-                result.push_back(llama_hybrid_align_pc_ratio(profile, q_cross + ratio_step));
-            }
-        }
+static double llama_hybrid_tensor_misc_cost(const llama_hybrid_profile & profile) {
+    double full_ffn_ms = 0.0;
+    if (!llama_hybrid_ffn_cost(profile.cpu_ffn, profile.probe_tokens, 1.0f, full_ffn_ms)) {
+        return 0.0;
     }
-
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end(), [](float a, float b) {
-        return std::fabs(a - b) < 1e-4f;
-    }), result.end());
-    result.erase(std::remove_if(result.begin(), result.end(), [](float q) {
-        return q <= 0.0f || q >= 1.0f;
-    }), result.end());
-    return result;
+    return std::max(0.0, profile.cpu_full_layer_ms - profile.cpu_attn_ms - full_ffn_ms);
 }
 
 std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama_hybrid_profile &     profile,
@@ -1496,12 +1002,9 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         if (ratio <= 0.0f || ratio >= 1.0f) {
             return result;
         }
-        ratios.push_back(llama_hybrid_align_pc_ratio(profile, ratio));
+        ratios.push_back(ratio);
     } else {
-        ratios = llama_hybrid_plan_ratio_candidates(profile);
-        if (ratios.empty()) {
-            return result;
-        }
+        ratios.assign(LLAMA_HYBRID_PLAN_RATIOS.begin(), LLAMA_HYBRID_PLAN_RATIOS.end());
     }
 
     std::vector<int> chunk_token_candidates;
@@ -1516,7 +1019,6 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     size_t    reject_pc        = 0;
     size_t    reject_phone     = 0;
     size_t    reject_gpu       = 0;
-    size_t    reject_chunks    = 0;
     const int n_layer          = profile.n_layer;
 
     for (int tensor_layers = 0; tensor_layers <= n_layer; ++tensor_layers) {
@@ -1535,8 +1037,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             }
 
             for (const float ratio : ratios) {
-                if (tensor_layers == 0 && !constraints.fixed_tensor_pc_ratio &&
-                    std::fabs(ratio - ratios.front()) >= 1e-4f) {
+                if (tensor_layers == 0 && !constraints.fixed_tensor_pc_ratio && std::fabs(ratio - 0.50f) >= 1e-4f) {
                     continue;
                 }
 
@@ -1550,7 +1051,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                     base.tensor_layers   = tensor_layers;
                     base.phone_layers    = phone_layers;
                     base.pc_layers       = pc_layers;
-                    base.tensor_pc_ratio = tensor_layers > 0 ? ratio : 0.50f;
+                    base.tensor_pc_ratio = ratio;
                     base.gpu_pc_layers   = gpu_layers;
 
                     for (const int chunk_tokens : chunk_token_candidates) {
@@ -1559,22 +1060,10 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                             continue;
                         }
 
-                        const int score_tokens = constraints.target_ubatch_tokens > 0 ?
-                            constraints.target_ubatch_tokens :
-                            (profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS);
-                        if (constraints.target_ubatch_tokens > 0 && chunk_tokens > score_tokens) {
-                            continue;
-                        }
-                        const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(score_tokens, chunk_tokens);
+                        const std::vector<int> chunks =
+                            llama_hybrid_split_by_chunk_size(LLAMA_HYBRID_REFERENCE_TOKENS, chunk_tokens);
                         if (chunks.empty() ||
                             *std::min_element(chunks.begin(), chunks.end()) < profile.probe_chunk_min_tokens) {
-                            continue;
-                        }
-
-                        ++total_candidates;
-                        if (tensor_layers > 0 && constraints.max_tensor_chunks > 0 &&
-                            chunks.size() > (size_t) constraints.max_tensor_chunks) {
-                            ++reject_chunks;
                             continue;
                         }
 
@@ -1582,6 +1071,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                         plan.tensor_chunk_tokens = chunk_tokens;
                         plan.predicted_ms        = 0.0;
 
+                        ++total_candidates;
                         if (!llama_hybrid_estimate_plan_memory(profile, constraints, plan)) {
                             continue;
                         }
@@ -1606,14 +1096,12 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     }
 
     LLAMA_LOG_ERROR(
-        "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d max_tensor_chunks=%d pc_budget=%zu "
-        "phone_budget=%zu gpu_budget=%zu gpu_runtime_reserve=%zu total=%zu feasible=%zu reject_chunks=%zu "
-        "reject_pc=%zu reject_phone=%zu reject_gpu=%zu\n",
+        "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d pc_budget=%zu phone_budget=%zu gpu_budget=%zu "
+        "gpu_runtime_reserve=%zu total=%zu feasible=%zu reject_pc=%zu reject_phone=%zu reject_gpu=%zu\n",
         constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train,
         constraints.target_ubatch_tokens > 0 ? constraints.target_ubatch_tokens : profile.probe_tokens,
-        profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS,
-        constraints.max_tensor_chunks, pc_budget, phone_budget, gpu_budget, constraints.gpu_runtime_reserve_bytes,
-        total_candidates, result.size(), reject_chunks, reject_pc, reject_phone, reject_gpu);
+        LLAMA_HYBRID_REFERENCE_TOKENS, pc_budget, phone_budget, gpu_budget,
+        constraints.gpu_runtime_reserve_bytes, total_candidates, result.size(), reject_pc, reject_phone, reject_gpu);
     return result;
 }
 
@@ -1626,17 +1114,16 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         return false;
     }
 
-    const int reference_tokens = profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS;
-    const int work_tokens = constraints.target_ubatch_tokens > 0 ? constraints.target_ubatch_tokens : reference_tokens;
-    if (work_tokens <= 0) {
+    if (profile.probe_tokens <= 0) {
         return false;
     }
+    const double ref_scale = (double) LLAMA_HYBRID_REFERENCE_TOKENS / profile.probe_tokens;
 
     int kv_tokens = constraints.score_kv_tokens;
     if (kv_tokens <= 0) {
         kv_tokens = constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train;
     }
-    kv_tokens = std::max(kv_tokens, work_tokens);
+    kv_tokens = std::max(kv_tokens, profile.probe_tokens);
     if (profile.n_ctx_train > 0) {
         kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
     }
@@ -1645,65 +1132,60 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
     double cpu_attn_kv     = 0.0;
     double phone_attn_base = 0.0;
     double phone_attn_kv   = 0.0;
-    if (!llama_hybrid_attn_cost(profile.cpu_attn, work_tokens, work_tokens, cpu_attn_base) ||
-        !llama_hybrid_attn_cost(profile.cpu_attn, work_tokens, kv_tokens, cpu_attn_kv) ||
-        !llama_hybrid_attn_cost(profile.phone_attn, work_tokens, work_tokens, phone_attn_base) ||
-        !llama_hybrid_attn_cost(profile.phone_attn, work_tokens, kv_tokens, phone_attn_kv)) {
-        return false;
-    }
-
-    double cpu_layer_base = 0.0;
-    double phone_layer_base = 0.0;
-    if (!llama_hybrid_layer_block_cost(profile.cpu_layer_blocks, work_tokens, false, cpu_layer_base) ||
-        !llama_hybrid_layer_block_cost(profile.phone_layer_blocks, work_tokens, true, phone_layer_base)) {
+    if (!llama_hybrid_attn_cost(profile.cpu_attn, profile.probe_tokens, cpu_attn_base) ||
+        !llama_hybrid_attn_cost(profile.cpu_attn, kv_tokens, cpu_attn_kv) ||
+        !llama_hybrid_attn_cost(profile.phone_attn, profile.probe_tokens, phone_attn_base) ||
+        !llama_hybrid_attn_cost(profile.phone_attn, kv_tokens, phone_attn_kv)) {
         return false;
     }
 
     plan.predicted_tensor_ms = 0.0;
     if (plan.tensor_layers > 0) {
         double tensor_ffn_ms = 0.0;
-        if (!llama_hybrid_tensor_ffn_cost(profile, plan.tensor_pc_ratio, work_tokens,
-                                          plan.tensor_chunk_tokens, tensor_ffn_ms)) {
+        if (!llama_hybrid_cached_tensor_ffn_cost(profile, plan.tensor_pc_ratio, plan.tensor_chunk_tokens,
+                                                 tensor_ffn_ms)) {
             return false;
         }
-        const double tensor_misc_ms =
-            llama_hybrid_tensor_misc_cost(profile, work_tokens, cpu_layer_base, cpu_attn_base);
-        const double tensor_layer_ms = cpu_attn_kv + tensor_misc_ms + tensor_ffn_ms;
+        const double tensor_layer_ms =
+            (cpu_attn_kv + llama_hybrid_tensor_misc_cost(profile)) * ref_scale + tensor_ffn_ms;
         plan.predicted_tensor_ms     = plan.tensor_layers * tensor_layer_ms;
     }
 
     plan.predicted_phone_ms = 0.0;
     if (plan.phone_layers > 0) {
-        const double phone_layer_ms = std::max(0.0, phone_layer_base + phone_attn_kv - phone_attn_base);
-        plan.predicted_phone_ms     = plan.phone_layers * phone_layer_ms;
+        double base_block_ms = 0.0;
+        if (!llama_hybrid_phone_block_cost(profile, plan.phone_layers, base_block_ms)) {
+            return false;
+        }
+        const double attn_delta = std::max(0.0, phone_attn_kv - phone_attn_base);
+        plan.predicted_phone_ms = (base_block_ms + plan.phone_layers * attn_delta) * ref_scale;
     }
 
-    const double cpu_layer_ms = std::max(0.0, cpu_layer_base + cpu_attn_kv - cpu_attn_base);
-    plan.predicted_pc_cpu_ms  = (plan.pc_layers - plan.gpu_pc_layers) * cpu_layer_ms;
+    const double cpu_layer_ms = std::max(0.0, profile.cpu_full_layer_ms + cpu_attn_kv - cpu_attn_base);
+    plan.predicted_pc_cpu_ms  = (plan.pc_layers - plan.gpu_pc_layers) * cpu_layer_ms * ref_scale;
 
     plan.predicted_pc_gpu_ms = 0.0;
     if (plan.gpu_pc_layers > 0) {
         double gpu_attn_base = 0.0;
         double gpu_attn_kv   = 0.0;
-        double gpu_layer_base = 0.0;
-        if (!llama_hybrid_attn_cost(profile.gpu_attn, work_tokens, work_tokens, gpu_attn_base) ||
-            !llama_hybrid_attn_cost(profile.gpu_attn, work_tokens, kv_tokens, gpu_attn_kv) ||
-            !llama_hybrid_layer_block_cost(profile.gpu_layer_blocks, work_tokens, false, gpu_layer_base)) {
+        if (!llama_hybrid_attn_cost(profile.gpu_attn, profile.probe_tokens, gpu_attn_base) ||
+            !llama_hybrid_attn_cost(profile.gpu_attn, kv_tokens, gpu_attn_kv)) {
             return false;
         }
-        const double gpu_layer_ms = std::max(0.0, gpu_layer_base + gpu_attn_kv - gpu_attn_base);
-        plan.predicted_pc_gpu_ms  = plan.gpu_pc_layers * gpu_layer_ms;
+        const double gpu_layer_ms = std::max(0.0, profile.gpu_full_layer_ms + gpu_attn_kv - gpu_attn_base);
+        plan.predicted_pc_gpu_ms  = plan.gpu_pc_layers * gpu_layer_ms * ref_scale;
     }
 
     plan.predicted_handoff_ms = 0.0;
     if (plan.phone_layers > 0) {
         if (profile.n_embd <= 0 ||
-            (size_t) profile.n_embd > std::numeric_limits<size_t>::max() / sizeof(float) /
-                                        (size_t) work_tokens) {
+            (size_t) profile.n_embd >
+                std::numeric_limits<size_t>::max() / sizeof(float) / (size_t) LLAMA_HYBRID_REFERENCE_TOKENS) {
             return false;
         }
 
-        const size_t bytes    = (size_t) profile.n_embd * (size_t) work_tokens * sizeof(float);
+        const size_t bytes =
+            (size_t) profile.n_embd * (size_t) LLAMA_HYBRID_REFERENCE_TOKENS * sizeof(float);
         double       enter_ms = 0.0;
         double       exit_ms  = 0.0;
         if (!llama_hybrid_transfer_cost(profile.pc_to_phone, bytes, enter_ms) ||
@@ -1718,83 +1200,6 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
     return std::isfinite(plan.predicted_ms);
 }
 
-bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
-                                               ggml_backend_t         gpu_backend,
-                                               ggml_backend_t         pc_backend) {
-    profile.gpu_to_pc.clear();
-    if (gpu_backend == nullptr) {
-        return true;
-    }
-    if (pc_backend == nullptr || profile.n_embd <= 0) {
-        return false;
-    }
-
-    const std::vector<int> token_sizes = llama_hybrid_probe_transfer_tokens(profile);
-    if (token_sizes.empty()) {
-        return false;
-    }
-
-    const size_t ctx_size = token_sizes.size() * ggml_tensor_overhead();
-    const ggml_init_params params = {
-        /*.mem_size   =*/ctx_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    ggml_context_ptr gpu_ctx(ggml_init(params));
-    ggml_context_ptr pc_ctx(ggml_init(params));
-    if (!gpu_ctx || !pc_ctx) {
-        return false;
-    }
-
-    std::vector<ggml_tensor *> gpu_tensors;
-    std::vector<ggml_tensor *> pc_tensors;
-    gpu_tensors.reserve(token_sizes.size());
-    pc_tensors.reserve(token_sizes.size());
-    for (const int tokens : token_sizes) {
-        gpu_tensors.push_back(ggml_new_tensor_2d(gpu_ctx.get(), GGML_TYPE_F32, profile.n_embd, tokens));
-        pc_tensors.push_back(ggml_new_tensor_2d(pc_ctx.get(), GGML_TYPE_F32, profile.n_embd, tokens));
-    }
-
-    ggml_backend_buffer_ptr gpu_buffer(ggml_backend_alloc_ctx_tensors(gpu_ctx.get(), gpu_backend));
-    ggml_backend_buffer_ptr pc_buffer(ggml_backend_alloc_ctx_tensors(pc_ctx.get(), pc_backend));
-    if (!gpu_buffer || !pc_buffer) {
-        LLAMA_LOG_ERROR("%s: failed to allocate GPU/PC transfer probe buffers\n", __func__);
-        return false;
-    }
-
-    const size_t max_bytes = ggml_nbytes(gpu_tensors.back());
-    std::vector<uint8_t> source_data(max_bytes, 0x5a);
-
-    for (size_t i = 0; i < token_sizes.size(); ++i) {
-        ggml_tensor * src = gpu_tensors[i];
-        ggml_tensor * dst = pc_tensors[i];
-        const size_t bytes = ggml_nbytes(src);
-        std::array<double, LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples;
-
-        for (int run = 0; run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS + LLAMA_HYBRID_COMPUTE_MEASURE_RUNS; ++run) {
-            ggml_backend_tensor_set(src, source_data.data(), 0, bytes);
-            ggml_backend_synchronize(gpu_backend);
-
-            const int64_t begin_us = ggml_time_us();
-            ggml_backend_tensor_copy(src, dst);
-            ggml_backend_synchronize(gpu_backend);
-            ggml_backend_synchronize(pc_backend);
-            const int64_t end_us = ggml_time_us();
-
-            if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
-                samples[run - LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] = (end_us - begin_us) / 1000.0;
-            }
-        }
-
-        const double ms = llama_hybrid_rpc_median(samples);
-        profile.gpu_to_pc.push_back({ bytes, ms, ms });
-        LLAMA_LOG_INFO("[HYBRID_PROFILE_TRANSFER] kind=gpu_to_pc tokens=%d bytes=%zu ms=%.3f\n",
-                       token_sizes[i], bytes, ms);
-    }
-
-    return true;
-}
-
 bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_backend, ggml_backend_t phone_backend) {
     if (pc_backend == nullptr || phone_backend == nullptr) {
         LLAMA_LOG_ERROR("%s: backend is null\n", __func__);
@@ -1806,9 +1211,12 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
         return false;
     }
 
-    const std::vector<int> chunk_tokens = llama_hybrid_probe_transfer_tokens(profile);
+    std::vector<int> chunk_tokens = llama_hybrid_probe_chunk_tokens(profile);
+    chunk_tokens.push_back(LLAMA_HYBRID_REFERENCE_TOKENS);
+    std::sort(chunk_tokens.begin(), chunk_tokens.end());
+    chunk_tokens.erase(std::unique(chunk_tokens.begin(), chunk_tokens.end()), chunk_tokens.end());
     if (chunk_tokens.empty()) {
-        LLAMA_LOG_ERROR("%s: no valid transfer probe sizes\n", __func__);
+        LLAMA_LOG_ERROR("%s: no valid chunk candidates\n", __func__);
         return false;
     }
 
@@ -2200,7 +1608,6 @@ bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
 
     profile.n_embd                     = (int) desc.n_embd;
     profile.n_ff                       = (int) desc.n_ff;
-    profile.ffn_shard_granularity      = std::lcm<int64_t>(ggml_blck_size(desc.down_type), 128);
     profile.ffn_weight_bytes_per_layer = desc.weight_bytes;
     llama_hybrid_update_weight_bytes(profile);
     profile.cpu_ffn.clear();
@@ -2215,46 +1622,29 @@ bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                    profile.rpc_fence_ms);
 
     for (const int tokens : chunk_tokens) {
-        for (const float requested_local_ratio : LLAMA_HYBRID_FFN_RATIO_PROBES) {
-            const int64_t cpu_local_ff = llama_hybrid_ffn_shard_size(desc.n_ff, desc.down_type,
-                                                                      requested_local_ratio, 0);
-            if (cpu_local_ff <= 0) {
-                continue;
-            }
-            const float cpu_ratio_eff = (float) ((double) cpu_local_ff / (double) desc.n_ff);
-
+        for (const float ratio : LLAMA_HYBRID_FFN_RATIOS) {
             double cpu_ms;
             size_t cpu_runtime_bytes;
-            if (!llama_hybrid_profile_ffn_point(desc, cpu_backend, 0, tokens, requested_local_ratio,
-                                                cpu_ms, cpu_runtime_bytes)) {
+            if (!llama_hybrid_profile_ffn_point(desc, cpu_backend, 0, tokens, ratio, cpu_ms, cpu_runtime_bytes)) {
                 return false;
             }
-            profile.cpu_ffn.push_back({ tokens, cpu_ratio_eff, cpu_local_ff, cpu_ms, cpu_runtime_bytes });
+            profile.cpu_ffn.push_back({ tokens, ratio, cpu_ms, cpu_runtime_bytes });
             LLAMA_LOG_INFO(
-                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=ffn tokens=%d local_ratio=%.5f local_ff=%" PRId64
-                " ms=%.3f runtime_bytes=%zu\n",
-                ggml_backend_name(cpu_backend), tokens, cpu_ratio_eff, cpu_local_ff, cpu_ms, cpu_runtime_bytes);
-
-            const float pc_ratio_for_phone = 1.0f - requested_local_ratio;
-            const int64_t phone_local_ff = llama_hybrid_ffn_shard_size(desc.n_ff, desc.down_type,
-                                                                        pc_ratio_for_phone, 1);
-            if (phone_local_ff <= 0) {
-                continue;
-            }
-            const float phone_ratio_eff = (float) ((double) phone_local_ff / (double) desc.n_ff);
+                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=ffn tokens=%d local_ratio=%.2f ms=%.3f "
+                "runtime_bytes=%zu\n",
+                ggml_backend_name(cpu_backend), tokens, ratio, cpu_ms, cpu_runtime_bytes);
 
             double phone_ms;
             size_t phone_runtime_bytes;
-            if (!llama_hybrid_profile_ffn_point(desc, phone_backend, 1, tokens, requested_local_ratio,
-                                                phone_ms, phone_runtime_bytes)) {
+            if (!llama_hybrid_profile_ffn_point(desc, phone_backend, 1, tokens, ratio, phone_ms,
+                                                phone_runtime_bytes)) {
                 return false;
             }
-            profile.phone_ffn.push_back({ tokens, phone_ratio_eff, phone_local_ff, phone_ms, phone_runtime_bytes });
+            profile.phone_ffn.push_back({ tokens, ratio, phone_ms, phone_runtime_bytes });
             LLAMA_LOG_INFO(
-                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=ffn tokens=%d local_ratio=%.5f local_ff=%" PRId64
-                " ms=%.3f runtime_bytes=%zu\n",
-                ggml_backend_name(phone_backend), tokens, phone_ratio_eff, phone_local_ff, phone_ms,
-                phone_runtime_bytes);
+                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=ffn tokens=%d local_ratio=%.2f ms=%.3f "
+                "runtime_bytes=%zu\n",
+                ggml_backend_name(phone_backend), tokens, ratio, phone_ms, phone_runtime_bytes);
         }
     }
     return true;
@@ -2523,7 +1913,8 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
         return false;
     }
 
-    if (profile.probe_tokens <= 0) {
+    const int tokens = profile.probe_tokens;
+    if (tokens <= 0) {
         LLAMA_LOG_ERROR("%s: invalid probe token count\n", __func__);
         return false;
     }
@@ -2541,58 +1932,52 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
 
     const auto profile_backend = [&](ggml_backend_t backend, std::vector<llama_hybrid_attn_compute_point> & points,
                                      double * legacy_ms) {
-        for (const int tokens : LLAMA_HYBRID_LAYER_TOKEN_CANDIDATES) {
-            if (tokens <= 0 || tokens > desc.n_ctx_orig) {
+        double full_base_ms      = 0.0;
+        size_t full_base_runtime = 0;
+        if (!llama_hybrid_profile_attn_point(desc, backend, tokens, tokens, full_base_ms, full_base_runtime)) {
+            return false;
+        }
+        if (legacy_ms != nullptr) {
+            *legacy_ms = full_base_ms;
+        }
+
+        double flash_base_ms      = 0.0;
+        size_t flash_base_runtime = 0;
+        if (!llama_hybrid_profile_attn_kv_kernel_point(desc, backend, tokens, tokens, flash_base_ms,
+                                                       flash_base_runtime)) {
+            return false;
+        }
+
+        for (const int kv_tokens : LLAMA_HYBRID_PREFILL_KV_ANCHORS) {
+            if (kv_tokens < tokens || kv_tokens > desc.n_ctx_orig) {
                 continue;
             }
 
-            double full_base_ms      = 0.0;
-            size_t full_base_runtime = 0;
-            if (!llama_hybrid_profile_attn_point(desc, backend, tokens, tokens, full_base_ms, full_base_runtime)) {
+            double flash_ms      = flash_base_ms;
+            size_t flash_runtime = flash_base_runtime;
+            if (kv_tokens != tokens &&
+                !llama_hybrid_profile_attn_kv_kernel_point(desc, backend, tokens, kv_tokens, flash_ms,
+                                                           flash_runtime)) {
                 return false;
             }
-            if (legacy_ms != nullptr && tokens == profile.probe_tokens) {
-                *legacy_ms = full_base_ms;
-            }
 
-            points.push_back({ tokens, tokens, full_base_ms, full_base_runtime });
+            const double attn_ms = full_base_ms + flash_ms - flash_base_ms;
+            size_t       attn_runtime = full_base_runtime;
+            if (flash_runtime > flash_base_runtime &&
+                !llama_hybrid_add_bytes(attn_runtime, flash_runtime - flash_base_runtime)) {
+                return false;
+            }
+            points.push_back({ tokens, kv_tokens, attn_ms, attn_runtime });
+            LLAMA_LOG_INFO(
+                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=attention_flash tokens=%d kv_tokens=%d ms=%.3f "
+                "runtime_bytes=%zu\n",
+                ggml_backend_name(backend), tokens, kv_tokens, flash_ms, flash_runtime);
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=attention tokens=%d kv_tokens=%d ms=%.3f "
                 "runtime_bytes=%zu\n",
-                ggml_backend_name(backend), tokens, tokens, full_base_ms, full_base_runtime);
-
-            double flash_base_ms      = 0.0;
-            size_t flash_base_runtime = 0;
-            if (!llama_hybrid_profile_attn_kv_kernel_point(desc, backend, tokens, tokens, flash_base_ms,
-                                                           flash_base_runtime)) {
-                return false;
-            }
-
-            for (const int kv_tokens : LLAMA_HYBRID_PREFILL_KV_ANCHORS) {
-                if (kv_tokens <= tokens || kv_tokens > desc.n_ctx_orig) {
-                    continue;
-                }
-
-                double flash_ms      = 0.0;
-                size_t flash_runtime = 0;
-                if (!llama_hybrid_profile_attn_kv_kernel_point(desc, backend, tokens, kv_tokens, flash_ms,
-                                                               flash_runtime)) {
-                    return false;
-                }
-
-                const double attn_ms = full_base_ms + flash_ms - flash_base_ms;
-                size_t       attn_runtime = full_base_runtime;
-                if (flash_runtime > flash_base_runtime &&
-                    !llama_hybrid_add_bytes(attn_runtime, flash_runtime - flash_base_runtime)) {
-                    return false;
-                }
-                points.push_back({ tokens, kv_tokens, attn_ms, attn_runtime });
-                LLAMA_LOG_INFO(
-                    "[HYBRID_PROFILE_COMPUTE] backend=%s kind=attention tokens=%d kv_tokens=%d ms=%.3f "
-                    "runtime_bytes=%zu\n",
-                    ggml_backend_name(backend), tokens, kv_tokens, attn_ms, attn_runtime);
-            }
+                ggml_backend_name(backend), tokens, kv_tokens, attn_ms, attn_runtime);
         }
+
         return true;
     };
 
@@ -2603,7 +1988,7 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
     }
 
     if (profile.cpu_attn.empty()) {
-        LLAMA_LOG_ERROR("%s: no valid attention profile points for context=%" PRId64 "\n", __func__,
+        LLAMA_LOG_ERROR("%s: no valid KV anchors for probe tokens=%d context=%" PRId64 "\n", __func__, tokens,
                         desc.n_ctx_orig);
         return false;
     }
@@ -2825,13 +2210,13 @@ static bool llama_hybrid_profile_full_layer_point(const llama_hybrid_attn_desc &
     return true;
 }
 
-static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc & attn_desc,
+static bool llama_hybrid_profile_phone_block_point(const llama_hybrid_attn_desc & attn_desc,
                                                    const llama_hybrid_ffn_desc &  ffn_desc,
-                                                   ggml_backend_t                 backend,
+                                                   ggml_backend_t                 phone_backend,
                                                    int                            n_layers,
                                                    int                            tokens,
                                                    llama_hybrid_graph_timing &    timing) {
-    if (backend == nullptr || n_layers <= 0 || tokens <= 0 || attn_desc.n_embd <= 0 || ffn_desc.n_embd <= 0 ||
+    if (phone_backend == nullptr || n_layers <= 0 || tokens <= 0 || attn_desc.n_embd <= 0 || ffn_desc.n_embd <= 0 ||
         ffn_desc.n_ff <= 0 || attn_desc.n_embd != ffn_desc.n_embd || attn_desc.n_head <= 0 ||
         attn_desc.n_head_kv <= 0 || attn_desc.q_dim % attn_desc.n_head != 0 ||
         attn_desc.k_dim % attn_desc.n_head_kv != 0 || attn_desc.v_dim % attn_desc.n_head_kv != 0) {
@@ -2861,33 +2246,31 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
     ggml_tensor * pos   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens);
     ggml_tensor * mask  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, tokens, tokens);
 
+    const llama_hybrid_probe_layer_weights weights =
+        llama_hybrid_make_probe_layer_weights(ctx.get(), attn_desc, ffn_desc);
     ggml_tensor * cur = input;
     for (int il = 0; il < n_layers; ++il) {
-        // Use distinct synthetic weights per layer. Reusing one weight set would make later
-        // layers unrealistically cache-hot and underestimate real multi-layer execution time.
-        const llama_hybrid_probe_layer_weights weights =
-            llama_hybrid_make_probe_layer_weights(ctx.get(), attn_desc, ffn_desc);
         cur = llama_hybrid_build_probe_layer(ctx.get(), cur, pos, mask, attn_desc, ffn_desc, weights, tokens);
     }
 
     ggml_cgraph *                graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
-    static std::atomic<uint64_t> next_layer_block_uid{ uint64_t(1) << 59 };
-    graph->uid = next_layer_block_uid.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint64_t> next_phone_block_uid{ uint64_t(1) << 59 };
+    graph->uid = next_phone_block_uid.fetch_add(1, std::memory_order_relaxed);
     ggml_build_forward_expand(graph, cur);
 
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
-        if (!ggml_backend_supports_op(backend, node)) {
+        if (!ggml_backend_supports_op(phone_backend, node)) {
             LLAMA_LOG_ERROR("%s: backend=%s layers=%d unsupported op=%s node=%s\n", __func__,
-                            ggml_backend_name(backend), n_layers, ggml_op_name(node->op), node->name);
+                            ggml_backend_name(phone_backend), n_layers, ggml_op_name(node->op), node->name);
             return false;
         }
     }
 
-    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), phone_backend));
     if (!buffer) {
         LLAMA_LOG_ERROR("%s: allocation failed layers=%d backend=%s\n", __func__, n_layers,
-                        ggml_backend_name(backend));
+                        ggml_backend_name(phone_backend));
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
@@ -2908,8 +2291,8 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
     }
     ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
 
-    if (!llama_hybrid_profile_graph_timing(backend, graph, timing)) {
-        LLAMA_LOG_ERROR("%s: layer block execution failed layers=%d\n", __func__, n_layers);
+    if (!llama_hybrid_profile_graph_timing(phone_backend, graph, timing)) {
+        LLAMA_LOG_ERROR("%s: phone block execution failed layers=%d\n", __func__, n_layers);
         return false;
     }
 
@@ -2932,7 +2315,8 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
         return false;
     }
 
-    const int tokens = profile.probe_tokens;
+    const int tokens    = profile.probe_tokens;
+    const int kv_tokens = tokens;
     if (tokens <= 0) {
         return false;
     }
@@ -2945,91 +2329,35 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
     profile.ffn_weight_bytes_per_layer  = ffn_desc.weight_bytes;
     llama_hybrid_update_weight_bytes(profile);
 
-    profile.cpu_layer_blocks.clear();
-    profile.phone_layer_blocks.clear();
-    profile.gpu_layer_blocks.clear();
-
-    const int block_layers = std::max(1, std::min(profile.profile_block_layers > 0 ? profile.profile_block_layers :
-                                                  LLAMA_HYBRID_PROFILE_BLOCK_LAYERS,
-                                                  profile.n_layer > 0 ? profile.n_layer : LLAMA_HYBRID_PROFILE_BLOCK_LAYERS));
-
-    profile.cpu_full_layer_ms              = 0.0;
-    profile.phone_full_layer_ms            = 0.0;
-    profile.phone_full_layer_compute_est_ms = 0.0;
-    profile.gpu_full_layer_ms              = 0.0;
-
-    for (const int tokens : LLAMA_HYBRID_LAYER_TOKEN_CANDIDATES) {
-        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
-            continue;
-        }
-
-        llama_hybrid_graph_timing cpu_timing;
-        if (!llama_hybrid_profile_layer_block_point(attn_desc, ffn_desc, cpu_backend, block_layers, tokens,
-                                                    cpu_timing)) {
-            return false;
-        }
-        profile.cpu_layer_blocks.push_back({ tokens, block_layers, cpu_timing.wall_ms, cpu_timing.compute_est_ms });
-        LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-            "per_layer_ms=%.3f\n",
-            ggml_backend_name(cpu_backend), block_layers, tokens, cpu_timing.wall_ms,
-            cpu_timing.wall_ms / block_layers);
-
-        llama_hybrid_graph_timing phone_timing;
-        if (!llama_hybrid_profile_layer_block_point(attn_desc, ffn_desc, phone_backend, block_layers, tokens,
-                                                    phone_timing)) {
-            return false;
-        }
-        profile.phone_layer_blocks.push_back({ tokens, block_layers, phone_timing.wall_ms,
-                                               phone_timing.compute_est_ms });
-        LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d wall_ms=%.3f "
-            "compute_est_ms=%.3f per_layer_est_ms=%.3f\n",
-            ggml_backend_name(phone_backend), block_layers, tokens, phone_timing.wall_ms,
-            phone_timing.compute_est_ms, phone_timing.compute_est_ms / block_layers);
-
-        if (gpu_backend != nullptr) {
-            llama_hybrid_graph_timing gpu_timing;
-            if (!llama_hybrid_profile_layer_block_point(attn_desc, ffn_desc, gpu_backend, block_layers, tokens,
-                                                        gpu_timing)) {
-                return false;
-            }
-            profile.gpu_layer_blocks.push_back({ tokens, block_layers, gpu_timing.wall_ms, gpu_timing.compute_est_ms });
-            LLAMA_LOG_INFO(
-                "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-                "per_layer_ms=%.3f\n",
-                ggml_backend_name(gpu_backend), block_layers, tokens, gpu_timing.wall_ms,
-                gpu_timing.wall_ms / block_layers);
-        }
-    }
-
-    auto find_probe_block = [&](const std::vector<llama_hybrid_layer_compute_point> & points,
-                                bool use_compute_est, double & result_ms) -> bool {
-        if (points.empty()) {
-            return false;
-        }
-        const llama_hybrid_layer_compute_point * best = nullptr;
-        for (const auto & point : points) {
-            if (best == nullptr || std::abs(point.tokens - profile.probe_tokens) <
-                                   std::abs(best->tokens - profile.probe_tokens)) {
-                best = &point;
-            }
-        }
-        if (best == nullptr || best->layers <= 0) {
-            return false;
-        }
-        const double total = use_compute_est ? best->compute_est_ms : best->wall_ms;
-        result_ms = total / best->layers;
-        return true;
-    };
-
-    if (!find_probe_block(profile.cpu_layer_blocks, false, profile.cpu_full_layer_ms) ||
-        !find_probe_block(profile.phone_layer_blocks, false, profile.phone_full_layer_ms) ||
-        !find_probe_block(profile.phone_layer_blocks, true, profile.phone_full_layer_compute_est_ms)) {
+    llama_hybrid_graph_timing cpu_timing;
+    if (!llama_hybrid_profile_full_layer_point(attn_desc, ffn_desc, cpu_backend, tokens, kv_tokens, cpu_timing)) {
         return false;
     }
-    if (gpu_backend != nullptr && !find_probe_block(profile.gpu_layer_blocks, false, profile.gpu_full_layer_ms)) {
+    profile.cpu_full_layer_ms = cpu_timing.wall_ms;
+    LLAMA_LOG_INFO("[HYBRID_PROFILE_COMPUTE] backend=%s kind=full_layer tokens=%d kv_tokens=%d ms=%.3f\n",
+                   ggml_backend_name(cpu_backend), tokens, kv_tokens, profile.cpu_full_layer_ms);
+
+    llama_hybrid_graph_timing phone_timing;
+    if (!llama_hybrid_profile_full_layer_point(attn_desc, ffn_desc, phone_backend, tokens, kv_tokens, phone_timing)) {
         return false;
+    }
+    profile.phone_full_layer_ms             = phone_timing.wall_ms;
+    profile.phone_full_layer_compute_est_ms = phone_timing.compute_est_ms;
+    LLAMA_LOG_INFO(
+        "[HYBRID_PROFILE_COMPUTE] backend=%s kind=full_layer tokens=%d kv_tokens=%d wall_ms=%.3f "
+        "compute_est_ms=%.3f\n",
+        ggml_backend_name(phone_backend), tokens, kv_tokens, profile.phone_full_layer_ms,
+        profile.phone_full_layer_compute_est_ms);
+
+    profile.gpu_full_layer_ms = 0.0;
+    if (gpu_backend != nullptr) {
+        llama_hybrid_graph_timing gpu_timing;
+        if (!llama_hybrid_profile_full_layer_point(attn_desc, ffn_desc, gpu_backend, tokens, kv_tokens, gpu_timing)) {
+            return false;
+        }
+        profile.gpu_full_layer_ms = gpu_timing.wall_ms;
+        LLAMA_LOG_INFO("[HYBRID_PROFILE_COMPUTE] backend=%s kind=full_layer tokens=%d kv_tokens=%d ms=%.3f\n",
+                       ggml_backend_name(gpu_backend), tokens, kv_tokens, profile.gpu_full_layer_ms);
     }
 
     return true;
@@ -3055,7 +2383,7 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
         }
 
         llama_hybrid_graph_timing timing;
-        if (!llama_hybrid_profile_layer_block_point(attn_desc, ffn_desc, phone_backend, n_layers, tokens, timing)) {
+        if (!llama_hybrid_profile_phone_block_point(attn_desc, ffn_desc, phone_backend, n_layers, tokens, timing)) {
             return false;
         }
 
@@ -3122,19 +2450,18 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     profile.n_embd                 = ffn_desc.n_embd;
     profile.n_ff                   = ffn_desc.n_ff;
     profile.probe_tokens           = LLAMA_HYBRID_PROFILE_TOKENS;
-    profile.reference_tokens       = LLAMA_HYBRID_REFERENCE_TOKENS;
     profile.probe_chunk_min_tokens = 4;
-    profile.profile_block_layers   = LLAMA_HYBRID_PROFILE_BLOCK_LAYERS;
 
     if (!ml.get_hybrid_weight_bytes(n_layer, profile.model_weight_bytes, profile.non_layer_weight_bytes,
                                     profile.layer_weight_bytes, profile.layer_attn_forced_bytes,
                                     profile.layer_ffn_split_bytes, profile.layer_mirrored_bytes) ||
         !llama_hybrid_profile_memory(profile, cpu.get(), phone.get(), gpu.get()) ||
-        !llama_hybrid_profile_gpu_transfer(profile, gpu.get(), cpu.get()) ||
         !llama_hybrid_profile_rpc(profile, cpu.get(), phone.get()) ||
         !llama_hybrid_profile_ffn(profile, ffn_desc, cpu.get(), phone.get()) ||
         !llama_hybrid_profile_attention(profile, attn_desc, cpu.get(), phone.get(), gpu.get()) ||
-        !llama_hybrid_profile_full_layer(profile, attn_desc, ffn_desc, cpu.get(), phone.get(), gpu.get())) {
+        !llama_hybrid_profile_full_layer(profile, attn_desc, ffn_desc, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_phone_blocks(profile, attn_desc, ffn_desc, phone.get()) ||
+        !llama_hybrid_prepare_tensor_costs(profile)) {
         LLAMA_LOG_ERROR("%s: profiling failed\n", __func__);
         return false;
     }

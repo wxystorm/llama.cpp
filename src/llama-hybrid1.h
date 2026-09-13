@@ -20,11 +20,16 @@ struct llama_hybrid_dual_transfer_point {
 };
 
 struct llama_hybrid_ffn_compute_point {
-    int     tokens        = 0;
-    float   local_ratio   = 1.0f;
-    int64_t local_ff      = 0;
-    double  ms            = 0.0;
-    size_t  runtime_bytes = 0;
+    int    tokens        = 0;
+    float  local_ratio   = 1.0f;
+    double ms            = 0.0;
+    size_t runtime_bytes = 0;
+};
+
+struct llama_hybrid_tensor_cost_point {
+    float  pc_ratio    = 0.0f;
+    int    chunk_tokens = 0;
+    double ms           = 0.0;
 };
 
 struct llama_hybrid_ffn_desc {
@@ -38,14 +43,6 @@ struct llama_hybrid_ffn_desc {
     ggml_type down_type = GGML_TYPE_COUNT;
 
     size_t weight_bytes = 0;
-};
-
-
-struct llama_hybrid_layer_compute_point {
-    int    tokens         = 0;
-    int    layers         = 0;
-    double wall_ms        = 0.0;
-    double compute_est_ms = 0.0;
 };
 
 struct llama_hybrid_attn_compute_point {
@@ -103,25 +100,19 @@ struct llama_hybrid_attn_desc {
 
 struct llama_hybrid_profile {
     int probe_tokens           = 0;
-    int reference_tokens       = 0;
     int probe_chunk_min_tokens = 0;
-    int profile_block_layers   = 0;
 
-    int     n_layer = 0;
-    int     n_embd  = 0;
-    int     n_ff    = 0;
-    int64_t ffn_shard_granularity = 0;
+    int n_layer = 0;
+    int n_embd  = 0;
+    int n_ff    = 0;
 
     std::vector<llama_hybrid_ffn_compute_point> cpu_ffn;
     std::vector<llama_hybrid_ffn_compute_point> phone_ffn;
+    std::vector<llama_hybrid_tensor_cost_point> tensor_ffn_costs;
 
     std::vector<llama_hybrid_attn_compute_point> cpu_attn;
     std::vector<llama_hybrid_attn_compute_point> phone_attn;
     std::vector<llama_hybrid_attn_compute_point> gpu_attn;
-
-    std::vector<llama_hybrid_layer_compute_point> cpu_layer_blocks;
-    std::vector<llama_hybrid_layer_compute_point> phone_layer_blocks;
-    std::vector<llama_hybrid_layer_compute_point> gpu_layer_blocks;
 
     std::vector<llama_hybrid_phone_block_point> phone_blocks;
 
@@ -134,7 +125,6 @@ struct llama_hybrid_profile {
 
     double gpu_full_layer_ms = 0.0;
 
-    std::vector<llama_hybrid_transfer_point> gpu_to_pc;
     std::vector<llama_hybrid_transfer_point> pc_to_phone;
     std::vector<llama_hybrid_transfer_point> snapshot_phone_to_pc;
     std::vector<llama_hybrid_transfer_point> phone_to_pc;
@@ -202,7 +192,6 @@ struct llama_hybrid_constraints {
     int target_ctx           = 0;
     int score_kv_tokens      = 0;
     int target_ubatch_tokens = 0;
-    int max_tensor_chunks    = 16;
 
     std::optional<int> fixed_tensor_layers;
     std::optional<int> fixed_phone_layers;
@@ -219,10 +208,6 @@ class llama_model_loader;
 
 LLAMA_API void llama_hybrid_profile_print(const llama_hybrid_profile & profile);
 LLAMA_API void llama_hybrid_plan_print(const llama_hybrid_plan & plan);
-
-LLAMA_API bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
-                                                 ggml_backend_t         gpu_backend,
-                                                 ggml_backend_t         pc_backend);
 
 LLAMA_API bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile,
                                         ggml_backend_t         pc_backend,
@@ -269,6 +254,8 @@ LLAMA_API std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(
 LLAMA_API bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
                                        const llama_hybrid_constraints & constraints,
                                        llama_hybrid_plan &              plan);
+
+LLAMA_API bool llama_hybrid_prepare_tensor_costs(llama_hybrid_profile & profile);
 
 LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);

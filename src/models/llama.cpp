@@ -15,11 +15,6 @@ static int llama_ffn_chunk_count() {
 }
 
 static int llama_prefill_ffn_chunk_count() {
-    const int planned = llama_hybrid_runtime_prefill_chunks();
-    if (planned > 0) {
-        return planned;
-    }
-
     const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");
 
     // 0 = 不启用新的 Prefill token pipeline
@@ -270,7 +265,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                                                 loras->empty() && cvec->tensor_for(il) == nullptr;
             const int64_t n_ffn_tokens = cur->ne[1];
 
-            const int n_prefill_chunks = std::min<int64_t>(llama_prefill_ffn_chunk_count(), n_ffn_tokens);
+            const int planned_chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
+            const int n_prefill_chunks = planned_chunk_tokens > 0 ?
+                (n_ffn_tokens + planned_chunk_tokens - 1) / planned_chunk_tokens :
+                std::min<int64_t>(llama_prefill_ffn_chunk_count(), n_ffn_tokens);
 
             const bool use_prefill_chunked_ffn =
                 !embed && n_tokens > 1 && n_ffn_tokens > 1 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
@@ -423,7 +421,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             } else if (use_prefill_chunked_ffn) {
                 std::vector<ggml_tensor *> down_chunks;
                 down_chunks.reserve(n_prefill_chunks);
-                const std::vector<int> chunk_sizes = llama_hybrid_split_chunks((int) n_ffn_tokens, n_prefill_chunks);
+                const std::vector<int> chunk_sizes = planned_chunk_tokens > 0 ?
+                    llama_hybrid_split_by_chunk_size((int) n_ffn_tokens, planned_chunk_tokens) :
+                    llama_hybrid_split_chunks((int) n_ffn_tokens, n_prefill_chunks);
                 GGML_ASSERT((int) chunk_sizes.size() == n_prefill_chunks);
                 int64_t token_begin = 0;
 

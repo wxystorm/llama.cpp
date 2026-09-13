@@ -2653,6 +2653,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.hybrid_auto                 =*/ false,
         /*.hybrid_target_ctx           =*/ 0,
+        /*.hybrid_target_ubatch_tokens =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

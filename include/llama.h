@@ -304,6 +304,7 @@ extern "C" {
 
         bool     hybrid_auto;
         uint32_t hybrid_target_ctx;
+        uint32_t hybrid_target_ubatch_tokens;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

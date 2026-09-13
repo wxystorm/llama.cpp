@@ -1402,8 +1402,11 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
         }
     }
 
-    const bool topo_ok = gpu_region == 2 && gpu1_begin > 0 && gpu1_end > gpu1_begin && gpu2_begin > gpu1_end &&
-                         gpu2_end == n_splits;
+    const bool topo_one_gpu =
+        gpu_region == 1 && gpu1_begin > 0 && gpu1_end > gpu1_begin && gpu1_end < n_splits;
+    const bool topo_two_gpu = gpu_region == 2 && gpu1_begin > 0 && gpu1_end > gpu1_begin &&
+                              gpu2_begin > gpu1_end && gpu2_end == n_splits;
+    const bool topo_ok = topo_one_gpu || topo_two_gpu;
 
     if (!topo_ok) {
         printf("[PIPE2_TOPO_SUM] ub=%d n_splits=%d gpu_regions=%d gpu1=[%d,%d) gpu2=[%d,%d)\n", ubatch_id,
@@ -1428,9 +1431,9 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
     slot.gpu_begin     = gpu1_begin;
     slot.gpu_end       = gpu1_end;
     slot.post_begin    = gpu1_end;
-    slot.post_end      = gpu2_begin;
-    slot.tail_begin    = gpu2_begin;
-    slot.tail_end      = gpu2_end;
+    slot.post_end      = topo_two_gpu ? gpu2_begin : n_splits;
+    slot.tail_begin    = topo_two_gpu ? gpu2_begin : n_splits;
+    slot.tail_end      = topo_two_gpu ? gpu2_end : n_splits;
     slot.active        = true;
     slot.post_prepared = false;
 
@@ -1529,6 +1532,15 @@ void llama_context::pipe_sync_post(llama_prefill_pipe_slot & slot) {
 ggml_status llama_context::pipe_run_tail(llama_prefill_pipe_slot & slot) {
     GGML_ASSERT(slot.active);
     GGML_ASSERT(!slot.post_prepared);
+
+    if (slot.tail_begin == slot.tail_end) {
+        slot.t_tail_begin = ggml_time_us();
+        slot.t_tail_end   = slot.t_tail_begin;
+        slot.active        = false;
+        slot.post_prepared = false;
+        return GGML_STATUS_SUCCESS;
+    }
+
     GGML_ASSERT(slot.tail_begin < slot.tail_end);
 
     slot.t_tail_begin = ggml_time_us();

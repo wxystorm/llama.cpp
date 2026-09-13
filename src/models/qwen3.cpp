@@ -14,11 +14,6 @@ static int qwen3_ffn_chunk_count() {
 }
 
 static int qwen3_prefill_ffn_chunk_count() {
-    const int planned = llama_hybrid_runtime_prefill_chunks();
-    if (planned > 0) {
-        return planned;
-    }
-
     const char * value = std::getenv("LLAMA_PREFILL_CHUNKS");
     return value == nullptr ? 0 : std::max(1, std::atoi(value));
 }
@@ -148,7 +143,10 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
         const llama_hybrid_layer_mode hybrid_mode      = model.hybrid_layer_mode(il);
         const int                     n_decode_chunks  = std::min<int64_t>(qwen3_ffn_chunk_count(), n_embd);
-        const int                     n_prefill_chunks = std::min<int64_t>(qwen3_prefill_ffn_chunk_count(), cur->ne[1]);
+        const int planned_chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
+        const int n_prefill_chunks = planned_chunk_tokens > 0 ?
+            (cur->ne[1] + planned_chunk_tokens - 1) / planned_chunk_tokens :
+            std::min<int64_t>(qwen3_prefill_ffn_chunk_count(), cur->ne[1]);
         const bool use_decode_chunked_ffn = n_tokens == 1 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                                             hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
                                             n_decode_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
@@ -187,7 +185,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         } else if (use_prefill_chunked_ffn) {
             std::vector<ggml_tensor *> chunks;
             chunks.reserve(n_prefill_chunks);
-            const std::vector<int> chunk_sizes = llama_hybrid_split_chunks((int) cur->ne[1], n_prefill_chunks);
+            const std::vector<int> chunk_sizes = planned_chunk_tokens > 0 ?
+                llama_hybrid_split_by_chunk_size((int) cur->ne[1], planned_chunk_tokens) :
+                llama_hybrid_split_chunks((int) cur->ne[1], n_prefill_chunks);
             GGML_ASSERT((int) chunk_sizes.size() == n_prefill_chunks);
             int64_t token_begin = 0;
             for (int i = 0; i < n_prefill_chunks; ++i) {

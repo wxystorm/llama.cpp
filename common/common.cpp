@@ -1220,8 +1220,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.hybrid_auto) {
-        mparams.hybrid_auto       = true;
-        mparams.hybrid_target_ctx = cparams.n_ctx;
+        mparams.hybrid_auto                  = true;
+        mparams.hybrid_target_ctx            = cparams.n_ctx;
+        mparams.hybrid_target_ubatch_tokens  = cparams.n_ubatch;
     }
 
     if (params.fit_params && !params.hybrid_auto) {

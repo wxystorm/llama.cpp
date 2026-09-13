@@ -309,7 +309,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (params.hybrid_auto && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
-            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u\n", params.hybrid_target_ctx);
+            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u target_ubatch=%u\n",
+                           params.hybrid_target_ctx, params.hybrid_target_ubatch_tokens);
 
             if (!llama_hybrid_autoplan(ml, params, best)) {
                 LLAMA_LOG_ERROR("[HYBRID_AUTO] planner failed\n");
@@ -322,10 +323,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 return {-1, nullptr};
             }
 
-            LLAMA_LOG_INFO(
-                "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d K=%d predicted=%.3f ms\n",
+            LLAMA_LOG_ERROR(
+                "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d X=%d predicted=%.3f ms\n",
                 best.tensor_layers, best.phone_layers, best.pc_layers, best.tensor_pc_ratio, best.gpu_pc_layers,
-                best.tensor_chunks_per_ubatch, best.predicted_ms);
+                best.tensor_chunk_tokens, best.predicted_ms);
         }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());

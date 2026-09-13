@@ -179,9 +179,7 @@ int main(int argc, char ** argv) {
         profile.n_ff    = desc.n_ff;
 
         profile.probe_tokens           = 16;
-        profile.reference_tokens       = 128;
         profile.probe_chunk_min_tokens = 4;
-        profile.profile_block_layers   = 5;
 
         if (!ml.get_hybrid_weight_bytes(n_layer, profile.model_weight_bytes, profile.non_layer_weight_bytes,
                                         profile.layer_weight_bytes, profile.layer_attn_forced_bytes,
@@ -207,17 +205,6 @@ int main(int argc, char ** argv) {
         if (!llama_hybrid_profile_memory(profile, cpu, phone, gpu)) {
             fprintf(stderr, "memory profile failed\n");
 
-            if (gpu != nullptr) {
-                ggml_backend_free(gpu);
-            }
-            ggml_backend_free(phone);
-            ggml_backend_free(cpu);
-            return 1;
-        }
-
-        printf("\n=== GPU -> PC TRANSFER PROFILE ===\n");
-        if (!llama_hybrid_profile_gpu_transfer(profile, gpu, cpu)) {
-            fprintf(stderr, "gpu transfer profile failed\n");
             if (gpu != nullptr) {
                 ggml_backend_free(gpu);
             }
@@ -287,6 +274,30 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        printf("\n=== PHONE BLOCK PROFILE ===\n");
+
+        if (!llama_hybrid_profile_phone_blocks(profile, attn_desc, desc, phone)) {
+            fprintf(stderr, "phone block profile failed\n");
+
+            if (gpu != nullptr) {
+                ggml_backend_free(gpu);
+            }
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+
+        if (!llama_hybrid_prepare_tensor_costs(profile)) {
+            fprintf(stderr, "tensor cost preparation failed\n");
+
+            if (gpu != nullptr) {
+                ggml_backend_free(gpu);
+            }
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+
         //
         // 8. 打印最终 profile
         //
@@ -297,9 +308,8 @@ int main(int argc, char ** argv) {
         printf("\n=== PHASE 4A PLAN ENUM ===\n");
 
         llama_hybrid_constraints constraints;
-        constraints.target_ctx           = 512;
-        constraints.score_kv_tokens      = 512;
-        constraints.target_ubatch_tokens = 16;
+        constraints.target_ctx      = 512;
+        constraints.score_kv_tokens = 512;
 
         const std::vector<llama_hybrid_plan> feasible = llama_hybrid_enumerate_feasible_plans(profile, constraints);
         printf("feasible plans: %zu\n", feasible.size());
