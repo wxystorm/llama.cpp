@@ -1057,6 +1057,8 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t request_done_us = ggml_time_us();
 
+        GGML_LOG_ERROR("[RPC_SNAPSHOT_GET] slot=%u seq=%" PRIu64 " size=%zu\n", request.slot, request.seq, size);
+
         status = snapshot_sock->recv_data(
             data,
             size);
@@ -2459,6 +2461,11 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         if (slot.seq != request.seq ||
             slot.state != rpc_snapshot_state::READY ||
             slot.data.size() != request.size) {
+            fprintf(stderr,
+                    "[RPC_SNAPSHOT_MISMATCH] slot=%u req_seq=%" PRIu64 " cur_seq=%" PRIu64
+                    " req_size=%" PRIu64 " cur_size=%zu state=%d\n",
+                    request.slot, request.seq, slot.seq, request.size, slot.data.size(), (int) slot.state);
+            fflush(stderr);
             return false;
         }
 

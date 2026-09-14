@@ -2013,7 +2013,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_hybrid_plan runtime_plan;
     const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
-    const bool stage_queue_requested = std::getenv("LLAMA_HYBRID_STAGE_QUEUE") != nullptr;
+    const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
+    const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
     const bool stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan && runtime_plan.gpu_pc_layers > 0 &&
         runtime_plan.pc_layers == runtime_plan.gpu_pc_layers && runtime_plan.tensor_layers > 0 &&
@@ -2030,10 +2031,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const uint32_t xg = std::min<uint32_t>(cparams.n_ubatch, runtime_plan.gpu_chunk_tokens);
         const uint32_t n_macros = (n_tokens_all + xg - 1) / xg;
 
-        stage_queue_runtime_enabled = true;
-        runtime_ubatch = xg;
-        LLAMA_LOG_ERROR("[STAGEQ] batch=%u XG=%u macros=%u XT=%d overlap=%d warmup=%d\n", n_tokens_all, xg,
-                        n_macros, runtime_plan.tensor_chunk_tokens, (int) (n_macros >= 2), (int) cparams.warmup);
+        stage_queue_runtime_enabled = n_macros >= 2;
+        if (stage_queue_runtime_enabled) {
+            runtime_ubatch = xg;
+        }
+        LLAMA_LOG_ERROR("[STAGEQ] batch=%u XG=%u macros=%u XT=%d enabled=%d overlap=%d warmup=%d\n", n_tokens_all,
+                        xg, n_macros, runtime_plan.tensor_chunk_tokens, (int) stage_queue_runtime_enabled,
+                        (int) (n_macros >= 2), (int) cparams.warmup);
     }
 
     bool did_optimize = false;
