@@ -2454,8 +2454,7 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(lock, [&]() {
-            return (slot.seq == request.seq && slot.state == rpc_snapshot_state::READY) ||
-                   slot.seq > request.seq;
+            return slot.seq == request.seq && slot.state == rpc_snapshot_state::READY;
         });
 
         if (slot.seq != request.seq ||
