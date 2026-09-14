@@ -1057,7 +1057,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t request_done_us = ggml_time_us();
 
-        GGML_LOG_ERROR("[RPC_SNAPSHOT_GET] slot=%u seq=%" PRIu64 " size=%zu\n", request.slot, request.seq, size);
+        GGML_LOG_INFO("[RPC_SNAPSHOT_GET] slot=%u seq=%" PRIu64 " size=%zu\n", request.slot, request.seq, size);
 
         status = snapshot_sock->recv_data(
             data,

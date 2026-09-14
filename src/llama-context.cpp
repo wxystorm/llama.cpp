@@ -2183,7 +2183,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         const bool pipe_candidate =
-            pipeline_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 && n_outputs == 0 &&
+            pipeline_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 &&
+            (n_outputs == 0 || stage_queue_runtime_enabled) &&
             !cparams.embeddings && !cparams.embeddings_nextn && cparams.cb_eval == nullptr &&
             std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
                          [](bool enabled) { return enabled; });
@@ -2274,7 +2275,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
 
                 if (status == GGML_STATUS_SUCCESS) {
-                    pipe_success = true;
+                    if (n_outputs > 0) {
+                        status = stage_queue_drain();
+                        if (status == GGML_STATUS_SUCCESS) {
+                            GGML_ASSERT(!cur.active);
+                            res       = cur.res;
+                            sched_use = cur.sched;
+                        }
+                    } else {
+                        pipe_success = true;
+                    }
                 }
             } else if (pipe_ready) {
                 status = pipe_run_pre(cur);
