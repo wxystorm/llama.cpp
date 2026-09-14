@@ -176,8 +176,12 @@ struct llama_hybrid_plan {
 
     float tensor_pc_ratio = 0.0f;
 
-    int gpu_pc_layers       = 0;
+    int gpu_pc_layers = 0;
+
+    int gpu_chunk_tokens    = 4;
+    int cpu_chunk_tokens    = 4;
     int tensor_chunk_tokens = 4;
+    int phone_chunk_tokens  = 4;
 
     double predicted_ms = 0.0;
 
@@ -210,7 +214,11 @@ struct llama_hybrid_constraints {
 
     std::optional<float> fixed_tensor_pc_ratio;
     std::optional<int>   fixed_gpu_pc_layers;
+
+    std::optional<int> fixed_gpu_chunk_tokens;
+    std::optional<int> fixed_cpu_chunk_tokens;
     std::optional<int>   fixed_tensor_chunk_tokens;
+    std::optional<int> fixed_phone_chunk_tokens;
 };
 
 struct ggml_backend;

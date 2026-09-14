@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
+#include "llama-hybrid.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -544,7 +546,7 @@ void llama_context::sched_reserve() {
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
-    LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+    LLAMA_LOG_ERROR("[GRAPH_CAP] tokens=%u max_nodes=%zu\n", n_tokens, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -1350,6 +1352,7 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
                                       llm_graph_type            gtype,
                                       llama_memory_context_i *  mctx,
                                       int                       ubatch_id,
+                                      bool                      stage_queue,
                                       ggml_status &             ret) {
     GGML_ASSERT(!slot.active);
 
@@ -1402,11 +1405,13 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
         }
     }
 
+    const bool topo_stage_queue =
+        gpu_region == 1 && gpu1_begin >= 0 && gpu1_end > gpu1_begin && gpu1_end < n_splits;
     const bool topo_one_gpu =
         gpu_region == 1 && gpu1_begin > 0 && gpu1_end > gpu1_begin && gpu1_end < n_splits;
     const bool topo_two_gpu = gpu_region == 2 && gpu1_begin > 0 && gpu1_end > gpu1_begin &&
                               gpu2_begin > gpu1_end && gpu2_end == n_splits;
-    const bool topo_ok = topo_one_gpu || topo_two_gpu;
+    const bool topo_ok = stage_queue ? topo_stage_queue : (topo_one_gpu || topo_two_gpu);
 
     if (!topo_ok) {
         printf("[PIPE2_TOPO_SUM] ub=%d n_splits=%d gpu_regions=%d gpu1=[%d,%d) gpu2=[%d,%d)\n", ubatch_id,
@@ -1426,14 +1431,15 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
     }
 
     slot.ubatch_id     = ubatch_id;
+    slot.n_tokens      = ubatch.n_tokens;
     slot.pre_begin     = 0;
     slot.pre_end       = gpu1_begin;
     slot.gpu_begin     = gpu1_begin;
     slot.gpu_end       = gpu1_end;
     slot.post_begin    = gpu1_end;
-    slot.post_end      = topo_two_gpu ? gpu2_begin : n_splits;
-    slot.tail_begin    = topo_two_gpu ? gpu2_begin : n_splits;
-    slot.tail_end      = topo_two_gpu ? gpu2_end : n_splits;
+    slot.post_end      = !stage_queue && topo_two_gpu ? gpu2_begin : n_splits;
+    slot.tail_begin    = !stage_queue && topo_two_gpu ? gpu2_begin : n_splits;
+    slot.tail_end      = !stage_queue && topo_two_gpu ? gpu2_end : n_splits;
     slot.active        = true;
     slot.post_prepared = false;
 
@@ -1447,6 +1453,13 @@ bool llama_context::prepare_pipe_slot(llama_prefill_pipe_slot & slot,
 ggml_status llama_context::pipe_run_pre(llama_prefill_pipe_slot & slot) {
     GGML_ASSERT(slot.active);
     slot.t_pre_begin = ggml_time_us();
+
+    if (slot.pre_begin == slot.pre_end) {
+        slot.t_pre_end = slot.t_pre_begin;
+        return GGML_STATUS_SUCCESS;
+    }
+
+    GGML_ASSERT(slot.pre_begin < slot.pre_end);
     printf("[PIPE2] ub=%d PRE_BEGIN t=%" PRId64 "\n", slot.ubatch_id, slot.t_pre_begin);
 
     const ggml_status status = graph_compute_range(slot.sched, slot.pre_begin, slot.pre_end, true);
@@ -1998,6 +2011,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     sched_reserve();
 
+    llama_hybrid_plan runtime_plan;
+    const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
+    const bool stage_queue_requested = std::getenv("LLAMA_HYBRID_STAGE_QUEUE") != nullptr;
+    const bool stage_queue_plan_eligible =
+        stage_queue_requested && has_runtime_plan && runtime_plan.gpu_pc_layers > 0 &&
+        runtime_plan.pc_layers == runtime_plan.gpu_pc_layers && runtime_plan.tensor_layers > 0 &&
+        runtime_plan.phone_layers == 0;
+
+    if (stage_queue_requested && !stage_queue_plan_eligible) {
+        LLAMA_LOG_WARN(
+            "[STAGEQ] disabled: requires a runtime GPU->TENSOR plan with G=C, T>0, and P=0\n");
+    }
+
+    bool stage_queue_runtime_enabled = false;
+    uint32_t runtime_ubatch = cparams.n_ubatch;
+    if (stage_queue_plan_eligible) {
+        const uint32_t xg = std::min<uint32_t>(cparams.n_ubatch, runtime_plan.gpu_chunk_tokens);
+        const uint32_t n_macros = (n_tokens_all + xg - 1) / xg;
+
+        stage_queue_runtime_enabled = true;
+        runtime_ubatch = xg;
+        LLAMA_LOG_ERROR("[STAGEQ] batch=%u XG=%u macros=%u XT=%d overlap=%d warmup=%d\n", n_tokens_all, xg,
+                        n_macros, runtime_plan.tensor_chunk_tokens, (int) (n_macros >= 2), (int) cparams.warmup);
+    }
+
     bool did_optimize = false;
 
     // handle any pending shifts/copies
@@ -2006,7 +2044,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, runtime_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
@@ -2064,8 +2102,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
     pipe_slots[1].sched = sched_pipe.get();
     pipe_slots[1].res   = gf_res_pipe.get();
 
+    std::deque<llama_prefill_pipe_slot *> handoff_q;
+    std::deque<llama_prefill_pipe_slot *> tensor_ready_q;
+
     llama_prefill_pipe_slot * prev                     = nullptr;
-    bool                      pipeline_runtime_enabled = std::getenv("LLAMA_PREFILL_STAGE_PIPELINE") != nullptr;
+    bool legacy_pipeline_runtime_enabled = std::getenv("LLAMA_PREFILL_STAGE_PIPELINE") != nullptr;
+    bool pipeline_runtime_enabled = stage_queue_runtime_enabled || legacy_pipeline_runtime_enabled;
+
+    const auto stage_queue_handoff = [&](llama_prefill_pipe_slot & slot) {
+        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d HANDOFF_BEGIN\n", slot.ubatch_id, slot.ubatch_id & 1);
+        const ggml_status status = pipe_prepare_post(slot);
+        if (status == GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_READY\n", slot.ubatch_id, slot.ubatch_id & 1);
+        }
+        return status;
+    };
+
+    const auto stage_queue_run_tensor = [&](llama_prefill_pipe_slot & slot) {
+        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_BEGIN tokens=%u XT=%d\n", slot.ubatch_id,
+                        slot.ubatch_id & 1, slot.n_tokens, runtime_plan.tensor_chunk_tokens);
+        ggml_status status = pipe_run_post_prepared(slot);
+        if (status == GGML_STATUS_SUCCESS) {
+            pipe_sync_post(slot);
+            status = pipe_run_tail(slot);
+        }
+        if (status == GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_END\n", slot.ubatch_id, slot.ubatch_id & 1);
+        }
+        return status;
+    };
+
+    const auto stage_queue_drain = [&]() {
+        ggml_status status = GGML_STATUS_SUCCESS;
+        while (status == GGML_STATUS_SUCCESS && !handoff_q.empty()) {
+            llama_prefill_pipe_slot * task = handoff_q.front();
+            handoff_q.pop_front();
+            status = stage_queue_handoff(*task);
+            if (status == GGML_STATUS_SUCCESS) {
+                tensor_ready_q.push_back(task);
+            }
+        }
+        while (status == GGML_STATUS_SUCCESS && !tensor_ready_q.empty()) {
+            llama_prefill_pipe_slot * task = tensor_ready_q.front();
+            tensor_ready_q.pop_front();
+            status = stage_queue_run_tensor(*task);
+        }
+        return status;
+    };
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2110,12 +2193,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(!cur.active);
 
             const bool pipe_ready = prepare_pipe_slot(
-                cur, ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), ubatch_id, status);
+                cur, ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), ubatch_id,
+                stage_queue_runtime_enabled, status);
 
             if (!pipe_ready && status == GGML_STATUS_SUCCESS) {
                 pipeline_runtime_enabled = false;
+                legacy_pipeline_runtime_enabled = false;
 
-                if (prev != nullptr) {
+                if (stage_queue_runtime_enabled) {
+                    status = stage_queue_drain();
+                    stage_queue_runtime_enabled = false;
+                } else if (prev != nullptr) {
                     status = pipe_prepare_post(*prev);
 
                     if (status == GGML_STATUS_SUCCESS) {
@@ -2154,6 +2242,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
                 }
+            } else if (pipe_ready && stage_queue_runtime_enabled) {
+                status = pipe_run_pre(cur);
+
+                if (status == GGML_STATUS_SUCCESS && !handoff_q.empty()) {
+                    llama_prefill_pipe_slot * task = handoff_q.front();
+                    handoff_q.pop_front();
+                    status = stage_queue_handoff(*task);
+                    if (status == GGML_STATUS_SUCCESS) {
+                        tensor_ready_q.push_back(task);
+                    }
+                }
+
+                if (status == GGML_STATUS_SUCCESS) {
+                    status = pipe_run_gpu(cur);
+                    if (status == GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d GPU_SUBMIT tokens=%u\n", cur.ubatch_id,
+                                        slot_id, cur.n_tokens);
+                        handoff_q.push_back(&cur);
+                    }
+                }
+
+                if (status == GGML_STATUS_SUCCESS && !tensor_ready_q.empty()) {
+                    llama_prefill_pipe_slot * task = tensor_ready_q.front();
+                    tensor_ready_q.pop_front();
+                    status = stage_queue_run_tensor(*task);
+                }
+
+                if (status == GGML_STATUS_SUCCESS) {
+                    pipe_success = true;
+                }
             } else if (pipe_ready) {
                 status = pipe_run_pre(cur);
 
@@ -2189,9 +2307,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     slot.post_prepared = false;
                 }
                 prev = nullptr;
+                handoff_q.clear();
+                tensor_ready_q.clear();
             }
         } else {
-            if (prev != nullptr) {
+            if (stage_queue_runtime_enabled) {
+                status = stage_queue_drain();
+            } else if (prev != nullptr) {
                 status = pipe_prepare_post(*prev);
                 if (status == GGML_STATUS_SUCCESS) {
                     status = pipe_run_post_prepared(*prev);
@@ -2395,7 +2517,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ubatch_id++;
     } while (mctx->next());
 
-    if (prev != nullptr) {
+    if (stage_queue_runtime_enabled && (!handoff_q.empty() || !tensor_ready_q.empty())) {
+        const ggml_status status = stage_queue_drain();
+        if (status != GGML_STATUS_SUCCESS) {
+            synchronize();
+            switch (status) {
+                case GGML_STATUS_ABORTED:
+                    return 2;
+                case GGML_STATUS_ALLOC_FAILED:
+                    return -2;
+                case GGML_STATUS_FAILED:
+                    return -3;
+                case GGML_STATUS_SUCCESS:
+                    GGML_ABORT("should not happen");
+            }
+        }
+    } else if (prev != nullptr) {
         ggml_status status = pipe_prepare_post(*prev);
         if (status == GGML_STATUS_SUCCESS) {
             status = pipe_run_post_prepared(*prev);
@@ -2748,14 +2885,20 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint64_t base;
+
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        base = std::max<uint64_t>((uint64_t) n_tokens * 40, (uint64_t) 32 * model.n_tensors());
+    } else {
+        base = std::max<uint64_t>(1024, (uint64_t) 8 * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    uint64_t res = base;
+
     if (model.arch == LLM_ARCH_LLAMA && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         constexpr uint32_t default_chunks = 2;
         const char * value = std::getenv("LLAMA_CHUNKS");
@@ -2765,12 +2908,32 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
         // Each decode chunk adds down, reduction, RMS preparation, and partial
         // Q/K/V tensors. This arena is shared by prefill and decode graphs.
-        res += model.hparams.n_layer() * (24u*n_chunks + 24u);
+        res += (uint64_t) model.hparams.n_layer() * (24ull*n_chunks + 24ull);
     }
+
+    const int chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
+
+    if (chunk_tokens > 0 && model.hparams.n_layer() > 0) {
+        const auto chunks = llama_hybrid_split_by_chunk_size((int) n_tokens, chunk_tokens);
+        const uint64_t n_chunks = chunks.size();
+
+        if (n_chunks > 1) {
+            const uint64_t tensor_layers = std::count(
+                    model.hybrid_layer_modes.begin(),
+                    model.hybrid_layer_modes.end(),
+                    llama_hybrid_layer_mode::TENSOR_SPLIT);
+            const uint64_t n_layers = model.hparams.n_layer();
+            const uint64_t base_nodes_per_layer = (base + n_layers - 1) / n_layers;
+
+            res += tensor_layers * (n_chunks - 1) * base_nodes_per_layer;
+        }
+    }
+
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
-    return res;
+
+    return (uint32_t) std::min<uint64_t>(res, std::numeric_limits<uint32_t>::max());
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
@@ -2816,7 +2979,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
+    LLAMA_LOG_ERROR("[GRAPH_RESERVE_BEGIN] tokens=%u outputs=%u\n", n_tokens, n_outputs);
     auto * gf = model.build_graph(gparams);
+    LLAMA_LOG_ERROR("[GRAPH_RESERVE_END] tokens=%u nodes=%d\n", n_tokens, ggml_graph_n_nodes(gf));
 
     this->n_outputs = save_n_outputs;
 

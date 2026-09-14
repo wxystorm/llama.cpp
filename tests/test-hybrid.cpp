@@ -299,7 +299,7 @@ int main(int argc, char ** argv) {
         llama_hybrid_constraints constraints;
         constraints.target_ctx           = 512;
         constraints.score_kv_tokens      = 512;
-        constraints.target_ubatch_tokens = 16;
+        constraints.target_ubatch_tokens = 512;
 
         const std::vector<llama_hybrid_plan> feasible = llama_hybrid_enumerate_feasible_plans(profile, constraints);
         printf("feasible plans: %zu\n", feasible.size());
@@ -361,9 +361,17 @@ int main(int argc, char ** argv) {
         if (!llama_hybrid_runtime_plan_get(verified)) {
             throw std::runtime_error("failed to read back the best hybrid plan");
         }
-        printf("[HYBRID_RUNTIME_VERIFY] T=%d P=%d C=%d R=%.3f G=%d X=%d\n", verified.tensor_layers,
-               verified.phone_layers, verified.pc_layers, verified.tensor_pc_ratio, verified.gpu_pc_layers,
-               verified.tensor_chunk_tokens);
+        if (verified.gpu_chunk_tokens <= 0 || verified.cpu_chunk_tokens <= 0 ||
+            verified.tensor_chunk_tokens <= 0 || verified.phone_chunk_tokens <= 0) {
+            throw std::runtime_error("invalid independent chunk sizes in the runtime plan");
+        }
+        if (llama_hybrid_runtime_prefill_chunk_tokens() != verified.tensor_chunk_tokens) {
+            throw std::runtime_error("runtime prefill must continue to use only the tensor chunk size");
+        }
+        printf("[HYBRID_RUNTIME_VERIFY] T=%d P=%d C=%d R=%.3f G=%d XG=%d XC=%d XT=%d XP=%d\n",
+               verified.tensor_layers, verified.phone_layers, verified.pc_layers, verified.tensor_pc_ratio,
+               verified.gpu_pc_layers, verified.gpu_chunk_tokens, verified.cpu_chunk_tokens,
+               verified.tensor_chunk_tokens, verified.phone_chunk_tokens);
 
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());

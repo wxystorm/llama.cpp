@@ -420,6 +420,22 @@ static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
     return policy;
 }
 
+static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
+        int n_layer, int pc_layers, int tensor_layers, int phone_layers) {
+    GGML_ASSERT(pc_layers + tensor_layers + phone_layers == n_layer);
+
+    std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
+
+    const int pc_end     = pc_layers;
+    const int tensor_end = pc_end + tensor_layers;
+
+    std::fill(policy.begin(), policy.begin() + pc_end, llama_hybrid_layer_mode::PC_ONLY);
+    std::fill(policy.begin() + pc_end, policy.begin() + tensor_end, llama_hybrid_layer_mode::TENSOR_SPLIT);
+    std::fill(policy.begin() + tensor_end, policy.end(), llama_hybrid_layer_mode::PHONE_ONLY);
+
+    return policy;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -1413,7 +1429,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const int phone_layers = has_runtime_plan ? runtime_plan.phone_layers :
             std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
         const int gpu_pc_layers = has_runtime_plan ? runtime_plan.gpu_pc_layers : llama_hybrid_gpu_pc_layers();
-        const std::string pc_layout = has_runtime_plan ? "tail" :
+        const std::string pc_layout = has_runtime_plan ? "gpu-cpu-tensor-phone" :
             (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
 
         if (has_runtime_plan) {
@@ -1423,7 +1439,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
-        hybrid_layer_modes = llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
+        hybrid_layer_modes = has_runtime_plan ?
+            llama_build_hybrid_plan_policy(
+                n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers, runtime_plan.phone_layers) :
+            llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
+
+        if (has_runtime_plan) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) TENSOR=[%d,%d) PHONE=[%d,%d)\n",
+                runtime_plan.gpu_pc_layers,
+                runtime_plan.gpu_pc_layers, runtime_plan.pc_layers,
+                runtime_plan.pc_layers, runtime_plan.pc_layers + runtime_plan.tensor_layers,
+                runtime_plan.pc_layers + runtime_plan.tensor_layers, n_layer);
+        }
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
         std::vector<int> pc_layer_ids;
@@ -1909,7 +1937,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                const size_t ctx_used = ggml_used_mem(ctx);
+                const size_t ctx_size = ggml_get_mem_size(ctx);
+                LLAMA_LOG_ERROR(
+                    "[MODEL_ALLOC_CTX_BEGIN] buft=%s used=%zu size=%zu free=%zu\n",
+                    ggml_backend_buft_name(buft), ctx_used, ctx_size, ctx_size - ctx_used);
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer   context很重要
+                LLAMA_LOG_ERROR("[MODEL_ALLOC_CTX_END] buft=%s\n", ggml_backend_buft_name(buft));
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

@@ -262,7 +262,8 @@ private:
         ggml_backend_sched_t sched = nullptr;
         llm_graph_result *   res   = nullptr;
 
-        int ubatch_id = -1;
+        int      ubatch_id = -1;
+        uint32_t n_tokens  = 0;
 
         int pre_begin = 0;
         int pre_end   = 0;
@@ -297,6 +298,7 @@ private:
                            llm_graph_type            gtype,
                            llama_memory_context_i *  mctx,
                            int                       ubatch_id,
+                           bool                      stage_queue,
                            ggml_status &             ret);
 
     ggml_status pipe_run_pre(llama_prefill_pipe_slot & slot);

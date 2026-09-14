@@ -324,9 +324,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
 
             LLAMA_LOG_ERROR(
-                "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d X=%d predicted=%.3f ms\n",
+                "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d XG=%d XC=%d XT=%d XP=%d "
+                "predicted=%.3f ms\n",
                 best.tensor_layers, best.phone_layers, best.pc_layers, best.tensor_pc_ratio, best.gpu_pc_layers,
-                best.tensor_chunk_tokens, best.predicted_ms);
+                best.gpu_chunk_tokens, best.cpu_chunk_tokens, best.tensor_chunk_tokens, best.phone_chunk_tokens,
+                best.predicted_ms);
         }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
