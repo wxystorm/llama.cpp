@@ -2657,17 +2657,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
-    // add on pooling layer
-    llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    if (params.stage.kind == llm_graph_stage_kind::FULL || params.stage.build_output_head) {
+        // add on pooling layer
+        llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
-    // add backend sampling layers (if any)
-    llm->build_sampling();
+        // add backend sampling layers (if any)
+        llm->build_sampling();
 
-    // if the gguf model was converted with --sentence-transformers-dense-modules
-    // there will be two additional dense projection layers
-    // dense linear projections are applied after pooling
-    // TODO: move reranking logic here and generalize
-    llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+        // if the gguf model was converted with --sentence-transformers-dense-modules
+        // there will be two additional dense projection layers
+        // dense linear projections are applied after pooling
+        // TODO: move reranking logic here and generalize
+        llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+    }
 
     llm->res->set_outputs(params);
 

@@ -38,6 +38,21 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DECODER_MTP,
 };
 
+enum class llm_graph_stage_kind {
+    FULL,
+    GPU_PREFIX,
+    CPU_MIDDLE,
+    TENSOR_SUFFIX,
+};
+
+struct llm_graph_stage_desc {
+    llm_graph_stage_kind kind = llm_graph_stage_kind::FULL;
+    int32_t layer_begin       = 0;
+    int32_t layer_end         = -1;
+    bool build_embeddings     = true;
+    bool build_output_head    = true;
+};
+
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_GDN_AR,
@@ -144,6 +159,20 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+
+    const int64_t n_embd = 0;
+};
+
+class llm_graph_input_stage : public llm_graph_input_i {
+public:
+    llm_graph_input_stage(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_stage() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * hidden = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
 };
@@ -707,6 +736,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    llm_graph_stage_desc stage;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -773,6 +804,11 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            stage.kind                      == other.stage.kind                      &&
+            stage.layer_begin               == other.stage.layer_begin               &&
+            stage.layer_end                 == other.stage.layer_end                 &&
+            stage.build_embeddings          == other.stage.build_embeddings          &&
+            stage.build_output_head         == other.stage.build_output_head         &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -798,6 +834,8 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_stage_input()  const { return t_stage_input; }
+    ggml_tensor * get_stage_output() const { return t_stage_output; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -833,6 +871,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_stage_input = nullptr; // [n_embd, n_tokens]
+    ggml_tensor * t_stage_output = nullptr; // [n_embd, n_tokens]
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1046,6 +1086,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_stage(int il) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
