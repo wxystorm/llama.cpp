@@ -20,6 +20,8 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+enum class llama_hybrid_boundary_action;
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
@@ -341,6 +343,35 @@ private:
                                       const std::vector<llama_hybrid_runtime_stage> & stages,
                                       int                                             ubatch_id,
                                       ggml_status &                                   ret);
+
+    llm_graph_result * run_hybrid_stage_block(
+                                      const llama_ubatch &                 ubatch,
+                                      const llama_hybrid_runtime_stage &   stage,
+                                      uint32_t                             token_begin,
+                                      uint32_t                             block_tokens,
+                                      float *                              stage_input,
+                                      float *                              stage_output,
+                                      llm_graph_type                       gtype,
+                                      llama_memory_context_i *            mctx,
+                                      ggml_backend_sched_t                 sched_use,
+                                      llm_graph_result *                   res_use,
+                                      int                                  ubatch_id,
+                                      size_t                               stage_index,
+                                      size_t                               block_index,
+                                      llama_hybrid_boundary_action         action,
+                                      int32_t                              block_outputs,
+                                      bool &                               apply_mctx,
+                                      bool                                 synchronize,
+                                      ggml_status &                        ret);
+
+    bool copy_hybrid_stage_output(
+                                      llm_graph_result *   res,
+                                      ggml_backend_sched_t sched_use,
+                                      float *              output,
+                                      uint32_t             n_tokens,
+                                      int                  ubatch_id,
+                                      size_t               stage_index,
+                                      size_t               block_index);
 
     ggml_status graph_compute_range(ggml_backend_sched_t sched_use, int first_split, int last_split, bool batched);
 

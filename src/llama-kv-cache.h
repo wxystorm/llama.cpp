@@ -399,7 +399,7 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
-    bool set_stage_range(uint32_t token_begin, uint32_t n_tokens);
+    bool set_stage_range(size_t ubatch_index, uint32_t token_begin, uint32_t n_tokens);
     void clear_stage_range();
 
 private:

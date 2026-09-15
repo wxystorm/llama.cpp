@@ -2635,8 +2635,12 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
 
-bool llama_kv_cache_context::set_stage_range(uint32_t token_begin, uint32_t n_tokens) {
-    const auto & sinfo = sinfos[i_cur];
+bool llama_kv_cache_context::set_stage_range(size_t ubatch_index, uint32_t token_begin, uint32_t n_tokens) {
+    if (ubatch_index >= sinfos.size()) {
+        return false;
+    }
+
+    const auto & sinfo = sinfos[ubatch_index];
     if (sinfo.n_stream() != 1 || n_tokens == 0 || token_begin > sinfo.size() ||
         n_tokens > sinfo.size() - token_begin) {
         return false;
