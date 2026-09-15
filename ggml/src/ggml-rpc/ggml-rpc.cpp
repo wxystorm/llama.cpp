@@ -2451,14 +2451,21 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     const int64_t wait_start = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
-        slot.cv.wait(lock, [&]() {
-            return (slot.seq == request.seq && slot.state == rpc_snapshot_state::READY) ||
-                   slot.seq > request.seq;
-        });
+        slot.cv.wait(lock, [&]() { return slot.state == rpc_snapshot_state::READY; });
 
         if (slot.seq != request.seq ||
             slot.state != rpc_snapshot_state::READY ||
             slot.data.size() != request.size) {
+            GGML_LOG_ERROR(
+                "[RPC_SNAPSHOT_MISMATCH] device=%u slot=%u request_seq=%" PRIu64
+                " slot_seq=%" PRIu64 " state=%d request_size=%" PRIu64 " slot_size=%zu\n",
+                request.device,
+                request.slot,
+                request.seq,
+                slot.seq,
+                (int) slot.state,
+                request.size,
+                slot.data.size());
             return false;
         }
 
