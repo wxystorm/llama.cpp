@@ -39,6 +39,21 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+enum class llama_hybrid_runtime_stage_kind {
+    GPU,
+    CPU,
+    TENSOR,
+    PHONE,
+};
+
+struct llama_hybrid_runtime_stage {
+    llama_hybrid_runtime_stage_kind kind;
+    int layer_begin;
+    int layer_end;
+    int macro_tokens;
+    int inner_chunk_tokens;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -314,7 +329,18 @@ private:
                                       llm_graph_type           gtype,
                                       llama_memory_context_i * mctx,
                                       ggml_status &            ret,
-                                      bool                     apply_mctx = true);
+                                      bool                     apply_mctx = true,
+                                      const llama_hybrid_runtime_stage * stage = nullptr);
+
+    llm_graph_result * process_ubatch_staged(
+                                      const llama_ubatch &                            ubatch,
+                                      llm_graph_type                                  gtype,
+                                      llama_memory_context_i *                       mctx,
+                                      ggml_backend_sched_t                           sched_use,
+                                      llm_graph_result *                             res_use,
+                                      const std::vector<llama_hybrid_runtime_stage> & stages,
+                                      int                                             ubatch_id,
+                                      ggml_status &                                   ret);
 
     ggml_status graph_compute_range(ggml_backend_sched_t sched_use, int first_split, int last_split, bool batched);
 

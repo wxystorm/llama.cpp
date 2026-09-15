@@ -2576,19 +2576,19 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, current_sinfo());
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, current_sinfo());
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, current_sinfo());
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, current_sinfo());
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2612,11 +2612,11 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
+    kv->set_input_k_idxs(dst, ubatch, current_sinfo());
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+    kv->set_input_v_idxs(dst, ubatch, current_sinfo());
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
@@ -2633,4 +2633,28 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+bool llama_kv_cache_context::set_stage_range(uint32_t token_begin, uint32_t n_tokens) {
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.n_stream() != 1 || n_tokens == 0 || token_begin > sinfo.size() ||
+        n_tokens > sinfo.size() - token_begin) {
+        return false;
+    }
+
+    stage_sinfo = sinfo;
+    stage_sinfo.idxs[0].assign(
+        sinfo.idxs[0].begin() + token_begin,
+        sinfo.idxs[0].begin() + token_begin + n_tokens);
+    has_stage_sinfo = true;
+    return true;
+}
+
+void llama_kv_cache_context::clear_stage_range() {
+    has_stage_sinfo = false;
+    stage_sinfo.clear();
+}
+
+const llama_kv_cache::slot_info & llama_kv_cache_context::current_sinfo() const {
+    return has_stage_sinfo ? stage_sinfo : sinfos[i_cur];
 }

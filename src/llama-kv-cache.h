@@ -399,6 +399,9 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    bool set_stage_range(uint32_t token_begin, uint32_t n_tokens);
+    void clear_stage_range();
+
 private:
     llama_memory_status status;
 
@@ -422,6 +425,9 @@ private:
 
     slot_info_vec_t sinfos;
 
+    llama_kv_cache::slot_info stage_sinfo;
+    bool                      has_stage_sinfo = false;
+
     std::vector<llama_ubatch> ubatches;
 
     //
@@ -431,4 +437,6 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    const llama_kv_cache::slot_info & current_sinfo() const;
 };

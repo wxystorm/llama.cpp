@@ -135,6 +135,45 @@ std::vector<int> llama_hybrid_split_by_chunk_size(int tokens, int chunk_tokens) 
     return result;
 }
 
+std::vector<llama_hybrid_boundary_block> llama_hybrid_plan_boundary(
+        int tokens, int upstream_chunk_tokens, int downstream_chunk_tokens) {
+    if (tokens <= 0 || upstream_chunk_tokens <= 0 || downstream_chunk_tokens <= 0) {
+        return {};
+    }
+
+    std::vector<llama_hybrid_boundary_block> blocks;
+    for (int output_begin = 0; output_begin < tokens; output_begin += downstream_chunk_tokens) {
+        llama_hybrid_boundary_block block;
+        block.output.token_begin = output_begin;
+        block.output.n_tokens    = std::min(downstream_chunk_tokens, tokens - output_begin);
+
+        const int output_end = output_begin + block.output.n_tokens;
+        int input_begin = output_begin - output_begin % upstream_chunk_tokens;
+        while (input_begin < output_end) {
+            const int input_end    = std::min(input_begin + upstream_chunk_tokens, tokens);
+            const int overlap_begin = std::max(output_begin, input_begin);
+            const int overlap_end   = std::min(output_end, input_end);
+            if (overlap_begin < overlap_end) {
+                block.inputs.push_back({ overlap_begin, overlap_end - overlap_begin });
+            }
+            input_begin = input_end;
+        }
+
+        GGML_ASSERT(!block.inputs.empty());
+        if (block.inputs.size() > 1) {
+            block.action = llama_hybrid_boundary_action::ACCUMULATE;
+        } else {
+            const int upstream_begin = output_begin - output_begin % upstream_chunk_tokens;
+            const int upstream_size  = std::min(upstream_chunk_tokens, tokens - upstream_begin);
+            block.action = output_begin == upstream_begin && block.output.n_tokens == upstream_size ?
+                llama_hybrid_boundary_action::PASS : llama_hybrid_boundary_action::SPLIT;
+        }
+
+        blocks.push_back(std::move(block));
+    }
+    return blocks;
+}
+
 static std::vector<std::vector<int>> llama_hybrid_probe_chunk_layouts(const llama_hybrid_profile & profile) {
     std::vector<std::vector<int>> result;
 
@@ -3283,7 +3322,13 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
-
+    constraints.fixed_tensor_layers       = 49;
+    constraints.fixed_phone_layers        = 0;
+    constraints.fixed_pc_layers           = 15;
+    constraints.fixed_gpu_pc_layers       = 14;
+    constraints.fixed_gpu_chunk_tokens    = 128;
+    constraints.fixed_tensor_chunk_tokens = 32;
+    constraints.fixed_cpu_chunk_tokens    = 64;
     const std::vector<llama_hybrid_plan> feasible = llama_hybrid_enumerate_feasible_plans(profile, constraints);
     bool                                 found    = false;
     for (auto plan : feasible) {

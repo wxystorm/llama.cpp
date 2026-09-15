@@ -756,6 +756,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_weight) ||
         std::regex_match(tensor_name, pattern_ffn_down_exps_bias);
+    const bool is_output_tensor =
+        std::regex_match(tensor_name, pattern_output_weight) ||
+        std::regex_match(tensor_name, pattern_output_bias);
 
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
@@ -823,7 +826,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool force_primary =
         (is_attention_tensor && mode != llama_hybrid_layer_mode::PHONE_ONLY) ||
-        (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY);
+        (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY) ||
+        is_output_tensor;
     const bool force_phone =
         mode == llama_hybrid_layer_mode::PHONE_ONLY &&
         (is_attention_tensor || is_ffn_split_tensor);
@@ -1679,7 +1683,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
     if (!hybrid_layer_modes.empty()) {
-        pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
+        if (meta_dev == nullptr) {
+            throw std::runtime_error(format(
+                "%s: no Meta backend found for hybrid output", __func__));
+        }
+        pimpl->dev_output = { meta_dev, &pimpl->gpu_buft_list.at(meta_dev) };
     } else {
         pimpl->dev_output = get_layer_buft_list(n_layer_all);
     }
