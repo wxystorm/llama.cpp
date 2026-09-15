@@ -89,22 +89,32 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
+    const bool stage_graph       = params.hybrid_layer_end >= 0;
+    const int  layer_begin       = stage_graph ? params.hybrid_layer_begin : 0;
+    const int  layer_end         = stage_graph ? params.hybrid_layer_end : n_layer;
+    const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
+    const bool build_output_head = !stage_graph || params.hybrid_output_head;
+
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
+    GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
+    GGML_ASSERT(hidden_input == (layer_begin > 0));
+    GGML_ASSERT(!build_output_head || layer_end == n_layer);
+    GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = hidden_input ? build_inp_stage() : build_inp_embd(model.tok_embd);
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_begin; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -130,7 +140,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                              Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && build_output_head && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -222,6 +232,12 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
     cur = inpL;
+
+    if (!build_output_head) {
+        res->t_stage_output = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 

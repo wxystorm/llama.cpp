@@ -1804,7 +1804,15 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
 
     plan.predicted_tensor_ms = 0.0;
     if (plan.tensor_layers > 0) {
-        const int macro_chunk_tokens = plan.gpu_pc_layers > 0 ? plan.gpu_chunk_tokens : work_tokens;
+        const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
+
+        int macro_chunk_tokens = work_tokens;
+        if (cpu_layers > 0) {
+            macro_chunk_tokens = plan.cpu_chunk_tokens;
+        } else if (plan.gpu_pc_layers > 0) {
+            macro_chunk_tokens = plan.gpu_chunk_tokens;
+        }
+
         const std::vector<int> macro_chunks =
             llama_hybrid_split_by_chunk_size(work_tokens, macro_chunk_tokens);
         if (macro_chunks.empty()) {

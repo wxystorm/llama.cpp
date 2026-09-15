@@ -148,6 +148,20 @@ public:
     const int64_t n_embd = 0;
 };
 
+class llm_graph_input_stage : public llm_graph_input_i {
+public:
+    llm_graph_input_stage(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_stage() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * hidden = nullptr; // F32 [n_embd, n_batch]
+
+    const int64_t n_embd = 0;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -707,6 +721,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    int32_t hybrid_layer_begin = 0;
+    int32_t hybrid_layer_end   = -1;
+
+    bool hybrid_hidden_input = false;
+    bool hybrid_output_head  = true;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -742,6 +762,13 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (hybrid_layer_begin  != other.hybrid_layer_begin ||
+            hybrid_layer_end    != other.hybrid_layer_end   ||
+            hybrid_hidden_input != other.hybrid_hidden_input ||
+            hybrid_output_head  != other.hybrid_output_head) {
             return false;
         }
 
@@ -798,6 +825,8 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_stage_input() const { return t_stage_input; }
+    ggml_tensor * get_stage_output() const { return t_stage_output; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -833,6 +862,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_stage_input  = nullptr; // [n_embd, n_tokens]
+    ggml_tensor * t_stage_output = nullptr; // [n_embd, n_tokens]
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1046,6 +1077,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_stage() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

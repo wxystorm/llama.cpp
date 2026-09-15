@@ -121,6 +121,18 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_stage::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->embd != nullptr);
+    GGML_ASSERT(n_embd == hidden->ne[0]);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    ggml_backend_tensor_set(hidden, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(hidden));
+}
+
+bool llm_graph_input_stage::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.embd != nullptr && hidden->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1188,12 +1200,14 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
-    t_h_nextn     = nullptr;
+    t_inp_tokens   = nullptr;
+    t_inp_embd     = nullptr;
+    t_logits       = nullptr;
+    t_embd         = nullptr;
+    t_embd_pooled  = nullptr;
+    t_h_nextn      = nullptr;
+    t_stage_input  = nullptr;
+    t_stage_output = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1239,6 +1253,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_stage_output != nullptr) {
+        ggml_set_output(t_stage_output);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -2235,6 +2252,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_stage() const {
+    auto inp = std::make_unique<llm_graph_input_stage>(n_embd);
+
+    inp->hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    cb(inp->hidden, "inp_stage", -1);
+    ggml_set_input(inp->hidden);
+
+    res->t_stage_input = inp->hidden;
+    res->add_input(std::move(inp));
+
+    return res->t_stage_input;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
