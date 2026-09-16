@@ -2501,6 +2501,20 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
             stats.bytes += size;
             stats.ready_wait_us += ready_us - wait_start_us;
             stats.send_us += send_us;
+
+            const uint64_t total_requests =
+                snapshot_breakdown[0].requests + snapshot_breakdown[1].requests;
+            if (total_requests % 100 == 0) {
+                for (size_t report_lane = 0; report_lane < snapshot_breakdown.size(); ++report_lane) {
+                    const auto & report = snapshot_breakdown[report_lane];
+                    printf(
+                        "[SNAPSHOT_BREAKDOWN] total_requests=%" PRIu64 " lane=%zu requests=%" PRIu64
+                        " ready_wait=%.3f send=%.3f bytes=%" PRIu64 "\n",
+                        total_requests, report_lane, report.requests,
+                        report.ready_wait_us / 1000.0, report.send_us / 1000.0, report.bytes);
+                }
+                fflush(stdout);
+            }
         }
 
         if (RPC_DEBUG) {
