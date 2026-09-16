@@ -1878,6 +1878,13 @@ struct rpc_snapshot_device {
     std::array<rpc_snapshot_slot, 2> slots;
 };
 
+struct rpc_snapshot_breakdown {
+    uint64_t requests      = 0;
+    uint64_t bytes         = 0;
+    int64_t  ready_wait_us = 0;
+    int64_t  send_us       = 0;
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
@@ -1936,6 +1943,8 @@ private:
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
+    std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
+    std::mutex snapshot_breakdown_mutex;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
 };
@@ -2448,7 +2457,7 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     rpc_snapshot_slot & slot = snapshot_devices[request.device]->slots[request.slot];
     const uint8_t * data;
     size_t size;
-    const int64_t wait_start = ggml_time_us();
+    const int64_t wait_start_us = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(lock, [&]() { return slot.state == rpc_snapshot_state::READY; });
@@ -2474,24 +2483,7 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         size = slot.data.size();
     }
 
-        const int64_t ready_us =
-        ggml_time_us();
-
-
-    const int64_t send_done_us =
-        ggml_time_us();
-
-    if (RPC_DEBUG) {
-        printf(
-            "[RPC_SNAPSHOT_SEND] bytes=%zu "
-            "seq=%" PRIu64
-            "wait_ready=%.3f ms "
-            "send=%.3f ms\n",
-            size,
-            request.seq,
-            (ready_us - wait_start) / 1000.0,
-            (send_done_us - ready_us) / 1000.0);
-    }
+    const int64_t ready_us = ggml_time_us();
     const int64_t send_start_us = ggml_time_us();
 
         // GET_SNAPSHOT 是固定长度协议。
@@ -2499,8 +2491,17 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         // 不再额外发送 uint64_t response_size。
         const bool status = sock->send_data(data, size);
 
-        const int64_t send_us =
-            ggml_time_us() - send_start_us;
+        const int64_t send_us = ggml_time_us() - send_start_us;
+
+        {
+            const size_t lane = request.slot & 1u;
+            std::lock_guard<std::mutex> lock(snapshot_breakdown_mutex);
+            auto & stats = snapshot_breakdown[lane];
+            ++stats.requests;
+            stats.bytes += size;
+            stats.ready_wait_us += ready_us - wait_start_us;
+            stats.send_us += send_us;
+        }
 
         if (RPC_DEBUG) {
             GGML_LOG_INFO(
@@ -2813,6 +2814,15 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
+        const auto & stats = snapshot_breakdown[lane];
+        if (stats.requests == 0) {
+            continue;
+        }
+        printf(
+            "[SNAPSHOT_BREAKDOWN] lane=%zu requests=%" PRIu64 " ready_wait=%.3f send=%.3f bytes=%" PRIu64 "\n",
+            lane, stats.requests, stats.ready_wait_us / 1000.0, stats.send_us / 1000.0, stats.bytes);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }

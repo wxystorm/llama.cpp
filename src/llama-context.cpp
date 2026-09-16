@@ -2283,7 +2283,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         std::all_of(runtime_stages.begin(), runtime_stages.end(),
                     [](const llama_hybrid_runtime_stage & stage) { return stage.macro_tokens > 0; });
     const bool stage_queue_plan_eligible =
-        stage_queue_requested && has_runtime_plan && gpu_tensor_topology;
+        stage_queue_requested && has_runtime_plan && gpu_tensor_topology && model.arch != LLM_ARCH_QWEN2;
     const bool gpu_cpu_tensor_topology =
         runtime_stages.size() == 3 &&
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
@@ -2291,9 +2291,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
         runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
         runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens &&
         runtime_stages[1].macro_tokens == runtime_stages[2].macro_tokens;
+    const bool gpu_tensor_phone_topology =
+        runtime_stages.size() == 3 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        runtime_stages[2].macro_tokens > 0 &&
+        runtime_stages[1].macro_tokens >= runtime_stages[2].macro_tokens;
+    const bool gpu_cpu_tensor_phone_topology =
+        runtime_stages.size() == 4 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
+        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        runtime_stages[3].kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens &&
+        runtime_stages[1].macro_tokens == runtime_stages[2].macro_tokens &&
+        runtime_stages[3].macro_tokens > 0 &&
+        runtime_stages[2].macro_tokens >= runtime_stages[3].macro_tokens &&
+        runtime_stages[2].macro_tokens % runtime_stages[3].macro_tokens == 0;
     const bool generalized_stage_queue_plan_eligible =
-        stage_queue_requested && has_runtime_plan && gpu_cpu_tensor_topology && valid_stage_macros &&
-        model.arch == LLM_ARCH_QWEN2;
+        stage_queue_requested && has_runtime_plan && valid_stage_macros && model.arch == LLM_ARCH_QWEN2 &&
+        (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
+         gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan && !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
@@ -2449,8 +2468,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool hybrid_gpu_pending_active = false;
     std::deque<llama_hybrid_job> hybrid_cpu_ready_q;
     std::deque<llama_hybrid_job> hybrid_tensor_ready_q;
+    std::deque<llama_hybrid_job> hybrid_phone_ready_q;
     size_t hybrid_tensor_ready_bytes = 0;
+    size_t hybrid_phone_ready_bytes = 0;
     size_t hybrid_tensor_queue_limit_bytes = 16ull * 1024 * 1024;
+    size_t hybrid_phone_queue_limit_bytes = 16ull * 1024 * 1024;
     size_t hybrid_cpu_ready_max = 2;
 
     if (const char * env = std::getenv("LLAMA_HYBRID_TENSOR_QUEUE_MB")) {
@@ -2466,6 +2488,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             hybrid_cpu_ready_max = (size_t) value;
         }
     }
+
+    if (const char * env = std::getenv("LLAMA_HYBRID_PHONE_QUEUE_MB")) {
+        const long long mb = std::atoll(env);
+        if (mb > 0) {
+            hybrid_phone_queue_limit_bytes = (size_t) mb * 1024ull * 1024ull;
+        }
+    }
+
+    const auto hybrid_has_ready = [&]() {
+        return !hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty() || !hybrid_phone_ready_q.empty();
+    };
 
     std::deque<llama_prefill_pipe_slot *> handoff_q;
     std::deque<llama_prefill_pipe_slot *> tensor_ready_q;
@@ -2515,6 +2548,58 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return status;
     };
 
+    const auto hybrid_enqueue_ready = [&](llama_hybrid_job && job, ggml_status & status) {
+        if (job.stage_index >= runtime_stages.size()) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PIPE] ub=%d invalid completed job stage=%zu\n",
+                job.ubatch_id, job.stage_index);
+            status = GGML_STATUS_FAILED;
+            return;
+        }
+
+        const auto kind = runtime_stages[job.stage_index].kind;
+        switch (kind) {
+            case llama_hybrid_runtime_stage_kind::CPU:
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PIPE] ub=%d -> CPU_QUEUE stage=%zu\n",
+                    job.ubatch_id, job.stage_index);
+                hybrid_cpu_ready_q.push_back(std::move(job));
+                break;
+            case llama_hybrid_runtime_stage_kind::TENSOR:
+                {
+                    const size_t tensor_bytes = job.hidden.capacity() * sizeof(float);
+                    hybrid_tensor_ready_bytes += tensor_bytes;
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_PIPE] ub=%d -> TENSOR_QUEUE stage=%zu "
+                        "job_mib=%.2f queue_mib=%.2f limit_mib=%.2f\n",
+                        job.ubatch_id, job.stage_index, tensor_bytes / 1048576.0,
+                        hybrid_tensor_ready_bytes / 1048576.0,
+                        hybrid_tensor_queue_limit_bytes / 1048576.0);
+                    hybrid_tensor_ready_q.push_back(std::move(job));
+                }
+                break;
+            case llama_hybrid_runtime_stage_kind::PHONE:
+                {
+                    const size_t phone_bytes = job.hidden.capacity() * sizeof(float);
+                    hybrid_phone_ready_bytes += phone_bytes;
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_PIPE] ub=%d -> PHONE_QUEUE stage=%zu "
+                        "job_mib=%.2f queue_mib=%.2f limit_mib=%.2f\n",
+                        job.ubatch_id, job.stage_index, phone_bytes / 1048576.0,
+                        hybrid_phone_ready_bytes / 1048576.0,
+                        hybrid_phone_queue_limit_bytes / 1048576.0);
+                    hybrid_phone_ready_q.push_back(std::move(job));
+                }
+                break;
+            default:
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PIPE] ub=%d unsupported next stage=%s stage=%zu\n",
+                    job.ubatch_id, llama_hybrid_runtime_stage_name(kind), job.stage_index);
+                status = GGML_STATUS_FAILED;
+                break;
+        }
+    };
+
     const auto hybrid_gpu_harvest = [&](ggml_status & status) {
         GGML_ASSERT(hybrid_gpu_pending_active);
 
@@ -2529,10 +2614,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         LLAMA_LOG_ERROR("[HYBRID_PIPE] ub=%d GPU_READY next_stage=%zu\n",
                         hybrid_gpu_pending.ubatch_id, hybrid_gpu_pending.stage_index);
-        hybrid_cpu_ready_q.push_back(std::move(hybrid_gpu_pending));
+        hybrid_enqueue_ready(std::move(hybrid_gpu_pending), status);
         hybrid_gpu_pending = {};
         hybrid_gpu_pending_active = false;
-        status = GGML_STATUS_SUCCESS;
     };
 
     const auto hybrid_gpu_submit = [&](
@@ -2590,6 +2674,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         bool apply_mctx = false;
         llm_graph_result * result = nullptr;
+        const bool profile_tensor = stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
+        const int64_t tensor_start_us = profile_tensor ? ggml_time_us() : 0;
+        if (profile_tensor) {
+            const int n_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_meta_tensor_profile_reset(ggml_backend_sched_get_backend(sched_pipe.get(), i));
+            }
+        }
         LLAMA_LOG_ERROR(
             "[HYBRID_PIPE] ub=%d %s_PHASE_BEGIN stage=%zu blocks=%zu\n",
             job.ubatch_id, llama_hybrid_runtime_stage_name(stage.kind), stage_index, blocks.size());
@@ -2622,6 +2714,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
         static_cast<llama_kv_cache_context *>(mctx.get())->clear_stage_range();
         job.hidden = std::move(next_hidden);
         job.stage_index++;
+        if (profile_tensor) {
+            ggml_backend_meta_tensor_profile profile {};
+            const int n_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_meta_tensor_profile backend_profile {};
+                if (!ggml_backend_meta_tensor_profile_get(
+                        ggml_backend_sched_get_backend(sched_pipe.get(), i), &backend_profile)) {
+                    continue;
+                }
+                profile.attn_us   += backend_profile.attn_us;
+                profile.pc_ffn_us += backend_profile.pc_ffn_us;
+                profile.h2d_us    += backend_profile.h2d_us;
+                profile.phone_us  += backend_profile.phone_us;
+                profile.d2h_us    += backend_profile.d2h_us;
+                profile.reduce_us += backend_profile.reduce_us;
+                profile.wait_us   += backend_profile.wait_us;
+            }
+            LLAMA_LOG_ERROR(
+                "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f pc_ffn=%.3f h2d=%.3f "
+                "phone=%.3f d2h=%.3f reduce=%.3f wait=%.3f ms\n",
+                job.ubatch_id, (ggml_time_us() - tensor_start_us) / 1000.0,
+                profile.attn_us / 1000.0, profile.pc_ffn_us / 1000.0,
+                profile.h2d_us / 1000.0, profile.phone_us / 1000.0,
+                profile.d2h_us / 1000.0, profile.reduce_us / 1000.0,
+                profile.wait_us / 1000.0);
+        }
         LLAMA_LOG_ERROR(
             "[HYBRID_PIPE] ub=%d %s_PHASE_END stage=%zu\n",
             job.ubatch_id, llama_hybrid_runtime_stage_name(stage.kind), stage_index);
@@ -2641,16 +2759,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return;
         }
 
-        GGML_ASSERT(job.stage_index < runtime_stages.size());
-        GGML_ASSERT(runtime_stages[job.stage_index].kind == llama_hybrid_runtime_stage_kind::TENSOR);
-        const size_t tensor_bytes = job.hidden.capacity() * sizeof(float);
-        hybrid_tensor_ready_bytes += tensor_bytes;
-
-        LLAMA_LOG_ERROR(
-            "[HYBRID_PIPE] ub=%d -> TENSOR_QUEUE job_mib=%.2f queue_mib=%.2f limit_mib=%.2f\n",
-            job.ubatch_id, tensor_bytes / 1048576.0, hybrid_tensor_ready_bytes / 1048576.0,
-            hybrid_tensor_queue_limit_bytes / 1048576.0);
-        hybrid_tensor_ready_q.push_back(std::move(job));
+        if (job.stage_index < runtime_stages.size()) {
+            hybrid_enqueue_ready(std::move(job), status);
+        }
     };
 
     const auto hybrid_run_tensor_one = [&](ggml_status & status) -> llm_graph_result * {
@@ -2668,20 +2779,65 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR(
             "[HYBRID_PIPE] ub=%d TENSOR_DEQUEUE job_mib=%.2f queue_mib=%.2f\n",
             job.ubatch_id, tensor_bytes / 1048576.0, hybrid_tensor_ready_bytes / 1048576.0);
-        return hybrid_run_downstream_stage(job, status);
-    };
 
-    const auto hybrid_run_pc_one = [&](ggml_status & status) -> llm_graph_result * {
-        if (hybrid_cpu_ready_q.empty() && hybrid_tensor_ready_q.empty()) {
+        llm_graph_result * result = hybrid_run_downstream_stage(job, status);
+        if (result == nullptr || status != GGML_STATUS_SUCCESS) {
             return nullptr;
         }
 
+        if (job.stage_index < runtime_stages.size()) {
+            hybrid_enqueue_ready(std::move(job), status);
+            return nullptr;
+        }
+
+        return result;
+    };
+
+    const auto hybrid_run_phone_one = [&](ggml_status & status) -> llm_graph_result * {
+        GGML_ASSERT(!hybrid_phone_ready_q.empty());
+
+        const size_t phone_bytes = hybrid_phone_ready_q.front().hidden.capacity() * sizeof(float);
+        GGML_ASSERT(hybrid_phone_ready_bytes >= phone_bytes);
+        hybrid_phone_ready_bytes -= phone_bytes;
+
+        llama_hybrid_job job = std::move(hybrid_phone_ready_q.front());
+        hybrid_phone_ready_q.pop_front();
+        GGML_ASSERT(job.stage_index < runtime_stages.size());
+        GGML_ASSERT(runtime_stages[job.stage_index].kind == llama_hybrid_runtime_stage_kind::PHONE);
+
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PIPE] ub=%d PHONE_DEQUEUE job_mib=%.2f queue_mib=%.2f\n",
+            job.ubatch_id, phone_bytes / 1048576.0, hybrid_phone_ready_bytes / 1048576.0);
+
+        llm_graph_result * result = hybrid_run_downstream_stage(job, status);
+        if (result == nullptr || status != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+
+        GGML_ASSERT(job.stage_index == runtime_stages.size());
+        return result;
+    };
+
+    const auto hybrid_run_ready_one = [&](ggml_status & status) -> llm_graph_result * {
+        if (!hybrid_has_ready()) {
+            return nullptr;
+        }
+
+        const bool phone_pressure = hybrid_phone_ready_bytes >= hybrid_phone_queue_limit_bytes;
         const bool tensor_pressure = hybrid_tensor_ready_bytes >= hybrid_tensor_queue_limit_bytes;
+
+        if (phone_pressure && !hybrid_phone_ready_q.empty()) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_SCHED] choose=PHONE reason=HWM cpu_q=%zu tensor_q=%zu phone_q=%zu phone_mib=%.2f\n",
+                hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(), hybrid_phone_ready_q.size(),
+                hybrid_phone_ready_bytes / 1048576.0);
+            return hybrid_run_phone_one(status);
+        }
 
         if (tensor_pressure && !hybrid_tensor_ready_q.empty()) {
             LLAMA_LOG_ERROR(
-                "[HYBRID_SCHED] choose=TENSOR reason=HWM cpu_q=%zu tensor_q=%zu tensor_mib=%.2f\n",
-                hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(),
+                "[HYBRID_SCHED] choose=TENSOR reason=HWM cpu_q=%zu tensor_q=%zu phone_q=%zu tensor_mib=%.2f\n",
+                hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(), hybrid_phone_ready_q.size(),
                 hybrid_tensor_ready_bytes / 1048576.0);
             return hybrid_run_tensor_one(status);
         }
@@ -2695,8 +2851,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return nullptr;
         }
 
-        GGML_ASSERT(!hybrid_tensor_ready_q.empty());
-        return hybrid_run_tensor_one(status);
+        if (!hybrid_tensor_ready_q.empty()) {
+            return hybrid_run_tensor_one(status);
+        }
+
+        GGML_ASSERT(!hybrid_phone_ready_q.empty());
+        return hybrid_run_phone_one(status);
     };
 
     do {
@@ -2788,9 +2948,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (hybrid_gpu_pending_active) {
                 hybrid_gpu_harvest(status);
             }
-            while (status == GGML_STATUS_SUCCESS &&
-                   (!hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty())) {
-                hybrid_run_pc_one(status);
+            while (status == GGML_STATUS_SUCCESS && hybrid_has_ready()) {
+                hybrid_run_ready_one(status);
             }
             n_outputs = n_outputs_saved;
             if (status == GGML_STATUS_SUCCESS) {
@@ -2805,7 +2964,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (hybrid_gpu_pending_active) {
                 while (status == GGML_STATUS_SUCCESS &&
                        hybrid_cpu_ready_q.size() >= hybrid_cpu_ready_max) {
-                    hybrid_run_pc_one(status);
+                    hybrid_run_ready_one(status);
                 }
                 if (status == GGML_STATUS_SUCCESS) {
                     hybrid_gpu_harvest(status);
@@ -2814,10 +2973,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (status == GGML_STATUS_SUCCESS) {
                 hybrid_gpu_submit(ubatch, ubatch_id, n_outputs_saved, status);
             }
-            if (status == GGML_STATUS_SUCCESS &&
-                (!hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty())) {
-                if (llm_graph_result * pc_res = hybrid_run_pc_one(status)) {
-                    res = pc_res;
+            if (status == GGML_STATUS_SUCCESS && hybrid_has_ready()) {
+                if (llm_graph_result * ready_res = hybrid_run_ready_one(status)) {
+                    res = ready_res;
                 }
             }
 
@@ -2825,10 +2983,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 if (hybrid_gpu_pending_active) {
                     hybrid_gpu_harvest(status);
                 }
-                while (status == GGML_STATUS_SUCCESS &&
-                       (!hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty())) {
-                    if (llm_graph_result * pc_res = hybrid_run_pc_one(status)) {
-                        res = pc_res;
+                while (status == GGML_STATUS_SUCCESS && hybrid_has_ready()) {
+                    if (llm_graph_result * ready_res = hybrid_run_ready_one(status)) {
+                        res = ready_res;
                     }
                 }
                 if (status == GGML_STATUS_SUCCESS) {
@@ -2845,7 +3002,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_gpu_pending_active = false;
                 hybrid_cpu_ready_q.clear();
                 hybrid_tensor_ready_q.clear();
+                hybrid_phone_ready_q.clear();
                 hybrid_tensor_ready_bytes = 0;
+                hybrid_phone_ready_bytes = 0;
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
@@ -3180,14 +3339,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ubatch_id++;
     } while (mctx->next());
 
-    if (hybrid_gpu_pending_active || !hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty()) {
+    if (hybrid_gpu_pending_active || hybrid_has_ready()) {
         ggml_status status = GGML_STATUS_SUCCESS;
         if (hybrid_gpu_pending_active) {
             hybrid_gpu_harvest(status);
         }
-        while (status == GGML_STATUS_SUCCESS &&
-               (!hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty())) {
-            hybrid_run_pc_one(status);
+        while (status == GGML_STATUS_SUCCESS && hybrid_has_ready()) {
+            hybrid_run_ready_one(status);
         }
         if (status != GGML_STATUS_SUCCESS) {
             synchronize();

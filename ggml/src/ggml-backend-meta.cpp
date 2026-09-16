@@ -2057,6 +2057,9 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
     uint64_t                    next_snapshot_seq = 1;
 
+    ggml_backend_meta_tensor_profile tensor_profile {};
+    std::mutex                       tensor_profile_mutex;
+
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
@@ -3016,6 +3019,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t pipeline_gap_sum_us    = 0;
     int64_t pipeline_gap_max_us    = 0;
     size_t  pipeline_gap_count     = 0;
+    int64_t tensor_attn_us         = 0;
+    int64_t tensor_pc_ffn_us       = 0;
+    int64_t tensor_phone_us        = 0;
+    int64_t tensor_wait_us         = 0;
     struct pipeline_gap_timing {
         bool valid = false;
 
@@ -3181,8 +3188,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return GGML_STATUS_SUCCESS;
         }
         GGML_ASSERT(pending_prefill_reduce_worker[lane] != nullptr);
+        const int64_t wait_start_us = ggml_time_us();
         const ggml_status status =
             pending_prefill_reduce_worker[lane]->wait(pending_prefill_reduce_task[lane]);
+        tensor_wait_us += ggml_time_us() - wait_start_us;
         pending_prefill_reduce_task[lane]   = 0;
         pending_prefill_reduce_layer[lane]  = -1;
         pending_prefill_reduce_worker[lane] = nullptr;
@@ -5296,7 +5305,7 @@ const bool continues_prefill_layer =
         printf("[PREFILL_NEXT_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", next_layer, next_chunk, next_begin_us);
     }
 
-    const int64_t compute_start_us = ggml_time_us();
+        const int64_t compute_start_us = ggml_time_us();
 
     for (size_t backend = 0; backend < n_backends; ++backend) {
         debug_layer_input(backend, i, 24);
@@ -5310,8 +5319,10 @@ const bool continues_prefill_layer =
 
         compute_workers.start(0, i);
         GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
+        const int64_t input_wait_start_us = ggml_time_us();
         const ggml_status input_status = backend_ctx->prefill_input_worker->wait(
             pending_prefill_input_task);
+        tensor_wait_us += ggml_time_us() - input_wait_start_us;
         pending_prefill_input_task = 0;
         pending_prefill_input_layer = -1;
         pending_prefill_input_chunk = -1;
@@ -5523,6 +5534,18 @@ const bool continues_prefill_layer =
             }
             timing.total_us += ggml_time_us() - layer_wall_start_us;
         }
+
+        const auto tensor_backend_times_after = backend_times_snapshot();
+        const int64_t pc_compute_us = !tensor_backend_times_after.empty() ?
+            tensor_backend_times_after[0] - backend_times_before[0] : 0;
+        const int64_t phone_compute_us = tensor_backend_times_after.size() > 1 ?
+            tensor_backend_times_after[1] - backend_times_before[1] : 0;
+        if (is_prefill_down_sg) {
+            tensor_pc_ffn_us += pc_compute_us;
+            tensor_phone_us  += phone_compute_us;
+        } else if (is_prefill_norm_sg || subgraph_is_prefill_pc_only(i)) {
+            tensor_attn_us += pc_compute_us;
+        }
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
@@ -5599,6 +5622,21 @@ const bool continues_prefill_layer =
                    pipeline_gap_max_us / 1000.0);
         }
     }
+
+
+    const int64_t h2d_us = n_backends > 1 ? reduce_copy_by_direction[1].total_us : 0;
+    const int64_t d2h_us = n_backends > 1 ? reduce_copy_by_direction[n_backends].total_us : 0;
+    const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
+    {
+        std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
+        backend_ctx->tensor_profile.attn_us   += tensor_attn_us;
+        backend_ctx->tensor_profile.pc_ffn_us += tensor_pc_ffn_us;
+        backend_ctx->tensor_profile.h2d_us    += h2d_us;
+        backend_ctx->tensor_profile.phone_us  += tensor_phone_us;
+        backend_ctx->tensor_profile.d2h_us    += d2h_us;
+        backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
+        backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5646,4 +5684,25 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
+    backend_ctx->tensor_profile = {};
+    return true;
+}
+
+bool ggml_backend_meta_tensor_profile_get(
+        ggml_backend_t backend, ggml_backend_meta_tensor_profile * profile) {
+    if (!ggml_backend_is_meta(backend) || profile == nullptr) {
+        return false;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
+    *profile = backend_ctx->tensor_profile;
+    return true;
 }

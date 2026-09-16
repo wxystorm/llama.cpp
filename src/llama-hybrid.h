@@ -191,6 +191,13 @@ struct llama_hybrid_plan {
     double predicted_pc_gpu_ms  = 0.0;
     double predicted_handoff_ms = 0.0;
 
+    double predicted_gpu_busy_ms   = 0.0;
+    double predicted_downstream_ms = 0.0;
+    double predicted_gpu_wait_ms   = 0.0;
+
+    size_t predicted_tensor_peak_bytes = 0;
+    size_t predicted_phone_peak_bytes  = 0;
+
     size_t pc_memory    = 0;
     size_t phone_memory = 0;
     size_t gpu_memory   = 0;

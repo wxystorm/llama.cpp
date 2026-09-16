@@ -418,6 +418,20 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    struct ggml_backend_meta_tensor_profile {
+        int64_t attn_us;
+        int64_t pc_ffn_us;
+        int64_t h2d_us;
+        int64_t phone_us;
+        int64_t d2h_us;
+        int64_t reduce_us;
+        int64_t wait_us;
+    };
+
+    GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
+    GGML_API bool ggml_backend_meta_tensor_profile_get(
+        ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
+
     //
     // Utils
     //
