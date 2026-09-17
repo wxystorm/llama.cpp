@@ -2730,6 +2730,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.d2h_us    += backend_profile.d2h_us;
                 profile.reduce_us += backend_profile.reduce_us;
                 profile.wait_us   += backend_profile.wait_us;
+                profile.lane_reuse_wait_count += backend_profile.lane_reuse_wait_count;
+                profile.lane_reuse_wait_us += backend_profile.lane_reuse_wait_us;
+                profile.lane_reuse_wait_max_us = std::max(
+                    profile.lane_reuse_wait_max_us, backend_profile.lane_reuse_wait_max_us);
+                for (size_t lane = 0; lane < 2; ++lane) {
+                    profile.lane_reuse_wait_count_by_lane[lane] +=
+                        backend_profile.lane_reuse_wait_count_by_lane[lane];
+                    profile.lane_reuse_wait_us_by_lane[lane] +=
+                        backend_profile.lane_reuse_wait_us_by_lane[lane];
+                }
+                if (backend_profile.layer_barrier_wait_count > 0 &&
+                    backend_profile.layer_barrier_wait_max_us >= profile.layer_barrier_wait_max_us) {
+                    profile.layer_barrier_wait_max_us = backend_profile.layer_barrier_wait_max_us;
+                    profile.layer_barrier_wait_max_layer = backend_profile.layer_barrier_wait_max_layer;
+                    profile.layer_barrier_wait_max_pending = backend_profile.layer_barrier_wait_max_pending;
+                    profile.layer_barrier_wait_max_last_lane = backend_profile.layer_barrier_wait_max_last_lane;
+                }
+                profile.layer_barrier_wait_count += backend_profile.layer_barrier_wait_count;
+                profile.layer_barrier_wait_us += backend_profile.layer_barrier_wait_us;
             }
             LLAMA_LOG_ERROR(
                 "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f pc_ffn=%.3f h2d=%.3f "
@@ -2739,6 +2758,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.h2d_us / 1000.0, profile.phone_us / 1000.0,
                 profile.d2h_us / 1000.0, profile.reduce_us / 1000.0,
                 profile.wait_us / 1000.0);
+            LLAMA_LOG_ERROR(
+                "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64 " lane_reuse_ms=%.3f "
+                "lane_reuse_max_ms=%.3f lane0_count=%" PRId64 " lane0_ms=%.3f "
+                "lane1_count=%" PRId64 " lane1_ms=%.3f layer_barrier_count=%" PRId64 " "
+                "layer_barrier_ms=%.3f layer_barrier_max_ms=%.3f max_layer=%" PRId64 " "
+                "max_pending=%" PRId64 " max_last_lane=%" PRId64 "\n",
+                profile.lane_reuse_wait_count, profile.lane_reuse_wait_us / 1000.0,
+                profile.lane_reuse_wait_max_us / 1000.0,
+                profile.lane_reuse_wait_count_by_lane[0], profile.lane_reuse_wait_us_by_lane[0] / 1000.0,
+                profile.lane_reuse_wait_count_by_lane[1], profile.lane_reuse_wait_us_by_lane[1] / 1000.0,
+                profile.layer_barrier_wait_count, profile.layer_barrier_wait_us / 1000.0,
+                profile.layer_barrier_wait_max_us / 1000.0, profile.layer_barrier_wait_max_layer,
+                profile.layer_barrier_wait_max_pending, profile.layer_barrier_wait_max_last_lane);
         }
         LLAMA_LOG_ERROR(
             "[HYBRID_PIPE] ub=%d %s_PHASE_END stage=%zu\n",

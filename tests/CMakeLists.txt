@@ -311,6 +311,8 @@ llama_test(test-hybrid)
 
 llama_build_and_test(test-hybrid-boundary.cpp)
 target_include_directories(test-hybrid-boundary PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-meta-return-stall-profile.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)

@@ -426,6 +426,17 @@ extern "C" {
         int64_t d2h_us;
         int64_t reduce_us;
         int64_t wait_us;
+        int64_t lane_reuse_wait_count;
+        int64_t lane_reuse_wait_us;
+        int64_t lane_reuse_wait_max_us;
+        int64_t lane_reuse_wait_count_by_lane[2];
+        int64_t lane_reuse_wait_us_by_lane[2];
+        int64_t layer_barrier_wait_count;
+        int64_t layer_barrier_wait_us;
+        int64_t layer_barrier_wait_max_us;
+        int64_t layer_barrier_wait_max_layer;
+        int64_t layer_barrier_wait_max_pending;
+        int64_t layer_barrier_wait_max_last_lane;
     };
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);

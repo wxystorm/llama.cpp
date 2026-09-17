@@ -3023,6 +3023,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t tensor_pc_ffn_us       = 0;
     int64_t tensor_phone_us        = 0;
     int64_t tensor_wait_us         = 0;
+    int64_t lane_reuse_wait_count  = 0;
+    int64_t lane_reuse_wait_us     = 0;
+    int64_t lane_reuse_wait_max_us = 0;
+    std::array<int64_t, ggml_backend_meta_context::PREFILL_RETURN_LANES>
+        lane_reuse_wait_count_by_lane {};
+    std::array<int64_t, ggml_backend_meta_context::PREFILL_RETURN_LANES>
+        lane_reuse_wait_us_by_lane {};
+    int64_t layer_barrier_wait_count  = 0;
+    int64_t layer_barrier_wait_us     = 0;
+    int64_t layer_barrier_wait_max_us = 0;
+    int64_t layer_barrier_wait_max_layer = -1;
+    int64_t layer_barrier_wait_max_pending = 0;
+    int64_t layer_barrier_wait_max_last_lane = -1;
     struct pipeline_gap_timing {
         bool valid = false;
 
@@ -3197,10 +3210,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         pending_prefill_reduce_worker[lane] = nullptr;
         return status;
     };
-    auto wait_all_prefill_reduces = [&]() {
+    auto wait_all_prefill_reduces = [&](int * last_lane) {
         ggml_status result = GGML_STATUS_SUCCESS;
+        int64_t max_lane_wait_us = -1;
+        if (last_lane != nullptr) {
+            *last_lane = -1;
+        }
         for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
+            const bool measure_lane = last_lane != nullptr && pending_prefill_reduce_task[lane] != 0;
+            const int64_t lane_wait_start_us = measure_lane ? ggml_time_us() : 0;
             const ggml_status status = wait_prefill_reduce_lane(lane);
+            if (measure_lane) {
+                const int64_t lane_wait_us = ggml_time_us() - lane_wait_start_us;
+                if (lane_wait_us > max_lane_wait_us) {
+                    max_lane_wait_us = lane_wait_us;
+                    *last_lane = (int) lane;
+                }
+            }
             if (result == GGML_STATUS_SUCCESS && status != GGML_STATUS_SUCCESS) {
                 result = status;
             }
@@ -4219,7 +4245,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 reduce_worker = lane_worker;
                 if (pending_prefill_reduce_task[return_lane] != 0) {
+                    const int old_layer = pending_prefill_reduce_layer[return_lane];
+                    const int64_t wait_start_us = ggml_time_us();
                     const ggml_status status = wait_prefill_reduce_lane(return_lane);
+                    const int64_t wait_us = ggml_time_us() - wait_start_us;
+                    ++lane_reuse_wait_count;
+                    lane_reuse_wait_us += wait_us;
+                    lane_reuse_wait_max_us = std::max(lane_reuse_wait_max_us, wait_us);
+                    ++lane_reuse_wait_count_by_lane[return_lane];
+                    lane_reuse_wait_us_by_lane[return_lane] += wait_us;
+                    if (pipeline_debug) {
+                        printf(
+                            "[PREFILL_LANE_REUSE_WAIT] lane=%zu old_layer=%d new_layer=%d new_chunk=%d "
+                            "wait_ms=%.3f\n",
+                            return_lane, old_layer, prefill_down_layer_0, prefill_down_chunk_0,
+                            wait_us / 1000.0);
+                    }
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
                     }
@@ -5236,11 +5277,30 @@ const bool down_can_overlap =
     is_prefill_down_sg &&
     has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
-const bool continues_prefill_layer =
+        const bool continues_prefill_layer =
     norm_can_overlap ||
     down_can_overlap;
         if (has_pending_prefill_reduce() && !continues_prefill_layer) {
-            const ggml_status status = wait_all_prefill_reduces();
+            size_t pending_lanes = 0;
+            int barrier_layer = -1;
+            for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
+                if (pending_prefill_reduce_task[lane] != 0) {
+                    ++pending_lanes;
+                    barrier_layer = std::max(barrier_layer, pending_prefill_reduce_layer[lane]);
+                }
+            }
+            int last_lane = -1;
+            const int64_t wait_start_us = ggml_time_us();
+            const ggml_status status = wait_all_prefill_reduces(&last_lane);
+            const int64_t wait_us = ggml_time_us() - wait_start_us;
+            ++layer_barrier_wait_count;
+            layer_barrier_wait_us += wait_us;
+            if (wait_us >= layer_barrier_wait_max_us) {
+                layer_barrier_wait_max_us = wait_us;
+                layer_barrier_wait_max_layer = barrier_layer;
+                layer_barrier_wait_max_pending = (int64_t) pending_lanes;
+                layer_barrier_wait_max_last_lane = last_lane;
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -5329,7 +5389,7 @@ const bool continues_prefill_layer =
         if (input_status != GGML_STATUS_SUCCESS) {
             compute_workers.wait(0);
             if (has_pending_prefill_reduce()) {
-                wait_all_prefill_reduces();
+                wait_all_prefill_reduces(nullptr);
             }
             return input_status;
         }
@@ -5456,7 +5516,7 @@ const bool continues_prefill_layer =
 
     if (compute_status != GGML_STATUS_SUCCESS) {
         if (has_pending_prefill_reduce()) {
-            wait_all_prefill_reduces();
+            wait_all_prefill_reduces(nullptr);
         }
         return compute_status;
     }
@@ -5560,7 +5620,7 @@ const bool continues_prefill_layer =
     if (has_pending_prefill_reduce()) {
         debug_handoff_watch("BEFORE_PENDING_REDUCE_WAIT");
 
-        const ggml_status status = wait_all_prefill_reduces();
+        const ggml_status status = wait_all_prefill_reduces(nullptr);
 
         debug_handoff_watch("AFTER_PENDING_REDUCE_WAIT");
 
@@ -5636,6 +5696,24 @@ const bool continues_prefill_layer =
         backend_ctx->tensor_profile.d2h_us    += d2h_us;
         backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
         backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+        backend_ctx->tensor_profile.lane_reuse_wait_count += lane_reuse_wait_count;
+        backend_ctx->tensor_profile.lane_reuse_wait_us += lane_reuse_wait_us;
+        backend_ctx->tensor_profile.lane_reuse_wait_max_us = std::max(
+            backend_ctx->tensor_profile.lane_reuse_wait_max_us, lane_reuse_wait_max_us);
+        for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
+            backend_ctx->tensor_profile.lane_reuse_wait_count_by_lane[lane] +=
+                lane_reuse_wait_count_by_lane[lane];
+            backend_ctx->tensor_profile.lane_reuse_wait_us_by_lane[lane] += lane_reuse_wait_us_by_lane[lane];
+        }
+        backend_ctx->tensor_profile.layer_barrier_wait_count += layer_barrier_wait_count;
+        backend_ctx->tensor_profile.layer_barrier_wait_us += layer_barrier_wait_us;
+        if (layer_barrier_wait_count > 0 &&
+            layer_barrier_wait_max_us >= backend_ctx->tensor_profile.layer_barrier_wait_max_us) {
+            backend_ctx->tensor_profile.layer_barrier_wait_max_us = layer_barrier_wait_max_us;
+            backend_ctx->tensor_profile.layer_barrier_wait_max_layer = layer_barrier_wait_max_layer;
+            backend_ctx->tensor_profile.layer_barrier_wait_max_pending = layer_barrier_wait_max_pending;
+            backend_ctx->tensor_profile.layer_barrier_wait_max_last_lane = layer_barrier_wait_max_last_lane;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }

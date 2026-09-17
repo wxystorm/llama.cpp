@@ -1,0 +1,192 @@
+--- a/src/llama-hybrid.cpp
++++ b/src/llama-hybrid.cpp
+@@ -2177,99 +2177,125 @@
+-    plan.predicted_pc_gpu_ms = 0.0;
+-    if (plan.gpu_pc_layers > 0) {
+-        const std::vector<int> candidates = llama_hybrid_plan_chunk_candidates(
+-            profile, work_tokens, constraints.fixed_gpu_chunk_tokens);
+-        double best_cost = std::numeric_limits<double>::infinity();
+-        for (const int chunk_tokens : candidates) {
+-            double compute_ms = 0.0;
+-            if (!llama_hybrid_layer_region_cost(profile, profile.gpu_layer_blocks, profile.gpu_attn,
+-                                                plan.gpu_pc_layers, work_tokens, chunk_tokens, kv_tokens, false,
+-                                                compute_ms)) {
+-                continue;
+-            }
+-
+-            double transfer_ms = 0.0;
+-            const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(work_tokens, chunk_tokens);
+-            for (const int tokens : chunks) {
+-                const size_t bytes = (size_t) profile.n_embd * (size_t) tokens * sizeof(float);
+-                double chunk_transfer_ms = 0.0;
+-                if (!llama_hybrid_transfer_cost(profile.gpu_to_pc, bytes, chunk_transfer_ms)) {
+-                    transfer_ms = std::numeric_limits<double>::infinity();
+-                    break;
+-                }
+-                transfer_ms += chunk_transfer_ms;
+-            }
+-
+-            const double cost = compute_ms + transfer_ms;
+-            if (cost < best_cost) {
+-                best_cost                 = cost;
+-                plan.gpu_chunk_tokens     = chunk_tokens;
+-                plan.predicted_pc_gpu_ms  = cost;
+-            }
+-        }
+-        if (!std::isfinite(best_cost)) {
+-            return false;
++    const auto score_tensor = [&](llama_hybrid_plan & candidate) {
++        candidate.predicted_tensor_ms = 0.0;
++        if (candidate.tensor_layers <= 0) {
++            return true;
+         }
+-    }
+-
+-    plan.predicted_tensor_ms = 0.0;
+-    if (plan.tensor_layers > 0) {
+-        const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
+ 
+         int macro_chunk_tokens = work_tokens;
+         if (cpu_layers > 0) {
+-            macro_chunk_tokens = plan.cpu_chunk_tokens;
+-        } else if (plan.gpu_pc_layers > 0) {
+-            macro_chunk_tokens = plan.gpu_chunk_tokens;
++            macro_chunk_tokens = candidate.cpu_chunk_tokens;
++        } else if (candidate.gpu_pc_layers > 0) {
++            macro_chunk_tokens = candidate.gpu_chunk_tokens;
+         }
+ 
+         const std::vector<int> macro_chunks =
+             llama_hybrid_split_by_chunk_size(work_tokens, macro_chunk_tokens);
+         if (macro_chunks.empty()) {
+             return false;
+         }
+ 
+         double tensor_layer_ms = 0.0;
+         for (const int macro_tokens : macro_chunks) {
+             double tensor_ffn_ms = 0.0;
+-            if (!llama_hybrid_tensor_ffn_cost(profile, plan.tensor_pc_ratio, macro_tokens,
+-                                              plan.tensor_chunk_tokens, tensor_ffn_ms)) {
++            if (!llama_hybrid_tensor_ffn_cost(profile, candidate.tensor_pc_ratio, macro_tokens,
++                                              candidate.tensor_chunk_tokens, tensor_ffn_ms)) {
+                 return false;
+             }
+ 
+             double cpu_layer_base = 0.0;
+             double cpu_attn_base  = 0.0;
+             double cpu_attn_kv    = 0.0;
+             if (!llama_hybrid_layer_block_cost(profile.cpu_layer_blocks, macro_tokens, false, cpu_layer_base) ||
+                 !llama_hybrid_attn_cost(profile.cpu_attn, macro_tokens, macro_tokens, cpu_attn_base) ||
+                 !llama_hybrid_attn_cost(profile.cpu_attn, macro_tokens, kv_tokens, cpu_attn_kv)) {
+                 return false;
+             }
+ 
+             tensor_layer_ms += cpu_attn_kv +
+                 llama_hybrid_tensor_misc_cost(profile, macro_tokens, cpu_layer_base, cpu_attn_base) + tensor_ffn_ms;
+         }
+-        plan.predicted_tensor_ms = plan.tensor_layers * tensor_layer_ms;
+-    }
++        candidate.predicted_tensor_ms = candidate.tensor_layers * tensor_layer_ms;
++        return true;
++    };
++
++    const auto finalize_score = [&](llama_hybrid_plan & candidate) {
++        candidate.predicted_ms = candidate.predicted_tensor_ms + candidate.predicted_phone_ms +
++                                 candidate.predicted_pc_cpu_ms + candidate.predicted_pc_gpu_ms +
++                                 candidate.predicted_handoff_ms;
++        candidate.predicted_gpu_busy_ms = 0.0;
++        candidate.predicted_downstream_ms = 0.0;
++        candidate.predicted_gpu_wait_ms = 0.0;
++        candidate.predicted_tensor_peak_bytes = 0;
++        candidate.predicted_phone_peak_bytes = 0;
++
++        if (!llama_hybrid_sim_stages(candidate).empty()) {
++            llama_hybrid_sim_result sim;
++            if (!llama_hybrid_simulate_prefill(profile, constraints, candidate, work_tokens, false, sim)) {
++                return false;
++            }
++            candidate.predicted_ms = sim.makespan_ms;
++            candidate.predicted_gpu_busy_ms = sim.gpu_busy_ms;
++            candidate.predicted_downstream_ms = sim.downstream_ms;
++            candidate.predicted_gpu_wait_ms = sim.gpu_wait_ms;
++            candidate.predicted_tensor_peak_bytes = sim.tensor_peak_bytes;
++            candidate.predicted_phone_peak_bytes = sim.phone_peak_bytes;
++        }
++        return std::isfinite(candidate.predicted_ms);
++    };
+ 
+-    plan.predicted_ms = plan.predicted_tensor_ms + plan.predicted_phone_ms + plan.predicted_pc_cpu_ms +
+-                        plan.predicted_pc_gpu_ms + plan.predicted_handoff_ms;
+-    plan.predicted_gpu_busy_ms = 0.0;
+-    plan.predicted_downstream_ms = 0.0;
+-    plan.predicted_gpu_wait_ms = 0.0;
+-    plan.predicted_tensor_peak_bytes = 0;
+-    plan.predicted_phone_peak_bytes = 0;
+-
+-    if (!llama_hybrid_sim_stages(plan).empty()) {
+-        llama_hybrid_sim_result sim;
+-        if (!llama_hybrid_simulate_prefill(profile, constraints, plan, work_tokens, false, sim)) {
++    plan.predicted_pc_gpu_ms = 0.0;
++    if (plan.gpu_pc_layers > 0) {
++        const std::vector<int> candidates = llama_hybrid_plan_chunk_candidates(
++            profile, work_tokens, constraints.fixed_gpu_chunk_tokens);
++        bool found = false;
++        llama_hybrid_plan best_plan;
++
++        for (const int chunk_tokens : candidates) {
++            llama_hybrid_plan candidate = plan;
++            candidate.gpu_chunk_tokens = chunk_tokens;
++
++            double compute_ms = 0.0;
++            if (!llama_hybrid_layer_region_cost(profile, profile.gpu_layer_blocks, profile.gpu_attn,
++                                                candidate.gpu_pc_layers, work_tokens, chunk_tokens, kv_tokens, false,
++                                                compute_ms)) {
++                continue;
++            }
++
++            double transfer_ms = 0.0;
++            const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(work_tokens, chunk_tokens);
++            for (const int tokens : chunks) {
++                const size_t bytes = (size_t) profile.n_embd * (size_t) tokens * sizeof(float);
++                double chunk_transfer_ms = 0.0;
++                if (!llama_hybrid_transfer_cost(profile.gpu_to_pc, bytes, chunk_transfer_ms)) {
++                    transfer_ms = std::numeric_limits<double>::infinity();
++                    break;
++                }
++                transfer_ms += chunk_transfer_ms;
++            }
++
++            candidate.predicted_pc_gpu_ms = compute_ms + transfer_ms;
++            if (!std::isfinite(candidate.predicted_pc_gpu_ms) ||
++                !score_tensor(candidate) ||
++                !finalize_score(candidate)) {
++                continue;
++            }
++
++            if (!found || candidate.predicted_ms < best_plan.predicted_ms ||
++                (candidate.predicted_ms == best_plan.predicted_ms &&
++                 candidate.gpu_chunk_tokens > best_plan.gpu_chunk_tokens)) {
++                best_plan = std::move(candidate);
++                found = true;
++            }
++        }
++
++        if (!found) {
+             return false;
+         }
+-        plan.predicted_ms = sim.makespan_ms;
+-        plan.predicted_gpu_busy_ms = sim.gpu_busy_ms;
+-        plan.predicted_downstream_ms = sim.downstream_ms;
+-        plan.predicted_gpu_wait_ms = sim.gpu_wait_ms;
+-        plan.predicted_tensor_peak_bytes = sim.tensor_peak_bytes;
+-        plan.predicted_phone_peak_bytes = sim.phone_peak_bytes;
++        plan = std::move(best_plan);
++        return true;
++    }
++
++    if (!score_tensor(plan)) {
++        return false;
+     }
+-    return std::isfinite(plan.predicted_ms);
++    return finalize_score(plan);
+ }
