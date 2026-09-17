@@ -308,6 +308,9 @@ LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
+LLAMA_API bool llama_hybrid_runtime_prefill_dag_enabled();
+LLAMA_API int  llama_hybrid_runtime_prefill_dag_max_ahead();
+LLAMA_API bool llama_hybrid_runtime_prefill_dag_eligible(int layer_begin, int layer_end);
 
 LLAMA_API bool llama_hybrid_autoplan(llama_model_loader &       ml,
                                      const llama_model_params & params,

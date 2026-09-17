@@ -1510,6 +1510,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
                       int   il) const {
     const int64_t n_embd_q  = n_embd_head * n_head;
     const int64_t n_embd_kv = n_embd_head * n_head_kv;
+    // QKV may be built for an XT-sized token slice in the prefill DAG.
+    // Use the actual input token dimension, not the macro ubatch size.
+    const int64_t n_tokens_qkv = cur->ne[1];
 
     ggml_tensor * Qcur, * Kcur, * Vcur;
 
@@ -1525,12 +1528,12 @@ llm_graph_qkv llm_graph_context::build_qkv(
             qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(qkv, "wqkv_clamped", il);
         }
-        Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head,    n_tokens,
+        Qcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head,    n_tokens_qkv,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1], 0);
-        Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+        Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens_qkv,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
             ggml_row_size(qkv->type, n_embd_q));
-        Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+        Vcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens_qkv,
             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
@@ -1565,9 +1568,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Vcur, "Vcur_clamped", il);
         }
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens); //
-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens_qkv); //
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens_qkv);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens_qkv);
     }
 
     cb(Qcur, "Qcur", il);

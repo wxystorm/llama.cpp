@@ -1685,7 +1685,7 @@ bool llama_context::copy_hybrid_stage_output(
     const int64_t n_embd = model.hparams.n_embd;
     if (stage_output == nullptr || stage_output->type != GGML_TYPE_F32 || !ggml_is_contiguous(stage_output) ||
         stage_output->ne[0] != n_embd || stage_output->ne[1] != n_tokens) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[HYBRID_EXEC] ub=%d stage=%zu block=%zu invalid stage output\n",
             ubatch_id, stage_index, block_index);
         return false;
@@ -1716,7 +1716,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ggml_status &                      ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[HYBRID_EXEC] ub=%d stage=%zu block=%zu invalid KV range=[%u,%u)\n",
             ubatch_id, stage_index, block_index, token_begin, token_begin + block_tokens);
         ret = GGML_STATUS_FAILED;
@@ -1727,7 +1727,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ubatch, token_begin, block_tokens, stage_input);
     n_outputs = block_outputs;
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_INFO(
         "[HYBRID_EXEC] ub=%d stage=%zu kind=%s layers=[%d,%d) block=%zu action=%s tokens=[%u,%u)\n",
         ubatch_id, stage_index, llama_hybrid_runtime_stage_name(stage.kind), stage.layer_begin, stage.layer_end,
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
@@ -2320,7 +2320,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (stage_queue_requested && has_runtime_plan) {
         for (size_t i = 0; i < runtime_stages.size(); ++i) {
             const auto & stage = runtime_stages[i];
-            LLAMA_LOG_ERROR("[HYBRID_STAGE] index=%zu kind=%s layers=[%d,%d) macro=%d inner=%d\n",
+            LLAMA_LOG_INFO("[HYBRID_STAGE] index=%zu kind=%s layers=[%d,%d) macro=%d inner=%d\n",
                             i, llama_hybrid_runtime_stage_name(stage.kind), stage.layer_begin, stage.layer_end,
                             stage.macro_tokens, stage.inner_chunk_tokens);
         }
@@ -2386,7 +2386,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size());
     } else if (stage_serial_runtime_enabled) {
         runtime_ubatch = std::min<uint32_t>(cparams.n_ubatch, runtime_stages.front().macro_tokens);
-        LLAMA_LOG_ERROR("[HYBRID_EXEC] mode=serial batch=%u ubatch=%u stages=%zu\n",
+        LLAMA_LOG_INFO("[HYBRID_EXEC] mode=serial batch=%u ubatch=%u stages=%zu\n",
                         n_tokens_all, runtime_ubatch, runtime_stages.size());
     }
 
@@ -2796,6 +2796,259 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     };
 
+
+    const auto hybrid_tensor_dag_job_eligible = [&](const llama_hybrid_job & job) -> bool {
+        if (!llama_hybrid_runtime_prefill_dag_enabled() ||
+                job.stage_index >= runtime_stages.size() ||
+                runtime_stages.size() != 2 || job.stage_index != 1) {
+            return false;
+        }
+
+        const auto & gpu_stage = runtime_stages[0];
+        const auto & stage     = runtime_stages[job.stage_index];
+        if (gpu_stage.kind != llama_hybrid_runtime_stage_kind::GPU ||
+                stage.kind != llama_hybrid_runtime_stage_kind::TENSOR ||
+                stage.inner_chunk_tokens <= 0 || job.ubatch.n_tokens <= 1 ||
+                job.ubatch.n_pos != 1 || job.ubatch.equal_seqs() ||
+                job.ubatch.n_seqs_unq != 1 ||
+                !llama_hybrid_runtime_prefill_dag_eligible(stage.layer_begin, stage.layer_end)) {
+            return false;
+        }
+
+        // v3a returns only the final task graph to the normal decode output path.
+        // Until multi-result harvesting is added, keep every requested output in
+        // the last XT chunk so earlier final-layer task graphs can be discarded.
+        const uint32_t xt = (uint32_t) stage.inner_chunk_tokens;
+        const uint32_t last_chunk_begin = ((job.ubatch.n_tokens - 1) / xt) * xt;
+        if (job.ubatch.output != nullptr) {
+            for (uint32_t i = 0; i < last_chunk_begin; ++i) {
+                if (job.ubatch.output[i] != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    const auto hybrid_run_tensor_dag = [&](llama_hybrid_job & job, ggml_status & status) -> llm_graph_result * {
+        GGML_ASSERT(hybrid_tensor_dag_job_eligible(job));
+        GGML_ASSERT(job.stage_index < runtime_stages.size());
+
+        const size_t stage_index = job.stage_index;
+        const auto & stage = runtime_stages[stage_index];
+        const int n_layers = stage.layer_end - stage.layer_begin;
+        const int max_ahead = llama_hybrid_runtime_prefill_dag_max_ahead();
+        const int xt = stage.inner_chunk_tokens;
+        const int64_t n_embd = model.hparams.n_embd;
+        const std::vector<int> chunk_sizes =
+            llama_hybrid_split_by_chunk_size((int) job.ubatch.n_tokens, xt);
+        GGML_ASSERT(!chunk_sizes.empty());
+
+        struct dag_chunk_state {
+            uint32_t token_begin = 0;
+            uint32_t token_count = 0;
+            int next_layer = 0;
+        };
+
+        std::vector<dag_chunk_state> chunks(chunk_sizes.size());
+        uint32_t token_begin = 0;
+        for (size_t c = 0; c < chunk_sizes.size(); ++c) {
+            chunks[c].token_begin = token_begin;
+            chunks[c].token_count = (uint32_t) chunk_sizes[c];
+            chunks[c].next_layer = stage.layer_begin;
+            token_begin += chunks[c].token_count;
+        }
+        GGML_ASSERT(token_begin == job.ubatch.n_tokens);
+
+        ggml_backend_meta_tensor_profile profile {};
+        const int n_profile_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());
+        const auto profile_reset = [&]() {
+            for (int i = 0; i < n_profile_backends; ++i) {
+                ggml_backend_meta_tensor_profile_reset(ggml_backend_sched_get_backend(sched_pipe.get(), i));
+            }
+        };
+        const auto profile_collect = [&]() {
+            for (int i = 0; i < n_profile_backends; ++i) {
+                ggml_backend_meta_tensor_profile p {};
+                if (!ggml_backend_meta_tensor_profile_get(
+                        ggml_backend_sched_get_backend(sched_pipe.get(), i), &p)) {
+                    continue;
+                }
+                profile.attn_us   += p.attn_us;
+                profile.pc_ffn_us += p.pc_ffn_us;
+                profile.h2d_us    += p.h2d_us;
+                profile.phone_us  += p.phone_us;
+                profile.d2h_us    += p.d2h_us;
+                profile.reduce_us += p.reduce_us;
+                profile.wait_us   += p.wait_us;
+                profile.lane_reuse_wait_count += p.lane_reuse_wait_count;
+                profile.lane_reuse_wait_us += p.lane_reuse_wait_us;
+                profile.lane_reuse_wait_max_us = std::max(
+                    profile.lane_reuse_wait_max_us, p.lane_reuse_wait_max_us);
+                for (size_t lane = 0; lane < 2; ++lane) {
+                    profile.lane_reuse_wait_count_by_lane[lane] += p.lane_reuse_wait_count_by_lane[lane];
+                    profile.lane_reuse_wait_us_by_lane[lane] += p.lane_reuse_wait_us_by_lane[lane];
+                }
+                if (p.layer_barrier_wait_count > 0 &&
+                        p.layer_barrier_wait_max_us >= profile.layer_barrier_wait_max_us) {
+                    profile.layer_barrier_wait_max_us = p.layer_barrier_wait_max_us;
+                    profile.layer_barrier_wait_max_layer = p.layer_barrier_wait_max_layer;
+                    profile.layer_barrier_wait_max_pending = p.layer_barrier_wait_max_pending;
+                    profile.layer_barrier_wait_max_last_lane = p.layer_barrier_wait_max_last_lane;
+                }
+                profile.layer_barrier_wait_count += p.layer_barrier_wait_count;
+                profile.layer_barrier_wait_us += p.layer_barrier_wait_us;
+            }
+        };
+
+        const int total_tasks = n_layers * (int) chunks.size();
+        int tasks_done = 0;
+        int64_t multi_ready_steps = 0;
+        int64_t max_ready = 0;
+        int max_layer_skew = 0;
+        llm_graph_result * result = nullptr;
+        bool apply_mctx = false; // GPU prefix already applied this macro's memory context.
+        const int64_t dag_begin_us = ggml_time_us();
+
+        LLAMA_LOG_ERROR(
+            "[PREFILL_DAG_V3_BEGIN] ub=%d layers=[%d,%d) tokens=%u XT=%d chunks=%zu max_ahead=%d\n",
+            job.ubatch_id, stage.layer_begin, stage.layer_end, job.ubatch.n_tokens,
+            xt, chunks.size(), max_ahead);
+
+        while (tasks_done < total_tasks) {
+            int min_layer = stage.layer_end;
+            for (const auto & c : chunks) {
+                if (c.next_layer < stage.layer_end) {
+                    min_layer = std::min(min_layer, c.next_layer);
+                }
+            }
+            GGML_ASSERT(min_layer < stage.layer_end);
+
+            size_t best_chunk = chunks.size();
+            int best_layer = -1;
+            int64_t ready_count = 0;
+
+            for (size_t c = 0; c < chunks.size(); ++c) {
+                const int layer = chunks[c].next_layer;
+                if (layer >= stage.layer_end) {
+                    continue;
+                }
+                if (layer >= min_layer + max_ahead) {
+                    continue;
+                }
+                // No KV holes: chunk C at layer L cannot run before C-1 has
+                // completed that same layer (its next_layer is then > L).
+                if (c > 0 && chunks[c - 1].next_layer <= layer) {
+                    continue;
+                }
+
+                ++ready_count;
+                // Prefer the deepest ready task so a completed chunk advances
+                // toward the next phone FFN quickly. Stable chunk order breaks ties.
+                if (best_chunk == chunks.size() || layer > best_layer ||
+                        (layer == best_layer && c < best_chunk)) {
+                    best_chunk = c;
+                    best_layer = layer;
+                }
+            }
+
+            GGML_ASSERT(best_chunk < chunks.size());
+            max_ready = std::max(max_ready, ready_count);
+            if (ready_count > 1) {
+                ++multi_ready_steps;
+            }
+
+            auto & c = chunks[best_chunk];
+            const int layer = c.next_layer;
+            const bool final_layer = layer + 1 == stage.layer_end;
+            float * hidden = job.hidden.data() + (size_t) c.token_begin * n_embd;
+
+            int32_t task_outputs = 0;
+            if (final_layer && job.ubatch.output != nullptr) {
+                for (uint32_t i = 0; i < c.token_count; ++i) {
+                    task_outputs += job.ubatch.output[c.token_begin + i] != 0;
+                }
+            }
+
+            llama_hybrid_runtime_stage task_stage = stage;
+            task_stage.layer_begin = layer;
+            task_stage.layer_end   = layer + 1;
+            task_stage.macro_tokens = (int) c.token_count;
+
+            profile_reset();
+            const int64_t task_begin_us = ggml_time_us();
+            LLAMA_LOG_INFO(
+                "[PREFILL_DAG_TASK_BEGIN] ub=%d task=%d layer=%d chunk=%zu tokens=[%u,%u) ready=%" PRId64 "\n",
+                job.ubatch_id, tasks_done, layer, best_chunk, c.token_begin,
+                c.token_begin + c.token_count, ready_count);
+
+            llm_graph_result * task_result = run_hybrid_stage_block(
+                job.ubatch, task_stage, c.token_begin, c.token_count,
+                hidden, final_layer ? nullptr : hidden,
+                ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched_pipe.get(), gf_res_pipe.get(),
+                job.ubatch_id, stage_index, (size_t) tasks_done,
+                llama_hybrid_boundary_action::PASS, task_outputs,
+                apply_mctx, true, status);
+
+            profile_collect();
+            const int64_t task_end_us = ggml_time_us();
+            LLAMA_LOG_INFO(
+                "[PREFILL_DAG_TASK_END] ub=%d task=%d layer=%d chunk=%zu status=%d dur=%.3f ms\n",
+                job.ubatch_id, tasks_done, layer, best_chunk, (int) status,
+                (task_end_us - task_begin_us) / 1000.0);
+
+            if (task_result == nullptr || status != GGML_STATUS_SUCCESS) {
+                static_cast<llama_kv_cache_context *>(mctx.get())->clear_stage_range();
+                return nullptr;
+            }
+
+            result = task_result;
+            ++c.next_layer;
+            ++tasks_done;
+
+            int min_progress = n_layers;
+            int max_progress = 0;
+            for (const auto & state : chunks) {
+                const int progress = std::min(n_layers, state.next_layer - stage.layer_begin);
+                min_progress = std::min(min_progress, progress);
+                max_progress = std::max(max_progress, progress);
+            }
+            max_layer_skew = std::max(max_layer_skew, max_progress - min_progress);
+        }
+
+        static_cast<llama_kv_cache_context *>(mctx.get())->clear_stage_range();
+        job.stage_index++;
+
+        LLAMA_LOG_ERROR(
+            "[PREFILL_DAG_V3_SUM] ub=%d tasks=%d max_skew=%d multi_ready_steps=%" PRId64
+            " max_ready=%" PRId64 " total=%.3f ms\n",
+            job.ubatch_id, tasks_done, max_layer_skew, multi_ready_steps, max_ready,
+            (ggml_time_us() - dag_begin_us) / 1000.0);
+        LLAMA_LOG_ERROR(
+            "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f pc_ffn=%.3f h2d=%.3f "
+            "phone=%.3f d2h=%.3f reduce=%.3f wait=%.3f ms\n",
+            job.ubatch_id, (ggml_time_us() - dag_begin_us) / 1000.0,
+            profile.attn_us / 1000.0, profile.pc_ffn_us / 1000.0,
+            profile.h2d_us / 1000.0, profile.phone_us / 1000.0,
+            profile.d2h_us / 1000.0, profile.reduce_us / 1000.0,
+            profile.wait_us / 1000.0);
+        LLAMA_LOG_ERROR(
+            "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64 " lane_reuse_ms=%.3f "
+            "lane_reuse_max_ms=%.3f lane0_count=%" PRId64 " lane0_ms=%.3f "
+            "lane1_count=%" PRId64 " lane1_ms=%.3f layer_barrier_count=%" PRId64 " "
+            "layer_barrier_ms=%.3f layer_barrier_max_ms=%.3f max_layer=%" PRId64 " "
+            "max_pending=%" PRId64 " max_last_lane=%" PRId64 "\n",
+            profile.lane_reuse_wait_count, profile.lane_reuse_wait_us / 1000.0,
+            profile.lane_reuse_wait_max_us / 1000.0,
+            profile.lane_reuse_wait_count_by_lane[0], profile.lane_reuse_wait_us_by_lane[0] / 1000.0,
+            profile.lane_reuse_wait_count_by_lane[1], profile.lane_reuse_wait_us_by_lane[1] / 1000.0,
+            profile.layer_barrier_wait_count, profile.layer_barrier_wait_us / 1000.0,
+            profile.layer_barrier_wait_max_us / 1000.0, profile.layer_barrier_wait_max_layer,
+            profile.layer_barrier_wait_max_pending, profile.layer_barrier_wait_max_last_lane);
+
+        return result;
+    };
+
     const auto hybrid_run_tensor_one = [&](ggml_status & status) -> llm_graph_result * {
         GGML_ASSERT(!hybrid_tensor_ready_q.empty());
 
@@ -2812,7 +3065,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             "[HYBRID_PIPE] ub=%d TENSOR_DEQUEUE job_mib=%.2f queue_mib=%.2f\n",
             job.ubatch_id, tensor_bytes / 1048576.0, hybrid_tensor_ready_bytes / 1048576.0);
 
-        llm_graph_result * result = hybrid_run_downstream_stage(job, status);
+        const bool use_dag_v3 = hybrid_tensor_dag_job_eligible(job);
+        if (llama_hybrid_runtime_prefill_dag_enabled() && !use_dag_v3) {
+            LLAMA_LOG_WARN(
+                "[PREFILL_DAG_V3] ub=%d unsupported job/topology; falling back to legacy Tensor stage\n",
+                job.ubatch_id);
+        }
+
+        llm_graph_result * result = use_dag_v3 ?
+            hybrid_run_tensor_dag(job, status) :
+            hybrid_run_downstream_stage(job, status);
         if (result == nullptr || status != GGML_STATUS_SUCCESS) {
             return nullptr;
         }

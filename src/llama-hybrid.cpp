@@ -108,6 +108,41 @@ int llama_hybrid_runtime_prefill_chunk_tokens() {
     return g_llama_hybrid_runtime_plan.has_value() ? g_llama_hybrid_runtime_plan->tensor_chunk_tokens : 0;
 }
 
+bool llama_hybrid_runtime_prefill_dag_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_PREFILL_DAG");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+int llama_hybrid_runtime_prefill_dag_max_ahead() {
+    const char * value = std::getenv("LLAMA_HYBRID_DAG_MAX_AHEAD");
+    if (value == nullptr) {
+        return 2;
+    }
+    return std::max(1, std::atoi(value));
+}
+
+bool llama_hybrid_runtime_prefill_dag_eligible(int layer_begin, int layer_end) {
+    if (!llama_hybrid_runtime_prefill_dag_enabled()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+    if (!g_llama_hybrid_runtime_plan.has_value()) {
+        return false;
+    }
+
+    const llama_hybrid_plan & plan = *g_llama_hybrid_runtime_plan;
+    const int tensor_begin = plan.pc_layers;
+    const int tensor_end   = tensor_begin + plan.tensor_layers;
+
+    return plan.gpu_pc_layers > 0 &&
+           plan.pc_layers == plan.gpu_pc_layers &&
+           plan.tensor_layers > 0 &&
+           plan.phone_layers == 0 &&
+           layer_begin == tensor_begin &&
+           layer_end == tensor_end;
+}
+
 std::vector<int> llama_hybrid_split_chunks(int tokens, int n_chunks) {
     if (tokens <= 0 || n_chunks <= 0 || n_chunks > tokens) {
         return {};
@@ -4128,7 +4163,11 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
     
-    
+    constraints.fixed_tensor_layers      = 50;
+    constraints.fixed_phone_layers       = 0;
+    constraints.fixed_pc_layers          = 14;
+    //constraints.fixed_tensor_pc_ratio     = 0.713f;
+    constraints.fixed_gpu_pc_layers      = 14;
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(

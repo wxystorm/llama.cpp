@@ -1252,6 +1252,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     return ggml_backend_meta_get_split_state(*stc, tensor, assume_sync);
 }
 
+static bool ggml_backend_meta_tensor_is_mirrored(
+        const ggml_tensor * tensor, bool assume_sync) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return false;
+    }
+    return ggml_backend_meta_get_split_state(tensor, assume_sync).axis ==
+        GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+}
+
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return (void *) 0x1000000000000000; // FIXME
@@ -2681,9 +2691,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 continue;
             }
 
-            if (ggml_backend_meta_get_split_state(
-                    next->src[s], false).axis !=
-                    GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            if (!ggml_backend_meta_tensor_is_mirrored(next->src[s], false)) {
                 return i;
             }
         }
@@ -2704,6 +2712,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return depends_on_delayed ? ii : i;
         }
 
+        if (next->buffer == nullptr || !ggml_backend_buffer_is_meta(next->buffer)) {
+            return i;
+        }
         if (ggml_backend_meta_get_split_state(next, false).axis ==
                 GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return i;
@@ -2723,7 +2734,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 next->name, next_prefill_chunk, next_prefill_layer)) {
                             break;
                         }
-                        if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        if (!ggml_backend_meta_tensor_is_mirrored(next, false)) {
                             break;
                         }
                         bool safe = true;
@@ -2735,7 +2746,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 safe = false;
                                 break;
                             }
-                            if (ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            if (!ggml_backend_meta_tensor_is_mirrored(next->src[s], false)) {
                                 safe = false;
                                 break;
                             }
@@ -2754,8 +2765,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                            next->src[1] != nullptr && next->src[1]->buffer != nullptr &&
+                            ggml_backend_buffer_is_meta(next->src[1]->buffer) &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
-                            ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            ggml_backend_meta_tensor_is_mirrored(next->src[2], false)) {
                         node = next;
                         id++;
                         idr = id;
@@ -2770,7 +2783,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_MUL && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            ggml_backend_meta_tensor_is_mirrored(next->src[1], false)) {
                         node = next;
                         id++;
                         idr = id;
@@ -2812,10 +2825,30 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return idr;
             };
 
+            auto is_passthrough_host_view = [](const ggml_tensor * node) -> bool {
+                return node->view_src != nullptr &&
+                       node->view_src->op == GGML_OP_NONE &&
+                       node->view_src->buffer != nullptr &&
+                       ggml_backend_buffer_is_host(node->view_src->buffer);
+            };
+
+            // DAG prefill creates token-range views of host inputs (for example
+            // position slices). Such VIEW nodes are no-op/pass-through nodes for
+            // the Meta split planner and are intentionally skipped below. The
+            // old end-of-graph test used the literal last cgraph node, however,
+            // so a trailing host VIEW could prevent the final subgraph from ever
+            // being closed and leave i_start < cgraph->n_nodes.
+            int last_meta_node = cgraph->n_nodes - 1;
+            while (last_meta_node >= 0 &&
+                   is_passthrough_host_view(cgraph->nodes[last_meta_node])) {
+                --last_meta_node;
+            }
+            GGML_ASSERT(last_meta_node >= 0);
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_passthrough_host_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
@@ -2832,7 +2865,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         node->name, prefill_chunk, prefill_layer);
 
                 const bool new_subgraph =
-                    i + 1 == cgraph->n_nodes ||
+                    i == last_meta_node ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk;
@@ -2866,6 +2899,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 n_subgraphs++;
                 i_start = i + 1;
             }
+
+            // The last simple-backend subgraph already extends to
+            // cgraph->n_nodes when it is materialized below, so any trailing
+            // pass-through host VIEWs are naturally kept in that final graph.
+            // They must be the only nodes left after the final real Meta node.
+            for (int i = i_start; i < cgraph->n_nodes; ++i) {
+                GGML_ASSERT(is_passthrough_host_view(cgraph->nodes[i]));
+            }
+            i_start = cgraph->n_nodes;
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
@@ -5269,17 +5311,15 @@ auto prefill_norm_sg_has_prework =
         return false;
     };
         const bool norm_can_overlap =
-    is_prefill_norm_sg &&
-    has_pending_prefill_reduce_for_layer(prefill_norm_layer) &&
-    !prefill_norm_sg_has_prework(i);
+            is_prefill_norm_sg &&
+            has_pending_prefill_reduce_for_layer(prefill_norm_layer) &&
+            !prefill_norm_sg_has_prework(i);
 
-const bool down_can_overlap =
-    is_prefill_down_sg &&
-    has_pending_prefill_reduce_for_layer(prefill_down_layer);
+        const bool down_can_overlap =
+            is_prefill_down_sg &&
+            has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
-        const bool continues_prefill_layer =
-    norm_can_overlap ||
-    down_can_overlap;
+        const bool continues_prefill_layer = norm_can_overlap || down_can_overlap;
         if (has_pending_prefill_reduce() && !continues_prefill_layer) {
             size_t pending_lanes = 0;
             int barrier_layer = -1;
