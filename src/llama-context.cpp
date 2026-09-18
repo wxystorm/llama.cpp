@@ -2335,8 +2335,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (return_wavefront_full_graph_override) {
             LLAMA_LOG_ERROR(
                 "[HYBRID_PIPE] return-wavefront full-graph override: "
-                "GPU->TENSOR stage queue disabled, batch=%u XG=%d XT=%d\n",
-                n_tokens_all, runtime_plan.gpu_chunk_tokens, runtime_plan.tensor_chunk_tokens);
+                "GPU->TENSOR stage queue disabled, batch=%u XG=%d XT=%d GA=%d XA=%d\n",
+                n_tokens_all, runtime_plan.gpu_chunk_tokens, runtime_plan.tensor_chunk_tokens,
+                llama_hybrid_runtime_prefill_attn_group_chunks(),
+                runtime_plan.tensor_chunk_tokens * llama_hybrid_runtime_prefill_attn_group_chunks());
         }
         for (size_t i = 0; i < runtime_stages.size(); ++i) {
             const auto & stage = runtime_stages[i];
@@ -2782,13 +2784,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (llama_hybrid_runtime_predict_tensor_compute(
                     (int) job.ubatch.n_tokens, tensor_prediction)) {
                 LLAMA_LOG_ERROR(
-                    "[PRED_TENSOR_COMPUTE] ub=%d tokens=%d kv_tokens=%d T=%d XT=%d R=%.3f "
+                    "[PRED_TENSOR_COMPUTE] ub=%d tokens=%d kv_tokens=%d T=%d XT=%d GA=%d XA=%d R=%.3f "
                     "attn_misc_ms=%.3f pc_ffn_ms=%.3f pc_compute_ms=%.3f tensor_total_ms=%.3f\n",
                     job.ubatch_id,
                     tensor_prediction.tokens,
                     tensor_prediction.kv_tokens,
                     tensor_prediction.tensor_layers,
                     tensor_prediction.tensor_chunk_tokens,
+                    tensor_prediction.attn_group_chunks,
+                    tensor_prediction.attn_chunk_tokens,
                     tensor_prediction.tensor_pc_ratio,
                     tensor_prediction.attn_misc_ms,
                     tensor_prediction.pc_ffn_ms,
