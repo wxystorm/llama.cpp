@@ -174,7 +174,9 @@ struct llama_hybrid_tensor_compute_prediction {
     int   kv_tokens           = 0;
     int   tensor_layers       = 0;
     int   tensor_chunk_tokens = 0;
-    float tensor_pc_ratio     = 0.0f;
+    int   attn_group_chunks    = 1;
+    int   attn_chunk_tokens    = 0;
+    float tensor_pc_ratio      = 0.0f;
 
     double attn_misc_ms    = 0.0;
     double pc_ffn_ms       = 0.0;
@@ -323,6 +325,7 @@ LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
+LLAMA_API int  llama_hybrid_runtime_prefill_attn_group_chunks();
 LLAMA_API bool llama_hybrid_runtime_prefill_dag_enabled();
 LLAMA_API int  llama_hybrid_runtime_prefill_dag_max_ahead();
 LLAMA_API bool llama_hybrid_runtime_prefill_dag_eligible(int layer_begin, int layer_end);
