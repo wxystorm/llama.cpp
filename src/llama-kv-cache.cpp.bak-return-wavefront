@@ -2619,36 +2619,6 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, current_sinfo());
 }
 
-llama_kv_cache::slot_info llama_kv_cache_context::current_sinfo_range(
-        uint32_t token_begin, uint32_t n_tokens) const {
-    const llama_kv_cache::slot_info & source = current_sinfo();
-
-    // The Hybrid prefill stage range is currently a single-stream slice. This
-    // matches llama_context::run_hybrid_stage_block() and keeps the DAG v1
-    // deliberately outside equal-sequence / multi-stream batching.
-    GGML_ASSERT(source.idxs.size() == 1);
-    GGML_ASSERT(token_begin <= source.idxs[0].size());
-    GGML_ASSERT(n_tokens <= source.idxs[0].size() - token_begin);
-
-    llama_kv_cache::slot_info result = source;
-    result.idxs[0].assign(
-        source.idxs[0].begin() + token_begin,
-        source.idxs[0].begin() + token_begin + n_tokens);
-    return result;
-}
-
-void llama_kv_cache_context::set_input_k_idxs_range(
-        ggml_tensor * dst, const llama_ubatch * ubatch,
-        uint32_t token_begin, uint32_t n_tokens) const {
-    kv->set_input_k_idxs(dst, ubatch, current_sinfo_range(token_begin, n_tokens));
-}
-
-void llama_kv_cache_context::set_input_v_idxs_range(
-        ggml_tensor * dst, const llama_ubatch * ubatch,
-        uint32_t token_begin, uint32_t n_tokens) const {
-    kv->set_input_v_idxs(dst, ubatch, current_sinfo_range(token_begin, n_tokens));
-}
-
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }

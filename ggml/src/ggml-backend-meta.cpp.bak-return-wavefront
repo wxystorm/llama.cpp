@@ -107,13 +107,6 @@ static bool ggml_backend_meta_parse_prefill_down_chunk(
     return std::sscanf(name, "prefill_ffn_down_chunk_%d-%d", &chunk, &layer) == 2;
 }
 
-static bool ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-        const char * name,
-        int & chunk,
-        int & layer) {
-    return std::sscanf(name, "prefill_wave_ffn_inp_chunk_%d-%d", &chunk, &layer) == 2;
-}
-
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -3231,7 +3224,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int pending_prefill_input_chunk = -1;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_task { 0, 0 };
     std::array<int, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_layer { -1, -1 };
-    std::array<int, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_chunk { -1, -1 };
     std::array<ggml_backend_meta_transfer_worker *, ggml_backend_meta_context::PREFILL_RETURN_LANES>
         pending_prefill_reduce_worker { nullptr, nullptr };
     auto has_pending_prefill_reduce = [&]() {
@@ -3257,42 +3249,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         tensor_wait_us += ggml_time_us() - wait_start_us;
         pending_prefill_reduce_task[lane]   = 0;
         pending_prefill_reduce_layer[lane]  = -1;
-        pending_prefill_reduce_chunk[lane]  = -1;
         pending_prefill_reduce_worker[lane] = nullptr;
         return status;
-    };
-
-    auto wait_prefill_reduce_dependency = [&](int layer, int chunk, bool & waited) {
-        waited = false;
-        for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
-            if (pending_prefill_reduce_task[lane] == 0 ||
-                pending_prefill_reduce_layer[lane] != layer ||
-                pending_prefill_reduce_chunk[lane] != chunk) {
-                continue;
-            }
-            waited = true;
-            return wait_prefill_reduce_lane(lane);
-        }
-        return GGML_STATUS_SUCCESS;
-    };
-    auto wait_prefill_reduces_before = [&](int layer_exclusive, bool & waited, int64_t & wait_us) {
-        waited = false;
-        wait_us = 0;
-        ggml_status result = GGML_STATUS_SUCCESS;
-        for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
-            if (pending_prefill_reduce_task[lane] == 0 ||
-                pending_prefill_reduce_layer[lane] >= layer_exclusive) {
-                continue;
-            }
-            waited = true;
-            const int64_t begin_us = ggml_time_us();
-            const ggml_status status = wait_prefill_reduce_lane(lane);
-            wait_us += ggml_time_us() - begin_us;
-            if (result == GGML_STATUS_SUCCESS && status != GGML_STATUS_SUCCESS) {
-                result = status;
-            }
-        }
-        return result;
     };
     auto wait_all_prefill_reduces = [&](int * last_lane) {
         ggml_status result = GGML_STATUS_SUCCESS;
@@ -3648,32 +3606,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
-
-    auto find_recent_prefill_wave_ffn_inp =
-        [&](size_t backend, size_t sg, int layer, int chunk) -> ggml_tensor * {
-            if (backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
-                return nullptr;
-            }
-
-            for (int64_t s = (int64_t) sg; s >= 0; --s) {
-                ggml_cgraph * graph =
-                    backend_ctx->backend_configs[backend].cgraphs[(size_t) s].cgraph_main;
-                if (graph == nullptr) {
-                    continue;
-                }
-                for (int k = graph->n_nodes - 1; k >= 0; --k) {
-                    int parsed_chunk = -1;
-                    int parsed_layer = -1;
-                    ggml_tensor * tensor = graph->nodes[k];
-                    if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                            tensor->name, parsed_chunk, parsed_layer) &&
-                        parsed_layer == layer && parsed_chunk == chunk) {
-                        return tensor;
-                    }
-                }
-            }
-            return nullptr;
-        };
     auto find_recent_ffn_inp_layer = [&](size_t backend, size_t sg, int & layer) -> ggml_tensor * {
         if (backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
             return nullptr;
@@ -3854,35 +3786,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return offset;
     };
-
-    bool return_wavefront_graph = false;
-    int  return_wavefront_first_layer = std::numeric_limits<int>::max();
-    if (n_backends == 2) {
-        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
-            ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
-            if (graph == nullptr) {
-                continue;
-            }
-            for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
-                int chunk = -1;
-                int layer = -1;
-                if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                        graph->nodes[node_id]->name, chunk, layer)) {
-                    return_wavefront_graph = true;
-                    return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
-                }
-            }
-        }
-    }
-
-    int64_t return_wave_dependency_wait_count  = 0;
-    int64_t return_wave_dependency_wait_us     = 0;
-    int64_t return_wave_dependency_wait_max_us = 0;
-    int64_t return_wave_overlap_boundaries     = 0;
-    int64_t return_wave_ahead_attn_chunks      = 0;
-    int64_t return_wave_ahead_phone_submits    = 0;
-    int64_t return_wave_old_layer_wait_count   = 0;
-    int64_t return_wave_old_layer_wait_us      = 0;
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
@@ -4374,8 +4277,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const uint32_t snapshot_slot =
                 use_snapshot_pipeline ? snapshot_prepares[i].slot : 0;
             const bool dual_prefill_return =
-                use_snapshot_pipeline &&
-                (std::getenv("GGML_META_PREFILL_DUAL_RETURN") != nullptr || return_wavefront_graph);
+                use_snapshot_pipeline && std::getenv("GGML_META_PREFILL_DUAL_RETURN") != nullptr;
             const size_t return_lane = dual_prefill_return ? (snapshot_slot & 1u) : 0;
             ggml_backend_meta_transfer_worker * reduce_worker = backend_ctx->transfer_worker;
             if (dual_prefill_return) {
@@ -4419,24 +4321,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 disable_layer_output_producers(1, i + 1, prefill_down_layer_0) : nullptr;
             ggml_tensor * pc_residual = handoff_to_phone ?
                 find_recent_ffn_inp(0, i, prefill_down_layer_0) : nullptr;
-            ggml_tensor * dag_residual = !handoff_to_phone ?
-                find_recent_prefill_wave_ffn_inp(
-                    0, i, prefill_down_layer_0, prefill_down_chunk_0) : nullptr;
             GGML_ASSERT(!handoff_to_phone ||
                 (pc_l_out != nullptr && pc_residual != nullptr &&
                  ggml_nbytes(pc_l_out) == ggml_nbytes(pc_residual)));
             GGML_ASSERT(!layer_handoff ||
                 (phone_l_out != nullptr &&
                  ggml_nbytes(pc_l_out) == ggml_nbytes(phone_l_out)));
-            GGML_ASSERT(!return_wavefront_graph || !handoff_to_phone);
-            GGML_ASSERT(!return_wavefront_graph || dag_residual != nullptr);
-            GGML_ASSERT(dag_residual == nullptr ||
-                ggml_nbytes(dag_residual) == ggml_nbytes(node_dst));
 
             ggml_tensor * pc_output_chunk = nullptr;
             ggml_tensor * residual_chunk = nullptr;
             ggml_cgraph * chunk_layer_graph = nullptr;
-            ggml_cgraph * dag_chunk_layer_graph = nullptr;
             if (handoff_to_phone) {
                 const size_t chunk_offset = down_chunk_offset(
                     0, true, prefill_down_layer_0, prefill_down_chunk_0);
@@ -4465,22 +4359,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 pc_output_chunk->view_offs = chunk_offset;
                 ggml_backend_view_init(pc_output_chunk);
                 GGML_ASSERT(ggml_nbytes(pc_output_chunk) == ggml_nbytes(node_dst));
-            } else if (dag_residual != nullptr) {
-                // The DAG graph intentionally omits the residual add from the
-                // main graph. Commit it here after the split FFN reduce so the
-                // completed down buffer is exactly l_out(L,C).
-                ggml_tensor * node_layer = get_node_aux(node_dst);
-                node_layer->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
-                node_layer->view_offs = node_dst->view_offs;
-                node_layer->op = GGML_OP_ADD;
-                node_layer->src[0] = node_dst;
-                node_layer->src[1] = dag_residual;
-                node_layer->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                ggml_backend_view_init(node_layer);
-
-                dag_chunk_layer_graph = get_cgraph_aux();
-                dag_chunk_layer_graph->nodes[0] = node_layer;
-                dag_chunk_layer_graph->n_nodes = 1;
             }
 
             const uint64_t reduce_task = reduce_worker->enqueue(
@@ -4488,7 +4366,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
                     snapshot_seq, handoff_to_phone, prefill_down_layer_0,
                     prefill_down_chunk_0, layer_handoff, pc_l_out, phone_l_out,
-                    pc_output_chunk, chunk_layer_graph, dag_chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
+                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
                         reduce_worker,
                         task_id,
@@ -4547,34 +4425,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const int64_t add_us = ggml_time_us() - add_start_us;
                     record_reduce_add(add_us, status == GGML_STATUS_SUCCESS);
 
-                    if (status != GGML_STATUS_SUCCESS) {
-                        return finish_return(status);
-                    }
-
-                    if (dag_chunk_layer_graph != nullptr) {
-                        // The dependency task is not complete until the PC
-                        // buffer contains full down + residual. Synchronize the
-                        // reduce, commit the residual in place, then publish
-                        // completion to the wavefront dependency tracker.
-                        ggml_backend_synchronize(bcj_dst.backend);
-                        const int64_t layer_add_start_us = ggml_time_us();
-                        const ggml_status layer_status =
-                            ggml_backend_graph_compute_async(
-                                bcj_dst.backend, dag_chunk_layer_graph);
-                        const int64_t layer_add_us = ggml_time_us() - layer_add_start_us;
-                        record_reduce_add(layer_add_us, false);
-                        if (layer_status != GGML_STATUS_SUCCESS) {
-                            return finish_return(layer_status);
-                        }
-                        ggml_backend_synchronize(bcj_dst.backend);
-                        if (pipeline_debug) {
-                            printf(
-                                "[RETURN_WAVEFRONT_COMMIT] layer=%d chunk=%d lane=%zu\n",
-                                prefill_down_layer_0, prefill_down_chunk_0, return_lane);
-                        }
-                    }
-
-                    if (!handoff_to_phone) {
+                    if (status != GGML_STATUS_SUCCESS || !handoff_to_phone) {
                         return finish_return(status);
                     }
 
@@ -4610,7 +4461,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             pending_prefill_reduce_task[return_lane]   = reduce_task;
             pending_prefill_reduce_layer[return_lane]  = prefill_down_layer_0;
-            pending_prefill_reduce_chunk[return_lane]  = prefill_down_chunk_0;
             pending_prefill_reduce_worker[return_lane] = reduce_worker;
 
             if (use_snapshot_pipeline) {
@@ -5470,58 +5320,7 @@ auto prefill_norm_sg_has_prework =
             has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
         const bool continues_prefill_layer = norm_can_overlap || down_can_overlap;
-        if (return_wavefront_graph && (is_prefill_norm_sg || is_prefill_down_sg)) {
-            if (is_prefill_norm_sg) {
-                // V1 permits L+1 while returns from L are in flight, but never
-                // L+2 while an L return still owns a lane.
-                bool older_waited = false;
-                int64_t older_wait_us = 0;
-                const ggml_status older_status = wait_prefill_reduces_before(
-                    prefill_norm_layer - 1, older_waited, older_wait_us);
-                if (older_waited) {
-                    ++return_wave_old_layer_wait_count;
-                    return_wave_old_layer_wait_us += older_wait_us;
-                }
-                if (older_status != GGML_STATUS_SUCCESS) {
-                    return older_status;
-                }
-
-                if (prefill_norm_layer > return_wavefront_first_layer) {
-                    bool waited = false;
-                    const int64_t wait_start_us = ggml_time_us();
-                    const ggml_status status = wait_prefill_reduce_dependency(
-                        prefill_norm_layer - 1, prefill_norm_chunk, waited);
-                    const int64_t wait_us = ggml_time_us() - wait_start_us;
-                    if (waited) {
-                        ++return_wave_dependency_wait_count;
-                        return_wave_dependency_wait_us += wait_us;
-                        return_wave_dependency_wait_max_us =
-                            std::max(return_wave_dependency_wait_max_us, wait_us);
-                        if (pipeline_debug) {
-                            printf(
-                                "[RETURN_WAVEFRONT_DEP_WAIT] layer=%d chunk=%d predecessor=%d wait_ms=%.3f\n",
-                                prefill_norm_layer, prefill_norm_chunk,
-                                prefill_norm_layer - 1, wait_us / 1000.0);
-                        }
-                    }
-                    if (status != GGML_STATUS_SUCCESS) {
-                        return status;
-                    }
-
-                    // Any other L-1 return still in flight means this chunk's
-                    // Attention is doing useful ahead work during old-layer D2H.
-                    if (has_pending_prefill_reduce_for_layer(prefill_norm_layer - 1)) {
-                        ++return_wave_overlap_boundaries;
-                        ++return_wave_ahead_attn_chunks;
-                    }
-                }
-            } else if (prefill_down_layer > return_wavefront_first_layer &&
-                       has_pending_prefill_reduce_for_layer(prefill_down_layer - 1)) {
-                // The down subgraph starts backend 0 and backend 1 together,
-                // so this is an immediate next-layer Phone FFN submission.
-                ++return_wave_ahead_phone_submits;
-            }
-        } else if (has_pending_prefill_reduce() && !continues_prefill_layer) {
+        if (has_pending_prefill_reduce() && !continues_prefill_layer) {
             size_t pending_lanes = 0;
             int barrier_layer = -1;
             for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
@@ -5868,27 +5667,6 @@ auto prefill_norm_sg_has_prework =
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
-    }
-
-    if (return_wavefront_graph) {
-        printf(
-            "[RETURN_WAVEFRONT_SUM] enabled=1 dependency_wait_count=%" PRId64
-            " dependency_wait_ms=%.3f dependency_wait_max_ms=%.3f"
-            " overlap_boundaries=%" PRId64
-            " ahead_attn=%" PRId64
-            " ahead_phone_submit=%" PRId64
-            " old_layer_wait_count=%" PRId64
-            " old_layer_wait_ms=%.3f"
-            " legacy_layer_barrier_count=%" PRId64 "\n",
-            return_wave_dependency_wait_count,
-            return_wave_dependency_wait_us / 1000.0,
-            return_wave_dependency_wait_max_us / 1000.0,
-            return_wave_overlap_boundaries,
-            return_wave_ahead_attn_chunks,
-            return_wave_ahead_phone_submits,
-            return_wave_old_layer_wait_count,
-            return_wave_old_layer_wait_us / 1000.0,
-            layer_barrier_wait_count);
     }
 
     debug_handoff_watch("BEFORE_META_RETURN");

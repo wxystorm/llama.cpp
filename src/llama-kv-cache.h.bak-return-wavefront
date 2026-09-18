@@ -391,12 +391,6 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_k_idxs_range(
-        ggml_tensor * dst, const llama_ubatch * ubatch,
-        uint32_t token_begin, uint32_t n_tokens) const;
-    void set_input_v_idxs_range(
-        ggml_tensor * dst, const llama_ubatch * ubatch,
-        uint32_t token_begin, uint32_t n_tokens) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -445,5 +439,4 @@ private:
     int32_t n_kv;
 
     const llama_kv_cache::slot_info & current_sinfo() const;
-    llama_kv_cache::slot_info current_sinfo_range(uint32_t token_begin, uint32_t n_tokens) const;
 };
