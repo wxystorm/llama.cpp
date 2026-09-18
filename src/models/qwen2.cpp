@@ -118,13 +118,16 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     // built exactly as before; only the final contiguous TENSOR_SPLIT suffix is
     // represented as layer-major token chunks inside this same graph.
     const int return_wave_chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
+    const int return_wave_attn_group_chunks =
+        llama_hybrid_runtime_prefill_attn_group_chunks();
     int return_wave_first_layer = -1;
     bool return_wave_eligible =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr &&
         !stage_graph && build_output_head && n_tokens > 1 &&
         ubatch.n_pos == 1 && !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
         model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-        return_wave_chunk_tokens > 0 && loras->empty();
+        return_wave_chunk_tokens > 0 && return_wave_attn_group_chunks > 0 &&
+        loras->empty();
 
     if (return_wave_eligible) {
         for (int il = layer_begin; il < layer_end; ++il) {
@@ -152,20 +155,14 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
 
             std::vector<int64_t> chunk_begin(chunk_sizes.size(), 0);
             std::vector<ggml_tensor *> hidden_chunks;
-            std::vector<llm_graph_input_attn_kv *> attn_chunks;
-            // Keep the split FFN result and its residual alive until the next
-            // layer consumes this exact chunk.  The l_out ADD is deliberately
-            // created later, immediately before Attention(L+1,C), so GGML's
-            // static lifetime matches the real delayed execution point.
+            // FFN/Phone/return remain XT-granular. Attention may consume
+            // several consecutive ready XT chunks as one larger group.
             std::vector<ggml_tensor *> pending_wave_down_chunks(
                 chunk_sizes.size(), nullptr);
             std::vector<ggml_tensor *> pending_wave_residual_chunks(
                 chunk_sizes.size(), nullptr);
             hidden_chunks.reserve(chunk_sizes.size());
-            attn_chunks.reserve(chunk_sizes.size());
 
-            // Materialize the prefix output on the first Tensor-split backend
-            // before creating token-range views.
             ggml_tensor * wave_entry = ggml_cont(ctx0, inpL);
             cb(wave_entry, "prefill_wave_entry", return_wave_first_layer);
 
@@ -177,100 +174,119 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 hidden_chunks.push_back(ggml_view_2d(
                     ctx0, wave_entry, wave_entry->ne[0], token_count,
                     wave_entry->nb[1], token_begin * wave_entry->nb[1]));
-                attn_chunks.push_back(build_attn_inp_kv_range(
-                    (uint32_t) token_begin, (uint32_t) token_count));
                 token_begin += token_count;
             }
             GGML_ASSERT(token_begin == n_tokens);
 
-            // Layer-major order is deliberate.  We finish all Phone compute
-            // submissions for layer L before entering L+1, while return/reduce
-            // tasks from L may remain in flight.  Meta waits only OUT(L,C)
-            // before executing Attention(L+1,C), so the ready prefix flows
-            // forward without the old whole-layer return barrier.
             for (int wave_layer = il; wave_layer < layer_end; ++wave_layer) {
-                for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
-                    const int64_t begin = chunk_begin[ci];
-                    const int64_t count = chunk_sizes[ci];
-                    ggml_tensor * inpSA = hidden_chunks[ci];
+                for (size_t group_start = 0; group_start < chunk_sizes.size();
+                     group_start += (size_t) return_wave_attn_group_chunks) {
+                    const size_t group_end = std::min(
+                        chunk_sizes.size(),
+                        group_start + (size_t) return_wave_attn_group_chunks);
+                    const int group_chunk_count = (int) (group_end - group_start);
+                    GGML_ASSERT(group_chunk_count > 0);
 
-                    if (wave_layer > il) {
-                        GGML_ASSERT(pending_wave_down_chunks[ci] != nullptr);
-                        GGML_ASSERT(pending_wave_residual_chunks[ci] != nullptr);
+                    const int64_t group_token_begin = chunk_begin[group_start];
+                    int64_t group_token_count = 0;
 
-                        // Deferred wavefront l_out: materialize OUT(L-1,C) at
-                        // its real execution point, immediately before
-                        // Attention(L,C).  Meta waits for the exact Phone
-                        // reduce dependency before executing this PC node.
-                        ggml_tensor * wave_l_out = ggml_add(
-                            ctx0, pending_wave_down_chunks[ci],
-                            pending_wave_residual_chunks[ci]);
-                        const std::string wave_l_out_name =
-                            "prefill_wave_l_out_chunk_" + std::to_string(ci);
-                        cb(wave_l_out, wave_l_out_name.c_str(), wave_layer - 1);
-                        ggml_build_forward_expand(gf, wave_l_out);
-                        hidden_chunks[ci] = wave_l_out;
-                        inpSA = wave_l_out;
+                    // Materialize every predecessor OUT that this grouped
+                    // Attention consumes. Meta waits for all corresponding
+                    // (L-1,C) returns before this subgraph can run.
+                    for (size_t ci = group_start; ci < group_end; ++ci) {
+                        if (wave_layer > il) {
+                            GGML_ASSERT(pending_wave_down_chunks[ci] != nullptr);
+                            GGML_ASSERT(pending_wave_residual_chunks[ci] != nullptr);
+
+                            ggml_tensor * wave_l_out = ggml_add(
+                                ctx0, pending_wave_down_chunks[ci],
+                                pending_wave_residual_chunks[ci]);
+                            const std::string wave_l_out_name =
+                                "prefill_wave_l_out_chunk_" + std::to_string(ci);
+                            cb(wave_l_out, wave_l_out_name.c_str(), wave_layer - 1);
+                            ggml_build_forward_expand(gf, wave_l_out);
+                            hidden_chunks[ci] = wave_l_out;
+                        }
+                        group_token_count += chunk_sizes[ci];
+                    }
+
+                    ggml_tensor * group_inp = hidden_chunks[group_start];
+                    for (size_t ci = group_start + 1; ci < group_end; ++ci) {
+                        group_inp = ggml_concat(ctx0, group_inp, hidden_chunks[ci], 1);
                     }
 
                     ggml_tensor * attn_norm = build_norm(
-                        inpSA, model.layers[wave_layer].attn_norm, NULL,
+                        group_inp, model.layers[wave_layer].attn_norm, NULL,
                         LLM_NORM_RMS, wave_layer);
                     const std::string attn_norm_name =
-                        "prefill_wave_attn_norm_chunk_" + std::to_string(ci);
+                        "prefill_wave_attn_norm_group_" +
+                        std::to_string(group_start) + "_" +
+                        std::to_string(group_chunk_count);
                     cb(attn_norm, attn_norm_name.c_str(), wave_layer);
 
                     auto [Qcur, Kcur, Vcur] = build_qkv(
                         model.layers[wave_layer], attn_norm,
                         n_embd_head, n_head, n_head_kv, wave_layer);
 
-                    ggml_tensor * pos_chunk = ggml_view_1d(
-                        ctx0, inp_pos, count, begin * inp_pos->nb[0]);
+                    ggml_tensor * pos_group = ggml_view_1d(
+                        ctx0, inp_pos, group_token_count,
+                        group_token_begin * inp_pos->nb[0]);
                     Qcur = ggml_rope_ext(
-                        ctx0, Qcur, pos_chunk, nullptr, n_rot, rope_type, n_ctx_orig,
+                        ctx0, Qcur, pos_group, nullptr, n_rot, rope_type, n_ctx_orig,
                         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
                     Kcur = ggml_rope_ext(
-                        ctx0, Kcur, pos_chunk, nullptr, n_rot, rope_type, n_ctx_orig,
+                        ctx0, Kcur, pos_group, nullptr, n_rot, rope_type, n_ctx_orig,
                         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
+                    auto * attn_group = build_attn_inp_kv_range(
+                        (uint32_t) group_token_begin, (uint32_t) group_token_count);
                     ggml_tensor * attn = build_attn(
-                        attn_chunks[ci], model.layers[wave_layer].wo,
+                        attn_group, model.layers[wave_layer].wo,
                         model.layers[wave_layer].wo_b, model.layers[wave_layer].wo_s,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                         1.0f / sqrtf(float(n_embd_head)), wave_layer);
                     const std::string attn_name =
-                        "prefill_wave_attn_out_chunk_" + std::to_string(ci);
+                        "prefill_wave_attn_out_group_" +
+                        std::to_string(group_start) + "_" +
+                        std::to_string(group_chunk_count);
                     cb(attn, attn_name.c_str(), wave_layer);
 
-                    ggml_tensor * ffn_inp = ggml_add(ctx0, attn, inpSA);
-                    const std::string ffn_inp_name =
-                        "prefill_wave_ffn_inp_chunk_" + std::to_string(ci);
-                    cb(ffn_inp, ffn_inp_name.c_str(), wave_layer);
+                    ggml_tensor * group_ffn_inp = ggml_add(ctx0, attn, group_inp);
 
-                    ggml_tensor * ffn_norm = build_norm(
-                        ffn_inp, model.layers[wave_layer].ffn_norm, NULL,
-                        LLM_NORM_RMS, wave_layer);
-                    const std::string norm_name =
-                        "prefill_ffn_norm_chunk_" + std::to_string(ci);
-                    cb(ffn_norm, norm_name.c_str(), wave_layer);
+                    int64_t group_offset_tokens = 0;
+                    for (size_t ci = group_start; ci < group_end; ++ci) {
+                        const int64_t count = chunk_sizes[ci];
+                        ggml_tensor * ffn_inp = ggml_view_2d(
+                            ctx0, group_ffn_inp, group_ffn_inp->ne[0], count,
+                            group_ffn_inp->nb[1],
+                            group_offset_tokens * group_ffn_inp->nb[1]);
+                        const std::string ffn_inp_name =
+                            "prefill_wave_ffn_inp_chunk_" + std::to_string(ci);
+                        cb(ffn_inp, ffn_inp_name.c_str(), wave_layer);
 
-                    ggml_tensor * down = build_ffn(
-                        ffn_norm,
-                        model.layers[wave_layer].ffn_up, NULL, NULL,
-                        model.layers[wave_layer].ffn_gate, NULL, NULL,
-                        model.layers[wave_layer].ffn_down, NULL, NULL,
-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, wave_layer);
-                    const std::string down_name =
-                        "prefill_ffn_down_chunk_" + std::to_string(ci);
-                    cb(down, down_name.c_str(), wave_layer);
+                        ggml_tensor * ffn_norm = build_norm(
+                            ffn_inp, model.layers[wave_layer].ffn_norm, NULL,
+                            LLM_NORM_RMS, wave_layer);
+                        const std::string norm_name =
+                            "prefill_ffn_norm_chunk_" + std::to_string(ci);
+                        cb(ffn_norm, norm_name.c_str(), wave_layer);
 
-                    // Expand the split FFN now, but defer the residual ADD until
-                    // the next layer reaches this same chunk.  This keeps the
-                    // residual live in the static graph for exactly as long as
-                    // the asynchronous Phone return can need it.
-                    ggml_build_forward_expand(gf, down);
-                    pending_wave_down_chunks[ci] = down;
-                    pending_wave_residual_chunks[ci] = ffn_inp;
+                        ggml_tensor * down = build_ffn(
+                            ffn_norm,
+                            model.layers[wave_layer].ffn_up, NULL, NULL,
+                            model.layers[wave_layer].ffn_gate, NULL, NULL,
+                            model.layers[wave_layer].ffn_down, NULL, NULL,
+                            NULL, LLM_FFN_SILU, LLM_FFN_PAR, wave_layer);
+                        const std::string down_name =
+                            "prefill_ffn_down_chunk_" + std::to_string(ci);
+                        cb(down, down_name.c_str(), wave_layer);
+
+                        ggml_build_forward_expand(gf, down);
+                        pending_wave_down_chunks[ci] = down;
+                        pending_wave_residual_chunks[ci] = ffn_inp;
+                        group_offset_tokens += count;
+                    }
+                    GGML_ASSERT(group_offset_tokens == group_token_count);
                 }
             }
 
