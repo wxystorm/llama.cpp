@@ -2758,6 +2758,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.h2d_us / 1000.0, profile.phone_us / 1000.0,
                 profile.d2h_us / 1000.0, profile.reduce_us / 1000.0,
                 profile.wait_us / 1000.0);
+            llama_hybrid_tensor_compute_prediction tensor_prediction;
+            if (llama_hybrid_runtime_predict_tensor_compute(
+                    (int) job.ubatch.n_tokens, tensor_prediction)) {
+                LLAMA_LOG_ERROR(
+                    "[PRED_TENSOR_COMPUTE] ub=%d tokens=%d kv_tokens=%d T=%d XT=%d R=%.3f "
+                    "attn_misc_ms=%.3f pc_ffn_ms=%.3f pc_compute_ms=%.3f tensor_total_ms=%.3f\n",
+                    job.ubatch_id,
+                    tensor_prediction.tokens,
+                    tensor_prediction.kv_tokens,
+                    tensor_prediction.tensor_layers,
+                    tensor_prediction.tensor_chunk_tokens,
+                    tensor_prediction.tensor_pc_ratio,
+                    tensor_prediction.attn_misc_ms,
+                    tensor_prediction.pc_ffn_ms,
+                    tensor_prediction.pc_compute_ms,
+                    tensor_prediction.tensor_total_ms);
+            }
             LLAMA_LOG_ERROR(
                 "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64 " lane_reuse_ms=%.3f "
                 "lane_reuse_max_ms=%.3f lane0_count=%" PRId64 " lane0_ms=%.3f "
