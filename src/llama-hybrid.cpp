@@ -112,6 +112,15 @@ int llama_hybrid_runtime_prefill_chunk_tokens() {
     return g_llama_hybrid_runtime_plan.has_value() ? g_llama_hybrid_runtime_plan->tensor_chunk_tokens : 0;
 }
 
+int llama_hybrid_runtime_prefill_attn_group_chunks() {
+    const char * value = std::getenv("LLAMA_HYBRID_ATTN_GROUP_CHUNKS");
+    if (value == nullptr) {
+        return 1;
+    }
+    const int group = std::atoi(value);
+    return group == 2 || group == 4 ? group : 1;
+}
+
 bool llama_hybrid_runtime_prefill_dag_enabled() {
     const char * value = std::getenv("LLAMA_HYBRID_PREFILL_DAG");
     return value != nullptr && std::atoi(value) != 0;
@@ -1532,34 +1541,54 @@ bool llama_hybrid_runtime_predict_tensor_compute(
         kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
     }
 
-    double cpu_layer_base = 0.0;
-    double cpu_attn_base  = 0.0;
-    double cpu_attn_kv    = 0.0;
-    if (!llama_hybrid_layer_block_cost(
-            profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
-        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
-        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, kv_tokens, cpu_attn_kv)) {
-        return false;
-    }
-
-    const double per_layer_attn_misc =
-        cpu_attn_kv +
-        llama_hybrid_tensor_misc_cost(profile, tokens, cpu_layer_base, cpu_attn_base);
-
     const std::vector<int> chunks =
         llama_hybrid_split_by_chunk_size(tokens, plan.tensor_chunk_tokens);
     if (chunks.empty()) {
         return false;
     }
 
-    double per_layer_pc_ffn = 0.0;
-    for (const int chunk_tokens : chunks) {
-        double chunk_pc_ffn = 0.0;
-        if (!llama_hybrid_ffn_cost(
-                profile.cpu_ffn, chunk_tokens, plan.tensor_pc_ratio, chunk_pc_ffn)) {
+    const int attn_group_chunks = llama_hybrid_runtime_prefill_attn_group_chunks();
+    double per_layer_attn_misc = 0.0;
+    double per_layer_pc_ffn    = 0.0;
+
+    // Attention may use a coarser token group than Tensor FFN/return.
+    // Consecutive XT chunks are grouped only for Attention; misc and FFN
+    // stay XT-granular so the prediction reflects both larger Attention
+    // GEMMs and the fine-grained return pipeline.
+    for (size_t group_begin = 0; group_begin < chunks.size();
+         group_begin += (size_t) attn_group_chunks) {
+        const size_t group_end = std::min(
+            chunks.size(), group_begin + (size_t) attn_group_chunks);
+        int group_tokens = 0;
+        for (size_t ci = group_begin; ci < group_end; ++ci) {
+            group_tokens += chunks[ci];
+        }
+
+        double group_attn_ms = 0.0;
+        if (!llama_hybrid_attn_cost(
+                profile.cpu_attn, group_tokens, kv_tokens, group_attn_ms)) {
             return false;
         }
-        per_layer_pc_ffn += chunk_pc_ffn;
+        per_layer_attn_misc += group_attn_ms;
+
+        for (size_t ci = group_begin; ci < group_end; ++ci) {
+            const int chunk_tokens = chunks[ci];
+            double cpu_layer_base = 0.0;
+            double cpu_attn_base  = 0.0;
+            double chunk_pc_ffn   = 0.0;
+            if (!llama_hybrid_layer_block_cost(
+                    profile.cpu_layer_blocks, chunk_tokens, false, cpu_layer_base) ||
+                !llama_hybrid_attn_cost(
+                    profile.cpu_attn, chunk_tokens, chunk_tokens, cpu_attn_base) ||
+                !llama_hybrid_ffn_cost(
+                    profile.cpu_ffn, chunk_tokens, plan.tensor_pc_ratio, chunk_pc_ffn)) {
+                return false;
+            }
+
+            per_layer_attn_misc += llama_hybrid_tensor_misc_cost(
+                profile, chunk_tokens, cpu_layer_base, cpu_attn_base);
+            per_layer_pc_ffn += chunk_pc_ffn;
+        }
     }
 
     double per_layer_tensor_pipeline = 0.0;
@@ -1571,9 +1600,11 @@ bool llama_hybrid_runtime_predict_tensor_compute(
 
     prediction.tokens             = tokens;
     prediction.kv_tokens          = kv_tokens;
-    prediction.tensor_layers      = plan.tensor_layers;
-    prediction.tensor_chunk_tokens = plan.tensor_chunk_tokens;
-    prediction.tensor_pc_ratio    = plan.tensor_pc_ratio;
+    prediction.tensor_layers       = plan.tensor_layers;
+    prediction.tensor_chunk_tokens  = plan.tensor_chunk_tokens;
+    prediction.attn_group_chunks    = attn_group_chunks;
+    prediction.attn_chunk_tokens    = plan.tensor_chunk_tokens * attn_group_chunks;
+    prediction.tensor_pc_ratio      = plan.tensor_pc_ratio;
     prediction.attn_misc_ms       = plan.tensor_layers * per_layer_attn_misc;
     prediction.pc_ffn_ms          = plan.tensor_layers * per_layer_pc_ffn;
     prediction.pc_compute_ms      = prediction.attn_misc_ms + prediction.pc_ffn_ms;
