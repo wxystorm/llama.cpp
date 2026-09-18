@@ -2273,6 +2273,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                            std::vector<llama_hybrid_runtime_stage>{};
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
+    const bool return_wavefront_requested =
+        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
 
     const bool gpu_tensor_topology =
         runtime_stages.size() == 2 &&
@@ -2309,8 +2311,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
         runtime_stages[3].macro_tokens > 0 &&
         runtime_stages[2].macro_tokens >= runtime_stages[3].macro_tokens &&
         runtime_stages[2].macro_tokens % runtime_stages[3].macro_tokens == 0;
+    // Qwen2 return-wavefront is currently implemented as a full-graph path.
+    // Do not slice a pure GPU->TENSOR prefill into upstream-sized stage graphs:
+    // doing so makes each Tensor job only one XT chunk wide (or smaller) and
+    // also sets stage_graph=true, which bypasses the wavefront graph builder.
+    //
+    // Keep the generalized stage queue for the other supported topologies.
+    // GPU->TENSOR + return-wavefront intentionally falls back to the normal
+    // full graph so the Tensor suffix can contain multiple XT chunks and
+    // advance as (layer, chunk) wavefronts.
+    const bool return_wavefront_full_graph_override =
+        return_wavefront_requested && gpu_tensor_topology && model.arch == LLM_ARCH_QWEN2;
     const bool generalized_stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan && valid_stage_macros && model.arch == LLM_ARCH_QWEN2 &&
+        !return_wavefront_full_graph_override &&
         (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
@@ -2318,6 +2332,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
 
     if (stage_queue_requested && has_runtime_plan) {
+        if (return_wavefront_full_graph_override) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PIPE] return-wavefront full-graph override: "
+                "GPU->TENSOR stage queue disabled, batch=%u XG=%d XT=%d\n",
+                n_tokens_all, runtime_plan.gpu_chunk_tokens, runtime_plan.tensor_chunk_tokens);
+        }
         for (size_t i = 0; i < runtime_stages.size(); ++i) {
             const auto & stage = runtime_stages[i];
             LLAMA_LOG_INFO("[HYBRID_STAGE] index=%zu kind=%s layers=[%d,%d) macro=%d inner=%d\n",
