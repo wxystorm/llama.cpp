@@ -6070,6 +6070,23 @@ auto prefill_norm_sg_has_prework =
     const int64_t h2d_us = n_backends > 1 ? reduce_copy_by_direction[1].total_us : 0;
     const int64_t d2h_us = n_backends > 1 ? reduce_copy_by_direction[n_backends].total_us : 0;
     const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
+
+    if (return_wavefront_graph) {
+        printf(
+            "[TENSOR_RUNTIME_SUM] "
+            "attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f phone_ms=%.3f "
+            "d2h_ms=%.3f reduce_ms=%.3f wait_ms=%.3f "
+            "compute_wall_ms=%.3f reduce_wall_ms=%.3f\n",
+            tensor_attn_us / 1000.0,
+            tensor_pc_ffn_us / 1000.0,
+            h2d_us / 1000.0,
+            tensor_phone_us / 1000.0,
+            d2h_us / 1000.0,
+            tensor_reduce_us / 1000.0,
+            tensor_wait_us / 1000.0,
+            compute_wall_us / 1000.0,
+            reduce_wall_us / 1000.0);
+    }
     {
         std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
         backend_ctx->tensor_profile.attn_us   += tensor_attn_us;
