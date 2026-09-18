@@ -1493,142 +1493,6 @@ static double llama_hybrid_tensor_misc_cost(const llama_hybrid_profile & profile
     return std::max(0.0, cpu_layer_base_ms - cpu_attn_base_ms - full_ffn_ms);
 }
 
-// Diagnostic model for the real return-wavefront execution order.
-//
-// Unlike llama_hybrid_tensor_ffn_cost(), this intentionally does NOT let the
-// PC and Phone FFN streams run independently across chunks.  The Meta backend
-// waits for both sides of one prefill-down chunk before it advances to the
-// next chunk.  Only the Phone->PC return/reduce is left asynchronous, and the
-// next layer may advance when the exact (layer-1, chunk) return is complete.
-static bool llama_hybrid_tensor_wavefront_cost(
-        const llama_hybrid_profile & profile,
-        float                        pc_ratio,
-        int                          total_tokens,
-        int                          chunk_tokens,
-        int                          layers,
-        int                          kv_tokens,
-        double &                     result_ms) {
-    result_ms = 0.0;
-    if (layers == 0) {
-        return true;
-    }
-    if (layers < 0 || total_tokens <= 0 || chunk_tokens <= 0 || kv_tokens <= 0 ||
-        profile.n_embd <= 0) {
-        return false;
-    }
-
-    const std::vector<int> chunks =
-        llama_hybrid_split_by_chunk_size(total_tokens, chunk_tokens);
-    if (chunks.empty()) {
-        return false;
-    }
-
-    struct chunk_cost {
-        double prework_ms = 0.0;
-        double pc_ffn_ms  = 0.0;
-        double h2d_ms     = 0.0;
-        double phone_ms   = 0.0;
-        double d2h_ms     = 0.0;
-    };
-
-    std::vector<chunk_cost> costs;
-    costs.reserve(chunks.size());
-    for (const int tokens : chunks) {
-        const size_t bytes = (size_t) profile.n_embd * (size_t) tokens * sizeof(float);
-
-        double cpu_layer_base = 0.0;
-        double cpu_attn_base  = 0.0;
-        double cpu_attn_kv    = 0.0;
-        chunk_cost cost;
-        if (!llama_hybrid_layer_block_cost(
-                profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
-            !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
-            !llama_hybrid_attn_cost(profile.cpu_attn, tokens, kv_tokens, cpu_attn_kv) ||
-            !llama_hybrid_ffn_cost(profile.cpu_ffn, tokens, pc_ratio, cost.pc_ffn_ms) ||
-            !llama_hybrid_ffn_cost(profile.phone_ffn, tokens, 1.0f - pc_ratio, cost.phone_ms) ||
-            !llama_hybrid_transfer_cost(profile.pc_to_phone, bytes, cost.h2d_ms) ||
-            !llama_hybrid_transfer_cost(profile.snapshot_phone_to_pc, bytes, cost.d2h_ms)) {
-            return false;
-        }
-
-        cost.prework_ms =
-            cpu_attn_kv +
-            llama_hybrid_tensor_misc_cost(profile, tokens, cpu_layer_base, cpu_attn_base);
-        costs.push_back(cost);
-    }
-
-    std::vector<std::vector<double>> return_done(
-        (size_t) layers, std::vector<double>(chunks.size(), 0.0));
-
-    // The graph thread/PC prework advances serially in graph order.
-    double host_ms = 0.0;
-
-    // Return-wavefront uses two snapshot/reduce lanes.  A lane may keep
-    // returning while the graph thread computes later chunks.
-    std::array<double, 2> return_lane_done = { 0.0, 0.0 };
-    size_t submit_index = 0;
-
-    for (int layer = 0; layer < layers; ++layer) {
-        double older_layer_done = 0.0;
-        if (layer >= 2) {
-            for (const double done : return_done[(size_t) layer - 2]) {
-                older_layer_done = std::max(older_layer_done, done);
-            }
-        }
-
-        for (size_t chunk = 0; chunk < chunks.size(); ++chunk) {
-            // V1 return-wavefront keeps at most one predecessor layer in
-            // flight.  Attention(L,C) consumes the exact OUT(L-1,C), while
-            // anything older than L-1 must already be drained.
-            if (layer >= 2) {
-                host_ms = std::max(host_ms, older_layer_done);
-            }
-            if (layer > 0) {
-                host_ms = std::max(
-                    host_ms, return_done[(size_t) layer - 1][chunk]);
-            }
-
-            const chunk_cost & cost = costs[chunk];
-
-            // Attention/QKV/norm/residual prework is chunked in the actual
-            // return-wavefront graph.
-            host_ms += cost.prework_ms;
-
-            // For one down chunk the Meta backend starts PC work, waits for
-            // the H2D input, starts Phone work, and then waits for BOTH PC and
-            // Phone before it can submit the asynchronous return task.
-            const double pc_done =
-                host_ms + cost.pc_ffn_ms;
-            const double phone_done =
-                host_ms + cost.h2d_ms + cost.phone_ms;
-            host_ms = std::max(pc_done, phone_done);
-
-            const size_t lane = submit_index++ & 1u;
-
-            // Reusing a still-busy lane stalls the graph thread.  In healthy
-            // runs this is normally almost zero, but model it explicitly.
-            host_ms = std::max(host_ms, return_lane_done[lane]);
-
-            // The return worker performs snapshot D2H followed by the PC
-            // reduce ADD.  We intentionally leave dual-lane bandwidth
-            // contention out of this first diagnostic model; measured lane
-            // stalls can tell us later whether that second-order term matters.
-            const double done =
-                host_ms + cost.d2h_ms + std::max(0.0, profile.reduce_ms);
-
-            return_done[(size_t) layer][chunk] = done;
-            return_lane_done[lane] = done;
-        }
-    }
-
-    // Leaving the Tensor region drains any outstanding final-layer returns.
-    host_ms = std::max(host_ms, return_lane_done[0]);
-    host_ms = std::max(host_ms, return_lane_done[1]);
-
-    result_ms = host_ms;
-    return std::isfinite(result_ms);
-}
-
 static float llama_hybrid_align_pc_ratio(const llama_hybrid_profile & profile, float ratio) {
     if (profile.n_ff <= 0 || profile.ffn_shard_granularity <= 0) {
         return std::clamp(ratio, 0.01f, 0.99f);
@@ -2342,7 +2206,6 @@ static bool llama_hybrid_sim_stage_cost(
         size_t                                      stage_index,
         int                                         job_tokens,
         int                                         kv_tokens,
-        bool                                        tensor_wavefront_model,
         double &                                    result_ms) {
     if (stage_index >= stages.size() || job_tokens <= 0) {
         return false;
@@ -2395,29 +2258,21 @@ static bool llama_hybrid_sim_stage_cost(
                 break;
             case llama_hybrid_sim_stage_kind::TENSOR:
                 {
-                    if (tensor_wavefront_model) {
-                        if (!llama_hybrid_tensor_wavefront_cost(
-                                profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens,
-                                stage.layers, kv_tokens, block_ms)) {
-                            return false;
-                        }
-                    } else {
-                        double tensor_ffn_ms = 0.0;
-                        double cpu_layer_base = 0.0;
-                        double cpu_attn_base = 0.0;
-                        double cpu_attn_kv = 0.0;
-                        if (!llama_hybrid_tensor_ffn_cost(
-                                profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens, tensor_ffn_ms) ||
-                            !llama_hybrid_layer_block_cost(
-                                profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
-                            !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
-                            !llama_hybrid_attn_cost(profile.cpu_attn, tokens, kv_tokens, cpu_attn_kv)) {
-                            return false;
-                        }
-                        block_ms = stage.layers * (
-                            cpu_attn_kv + llama_hybrid_tensor_misc_cost(
-                                profile, tokens, cpu_layer_base, cpu_attn_base) + tensor_ffn_ms);
+                    double tensor_ffn_ms = 0.0;
+                    double cpu_layer_base = 0.0;
+                    double cpu_attn_base = 0.0;
+                    double cpu_attn_kv = 0.0;
+                    if (!llama_hybrid_tensor_ffn_cost(
+                            profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens, tensor_ffn_ms) ||
+                        !llama_hybrid_layer_block_cost(
+                            profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
+                        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
+                        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, kv_tokens, cpu_attn_kv)) {
+                        return false;
                     }
+                    block_ms = stage.layers * (
+                        cpu_attn_kv + llama_hybrid_tensor_misc_cost(
+                            profile, tokens, cpu_layer_base, cpu_attn_base) + tensor_ffn_ms);
                 }
                 break;
             case llama_hybrid_sim_stage_kind::PHONE:
@@ -2460,7 +2315,6 @@ static bool llama_hybrid_simulate_prefill(
         const llama_hybrid_constraints & constraints,
         const llama_hybrid_plan &        plan,
         int                              tokens,
-        bool                             tensor_wavefront_model,
         bool                             capture_schedule,
         llama_hybrid_sim_result &        result) {
     const auto stages = llama_hybrid_sim_stages(plan);
@@ -2547,9 +2401,7 @@ static bool llama_hybrid_simulate_prefill(
 
     const auto run_stage = [&](llama_hybrid_sim_job job, llama_hybrid_sim_stage_kind kind) {
         double stage_ms = 0.0;
-        if (!llama_hybrid_sim_stage_cost(
-                profile, plan, stages, job.stage_index, job.tokens, kv_tokens,
-                tensor_wavefront_model, stage_ms)) {
+        if (!llama_hybrid_sim_stage_cost(profile, plan, stages, job.stage_index, job.tokens, kv_tokens, stage_ms)) {
             return false;
         }
         host_ms += stage_ms;
@@ -2619,9 +2471,7 @@ static bool llama_hybrid_simulate_prefill(
 
         const int job_tokens = macro_jobs[i];
         double gpu_ms = 0.0;
-        if (!llama_hybrid_sim_stage_cost(
-                profile, plan, stages, 0, job_tokens, kv_tokens,
-                tensor_wavefront_model, gpu_ms)) {
+        if (!llama_hybrid_sim_stage_cost(profile, plan, stages, 0, job_tokens, kv_tokens, gpu_ms)) {
             return false;
         }
         gpu_job = {
@@ -2797,7 +2647,7 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
 
         if (!llama_hybrid_sim_stages(candidate).empty()) {
             llama_hybrid_sim_result sim;
-            if (!llama_hybrid_simulate_prefill(profile, constraints, candidate, work_tokens, false, false, sim)) {
+            if (!llama_hybrid_simulate_prefill(profile, constraints, candidate, work_tokens, false, sim)) {
                 return false;
             }
             candidate.predicted_ms = sim.makespan_ms;
@@ -4381,7 +4231,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         const int work_tokens = constraints.target_ubatch_tokens > 0 ?
             constraints.target_ubatch_tokens : reference_tokens;
         llama_hybrid_sim_result sim;
-        if (llama_hybrid_simulate_prefill(profile, constraints, best_plan, work_tokens, false, true, sim)) {
+        if (llama_hybrid_simulate_prefill(profile, constraints, best_plan, work_tokens, true, sim)) {
             LLAMA_LOG_ERROR(
                 "[PRED_PIPE] plan=T%d,P%d,C%d,G%d,XG%d,XC%d,XT%d,XP%d sim_ms=%.3f "
                 "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f tensor_peak_mib=%.2f "
@@ -4392,21 +4242,6 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 sim.gpu_busy_ms, sim.downstream_ms, sim.gpu_wait_ms,
                 sim.tensor_peak_bytes / 1048576.0, sim.phone_peak_bytes / 1048576.0,
                 sim.schedule.c_str());
-
-            llama_hybrid_sim_result wave_sim;
-            if (llama_hybrid_simulate_prefill(
-                    profile, constraints, best_plan, work_tokens, true, false, wave_sim)) {
-                LLAMA_LOG_ERROR(
-                    "[PRED_WAVE] plan=T%d,P%d,C%d,G%d,XG%d,XC%d,XT%d,XP%d "
-                    "old_ms=%.3f wave_ms=%.3f delta_ms=%.3f "
-                    "wave_downstream_ms=%.3f wave_gpu_wait_ms=%.3f\n",
-                    best_plan.tensor_layers, best_plan.phone_layers, best_plan.pc_layers,
-                    best_plan.gpu_pc_layers, best_plan.gpu_chunk_tokens, best_plan.cpu_chunk_tokens,
-                    best_plan.tensor_chunk_tokens, best_plan.phone_chunk_tokens,
-                    sim.makespan_ms, wave_sim.makespan_ms,
-                    wave_sim.makespan_ms - sim.makespan_ms,
-                    wave_sim.downstream_ms, wave_sim.gpu_wait_ms);
-            }
         }
     }
     return found;
