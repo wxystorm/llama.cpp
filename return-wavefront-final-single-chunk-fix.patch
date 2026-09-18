@@ -1,0 +1,24 @@
+diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
+--- a/src/models/qwen2.cpp
++++ b/src/models/qwen2.cpp
+@@ -243,10 +243,17 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_para
+ 
+             cur = hidden_chunks.back();
+             for (int ci = (int) hidden_chunks.size() - 2; ci >= 0; --ci) {
+                 cur = ggml_concat(ctx0, hidden_chunks[(size_t) ci], cur, 1);
+             }
+-            cb(cur, "l_out", layer_end - 1);
++
++            // With a single token chunk, cur is the exact same tensor as the
++            // terminal prefill_ffn_down_chunk_0-* boundary. Renaming it to
++            // l_out-* makes Meta lose the final down-chunk marker, so the
++            // prefill norm -> down handoff cannot find its i+1 boundary.
++            // With multiple chunks, cur is a distinct CONCAT result and can
++            // keep the normal l_out name.
++            if (hidden_chunks.size() > 1) {
++                cb(cur, "l_out", layer_end - 1);
++            }
+ 
+             if (!build_output_head) {
+                 res->t_stage_output = cur;
+                 ggml_build_forward_expand(gf, cur);

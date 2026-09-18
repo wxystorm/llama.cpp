@@ -1563,14 +1563,23 @@ static void ggml_backend_sched_debug_tensor(
         ggml_backend_t backend,
         const ggml_tensor * tensor,
         const char * tag) {
-    if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
+    if (tensor == NULL || tensor->type != GGML_TYPE_F32 || tensor->buffer == NULL) {
+        return;
+    }
+
+    if (ggml_backend_buffer_is_meta(tensor->buffer)) {
+        printf("[NUMDBG_SKIP_META] %s tensor=%s bytes=%zu\n",
+               tag, tensor->name, ggml_nbytes(tensor));
         return;
     }
 
     ggml_backend_synchronize(backend);
+
     const size_t n = ggml_nelements(tensor);
     std::vector<float> data(n);
     ggml_backend_tensor_get(tensor, data.data(), 0, n * sizeof(float));
+
+    // 后面保持原样
 
     double sum = 0.0;
     double l2 = 0.0;

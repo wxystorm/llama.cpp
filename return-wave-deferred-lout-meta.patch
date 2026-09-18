@@ -1,0 +1,150 @@
+--- /mnt/data/_work_newfix/prework/ggml-backend-meta.cpp	2026-09-18 10:07:43.000000000 +0000
++++ /mnt/data/return-wave-deferred-lout-fix/ggml-backend-meta.cpp	2026-09-18 11:49:54.248596444 +0000
+@@ -2740,10 +2740,10 @@
+             }
+         }
+ 
+-        // Return-wavefront l_out nodes are real graph dependencies so the
+-        // allocator keeps ffn_inp alive, but they must not execute in the main
+-        // per-backend graph. The return worker commits the PC copy only after
+-        // the Phone down contribution has been reduced.
++        // Wavefront l_out is a real PC graph node.  Its static position is now
++        // immediately before Attention(L+1,C), so executing it in the normal
++        // PC graph preserves allocator lifetime and ordering.  Secondary
++        // backends keep the mirrored placeholder but never compute this ADD.
+         for (int i = 0; i < cgraph->n_nodes; ++i) {
+             int chunk = -1;
+             int layer = -1;
+@@ -2751,7 +2751,7 @@
+                     cgraph->nodes[i]->name, chunk, layer)) {
+                 continue;
+             }
+-            for (size_t j = 0; j < n_backends; ++j) {
++            for (size_t j = 1; j < n_backends; ++j) {
+                 backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+             }
+         }
+@@ -3752,34 +3752,6 @@
+         return nullptr;
+     };
+ 
+-    auto find_prefill_wave_l_out =
+-        [&](size_t backend, size_t sg, int layer, int chunk) -> ggml_tensor * {
+-            if (backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
+-                return nullptr;
+-            }
+-
+-            // The explicit l_out node consumes the split down node, so search
+-            // the current/following subgraphs instead of retaining an
+-            // out-of-graph ffn_inp pointer.
+-            for (size_t s = sg; s < backend_ctx->n_subgraphs; ++s) {
+-                ggml_cgraph * graph =
+-                    backend_ctx->backend_configs[backend].cgraphs[s].cgraph_main;
+-                if (graph == nullptr) {
+-                    continue;
+-                }
+-                for (int k = 0; k < graph->n_nodes; ++k) {
+-                    int parsed_chunk = -1;
+-                    int parsed_layer = -1;
+-                    ggml_tensor * tensor = graph->nodes[k];
+-                    if (ggml_backend_meta_parse_prefill_wave_l_out_chunk(
+-                            tensor->name, parsed_chunk, parsed_layer) &&
+-                        parsed_layer == layer && parsed_chunk == chunk) {
+-                        return tensor;
+-                    }
+-                }
+-            }
+-            return nullptr;
+-        };
+     auto find_recent_ffn_inp_layer = [&](size_t backend, size_t sg, int & layer) -> ggml_tensor * {
+         if (backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
+             return nullptr;
+@@ -4525,10 +4497,6 @@
+                 disable_layer_output_producers(1, i + 1, prefill_down_layer_0) : nullptr;
+             ggml_tensor * pc_residual = handoff_to_phone ?
+                 find_recent_ffn_inp(0, i, prefill_down_layer_0) : nullptr;
+-            ggml_tensor * pc_wave_l_out =
+-                return_wavefront_graph && !handoff_to_phone ?
+-                    find_prefill_wave_l_out(
+-                        0, i, prefill_down_layer_0, prefill_down_chunk_0) : nullptr;
+             GGML_ASSERT(!handoff_to_phone ||
+                 (pc_l_out != nullptr && pc_residual != nullptr &&
+                  ggml_nbytes(pc_l_out) == ggml_nbytes(pc_residual)));
+@@ -4536,17 +4504,10 @@
+                 (phone_l_out != nullptr &&
+                  ggml_nbytes(pc_l_out) == ggml_nbytes(phone_l_out)));
+             GGML_ASSERT(!return_wavefront_graph || !handoff_to_phone);
+-            GGML_ASSERT(!return_wavefront_graph || pc_wave_l_out != nullptr);
+-            GGML_ASSERT(pc_wave_l_out == nullptr ||
+-                (ggml_nbytes(pc_wave_l_out) == ggml_nbytes(node_dst) &&
+-                 pc_wave_l_out->src[0] == node_dst &&
+-                 pc_wave_l_out->src[1] != nullptr &&
+-                 ggml_nbytes(pc_wave_l_out->src[1]) == ggml_nbytes(node_dst)));
+ 
+             ggml_tensor * pc_output_chunk = nullptr;
+             ggml_tensor * residual_chunk = nullptr;
+             ggml_cgraph * chunk_layer_graph = nullptr;
+-            ggml_cgraph * wave_commit_graph = nullptr;
+             if (handoff_to_phone) {
+                 const size_t chunk_offset = down_chunk_offset(
+                     0, true, prefill_down_layer_0, prefill_down_chunk_0);
+@@ -4575,22 +4536,6 @@
+                 pc_output_chunk->view_offs = chunk_offset;
+                 ggml_backend_view_init(pc_output_chunk);
+                 GGML_ASSERT(ggml_nbytes(pc_output_chunk) == ggml_nbytes(node_dst));
+-            } else if (pc_wave_l_out != nullptr) {
+-                // The original graph owns the residual edge and therefore its
+-                // lifetime. This auxiliary node writes into the real PC l_out
+-                // buffer only after Phone has been reduced into node_dst.
+-                ggml_tensor * node_layer = get_node_aux(pc_wave_l_out);
+-                node_layer->view_src = pc_wave_l_out;
+-                node_layer->view_offs = 0;
+-                node_layer->op = GGML_OP_ADD;
+-                node_layer->src[0] = node_dst;
+-                node_layer->src[1] = pc_wave_l_out->src[1];
+-                node_layer->flags |= GGML_TENSOR_FLAG_COMPUTE;
+-                ggml_backend_view_init(node_layer);
+-
+-                wave_commit_graph = get_cgraph_aux();
+-                wave_commit_graph->nodes[0] = node_layer;
+-                wave_commit_graph->n_nodes = 1;
+             }
+ 
+             const uint64_t reduce_task = reduce_worker->enqueue(
+@@ -4598,7 +4543,7 @@
+                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
+                     snapshot_seq, handoff_to_phone, prefill_down_layer_0,
+                     prefill_down_chunk_0, layer_handoff, pc_l_out, phone_l_out,
+-                    pc_output_chunk, chunk_layer_graph, wave_commit_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
++                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
+                     ggml_backend_meta_stage_ready_context stage_context {
+                         reduce_worker,
+                         task_id,
+@@ -4661,23 +4606,13 @@
+                         return finish_return(status);
+                     }
+ 
+-                    if (wave_commit_graph != nullptr) {
+-                        // The dependency is ready only after the graph-visible
+-                        // l_out buffer contains full down + residual.
+-                        ggml_backend_synchronize(bcj_dst.backend);
+-                        const int64_t layer_add_start_us = ggml_time_us();
+-                        const ggml_status layer_status =
+-                            ggml_backend_graph_compute_async(
+-                                bcj_dst.backend, wave_commit_graph);
+-                        const int64_t layer_add_us = ggml_time_us() - layer_add_start_us;
+-                        record_reduce_add(layer_add_us, false);
+-                        if (layer_status != GGML_STATUS_SUCCESS) {
+-                            return finish_return(layer_status);
+-                        }
++                    if (return_wavefront_graph && !handoff_to_phone) {
++                        // The pending task is the exact DOWN_READY(L,C) fence.
++                        // Do not publish it until the PC reduce ADD is complete.
+                         ggml_backend_synchronize(bcj_dst.backend);
+                         if (pipeline_debug) {
+                             GGML_LOG_INFO(
+-                                "[RETURN_WAVEFRONT_COMMIT] layer=%d chunk=%d lane=%zu\n",
++                                "[RETURN_WAVEFRONT_DOWN_READY] layer=%d chunk=%d lane=%zu\n",
+                                 prefill_down_layer_0, prefill_down_chunk_0, return_lane);
+                         }
+                     }

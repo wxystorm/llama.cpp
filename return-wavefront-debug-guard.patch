@@ -1,0 +1,32 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1562,10 +1562,24 @@ static void ggml_backend_sched_debug_tensor(
+         ggml_backend_t backend,
+         const ggml_tensor * tensor,
+         const char * tag) {
+-    if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
++    if (tensor == NULL || tensor->type != GGML_TYPE_F32 || tensor->buffer == NULL) {
+         return;
+     }
+ 
++    // A Meta tensor with PARTIAL split state is not a materialized tensor that
++    // can be exported with ggml_backend_tensor_get(). In return-wavefront the
++    // previous layer's FFN down tensor intentionally remains a Meta/PARTIAL
++    // object while its PC simple tensor is committed in-place by the async
++    // return/reduce worker. Debugging must not force a composite read here:
++    // ggml_backend_meta_buffer_get_tensor() correctly rejects PARTIAL and would
++    // abort in its default split-axis case.
++    //
++    // This helper is diagnostic only, so skip Meta-backed tensors. The Meta
++    // backend already has per-simple-backend NUMDBG hooks where a concrete
++    // simple tensor can be read safely.
++    if (ggml_backend_buffer_is_meta(tensor->buffer)) {
++        printf("[NUMDBG_SKIP_META] %s tensor=%s bytes=%zu\n",
++               tag, tensor->name, ggml_nbytes(tensor));
++        return;
++    }
++
+     ggml_backend_synchronize(backend);
+     const size_t n = ggml_nelements(tensor);
+     std::vector<float> data(n);

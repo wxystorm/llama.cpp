@@ -3966,6 +3966,18 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             ggml_set_name(cur, name);
         }
 
+        if (il >= 0 && strcmp(name, "prefill_wave_entry") == 0) {
+            const ggml_backend_dev_t dev_layer = model.dev_layer(il);
+
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer &&
+                    ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched_use, cur, backend.get());
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;

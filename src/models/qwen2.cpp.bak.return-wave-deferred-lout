@@ -153,14 +153,6 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
             std::vector<int64_t> chunk_begin(chunk_sizes.size(), 0);
             std::vector<ggml_tensor *> hidden_chunks;
             std::vector<llm_graph_input_attn_kv *> attn_chunks;
-            // Keep the split FFN result and its residual alive until the next
-            // layer consumes this exact chunk.  The l_out ADD is deliberately
-            // created later, immediately before Attention(L+1,C), so GGML's
-            // static lifetime matches the real delayed execution point.
-            std::vector<ggml_tensor *> pending_wave_down_chunks(
-                chunk_sizes.size(), nullptr);
-            std::vector<ggml_tensor *> pending_wave_residual_chunks(
-                chunk_sizes.size(), nullptr);
             hidden_chunks.reserve(chunk_sizes.size());
             attn_chunks.reserve(chunk_sizes.size());
 
@@ -193,25 +185,6 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                     const int64_t begin = chunk_begin[ci];
                     const int64_t count = chunk_sizes[ci];
                     ggml_tensor * inpSA = hidden_chunks[ci];
-
-                    if (wave_layer > il) {
-                        GGML_ASSERT(pending_wave_down_chunks[ci] != nullptr);
-                        GGML_ASSERT(pending_wave_residual_chunks[ci] != nullptr);
-
-                        // Deferred wavefront l_out: materialize OUT(L-1,C) at
-                        // its real execution point, immediately before
-                        // Attention(L,C).  Meta waits for the exact Phone
-                        // reduce dependency before executing this PC node.
-                        ggml_tensor * wave_l_out = ggml_add(
-                            ctx0, pending_wave_down_chunks[ci],
-                            pending_wave_residual_chunks[ci]);
-                        const std::string wave_l_out_name =
-                            "prefill_wave_l_out_chunk_" + std::to_string(ci);
-                        cb(wave_l_out, wave_l_out_name.c_str(), wave_layer - 1);
-                        ggml_build_forward_expand(gf, wave_l_out);
-                        hidden_chunks[ci] = wave_l_out;
-                        inpSA = wave_l_out;
-                    }
 
                     ggml_tensor * attn_norm = build_norm(
                         inpSA, model.layers[wave_layer].attn_norm, NULL,
@@ -264,32 +237,18 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                         "prefill_ffn_down_chunk_" + std::to_string(ci);
                     cb(down, down_name.c_str(), wave_layer);
 
-                    // Expand the split FFN now, but defer the residual ADD until
-                    // the next layer reaches this same chunk.  This keeps the
-                    // residual live in the static graph for exactly as long as
-                    // the asynchronous Phone return can need it.
-                    ggml_build_forward_expand(gf, down);
-                    pending_wave_down_chunks[ci] = down;
-                    pending_wave_residual_chunks[ci] = ffn_inp;
+                    // Keep the residual add as an explicit graph dependency.
+                    // Meta disables this node in the main graph and commits the
+                    // PC copy only after the Phone down contribution is reduced.
+                    // Keeping the edge here makes the allocator keep ffn_inp live
+                    // until OUT(L,C) is really committed.
+                    ggml_tensor * wave_l_out = ggml_add(ctx0, down, ffn_inp);
+                    const std::string wave_l_out_name =
+                        "prefill_wave_l_out_chunk_" + std::to_string(ci);
+                    cb(wave_l_out, wave_l_out_name.c_str(), wave_layer);
+                    ggml_build_forward_expand(gf, wave_l_out);
+                    hidden_chunks[ci] = wave_l_out;
                 }
-            }
-
-            // Materialize the final transformer layer outputs after all final
-            // split FFNs have been submitted.  There is no next Attention to
-            // create these nodes for us, so the normal pending-return barrier
-            // before the output tail drains the remaining Phone reductions.
-            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
-                GGML_ASSERT(pending_wave_down_chunks[ci] != nullptr);
-                GGML_ASSERT(pending_wave_residual_chunks[ci] != nullptr);
-
-                ggml_tensor * wave_l_out = ggml_add(
-                    ctx0, pending_wave_down_chunks[ci],
-                    pending_wave_residual_chunks[ci]);
-                const std::string wave_l_out_name =
-                    "prefill_wave_l_out_chunk_" + std::to_string(ci);
-                cb(wave_l_out, wave_l_out_name.c_str(), layer_end - 1);
-                ggml_build_forward_expand(gf, wave_l_out);
-                hidden_chunks[ci] = wave_l_out;
             }
 
             cur = hidden_chunks.back();
