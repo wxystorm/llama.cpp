@@ -121,6 +121,16 @@ static bool ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
     return std::sscanf(name, "prefill_wave_attn_out_chunk_%d-%d", &chunk, &layer) == 2;
 }
 
+static bool ggml_backend_meta_parse_prefill_wave_attn_out_group(
+        const char * name,
+        int & chunk_begin,
+        int & chunk_count,
+        int & layer) {
+    return std::sscanf(
+        name, "prefill_wave_attn_out_group_%d_%d-%d",
+        &chunk_begin, &chunk_count, &layer) == 3;
+}
+
 static bool ggml_backend_meta_parse_prefill_wave_l_out_chunk(
         const char * name,
         int & chunk,
@@ -5278,44 +5288,61 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return parsed && chunk == phone_chunk && layer == phone_layer;
     };
     auto parse_prefill_wave_attn_sg =
-        [&](size_t i, int & chunk, int & layer) -> bool {
+        [&](size_t i, int & chunk_begin, int & chunk_count, int & layer) -> bool {
             if (n_backends != 2 || i >= backend_ctx->n_subgraphs) {
                 return false;
             }
 
-            auto find_wave_attn = [&](size_t backend, int & out_chunk, int & out_layer) -> bool {
-                ggml_cgraph * graph =
-                    backend_ctx->backend_configs[backend].cgraphs[i].cgraph_main;
-                if (graph == nullptr || graph->n_nodes == 0) {
-                    return false;
-                }
-
-                bool found = false;
-                for (int k = 0; k < graph->n_nodes; ++k) {
-                    int parsed_chunk = -1;
-                    int parsed_layer = -1;
-                    if (!ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
-                            graph->nodes[k]->name, parsed_chunk, parsed_layer)) {
-                        continue;
-                    }
-                    if (found &&
-                            (parsed_chunk != out_chunk || parsed_layer != out_layer)) {
+            auto find_wave_attn =
+                [&](size_t backend, int & out_begin, int & out_count, int & out_layer) -> bool {
+                    ggml_cgraph * graph =
+                        backend_ctx->backend_configs[backend].cgraphs[i].cgraph_main;
+                    if (graph == nullptr || graph->n_nodes == 0) {
                         return false;
                     }
-                    out_chunk = parsed_chunk;
-                    out_layer = parsed_layer;
-                    found = true;
-                }
-                return found;
-            };
 
-            int phone_chunk = -1;
+                    bool found = false;
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        int parsed_begin = -1;
+                        int parsed_count = 1;
+                        int parsed_layer = -1;
+                        bool parsed = ggml_backend_meta_parse_prefill_wave_attn_out_group(
+                            graph->nodes[k]->name, parsed_begin, parsed_count, parsed_layer);
+                        if (!parsed) {
+                            parsed = ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
+                                graph->nodes[k]->name, parsed_begin, parsed_layer);
+                            parsed_count = 1;
+                        }
+                        if (!parsed) {
+                            continue;
+                        }
+                        if (parsed_count <= 0) {
+                            return false;
+                        }
+                        if (found &&
+                                (parsed_begin != out_begin ||
+                                 parsed_count != out_count ||
+                                 parsed_layer != out_layer)) {
+                            return false;
+                        }
+                        out_begin = parsed_begin;
+                        out_count = parsed_count;
+                        out_layer = parsed_layer;
+                        found = true;
+                    }
+                    return found;
+                };
+
+            int phone_begin = -1;
+            int phone_count = -1;
             int phone_layer = -1;
-            if (!find_wave_attn(0, chunk, layer) ||
-                    !find_wave_attn(1, phone_chunk, phone_layer)) {
+            if (!find_wave_attn(0, chunk_begin, chunk_count, layer) ||
+                    !find_wave_attn(1, phone_begin, phone_count, phone_layer)) {
                 return false;
             }
-            return chunk == phone_chunk && layer == phone_layer;
+            return chunk_begin == phone_begin &&
+                   chunk_count == phone_count &&
+                   layer == phone_layer;
         };
 
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
@@ -5449,13 +5476,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         int prefill_down_chunk = -1;
         int prefill_down_layer = -1;
         int prefill_wave_attn_chunk = -1;
+        int prefill_wave_attn_chunk_count = 1;
         int prefill_wave_attn_layer = -1;
         const bool is_prefill_norm_sg = parse_prefill_sg(
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
             i, false, prefill_down_chunk, prefill_down_layer);
         const bool is_prefill_wave_attn_sg = parse_prefill_wave_attn_sg(
-            i, prefill_wave_attn_chunk, prefill_wave_attn_layer);
+            i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
+            prefill_wave_attn_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
@@ -5584,24 +5613,33 @@ auto prefill_norm_sg_has_prework =
                 bool waited = false;
                 int64_t dependency_wait_us = 0;
                 if (prefill_wave_attn_layer > return_wavefront_first_layer) {
-                    const int64_t wait_start_us = ggml_time_us();
-                    const ggml_status status = wait_prefill_reduce_dependency(
-                        prefill_wave_attn_layer - 1, prefill_wave_attn_chunk, waited);
-                    dependency_wait_us = ggml_time_us() - wait_start_us;
-                    if (waited) {
-                        ++return_wave_dependency_wait_count;
-                        return_wave_dependency_wait_us += dependency_wait_us;
-                        return_wave_dependency_wait_max_us =
-                            std::max(return_wave_dependency_wait_max_us, dependency_wait_us);
-                        if (pipeline_debug) {
-                            printf(
-                                "[RETURN_WAVEFRONT_DEP_WAIT] layer=%d chunk=%d predecessor=%d wait_ms=%.3f\n",
-                                prefill_wave_attn_layer, prefill_wave_attn_chunk,
-                                prefill_wave_attn_layer - 1, dependency_wait_us / 1000.0);
+                    for (int dep_chunk = prefill_wave_attn_chunk;
+                         dep_chunk < prefill_wave_attn_chunk + prefill_wave_attn_chunk_count;
+                         ++dep_chunk) {
+                        bool dep_waited = false;
+                        const int64_t wait_start_us = ggml_time_us();
+                        const ggml_status status = wait_prefill_reduce_dependency(
+                            prefill_wave_attn_layer - 1, dep_chunk, dep_waited);
+                        const int64_t dep_wait_us = ggml_time_us() - wait_start_us;
+                        dependency_wait_us += dep_wait_us;
+                        waited = waited || dep_waited;
+                        if (dep_waited) {
+                            ++return_wave_dependency_wait_count;
+                            return_wave_dependency_wait_us += dep_wait_us;
+                            return_wave_dependency_wait_max_us =
+                                std::max(return_wave_dependency_wait_max_us, dep_wait_us);
+                            if (pipeline_debug) {
+                                printf(
+                                    "[RETURN_WAVEFRONT_DEP_WAIT] layer=%d chunk=%d group_begin=%d group_count=%d "
+                                    "predecessor=%d wait_ms=%.3f\n",
+                                    prefill_wave_attn_layer, dep_chunk,
+                                    prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
+                                    prefill_wave_attn_layer - 1, dep_wait_us / 1000.0);
+                            }
                         }
-                    }
-                    if (status != GGML_STATUS_SUCCESS) {
-                        return status;
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
                     }
                 }
 
@@ -5612,15 +5650,16 @@ auto prefill_norm_sg_has_prework =
                     ++return_wave_overlap_boundaries;
                 }
                 if (predecessor_layer_still_in_flight) {
-                    ++return_wave_ahead_attn_chunks;
+                    return_wave_ahead_attn_chunks += prefill_wave_attn_chunk_count;
                 }
 
                 if (pipeline_debug) {
                     printf(
-                        "[RETURN_WAVEFRONT_PREWORK] layer=%d chunk=%d waited=%d "
+                        "[RETURN_WAVEFRONT_PREWORK] layer=%d group_begin=%d group_count=%d waited=%d "
                         "wait_ms=%.3f predecessor_pending=%d any_pending=%d\n",
                         prefill_wave_attn_layer, prefill_wave_attn_chunk,
-                        waited ? 1 : 0, dependency_wait_us / 1000.0,
+                        prefill_wave_attn_chunk_count, waited ? 1 : 0,
+                        dependency_wait_us / 1000.0,
                         predecessor_layer_still_in_flight ? 1 : 0,
                         has_pending_prefill_reduce() ? 1 : 0);
                 }
