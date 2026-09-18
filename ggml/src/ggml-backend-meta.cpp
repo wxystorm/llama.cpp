@@ -2617,6 +2617,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    const int64_t meta_graph_start_us = ggml_time_us();
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -5957,7 +5958,9 @@ auto prefill_norm_sg_has_prework =
         if (is_prefill_down_sg) {
             tensor_pc_ffn_us += pc_compute_us;
             tensor_phone_us  += phone_compute_us;
-        } else if (is_prefill_norm_sg || subgraph_is_prefill_pc_only(i)) {
+        } else if (is_prefill_wave_attn_sg || is_prefill_norm_sg || subgraph_is_prefill_pc_only(i)) {
+            // Return-wavefront Attention is its own subgraph.  It must be
+            // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
         }
     }
@@ -6072,11 +6075,17 @@ auto prefill_norm_sg_has_prework =
     const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
 
     if (return_wavefront_graph) {
+        const int64_t meta_total_us = ggml_time_us() - meta_graph_start_us;
+        const int64_t main_accounted_us =
+            compute_wall_us + reduce_wall_us + layer_barrier_wait_us;
+        const int64_t other_main_us =
+            std::max<int64_t>(0, meta_total_us - main_accounted_us);
         printf(
             "[TENSOR_RUNTIME_SUM] "
             "attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f phone_ms=%.3f "
             "d2h_ms=%.3f reduce_ms=%.3f wait_ms=%.3f "
-            "compute_wall_ms=%.3f reduce_wall_ms=%.3f\n",
+            "compute_wall_ms=%.3f reduce_wall_ms=%.3f "
+            "meta_total_ms=%.3f other_main_ms=%.3f\n",
             tensor_attn_us / 1000.0,
             tensor_pc_ffn_us / 1000.0,
             h2d_us / 1000.0,
@@ -6085,7 +6094,9 @@ auto prefill_norm_sg_has_prework =
             tensor_reduce_us / 1000.0,
             tensor_wait_us / 1000.0,
             compute_wall_us / 1000.0,
-            reduce_wall_us / 1000.0);
+            reduce_wall_us / 1000.0,
+            meta_total_us / 1000.0,
+            other_main_us / 1000.0);
     }
     {
         std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
