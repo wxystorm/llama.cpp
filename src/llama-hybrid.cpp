@@ -47,8 +47,10 @@ static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION    = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION = 0.90;
 static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION   = 0.90;
 
-static std::mutex                       g_llama_hybrid_runtime_plan_mutex;
-static std::optional<llama_hybrid_plan> g_llama_hybrid_runtime_plan;
+static std::mutex                              g_llama_hybrid_runtime_plan_mutex;
+static std::optional<llama_hybrid_plan>        g_llama_hybrid_runtime_plan;
+static std::optional<llama_hybrid_profile>     g_llama_hybrid_runtime_profile;
+static std::optional<llama_hybrid_constraints> g_llama_hybrid_runtime_constraints;
 
 static bool llama_hybrid_runtime_plan_valid(const llama_hybrid_plan & plan) {
     return plan.tensor_layers >= 0 && plan.phone_layers >= 0 && plan.pc_layers >= 0 &&
@@ -100,6 +102,8 @@ bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan) {
 void llama_hybrid_runtime_plan_clear() {
     std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
     g_llama_hybrid_runtime_plan.reset();
+    g_llama_hybrid_runtime_profile.reset();
+    g_llama_hybrid_runtime_constraints.reset();
     llama_hybrid_runtime_set_dual_return(false);
 }
 
@@ -1491,6 +1495,95 @@ static double llama_hybrid_tensor_misc_cost(const llama_hybrid_profile & profile
         return 0.0;
     }
     return std::max(0.0, cpu_layer_base_ms - cpu_attn_base_ms - full_ffn_ms);
+}
+
+bool llama_hybrid_runtime_predict_tensor_compute(
+        int tokens, llama_hybrid_tensor_compute_prediction & prediction) {
+    prediction = {};
+    if (tokens <= 0) {
+        return false;
+    }
+
+    llama_hybrid_plan plan;
+    llama_hybrid_profile profile;
+    llama_hybrid_constraints constraints;
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        if (!g_llama_hybrid_runtime_plan.has_value() ||
+            !g_llama_hybrid_runtime_profile.has_value() ||
+            !g_llama_hybrid_runtime_constraints.has_value()) {
+            return false;
+        }
+        plan        = *g_llama_hybrid_runtime_plan;
+        profile     = *g_llama_hybrid_runtime_profile;
+        constraints = *g_llama_hybrid_runtime_constraints;
+    }
+
+    if (plan.tensor_layers <= 0 || plan.tensor_chunk_tokens <= 0) {
+        return false;
+    }
+
+    int kv_tokens = constraints.score_kv_tokens;
+    if (kv_tokens <= 0) {
+        kv_tokens = constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train;
+    }
+    kv_tokens = std::max(kv_tokens, tokens);
+    if (profile.n_ctx_train > 0) {
+        kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
+    }
+
+    double cpu_layer_base = 0.0;
+    double cpu_attn_base  = 0.0;
+    double cpu_attn_kv    = 0.0;
+    if (!llama_hybrid_layer_block_cost(
+            profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
+        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
+        !llama_hybrid_attn_cost(profile.cpu_attn, tokens, kv_tokens, cpu_attn_kv)) {
+        return false;
+    }
+
+    const double per_layer_attn_misc =
+        cpu_attn_kv +
+        llama_hybrid_tensor_misc_cost(profile, tokens, cpu_layer_base, cpu_attn_base);
+
+    const std::vector<int> chunks =
+        llama_hybrid_split_by_chunk_size(tokens, plan.tensor_chunk_tokens);
+    if (chunks.empty()) {
+        return false;
+    }
+
+    double per_layer_pc_ffn = 0.0;
+    for (const int chunk_tokens : chunks) {
+        double chunk_pc_ffn = 0.0;
+        if (!llama_hybrid_ffn_cost(
+                profile.cpu_ffn, chunk_tokens, plan.tensor_pc_ratio, chunk_pc_ffn)) {
+            return false;
+        }
+        per_layer_pc_ffn += chunk_pc_ffn;
+    }
+
+    double per_layer_tensor_pipeline = 0.0;
+    if (!llama_hybrid_tensor_ffn_cost(
+            profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens,
+            per_layer_tensor_pipeline)) {
+        return false;
+    }
+
+    prediction.tokens             = tokens;
+    prediction.kv_tokens          = kv_tokens;
+    prediction.tensor_layers      = plan.tensor_layers;
+    prediction.tensor_chunk_tokens = plan.tensor_chunk_tokens;
+    prediction.tensor_pc_ratio    = plan.tensor_pc_ratio;
+    prediction.attn_misc_ms       = plan.tensor_layers * per_layer_attn_misc;
+    prediction.pc_ffn_ms          = plan.tensor_layers * per_layer_pc_ffn;
+    prediction.pc_compute_ms      = prediction.attn_misc_ms + prediction.pc_ffn_ms;
+    prediction.tensor_total_ms    =
+        plan.tensor_layers * (per_layer_attn_misc + per_layer_tensor_pipeline);
+
+    return std::isfinite(prediction.attn_misc_ms) &&
+           std::isfinite(prediction.pc_ffn_ms) &&
+           std::isfinite(prediction.pc_compute_ms) &&
+           std::isfinite(prediction.tensor_total_ms);
 }
 
 static float llama_hybrid_align_pc_ratio(const llama_hybrid_profile & profile, float ratio) {
@@ -4225,7 +4318,15 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     if (!found) {
         LLAMA_LOG_ERROR("%s: no scoreable hybrid plans\n", __func__);
-    } else if (!llama_hybrid_sim_stages(best_plan).empty()) {
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+            g_llama_hybrid_runtime_profile = profile;
+            g_llama_hybrid_runtime_constraints = constraints;
+        }
+    }
+
+    if (found && !llama_hybrid_sim_stages(best_plan).empty()) {
         const int reference_tokens = profile.reference_tokens > 0 ?
             profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS;
         const int work_tokens = constraints.target_ubatch_tokens > 0 ?
