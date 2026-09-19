@@ -1882,7 +1882,7 @@ bool llama_context::run_hybrid_wave_probe(
         hidden.data(), nullptr,
         ctx_type_to_graph_type(cparams.ctx_type),
         probe_mctx.get(), sched.get(), gf_res_prev.get(),
-        -1, 0, 0, llama_hybrid_boundary_action::PASS,
+        0, 0, 0, llama_hybrid_boundary_action::PASS,
         0, apply_mctx, true, status);
     ggml_backend_sched_synchronize(sched.get());
     const int64_t wall_us = ggml_time_us() - wall_begin_us;
