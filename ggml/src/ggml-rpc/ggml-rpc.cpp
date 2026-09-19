@@ -300,6 +300,12 @@ struct rpc_pending_fused_ffn_input {
     std::vector<uint8_t> packet;
 };
 
+struct rpc_snapshot_ready_context {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unordered_set<uint64_t> ready_seqs;
+};
+
 struct ggml_backend_rpc_device_context {
     std::string endpoint;
     uint32_t    device;
@@ -307,6 +313,7 @@ struct ggml_backend_rpc_device_context {
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
     rpc_pending_fused_ffn_input fused_ffn;
+    rpc_snapshot_ready_context snapshot_ready;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -549,6 +556,43 @@ static void ggml_backend_rpc_set_snapshot_read(bool enabled, uint32_t slot, uint
     rpc_snapshot_read.active = enabled;
     rpc_snapshot_read.slot = slot;
     rpc_snapshot_read.seq = seq;
+}
+
+static void rpc_mark_snapshot_ready(
+        ggml_backend_rpc_device_context * device_ctx,
+        uint64_t seq) {
+    if (device_ctx == nullptr) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(device_ctx->snapshot_ready.mutex);
+        device_ctx->snapshot_ready.ready_seqs.insert(seq);
+    }
+    device_ctx->snapshot_ready.cv.notify_all();
+}
+
+static bool ggml_backend_rpc_wait_snapshot_ready(
+        ggml_backend_t backend,
+        uint64_t seq) {
+    auto * dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return false;
+    }
+
+    auto * device_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(dev->context);
+    if (device_ctx == nullptr) {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(device_ctx->snapshot_ready.mutex);
+    device_ctx->snapshot_ready.cv.wait(lock, [&]() {
+        return device_ctx->snapshot_ready.ready_seqs.find(seq) !=
+               device_ctx->snapshot_ready.ready_seqs.end();
+    });
+    device_ctx->snapshot_ready.ready_seqs.erase(seq);
+    return true;
 }
 
 static bool send_rpc_cmd_staged(
@@ -1057,11 +1101,33 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t request_done_us = ggml_time_us();
 
-        status = snapshot_sock->recv_data(
-            data,
-            size);
+        int64_t ready_first_byte_us = 0;
+        int64_t recv_rest_us = 0;
 
-        RPC_STATUS_ASSERT(status);
+        if (size > 0) {
+            const int64_t ready_wait_start_us = ggml_time_us();
+            status = snapshot_sock->recv_data(data, 1);
+            RPC_STATUS_ASSERT(status);
+            const int64_t ready_byte_us = ggml_time_us();
+            ready_first_byte_us = ready_byte_us - ready_wait_start_us;
+
+            // The server only starts sending snapshot bytes after the slot
+            // transitions to READY. Receiving the first byte is therefore the
+            // producer-complete signal. Publish it immediately so Phone
+            // compute credit does not wait for the rest of the payload.
+            rpc_mark_snapshot_ready(ctx->device_ctx, request.seq);
+
+            if (size > 1) {
+                const int64_t recv_rest_start_us = ggml_time_us();
+                status = snapshot_sock->recv_data(
+                    static_cast<uint8_t *>(data) + 1,
+                    size - 1);
+                RPC_STATUS_ASSERT(status);
+                recv_rest_us = ggml_time_us() - recv_rest_start_us;
+            }
+        } else {
+            rpc_mark_snapshot_ready(ctx->device_ctx, request.seq);
+        }
 
         const int64_t done_us = ggml_time_us();
 
@@ -1069,12 +1135,15 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             printf(
                 "[RPC_SNAPSHOT_CLIENT] "
                 "slot=%u lane=%zu seq=%" PRIu64
-                " bytes=%zu request=%.3f recv=%.3f total=%.3f ms\n",
+                " bytes=%zu request=%.3f ready_first_byte=%.3f recv_rest=%.3f "
+                "recv=%.3f total=%.3f ms\n",
                 request.slot,
                 lane,
                 request.seq,
                 size,
                 (request_done_us - t0) / 1000.0,
+                ready_first_byte_us / 1000.0,
+                recv_rest_us / 1000.0,
                 (done_us - request_done_us) / 1000.0,
                 (done_us - t0) / 1000.0);
             fflush(stdout);
@@ -4093,6 +4162,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_set_snapshot_read);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_WAIT_SNAPSHOT_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_wait_snapshot_ready);
     }
     if (std::strcmp(
             name,
