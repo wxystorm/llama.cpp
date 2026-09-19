@@ -212,6 +212,25 @@ struct llama_hybrid_wave_calibration {
     double sync_ms          = 0.0;
     double post_sync_ms     = 0.0;
 
+    int    prepare_probe_layers_a = 0;
+    int    prepare_probe_layers_b = 0;
+    double prepare_probe_ms_a     = 0.0;
+    double prepare_probe_ms_b     = 0.0;
+    double prepare_intercept_ms   = 0.0;
+    double prepare_slope_ms_per_layer = 0.0;
+    bool   prepare_affine_valid   = false;
+
+    int    wave_layer_start_count = 0;
+    int    wave_ii_count          = 0;
+    double wave_ii_mean_ms        = 0.0;
+    double wave_ii_median_ms      = 0.0;
+    double wave_ii_min_ms         = 0.0;
+    double wave_ii_max_ms         = 0.0;
+    double wave_fill_ms           = 0.0;
+    double wave_drain_ms          = 0.0;
+    double wave_span_ms           = 0.0;
+    double wave_outer_runtime_ms  = 0.0;
+
     double attn_ms        = 0.0;
     double pc_ffn_ms      = 0.0;
     double h2d_ms         = 0.0;
