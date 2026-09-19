@@ -2505,6 +2505,21 @@ static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC));
 }
 
+static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_ready_waiter(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_wait_snapshot_ready_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_WAIT_SNAPSHOT_READY_PROC));
+}
+
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
@@ -3981,6 +3996,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_phone_credit_wait_count = 0;
     int64_t return_wave_phone_credit_wait_us    = 0;
     int64_t return_wave_phone_credit_wait_max_us = 0;
+    std::deque<uint64_t> return_wave_phone_credit_seqs;
+    ggml_backend_rpc_wait_snapshot_ready_t return_wave_snapshot_ready_waiter =
+        n_backends > 1 ?
+        ggml_backend_meta_get_snapshot_ready_waiter(backend_ctx->backend_configs[1].backend) :
+        nullptr;
     int64_t return_wave_old_layer_wait_count   = 0;
     int64_t return_wave_old_layer_wait_us      = 0;
     std::map<int, int64_t> return_wave_layer_start_us;
@@ -5859,38 +5879,20 @@ auto prefill_norm_sg_has_prework =
         GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
 
         if (return_wavefront_graph) {
-            // Bound Phone producer pressure. A pending reduce represents a
-            // previously submitted Phone chunk whose snapshot return has not
-            // completed yet. Before submitting the current Phone chunk, keep
-            // at most one older chunk outstanding so that older + current <= 2.
+            // Bound Phone producer pressure by producer completion, not by
+            // full snapshot return completion. The snapshot client publishes
+            // seq readiness as soon as the first payload byte arrives, which
+            // can only happen after the server slot reached READY.
             constexpr size_t phone_inflight_limit = 2;
+            GGML_ASSERT(return_wave_snapshot_ready_waiter != nullptr);
 
-            size_t pending_count = 0;
-            int oldest_lane = -1;
-            int oldest_layer = std::numeric_limits<int>::max();
-            int oldest_chunk = std::numeric_limits<int>::max();
-
-            for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
-                if (pending_prefill_reduce_task[lane] == 0) {
-                    continue;
-                }
-                ++pending_count;
-                const int layer = pending_prefill_reduce_layer[lane];
-                const int chunk = pending_prefill_reduce_chunk[lane];
-                if (oldest_lane < 0 ||
-                    layer < oldest_layer ||
-                    (layer == oldest_layer && chunk < oldest_chunk)) {
-                    oldest_lane = (int) lane;
-                    oldest_layer = layer;
-                    oldest_chunk = chunk;
-                }
-            }
-
-            if (pending_count >= phone_inflight_limit) {
-                GGML_ASSERT(oldest_lane >= 0);
+            if (return_wave_phone_credit_seqs.size() >= phone_inflight_limit) {
+                const uint64_t oldest_seq = return_wave_phone_credit_seqs.front();
+                const size_t pending_before = return_wave_phone_credit_seqs.size();
                 const int64_t wait_start_us = ggml_time_us();
-                const ggml_status credit_status =
-                    wait_prefill_reduce_lane((size_t) oldest_lane);
+                const bool ready = return_wave_snapshot_ready_waiter(
+                    backend_ctx->backend_configs[1].backend,
+                    oldest_seq);
                 const int64_t wait_us = ggml_time_us() - wait_start_us;
 
                 ++return_wave_phone_credit_wait_count;
@@ -5900,18 +5902,18 @@ auto prefill_norm_sg_has_prework =
 
                 if (return_path_debug || pipeline_debug) {
                     printf(
-                        "[PHONE_CREDIT_WAIT] limit=%zu pending_before=%zu lane=%d "
-                        "old_layer=%d old_chunk=%d new_layer=%d new_chunk=%d wait_ms=%.3f\n",
-                        phone_inflight_limit, pending_count, oldest_lane,
-                        oldest_layer, oldest_chunk,
+                        "[PHONE_CREDIT_WAIT] limit=%zu pending_before=%zu old_seq=%" PRIu64
+                        " new_layer=%d new_chunk=%d wait_ms=%.3f ready=%d\n",
+                        phone_inflight_limit, pending_before, oldest_seq,
                         prefill_down_layer, prefill_down_chunk,
-                        wait_us / 1000.0);
+                        wait_us / 1000.0, ready ? 1 : 0);
                     fflush(stdout);
                 }
 
-                if (credit_status != GGML_STATUS_SUCCESS) {
-                    return credit_status;
+                if (!ready) {
+                    return GGML_STATUS_FAILED;
                 }
+                return_wave_phone_credit_seqs.pop_front();
             }
         }
 
@@ -5940,6 +5942,12 @@ auto prefill_norm_sg_has_prework =
         compute_workers.start(1, i);
         const ggml_status pc_status = compute_workers.wait(0);
         const ggml_status phone_status = compute_workers.wait(1);
+
+        if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
+            GGML_ASSERT(snapshot_prepares[i].prepared);
+            return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
+        }
+
         const int64_t chunk_submit_end_us = ggml_time_us();
         if (pipeline_debug) {
             GGML_LOG_INFO("[PREFILL_CHUNK_SUBMIT_END] layer=%d chunk=%d t=%" PRId64 " dur=%.3f ms\n",
@@ -6183,6 +6191,20 @@ auto prefill_norm_sg_has_prework =
 
         if (status != GGML_STATUS_SUCCESS) {
             return status;
+        }
+    }
+
+    if (return_wavefront_graph && return_wave_snapshot_ready_waiter != nullptr) {
+        // Full returns are drained now, so any remaining producer credits are
+        // already READY. Consume their notifications to avoid carrying stale
+        // seq entries into a later graph execution.
+        while (!return_wave_phone_credit_seqs.empty()) {
+            const uint64_t seq = return_wave_phone_credit_seqs.front();
+            const bool ready = return_wave_snapshot_ready_waiter(
+                backend_ctx->backend_configs[1].backend,
+                seq);
+            GGML_ASSERT(ready);
+            return_wave_phone_credit_seqs.pop_front();
         }
     }
 
