@@ -1890,6 +1890,8 @@ bool llama_context::run_hybrid_wave_probe(
     ggml_backend_meta_tensor_profile profile {};
     const bool have_profile =
         ggml_backend_meta_tensor_profile_get(meta_backend, &profile);
+    // Do not let probe counters leak into the following real prefill.
+    ggml_backend_meta_tensor_profile_reset(meta_backend);
 
     n_outputs = n_outputs_saved;
     if (auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(probe_mctx.get())) {
