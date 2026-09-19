@@ -212,6 +212,11 @@ struct llama_hybrid_wave_calibration {
     double sync_ms          = 0.0;
     double post_sync_ms     = 0.0;
 
+    int    prepare_target_tensor_layers = 0;
+    double prepare_target_ms            = 0.0;
+    bool   prepare_target_valid         = false;
+
+    // Retained for log/backward compatibility with older experiments.
     int    prepare_probe_layers_a = 0;
     int    prepare_probe_layers_b = 0;
     double prepare_probe_ms_a     = 0.0;
