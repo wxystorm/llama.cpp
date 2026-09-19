@@ -3978,6 +3978,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_overlap_boundaries     = 0;
     int64_t return_wave_ahead_attn_chunks      = 0;
     int64_t return_wave_ahead_phone_submits    = 0;
+    int64_t return_wave_phone_credit_wait_count = 0;
+    int64_t return_wave_phone_credit_wait_us    = 0;
+    int64_t return_wave_phone_credit_wait_max_us = 0;
     int64_t return_wave_old_layer_wait_count   = 0;
     int64_t return_wave_old_layer_wait_us      = 0;
     std::map<int, int64_t> return_wave_layer_start_us;
@@ -5855,6 +5858,63 @@ auto prefill_norm_sg_has_prework =
         GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
         GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
 
+        if (return_wavefront_graph) {
+            // Bound Phone producer pressure. A pending reduce represents a
+            // previously submitted Phone chunk whose snapshot return has not
+            // completed yet. Before submitting the current Phone chunk, keep
+            // at most one older chunk outstanding so that older + current <= 2.
+            constexpr size_t phone_inflight_limit = 2;
+
+            size_t pending_count = 0;
+            int oldest_lane = -1;
+            int oldest_layer = std::numeric_limits<int>::max();
+            int oldest_chunk = std::numeric_limits<int>::max();
+
+            for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
+                if (pending_prefill_reduce_task[lane] == 0) {
+                    continue;
+                }
+                ++pending_count;
+                const int layer = pending_prefill_reduce_layer[lane];
+                const int chunk = pending_prefill_reduce_chunk[lane];
+                if (oldest_lane < 0 ||
+                    layer < oldest_layer ||
+                    (layer == oldest_layer && chunk < oldest_chunk)) {
+                    oldest_lane = (int) lane;
+                    oldest_layer = layer;
+                    oldest_chunk = chunk;
+                }
+            }
+
+            if (pending_count >= phone_inflight_limit) {
+                GGML_ASSERT(oldest_lane >= 0);
+                const int64_t wait_start_us = ggml_time_us();
+                const ggml_status credit_status =
+                    wait_prefill_reduce_lane((size_t) oldest_lane);
+                const int64_t wait_us = ggml_time_us() - wait_start_us;
+
+                ++return_wave_phone_credit_wait_count;
+                return_wave_phone_credit_wait_us += wait_us;
+                return_wave_phone_credit_wait_max_us =
+                    std::max(return_wave_phone_credit_wait_max_us, wait_us);
+
+                if (return_path_debug || pipeline_debug) {
+                    printf(
+                        "[PHONE_CREDIT_WAIT] limit=%zu pending_before=%zu lane=%d "
+                        "old_layer=%d old_chunk=%d new_layer=%d new_chunk=%d wait_ms=%.3f\n",
+                        phone_inflight_limit, pending_count, oldest_lane,
+                        oldest_layer, oldest_chunk,
+                        prefill_down_layer, prefill_down_chunk,
+                        wait_us / 1000.0);
+                    fflush(stdout);
+                }
+
+                if (credit_status != GGML_STATUS_SUCCESS) {
+                    return credit_status;
+                }
+            }
+        }
+
         compute_workers.start(0, i);
         GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
         const int64_t input_wait_start_us = ggml_time_us();
@@ -6133,6 +6193,8 @@ auto prefill_norm_sg_has_prework =
             " overlap_boundaries=%" PRId64
             " ahead_attn=%" PRId64
             " ahead_phone_submit=%" PRId64
+            " phone_credit_wait_count=%" PRId64
+            " phone_credit_wait_ms=%.3f phone_credit_wait_max_ms=%.3f"
             " old_layer_wait_count=%" PRId64
             " old_layer_wait_ms=%.3f"
             " lane_reuse_wait_count=%" PRId64
@@ -6145,6 +6207,9 @@ auto prefill_norm_sg_has_prework =
             return_wave_overlap_boundaries,
             return_wave_ahead_attn_chunks,
             return_wave_ahead_phone_submits,
+            return_wave_phone_credit_wait_count,
+            return_wave_phone_credit_wait_us / 1000.0,
+            return_wave_phone_credit_wait_max_us / 1000.0,
             return_wave_old_layer_wait_count,
             return_wave_old_layer_wait_us / 1000.0,
             lane_reuse_wait_count,
