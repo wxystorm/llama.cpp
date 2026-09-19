@@ -1065,19 +1065,19 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 
         const int64_t done_us = ggml_time_us();
 
-        if (RPC_DEBUG) {
+        if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
             printf(
-                "[RPC_SNAPSHOT_COMPACT_CLIENT] "
-                "seq=%" PRIu64
-                " bytes=%zu "
-                "request=%.3f ms "
-                "recv=%.3f ms "
-                "total=%.3f ms\n",
+                "[RPC_SNAPSHOT_CLIENT] "
+                "slot=%u lane=%zu seq=%" PRIu64
+                " bytes=%zu request=%.3f recv=%.3f total=%.3f ms\n",
+                request.slot,
+                lane,
                 request.seq,
                 size,
                 (request_done_us - t0) / 1000.0,
                 (done_us - request_done_us) / 1000.0,
                 (done_us - t0) / 1000.0);
+            fflush(stdout);
         }
 
         return;
@@ -1871,6 +1871,8 @@ struct rpc_snapshot_slot {
     std::condition_variable cv;
     std::vector<uint8_t> data;
     uint64_t seq = 0;
+    int64_t free_wait_us = 0;
+    int64_t fill_us = 0;
     rpc_snapshot_state state = rpc_snapshot_state::FREE;
 };
 
@@ -2413,9 +2415,12 @@ bool rpc_server::snapshot_tensor_direct(
     }
 
     rpc_snapshot_slot & slot = snapshot_devices[device]->slots[slot_id];
+    const int64_t free_wait_start_us = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(lock, [&]() { return slot.state == rpc_snapshot_state::FREE; });
+        slot.free_wait_us = ggml_time_us() - free_wait_start_us;
+        slot.fill_us = 0;
         slot.state = rpc_snapshot_state::FILLING;
         slot.seq = seq;
         slot.data.resize(size);
@@ -2430,21 +2435,29 @@ bool rpc_server::snapshot_tensor_direct(
         size);
 
     const int64_t t1 = ggml_time_us();
-
-    if (RPC_DEBUG) {
-        printf(
-            "[RPC_SNAPSHOT_FILL] "
-            "seq=%" PRIu64 " bytes=%" PRIu64
-            " tensor_get=%.3f ms\n",
-            seq,
-            size,
-            (t1 - t0) / 1000.0);
-    }
+    const int64_t fill_us = t1 - t0;
+    int64_t free_wait_us = 0;
 
     {
         std::lock_guard<std::mutex> lock(slot.mutex);
+        slot.fill_us = fill_us;
+        free_wait_us = slot.free_wait_us;
         slot.state = rpc_snapshot_state::READY;
     }
+
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+        printf(
+            "[RPC_SNAPSHOT_FILL] "
+            "slot=%u seq=%" PRIu64 " bytes=%" PRIu64
+            " free_wait=%.3f tensor_get=%.3f ms\n",
+            slot_id,
+            seq,
+            size,
+            free_wait_us / 1000.0,
+            fill_us / 1000.0);
+        fflush(stdout);
+    }
+
     slot.cv.notify_all();
     return true;
 }
@@ -2457,6 +2470,8 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
     rpc_snapshot_slot & slot = snapshot_devices[request.device]->slots[request.slot];
     const uint8_t * data;
     size_t size;
+    int64_t slot_free_wait_us = 0;
+    int64_t slot_fill_us = 0;
     const int64_t wait_start_us = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
@@ -2481,6 +2496,8 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         slot.state = rpc_snapshot_state::SENDING;
         data = slot.data.data();
         size = slot.data.size();
+        slot_free_wait_us = slot.free_wait_us;
+        slot_fill_us = slot.fill_us;
     }
 
     const int64_t ready_us = ggml_time_us();
@@ -2517,15 +2534,19 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
             }
         }
 
-        if (RPC_DEBUG) {
-            GGML_LOG_INFO(
-                "[RPC_SNAPSHOT_RAW_SEND] "
-                "seq=%" PRIu64
-                " bytes=%zu "
-                "send=%.3f ms\n",
+        if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+            printf(
+                "[RPC_SNAPSHOT_SERVER] slot=%u lane=%u seq=%" PRIu64
+                " bytes=%zu free_wait=%.3f fill=%.3f ready_wait=%.3f send=%.3f ms\n",
+                request.slot,
+                request.slot & 1u,
                 request.seq,
                 size,
+                slot_free_wait_us / 1000.0,
+                slot_fill_us / 1000.0,
+                (ready_us - wait_start_us) / 1000.0,
                 send_us / 1000.0);
+            fflush(stdout);
         }
 
         {
