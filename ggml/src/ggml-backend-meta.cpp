@@ -3184,6 +3184,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
     size_t reduce_copy_detail_count = 0;
     int64_t pipeline_submit_sum_us = 0;
     int64_t pipeline_gap_sum_us    = 0;
@@ -4559,10 +4560,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(ggml_nbytes(pc_output_chunk) == ggml_nbytes(node_dst));
             }
 
+            const int64_t return_enqueue_us = ggml_time_us();
             const uint64_t reduce_task = reduce_worker->enqueue(
                 [&, node_src, node_dst, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence,
                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
-                    snapshot_seq, handoff_to_phone, prefill_down_layer_0,
+                    snapshot_seq, return_enqueue_us, handoff_to_phone, prefill_down_layer_0,
                     prefill_down_chunk_0, layer_handoff, pc_l_out, phone_l_out,
                     pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
@@ -4570,12 +4572,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         task_id,
                     };
                     const int64_t return_begin_us = ggml_time_us();
+                    const int64_t worker_queue_us = return_begin_us - return_enqueue_us;
+                    int64_t rpc_src_sync_us = 0;
+                    int64_t pc_dst_sync_us = 0;
+                    int64_t snapshot_copy_us = 0;
+                    int64_t reduce_add_submit_us = 0;
+                    int64_t reduce_sync_us = 0;
                     if (pipeline_debug) {
                             GGML_LOG_INFO("[PREFILL_RETURN_BEGIN] layer=%d chunk=%d lane=%zu t=%" PRId64 "\n",
                                    prefill_down_layer_0, prefill_down_chunk_0, return_lane, return_begin_us);
                     }
                     auto finish_return = [&](ggml_status result) {
                         const int64_t return_end_us = ggml_time_us();
+                        if (return_path_debug && use_snapshot_pipeline) {
+                            printf(
+                                "[RETURN_PATH] layer=%d chunk=%d lane=%zu slot=%u seq=%" PRIu64
+                                " worker_queue=%.3f rpc_src_sync=%.3f pc_dst_sync=%.3f "
+                                "snapshot_copy=%.3f reduce_add_submit=%.3f reduce_sync=%.3f "
+                                "total=%.3f status=%d\n",
+                                prefill_down_layer_0, prefill_down_chunk_0, return_lane,
+                                snapshot_slot, snapshot_seq,
+                                worker_queue_us / 1000.0,
+                                rpc_src_sync_us / 1000.0,
+                                pc_dst_sync_us / 1000.0,
+                                snapshot_copy_us / 1000.0,
+                                reduce_add_submit_us / 1000.0,
+                                reduce_sync_us / 1000.0,
+                                (return_end_us - return_begin_us) / 1000.0,
+                                (int) result);
+                            fflush(stdout);
+                        }
                         if (pipeline_debug) {
                             GGML_LOG_INFO("[PREFILL_RETURN_END] layer=%d chunk=%d lane=%zu t=%" PRId64 " dur=%.3f ms\n",
                                    prefill_down_layer_0, prefill_down_chunk_0, return_lane, return_end_us,
@@ -4605,8 +4631,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         set_stage_ready(ggml_backend_meta_stage_ready, &stage_context);
                     }
 
-                    ggml_backend_tensor_copy_async(
-                        bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+                    if (use_snapshot_pipeline && bcj_dst.backend->iface.cpy_tensor_async == nullptr) {
+                        // This is exactly the generic ggml_backend_tensor_copy_async()
+                        // fallback, expanded here so the two hidden synchronizations can
+                        // be measured separately. Keep the semantics unchanged while
+                        // diagnosing return-wavefront slowdown.
+                        const int64_t src_sync_start_us = ggml_time_us();
+                        ggml_backend_synchronize(bcj_src.backend);
+                        rpc_src_sync_us = ggml_time_us() - src_sync_start_us;
+
+                        const int64_t dst_sync_start_us = ggml_time_us();
+                        ggml_backend_synchronize(bcj_dst.backend);
+                        pc_dst_sync_us = ggml_time_us() - dst_sync_start_us;
+
+                        const int64_t snapshot_copy_start_us = ggml_time_us();
+                        ggml_backend_tensor_copy(node_src, node_tmp);
+                        snapshot_copy_us = ggml_time_us() - snapshot_copy_start_us;
+                    } else {
+                        const int64_t snapshot_copy_start_us = ggml_time_us();
+                        ggml_backend_tensor_copy_async(
+                            bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+                        snapshot_copy_us = ggml_time_us() - snapshot_copy_start_us;
+                    }
 
                     if (use_snapshot_pipeline) {
                         set_snapshot_read(false, 0, 0);
@@ -4621,6 +4667,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const ggml_status status = ggml_backend_graph_compute_async(
                         bcj_dst.backend, cgraph_aux);
                     const int64_t add_us = ggml_time_us() - add_start_us;
+                    reduce_add_submit_us = add_us;
                     record_reduce_add(add_us, status == GGML_STATUS_SUCCESS);
 
                     if (status != GGML_STATUS_SUCCESS) {
@@ -4630,7 +4677,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     if (return_wavefront_graph && !handoff_to_phone) {
                         // The pending task is the exact DOWN_READY(L,C) fence.
                         // Do not publish it until the PC reduce ADD is complete.
+                        const int64_t reduce_sync_start_us = ggml_time_us();
                         ggml_backend_synchronize(bcj_dst.backend);
+                        reduce_sync_us = ggml_time_us() - reduce_sync_start_us;
                         if (pipeline_debug) {
                             GGML_LOG_INFO(
                                 "[RETURN_WAVEFRONT_DOWN_READY] layer=%d chunk=%d lane=%zu\n",
