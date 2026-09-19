@@ -198,6 +198,36 @@ struct llama_hybrid_full_prefill_prediction {
     double total_ms  = 0.0;
 };
 
+struct llama_hybrid_wave_calibration {
+    int tokens              = 0;
+    int tensor_layers       = 0;
+    int tensor_chunk_tokens = 0;
+    int attn_group_chunks   = 1;
+    int attn_chunk_tokens   = 0;
+    float tensor_pc_ratio   = 0.0f;
+
+    double wall_ms          = 0.0;
+    double prepare_ms       = 0.0;
+    double compute_range_ms = 0.0;
+    double sync_ms          = 0.0;
+    double post_sync_ms     = 0.0;
+
+    double attn_ms        = 0.0;
+    double pc_ffn_ms      = 0.0;
+    double h2d_ms         = 0.0;
+    double phone_ms       = 0.0;
+    double d2h_ms         = 0.0;
+    double reduce_ms      = 0.0;
+    double wait_ms        = 0.0;
+    double compute_wall_ms = 0.0;
+    double reduce_wall_ms  = 0.0;
+    double meta_total_ms   = 0.0;
+    double other_main_ms   = 0.0;
+
+    double lane_reuse_wait_ms = 0.0;
+    double barrier_ms         = 0.0;
+};
+
 struct llama_hybrid_plan {
     int tensor_layers = 0;
     int phone_layers  = 0;
@@ -335,6 +365,8 @@ LLAMA_API bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
 
 LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
+LLAMA_API void llama_hybrid_runtime_wave_calibration_set(const llama_hybrid_wave_calibration & calibration);
+LLAMA_API bool llama_hybrid_runtime_wave_calibration_get(llama_hybrid_wave_calibration & calibration);
 LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(
