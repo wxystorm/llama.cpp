@@ -55,6 +55,99 @@ static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_acti
     return "UNKNOWN";
 }
 
+static void llama_hybrid_log_formal_prepare_prediction(
+        uint32_t tokens,
+        double   prepare_ms) {
+    llama_hybrid_plan runtime_plan;
+    llama_hybrid_wave_calibration calibration;
+    llama_hybrid_full_prefill_prediction full_prediction;
+    if (!llama_hybrid_runtime_plan_get(runtime_plan) ||
+        !llama_hybrid_runtime_wave_calibration_get(calibration) ||
+        !llama_hybrid_runtime_predict_full_prefill((int) tokens, full_prediction)) {
+        return;
+    }
+
+    if (tokens <= 1 ||
+        calibration.tokens != (int) tokens ||
+        calibration.tensor_layers <= 0 ||
+        calibration.tensor_chunk_tokens != full_prediction.tensor_chunk_tokens ||
+        calibration.attn_group_chunks != full_prediction.attn_group_chunks ||
+        std::abs(calibration.tensor_pc_ratio - full_prediction.tensor_pc_ratio) >= 1e-4f ||
+        calibration.wave_ii_count <= 0 ||
+        calibration.wave_ii_median_ms <= 0.0) {
+        return;
+    }
+
+    calibration.prepare_target_tensor_layers = full_prediction.tensor_layers;
+    calibration.prepare_target_ms            = prepare_ms;
+    calibration.prepare_target_valid         = true;
+    llama_hybrid_runtime_wave_calibration_set(calibration);
+
+    const int target_intervals = std::max(0, full_prediction.tensor_layers - 1);
+    const int observed_intervals = std::min(target_intervals, calibration.wave_ii_count);
+    const int remaining_intervals = std::max(0, target_intervals - observed_intervals);
+
+    const double observed_ii_sum_ms =
+        calibration.wave_ii_mean_ms * observed_intervals;
+    const double late_ii_ms =
+        calibration.wave_late_ii_median_ms > 0.0 ?
+            calibration.wave_late_ii_median_ms :
+            calibration.wave_ii_median_ms;
+
+    // Primary drift-aware model: preserve the exact probe intervals we
+    // actually observed, then assume the late probe rate is the steady state
+    // for the remaining Tensor layers. This uses the slowdown trend without
+    // extrapolating a noisy linear slope indefinitely.
+    const double wave_span_drift_ms =
+        calibration.wave_fill_ms +
+        observed_ii_sum_ms +
+        remaining_intervals * late_ii_ms +
+        calibration.wave_drain_ms;
+    const double runtime_drift_ms =
+        calibration.wave_outer_runtime_ms + wave_span_drift_ms;
+    const double tensor_drift_ms = prepare_ms + runtime_drift_ms;
+    const double total_drift_ms = full_prediction.gpu_ms + tensor_drift_ms;
+
+    // Keep the old constant-median extrapolation beside it for comparison.
+    const double wave_span_median_ms =
+        calibration.wave_fill_ms +
+        target_intervals * calibration.wave_ii_median_ms +
+        calibration.wave_drain_ms;
+    const double runtime_median_ms =
+        calibration.wave_outer_runtime_ms + wave_span_median_ms;
+    const double total_median_ms =
+        full_prediction.gpu_ms + prepare_ms + runtime_median_ms;
+
+    LLAMA_LOG_ERROR(
+        "[WAVE_FORMAL_PREP] tokens=%u target_tensor_layers=%d prepare_ms=%.3f reuse=1\n",
+        tokens, full_prediction.tensor_layers, prepare_ms);
+
+    LLAMA_LOG_ERROR(
+        "[PRED_WAVE_II] mode=late_hold probe_layers=%d target_layers=%d "
+        "prepare_ms=%.3f observed_intervals=%d observed_ii_sum_ms=%.3f "
+        "remaining_intervals=%d late_ii_ms=%.3f ii_drift_ratio=%.4f "
+        "fill_ms=%.3f drain_ms=%.3f outer_runtime_ms=%.3f "
+        "wave_span_ms=%.3f runtime_ms=%.3f tensor_ms=%.3f gpu_ms=%.3f "
+        "total_ms=%.3f constant_median_total_ms=%.3f\n",
+        calibration.tensor_layers,
+        full_prediction.tensor_layers,
+        prepare_ms,
+        observed_intervals,
+        observed_ii_sum_ms,
+        remaining_intervals,
+        late_ii_ms,
+        calibration.wave_ii_drift_ratio,
+        calibration.wave_fill_ms,
+        calibration.wave_drain_ms,
+        calibration.wave_outer_runtime_ms,
+        wave_span_drift_ms,
+        runtime_drift_ms,
+        tensor_drift_ms,
+        full_prediction.gpu_ms,
+        total_drift_ms,
+        total_median_ms);
+}
+
 static std::vector<llama_hybrid_runtime_stage> llama_hybrid_build_runtime_stages(const llama_hybrid_plan & plan) {
     std::vector<llama_hybrid_runtime_stage> stages;
 
