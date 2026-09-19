@@ -90,6 +90,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     const bool stage_graph       = params.hybrid_layer_end >= 0;
+    const bool wave_probe_graph  = stage_graph && params.hybrid_wave_probe;
     const int  layer_begin       = stage_graph ? params.hybrid_layer_begin : 0;
     const int  layer_end         = stage_graph ? params.hybrid_layer_end : n_layer;
     const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
@@ -123,7 +124,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     int return_wave_first_layer = -1;
     bool return_wave_eligible =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr &&
-        !stage_graph && build_output_head && n_tokens > 1 &&
+        (!stage_graph || wave_probe_graph) &&
+        (build_output_head || wave_probe_graph) && n_tokens > 1 &&
         ubatch.n_pos == 1 && !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
         model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
         return_wave_chunk_tokens > 0 && return_wave_attn_group_chunks > 0 &&
@@ -139,7 +141,9 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
         // V1 is the measured GPU -> TENSOR topology: keep a normal prefix and
         // require the Tensor split to continue through the final transformer
         // layer.  This avoids mixing the experiment with a later PHONE stage.
-        return_wave_eligible = return_wave_first_layer > layer_begin;
+        return_wave_eligible = wave_probe_graph ?
+            return_wave_first_layer == layer_begin :
+            return_wave_first_layer > layer_begin;
         for (int il = return_wave_first_layer; return_wave_eligible && il < layer_end; ++il) {
             return_wave_eligible =
                 model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::TENSOR_SPLIT &&
