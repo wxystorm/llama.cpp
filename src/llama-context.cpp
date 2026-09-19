@@ -1844,7 +1844,9 @@ bool llama_context::run_hybrid_wave_probe(
         return false;
     }
 
-    llama_ubatch probe_ubatch = probe_balloc.split_simple(probe_tokens);
+    // init_batch() already split/owns the current ubatch. Pull that exact
+    // ubatch from the memory context instead of consuming balloc a second time.
+    llama_ubatch probe_ubatch = probe_mctx->get_ubatch();
     if (probe_ubatch.n_tokens != probe_tokens) {
         LLAMA_LOG_WARN(
             "[WAVE_PROBE] unexpected ubatch size=%u expected=%u\n",
@@ -2506,12 +2508,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
 
     if (!hybrid_wave_probe_done &&
-        n_tokens_all > 1 &&
+        n_tokens_all > (uint32_t) std::max(1, runtime_plan.tensor_chunk_tokens) &&
         return_wavefront_requested &&
         return_wavefront_full_graph_override) {
         const char * probe_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE");
         if (probe_env != nullptr && std::atoi(probe_env) != 0) {
-            hybrid_wave_probe_done = true;
             int probe_layers = 6;
             if (const char * layers_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE_LAYERS")) {
                 const int requested = std::atoi(layers_env);
@@ -2520,7 +2521,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
             probe_layers = std::min(probe_layers, runtime_plan.tensor_layers);
-            run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
+            hybrid_wave_probe_done =
+                run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
         }
     }
 
