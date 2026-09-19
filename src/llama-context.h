@@ -21,6 +21,7 @@ class llama_io_read_i;
 class llama_io_write_i;
 
 enum class llama_hybrid_boundary_action;
+struct llama_hybrid_plan;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
