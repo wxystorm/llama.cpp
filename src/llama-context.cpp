@@ -1714,7 +1714,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int32_t                            block_outputs,
         bool &                             apply_mctx,
         bool                               synchronize,
-        ggml_status &                      ret) {
+        ggml_status &                      ret,
+        llama_hybrid_stage_timing *        timing) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -1733,27 +1734,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ubatch_id, stage_index, llama_hybrid_runtime_stage_name(stage.kind), stage.layer_begin, stage.layer_end,
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
 
+    const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
     llm_graph_result * result = prepare_ubatch(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx, &stage);
+    if (timing != nullptr) {
+        timing->prepare_us += ggml_time_us() - prepare_begin_us;
+    }
     apply_mctx = false;
     if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
         return nullptr;
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
+    const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    if (timing != nullptr) {
+        timing->compute_range_us += ggml_time_us() - compute_begin_us;
+    }
     if (ret != GGML_STATUS_SUCCESS) {
         return nullptr;
     }
 
     if (stage_output != nullptr) {
+        const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         if (!copy_hybrid_stage_output(
                 result, sched_use, stage_output, block_tokens, ubatch_id, stage_index, block_index)) {
+            if (timing != nullptr) {
+                timing->sync_us += ggml_time_us() - sync_begin_us;
+            }
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        if (timing != nullptr) {
+            timing->sync_us += ggml_time_us() - sync_begin_us;
+        }
     } else if (synchronize) {
+        const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched_use);
+        if (timing != nullptr) {
+            timing->sync_us += ggml_time_us() - sync_begin_us;
+        }
     }
 
     return result;
@@ -1878,6 +1898,7 @@ bool llama_context::run_hybrid_wave_probe(
         runtime_plan.tensor_chunk_tokens * llama_hybrid_runtime_prefill_attn_group_chunks(),
         runtime_plan.tensor_pc_ratio);
 
+    llama_hybrid_stage_timing stage_timing {};
     const int64_t wall_begin_us = ggml_time_us();
     llm_graph_result * result = run_hybrid_stage_block(
         probe_ubatch, probe_stage, 0, probe_tokens,
@@ -1885,8 +1906,10 @@ bool llama_context::run_hybrid_wave_probe(
         ctx_type_to_graph_type(cparams.ctx_type),
         probe_mctx.get(), sched.get(), gf_res_prev.get(),
         0, 0, 0, llama_hybrid_boundary_action::PASS,
-        0, apply_mctx, true, status);
+        0, apply_mctx, true, status, &stage_timing);
+    const int64_t post_sync_begin_us = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
+    const int64_t post_sync_us = ggml_time_us() - post_sync_begin_us;
     const int64_t wall_us = ggml_time_us() - wall_begin_us;
 
     ggml_backend_meta_tensor_profile profile {};
@@ -1910,26 +1933,97 @@ bool llama_context::run_hybrid_wave_probe(
         return false;
     }
 
+    const int probe_layer_count = tensor_end_probe - tensor_begin;
+    const int attn_group_chunks = llama_hybrid_runtime_prefill_attn_group_chunks();
+    const double accounted_probe_us =
+        (double) stage_timing.prepare_us +
+        (double) stage_timing.compute_range_us +
+        (double) stage_timing.sync_us +
+        (double) post_sync_us;
+    const double unaccounted_probe_us =
+        std::max(0.0, (double) wall_us - accounted_probe_us);
+
+    llama_hybrid_wave_calibration calibration {};
+    calibration.tokens              = (int) probe_tokens;
+    calibration.tensor_layers       = probe_layer_count;
+    calibration.tensor_chunk_tokens = runtime_plan.tensor_chunk_tokens;
+    calibration.attn_group_chunks   = attn_group_chunks;
+    calibration.attn_chunk_tokens   = runtime_plan.tensor_chunk_tokens * attn_group_chunks;
+    calibration.tensor_pc_ratio     = runtime_plan.tensor_pc_ratio;
+
+    calibration.wall_ms          = wall_us / 1000.0;
+    calibration.prepare_ms       = stage_timing.prepare_us / 1000.0;
+    calibration.compute_range_ms = stage_timing.compute_range_us / 1000.0;
+    calibration.sync_ms          = stage_timing.sync_us / 1000.0;
+    calibration.post_sync_ms     = post_sync_us / 1000.0;
+
+    calibration.attn_ms         = profile.attn_us / 1000.0;
+    calibration.pc_ffn_ms       = profile.pc_ffn_us / 1000.0;
+    calibration.h2d_ms          = profile.h2d_us / 1000.0;
+    calibration.phone_ms        = profile.phone_us / 1000.0;
+    calibration.d2h_ms          = profile.d2h_us / 1000.0;
+    calibration.reduce_ms       = profile.reduce_us / 1000.0;
+    calibration.wait_ms         = profile.wait_us / 1000.0;
+    calibration.compute_wall_ms = profile.compute_wall_us / 1000.0;
+    calibration.reduce_wall_ms  = profile.reduce_wall_us / 1000.0;
+    calibration.meta_total_ms   = profile.meta_total_us / 1000.0;
+    calibration.other_main_ms   = profile.other_main_us / 1000.0;
+
+    calibration.lane_reuse_wait_ms = profile.lane_reuse_wait_us / 1000.0;
+    calibration.barrier_ms         = profile.layer_barrier_wait_us / 1000.0;
+    llama_hybrid_runtime_wave_calibration_set(calibration);
+
+    const double operator_compute_ms = calibration.attn_ms + calibration.pc_ffn_ms;
+    const double compute_inflation =
+        operator_compute_ms > 0.0 ? calibration.compute_wall_ms / operator_compute_ms : 0.0;
+    const double meta_inflation =
+        calibration.compute_wall_ms > 0.0 ?
+            calibration.meta_total_ms / calibration.compute_wall_ms : 0.0;
+
     LLAMA_LOG_ERROR(
         "[WAVE_PROBE_SUM] tokens=%u layers=%d XT=%d GA=%d XA=%d R=%.3f "
-        "wall_ms=%.3f attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f "
-        "phone_ms=%.3f d2h_ms=%.3f reduce_ms=%.3f wait_ms=%.3f "
+        "wall_ms=%.3f prepare_ms=%.3f compute_range_ms=%.3f sync_ms=%.3f "
+        "post_sync_ms=%.3f unaccounted_ms=%.3f "
+        "attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f phone_ms=%.3f "
+        "d2h_ms=%.3f reduce_ms=%.3f wait_ms=%.3f "
+        "compute_wall_ms=%.3f reduce_wall_ms=%.3f meta_total_ms=%.3f other_main_ms=%.3f "
         "lane_reuse_wait_ms=%.3f barrier_ms=%.3f\n",
-        probe_tokens, tensor_end_probe - tensor_begin,
+        probe_tokens, probe_layer_count,
         runtime_plan.tensor_chunk_tokens,
-        llama_hybrid_runtime_prefill_attn_group_chunks(),
-        runtime_plan.tensor_chunk_tokens * llama_hybrid_runtime_prefill_attn_group_chunks(),
+        attn_group_chunks,
+        runtime_plan.tensor_chunk_tokens * attn_group_chunks,
         runtime_plan.tensor_pc_ratio,
-        wall_us / 1000.0,
-        profile.attn_us / 1000.0,
-        profile.pc_ffn_us / 1000.0,
-        profile.h2d_us / 1000.0,
-        profile.phone_us / 1000.0,
-        profile.d2h_us / 1000.0,
-        profile.reduce_us / 1000.0,
-        profile.wait_us / 1000.0,
-        profile.lane_reuse_wait_us / 1000.0,
-        profile.layer_barrier_wait_us / 1000.0);
+        calibration.wall_ms,
+        calibration.prepare_ms,
+        calibration.compute_range_ms,
+        calibration.sync_ms,
+        calibration.post_sync_ms,
+        unaccounted_probe_us / 1000.0,
+        calibration.attn_ms,
+        calibration.pc_ffn_ms,
+        calibration.h2d_ms,
+        calibration.phone_ms,
+        calibration.d2h_ms,
+        calibration.reduce_ms,
+        calibration.wait_ms,
+        calibration.compute_wall_ms,
+        calibration.reduce_wall_ms,
+        calibration.meta_total_ms,
+        calibration.other_main_ms,
+        calibration.lane_reuse_wait_ms,
+        calibration.barrier_ms);
+
+    LLAMA_LOG_ERROR(
+        "[WAVE_PROBE_CAL] layers=%d operator_compute_ms=%.3f compute_inflation=%.4f "
+        "meta_inflation=%.4f attn_per_layer_ms=%.3f pc_ffn_per_layer_ms=%.3f "
+        "meta_per_layer_ms=%.3f\n",
+        probe_layer_count,
+        operator_compute_ms,
+        compute_inflation,
+        meta_inflation,
+        probe_layer_count > 0 ? calibration.attn_ms / probe_layer_count : 0.0,
+        probe_layer_count > 0 ? calibration.pc_ffn_ms / probe_layer_count : 0.0,
+        probe_layer_count > 0 ? calibration.meta_total_ms / probe_layer_count : 0.0);
 
     return true;
 }
