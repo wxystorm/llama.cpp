@@ -4727,6 +4727,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pending_prefill_reduce_worker[return_lane] = reduce_worker;
 
             if (use_snapshot_pipeline) {
+                const int64_t snapshot_arm_start_us = ggml_time_us();
+                const int64_t enqueue_to_arm_us = snapshot_arm_start_us - return_enqueue_us;
                 const bool armed = snapshot_arm(
                     bcj_src.backend,
                     node_src,
@@ -4734,7 +4736,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_nbytes(node_src),
                     snapshot_slot,
                     snapshot_seq);
+                const int64_t snapshot_arm_call_us = ggml_time_us() - snapshot_arm_start_us;
                 GGML_ASSERT(armed);
+
+                if (return_path_debug) {
+                    printf(
+                        "[SNAPSHOT_ARM_META] layer=%d chunk=%d lane=%zu slot=%u seq=%" PRIu64
+                        " enqueue_to_arm=%.3f arm_call=%.3f bytes=%zu\n",
+                        prefill_down_layer_0, prefill_down_chunk_0, return_lane,
+                        snapshot_slot, snapshot_seq,
+                        enqueue_to_arm_us / 1000.0,
+                        snapshot_arm_call_us / 1000.0,
+                        ggml_nbytes(node_src));
+                    fflush(stdout);
+                }
 
                 if (pipeline_debug) {
                     GGML_LOG_INFO("[PREFILL_SNAPSHOT_ARM] sg=%zu layer=%d chunk=%d "
