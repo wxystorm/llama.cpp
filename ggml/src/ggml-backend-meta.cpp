@@ -2149,6 +2149,9 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
+    std::map<int, int64_t>           tensor_profile_wave_layer_start_us;
+    int64_t                          tensor_profile_wave_span_begin_us = 0;
+    int64_t                          tensor_profile_wave_span_end_us   = 0;
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
@@ -3972,6 +3975,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_ahead_phone_submits    = 0;
     int64_t return_wave_old_layer_wait_count   = 0;
     int64_t return_wave_old_layer_wait_us      = 0;
+    std::map<int, int64_t> return_wave_layer_start_us;
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
@@ -5761,6 +5765,13 @@ auto prefill_norm_sg_has_prework =
 
         const int64_t compute_start_us = ggml_time_us();
 
+    if (is_prefill_wave_attn_sg && prefill_wave_attn_chunk == 0) {
+        auto it = return_wave_layer_start_us.find(prefill_wave_attn_layer);
+        if (it == return_wave_layer_start_us.end() || compute_start_us < it->second) {
+            return_wave_layer_start_us[prefill_wave_attn_layer] = compute_start_us;
+        }
+    }
+
     for (size_t backend = 0; backend < n_backends; ++backend) {
         debug_layer_input(backend, i, 24);
     }
@@ -6112,8 +6123,9 @@ auto prefill_norm_sg_has_prework =
     const int64_t h2d_us = n_backends > 1 ? reduce_copy_by_direction[1].total_us : 0;
     const int64_t d2h_us = n_backends > 1 ? reduce_copy_by_direction[n_backends].total_us : 0;
     const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
+    const int64_t meta_graph_end_us = return_wavefront_graph ? ggml_time_us() : 0;
     const int64_t meta_total_us =
-        return_wavefront_graph ? ggml_time_us() - meta_graph_start_us : 0;
+        return_wavefront_graph ? meta_graph_end_us - meta_graph_start_us : 0;
     const int64_t main_accounted_us =
         return_wavefront_graph ? compute_wall_us + reduce_wall_us + layer_barrier_wait_us : 0;
     const int64_t other_main_us =
@@ -6152,6 +6164,21 @@ auto prefill_norm_sg_has_prework =
             backend_ctx->tensor_profile.reduce_wall_us  += reduce_wall_us;
             backend_ctx->tensor_profile.meta_total_us   += meta_total_us;
             backend_ctx->tensor_profile.other_main_us   += other_main_us;
+
+            if (backend_ctx->tensor_profile_wave_span_begin_us == 0 ||
+                meta_graph_start_us < backend_ctx->tensor_profile_wave_span_begin_us) {
+                backend_ctx->tensor_profile_wave_span_begin_us = meta_graph_start_us;
+            }
+            backend_ctx->tensor_profile_wave_span_end_us =
+                std::max(backend_ctx->tensor_profile_wave_span_end_us, meta_graph_end_us);
+
+            for (const auto & [layer, start_us] : return_wave_layer_start_us) {
+                auto it = backend_ctx->tensor_profile_wave_layer_start_us.find(layer);
+                if (it == backend_ctx->tensor_profile_wave_layer_start_us.end() ||
+                    start_us < it->second) {
+                    backend_ctx->tensor_profile_wave_layer_start_us[layer] = start_us;
+                }
+            }
         }
         backend_ctx->tensor_profile.lane_reuse_wait_count += lane_reuse_wait_count;
         backend_ctx->tensor_profile.lane_reuse_wait_us += lane_reuse_wait_us;
@@ -6228,6 +6255,9 @@ bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend) {
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
     backend_ctx->tensor_profile = {};
+    backend_ctx->tensor_profile_wave_layer_start_us.clear();
+    backend_ctx->tensor_profile_wave_span_begin_us = 0;
+    backend_ctx->tensor_profile_wave_span_end_us   = 0;
     return true;
 }
 
@@ -6239,5 +6269,54 @@ bool ggml_backend_meta_tensor_profile_get(
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
     *profile = backend_ctx->tensor_profile;
+
+    const auto & starts = backend_ctx->tensor_profile_wave_layer_start_us;
+    profile->wave_layer_start_count = (int64_t) starts.size();
+    if (!starts.empty()) {
+        const int64_t first_start_us = starts.begin()->second;
+        const int64_t last_start_us  = starts.rbegin()->second;
+
+        if (backend_ctx->tensor_profile_wave_span_begin_us > 0) {
+            profile->wave_fill_us = std::max<int64_t>(
+                0, first_start_us - backend_ctx->tensor_profile_wave_span_begin_us);
+        }
+        if (backend_ctx->tensor_profile_wave_span_end_us > 0) {
+            profile->wave_drain_us = std::max<int64_t>(
+                0, backend_ctx->tensor_profile_wave_span_end_us - last_start_us);
+        }
+        if (backend_ctx->tensor_profile_wave_span_begin_us > 0 &&
+            backend_ctx->tensor_profile_wave_span_end_us >=
+                backend_ctx->tensor_profile_wave_span_begin_us) {
+            profile->wave_span_us =
+                backend_ctx->tensor_profile_wave_span_end_us -
+                backend_ctx->tensor_profile_wave_span_begin_us;
+        }
+
+        std::vector<int64_t> intervals;
+        intervals.reserve(starts.size() > 1 ? starts.size() - 1 : 0);
+        auto prev = starts.begin();
+        for (auto it = std::next(prev); it != starts.end(); ++it) {
+            if (it->first == prev->first + 1 && it->second >= prev->second) {
+                intervals.push_back(it->second - prev->second);
+            }
+            prev = it;
+        }
+
+        if (!intervals.empty()) {
+            profile->wave_ii_count = (int64_t) intervals.size();
+            profile->wave_ii_sum_us =
+                std::accumulate(intervals.begin(), intervals.end(), int64_t(0));
+            profile->wave_ii_min_us =
+                *std::min_element(intervals.begin(), intervals.end());
+            profile->wave_ii_max_us =
+                *std::max_element(intervals.begin(), intervals.end());
+
+            std::sort(intervals.begin(), intervals.end());
+            const size_t n = intervals.size();
+            profile->wave_ii_median_us = n % 2 != 0 ?
+                intervals[n / 2] :
+                (intervals[n / 2 - 1] + intervals[n / 2]) / 2;
+        }
+    }
     return true;
 }
