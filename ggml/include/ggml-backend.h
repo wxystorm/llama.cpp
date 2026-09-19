@@ -430,6 +430,17 @@ extern "C" {
         int64_t reduce_wall_us;
         int64_t meta_total_us;
         int64_t other_main_us;
+
+        int64_t wave_layer_start_count;
+        int64_t wave_ii_count;
+        int64_t wave_ii_sum_us;
+        int64_t wave_ii_median_us;
+        int64_t wave_ii_min_us;
+        int64_t wave_ii_max_us;
+        int64_t wave_fill_us;
+        int64_t wave_drain_us;
+        int64_t wave_span_us;
+
         int64_t lane_reuse_wait_count;
         int64_t lane_reuse_wait_us;
         int64_t lane_reuse_wait_max_us;
