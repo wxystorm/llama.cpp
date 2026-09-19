@@ -1781,7 +1781,7 @@ bool llama_context::run_hybrid_wave_probe(
 
     ggml_backend_t meta_backend = nullptr;
     for (ggml_backend_t backend : backend_ptrs) {
-        if (backend != nullptr && ggml_backend_is_meta(backend)) {
+        if (backend != nullptr && ggml_backend_meta_tensor_profile_reset(backend)) {
             meta_backend = backend;
             break;
         }
