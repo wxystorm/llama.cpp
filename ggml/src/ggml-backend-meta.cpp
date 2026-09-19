@@ -6304,6 +6304,17 @@ bool ggml_backend_meta_tensor_profile_get(
     std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
     *profile = backend_ctx->tensor_profile;
 
+    const auto median_us = [](std::vector<int64_t> values) -> int64_t {
+        if (values.empty()) {
+            return 0;
+        }
+        std::sort(values.begin(), values.end());
+        const size_t n = values.size();
+        return n % 2 != 0 ?
+            values[n / 2] :
+            (values[n / 2 - 1] + values[n / 2]) / 2;
+    };
+
     const auto & starts = backend_ctx->tensor_profile_wave_layer_start_us;
     profile->wave_layer_start_count = (int64_t) starts.size();
     if (!starts.empty()) {
@@ -6344,12 +6355,58 @@ bool ggml_backend_meta_tensor_profile_get(
                 *std::min_element(intervals.begin(), intervals.end());
             profile->wave_ii_max_us =
                 *std::max_element(intervals.begin(), intervals.end());
+            profile->wave_ii_median_us = median_us(intervals);
 
-            std::sort(intervals.begin(), intervals.end());
-            const size_t n = intervals.size();
-            profile->wave_ii_median_us = n % 2 != 0 ?
-                intervals[n / 2] :
-                (intervals[n / 2 - 1] + intervals[n / 2]) / 2;
+            // Use symmetric first/last windows. For an odd interval count,
+            // leave the middle interval out of both windows.
+            const size_t half = intervals.size() / 2;
+            if (half > 0) {
+                std::vector<int64_t> early(intervals.begin(), intervals.begin() + half);
+                std::vector<int64_t> late(intervals.end() - half, intervals.end());
+
+                profile->wave_early_ii_count = (int64_t) early.size();
+                profile->wave_early_ii_sum_us =
+                    std::accumulate(early.begin(), early.end(), int64_t(0));
+                profile->wave_early_ii_median_us = median_us(early);
+
+                profile->wave_late_ii_count = (int64_t) late.size();
+                profile->wave_late_ii_sum_us =
+                    std::accumulate(late.begin(), late.end(), int64_t(0));
+                profile->wave_late_ii_median_us = median_us(late);
+            }
+        }
+
+        const size_t layer_half = starts.size() / 2;
+        if (layer_half > 0) {
+            size_t index = 0;
+            for (const auto & [layer, start_us] : starts) {
+                GGML_UNUSED(start_us);
+                const bool early = index < layer_half;
+                const bool late  = index >= starts.size() - layer_half;
+
+                const auto compute_it =
+                    backend_ctx->tensor_profile_wave_layer_compute_wall_us.find(layer);
+                const auto barrier_it =
+                    backend_ctx->tensor_profile_wave_layer_barrier_us.find(layer);
+                const int64_t compute_us =
+                    compute_it != backend_ctx->tensor_profile_wave_layer_compute_wall_us.end() ?
+                        compute_it->second : 0;
+                const int64_t barrier_us =
+                    barrier_it != backend_ctx->tensor_profile_wave_layer_barrier_us.end() ?
+                        barrier_it->second : 0;
+
+                if (early) {
+                    ++profile->wave_early_layer_count;
+                    profile->wave_early_compute_wall_us += compute_us;
+                    profile->wave_early_barrier_us += barrier_us;
+                }
+                if (late) {
+                    ++profile->wave_late_layer_count;
+                    profile->wave_late_compute_wall_us += compute_us;
+                    profile->wave_late_barrier_us += barrier_us;
+                }
+                ++index;
+            }
         }
     }
     return true;
