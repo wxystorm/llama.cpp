@@ -1782,9 +1782,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 bool llama_context::run_hybrid_wave_probe(
         uint32_t                  probe_tokens,
         int                       probe_layers,
-        const llama_hybrid_plan & runtime_plan,
-        const llama_batch &       prepare_batch,
-        int32_t                    prepare_outputs) {
+        const llama_hybrid_plan & runtime_plan) {
     if (probe_tokens <= 1 || probe_layers <= 0 || memory == nullptr ||
         model.arch != LLM_ARCH_QWEN2 ||
         model.split_mode() != LLAMA_SPLIT_MODE_TENSOR ||
@@ -1849,71 +1847,6 @@ bool llama_context::run_hybrid_wave_probe(
         /*.seq_id   =*/ seq_id.data(),
         /*.logits   =*/ logits.data(),
     };
-
-    double prepare_target_ms = 0.0;
-    bool prepare_target_ok = false;
-
-    const bool prepare_probe_enabled = []() {
-        const char * env = std::getenv("LLAMA_HYBRID_WAVE_PREPARE_PROBE");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-
-    const auto measure_target_prepare_only = [&]() -> bool {
-        if (gf_res_prev == nullptr || sched == nullptr ||
-            prepare_batch.n_tokens != (int32_t) probe_tokens) {
-            return false;
-        }
-
-        llama_batch_allocr prep_balloc(model.hparams.n_pos_per_embd());
-        if (!prep_balloc.init(
-                prepare_batch, model.vocab, memory.get(), (uint32_t) n_embd,
-                n_seq_max, false)) {
-            return false;
-        }
-
-        llama_memory_context_ptr prep_mctx =
-            memory->init_batch(prep_balloc, probe_tokens, false);
-        if (!prep_mctx || prep_mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
-            memory->clear(true);
-            return false;
-        }
-
-        const llama_ubatch prep_ubatch = prep_mctx->get_ubatch();
-        if (prep_ubatch.n_tokens != probe_tokens) {
-            memory->clear(true);
-            return false;
-        }
-
-        // Build exactly the normal full graph: real input batch, GPU prefix,
-        // full Tensor suffix, and output head. Do not execute it.
-        llm_graph_result prep_res(gf_res_prev->get_max_nodes());
-        const int32_t outputs_saved = n_outputs;
-        n_outputs = prepare_outputs;
-        ggml_status prep_status = GGML_STATUS_SUCCESS;
-        const int64_t begin_us = ggml_time_us();
-        llm_graph_result * prep_result = prepare_ubatch(
-            &prep_res, sched.get(), prep_ubatch,
-            ctx_type_to_graph_type(cparams.ctx_type),
-            prep_mctx.get(), prep_status, true, nullptr);
-        prepare_target_ms = (ggml_time_us() - begin_us) / 1000.0;
-        n_outputs = outputs_saved;
-
-        ggml_backend_sched_reset(sched.get());
-        // sched reset invalidates graph tensor allocations.
-        gf_res_prev->reset();
-        memory->clear(true);
-
-        return prep_result != nullptr && prep_status == GGML_STATUS_SUCCESS;
-    };
-
-    if (prepare_probe_enabled) {
-        prepare_target_ok = measure_target_prepare_only();
-        LLAMA_LOG_ERROR(
-            "[WAVE_PREPARE_TARGET] tensor_layers=%d full_graph=1 tokens=%u "
-            "prepare_ms=%.3f ok=%d\n",
-            runtime_plan.tensor_layers, probe_tokens,
-            prepare_target_ms, prepare_target_ok ? 1 : 0);
-    }
 
     llama_batch_allocr probe_balloc(model.hparams.n_pos_per_embd());
     if (!probe_balloc.init(
@@ -2024,10 +1957,6 @@ bool llama_context::run_hybrid_wave_probe(
     calibration.sync_ms          = stage_timing.sync_us / 1000.0;
     calibration.post_sync_ms     = post_sync_us / 1000.0;
 
-    calibration.prepare_target_tensor_layers = runtime_plan.tensor_layers;
-    calibration.prepare_target_ms            = prepare_target_ms;
-    calibration.prepare_target_valid         = prepare_target_ok;
-
     calibration.wave_layer_start_count = (int) profile.wave_layer_start_count;
     calibration.wave_ii_count          = (int) profile.wave_ii_count;
     calibration.wave_ii_mean_ms        =
@@ -2126,11 +2055,8 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.wave_outer_runtime_ms);
 
     LLAMA_LOG_ERROR(
-        "[WAVE_PREPARE_MODEL] mode=direct_target valid=%d target_tensor_layers=%d "
-        "target_prepare_ms=%.3f\n",
-        calibration.prepare_target_valid ? 1 : 0,
-        calibration.prepare_target_tensor_layers,
-        calibration.prepare_target_ms);
+        "[WAVE_PREPARE_MODEL] mode=formal_reuse pending=1 target_tensor_layers=%d\n",
+        runtime_plan.tensor_layers);
 
     return true;
 }
@@ -2714,7 +2640,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return_wavefront_full_graph_override) {
         const char * probe_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE");
         if (probe_env != nullptr && std::atoi(probe_env) != 0) {
-            int probe_layers = 8;
+            int probe_layers = 16;
             if (const char * layers_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE_LAYERS")) {
                 const int requested = std::atoi(layers_env);
                 if (requested > 0) {
@@ -2723,9 +2649,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
             probe_layers = std::min(probe_layers, runtime_plan.tensor_layers);
             hybrid_wave_probe_done =
-                run_hybrid_wave_probe(
-                    n_tokens_all, probe_layers, runtime_plan,
-                    batch_inp, (int32_t) n_outputs_all);
+                run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
         }
     }
 
