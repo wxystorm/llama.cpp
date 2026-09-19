@@ -735,6 +735,7 @@ struct llm_graph_params {
 
     bool hybrid_hidden_input = false;
     bool hybrid_output_head  = true;
+    bool hybrid_wave_probe   = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -777,7 +778,8 @@ struct llm_graph_params {
         if (hybrid_layer_begin  != other.hybrid_layer_begin ||
             hybrid_layer_end    != other.hybrid_layer_end   ||
             hybrid_hidden_input != other.hybrid_hidden_input ||
-            hybrid_output_head  != other.hybrid_output_head) {
+            hybrid_output_head  != other.hybrid_output_head  ||
+            hybrid_wave_probe   != other.hybrid_wave_probe) {
             return false;
         }
 
