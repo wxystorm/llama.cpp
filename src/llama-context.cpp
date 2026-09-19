@@ -2309,10 +2309,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                                                  ggml_status &            ret) {
     GGML_UNUSED(ubatch_id);
 
+    const int64_t prepare_begin_us = ggml_time_us();
     llm_graph_result * res = prepare_ubatch(res_use, sched_use, ubatch, gtype, mctx, ret);
+    const int64_t prepare_us = ggml_time_us() - prepare_begin_us;
 
     if (res == nullptr) {
         return nullptr;
+    }
+
+    if (ubatch.n_tokens > 1) {
+        llama_hybrid_log_formal_prepare_prediction(
+            ubatch.n_tokens, prepare_us / 1000.0);
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
