@@ -441,6 +441,20 @@ extern "C" {
         int64_t wave_drain_us;
         int64_t wave_span_us;
 
+        int64_t wave_early_ii_count;
+        int64_t wave_early_ii_sum_us;
+        int64_t wave_early_ii_median_us;
+        int64_t wave_late_ii_count;
+        int64_t wave_late_ii_sum_us;
+        int64_t wave_late_ii_median_us;
+
+        int64_t wave_early_layer_count;
+        int64_t wave_early_compute_wall_us;
+        int64_t wave_early_barrier_us;
+        int64_t wave_late_layer_count;
+        int64_t wave_late_compute_wall_us;
+        int64_t wave_late_barrier_us;
+
         int64_t lane_reuse_wait_count;
         int64_t lane_reuse_wait_us;
         int64_t lane_reuse_wait_max_us;
