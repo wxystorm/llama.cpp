@@ -70,6 +70,8 @@ static void llama_hybrid_log_formal_prepare_prediction(
     if (tokens <= 1 ||
         calibration.tokens != (int) tokens ||
         calibration.tensor_layers <= 0 ||
+        runtime_plan.tensor_layers != full_prediction.tensor_layers ||
+        runtime_plan.tensor_chunk_tokens != full_prediction.tensor_chunk_tokens ||
         calibration.tensor_chunk_tokens != full_prediction.tensor_chunk_tokens ||
         calibration.attn_group_chunks != full_prediction.attn_group_chunks ||
         std::abs(calibration.tensor_pc_ratio - full_prediction.tensor_pc_ratio) >= 1e-4f ||
