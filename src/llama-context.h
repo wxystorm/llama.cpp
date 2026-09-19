@@ -355,9 +355,7 @@ private:
     bool run_hybrid_wave_probe(
                                       uint32_t                          probe_tokens,
                                       int                               probe_layers,
-                                      const llama_hybrid_plan &         runtime_plan,
-                                      const llama_batch &               prepare_batch,
-                                      int32_t                            prepare_outputs);
+                                      const llama_hybrid_plan &         runtime_plan);
 
     llm_graph_result * run_hybrid_stage_block(
                                       const llama_ubatch &                 ubatch,
