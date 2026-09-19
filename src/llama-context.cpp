@@ -1971,6 +1971,45 @@ bool llama_context::run_hybrid_wave_probe(
     calibration.wave_outer_runtime_ms  =
         std::max(0.0, calibration.compute_range_ms - calibration.wave_span_ms);
 
+    calibration.wave_early_ii_count = (int) profile.wave_early_ii_count;
+    calibration.wave_early_ii_mean_ms =
+        profile.wave_early_ii_count > 0 ?
+            (profile.wave_early_ii_sum_us / 1000.0) / profile.wave_early_ii_count : 0.0;
+    calibration.wave_early_ii_median_ms =
+        profile.wave_early_ii_median_us / 1000.0;
+    calibration.wave_late_ii_count = (int) profile.wave_late_ii_count;
+    calibration.wave_late_ii_mean_ms =
+        profile.wave_late_ii_count > 0 ?
+            (profile.wave_late_ii_sum_us / 1000.0) / profile.wave_late_ii_count : 0.0;
+    calibration.wave_late_ii_median_ms =
+        profile.wave_late_ii_median_us / 1000.0;
+    calibration.wave_ii_drift_ratio =
+        calibration.wave_early_ii_median_ms > 0.0 ?
+            calibration.wave_late_ii_median_ms / calibration.wave_early_ii_median_ms : 0.0;
+
+    calibration.wave_early_layer_count = (int) profile.wave_early_layer_count;
+    calibration.wave_early_compute_wall_per_layer_ms =
+        profile.wave_early_layer_count > 0 ?
+            (profile.wave_early_compute_wall_us / 1000.0) / profile.wave_early_layer_count : 0.0;
+    calibration.wave_early_barrier_per_layer_ms =
+        profile.wave_early_layer_count > 0 ?
+            (profile.wave_early_barrier_us / 1000.0) / profile.wave_early_layer_count : 0.0;
+    calibration.wave_late_layer_count = (int) profile.wave_late_layer_count;
+    calibration.wave_late_compute_wall_per_layer_ms =
+        profile.wave_late_layer_count > 0 ?
+            (profile.wave_late_compute_wall_us / 1000.0) / profile.wave_late_layer_count : 0.0;
+    calibration.wave_late_barrier_per_layer_ms =
+        profile.wave_late_layer_count > 0 ?
+            (profile.wave_late_barrier_us / 1000.0) / profile.wave_late_layer_count : 0.0;
+    calibration.wave_compute_drift_ratio =
+        calibration.wave_early_compute_wall_per_layer_ms > 0.0 ?
+            calibration.wave_late_compute_wall_per_layer_ms /
+                calibration.wave_early_compute_wall_per_layer_ms : 0.0;
+    calibration.wave_barrier_drift_ratio =
+        calibration.wave_early_barrier_per_layer_ms > 0.0 ?
+            calibration.wave_late_barrier_per_layer_ms /
+                calibration.wave_early_barrier_per_layer_ms : 0.0;
+
     calibration.attn_ms         = profile.attn_us / 1000.0;
     calibration.pc_ffn_ms       = profile.pc_ffn_us / 1000.0;
     calibration.h2d_ms          = profile.h2d_us / 1000.0;
@@ -2053,6 +2092,28 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.wave_drain_ms,
         calibration.wave_span_ms,
         calibration.wave_outer_runtime_ms);
+
+    LLAMA_LOG_ERROR(
+        "[WAVE_PROBE_DRIFT] early_ii_count=%d early_ii_mean_ms=%.3f early_ii_median_ms=%.3f "
+        "late_ii_count=%d late_ii_mean_ms=%.3f late_ii_median_ms=%.3f ii_drift_ratio=%.4f "
+        "early_layers=%d early_compute_per_layer_ms=%.3f early_barrier_per_layer_ms=%.3f "
+        "late_layers=%d late_compute_per_layer_ms=%.3f late_barrier_per_layer_ms=%.3f "
+        "compute_drift_ratio=%.4f barrier_drift_ratio=%.4f\n",
+        calibration.wave_early_ii_count,
+        calibration.wave_early_ii_mean_ms,
+        calibration.wave_early_ii_median_ms,
+        calibration.wave_late_ii_count,
+        calibration.wave_late_ii_mean_ms,
+        calibration.wave_late_ii_median_ms,
+        calibration.wave_ii_drift_ratio,
+        calibration.wave_early_layer_count,
+        calibration.wave_early_compute_wall_per_layer_ms,
+        calibration.wave_early_barrier_per_layer_ms,
+        calibration.wave_late_layer_count,
+        calibration.wave_late_compute_wall_per_layer_ms,
+        calibration.wave_late_barrier_per_layer_ms,
+        calibration.wave_compute_drift_ratio,
+        calibration.wave_barrier_drift_ratio);
 
     LLAMA_LOG_ERROR(
         "[WAVE_PREPARE_MODEL] mode=formal_reuse pending=1 target_tensor_layers=%d\n",
