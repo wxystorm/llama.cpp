@@ -58,6 +58,12 @@ struct llama_hybrid_runtime_stage {
     bool wave_probe = false;
 };
 
+struct llama_hybrid_stage_timing {
+    int64_t prepare_us       = 0;
+    int64_t compute_range_us = 0;
+    int64_t sync_us          = 0;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -369,7 +375,8 @@ private:
                                       int32_t                              block_outputs,
                                       bool &                               apply_mctx,
                                       bool                                 synchronize,
-                                      ggml_status &                        ret);
+                                      ggml_status &                        ret,
+                                      llama_hybrid_stage_timing *          timing = nullptr);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
