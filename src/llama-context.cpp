@@ -2847,6 +2847,52 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         cal_meta_per_layer,
                         pred_tensor_per_layer,
                         pred_tensor_per_layer > 0.0 ? cal_meta_per_layer / pred_tensor_per_layer : 0.0);
+
+                    if (calibration.prepare_affine_valid &&
+                        calibration.wave_ii_count > 0 &&
+                        calibration.wave_ii_median_ms > 0.0) {
+                        const int target_layers = full_prediction.tensor_layers;
+                        const double prepare_est_ms = std::max(
+                            0.0,
+                            calibration.prepare_intercept_ms +
+                                calibration.prepare_slope_ms_per_layer * target_layers);
+                        const double wave_span_est_ms =
+                            calibration.wave_fill_ms +
+                            std::max(0, target_layers - 1) * calibration.wave_ii_median_ms +
+                            calibration.wave_drain_ms;
+                        const double runtime_est_ms =
+                            calibration.wave_outer_runtime_ms + wave_span_est_ms;
+                        const double tensor_est_ms = prepare_est_ms + runtime_est_ms;
+                        const double total_est_ms =
+                            full_prediction.gpu_ms + tensor_est_ms;
+
+                        LLAMA_LOG_ERROR(
+                            "[PRED_WAVE_II] probe_layers=%d target_layers=%d "
+                            "prepare_est_ms=%.3f fill_ms=%.3f ii_median_ms=%.3f "
+                            "steady_intervals=%d drain_ms=%.3f outer_runtime_ms=%.3f "
+                            "wave_span_est_ms=%.3f runtime_est_ms=%.3f "
+                            "tensor_est_ms=%.3f gpu_ms=%.3f total_est_ms=%.3f\n",
+                            calibration.tensor_layers,
+                            target_layers,
+                            prepare_est_ms,
+                            calibration.wave_fill_ms,
+                            calibration.wave_ii_median_ms,
+                            std::max(0, target_layers - 1),
+                            calibration.wave_drain_ms,
+                            calibration.wave_outer_runtime_ms,
+                            wave_span_est_ms,
+                            runtime_est_ms,
+                            tensor_est_ms,
+                            full_prediction.gpu_ms,
+                            total_est_ms);
+                    } else {
+                        LLAMA_LOG_ERROR(
+                            "[PRED_WAVE_II] unavailable prepare_valid=%d ii_count=%d "
+                            "ii_median_ms=%.3f\n",
+                            calibration.prepare_affine_valid ? 1 : 0,
+                            calibration.wave_ii_count,
+                            calibration.wave_ii_median_ms);
+                    }
                 }
             }
         }
