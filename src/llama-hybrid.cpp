@@ -51,6 +51,7 @@ static std::mutex                              g_llama_hybrid_runtime_plan_mutex
 static std::optional<llama_hybrid_plan>        g_llama_hybrid_runtime_plan;
 static std::optional<llama_hybrid_profile>     g_llama_hybrid_runtime_profile;
 static std::optional<llama_hybrid_constraints> g_llama_hybrid_runtime_constraints;
+static std::optional<llama_hybrid_wave_calibration> g_llama_hybrid_runtime_wave_calibration;
 
 static bool llama_hybrid_runtime_plan_valid(const llama_hybrid_plan & plan) {
     return plan.tensor_layers >= 0 && plan.phone_layers >= 0 && plan.pc_layers >= 0 &&
@@ -80,6 +81,7 @@ bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan) {
     {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
         g_llama_hybrid_runtime_plan = plan;
+        g_llama_hybrid_runtime_wave_calibration.reset();
         llama_hybrid_runtime_set_dual_return(plan.tensor_layers > 0);
     }
 
@@ -99,11 +101,28 @@ bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan) {
     return true;
 }
 
+void llama_hybrid_runtime_wave_calibration_set(
+        const llama_hybrid_wave_calibration & calibration) {
+    std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+    g_llama_hybrid_runtime_wave_calibration = calibration;
+}
+
+bool llama_hybrid_runtime_wave_calibration_get(
+        llama_hybrid_wave_calibration & calibration) {
+    std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+    if (!g_llama_hybrid_runtime_wave_calibration.has_value()) {
+        return false;
+    }
+    calibration = *g_llama_hybrid_runtime_wave_calibration;
+    return true;
+}
+
 void llama_hybrid_runtime_plan_clear() {
     std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
     g_llama_hybrid_runtime_plan.reset();
     g_llama_hybrid_runtime_profile.reset();
     g_llama_hybrid_runtime_constraints.reset();
+    g_llama_hybrid_runtime_wave_calibration.reset();
     llama_hybrid_runtime_set_dual_return(false);
 }
 
