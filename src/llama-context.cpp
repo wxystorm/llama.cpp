@@ -1913,6 +1913,9 @@ bool llama_context::run_hybrid_wave_probe(
 
         prep_kv_mctx->clear_stage_range();
         ggml_backend_sched_reset(sched.get());
+        // sched reset invalidates any tensors allocated for the previously
+        // cached graph result. Force the next real probe/full graph to rebuild.
+        gf_res_prev->reset();
         memory->clear(true);
 
         return prep_result != nullptr && prep_status == GGML_STATUS_SUCCESS;
