@@ -18,8 +18,10 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <set>
 #include <string>
