@@ -2732,13 +2732,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     const int64_t t1 = ggml_time_us();
 
-    if (RPC_DEBUG) {
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
             "[RPC_GRAPH_SERVER] uid=%" PRIu64
             " nodes=%d compute=%.3f ms\n",
             graph_uid,
             graph->n_nodes,
             (t1 - t0) / 1000.0);
+        fflush(stdout);
     }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     graph_entry.graph = graph;
@@ -2765,13 +2766,14 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 
     const int64_t t1 = ggml_time_us();
 
-    if (RPC_DEBUG) {
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
             "[RPC_GRAPH_SERVER] uid=%" PRIu64
             " nodes=%d compute=%.3f ms\n",
             request.graph_uid,
             graph->n_nodes,
             (t1 - t0) / 1000.0);
+        fflush(stdout);
     }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
