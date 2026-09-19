@@ -2647,6 +2647,60 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     full_prediction.gpu_ms,
                     full_prediction.tensor_ms,
                     full_prediction.total_ms);
+
+                llama_hybrid_wave_calibration calibration;
+                llama_hybrid_tensor_compute_prediction tensor_prediction;
+                if (llama_hybrid_runtime_wave_calibration_get(calibration) &&
+                    llama_hybrid_runtime_predict_tensor_compute(
+                        (int) n_tokens_all, tensor_prediction) &&
+                    calibration.tokens == (int) n_tokens_all &&
+                    calibration.tensor_layers > 0 &&
+                    calibration.tensor_chunk_tokens == full_prediction.tensor_chunk_tokens &&
+                    calibration.attn_group_chunks == full_prediction.attn_group_chunks &&
+                    std::abs(calibration.tensor_pc_ratio - full_prediction.tensor_pc_ratio) < 1e-4f &&
+                    tensor_prediction.tensor_layers > 0) {
+                    const double cal_layers = (double) calibration.tensor_layers;
+                    const double pred_layers = (double) tensor_prediction.tensor_layers;
+
+                    const double cal_attn_per_layer =
+                        calibration.attn_ms / cal_layers;
+                    const double cal_pc_ffn_per_layer =
+                        calibration.pc_ffn_ms / cal_layers;
+                    const double cal_compute_wall_per_layer =
+                        calibration.compute_wall_ms / cal_layers;
+                    const double cal_meta_per_layer =
+                        calibration.meta_total_ms / cal_layers;
+
+                    const double pred_attn_per_layer =
+                        tensor_prediction.attn_misc_ms / pred_layers;
+                    const double pred_pc_ffn_per_layer =
+                        tensor_prediction.pc_ffn_ms / pred_layers;
+                    const double pred_pc_compute_per_layer =
+                        tensor_prediction.pc_compute_ms / pred_layers;
+                    const double pred_tensor_per_layer =
+                        tensor_prediction.tensor_total_ms / pred_layers;
+
+                    LLAMA_LOG_ERROR(
+                        "[PRED_WAVE_CAL_DIAG] probe_layers=%d "
+                        "cal_attn_per_layer_ms=%.3f pred_attn_per_layer_ms=%.3f attn_ratio=%.4f "
+                        "cal_pc_ffn_per_layer_ms=%.3f pred_pc_ffn_per_layer_ms=%.3f pc_ffn_ratio=%.4f "
+                        "cal_compute_wall_per_layer_ms=%.3f pred_pc_compute_per_layer_ms=%.3f compute_ratio=%.4f "
+                        "cal_meta_per_layer_ms=%.3f pred_tensor_per_layer_ms=%.3f meta_ratio=%.4f\n",
+                        calibration.tensor_layers,
+                        cal_attn_per_layer,
+                        pred_attn_per_layer,
+                        pred_attn_per_layer > 0.0 ? cal_attn_per_layer / pred_attn_per_layer : 0.0,
+                        cal_pc_ffn_per_layer,
+                        pred_pc_ffn_per_layer,
+                        pred_pc_ffn_per_layer > 0.0 ? cal_pc_ffn_per_layer / pred_pc_ffn_per_layer : 0.0,
+                        cal_compute_wall_per_layer,
+                        pred_pc_compute_per_layer,
+                        pred_pc_compute_per_layer > 0.0 ?
+                            cal_compute_wall_per_layer / pred_pc_compute_per_layer : 0.0,
+                        cal_meta_per_layer,
+                        pred_tensor_per_layer,
+                        pred_tensor_per_layer > 0.0 ? cal_meta_per_layer / pred_tensor_per_layer : 0.0);
+                }
             }
         }
         for (size_t i = 0; i < runtime_stages.size(); ++i) {
