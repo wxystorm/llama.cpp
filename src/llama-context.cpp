@@ -4086,6 +4086,64 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 real_profile.reduce_wall_us / 1000.0,
                 real_profile.layer_barrier_wait_us / 1000.0);
 
+            const double real_early_ii_mean_ms =
+                real_profile.wave_early_ii_count > 0 ?
+                    (real_profile.wave_early_ii_sum_us / 1000.0) /
+                        real_profile.wave_early_ii_count : 0.0;
+            const double real_late_ii_mean_ms =
+                real_profile.wave_late_ii_count > 0 ?
+                    (real_profile.wave_late_ii_sum_us / 1000.0) /
+                        real_profile.wave_late_ii_count : 0.0;
+            const double real_early_ii_median_ms =
+                real_profile.wave_early_ii_median_us / 1000.0;
+            const double real_late_ii_median_ms =
+                real_profile.wave_late_ii_median_us / 1000.0;
+            const double real_early_compute_per_layer_ms =
+                real_profile.wave_early_layer_count > 0 ?
+                    (real_profile.wave_early_compute_wall_us / 1000.0) /
+                        real_profile.wave_early_layer_count : 0.0;
+            const double real_late_compute_per_layer_ms =
+                real_profile.wave_late_layer_count > 0 ?
+                    (real_profile.wave_late_compute_wall_us / 1000.0) /
+                        real_profile.wave_late_layer_count : 0.0;
+            const double real_early_barrier_per_layer_ms =
+                real_profile.wave_early_layer_count > 0 ?
+                    (real_profile.wave_early_barrier_us / 1000.0) /
+                        real_profile.wave_early_layer_count : 0.0;
+            const double real_late_barrier_per_layer_ms =
+                real_profile.wave_late_layer_count > 0 ?
+                    (real_profile.wave_late_barrier_us / 1000.0) /
+                        real_profile.wave_late_layer_count : 0.0;
+
+            LLAMA_LOG_ERROR(
+                "[WAVE_REAL_DRIFT] early_ii_count=%" PRId64
+                " early_ii_mean_ms=%.3f early_ii_median_ms=%.3f "
+                "late_ii_count=%" PRId64
+                " late_ii_mean_ms=%.3f late_ii_median_ms=%.3f ii_drift_ratio=%.4f "
+                "early_layers=%" PRId64
+                " early_compute_per_layer_ms=%.3f early_barrier_per_layer_ms=%.3f "
+                "late_layers=%" PRId64
+                " late_compute_per_layer_ms=%.3f late_barrier_per_layer_ms=%.3f "
+                "compute_drift_ratio=%.4f barrier_drift_ratio=%.4f\n",
+                real_profile.wave_early_ii_count,
+                real_early_ii_mean_ms,
+                real_early_ii_median_ms,
+                real_profile.wave_late_ii_count,
+                real_late_ii_mean_ms,
+                real_late_ii_median_ms,
+                real_early_ii_median_ms > 0.0 ?
+                    real_late_ii_median_ms / real_early_ii_median_ms : 0.0,
+                real_profile.wave_early_layer_count,
+                real_early_compute_per_layer_ms,
+                real_early_barrier_per_layer_ms,
+                real_profile.wave_late_layer_count,
+                real_late_compute_per_layer_ms,
+                real_late_barrier_per_layer_ms,
+                real_early_compute_per_layer_ms > 0.0 ?
+                    real_late_compute_per_layer_ms / real_early_compute_per_layer_ms : 0.0,
+                real_early_barrier_per_layer_ms > 0.0 ?
+                    real_late_barrier_per_layer_ms / real_early_barrier_per_layer_ms : 0.0);
+
             llama_hybrid_wave_calibration calibration;
             if (llama_hybrid_runtime_wave_calibration_get(calibration)) {
                 LLAMA_LOG_ERROR(
@@ -4107,6 +4165,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     real_drain_ms,
                     calibration.wave_drain_ms > 0.0 ?
                         real_drain_ms / calibration.wave_drain_ms : 0.0);
+
+                LLAMA_LOG_ERROR(
+                    "[WAVE_DRIFT_COMPARE] probe_ii_drift=%.4f real_ii_drift=%.4f "
+                    "probe_compute_drift=%.4f real_compute_drift=%.4f "
+                    "probe_barrier_drift=%.4f real_barrier_drift=%.4f "
+                    "probe_late_ii_ms=%.3f real_late_ii_ms=%.3f late_ii_ratio=%.4f\n",
+                    calibration.wave_ii_drift_ratio,
+                    real_early_ii_median_ms > 0.0 ?
+                        real_late_ii_median_ms / real_early_ii_median_ms : 0.0,
+                    calibration.wave_compute_drift_ratio,
+                    real_early_compute_per_layer_ms > 0.0 ?
+                        real_late_compute_per_layer_ms / real_early_compute_per_layer_ms : 0.0,
+                    calibration.wave_barrier_drift_ratio,
+                    real_early_barrier_per_layer_ms > 0.0 ?
+                        real_late_barrier_per_layer_ms / real_early_barrier_per_layer_ms : 0.0,
+                    calibration.wave_late_ii_median_ms,
+                    real_late_ii_median_ms,
+                    calibration.wave_late_ii_median_ms > 0.0 ?
+                        real_late_ii_median_ms / calibration.wave_late_ii_median_ms : 0.0);
             }
         }
 
