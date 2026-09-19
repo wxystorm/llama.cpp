@@ -2810,7 +2810,7 @@ bool rpc_server::graph_recompute_snapshot(
         request.size);
     const int64_t t2 = ggml_time_us();
 
-    if (RPC_DEBUG) {
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
             "[RPC_GRAPH_SNAPSHOT_SERVER] uid=%" PRIu64
             " node=%u seq=%" PRIu64
@@ -2820,6 +2820,7 @@ bool rpc_server::graph_recompute_snapshot(
             request.seq,
             (t1 - t0) / 1000.0,
             (t2 - t1) / 1000.0);
+        fflush(stdout);
     }
 
     return snapshot_ok;
