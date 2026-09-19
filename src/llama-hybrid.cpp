@@ -1617,6 +1617,71 @@ bool llama_hybrid_runtime_predict_tensor_compute(
            std::isfinite(prediction.tensor_total_ms);
 }
 
+bool llama_hybrid_runtime_predict_full_prefill(
+        int tokens, llama_hybrid_full_prefill_prediction & prediction) {
+    prediction = {};
+    if (tokens <= 0) {
+        return false;
+    }
+
+    llama_hybrid_tensor_compute_prediction tensor_prediction;
+    if (!llama_hybrid_runtime_predict_tensor_compute(tokens, tensor_prediction)) {
+        return false;
+    }
+
+    llama_hybrid_plan plan;
+    llama_hybrid_profile profile;
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        if (!g_llama_hybrid_runtime_plan.has_value() ||
+            !g_llama_hybrid_runtime_profile.has_value()) {
+            return false;
+        }
+        plan    = *g_llama_hybrid_runtime_plan;
+        profile = *g_llama_hybrid_runtime_profile;
+    }
+
+    // This diagnostic intentionally matches the current full-graph override
+    // topology only: a GPU prefix followed by a Tensor-split suffix.
+    if (plan.gpu_pc_layers <= 0 ||
+        plan.tensor_layers <= 0 ||
+        plan.phone_layers != 0 ||
+        plan.pc_layers != plan.gpu_pc_layers) {
+        return false;
+    }
+
+    double gpu_compute_ms = 0.0;
+    if (!llama_hybrid_layer_region_cost(
+            profile, profile.gpu_layer_blocks, profile.gpu_attn,
+            plan.gpu_pc_layers, tokens, tokens,
+            tensor_prediction.kv_tokens, false, gpu_compute_ms)) {
+        return false;
+    }
+
+    const size_t boundary_bytes =
+        (size_t) profile.n_embd * (size_t) tokens * sizeof(float);
+    double gpu_to_pc_ms = 0.0;
+    if (!llama_hybrid_transfer_cost(
+            profile.gpu_to_pc, boundary_bytes, gpu_to_pc_ms)) {
+        return false;
+    }
+
+    prediction.tokens              = tokens;
+    prediction.kv_tokens           = tensor_prediction.kv_tokens;
+    prediction.tensor_layers       = tensor_prediction.tensor_layers;
+    prediction.tensor_chunk_tokens = tensor_prediction.tensor_chunk_tokens;
+    prediction.attn_group_chunks   = tensor_prediction.attn_group_chunks;
+    prediction.attn_chunk_tokens   = tensor_prediction.attn_chunk_tokens;
+    prediction.tensor_pc_ratio     = tensor_prediction.tensor_pc_ratio;
+    prediction.gpu_ms              = gpu_compute_ms + gpu_to_pc_ms;
+    prediction.tensor_ms           = tensor_prediction.tensor_total_ms;
+    prediction.total_ms            = prediction.gpu_ms + prediction.tensor_ms;
+
+    return std::isfinite(prediction.gpu_ms) &&
+           std::isfinite(prediction.tensor_ms) &&
+           std::isfinite(prediction.total_ms);
+}
+
 static float llama_hybrid_align_pc_ratio(const llama_hybrid_profile & profile, float ratio) {
     if (profile.n_ff <= 0 || profile.ffn_shard_granularity <= 0) {
         return std::clamp(ratio, 0.01f, 0.99f);
@@ -4365,7 +4430,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         llama_hybrid_sim_result sim;
         if (llama_hybrid_simulate_prefill(profile, constraints, best_plan, work_tokens, true, sim)) {
             LLAMA_LOG_ERROR(
-                "[PRED_PIPE] plan=T%d,P%d,C%d,G%d,XG%d,XC%d,XT%d,XP%d sim_ms=%.3f "
+                "[PRED_PIPE_LEGACY] plan=T%d,P%d,C%d,G%d,XG%d,XC%d,XT%d,XP%d sim_ms=%.3f "
                 "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f tensor_peak_mib=%.2f "
                 "phone_peak_mib=%.2f schedule=%s\n",
                 best_plan.tensor_layers, best_plan.phone_layers, best_plan.pc_layers,
