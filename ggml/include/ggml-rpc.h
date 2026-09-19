@@ -59,6 +59,9 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC \
     "ggml_backend_rpc_set_snapshot_read"
+
+#define GGML_BACKEND_RPC_WAIT_SNAPSHOT_READY_PROC \
+    "ggml_backend_rpc_wait_snapshot_ready"
     
 #define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
     "ggml_backend_rpc_prepare_fused_ffn_input"
@@ -109,6 +112,10 @@ using ggml_backend_rpc_prepare_graph_snapshot_t = bool (*)(
 using ggml_backend_rpc_set_snapshot_read_t = void (*)(
         bool enabled,
         uint32_t slot,
+        uint64_t seq);
+
+using ggml_backend_rpc_wait_snapshot_ready_t = bool (*)(
+        ggml_backend_t backend,
         uint64_t seq);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
