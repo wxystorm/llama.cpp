@@ -3997,6 +3997,77 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    if (n_tokens_all > 1 && return_wavefront_full_graph_override && hybrid_wave_probe_done) {
+        ggml_backend_t meta_backend = nullptr;
+        ggml_backend_meta_tensor_profile real_profile {};
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (backend != nullptr &&
+                ggml_backend_meta_tensor_profile_get(backend, &real_profile)) {
+                meta_backend = backend;
+                break;
+            }
+        }
+
+        if (meta_backend != nullptr && real_profile.wave_layer_start_count > 0) {
+            const double real_ii_mean_ms =
+                real_profile.wave_ii_count > 0 ?
+                    (real_profile.wave_ii_sum_us / 1000.0) / real_profile.wave_ii_count : 0.0;
+            const double real_ii_median_ms = real_profile.wave_ii_median_us / 1000.0;
+            const double real_fill_ms      = real_profile.wave_fill_us / 1000.0;
+            const double real_drain_ms     = real_profile.wave_drain_us / 1000.0;
+            const double real_span_ms      = real_profile.wave_span_us / 1000.0;
+
+            LLAMA_LOG_ERROR(
+                "[WAVE_REAL_II] expected_layers=%d layer_starts=%" PRId64
+                " ii_count=%" PRId64 " fill_ms=%.3f ii_mean_ms=%.3f "
+                "ii_median_ms=%.3f ii_min_ms=%.3f ii_max_ms=%.3f "
+                "drain_ms=%.3f span_ms=%.3f meta_total_ms=%.3f "
+                "compute_wall_ms=%.3f reduce_wall_ms=%.3f barrier_ms=%.3f\n",
+                runtime_plan.tensor_layers,
+                real_profile.wave_layer_start_count,
+                real_profile.wave_ii_count,
+                real_fill_ms,
+                real_ii_mean_ms,
+                real_ii_median_ms,
+                real_profile.wave_ii_min_us / 1000.0,
+                real_profile.wave_ii_max_us / 1000.0,
+                real_drain_ms,
+                real_span_ms,
+                real_profile.meta_total_us / 1000.0,
+                real_profile.compute_wall_us / 1000.0,
+                real_profile.reduce_wall_us / 1000.0,
+                real_profile.layer_barrier_wait_us / 1000.0);
+
+            llama_hybrid_wave_calibration calibration;
+            if (llama_hybrid_runtime_wave_calibration_get(calibration)) {
+                LLAMA_LOG_ERROR(
+                    "[WAVE_II_COMPARE] probe_layers=%d real_layers=%" PRId64
+                    " probe_ii_median_ms=%.3f real_ii_median_ms=%.3f ii_ratio=%.4f "
+                    "probe_ii_mean_ms=%.3f real_ii_mean_ms=%.3f mean_ratio=%.4f "
+                    "probe_drain_ms=%.3f real_drain_ms=%.3f drain_ratio=%.4f\n",
+                    calibration.tensor_layers,
+                    real_profile.wave_layer_start_count,
+                    calibration.wave_ii_median_ms,
+                    real_ii_median_ms,
+                    calibration.wave_ii_median_ms > 0.0 ?
+                        real_ii_median_ms / calibration.wave_ii_median_ms : 0.0,
+                    calibration.wave_ii_mean_ms,
+                    real_ii_mean_ms,
+                    calibration.wave_ii_mean_ms > 0.0 ?
+                        real_ii_mean_ms / calibration.wave_ii_mean_ms : 0.0,
+                    calibration.wave_drain_ms,
+                    real_drain_ms,
+                    calibration.wave_drain_ms > 0.0 ?
+                        real_drain_ms / calibration.wave_drain_ms : 0.0);
+            }
+        }
+
+        if (meta_backend != nullptr) {
+            // Keep later decode/prefill calls from inheriting this prompt's profile.
+            ggml_backend_meta_tensor_profile_reset(meta_backend);
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
