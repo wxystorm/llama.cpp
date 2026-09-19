@@ -2152,6 +2152,8 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
     std::map<int, int64_t>           tensor_profile_wave_layer_start_us;
+    std::map<int, int64_t>           tensor_profile_wave_layer_compute_wall_us;
+    std::map<int, int64_t>           tensor_profile_wave_layer_barrier_us;
     int64_t                          tensor_profile_wave_span_begin_us = 0;
     int64_t                          tensor_profile_wave_span_end_us   = 0;
 
@@ -3978,6 +3980,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_old_layer_wait_count   = 0;
     int64_t return_wave_old_layer_wait_us      = 0;
     std::map<int, int64_t> return_wave_layer_start_us;
+    std::map<int, int64_t> return_wave_layer_compute_wall_us;
+    std::map<int, int64_t> return_wave_layer_barrier_us;
 
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
@@ -5695,6 +5699,9 @@ auto prefill_norm_sg_has_prework =
             const int64_t wait_us = ggml_time_us() - wait_start_us;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
+            if (return_wavefront_graph && barrier_layer >= return_wavefront_first_layer) {
+                return_wave_layer_barrier_us[barrier_layer] += wait_us;
+            }
             if (wait_us >= layer_barrier_wait_max_us) {
                 layer_barrier_wait_max_us = wait_us;
                 layer_barrier_wait_max_layer = barrier_layer;
@@ -5913,7 +5920,24 @@ auto prefill_norm_sg_has_prework =
         compute_status = compute_workers.compute(i);
     }
 
-    compute_wall_us += ggml_time_us() - compute_start_us;
+    const int64_t subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
+    compute_wall_us += subgraph_compute_wall_us;
+
+    if (return_wavefront_graph) {
+        int wave_profile_layer = -1;
+        if (is_prefill_wave_attn_sg) {
+            wave_profile_layer = prefill_wave_attn_layer;
+        } else if (is_prefill_down_sg) {
+            wave_profile_layer = prefill_down_layer;
+        } else if (is_prefill_norm_sg) {
+            wave_profile_layer = prefill_norm_layer;
+        } else {
+            wave_profile_layer = subgraph_layer(i);
+        }
+        if (wave_profile_layer >= return_wavefront_first_layer) {
+            return_wave_layer_compute_wall_us[wave_profile_layer] += subgraph_compute_wall_us;
+        }
+    }
 
     if (trace_prefill_chunk) {
         const int64_t next_end_us = ggml_time_us();
@@ -6181,6 +6205,12 @@ auto prefill_norm_sg_has_prework =
                     backend_ctx->tensor_profile_wave_layer_start_us[layer] = start_us;
                 }
             }
+            for (const auto & [layer, value_us] : return_wave_layer_compute_wall_us) {
+                backend_ctx->tensor_profile_wave_layer_compute_wall_us[layer] += value_us;
+            }
+            for (const auto & [layer, value_us] : return_wave_layer_barrier_us) {
+                backend_ctx->tensor_profile_wave_layer_barrier_us[layer] += value_us;
+            }
         }
         backend_ctx->tensor_profile.lane_reuse_wait_count += lane_reuse_wait_count;
         backend_ctx->tensor_profile.lane_reuse_wait_us += lane_reuse_wait_us;
@@ -6258,6 +6288,8 @@ bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend) {
     std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
     backend_ctx->tensor_profile = {};
     backend_ctx->tensor_profile_wave_layer_start_us.clear();
+    backend_ctx->tensor_profile_wave_layer_compute_wall_us.clear();
+    backend_ctx->tensor_profile_wave_layer_barrier_us.clear();
     backend_ctx->tensor_profile_wave_span_begin_us = 0;
     backend_ctx->tensor_profile_wave_span_end_us   = 0;
     return true;
