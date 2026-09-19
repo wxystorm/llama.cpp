@@ -426,6 +426,10 @@ extern "C" {
         int64_t d2h_us;
         int64_t reduce_us;
         int64_t wait_us;
+        int64_t compute_wall_us;
+        int64_t reduce_wall_us;
+        int64_t meta_total_us;
+        int64_t other_main_us;
         int64_t lane_reuse_wait_count;
         int64_t lane_reuse_wait_us;
         int64_t lane_reuse_wait_max_us;
