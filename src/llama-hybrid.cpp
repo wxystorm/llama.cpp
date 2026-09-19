@@ -1617,6 +1617,17 @@ bool llama_hybrid_runtime_predict_tensor_compute(
            std::isfinite(prediction.tensor_total_ms);
 }
 
+static bool llama_hybrid_layer_region_cost(
+        const llama_hybrid_profile &                            profile,
+        const std::vector<llama_hybrid_layer_compute_point> & layer_points,
+        const std::vector<llama_hybrid_attn_compute_point> &  attn_points,
+        int                                                    layers,
+        int                                                    total_tokens,
+        int                                                    chunk_tokens,
+        int                                                    kv_tokens,
+        bool                                                   use_compute_est,
+        double &                                               result_ms);
+
 bool llama_hybrid_runtime_predict_full_prefill(
         int tokens, llama_hybrid_full_prefill_prediction & prediction) {
     prediction = {};
