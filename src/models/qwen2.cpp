@@ -111,7 +111,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    llm_graph_input_attn_kv * inp_attn = nullptr;
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
@@ -149,6 +149,15 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::TENSOR_SPLIT &&
                 cvec->tensor_for(il) == nullptr;
         }
+    }
+
+    // The full-batch KV/mask input is needed by the normal prefix/path.
+    // A windowed wave probe starts directly at the Tensor wavefront and uses
+    // build_attn_inp_kv_range() for every group. Avoid registering an unused
+    // full-batch input because it is not allocated by the scheduler, while
+    // res->set_inputs() would still try to write it.
+    if (!return_wave_eligible || return_wave_first_layer > layer_begin) {
+        inp_attn = build_attn_inp_kv();
     }
 
     for (int il = layer_begin; il < layer_end; ++il) {
