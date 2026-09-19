@@ -6112,13 +6112,14 @@ auto prefill_norm_sg_has_prework =
     const int64_t h2d_us = n_backends > 1 ? reduce_copy_by_direction[1].total_us : 0;
     const int64_t d2h_us = n_backends > 1 ? reduce_copy_by_direction[n_backends].total_us : 0;
     const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
+    const int64_t meta_total_us =
+        return_wavefront_graph ? ggml_time_us() - meta_graph_start_us : 0;
+    const int64_t main_accounted_us =
+        return_wavefront_graph ? compute_wall_us + reduce_wall_us + layer_barrier_wait_us : 0;
+    const int64_t other_main_us =
+        return_wavefront_graph ? std::max<int64_t>(0, meta_total_us - main_accounted_us) : 0;
 
     if (return_wavefront_graph) {
-        const int64_t meta_total_us = ggml_time_us() - meta_graph_start_us;
-        const int64_t main_accounted_us =
-            compute_wall_us + reduce_wall_us + layer_barrier_wait_us;
-        const int64_t other_main_us =
-            std::max<int64_t>(0, meta_total_us - main_accounted_us);
         printf(
             "[TENSOR_RUNTIME_SUM] "
             "attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f phone_ms=%.3f "
@@ -6146,6 +6147,12 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.d2h_us    += d2h_us;
         backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
         backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+        if (return_wavefront_graph) {
+            backend_ctx->tensor_profile.compute_wall_us += compute_wall_us;
+            backend_ctx->tensor_profile.reduce_wall_us  += reduce_wall_us;
+            backend_ctx->tensor_profile.meta_total_us   += meta_total_us;
+            backend_ctx->tensor_profile.other_main_us   += other_main_us;
+        }
         backend_ctx->tensor_profile.lane_reuse_wait_count += lane_reuse_wait_count;
         backend_ctx->tensor_profile.lane_reuse_wait_us += lane_reuse_wait_us;
         backend_ctx->tensor_profile.lane_reuse_wait_max_us = std::max(
