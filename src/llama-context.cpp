@@ -1377,6 +1377,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         gparams.hybrid_layer_end    = stage->layer_end;
         gparams.hybrid_hidden_input = stage->layer_begin > 0;
         gparams.hybrid_output_head  = stage->layer_end == n_layer;
+        gparams.hybrid_wave_probe   = stage->wave_probe;
     }
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
@@ -1756,6 +1757,177 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     return result;
+}
+
+bool llama_context::run_hybrid_wave_probe(
+        uint32_t                  probe_tokens,
+        int                       probe_layers,
+        const llama_hybrid_plan & runtime_plan) {
+    if (probe_tokens <= 1 || probe_layers <= 0 || memory == nullptr ||
+        model.arch != LLM_ARCH_QWEN2 ||
+        model.split_mode() != LLAMA_SPLIT_MODE_TENSOR ||
+        runtime_plan.tensor_layers <= 0 ||
+        runtime_plan.phone_layers != 0 ||
+        runtime_plan.pc_layers != runtime_plan.gpu_pc_layers) {
+        return false;
+    }
+
+    const int tensor_begin = runtime_plan.pc_layers;
+    const int tensor_end_full = tensor_begin + runtime_plan.tensor_layers;
+    const int tensor_end_probe = std::min(tensor_end_full, tensor_begin + probe_layers);
+    if (tensor_begin < 0 || tensor_end_probe <= tensor_begin) {
+        return false;
+    }
+
+    ggml_backend_t meta_backend = nullptr;
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (backend != nullptr && ggml_backend_is_meta(backend)) {
+            meta_backend = backend;
+            break;
+        }
+    }
+    if (meta_backend == nullptr) {
+        LLAMA_LOG_WARN("[WAVE_PROBE] skipped: Meta backend not found\n");
+        return false;
+    }
+
+    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    const int64_t n_embd = model.hparams.n_embd;
+    if (n_embd <= 0 || probe_tokens > cparams.n_ubatch) {
+        LLAMA_LOG_WARN(
+            "[WAVE_PROBE] skipped: tokens=%u exceeds n_ubatch=%u or invalid n_embd=%" PRId64 "\n",
+            probe_tokens, cparams.n_ubatch, n_embd);
+        return false;
+    }
+
+    // Deterministic non-zero hidden input. Dense GEMM/attention timing is shape
+    // dominated, while avoiding an all-zero special case keeps the probe closer
+    // to a normal transformer activation.
+    std::vector<float> hidden((size_t) n_embd * probe_tokens);
+    for (size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] = (float) ((int) (i % 17) - 8) * 0.001f;
+    }
+
+    std::vector<llama_pos> positions(probe_tokens);
+    std::vector<int32_t> n_seq_id(probe_tokens, 1);
+    std::vector<llama_seq_id> seq_id_data(probe_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(probe_tokens);
+    std::vector<int8_t> logits(probe_tokens, 0);
+    for (uint32_t i = 0; i < probe_tokens; ++i) {
+        positions[i] = (llama_pos) i;
+        seq_id[i] = &seq_id_data[i];
+    }
+
+    llama_batch probe_batch = {
+        /*.n_tokens =*/ (int32_t) probe_tokens,
+        /*.token    =*/ nullptr,
+        /*.embd     =*/ hidden.data(),
+        /*.pos      =*/ positions.data(),
+        /*.n_seq_id =*/ n_seq_id.data(),
+        /*.seq_id   =*/ seq_id.data(),
+        /*.logits   =*/ logits.data(),
+    };
+
+    llama_batch_allocr probe_balloc(model.hparams.n_pos_per_embd());
+    if (!probe_balloc.init(
+            probe_batch, model.vocab, memory.get(), (uint32_t) n_embd,
+            n_seq_max, false)) {
+        LLAMA_LOG_WARN("[WAVE_PROBE] failed to initialize probe batch\n");
+        return false;
+    }
+
+    llama_memory_context_ptr probe_mctx =
+        memory->init_batch(probe_balloc, probe_tokens, false);
+    if (!probe_mctx || probe_mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_WARN("[WAVE_PROBE] failed to initialize scratch memory context\n");
+        memory->clear(true);
+        return false;
+    }
+
+    llama_ubatch probe_ubatch = probe_balloc.split_simple(probe_tokens);
+    if (probe_ubatch.n_tokens != probe_tokens) {
+        LLAMA_LOG_WARN(
+            "[WAVE_PROBE] unexpected ubatch size=%u expected=%u\n",
+            probe_ubatch.n_tokens, probe_tokens);
+        memory->clear(true);
+        return false;
+    }
+
+    llama_hybrid_runtime_stage probe_stage {
+        llama_hybrid_runtime_stage_kind::TENSOR,
+        tensor_begin,
+        tensor_end_probe,
+        (int) probe_tokens,
+        runtime_plan.tensor_chunk_tokens,
+        true,
+    };
+
+    ggml_backend_meta_tensor_profile_reset(meta_backend);
+
+    const int32_t n_outputs_saved = n_outputs;
+    bool apply_mctx = true;
+    ggml_status status = GGML_STATUS_SUCCESS;
+
+    LLAMA_LOG_ERROR(
+        "[WAVE_PROBE_BEGIN] tokens=%u layers=[%d,%d) n_layers=%d XT=%d GA=%d XA=%d R=%.3f\n",
+        probe_tokens, tensor_begin, tensor_end_probe, tensor_end_probe - tensor_begin,
+        runtime_plan.tensor_chunk_tokens,
+        llama_hybrid_runtime_prefill_attn_group_chunks(),
+        runtime_plan.tensor_chunk_tokens * llama_hybrid_runtime_prefill_attn_group_chunks(),
+        runtime_plan.tensor_pc_ratio);
+
+    const int64_t wall_begin_us = ggml_time_us();
+    llm_graph_result * result = run_hybrid_stage_block(
+        probe_ubatch, probe_stage, 0, probe_tokens,
+        hidden.data(), nullptr,
+        ctx_type_to_graph_type(cparams.ctx_type),
+        probe_mctx.get(), sched.get(), gf_res_prev.get(),
+        -1, 0, 0, llama_hybrid_boundary_action::PASS,
+        0, apply_mctx, true, status);
+    ggml_backend_sched_synchronize(sched.get());
+    const int64_t wall_us = ggml_time_us() - wall_begin_us;
+
+    ggml_backend_meta_tensor_profile profile {};
+    const bool have_profile =
+        ggml_backend_meta_tensor_profile_get(meta_backend, &profile);
+
+    n_outputs = n_outputs_saved;
+    if (auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(probe_mctx.get())) {
+        kv_mctx->clear_stage_range();
+    }
+    // Probe runs before the first real batch. Clear its scratch KV so the
+    // following user prompt starts from exactly the normal empty state.
+    memory->clear(true);
+
+    if (result == nullptr || status != GGML_STATUS_SUCCESS || !have_profile) {
+        LLAMA_LOG_WARN(
+            "[WAVE_PROBE_END] failed status=%d profile=%d wall_ms=%.3f\n",
+            (int) status, have_profile ? 1 : 0, wall_us / 1000.0);
+        return false;
+    }
+
+    LLAMA_LOG_ERROR(
+        "[WAVE_PROBE_SUM] tokens=%u layers=%d XT=%d GA=%d XA=%d R=%.3f "
+        "wall_ms=%.3f attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f "
+        "phone_ms=%.3f d2h_ms=%.3f reduce_ms=%.3f wait_ms=%.3f "
+        "lane_reuse_wait_ms=%.3f barrier_ms=%.3f\n",
+        probe_tokens, tensor_end_probe - tensor_begin,
+        runtime_plan.tensor_chunk_tokens,
+        llama_hybrid_runtime_prefill_attn_group_chunks(),
+        runtime_plan.tensor_chunk_tokens * llama_hybrid_runtime_prefill_attn_group_chunks(),
+        runtime_plan.tensor_pc_ratio,
+        wall_us / 1000.0,
+        profile.attn_us / 1000.0,
+        profile.pc_ffn_us / 1000.0,
+        profile.h2d_us / 1000.0,
+        profile.phone_us / 1000.0,
+        profile.d2h_us / 1000.0,
+        profile.reduce_us / 1000.0,
+        profile.wait_us / 1000.0,
+        profile.lane_reuse_wait_us / 1000.0,
+        profile.layer_barrier_wait_us / 1000.0);
+
+    return true;
 }
 
 llm_graph_result * llama_context::process_ubatch_staged(
@@ -2330,6 +2502,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan && !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
+
+    if (!hybrid_wave_probe_done &&
+        n_tokens_all > 1 &&
+        return_wavefront_requested &&
+        return_wavefront_full_graph_override) {
+        const char * probe_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE");
+        if (probe_env != nullptr && std::atoi(probe_env) != 0) {
+            hybrid_wave_probe_done = true;
+            int probe_layers = 6;
+            if (const char * layers_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE_LAYERS")) {
+                const int requested = std::atoi(layers_env);
+                if (requested > 0) {
+                    probe_layers = requested;
+                }
+            }
+            probe_layers = std::min(probe_layers, runtime_plan.tensor_layers);
+            run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
+        }
+    }
 
     if (stage_queue_requested && has_runtime_plan) {
         if (return_wavefront_full_graph_override) {
