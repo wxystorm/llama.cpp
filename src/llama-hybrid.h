@@ -184,6 +184,20 @@ struct llama_hybrid_tensor_compute_prediction {
     double tensor_total_ms = 0.0;
 };
 
+struct llama_hybrid_full_prefill_prediction {
+    int tokens              = 0;
+    int kv_tokens           = 0;
+    int tensor_layers       = 0;
+    int tensor_chunk_tokens = 0;
+    int attn_group_chunks   = 1;
+    int attn_chunk_tokens   = 0;
+    float tensor_pc_ratio   = 0.0f;
+
+    double gpu_ms    = 0.0;
+    double tensor_ms = 0.0;
+    double total_ms  = 0.0;
+};
+
 struct llama_hybrid_plan {
     int tensor_layers = 0;
     int phone_layers  = 0;
@@ -323,6 +337,8 @@ LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
+LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(
+    int tokens, llama_hybrid_full_prefill_prediction & prediction);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API int  llama_hybrid_runtime_prefill_attn_group_chunks();
