@@ -54,6 +54,7 @@ struct llama_hybrid_runtime_stage {
     int layer_end;
     int macro_tokens;
     int inner_chunk_tokens;
+    bool wave_probe = false;
 };
 
 struct llama_context {
@@ -344,6 +345,11 @@ private:
                                       int                                             ubatch_id,
                                       ggml_status &                                   ret);
 
+    bool run_hybrid_wave_probe(
+                                      uint32_t                          probe_tokens,
+                                      int                               probe_layers,
+                                      const llama_hybrid_plan &         runtime_plan);
+
     llm_graph_result * run_hybrid_stage_block(
                                       const llama_ubatch &                 ubatch,
                                       const llama_hybrid_runtime_stage &   stage,
@@ -497,6 +503,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool hybrid_wave_probe_done = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
