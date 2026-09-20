@@ -4414,6 +4414,8 @@ static bool llama_hybrid_profile_moe_router_point(
     weights_sum = ggml_clamp(
         ctx.get(), weights_sum, 6.103515625e-5f, INFINITY);
     weights = ggml_div(ctx.get(), weights, weights_sum);
+    weights = ggml_reshape_3d(
+        ctx.get(), weights, 1, moe_desc.n_expert_used, tokens);
 
     ggml_cgraph * graph =
         ggml_new_graph_custom(ctx.get(), graph_size, false);
