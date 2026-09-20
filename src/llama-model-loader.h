@@ -21,6 +21,7 @@ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
 struct llama_hybrid_ffn_desc;
+struct llama_hybrid_moe_desc;
 struct llama_hybrid_attn_desc;
 
 enum llama_fver {
@@ -191,6 +192,8 @@ struct LLAMA_API llama_model_loader {
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
     bool get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & desc) const;
+
+    bool get_hybrid_moe_desc(int layer, llama_hybrid_moe_desc & desc);
 
     bool get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc & desc);
 
