@@ -5908,11 +5908,19 @@ auto prefill_norm_sg_has_prework =
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
-        GGML_ASSERT(pending_prefill_input_task != 0);
-        GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
-        GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
+        const bool has_async_prefill_input =
+            pending_prefill_input_task != 0;
+
+        if (has_async_prefill_input) {
+            GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
+            GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
+        }
 
         if (return_wavefront_graph) {
+            // Return-wavefront currently relies on the dense optimized input
+            // pipeline.  A graph that fell back to generic MoE handoff must
+            // never enter this path.
+            GGML_ASSERT(has_async_prefill_input);
             // Bound Phone producer pressure by producer completion, not by
             // full snapshot return completion. The snapshot client publishes
             // seq readiness as soon as the first payload byte arrives, which
@@ -5952,20 +5960,29 @@ auto prefill_norm_sg_has_prework =
         }
 
         compute_workers.start(0, i);
-        GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
-        const int64_t input_wait_start_us = ggml_time_us();
-        const ggml_status input_status = backend_ctx->prefill_input_worker->wait(
-            pending_prefill_input_task);
-        tensor_wait_us += ggml_time_us() - input_wait_start_us;
-        pending_prefill_input_task = 0;
-        pending_prefill_input_layer = -1;
-        pending_prefill_input_chunk = -1;
-        if (input_status != GGML_STATUS_SUCCESS) {
-            compute_workers.wait(0);
-            if (has_pending_prefill_reduce()) {
-                wait_all_prefill_reduces(nullptr);
+
+        if (has_async_prefill_input) {
+            GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
+            const int64_t input_wait_start_us = ggml_time_us();
+            const ggml_status input_status =
+                backend_ctx->prefill_input_worker->wait(
+                    pending_prefill_input_task);
+            tensor_wait_us += ggml_time_us() - input_wait_start_us;
+            pending_prefill_input_task = 0;
+            pending_prefill_input_layer = -1;
+            pending_prefill_input_chunk = -1;
+            if (input_status != GGML_STATUS_SUCCESS) {
+                compute_workers.wait(0);
+                if (has_pending_prefill_reduce()) {
+                    wait_all_prefill_reduces(nullptr);
+                }
+                return input_status;
             }
-            return input_status;
+        } else if (pipeline_debug) {
+            GGML_LOG_INFO(
+                "[PREFILL_DOWN_FALLBACK] sg=%zu layer=%d chunk=%d "
+                "input=generic_handoff\n",
+                i, prefill_down_layer, prefill_down_chunk);
         }
 
         const int64_t chunk_submit_begin_us = ggml_time_us();
