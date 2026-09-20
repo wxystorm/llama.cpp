@@ -4967,47 +4967,111 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
+    const bool is_qwen3_moe = ml.get_arch() == LLM_ARCH_QWEN3MOE;
+    if (ml.get_arch() != LLM_ARCH_LLAMA &&
+        ml.get_arch() != LLM_ARCH_QWEN2 &&
+        ml.get_arch() != LLM_ARCH_QWEN3 &&
+        !is_qwen3_moe) {
+        LLAMA_LOG_ERROR(
+            "%s: hybrid auto does not support architecture %s\n",
+            __func__, ml.get_arch_name().c_str());
+        return false;
+    }
+
     int n_layer = 0;
     for (int il = 0; il < 1024; ++il) {
-        llama_hybrid_ffn_desc desc;
-        if (!ml.get_hybrid_ffn_desc(il, desc)) {
+        bool ok = false;
+        if (is_qwen3_moe) {
+            llama_hybrid_moe_desc desc;
+            ok = ml.get_hybrid_moe_desc(il, desc);
+        } else {
+            llama_hybrid_ffn_desc desc;
+            ok = ml.get_hybrid_ffn_desc(il, desc);
+        }
+        if (!ok) {
             break;
         }
         ++n_layer;
     }
     if (n_layer <= 0) {
-        LLAMA_LOG_ERROR("%s: model has no supported dense FFN layers\n", __func__);
+        LLAMA_LOG_ERROR(
+            "%s: model has no supported %s layers\n",
+            __func__, is_qwen3_moe ? "MoE" : "dense FFN");
         return false;
     }
 
-    const int              probe_layer = n_layer / 2;
+    const int probe_layer = n_layer / 2;
     llama_hybrid_ffn_desc  ffn_desc;
+    llama_hybrid_moe_desc  moe_desc;
     llama_hybrid_attn_desc attn_desc;
-    if (!ml.get_hybrid_ffn_desc(probe_layer, ffn_desc) || !ml.get_hybrid_attn_desc(probe_layer, attn_desc)) {
-        LLAMA_LOG_ERROR("%s: failed to describe probe layer %d\n", __func__, probe_layer);
+
+    const bool desc_ok = is_qwen3_moe ?
+        ml.get_hybrid_moe_desc(probe_layer, moe_desc) :
+        ml.get_hybrid_ffn_desc(probe_layer, ffn_desc);
+    if (!desc_ok ||
+        !ml.get_hybrid_attn_desc(probe_layer, attn_desc)) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to describe probe layer %d\n",
+            __func__, probe_layer);
         return false;
     }
 
     llama_hybrid_profile profile;
-    profile.n_layer                = n_layer;
-    profile.n_embd                 = ffn_desc.n_embd;
-    profile.n_ff                   = ffn_desc.n_ff;
-    profile.probe_tokens           = LLAMA_HYBRID_PROFILE_TOKENS;
-    profile.reference_tokens       = LLAMA_HYBRID_REFERENCE_TOKENS;
+    profile.n_layer = n_layer;
+    profile.n_embd = (int) (is_qwen3_moe ?
+        moe_desc.n_embd : ffn_desc.n_embd);
+    profile.n_ff = (int) (is_qwen3_moe ?
+        moe_desc.n_ff_exp : ffn_desc.n_ff);
+    profile.probe_tokens = LLAMA_HYBRID_PROFILE_TOKENS;
+    profile.reference_tokens = LLAMA_HYBRID_REFERENCE_TOKENS;
     profile.probe_chunk_min_tokens = 4;
-    profile.profile_block_layers   = LLAMA_HYBRID_PROFILE_BLOCK_LAYERS;
+    profile.profile_block_layers = LLAMA_HYBRID_PROFILE_BLOCK_LAYERS;
 
-    if (!ml.get_hybrid_weight_bytes(n_layer, profile.model_weight_bytes, profile.non_layer_weight_bytes,
-                                    profile.layer_weight_bytes, profile.layer_attn_forced_bytes,
-                                    profile.layer_ffn_split_bytes, profile.layer_mirrored_bytes) ||
-        !llama_hybrid_profile_memory(profile, cpu.get(), phone.get(), gpu.get()) ||
-        !llama_hybrid_profile_gpu_transfer(profile, gpu.get(), cpu.get()) ||
-        !llama_hybrid_profile_rpc(profile, cpu.get(), phone.get()) ||
-        !llama_hybrid_profile_ffn(profile, ffn_desc, cpu.get(), phone.get()) ||
-        !llama_hybrid_profile_attention(profile, attn_desc, cpu.get(), phone.get(), gpu.get()) ||
-        !llama_hybrid_profile_full_layer(profile, attn_desc, ffn_desc, cpu.get(), phone.get(), gpu.get())) {
-        LLAMA_LOG_ERROR("%s: profiling failed\n", __func__);
+    if (!ml.get_hybrid_weight_bytes(
+            n_layer,
+            profile.model_weight_bytes,
+            profile.non_layer_weight_bytes,
+            profile.layer_weight_bytes,
+            profile.layer_attn_forced_bytes,
+            profile.layer_ffn_split_bytes,
+            profile.layer_mirrored_bytes) ||
+        !llama_hybrid_profile_memory(
+            profile, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_gpu_transfer(
+            profile, gpu.get(), cpu.get()) ||
+        !llama_hybrid_profile_rpc(
+            profile, cpu.get(), phone.get()) ||
+        !llama_hybrid_profile_attention(
+            profile, attn_desc, cpu.get(), phone.get(), gpu.get())) {
+        LLAMA_LOG_ERROR("%s: common profiling failed\n", __func__);
         return false;
+    }
+
+    if (is_qwen3_moe) {
+        LLAMA_LOG_INFO(
+            "[HYBRID_MOE] arch=qwen3moe layers=%d n_embd=%" PRId64
+            " n_ff_exp=%" PRId64 " experts=%" PRId64
+            " topk=%" PRId64 "\n",
+            n_layer, moe_desc.n_embd, moe_desc.n_ff_exp,
+            moe_desc.n_expert, moe_desc.n_expert_used);
+
+        if (!llama_hybrid_profile_moe_ffn(
+                profile, moe_desc, cpu.get(), phone.get()) ||
+            !llama_hybrid_profile_moe_full_layer(
+                profile, attn_desc, moe_desc,
+                cpu.get(), phone.get(), gpu.get())) {
+            LLAMA_LOG_ERROR("%s: MoE profiling failed\n", __func__);
+            return false;
+        }
+    } else {
+        if (!llama_hybrid_profile_ffn(
+                profile, ffn_desc, cpu.get(), phone.get()) ||
+            !llama_hybrid_profile_full_layer(
+                profile, attn_desc, ffn_desc,
+                cpu.get(), phone.get(), gpu.get())) {
+            LLAMA_LOG_ERROR("%s: dense profiling failed\n", __func__);
+            return false;
+        }
     }
 
     llama_hybrid_profile_print(profile);
