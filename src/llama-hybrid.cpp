@@ -1875,120 +1875,6 @@ struct llama_hybrid_lp_model {
     double phone_capacity_bytes = std::numeric_limits<double>::infinity();
 };
 
-struct llama_hybrid_lp_vertex {
-    double cpu_layers    = 0.0;
-    double tensor_layers = 0.0;
-    double phone_layers  = 0.0;
-    double score         = std::numeric_limits<double>::infinity();
-};
-
-static std::vector<llama_hybrid_lp_vertex> llama_hybrid_lp_best_vertices(
-        const llama_hybrid_lp_model & model,
-        size_t                        max_vertices) {
-    std::vector<llama_hybrid_lp_vertex> result;
-    if (model.layers < 0 || max_vertices == 0) {
-        return result;
-    }
-
-    struct line {
-        double a;
-        double b;
-        double c;
-    };
-
-    // Eliminate P with P = L - C - T. The first three boundaries are
-    // C=0, T=0, and C+T=L. Memory constraints add at most two more lines.
-    std::vector<line> boundaries = {
-        { 1.0, 0.0, 0.0 },
-        { 0.0, 1.0, 0.0 },
-        { 1.0, 1.0, (double) model.layers },
-    };
-
-    if (std::isfinite(model.pc_capacity_bytes)) {
-        boundaries.push_back({
-            model.pc_cpu_bytes - model.pc_phone_bytes,
-            model.pc_tensor_bytes - model.pc_phone_bytes,
-            model.pc_capacity_bytes - model.pc_phone_bytes * model.layers,
-        });
-    }
-    if (std::isfinite(model.phone_capacity_bytes)) {
-        boundaries.push_back({
-            model.phone_cpu_bytes - model.phone_phone_bytes,
-            model.phone_tensor_bytes - model.phone_phone_bytes,
-            model.phone_capacity_bytes - model.phone_phone_bytes * model.layers,
-        });
-    }
-
-    const auto feasible = [&](double c, double t) {
-        constexpr double eps = 1e-7;
-        const double p = model.layers - c - t;
-        if (c < -eps || t < -eps || p < -eps) {
-            return false;
-        }
-        const double pc = model.pc_cpu_bytes * c + model.pc_tensor_bytes * t + model.pc_phone_bytes * p;
-        const double ph = model.phone_cpu_bytes * c + model.phone_tensor_bytes * t + model.phone_phone_bytes * p;
-        if (std::isfinite(model.pc_capacity_bytes) && pc > model.pc_capacity_bytes + 1e-3) {
-            return false;
-        }
-        if (std::isfinite(model.phone_capacity_bytes) && ph > model.phone_capacity_bytes + 1e-3) {
-            return false;
-        }
-        return true;
-    };
-
-    const auto add_vertex = [&](double c, double t) {
-        if (!feasible(c, t)) {
-            return;
-        }
-        const double p = std::max(0.0, (double) model.layers - c - t);
-        llama_hybrid_lp_vertex v;
-        v.cpu_layers    = std::max(0.0, c);
-        v.tensor_layers = std::max(0.0, t);
-        v.phone_layers  = p;
-        v.score         = model.cpu_cost * v.cpu_layers +
-                          model.tensor_cost * v.tensor_layers +
-                          model.phone_cost * v.phone_layers;
-        result.push_back(v);
-    };
-
-    for (size_t i = 0; i < boundaries.size(); ++i) {
-        for (size_t j = i + 1; j < boundaries.size(); ++j) {
-            const double det = boundaries[i].a * boundaries[j].b - boundaries[j].a * boundaries[i].b;
-            if (std::fabs(det) < 1e-12) {
-                continue;
-            }
-            const double c = (boundaries[i].c * boundaries[j].b - boundaries[j].c * boundaries[i].b) / det;
-            const double t = (boundaries[i].a * boundaries[j].c - boundaries[j].a * boundaries[i].c) / det;
-            add_vertex(c, t);
-        }
-    }
-
-    // Degenerate cases can leave only one feasible corner; make sure the simplex corners are considered.
-    add_vertex(0.0, 0.0);
-    add_vertex((double) model.layers, 0.0);
-    add_vertex(0.0, (double) model.layers);
-
-    std::sort(result.begin(), result.end(), [](const llama_hybrid_lp_vertex & a, const llama_hybrid_lp_vertex & b) {
-        if (a.score != b.score) {
-            return a.score < b.score;
-        }
-        if (a.cpu_layers != b.cpu_layers) {
-            return a.cpu_layers > b.cpu_layers;
-        }
-        return a.tensor_layers > b.tensor_layers;
-    });
-    result.erase(std::unique(result.begin(), result.end(), [](const llama_hybrid_lp_vertex & a,
-                                                             const llama_hybrid_lp_vertex & b) {
-        return std::fabs(a.cpu_layers - b.cpu_layers) < 1e-6 &&
-               std::fabs(a.tensor_layers - b.tensor_layers) < 1e-6 &&
-               std::fabs(a.phone_layers - b.phone_layers) < 1e-6;
-    }), result.end());
-    if (result.size() > max_vertices) {
-        result.resize(max_vertices);
-    }
-    return result;
-}
-
 static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profile,
                                          const llama_hybrid_constraints & constraints,
                                          int                              gpu_layers,
@@ -2112,26 +1998,13 @@ static int llama_hybrid_topology_family(const llama_hybrid_plan & plan) {
 }
 
 static bool llama_hybrid_coarse_plan_score(
-        const llama_hybrid_profile &     profile,
-        const llama_hybrid_constraints & constraints,
-        const llama_hybrid_plan &        plan,
-        double &                         result_ms) {
+        const llama_hybrid_lp_model & model,
+        const llama_hybrid_plan &    plan,
+        double                       gpu_lane_ms,
+        double                       phone_boundary_ms,
+        double &                     result_ms) {
     const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
     if (cpu_layers < 0 || plan.tensor_layers < 0 || plan.phone_layers < 0) {
-        return false;
-    }
-
-    llama_hybrid_lp_model model;
-    if (!llama_hybrid_coarse_lp_model(
-            profile, constraints, plan.gpu_pc_layers, plan.tensor_chunk_tokens,
-            plan.tensor_pc_ratio, model)) {
-        return false;
-    }
-
-    const int work_tokens = constraints.target_ubatch_tokens > 0 ?
-        constraints.target_ubatch_tokens :
-        (profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS);
-    if (work_tokens <= 0) {
         return false;
     }
 
@@ -2140,68 +2013,56 @@ static bool llama_hybrid_coarse_plan_score(
         plan.tensor_layers * model.tensor_cost +
         plan.phone_layers * model.phone_cost;
 
-    // A phone-only suffix must at least cross the PC/phone boundary once in
-    // each direction.  This is intentionally optimistic; exact macro-level
-    // transfers are handled by the full simulator in the second pass.
     if (plan.phone_layers > 0) {
-        const size_t bytes = (size_t) profile.n_embd * (size_t) work_tokens * sizeof(float);
-        double enter_ms = 0.0;
-        double exit_ms  = 0.0;
-        if (!llama_hybrid_transfer_cost(profile.pc_to_phone, bytes, enter_ms) ||
-            !llama_hybrid_transfer_cost(profile.phone_to_pc, bytes, exit_ms)) {
+        if (!std::isfinite(phone_boundary_ms)) {
             return false;
         }
-        downstream_ms += enter_ms + exit_ms;
-    }
-
-    double gpu_ms = 0.0;
-    if (plan.gpu_pc_layers > 0) {
-        if (profile.gpu_full_layer_ms <= 0.0 || profile.probe_tokens <= 0) {
-            return false;
-        }
-        const double token_scale = (double) work_tokens / (double) profile.probe_tokens;
-        gpu_ms = plan.gpu_pc_layers * profile.gpu_full_layer_ms * token_scale;
-
-        if (cpu_layers + plan.tensor_layers + plan.phone_layers > 0) {
-            const size_t bytes = (size_t) profile.n_embd * (size_t) work_tokens * sizeof(float);
-            double transfer_ms = 0.0;
-            if (!llama_hybrid_transfer_cost(profile.gpu_to_pc, bytes, transfer_ms)) {
-                return false;
-            }
-            gpu_ms += transfer_ms;
-        }
+        downstream_ms += phone_boundary_ms;
     }
 
     if (plan.gpu_pc_layers > 0 && downstream_ms > 0.0) {
-        // Stage execution can overlap the GPU lane with downstream work.
-        // Use an optimistic lower-cost ranking here; the exact queue timing is
-        // evaluated only after XG/XC/XP are expanded.
-        result_ms = std::max(gpu_ms, downstream_ms);
+        result_ms = std::max(gpu_lane_ms, downstream_ms);
     } else {
-        result_ms = gpu_ms + downstream_ms;
+        result_ms = gpu_lane_ms + downstream_ms;
     }
     return std::isfinite(result_ms);
+}
+
+static bool llama_hybrid_coarse_candidate_less(
+        const llama_hybrid_coarse_candidate & a,
+        const llama_hybrid_coarse_candidate & b) {
+    if (a.coarse_ms != b.coarse_ms) {
+        return a.coarse_ms < b.coarse_ms;
+    }
+    if (a.plan.gpu_pc_layers != b.plan.gpu_pc_layers) {
+        return a.plan.gpu_pc_layers > b.plan.gpu_pc_layers;
+    }
+    if (a.plan.tensor_layers != b.plan.tensor_layers) {
+        return a.plan.tensor_layers > b.plan.tensor_layers;
+    }
+    return a.plan.tensor_chunk_tokens > b.plan.tensor_chunk_tokens;
 }
 
 static void llama_hybrid_coarse_insert_top(
         std::vector<llama_hybrid_coarse_candidate> & bucket,
         const llama_hybrid_coarse_candidate &        candidate,
         size_t                                       limit) {
-    bucket.push_back(candidate);
-    std::sort(bucket.begin(), bucket.end(), [](const auto & a, const auto & b) {
-        if (a.coarse_ms != b.coarse_ms) {
-            return a.coarse_ms < b.coarse_ms;
-        }
-        if (a.plan.gpu_pc_layers != b.plan.gpu_pc_layers) {
-            return a.plan.gpu_pc_layers > b.plan.gpu_pc_layers;
-        }
-        if (a.plan.tensor_layers != b.plan.tensor_layers) {
-            return a.plan.tensor_layers > b.plan.tensor_layers;
-        }
-        return a.plan.tensor_chunk_tokens > b.plan.tensor_chunk_tokens;
-    });
+    if (limit == 0) {
+        return;
+    }
+    if (bucket.size() == limit &&
+        !llama_hybrid_coarse_candidate_less(candidate, bucket.back())) {
+        return;
+    }
+
+    const auto it = std::lower_bound(
+        bucket.begin(), bucket.end(), candidate,
+        [](const auto & a, const auto & b) {
+            return llama_hybrid_coarse_candidate_less(a, b);
+        });
+    bucket.insert(it, candidate);
     if (bucket.size() > limit) {
-        bucket.resize(limit);
+        bucket.pop_back();
     }
 }
 
@@ -2297,9 +2158,57 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             for (size_t ir = 0; ir < ratios.size(); ++ir) {
                 const float ratio = ratios[ir];
 
+                llama_hybrid_lp_model coarse_model;
+                if (!llama_hybrid_coarse_lp_model(
+                        profile, constraints, gpu_layers, chunk_tokens, ratio, coarse_model)) {
+                    continue;
+                }
+
+                double gpu_lane_ms = 0.0;
+                if (gpu_layers > 0) {
+                    if (profile.gpu_full_layer_ms <= 0.0 || profile.probe_tokens <= 0) {
+                        continue;
+                    }
+                    const double token_scale =
+                        (double) score_tokens / (double) profile.probe_tokens;
+                    gpu_lane_ms =
+                        gpu_layers * profile.gpu_full_layer_ms * token_scale;
+
+                    if (remaining > 0) {
+                        const size_t bytes =
+                            (size_t) profile.n_embd * (size_t) score_tokens * sizeof(float);
+                        double transfer_ms = 0.0;
+                        if (!llama_hybrid_transfer_cost(
+                                profile.gpu_to_pc, bytes, transfer_ms)) {
+                            continue;
+                        }
+                        gpu_lane_ms += transfer_ms;
+                    }
+                }
+
+                double phone_boundary_ms = 0.0;
+                {
+                    const size_t bytes =
+                        (size_t) profile.n_embd * (size_t) score_tokens * sizeof(float);
+                    double enter_ms = 0.0;
+                    double exit_ms  = 0.0;
+                    if (!llama_hybrid_transfer_cost(
+                            profile.pc_to_phone, bytes, enter_ms) ||
+                        !llama_hybrid_transfer_cost(
+                            profile.phone_to_pc, bytes, exit_ms)) {
+                        phone_boundary_ms =
+                            std::numeric_limits<double>::infinity();
+                    } else {
+                        phone_boundary_ms = enter_ms + exit_ms;
+                    }
+                }
+
                 for (int cpu_layers = 0; cpu_layers <= remaining; ++cpu_layers) {
-                    for (int tensor_layers = 0; tensor_layers <= remaining - cpu_layers; ++tensor_layers) {
-                        const int phone_layers = remaining - cpu_layers - tensor_layers;
+                    for (int tensor_layers = 0;
+                         tensor_layers <= remaining - cpu_layers;
+                         ++tensor_layers) {
+                        const int phone_layers =
+                            remaining - cpu_layers - tensor_layers;
                         const int pc_layers = gpu_layers + cpu_layers;
 
                         if (topology_fixed) {
@@ -2343,7 +2252,9 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                         plan.tensor_chunk_tokens = chunk_tokens;
 
                         double coarse_ms = 0.0;
-                        if (!llama_hybrid_coarse_plan_score(profile, constraints, plan, coarse_ms)) {
+                        if (!llama_hybrid_coarse_plan_score(
+                                coarse_model, plan, gpu_lane_ms,
+                                phone_boundary_ms, coarse_ms)) {
                             continue;
                         }
                         ++coarse_scoreable;
@@ -2358,9 +2269,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                             family_top[(size_t) candidate.family], candidate,
                             LLAMA_HYBRID_COARSE_FAMILY_TOP_K);
                         llama_hybrid_coarse_insert_top(
-                            global_top, candidate, LLAMA_HYBRID_COARSE_GLOBAL_TOP_K);
+                            global_top, candidate,
+                            LLAMA_HYBRID_COARSE_GLOBAL_TOP_K);
                         llama_hybrid_coarse_insert_top(
-                            margin_pool, candidate, LLAMA_HYBRID_COARSE_MARGIN_POOL);
+                            margin_pool, candidate,
+                            LLAMA_HYBRID_COARSE_MARGIN_POOL);
                     }
                 }
             }
