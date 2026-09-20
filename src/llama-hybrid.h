@@ -40,6 +40,23 @@ struct llama_hybrid_ffn_desc {
     size_t weight_bytes = 0;
 };
 
+struct llama_hybrid_moe_desc {
+    int64_t n_embd       = 0;
+    int64_t n_ff_exp     = 0;
+    int64_t n_expert     = 0;
+    int64_t n_expert_used = 0;
+
+    ggml_type ffn_norm_type   = GGML_TYPE_COUNT;
+    ggml_type router_type     = GGML_TYPE_COUNT;
+    ggml_type gate_exps_type  = GGML_TYPE_COUNT;
+    ggml_type up_exps_type    = GGML_TYPE_COUNT;
+    ggml_type down_exps_type  = GGML_TYPE_COUNT;
+
+    size_t weight_bytes        = 0;
+    size_t router_weight_bytes = 0;
+    size_t expert_weight_bytes = 0;
+};
+
 
 struct llama_hybrid_layer_compute_point {
     int    tokens         = 0;
@@ -372,6 +389,18 @@ LLAMA_API bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                                         const llama_hybrid_ffn_desc & desc,
                                         ggml_backend_t                cpu_backend,
                                         ggml_backend_t                phone_backend);
+
+LLAMA_API bool llama_hybrid_profile_moe_ffn(llama_hybrid_profile &        profile,
+                                            const llama_hybrid_moe_desc & desc,
+                                            ggml_backend_t                cpu_backend,
+                                            ggml_backend_t                phone_backend);
+
+LLAMA_API bool llama_hybrid_profile_moe_full_layer(llama_hybrid_profile &         profile,
+                                                   const llama_hybrid_attn_desc & attn_desc,
+                                                   const llama_hybrid_moe_desc &  moe_desc,
+                                                   ggml_backend_t                 cpu_backend,
+                                                   ggml_backend_t                 phone_backend,
+                                                   ggml_backend_t                 gpu_backend);
 
 LLAMA_API bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
                                               const llama_hybrid_attn_desc & desc,
