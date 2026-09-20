@@ -2816,6 +2816,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         wave_probe_env != nullptr && std::atoi(wave_probe_env) != 0;
     if (wave_probe_diagnostic_requested &&
         !hybrid_wave_probe_done &&
+        has_runtime_plan &&
         n_tokens_all > (uint32_t) std::max(1, runtime_plan.tensor_chunk_tokens) &&
         return_wavefront_requested &&
         return_wavefront_full_graph_override) {
