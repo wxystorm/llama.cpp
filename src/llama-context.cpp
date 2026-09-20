@@ -1451,17 +1451,37 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  ggml_status &            ret,
                                                  bool                     apply_mctx,
                                                  const llama_hybrid_runtime_stage * stage) {
+    const bool log_formal_prepare =
+        ubatch.n_tokens > 1 &&
+        stage == nullptr &&
+        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+    const int64_t prepare_total_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+    int64_t apply_mctx_us = 0;
+    int64_t graph_params_us = 0;
+    int64_t graph_build_us = 0;
+    int64_t graph_alloc_us = 0;
+    int64_t set_inputs_us = 0;
+    bool reused_graph = false;
+
+    const int64_t apply_mctx_begin_us = log_formal_prepare ? ggml_time_us() : 0;
     if (apply_mctx && mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (log_formal_prepare) {
+        apply_mctx_us = ggml_time_us() - apply_mctx_begin_us;
     }
 
     auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    const int64_t graph_params_begin_us = log_formal_prepare ? ggml_time_us() : 0;
     auto gparams = graph_params(res, ubatch, mctx, gtype, sched_use);
+    if (log_formal_prepare) {
+        graph_params_us = ggml_time_us() - graph_params_begin_us;
+    }
     if (stage != nullptr) {
         const int n_layer = model.hparams.n_layer();
         GGML_ASSERT(stage->layer_begin >= 0);
@@ -1476,8 +1496,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     }
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
-
+        reused_graph = true;
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
@@ -1492,11 +1511,11 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         ggml_backend_sched_reset(sched_use);
         ggml_backend_sched_set_eval_callback(sched_use, cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
+        const int64_t graph_build_begin_us = log_formal_prepare ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (log_formal_prepare) {
+            graph_build_us = ggml_time_us() - graph_build_begin_us;
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1504,21 +1523,47 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
+        const int64_t graph_alloc_begin_us = log_formal_prepare ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        if (log_formal_prepare) {
+            graph_alloc_us = ggml_time_us() - graph_alloc_begin_us;
+        }
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const int64_t set_inputs_begin_us = log_formal_prepare ? ggml_time_us() : 0;
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (log_formal_prepare) {
+            set_inputs_us = ggml_time_us() - set_inputs_begin_us;
+        }
+    }
+
+    if (log_formal_prepare) {
+        const int64_t prepare_total_us = ggml_time_us() - prepare_total_begin_us;
+        LLAMA_LOG_ERROR(
+            "[FORMAL_PREPARE_BREAKDOWN] tokens=%u reused=%d total_ms=%.3f "
+            "apply_mctx_ms=%.3f graph_params_ms=%.3f build_graph_ms=%.3f "
+            "alloc_graph_ms=%.3f set_inputs_ms=%.3f unaccounted_ms=%.3f\n",
+            ubatch.n_tokens,
+            reused_graph ? 1 : 0,
+            prepare_total_us / 1000.0,
+            apply_mctx_us / 1000.0,
+            graph_params_us / 1000.0,
+            graph_build_us / 1000.0,
+            graph_alloc_us / 1000.0,
+            set_inputs_us / 1000.0,
+            std::max<int64_t>(
+                0,
+                prepare_total_us - apply_mctx_us - graph_params_us -
+                    graph_build_us - graph_alloc_us - set_inputs_us) / 1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2320,6 +2365,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     if (ubatch.n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[FORMAL_PREPARE] tokens=%u prepare_ms=%.3f\n",
+            ubatch.n_tokens, prepare_us / 1000.0);
         llama_hybrid_log_formal_prepare_prediction(
             ubatch.n_tokens, prepare_us / 1000.0);
     }
@@ -2328,7 +2376,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     const bool batched = ubatch.n_tokens > 1;
 
+    const int64_t compute_begin_us = batched ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, batched);
+    const int64_t compute_us = batched ? ggml_time_us() - compute_begin_us : 0;
+
+    if (batched) {
+        LLAMA_LOG_ERROR(
+            "[FORMAL_UBATCH_TIMING] tokens=%u splits=%d prepare_ms=%.3f "
+            "compute_ms=%.3f total_ms=%.3f\n",
+            ubatch.n_tokens,
+            n_splits,
+            prepare_us / 1000.0,
+            compute_us / 1000.0,
+            (prepare_us + compute_us) / 1000.0);
+    }
 
     if (ret != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute full graph, status: %d\n", __func__, ret);
