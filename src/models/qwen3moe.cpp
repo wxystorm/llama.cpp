@@ -1,3 +1,4 @@
+#include "llama-hybrid.h"
 #include "models.h"
 
 void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
@@ -143,26 +144,89 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
-            build_moe_ffn(cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, true,
-                    hparams.expert_weights_scale,
-                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il,
-                    nullptr, nullptr,
-                    model.layers[il].ffn_up_exps_s,
-                    model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
-        cb(moe_out, "ffn_moe_out", il);
-        cur = moe_out;
+        const llama_hybrid_layer_mode hybrid_mode =
+            model.hybrid_layer_mode(il);
+        const int planned_chunk_tokens =
+            llama_hybrid_runtime_prefill_chunk_tokens();
+        const bool use_prefill_chunked_moe =
+            n_tokens > 1 && cur->ne[1] > 1 &&
+            planned_chunk_tokens > 0 &&
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            loras->empty() && cvec->tensor_for(il) == nullptr;
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        if (use_prefill_chunked_moe) {
+            const std::vector<int> chunk_sizes =
+                llama_hybrid_split_by_chunk_size(
+                    (int) cur->ne[1], planned_chunk_tokens);
+            GGML_ASSERT(!chunk_sizes.empty());
+
+            std::vector<ggml_tensor *> chunks;
+            chunks.reserve(chunk_sizes.size());
+            int64_t token_begin = 0;
+
+            for (size_t i = 0; i < chunk_sizes.size(); ++i) {
+                const int64_t token_count = chunk_sizes[i];
+                GGML_ASSERT(token_count > 0);
+
+                ggml_tensor * norm_chunk =
+                    ggml_view_2d(
+                        ctx0, cur, cur->ne[0], token_count,
+                        cur->nb[1], token_begin * cur->nb[1]);
+                const std::string norm_name =
+                    "prefill_ffn_norm_chunk_" + std::to_string(i);
+                cb(norm_chunk, norm_name.c_str(), il);
+
+                ggml_tensor * moe_chunk =
+                    build_moe_ffn(
+                        norm_chunk,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il,
+                        nullptr, nullptr,
+                        model.layers[il].ffn_up_exps_s,
+                        model.layers[il].ffn_gate_exps_s,
+                        model.layers[il].ffn_down_exps_s);
+                const std::string down_name =
+                    "prefill_ffn_down_chunk_" + std::to_string(i);
+                cb(moe_chunk, down_name.c_str(), il);
+                chunks.push_back(moe_chunk);
+                token_begin += token_count;
+            }
+
+            GGML_ASSERT(token_begin == cur->ne[1]);
+            cur = chunks.back();
+            for (int i = (int) chunks.size() - 2; i >= 0; --i) {
+                cur = ggml_concat(ctx0, chunks[(size_t) i], cur, 1);
+            }
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        } else {
+            ggml_tensor * moe_out =
+                build_moe_ffn(cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il,
+                        nullptr, nullptr,
+                        model.layers[il].ffn_up_exps_s,
+                        model.layers[il].ffn_gate_exps_s,
+                        model.layers[il].ffn_down_exps_s);
+            cb(moe_out, "ffn_moe_out", il);
+            cur = ggml_add(ctx0, moe_out, ffn_inp);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
