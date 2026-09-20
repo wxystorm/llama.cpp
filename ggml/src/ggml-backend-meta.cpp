@@ -4032,50 +4032,84 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 nodes[active_backend]->name, prefill_norm_chunk, prefill_norm_layer);
 
         if (is_prefill_norm_input) {
-            GGML_ASSERT(pending_prefill_input_task == 0);
-            GGML_ASSERT(i + 1 < backend_ctx->n_subgraphs);
-
-            ggml_tensor * pc_next_down = get_prefill_down_boundary_node(0, i + 1);
-            ggml_tensor * phone_next_down = get_prefill_down_boundary_node(1, i + 1);
+            // The optimized prefill input pipeline was originally written for
+            // dense FFN graphs, where the norm boundary is followed directly
+            // by one subgraph whose terminal node is prefill_ffn_down_chunk_*.
+            //
+            // MoE inserts Router/Top-K/MUL_MAT_ID/expert aggregation between
+            // those points, so Meta may split the graph differently.  Do not
+            // assert that the dense subgraph shape exists.  Use the optimized
+            // path only when the next subgraph actually matches it; otherwise
+            // fall through to the generic active_count==1 PC->Phone copy and
+            // normal PARTIAL/AllReduce handling below.
+            bool direct_prefill_down = false;
+            ggml_tensor * pc_next_down = nullptr;
+            ggml_tensor * phone_next_down = nullptr;
             int next_chunk = -1;
             int next_layer = -1;
-            GGML_ASSERT(pc_next_down != nullptr && phone_next_down != nullptr);
-            GGML_ASSERT(ggml_backend_meta_parse_prefill_down_chunk(
-                pc_next_down->name, next_chunk, next_layer));
-            GGML_ASSERT(next_chunk == prefill_norm_chunk && next_layer == prefill_norm_layer);
 
-            if (backend_ctx->prefill_input_worker == nullptr) {
-                backend_ctx->prefill_input_worker = new ggml_backend_meta_transfer_worker();
+            if (i + 1 < backend_ctx->n_subgraphs) {
+                pc_next_down = get_prefill_down_boundary_node(0, i + 1);
+                phone_next_down = get_prefill_down_boundary_node(1, i + 1);
+                direct_prefill_down =
+                    pc_next_down != nullptr &&
+                    phone_next_down != nullptr &&
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        pc_next_down->name, next_chunk, next_layer) &&
+                    next_chunk == prefill_norm_chunk &&
+                    next_layer == prefill_norm_layer;
             }
 
-            handled = true;
-            auto & bcj_src = backend_ctx->backend_configs[0];
-            auto & bcj_dst = backend_ctx->backend_configs[1];
-            ggml_tensor * src = nodes[0];
-            ggml_tensor * dst = nodes[1];
-            GGML_ASSERT(ggml_is_contiguous(src));
-            GGML_ASSERT(ggml_is_contiguous(dst));
+            if (direct_prefill_down) {
+                GGML_ASSERT(pending_prefill_input_task == 0);
 
-            pending_prefill_input_task = backend_ctx->prefill_input_worker->enqueue(
-                [&, src, dst, i](uint64_t) -> ggml_status {
-                    const int64_t copy_start_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, src, dst);
-                    const int64_t copy_us = ggml_time_us() - copy_start_us;
-                    record_copy_wait(copy_us);
-                    record_meta_copy(i, 0, 1, src, copy_us);
-                    return GGML_STATUS_SUCCESS;
-                });
-            pending_prefill_input_layer = prefill_norm_layer;
-            pending_prefill_input_chunk = prefill_norm_chunk;
-            record_direct_copy();
+                if (backend_ctx->prefill_input_worker == nullptr) {
+                    backend_ctx->prefill_input_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+
+                handled = true;
+                auto & bcj_src = backend_ctx->backend_configs[0];
+                auto & bcj_dst = backend_ctx->backend_configs[1];
+                ggml_tensor * src = nodes[0];
+                ggml_tensor * dst = nodes[1];
+                GGML_ASSERT(ggml_is_contiguous(src));
+                GGML_ASSERT(ggml_is_contiguous(dst));
+
+                pending_prefill_input_task =
+                    backend_ctx->prefill_input_worker->enqueue(
+                        [&, src, dst, i](uint64_t) -> ggml_status {
+                            const int64_t copy_start_us = ggml_time_us();
+                            ggml_backend_tensor_copy_async(
+                                bcj_src.backend, bcj_dst.backend, src, dst);
+                            const int64_t copy_us =
+                                ggml_time_us() - copy_start_us;
+                            record_copy_wait(copy_us);
+                            record_meta_copy(i, 0, 1, src, copy_us);
+                            return GGML_STATUS_SUCCESS;
+                        });
+                pending_prefill_input_layer = prefill_norm_layer;
+                pending_prefill_input_chunk = prefill_norm_chunk;
+                record_direct_copy();
+
+                if (pipeline_debug) {
+                    GGML_LOG_INFO(
+                        "[PREFILL_INPUT] layer=%d chunk=%d tensor=%s "
+                        "ne=[%" PRId64 ",%" PRId64 "]\n",
+                        prefill_norm_layer, prefill_norm_chunk,
+                        src->name, src->ne[0], src->ne[1]);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
 
             if (pipeline_debug) {
-                GGML_LOG_INFO("[PREFILL_INPUT] layer=%d chunk=%d tensor=%s "
-                       "ne=[%" PRId64 ",%" PRId64 "]\n",
-                       prefill_norm_layer, prefill_norm_chunk, src->name,
-                       src->ne[0], src->ne[1]);
+                GGML_LOG_INFO(
+                    "[PREFILL_INPUT_FALLBACK] sg=%zu layer=%d chunk=%d "
+                    "reason=non_dense_next_subgraph\n",
+                    i, prefill_norm_layer, prefill_norm_chunk);
             }
-            return GGML_STATUS_SUCCESS;
+            // Fall through.  The generic single-owner handoff below performs
+            // a synchronous PC->Phone copy before the next phone computation.
         }
 
         if (active_count == 1 && n_backends == 2 && active_backend == 0) {
