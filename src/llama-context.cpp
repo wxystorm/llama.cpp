@@ -2849,14 +2849,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // advance as (layer, chunk) wavefronts.
     const bool return_wavefront_full_graph_override =
         return_wavefront_requested && gpu_tensor_topology && model.arch == LLM_ARCH_QWEN2;
+    const bool generalized_stage_arch =
+        model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3MOE;
     const bool generalized_stage_queue_plan_eligible =
-        stage_queue_requested && has_runtime_plan && valid_stage_macros && model.arch == LLM_ARCH_QWEN2 &&
+        stage_queue_requested && has_runtime_plan && valid_stage_macros && generalized_stage_arch &&
         !return_wavefront_full_graph_override &&
         (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan && !gpu_tensor_topology && runtime_stages.size() >= 2 &&
-        valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
+        valid_stage_macros && generalized_stage_arch;
 
     // Formal return-wavefront profiling must be self-contained. Historically the
     // online wave probe reset these counters as a side effect before the real
