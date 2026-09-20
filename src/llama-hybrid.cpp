@@ -4367,6 +4367,77 @@ static bool llama_hybrid_profile_moe_router_point(
     return true;
 }
 
+static bool llama_hybrid_profile_moe_misc_point(
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_moe_desc &  moe_desc,
+        ggml_backend_t                 backend,
+        int                            tokens,
+        double &                       result_ms) {
+    if (backend == nullptr || tokens <= 0 ||
+        moe_desc.n_embd <= 0 ||
+        moe_desc.ffn_norm_type < 0 ||
+        moe_desc.ffn_norm_type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+
+    static constexpr size_t graph_size = 16;
+    const ggml_init_params params = {
+        /*.mem_size   =*/32 * ggml_tensor_overhead() +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx.get(), GGML_TYPE_F32, moe_desc.n_embd, tokens);
+    ggml_tensor * norm_w = ggml_new_tensor_1d(
+        ctx.get(), moe_desc.ffn_norm_type, moe_desc.n_embd);
+
+    ggml_tensor * norm = ggml_rms_norm(
+        ctx.get(), input, attn_desc.rms_eps);
+    norm = ggml_mul(ctx.get(), norm, norm_w);
+    ggml_tensor * output = ggml_add(ctx.get(), norm, input);
+
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+    static std::atomic<uint64_t> next_moe_misc_uid{
+        (uint64_t(1) << 62) | (uint64_t(1) << 56)
+    };
+    graph->uid =
+        next_moe_misc_uid.fetch_add(1, std::memory_order_relaxed);
+    ggml_build_forward_expand(graph, output);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (!ggml_backend_supports_op(backend, graph->nodes[i])) {
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    llama_hybrid_graph_timing timing;
+    if (!llama_hybrid_profile_graph_timing(
+            backend, graph, timing)) {
+        return false;
+    }
+
+    const bool is_rpc =
+        llama_hybrid_rpc_get_proc_address(
+            backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
+    result_ms =
+        is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    return true;
+}
+
 bool llama_hybrid_profile_moe_full_layer(
         llama_hybrid_profile &         profile,
         const llama_hybrid_attn_desc & attn_desc,
@@ -4397,9 +4468,12 @@ bool llama_hybrid_profile_moe_full_layer(
                                  double & total_ms) {
         double attn_ms = 0.0;
         double branch_ms = 0.0;
+        double misc_ms = 0.0;
 
         if (!llama_hybrid_attn_cost(
-                attn_points, tokens, tokens, attn_ms)) {
+                attn_points, tokens, tokens, attn_ms) ||
+            !llama_hybrid_profile_moe_misc_point(
+                attn_desc, moe_desc, backend, tokens, misc_ms)) {
             return false;
         }
 
@@ -4424,12 +4498,13 @@ bool llama_hybrid_profile_moe_full_layer(
             branch_ms = router_ms + expert_ms;
         }
 
-        total_ms = attn_ms + branch_ms;
+        total_ms = attn_ms + misc_ms + branch_ms;
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_layer "
-            "tokens=%d attn_ms=%.3f branch_ms=%.3f total_ms=%.3f\n",
+            "tokens=%d attn_ms=%.3f misc_ms=%.3f branch_ms=%.3f "
+            "total_ms=%.3f\n",
             ggml_backend_name(backend), tokens,
-            attn_ms, branch_ms, total_ms);
+            attn_ms, misc_ms, branch_ms, total_ms);
         return true;
     };
 
