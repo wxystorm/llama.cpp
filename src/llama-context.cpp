@@ -2797,23 +2797,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
         stage_queue_requested && has_runtime_plan && !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && model.arch == LLM_ARCH_QWEN2;
 
-    if (!hybrid_wave_probe_done &&
+    // Formal return-wavefront profiling must be self-contained. Historically the
+    // online wave probe reset these counters as a side effect before the real
+    // prefill; keep the real measurement correct even when no probe is run.
+    if (n_tokens_all > 1 && return_wavefront_full_graph_override) {
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (backend != nullptr) {
+                ggml_backend_meta_tensor_profile_reset(backend);
+            }
+        }
+    }
+
+    // The wave probe is diagnostic-only. It is never required for plan
+    // selection or for WAVE_REAL collection, because executing it adds a real
+    // Tensor forward pass to user-visible prefill latency.
+    const char * wave_probe_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE");
+    const bool wave_probe_diagnostic_requested =
+        wave_probe_env != nullptr && std::atoi(wave_probe_env) != 0;
+    if (wave_probe_diagnostic_requested &&
+        !hybrid_wave_probe_done &&
         n_tokens_all > (uint32_t) std::max(1, runtime_plan.tensor_chunk_tokens) &&
         return_wavefront_requested &&
         return_wavefront_full_graph_override) {
-        const char * probe_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE");
-        if (probe_env != nullptr && std::atoi(probe_env) != 0) {
-            int probe_layers = 16;
-            if (const char * layers_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE_LAYERS")) {
-                const int requested = std::atoi(layers_env);
-                if (requested > 0) {
-                    probe_layers = requested;
-                }
+        LLAMA_LOG_WARN(
+            "[WAVE_PROBE] diagnostic mode enabled; probe time is part of prompt latency\n");
+
+        int probe_layers = 16;
+        if (const char * layers_env = std::getenv("LLAMA_HYBRID_WAVE_PROBE_LAYERS")) {
+            const int requested = std::atoi(layers_env);
+            if (requested > 0) {
+                probe_layers = requested;
             }
-            probe_layers = std::min(probe_layers, runtime_plan.tensor_layers);
-            hybrid_wave_probe_done =
-                run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
         }
+        probe_layers = std::min(probe_layers, runtime_plan.tensor_layers);
+        hybrid_wave_probe_done =
+            run_hybrid_wave_probe(n_tokens_all, probe_layers, runtime_plan);
     }
 
     if (stage_queue_requested && has_runtime_plan) {
@@ -4047,7 +4065,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (n_tokens_all > 1 && return_wavefront_full_graph_override && hybrid_wave_probe_done) {
+    if (n_tokens_all > 1 && return_wavefront_full_graph_override) {
         ggml_backend_t meta_backend = nullptr;
         ggml_backend_meta_tensor_profile real_profile {};
         for (ggml_backend_t backend : backend_ptrs) {
@@ -4147,7 +4165,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     real_late_barrier_per_layer_ms / real_early_barrier_per_layer_ms : 0.0);
 
             llama_hybrid_wave_calibration calibration;
-            if (llama_hybrid_runtime_wave_calibration_get(calibration)) {
+            if (hybrid_wave_probe_done &&
+                llama_hybrid_runtime_wave_calibration_get(calibration) &&
+                calibration.tokens == (int) n_tokens_all &&
+                calibration.tensor_chunk_tokens == runtime_plan.tensor_chunk_tokens &&
+                std::abs(calibration.tensor_pc_ratio - runtime_plan.tensor_pc_ratio) < 1e-4f) {
                 LLAMA_LOG_ERROR(
                     "[WAVE_II_COMPARE] probe_layers=%d real_layers=%" PRId64
                     " probe_ii_median_ms=%.3f real_ii_median_ms=%.3f ii_ratio=%.4f "
