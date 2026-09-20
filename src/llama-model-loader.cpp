@@ -1015,6 +1015,7 @@ bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc 
             break;
         case LLM_ARCH_QWEN2:
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
             rope_type = LLAMA_ROPE_TYPE_NEOX;
             break;
         default:
