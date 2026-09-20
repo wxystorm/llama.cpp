@@ -390,10 +390,11 @@ LLAMA_API bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                                         ggml_backend_t                cpu_backend,
                                         ggml_backend_t                phone_backend);
 
-LLAMA_API bool llama_hybrid_profile_moe_ffn(llama_hybrid_profile &        profile,
-                                            const llama_hybrid_moe_desc & desc,
-                                            ggml_backend_t                cpu_backend,
-                                            ggml_backend_t                phone_backend);
+LLAMA_API bool llama_hybrid_profile_moe_ffn(llama_hybrid_profile &         profile,
+                                            const llama_hybrid_moe_desc &  desc,
+                                            const llama_hybrid_attn_desc & attn_desc,
+                                            ggml_backend_t                 cpu_backend,
+                                            ggml_backend_t                 phone_backend);
 
 LLAMA_API bool llama_hybrid_profile_moe_full_layer(llama_hybrid_profile &         profile,
                                                    const llama_hybrid_attn_desc & attn_desc,
