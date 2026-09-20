@@ -4242,6 +4242,240 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
     return true;
 }
 
+
+static bool llama_hybrid_profile_moe_router_point(
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_moe_desc &  moe_desc,
+        ggml_backend_t                 backend,
+        int                            tokens,
+        double &                       result_ms) {
+    if (backend == nullptr || tokens <= 0 ||
+        moe_desc.n_embd <= 0 || moe_desc.n_expert <= 0 ||
+        moe_desc.n_expert_used <= 0 ||
+        moe_desc.n_expert_used > moe_desc.n_expert) {
+        return false;
+    }
+
+    static constexpr size_t graph_size = 64;
+    const ggml_init_params params = {
+        /*.mem_size   =*/128 * ggml_tensor_overhead() +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx.get(), GGML_TYPE_F32, moe_desc.n_embd, tokens);
+    ggml_tensor * norm_w = ggml_new_tensor_1d(
+        ctx.get(), moe_desc.ffn_norm_type, moe_desc.n_embd);
+    ggml_tensor * router_w = ggml_new_tensor_2d(
+        ctx.get(), moe_desc.router_type,
+        moe_desc.n_embd, moe_desc.n_expert);
+
+    ggml_tensor * norm = ggml_rms_norm(
+        ctx.get(), input, attn_desc.rms_eps);
+    norm = ggml_mul(ctx.get(), norm, norm_w);
+
+    ggml_tensor * logits = ggml_mul_mat(
+        ctx.get(), router_w, norm);
+    ggml_tensor * probs = ggml_soft_max(
+        ctx.get(), logits);
+    ggml_tensor * selected = ggml_argsort_top_k(
+        ctx.get(), probs, (int) moe_desc.n_expert_used);
+
+    probs = ggml_reshape_3d(
+        ctx.get(), probs, 1, moe_desc.n_expert, tokens);
+    ggml_tensor * weights = ggml_get_rows(
+        ctx.get(), probs, selected);
+    weights = ggml_reshape_2d(
+        ctx.get(), weights, moe_desc.n_expert_used, tokens);
+    ggml_tensor * weights_sum = ggml_sum_rows(
+        ctx.get(), weights);
+    weights_sum = ggml_clamp(
+        ctx.get(), weights_sum, 6.103515625e-5f, INFINITY);
+    weights = ggml_div(ctx.get(), weights, weights_sum);
+
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+    static std::atomic<uint64_t> next_moe_router_uid{
+        (uint64_t(1) << 62) | (uint64_t(1) << 57)
+    };
+    graph->uid =
+        next_moe_router_uid.fetch_add(1, std::memory_order_relaxed);
+    ggml_build_forward_expand(graph, weights);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (!ggml_backend_supports_op(backend, node)) {
+            LLAMA_LOG_ERROR(
+                "%s: backend=%s unsupported MoE router op=%s node=%s\n",
+                __func__, ggml_backend_name(backend),
+                ggml_op_name(node->op), node->name);
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to allocate MoE router probe on %s\n",
+            __func__, ggml_backend_name(backend));
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    llama_hybrid_graph_timing timing;
+    if (!llama_hybrid_profile_graph_timing(
+            backend, graph, timing)) {
+        return false;
+    }
+
+    const bool is_rpc =
+        llama_hybrid_rpc_get_proc_address(
+            backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
+    result_ms =
+        is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    return true;
+}
+
+bool llama_hybrid_profile_moe_full_layer(
+        llama_hybrid_profile &         profile,
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_moe_desc &  moe_desc,
+        ggml_backend_t                 cpu_backend,
+        ggml_backend_t                 phone_backend,
+        ggml_backend_t                 gpu_backend) {
+    if (cpu_backend == nullptr || phone_backend == nullptr ||
+        attn_desc.n_embd != moe_desc.n_embd) {
+        return false;
+    }
+
+    profile.cpu_layer_blocks.clear();
+    profile.phone_layer_blocks.clear();
+    profile.gpu_layer_blocks.clear();
+    profile.phone_blocks.clear();
+
+    profile.cpu_full_layer_ms = 0.0;
+    profile.phone_full_layer_ms = 0.0;
+    profile.phone_full_layer_compute_est_ms = 0.0;
+    profile.gpu_full_layer_ms = 0.0;
+
+    const auto profile_one = [&](ggml_backend_t backend,
+                                 const std::vector<llama_hybrid_attn_compute_point> & attn_points,
+                                 int backend_index,
+                                 int tokens,
+                                 double & total_ms) {
+        double attn_ms = 0.0;
+        double router_ms = 0.0;
+        double expert_ms = 0.0;
+        size_t expert_runtime_bytes = 0;
+
+        if (!llama_hybrid_attn_cost(
+                attn_points, tokens, tokens, attn_ms) ||
+            !llama_hybrid_profile_moe_router_point(
+                attn_desc, moe_desc, backend, tokens, router_ms) ||
+            !llama_hybrid_profile_moe_ffn_point(
+                moe_desc, backend, backend_index, tokens, 1.0f,
+                expert_ms, expert_runtime_bytes)) {
+            return false;
+        }
+
+        total_ms = attn_ms + router_ms + expert_ms;
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_layer "
+            "tokens=%d attn_ms=%.3f router_ms=%.3f expert_ms=%.3f "
+            "total_ms=%.3f\n",
+            ggml_backend_name(backend), tokens,
+            attn_ms, router_ms, expert_ms, total_ms);
+        return true;
+    };
+
+    for (const int tokens : LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+            continue;
+        }
+
+        double cpu_ms = 0.0;
+        if (!profile_one(
+                cpu_backend, profile.cpu_attn, 0,
+                tokens, cpu_ms)) {
+            return false;
+        }
+        profile.cpu_layer_blocks.push_back({
+            tokens, 1, cpu_ms, cpu_ms
+        });
+        if (tokens == profile.probe_tokens) {
+            profile.cpu_full_layer_ms = cpu_ms;
+        }
+
+        double phone_ms = 0.0;
+        if (!profile_one(
+                phone_backend, profile.phone_attn, 1,
+                tokens, phone_ms)) {
+            return false;
+        }
+        profile.phone_layer_blocks.push_back({
+            tokens, 1, phone_ms, phone_ms
+        });
+        if (tokens == profile.probe_tokens) {
+            profile.phone_full_layer_ms = phone_ms;
+            profile.phone_full_layer_compute_est_ms = phone_ms;
+        }
+
+        profile.phone_blocks.push_back({
+            1, tokens, tokens, phone_ms, phone_ms
+        });
+    }
+
+    if (gpu_backend != nullptr) {
+        for (const int tokens : LLAMA_HYBRID_GPU_LAYER_TOKENS) {
+            if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+                continue;
+            }
+            double gpu_ms = 0.0;
+            if (!profile_one(
+                    gpu_backend, profile.gpu_attn, 0,
+                    tokens, gpu_ms)) {
+                return false;
+            }
+            profile.gpu_layer_blocks.push_back({
+                tokens, 1, gpu_ms, gpu_ms
+            });
+            if (tokens == profile.probe_tokens) {
+                profile.gpu_full_layer_ms = gpu_ms;
+            }
+        }
+    }
+
+    if (profile.cpu_full_layer_ms <= 0.0 &&
+        !profile.cpu_layer_blocks.empty()) {
+        profile.cpu_full_layer_ms =
+            profile.cpu_layer_blocks.front().wall_ms;
+    }
+    if (profile.phone_full_layer_compute_est_ms <= 0.0 &&
+        !profile.phone_layer_blocks.empty()) {
+        profile.phone_full_layer_ms =
+            profile.phone_layer_blocks.front().wall_ms;
+        profile.phone_full_layer_compute_est_ms =
+            profile.phone_layer_blocks.front().compute_est_ms;
+    }
+    if (gpu_backend != nullptr &&
+        profile.gpu_full_layer_ms <= 0.0 &&
+        !profile.gpu_layer_blocks.empty()) {
+        profile.gpu_full_layer_ms =
+            profile.gpu_layer_blocks.front().wall_ms;
+    }
+
+    return !profile.cpu_layer_blocks.empty() &&
+           !profile.phone_layer_blocks.empty() &&
+           (gpu_backend == nullptr || !profile.gpu_layer_blocks.empty());
+}
+
 struct llama_hybrid_probe_layer_weights {
     ggml_tensor * attn_norm = nullptr;
     ggml_tensor * wq        = nullptr;
