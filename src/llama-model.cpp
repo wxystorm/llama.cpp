@@ -821,7 +821,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool hybrid_arch =
         ud->model->arch == LLM_ARCH_LLAMA ||
         ud->model->arch == LLM_ARCH_QWEN2 ||
-        ud->model->arch == LLM_ARCH_QWEN3;
+        ud->model->arch == LLM_ARCH_QWEN3 ||
+        ud->model->arch == LLM_ARCH_QWEN3MOE;
     const llama_hybrid_layer_mode mode = hybrid_arch ?
         ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool force_primary =
@@ -1415,7 +1416,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     const bool hybrid_arch =
         arch == LLM_ARCH_LLAMA ||
         arch == LLM_ARCH_QWEN2 ||
-        arch == LLM_ARCH_QWEN3;
+        arch == LLM_ARCH_QWEN3 ||
+        arch == LLM_ARCH_QWEN3MOE;
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_plan runtime_plan;
