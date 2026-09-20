@@ -3786,11 +3786,19 @@ static bool llama_hybrid_profile_moe_ffn_point(
     return true;
 }
 
+static bool llama_hybrid_profile_moe_router_point(
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_moe_desc &  moe_desc,
+        ggml_backend_t                 backend,
+        int                            tokens,
+        double &                       result_ms);
+
 bool llama_hybrid_profile_moe_ffn(
-        llama_hybrid_profile &        profile,
-        const llama_hybrid_moe_desc & desc,
-        ggml_backend_t                cpu_backend,
-        ggml_backend_t                phone_backend) {
+        llama_hybrid_profile &         profile,
+        const llama_hybrid_moe_desc &  desc,
+        const llama_hybrid_attn_desc & attn_desc,
+        ggml_backend_t                 cpu_backend,
+        ggml_backend_t                 phone_backend) {
     if (cpu_backend == nullptr || phone_backend == nullptr ||
         desc.n_embd <= 0 || desc.n_ff_exp <= 0 ||
         desc.n_expert <= 0 || desc.n_expert_used <= 0 ||
@@ -3826,6 +3834,15 @@ bool llama_hybrid_profile_moe_ffn(
         std::set<int64_t> seen_cpu_ff;
         std::set<int64_t> seen_phone_ff;
 
+        double cpu_router_ms = 0.0;
+        double phone_router_ms = 0.0;
+        if (!llama_hybrid_profile_moe_router_point(
+                attn_desc, desc, cpu_backend, tokens, cpu_router_ms) ||
+            !llama_hybrid_profile_moe_router_point(
+                attn_desc, desc, phone_backend, tokens, phone_router_ms)) {
+            return false;
+        }
+
         for (const float requested_local_ratio :
              LLAMA_HYBRID_FFN_RATIO_PROBES) {
             const int64_t cpu_local_ff = llama_hybrid_ffn_shard_size(
@@ -3842,17 +3859,20 @@ bool llama_hybrid_profile_moe_ffn(
                         cpu_ms, cpu_runtime_bytes)) {
                     return false;
                 }
+                const double cpu_branch_ms = cpu_router_ms + cpu_ms;
                 profile.cpu_ffn.push_back({
                     tokens, cpu_ratio_eff, cpu_local_ff,
-                    cpu_ms, cpu_runtime_bytes
+                    cpu_branch_ms, cpu_runtime_bytes
                 });
                 LLAMA_LOG_INFO(
-                    "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_expert "
+                    "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_branch "
                     "tokens=%d topk=%" PRId64 " local_ratio=%.5f "
-                    "local_ff=%" PRId64 " ms=%.3f runtime_bytes=%zu\n",
+                    "local_ff=%" PRId64 " router_ms=%.3f expert_ms=%.3f "
+                    "total_ms=%.3f runtime_bytes=%zu\n",
                     ggml_backend_name(cpu_backend), tokens,
                     desc.n_expert_used, cpu_ratio_eff,
-                    cpu_local_ff, cpu_ms, cpu_runtime_bytes);
+                    cpu_local_ff, cpu_router_ms, cpu_ms,
+                    cpu_branch_ms, cpu_runtime_bytes);
             }
 
             const float pc_ratio_for_phone =
@@ -3873,17 +3893,20 @@ bool llama_hybrid_profile_moe_ffn(
                         phone_ms, phone_runtime_bytes)) {
                     return false;
                 }
+                const double phone_branch_ms = phone_router_ms + phone_ms;
                 profile.phone_ffn.push_back({
                     tokens, phone_ratio_eff, phone_local_ff,
-                    phone_ms, phone_runtime_bytes
+                    phone_branch_ms, phone_runtime_bytes
                 });
                 LLAMA_LOG_INFO(
-                    "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_expert "
+                    "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_branch "
                     "tokens=%d topk=%" PRId64 " local_ratio=%.5f "
-                    "local_ff=%" PRId64 " ms=%.3f runtime_bytes=%zu\n",
+                    "local_ff=%" PRId64 " router_ms=%.3f expert_ms=%.3f "
+                    "total_ms=%.3f runtime_bytes=%zu\n",
                     ggml_backend_name(phone_backend), tokens,
                     desc.n_expert_used, phone_ratio_eff,
-                    phone_local_ff, phone_ms, phone_runtime_bytes);
+                    phone_local_ff, phone_router_ms, phone_ms,
+                    phone_branch_ms, phone_runtime_bytes);
             }
         }
     }
@@ -4273,18 +4296,16 @@ static bool llama_hybrid_profile_moe_router_point(
 
     ggml_tensor * input = ggml_new_tensor_2d(
         ctx.get(), GGML_TYPE_F32, moe_desc.n_embd, tokens);
-    ggml_tensor * norm_w = ggml_new_tensor_1d(
-        ctx.get(), moe_desc.ffn_norm_type, moe_desc.n_embd);
     ggml_tensor * router_w = ggml_new_tensor_2d(
         ctx.get(), moe_desc.router_type,
         moe_desc.n_embd, moe_desc.n_expert);
 
-    ggml_tensor * norm = ggml_rms_norm(
-        ctx.get(), input, attn_desc.rms_eps);
-    norm = ggml_mul(ctx.get(), norm, norm_w);
-
+    // Qwen3-MoE computes FFN norm once for the whole stage macro, then
+    // Router/Top-K per XT chunk.  Keep the per-chunk profile aligned with
+    // that execution and do not charge RMSNorm here.
+    GGML_UNUSED(attn_desc);
     ggml_tensor * logits = ggml_mul_mat(
-        ctx.get(), router_w, norm);
+        ctx.get(), router_w, input);
     ggml_tensor * probs = ggml_soft_max(
         ctx.get(), logits);
     ggml_tensor * selected = ggml_argsort_top_k(
@@ -4375,37 +4396,40 @@ bool llama_hybrid_profile_moe_full_layer(
                                  int tokens,
                                  double & total_ms) {
         double attn_ms = 0.0;
-        double router_ms = 0.0;
-        double expert_ms = 0.0;
+        double branch_ms = 0.0;
 
         if (!llama_hybrid_attn_cost(
-                attn_points, tokens, tokens, attn_ms) ||
-            !llama_hybrid_profile_moe_router_point(
-                attn_desc, moe_desc, backend, tokens, router_ms)) {
+                attn_points, tokens, tokens, attn_ms)) {
             return false;
         }
 
         if (expert_points != nullptr) {
+            // cpu_ffn/phone_ffn are MoE branch points here:
+            // Router + Top-K + expert compute + combine.
             if (!llama_hybrid_ffn_cost(
-                    *expert_points, tokens, 1.0f, expert_ms)) {
+                    *expert_points, tokens, 1.0f, branch_ms)) {
                 return false;
             }
         } else {
+            double router_ms = 0.0;
+            double expert_ms = 0.0;
             size_t expert_runtime_bytes = 0;
-            if (!llama_hybrid_profile_moe_ffn_point(
+            if (!llama_hybrid_profile_moe_router_point(
+                    attn_desc, moe_desc, backend, tokens, router_ms) ||
+                !llama_hybrid_profile_moe_ffn_point(
                     moe_desc, backend, backend_index, tokens, 1.0f,
                     expert_ms, expert_runtime_bytes)) {
                 return false;
             }
+            branch_ms = router_ms + expert_ms;
         }
 
-        total_ms = attn_ms + router_ms + expert_ms;
+        total_ms = attn_ms + branch_ms;
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_layer "
-            "tokens=%d attn_ms=%.3f router_ms=%.3f expert_ms=%.3f "
-            "total_ms=%.3f\n",
+            "tokens=%d attn_ms=%.3f branch_ms=%.3f total_ms=%.3f\n",
             ggml_backend_name(backend), tokens,
-            attn_ms, router_ms, expert_ms, total_ms);
+            attn_ms, branch_ms, total_ms);
         return true;
     };
 
@@ -5067,7 +5091,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             moe_desc.n_expert, moe_desc.n_expert_used);
 
         if (!llama_hybrid_profile_moe_ffn(
-                profile, moe_desc, cpu.get(), phone.get()) ||
+                profile, moe_desc, attn_desc, cpu.get(), phone.get()) ||
             !llama_hybrid_profile_moe_full_layer(
                 profile, attn_desc, moe_desc,
                 cpu.get(), phone.get(), gpu.get())) {
