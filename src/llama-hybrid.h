@@ -119,6 +119,8 @@ struct llama_hybrid_attn_desc {
 };
 
 struct llama_hybrid_profile {
+    bool is_moe = false;
+
     int probe_tokens           = 0;
     int reference_tokens       = 0;
     int probe_chunk_min_tokens = 0;
