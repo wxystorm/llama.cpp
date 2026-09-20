@@ -3823,12 +3823,15 @@ bool llama_hybrid_profile_moe_ffn(
     }
 
     for (const int tokens : chunk_tokens) {
+        std::set<int64_t> seen_cpu_ff;
+        std::set<int64_t> seen_phone_ff;
+
         for (const float requested_local_ratio :
              LLAMA_HYBRID_FFN_RATIO_PROBES) {
             const int64_t cpu_local_ff = llama_hybrid_ffn_shard_size(
                 desc.n_ff_exp, desc.down_exps_type,
                 requested_local_ratio, 0);
-            if (cpu_local_ff > 0) {
+            if (cpu_local_ff > 0 && seen_cpu_ff.insert(cpu_local_ff).second) {
                 const float cpu_ratio_eff =
                     (float) ((double) cpu_local_ff / (double) desc.n_ff_exp);
                 double cpu_ms = 0.0;
@@ -3858,7 +3861,7 @@ bool llama_hybrid_profile_moe_ffn(
                 llama_hybrid_ffn_shard_size(
                     desc.n_ff_exp, desc.down_exps_type,
                     pc_ratio_for_phone, 1);
-            if (phone_local_ff > 0) {
+            if (phone_local_ff > 0 && seen_phone_ff.insert(phone_local_ff).second) {
                 const float phone_ratio_eff =
                     (float) ((double) phone_local_ff /
                              (double) desc.n_ff_exp);
@@ -4367,22 +4370,33 @@ bool llama_hybrid_profile_moe_full_layer(
 
     const auto profile_one = [&](ggml_backend_t backend,
                                  const std::vector<llama_hybrid_attn_compute_point> & attn_points,
+                                 const std::vector<llama_hybrid_ffn_compute_point> * expert_points,
                                  int backend_index,
                                  int tokens,
                                  double & total_ms) {
         double attn_ms = 0.0;
         double router_ms = 0.0;
         double expert_ms = 0.0;
-        size_t expert_runtime_bytes = 0;
 
         if (!llama_hybrid_attn_cost(
                 attn_points, tokens, tokens, attn_ms) ||
             !llama_hybrid_profile_moe_router_point(
-                attn_desc, moe_desc, backend, tokens, router_ms) ||
-            !llama_hybrid_profile_moe_ffn_point(
-                moe_desc, backend, backend_index, tokens, 1.0f,
-                expert_ms, expert_runtime_bytes)) {
+                attn_desc, moe_desc, backend, tokens, router_ms)) {
             return false;
+        }
+
+        if (expert_points != nullptr) {
+            if (!llama_hybrid_ffn_cost(
+                    *expert_points, tokens, 1.0f, expert_ms)) {
+                return false;
+            }
+        } else {
+            size_t expert_runtime_bytes = 0;
+            if (!llama_hybrid_profile_moe_ffn_point(
+                    moe_desc, backend, backend_index, tokens, 1.0f,
+                    expert_ms, expert_runtime_bytes)) {
+                return false;
+            }
         }
 
         total_ms = attn_ms + router_ms + expert_ms;
@@ -4402,7 +4416,7 @@ bool llama_hybrid_profile_moe_full_layer(
 
         double cpu_ms = 0.0;
         if (!profile_one(
-                cpu_backend, profile.cpu_attn, 0,
+                cpu_backend, profile.cpu_attn, &profile.cpu_ffn, 0,
                 tokens, cpu_ms)) {
             return false;
         }
@@ -4415,7 +4429,7 @@ bool llama_hybrid_profile_moe_full_layer(
 
         double phone_ms = 0.0;
         if (!profile_one(
-                phone_backend, profile.phone_attn, 1,
+                phone_backend, profile.phone_attn, &profile.phone_ffn, 1,
                 tokens, phone_ms)) {
             return false;
         }
@@ -4427,9 +4441,6 @@ bool llama_hybrid_profile_moe_full_layer(
             profile.phone_full_layer_compute_est_ms = phone_ms;
         }
 
-        profile.phone_blocks.push_back({
-            1, tokens, tokens, phone_ms, phone_ms
-        });
     }
 
     if (gpu_backend != nullptr) {
@@ -4439,7 +4450,7 @@ bool llama_hybrid_profile_moe_full_layer(
             }
             double gpu_ms = 0.0;
             if (!profile_one(
-                    gpu_backend, profile.gpu_attn, 0,
+                    gpu_backend, profile.gpu_attn, nullptr, 0,
                     tokens, gpu_ms)) {
                 return false;
             }
