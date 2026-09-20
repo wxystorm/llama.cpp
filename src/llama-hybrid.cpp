@@ -1085,66 +1085,6 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
     }
 
     plan.pc_memory    = pc_memory;
-            plan.phone_memory = phone_memory;
-            plan.gpu_memory   = gpu_memory;
-            return true;
-        }
-
-        int tensor_macro_tokens = work_tokens;
-        if (cpu_pc_layers > 0) {
-            tensor_macro_tokens = std::min(work_tokens, plan.cpu_chunk_tokens);
-        } else if (gpu_layers > 0) {
-            tensor_macro_tokens = std::min(work_tokens, plan.gpu_chunk_tokens);
-        }
-        if (tensor_macro_tokens <= 0) {
-            return false;
-        }
-
-        size_t pc_tensor_attn_runtime = 0;
-        if (!llama_hybrid_attn_runtime_bytes(profile.cpu_attn, tensor_macro_tokens, attn_kv_tokens,
-                                              pc_tensor_attn_runtime)) {
-            return false;
-        }
-
-        const int chunk_tokens = std::min(tensor_macro_tokens, plan.tensor_chunk_tokens);
-        if (chunk_tokens <= 0) {
-            return false;
-        }
-        const int chunks = (tensor_macro_tokens + chunk_tokens - 1) / chunk_tokens;
-
-        size_t pc_ffn_runtime    = 0;
-        size_t phone_ffn_runtime = 0;
-        if (!llama_hybrid_ffn_runtime_bytes(profile.cpu_ffn, chunk_tokens, pc_ratio, pc_ffn_runtime) ||
-            !llama_hybrid_ffn_runtime_bytes(profile.phone_ffn, chunk_tokens, 1.0f - pc_ratio,
-                                             phone_ffn_runtime)) {
-            return false;
-        }
-
-        const size_t live_chunks = (size_t) std::min(chunks, 2);
-        if (profile.n_embd <= 0 || chunk_tokens <= 0 ||
-            (size_t) profile.n_embd > std::numeric_limits<size_t>::max() / (size_t) chunk_tokens / sizeof(float) /
-                                        live_chunks) {
-            return false;
-        }
-        const size_t transfer_runtime =
-            (size_t) profile.n_embd * (size_t) chunk_tokens * sizeof(float) * live_chunks;
-
-        size_t pc_ffn_stage = 0;
-        if (!llama_hybrid_add_bytes(pc_ffn_stage, pc_ffn_runtime) ||
-            !llama_hybrid_add_bytes(pc_ffn_stage, transfer_runtime) ||
-            !llama_hybrid_add_bytes(phone_memory, phone_ffn_runtime) ||
-            !llama_hybrid_add_bytes(phone_memory, transfer_runtime)) {
-            return false;
-        }
-
-        const size_t tensor_runtime_peak = std::max(pc_tensor_attn_runtime, pc_ffn_stage);
-        pc_runtime_peak                  = std::max(pc_runtime_peak, tensor_runtime_peak);
-        if (!llama_hybrid_add_bytes(pc_memory, pc_runtime_peak)) {
-            return false;
-        }
-    }
-
-    plan.pc_memory    = pc_memory;
     plan.phone_memory = phone_memory;
     plan.gpu_memory   = gpu_memory;
     return true;
