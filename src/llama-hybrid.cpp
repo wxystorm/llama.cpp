@@ -4382,11 +4382,15 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
     
-    constraints.fixed_tensor_layers      = 50;
+    /*constraints.fixed_tensor_layers      = 50;
     constraints.fixed_phone_layers       = 0;
     constraints.fixed_pc_layers          = 14;
     //constraints.fixed_tensor_pc_ratio     = 0.713f;
     constraints.fixed_gpu_pc_layers      = 14;
+    constraints.fixed_gpu_chunk_tokens    = 256;
+constraints.fixed_cpu_chunk_tokens    = 4;
+constraints.fixed_tensor_chunk_tokens = 32;
+constraints.fixed_phone_chunk_tokens  = 4;*/
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
