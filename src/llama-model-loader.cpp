@@ -902,6 +902,62 @@ bool llama_model_loader::get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & 
     desc.weight_bytes = ggml_nbytes(ffn_norm) + ggml_nbytes(gate) + ggml_nbytes(up) + ggml_nbytes(down);
     return true;
 }
+bool llama_model_loader::get_hybrid_moe_desc(int layer, llama_hybrid_moe_desc & desc) {
+    if (layer < 0 || get_arch() != LLM_ARCH_QWEN3MOE) {
+        return false;
+    }
+
+    const LLM_TN tn(get_arch());
+    const ggml_tensor * ffn_norm = get_tensor_meta(tn(LLM_TENSOR_FFN_NORM, "weight", layer).str().c_str());
+    const ggml_tensor * router   = get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_INP, "weight", layer).str().c_str());
+    const ggml_tensor * gate     = get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", layer).str().c_str());
+    const ggml_tensor * up       = get_tensor_meta(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", layer).str().c_str());
+    const ggml_tensor * down     = get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", layer).str().c_str());
+    if (ffn_norm == nullptr || router == nullptr || gate == nullptr || up == nullptr || down == nullptr) {
+        return false;
+    }
+
+    if (ggml_n_dims(ffn_norm) != 1 || ggml_n_dims(router) != 2 ||
+        ggml_n_dims(gate) != 3 || ggml_n_dims(up) != 3 || ggml_n_dims(down) != 3) {
+        return false;
+    }
+
+    const int64_t n_embd   = router->ne[0];
+    const int64_t n_expert = router->ne[1];
+    const int64_t n_ff_exp = gate->ne[1];
+
+    if (n_embd <= 0 || n_expert <= 0 || n_ff_exp <= 0 ||
+        ffn_norm->ne[0] != n_embd ||
+        gate->ne[0] != n_embd || up->ne[0] != n_embd ||
+        gate->ne[1] != up->ne[1] || gate->ne[2] != n_expert || up->ne[2] != n_expert ||
+        down->ne[0] != n_ff_exp || down->ne[1] != n_embd || down->ne[2] != n_expert) {
+        return false;
+    }
+
+    uint32_t n_expert_used = 0;
+    if (!get_key(LLM_KV_EXPERT_USED_COUNT, n_expert_used, false) ||
+        n_expert_used == 0 || n_expert_used > (uint32_t) n_expert) {
+        return false;
+    }
+
+    desc = {};
+    desc.n_embd        = n_embd;
+    desc.n_ff_exp      = n_ff_exp;
+    desc.n_expert      = n_expert;
+    desc.n_expert_used = n_expert_used;
+
+    desc.ffn_norm_type  = ffn_norm->type;
+    desc.router_type    = router->type;
+    desc.gate_exps_type = gate->type;
+    desc.up_exps_type   = up->type;
+    desc.down_exps_type = down->type;
+
+    desc.router_weight_bytes = ggml_nbytes(router);
+    desc.expert_weight_bytes = ggml_nbytes(gate) + ggml_nbytes(up) + ggml_nbytes(down);
+    desc.weight_bytes = ggml_nbytes(ffn_norm) + desc.router_weight_bytes + desc.expert_weight_bytes;
+    return true;
+}
+
 bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc & desc) {
     if (layer < 0) {
         return false;
