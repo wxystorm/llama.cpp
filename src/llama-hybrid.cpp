@@ -1997,6 +1997,52 @@ static int llama_hybrid_topology_family(const llama_hybrid_plan & plan) {
            (plan.phone_layers > 0 ? 1 : 0);
 }
 
+static bool llama_hybrid_coarse_memory_possible(
+        const llama_hybrid_profile &     profile,
+        const llama_hybrid_constraints & constraints,
+        const llama_hybrid_plan &        base_plan) {
+    llama_hybrid_plan probe = base_plan;
+
+    // Use the smallest stage macros as a lower-bound activation footprint.
+    // If even this version does not fit, no later XG/XC/XP expansion can make
+    // the topology feasible. Fixed chunk constraints must still be honored.
+    probe.gpu_chunk_tokens =
+        constraints.fixed_gpu_chunk_tokens.value_or(4);
+    probe.cpu_chunk_tokens =
+        constraints.fixed_cpu_chunk_tokens.value_or(4);
+    probe.phone_chunk_tokens =
+        constraints.fixed_phone_chunk_tokens.value_or(4);
+
+    probe.predicted_tensor_peak_bytes = 0;
+    probe.predicted_phone_peak_bytes  = 0;
+
+    if (!llama_hybrid_estimate_plan_memory(profile, constraints, probe)) {
+        return false;
+    }
+
+    const size_t pc_budget = llama_hybrid_effective_budget(
+        constraints.pc_memory_budget, profile.pc_free_mem,
+        LLAMA_HYBRID_PC_MEMORY_FRACTION);
+    const size_t phone_budget = llama_hybrid_effective_budget(
+        constraints.phone_memory_budget, profile.phone_free_mem,
+        LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+    const size_t gpu_budget = llama_hybrid_effective_budget(
+        constraints.gpu_memory_budget, profile.gpu_free_mem,
+        LLAMA_HYBRID_GPU_MEMORY_FRACTION);
+
+    if (pc_budget > 0 && probe.pc_memory > pc_budget) {
+        return false;
+    }
+    if (phone_budget > 0 && probe.phone_memory > phone_budget) {
+        return false;
+    }
+    if (probe.gpu_pc_layers > 0 &&
+        (gpu_budget == 0 || probe.gpu_memory > gpu_budget)) {
+        return false;
+    }
+    return true;
+}
+
 static bool llama_hybrid_coarse_plan_score(
         const llama_hybrid_lp_model & model,
         const llama_hybrid_plan &    plan,
@@ -2112,10 +2158,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     std::vector<llama_hybrid_coarse_candidate> margin_pool;
 
     double best_coarse = std::numeric_limits<double>::infinity();
-    size_t total_candidates = 0;
-    size_t coarse_scoreable  = 0;
-    size_t reject_chunks     = 0;
-    size_t ratio_evals       = 0;
+    size_t total_candidates      = 0;
+    size_t coarse_scoreable       = 0;
+    size_t reject_chunks          = 0;
+    size_t reject_coarse_memory   = 0;
+    size_t ratio_evals            = 0;
 
     for (const int chunk_tokens : chunk_token_candidates) {
         if (chunk_tokens <= 0 || chunk_tokens > score_tokens) {
@@ -2251,6 +2298,12 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                         plan.gpu_pc_layers       = gpu_layers;
                         plan.tensor_chunk_tokens = chunk_tokens;
 
+                        if (!llama_hybrid_coarse_memory_possible(
+                                profile, constraints, plan)) {
+                            ++reject_coarse_memory;
+                            continue;
+                        }
+
                         double coarse_ms = 0.0;
                         if (!llama_hybrid_coarse_plan_score(
                                 coarse_model, plan, gpu_lane_ms,
@@ -2318,13 +2371,14 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     LLAMA_LOG_ERROR(
         "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d max_tensor_chunks=%d pc_budget=%zu "
         "phone_budget=%zu gpu_budget=%zu gpu_runtime_reserve=%zu total=%zu coarse_scoreable=%zu kept=%zu "
-        "reject_chunks=%zu ratio_evals=%zu best_coarse_ms=%.3f family_top_k=%zu global_top_k=%zu "
-        "margin_pool=%zu margin=%.2f\n",
+        "reject_chunks=%zu reject_coarse_memory=%zu ratio_evals=%zu best_coarse_ms=%.3f "
+        "family_top_k=%zu global_top_k=%zu margin_pool=%zu margin=%.2f\n",
         constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train,
         constraints.target_ubatch_tokens > 0 ? constraints.target_ubatch_tokens : profile.probe_tokens,
         profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS,
         constraints.max_tensor_chunks, pc_budget, phone_budget, gpu_budget, constraints.gpu_runtime_reserve_bytes,
-        total_candidates, coarse_scoreable, result.size(), reject_chunks, ratio_evals,
+        total_candidates, coarse_scoreable, result.size(), reject_chunks,
+        reject_coarse_memory, ratio_evals,
         std::isfinite(best_coarse) ? best_coarse : 0.0,
         LLAMA_HYBRID_COARSE_FAMILY_TOP_K, LLAMA_HYBRID_COARSE_GLOBAL_TOP_K,
         LLAMA_HYBRID_COARSE_MARGIN_POOL, LLAMA_HYBRID_COARSE_MARGIN);
