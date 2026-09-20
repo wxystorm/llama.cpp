@@ -944,7 +944,7 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
     }
 
     const int cpu_pc_layers = pc_layers - gpu_layers;
-    if (tensor_layers > 0 || cpu_pc_layers > 0) {
+    if (tensor_layers > 0 || cpu_pc_layers > 0 || phone_layers > 0) {
         const int work_tokens = constraints.target_ubatch_tokens > 0 ?
             constraints.target_ubatch_tokens : profile.probe_tokens;
         if (work_tokens <= 0) {
@@ -957,7 +957,8 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
         }
         attn_kv_tokens = std::max(attn_kv_tokens, work_tokens);
 
-        size_t pc_runtime_peak = 0;
+        size_t pc_runtime_peak    = 0;
+        size_t phone_runtime_peak = 0;
 
         if (cpu_pc_layers > 0) {
             const int cpu_tokens = std::min(work_tokens, plan.cpu_chunk_tokens);
@@ -967,19 +968,123 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
 
             size_t pc_cpu_attn_runtime = 0;
             size_t pc_full_ffn_runtime = 0;
-            if (!llama_hybrid_attn_runtime_bytes(profile.cpu_attn, cpu_tokens, attn_kv_tokens,
-                                                  pc_cpu_attn_runtime) ||
-                !llama_hybrid_ffn_runtime_bytes(profile.cpu_ffn, cpu_tokens, 1.0f, pc_full_ffn_runtime)) {
+            if (!llama_hybrid_attn_runtime_bytes(
+                    profile.cpu_attn, cpu_tokens, attn_kv_tokens,
+                    pc_cpu_attn_runtime) ||
+                !llama_hybrid_ffn_runtime_bytes(
+                    profile.cpu_ffn, cpu_tokens, 1.0f,
+                    pc_full_ffn_runtime)) {
                 return false;
             }
-            pc_runtime_peak = std::max(pc_cpu_attn_runtime, pc_full_ffn_runtime);
+            pc_runtime_peak = std::max(
+                pc_runtime_peak,
+                std::max(pc_cpu_attn_runtime, pc_full_ffn_runtime));
         }
 
-        if (tensor_layers == 0) {
-            if (!llama_hybrid_add_bytes(pc_memory, pc_runtime_peak)) {
+        if (tensor_layers > 0) {
+            int tensor_macro_tokens = work_tokens;
+            if (cpu_pc_layers > 0) {
+                tensor_macro_tokens =
+                    std::min(work_tokens, plan.cpu_chunk_tokens);
+            } else if (gpu_layers > 0) {
+                tensor_macro_tokens =
+                    std::min(work_tokens, plan.gpu_chunk_tokens);
+            }
+            if (tensor_macro_tokens <= 0) {
                 return false;
             }
-            plan.pc_memory    = pc_memory;
+
+            size_t pc_tensor_attn_runtime = 0;
+            if (!llama_hybrid_attn_runtime_bytes(
+                    profile.cpu_attn, tensor_macro_tokens,
+                    attn_kv_tokens, pc_tensor_attn_runtime)) {
+                return false;
+            }
+
+            const int chunk_tokens =
+                std::min(tensor_macro_tokens, plan.tensor_chunk_tokens);
+            if (chunk_tokens <= 0) {
+                return false;
+            }
+            const int chunks =
+                (tensor_macro_tokens + chunk_tokens - 1) / chunk_tokens;
+
+            size_t pc_ffn_runtime    = 0;
+            size_t phone_ffn_runtime = 0;
+            if (!llama_hybrid_ffn_runtime_bytes(
+                    profile.cpu_ffn, chunk_tokens, pc_ratio,
+                    pc_ffn_runtime) ||
+                !llama_hybrid_ffn_runtime_bytes(
+                    profile.phone_ffn, chunk_tokens,
+                    1.0f - pc_ratio, phone_ffn_runtime)) {
+                return false;
+            }
+
+            const size_t live_chunks =
+                (size_t) std::min(chunks, 2);
+            if (profile.n_embd <= 0 || chunk_tokens <= 0 ||
+                (size_t) profile.n_embd >
+                    std::numeric_limits<size_t>::max() /
+                    (size_t) chunk_tokens / sizeof(float) /
+                    live_chunks) {
+                return false;
+            }
+            const size_t transfer_runtime =
+                (size_t) profile.n_embd *
+                (size_t) chunk_tokens *
+                sizeof(float) * live_chunks;
+
+            size_t pc_ffn_stage = 0;
+            size_t phone_ffn_stage = 0;
+            if (!llama_hybrid_add_bytes(
+                    pc_ffn_stage, pc_ffn_runtime) ||
+                !llama_hybrid_add_bytes(
+                    pc_ffn_stage, transfer_runtime) ||
+                !llama_hybrid_add_bytes(
+                    phone_ffn_stage, phone_ffn_runtime) ||
+                !llama_hybrid_add_bytes(
+                    phone_ffn_stage, transfer_runtime)) {
+                return false;
+            }
+
+            const size_t tensor_pc_peak =
+                std::max(pc_tensor_attn_runtime, pc_ffn_stage);
+            pc_runtime_peak =
+                std::max(pc_runtime_peak, tensor_pc_peak);
+            phone_runtime_peak =
+                std::max(phone_runtime_peak, phone_ffn_stage);
+        }
+
+        if (phone_layers > 0) {
+            const int phone_tokens =
+                std::min(work_tokens, plan.phone_chunk_tokens);
+            if (phone_tokens <= 0) {
+                return false;
+            }
+
+            size_t phone_attn_runtime = 0;
+            size_t phone_full_ffn_runtime = 0;
+            if (!llama_hybrid_attn_runtime_bytes(
+                    profile.phone_attn, phone_tokens,
+                    attn_kv_tokens, phone_attn_runtime) ||
+                !llama_hybrid_ffn_runtime_bytes(
+                    profile.phone_ffn, phone_tokens, 1.0f,
+                    phone_full_ffn_runtime)) {
+                return false;
+            }
+            const size_t phone_stage_peak =
+                std::max(phone_attn_runtime, phone_full_ffn_runtime);
+            phone_runtime_peak =
+                std::max(phone_runtime_peak, phone_stage_peak);
+        }
+
+        if (!llama_hybrid_add_bytes(pc_memory, pc_runtime_peak) ||
+            !llama_hybrid_add_bytes(phone_memory, phone_runtime_peak)) {
+            return false;
+        }
+    }
+
+    plan.pc_memory    = pc_memory;
             plan.phone_memory = phone_memory;
             plan.gpu_memory   = gpu_memory;
             return true;
@@ -1574,47 +1679,93 @@ bool llama_hybrid_runtime_predict_tensor_compute(
         return false;
     }
 
-    const int attn_group_chunks = llama_hybrid_runtime_prefill_attn_group_chunks();
+    int attn_group_chunks = llama_hybrid_runtime_prefill_attn_group_chunks();
     double per_layer_attn_misc = 0.0;
     double per_layer_pc_ffn    = 0.0;
 
-    // Attention may use a coarser token group than Tensor FFN/return.
-    // Consecutive XT chunks are grouped only for Attention; misc and FFN
-    // stay XT-granular so the prediction reflects both larger Attention
-    // GEMMs and the fine-grained return pipeline.
-    for (size_t group_begin = 0; group_begin < chunks.size();
-         group_begin += (size_t) attn_group_chunks) {
-        const size_t group_end = std::min(
-            chunks.size(), group_begin + (size_t) attn_group_chunks);
-        int group_tokens = 0;
-        for (size_t ci = group_begin; ci < group_end; ++ci) {
-            group_tokens += chunks[ci];
-        }
-
-        double group_attn_ms = 0.0;
+    if (profile.is_moe) {
+        // Qwen3-MoE stage execution computes Attention and FFN norm once
+        // for the whole stage macro, then runs Router/Top-K/experts per XT.
+        // Keep the predictor aligned with that graph shape.
+        double macro_attn_ms = 0.0;
+        double macro_layer_base = 0.0;
+        double macro_attn_base = 0.0;
         if (!llama_hybrid_attn_cost(
-                profile.cpu_attn, group_tokens, kv_tokens, group_attn_ms)) {
+                profile.cpu_attn, tokens, kv_tokens, macro_attn_ms) ||
+            !llama_hybrid_layer_block_cost(
+                profile.cpu_layer_blocks, tokens, false,
+                macro_layer_base) ||
+            !llama_hybrid_attn_cost(
+                profile.cpu_attn, tokens, tokens,
+                macro_attn_base)) {
             return false;
         }
-        per_layer_attn_misc += group_attn_ms;
 
-        for (size_t ci = group_begin; ci < group_end; ++ci) {
-            const int chunk_tokens = chunks[ci];
-            double cpu_layer_base = 0.0;
-            double cpu_attn_base  = 0.0;
-            double chunk_pc_ffn   = 0.0;
-            if (!llama_hybrid_layer_block_cost(
-                    profile.cpu_layer_blocks, chunk_tokens, false, cpu_layer_base) ||
-                !llama_hybrid_attn_cost(
-                    profile.cpu_attn, chunk_tokens, chunk_tokens, cpu_attn_base) ||
-                !llama_hybrid_ffn_cost(
-                    profile.cpu_ffn, chunk_tokens, plan.tensor_pc_ratio, chunk_pc_ffn)) {
+        per_layer_attn_misc =
+            macro_attn_ms +
+            llama_hybrid_tensor_misc_cost(
+                profile, tokens,
+                macro_layer_base, macro_attn_base);
+
+        for (const int chunk_tokens : chunks) {
+            double chunk_pc_ffn = 0.0;
+            if (!llama_hybrid_ffn_cost(
+                    profile.cpu_ffn, chunk_tokens,
+                    plan.tensor_pc_ratio,
+                    chunk_pc_ffn)) {
                 return false;
             }
-
-            per_layer_attn_misc += llama_hybrid_tensor_misc_cost(
-                profile, chunk_tokens, cpu_layer_base, cpu_attn_base);
             per_layer_pc_ffn += chunk_pc_ffn;
+        }
+
+        // Attention is not XT-grouped in the Qwen3-MoE staged graph.
+        attn_group_chunks = (int) chunks.size();
+    } else {
+        // Dense Qwen2 keeps its existing attention-group / XT-granular
+        // accounting.
+        for (size_t group_begin = 0; group_begin < chunks.size();
+             group_begin += (size_t) attn_group_chunks) {
+            const size_t group_end = std::min(
+                chunks.size(), group_begin + (size_t) attn_group_chunks);
+            int group_tokens = 0;
+            for (size_t ci = group_begin; ci < group_end; ++ci) {
+                group_tokens += chunks[ci];
+            }
+
+            double group_attn_ms = 0.0;
+            if (!llama_hybrid_attn_cost(
+                    profile.cpu_attn, group_tokens, kv_tokens,
+                    group_attn_ms)) {
+                return false;
+            }
+            per_layer_attn_misc += group_attn_ms;
+
+            for (size_t ci = group_begin; ci < group_end; ++ci) {
+                const int chunk_tokens = chunks[ci];
+                double cpu_layer_base = 0.0;
+                double cpu_attn_base  = 0.0;
+                double chunk_pc_ffn   = 0.0;
+                if (!llama_hybrid_layer_block_cost(
+                        profile.cpu_layer_blocks,
+                        chunk_tokens, false,
+                        cpu_layer_base) ||
+                    !llama_hybrid_attn_cost(
+                        profile.cpu_attn,
+                        chunk_tokens, chunk_tokens,
+                        cpu_attn_base) ||
+                    !llama_hybrid_ffn_cost(
+                        profile.cpu_ffn, chunk_tokens,
+                        plan.tensor_pc_ratio,
+                        chunk_pc_ffn)) {
+                    return false;
+                }
+
+                per_layer_attn_misc +=
+                    llama_hybrid_tensor_misc_cost(
+                        profile, chunk_tokens,
+                        cpu_layer_base, cpu_attn_base);
+                per_layer_pc_ffn += chunk_pc_ffn;
+            }
         }
     }
 
@@ -1630,7 +1781,8 @@ bool llama_hybrid_runtime_predict_tensor_compute(
     prediction.tensor_layers       = plan.tensor_layers;
     prediction.tensor_chunk_tokens  = plan.tensor_chunk_tokens;
     prediction.attn_group_chunks    = attn_group_chunks;
-    prediction.attn_chunk_tokens    = plan.tensor_chunk_tokens * attn_group_chunks;
+    prediction.attn_chunk_tokens    = profile.is_moe ?
+        tokens : plan.tensor_chunk_tokens * attn_group_chunks;
     prediction.tensor_pc_ratio      = plan.tensor_pc_ratio;
     prediction.attn_misc_ms       = plan.tensor_layers * per_layer_attn_misc;
     prediction.pc_ffn_ms          = plan.tensor_layers * per_layer_pc_ffn;
@@ -5127,6 +5279,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
 
     llama_hybrid_profile profile;
+    profile.is_moe = is_qwen3_moe;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
         moe_desc.n_embd : ffn_desc.n_embd);
