@@ -99,7 +99,21 @@ static bool ggml_backend_meta_parse_prefill_norm_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "prefill_ffn_norm_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(
+            name,
+            "prefill_ffn_norm_chunk_%d-%d%n",
+            &chunk,
+            &layer,
+            &n) != 2) {
+        return false;
+    }
+
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_down_chunk(

@@ -1431,8 +1431,20 @@ static bool ggml_backend_rpc_prepare_graph_snapshot(
 }
 
 static bool rpc_is_prefill_external_input(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+
     static constexpr const char * prefix = "prefill_ffn_norm_chunk_";
-    return tensor != nullptr && std::strncmp(tensor->name, prefix, std::strlen(prefix)) == 0;
+    if (std::strncmp(tensor->name, prefix, std::strlen(prefix)) != 0) {
+        return false;
+    }
+
+    if (std::strstr(tensor->name, " (reshaped)") != nullptr) {
+        return false;
+    }
+
+    return true;
 }
 
 static void add_tensor(
