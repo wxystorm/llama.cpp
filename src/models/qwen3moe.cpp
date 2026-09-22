@@ -1,8 +1,6 @@
 #include "llama-hybrid.h"
 #include "models.h"
 
-#include <cstdlib>
-
 void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -150,10 +148,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             model.hybrid_layer_mode(il);
         const int planned_chunk_tokens =
             llama_hybrid_runtime_prefill_chunk_tokens();
-        const bool disable_chunked_moe =
-            std::getenv("LLAMA_DISABLE_CHUNKED_MOE") != nullptr;
         const bool use_prefill_chunked_moe =
-            !disable_chunked_moe &&
             n_tokens > 1 &&
             cur->ne[1] > 1 &&
             planned_chunk_tokens > 0 &&

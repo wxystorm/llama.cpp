@@ -92,7 +92,15 @@ static bool ggml_backend_meta_parse_decode_ffn_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "ffn_down_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "ffn_down_chunk_%d-%d%n", &chunk, &layer, &n) != 2) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_norm_chunk(
@@ -120,21 +128,45 @@ static bool ggml_backend_meta_parse_prefill_down_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "prefill_ffn_down_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "prefill_ffn_down_chunk_%d-%d%n", &chunk, &layer, &n) != 2) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "prefill_wave_ffn_inp_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "prefill_wave_ffn_inp_chunk_%d-%d%n", &chunk, &layer, &n) != 2) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "prefill_wave_attn_out_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "prefill_wave_attn_out_chunk_%d-%d%n", &chunk, &layer, &n) != 2) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_wave_attn_out_group(
@@ -142,16 +174,32 @@ static bool ggml_backend_meta_parse_prefill_wave_attn_out_group(
         int & chunk_begin,
         int & chunk_count,
         int & layer) {
-    return std::sscanf(
-        name, "prefill_wave_attn_out_group_%d_%d-%d",
-        &chunk_begin, &chunk_count, &layer) == 3;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(
+            name, "prefill_wave_attn_out_group_%d_%d-%d%n",
+            &chunk_begin, &chunk_count, &layer, &n) != 3) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 static bool ggml_backend_meta_parse_prefill_wave_l_out_chunk(
         const char * name,
         int & chunk,
         int & layer) {
-    return std::sscanf(name, "prefill_wave_l_out_chunk_%d-%d", &chunk, &layer) == 2;
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "prefill_wave_l_out_chunk_%d-%d%n", &chunk, &layer, &n) != 2) {
+        return false;
+    }
+    return name[n] == '\0';
 }
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {

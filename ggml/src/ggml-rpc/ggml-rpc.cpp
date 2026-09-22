@@ -1435,16 +1435,18 @@ static bool rpc_is_prefill_external_input(const ggml_tensor * tensor) {
         return false;
     }
 
-    static constexpr const char * prefix = "prefill_ffn_norm_chunk_";
-    if (std::strncmp(tensor->name, prefix, std::strlen(prefix)) != 0) {
+    int chunk = -1;
+    int layer = -1;
+    int n = 0;
+    if (std::sscanf(
+            tensor->name,
+            "prefill_ffn_norm_chunk_%d-%d%n",
+            &chunk,
+            &layer,
+            &n) != 2) {
         return false;
     }
-
-    if (std::strstr(tensor->name, " (reshaped)") != nullptr) {
-        return false;
-    }
-
-    return true;
+    return tensor->name[n] == '\0';
 }
 
 static void add_tensor(
@@ -2028,7 +2030,6 @@ private:
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
     std::mutex snapshot_breakdown_mutex;
-    std::recursive_mutex backend_op_mutex;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
 };
@@ -2149,8 +2150,6 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -2240,7 +2239,6 @@ bool rpc_server::set_tensor_direct(
         uint64_t offset,
         const void * data,
         size_t size) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2367,8 +2365,6 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 }
 
 bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2404,8 +2400,6 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 }
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2491,8 +2485,6 @@ bool rpc_server::snapshot_tensor_direct(
         ggml_tensor * tensor,
         uint64_t offset,
         uint64_t size) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     if (device >= backends.size() ||
         slot_id >= 2 ||
         tensor == nullptr ||
@@ -2650,8 +2642,6 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2749,8 +2739,6 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -2842,8 +2830,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -2878,8 +2864,6 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     if (request.device >= backends.size() || request.slot >= 2) {
         return false;
     }
@@ -2928,8 +2912,6 @@ bool rpc_server::graph_recompute_snapshot(
 }
 
 bool rpc_server::synchronize(uint32_t device) {
-    std::lock_guard<std::recursive_mutex> lock(backend_op_mutex);
-
     if (device >= backends.size()) {
         return false;
     }
