@@ -336,9 +336,11 @@ struct ggml_backend_rpc_buffer_type_context {
     uint64_t alloc_size_exact_hits       = 0;
     uint64_t alloc_size_structural_hits  = 0;
     uint64_t alloc_size_misses           = 0;
-    uint64_t alloc_size_exact_clears     = 0;
+    uint64_t alloc_size_exact_clears      = 0;
     uint64_t alloc_size_structural_clears = 0;
-    int64_t  alloc_size_miss_rpc_us      = 0;
+    uint64_t alloc_size_connection_resets = 0;
+    int64_t  alloc_size_miss_rpc_us       = 0;
+    const socket_t * alloc_size_cache_socket = nullptr;
 };
 
 struct rpc_graph_snapshot_context {
@@ -897,7 +899,8 @@ static void rpc_alloc_size_cache_log_locked(
         " misses=%" PRIu64 " saved_rpc=%" PRIu64
         " hit_rate=%.1f miss_rpc_ms=%.3f avg_miss_rpc_ms=%.3f"
         " exact_entries=%zu structural_entries=%zu"
-        " exact_clears=%" PRIu64 " structural_clears=%" PRIu64 "\n",
+        " exact_clears=%" PRIu64 " structural_clears=%" PRIu64
+        " connection_resets=%" PRIu64 "\n",
         ctx->device,
         ctx->alloc_size_lookups,
         ctx->alloc_size_exact_hits,
@@ -910,7 +913,8 @@ static void rpc_alloc_size_cache_log_locked(
         ctx->alloc_size_exact_cache.size(),
         ctx->alloc_size_structural_cache.size(),
         ctx->alloc_size_exact_clears,
-        ctx->alloc_size_structural_clears);
+        ctx->alloc_size_structural_clears,
+        ctx->alloc_size_connection_resets);
 }
 
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1450,6 +1454,9 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
+        auto sock = get_socket(buft_ctx->endpoint);
+        RPC_STATUS_ASSERT(sock != nullptr);
+
         const bool cache_enabled = rpc_alloc_size_cache_enabled();
         const bool structural_eligible =
             cache_enabled && rpc_alloc_size_structural_cache_eligible(request);
@@ -1463,6 +1470,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             }
 
             std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_cache_mutex);
+            if (buft_ctx->alloc_size_cache_socket != sock.get()) {
+                buft_ctx->alloc_size_exact_cache.clear();
+                buft_ctx->alloc_size_structural_cache.clear();
+                buft_ctx->alloc_size_cache_socket = sock.get();
+                buft_ctx->alloc_size_connection_resets += 1;
+            }
             buft_ctx->alloc_size_lookups += 1;
 
             auto exact_it = buft_ctx->alloc_size_exact_cache.find(exact_key);
@@ -1495,7 +1508,6 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             }
         }
 
-        auto sock = get_socket(buft_ctx->endpoint);
         rpc_msg_get_alloc_size_rsp response {};
         const int64_t rpc_begin_us = ggml_time_us();
         bool status = send_rpc_cmd(
