@@ -3538,6 +3538,49 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     tensor_prediction.pc_ffn_ms,
                     tensor_prediction.pc_compute_ms,
                     tensor_prediction.tensor_total_ms);
+
+                LLAMA_LOG_ERROR(
+                    "[PRED_TENSOR_PIPE_DETAIL] ub=%d chunks=%d "
+                    "h2d_sum_ms=%.3f pc_ffn_sum_ms=%.3f phone_sum_ms=%.3f d2h_sum_ms=%.3f "
+                    "h2d_finish_ms=%.3f pc_finish_ms=%.3f phone_finish_ms=%.3f "
+                    "return_finish_ms=%.3f reduce_tail_ms=%.3f pipeline_done_ms=%.3f "
+                    "overlap_saved_ms=%.3f\n",
+                    job.ubatch_id,
+                    tensor_prediction.tensor_chunks,
+                    tensor_prediction.pipeline_h2d_sum_ms,
+                    tensor_prediction.pipeline_pc_ffn_sum_ms,
+                    tensor_prediction.pipeline_phone_sum_ms,
+                    tensor_prediction.pipeline_d2h_sum_ms,
+                    tensor_prediction.pipeline_h2d_finish_ms,
+                    tensor_prediction.pipeline_pc_finish_ms,
+                    tensor_prediction.pipeline_phone_finish_ms,
+                    tensor_prediction.pipeline_return_finish_ms,
+                    tensor_prediction.pipeline_reduce_tail_ms,
+                    tensor_prediction.pipeline_done_ms,
+                    tensor_prediction.pipeline_overlap_saved_ms);
+
+                const auto actual_over_pred = [](double actual_ms, double pred_ms) {
+                    return pred_ms > 0.0 ? actual_ms / pred_ms : 0.0;
+                };
+                LLAMA_LOG_ERROR(
+                    "[PRED_TENSOR_ERROR] ub=%d actual_over_pred "
+                    "compute=%.3f pc_ffn=%.3f h2d=%.3f phone=%.3f d2h=%.3f\n",
+                    job.ubatch_id,
+                    actual_over_pred(
+                        tensor_stage_timing.compute_range_us / 1000.0,
+                        tensor_prediction.tensor_total_ms),
+                    actual_over_pred(
+                        profile.pc_ffn_us / 1000.0,
+                        tensor_prediction.pipeline_pc_ffn_sum_ms),
+                    actual_over_pred(
+                        profile.h2d_us / 1000.0,
+                        tensor_prediction.pipeline_h2d_sum_ms),
+                    actual_over_pred(
+                        profile.phone_us / 1000.0,
+                        tensor_prediction.pipeline_phone_sum_ms),
+                    actual_over_pred(
+                        profile.d2h_us / 1000.0,
+                        tensor_prediction.pipeline_d2h_sum_ms));
             }
             LLAMA_LOG_ERROR(
                 "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64 " lane_reuse_ms=%.3f "

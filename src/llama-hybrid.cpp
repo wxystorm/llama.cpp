@@ -1486,11 +1486,27 @@ static bool llama_hybrid_phone_block_cost(const llama_hybrid_profile & profile, 
     return true;
 }
 
+struct llama_hybrid_tensor_ffn_detail {
+    int    chunks            = 0;
+    double h2d_sum_ms        = 0.0;
+    double pc_ffn_sum_ms     = 0.0;
+    double phone_sum_ms      = 0.0;
+    double d2h_sum_ms        = 0.0;
+    double h2d_finish_ms     = 0.0;
+    double pc_finish_ms      = 0.0;
+    double phone_finish_ms   = 0.0;
+    double return_finish_ms  = 0.0;
+    double reduce_tail_ms    = 0.0;
+    double done_ms           = 0.0;
+    double overlap_saved_ms  = 0.0;
+};
+
 static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
                                          float                        pc_ratio,
                                          int                          total_tokens,
                                          int                          chunk_tokens,
-                                         double &                     result_ms) {
+                                         double &                     result_ms,
+                                         llama_hybrid_tensor_ffn_detail * detail = nullptr) {
     const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(total_tokens, chunk_tokens);
     if (chunks.empty()) {
         return false;
@@ -1504,6 +1520,11 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
     double h2d_available   = 0.0;
     double cpu_available   = 0.0;
     double phone_available = 0.0;
+
+    double h2d_sum_ms    = 0.0;
+    double cpu_sum_ms    = 0.0;
+    double phone_sum_ms  = 0.0;
+    double d2h_sum_ms    = 0.0;
 
     for (size_t i = 0; i < chunks.size(); ++i) {
         const int    tokens        = chunks[i];
@@ -1519,6 +1540,11 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
             !llama_hybrid_ffn_cost(profile.phone_ffn, tokens, 1.0f - pc_ratio, phone_ms)) {
             return false;
         }
+
+        h2d_sum_ms   += h2d_ms;
+        cpu_sum_ms   += cpu_ms;
+        phone_sum_ms += phone_ms;
+        d2h_sum_ms   += d2h_single_ms;
 
         h2d_available += h2d_ms;
         cpu_available += cpu_ms;
@@ -1564,6 +1590,25 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
     }
 
     result_ms = done_ms;
+
+    if (detail != nullptr) {
+        detail->chunks            = (int) chunks.size();
+        detail->h2d_sum_ms        = h2d_sum_ms;
+        detail->pc_ffn_sum_ms     = cpu_sum_ms;
+        detail->phone_sum_ms      = phone_sum_ms;
+        detail->d2h_sum_ms        = d2h_sum_ms;
+        detail->h2d_finish_ms     = h2d_available;
+        detail->pc_finish_ms      = cpu_available;
+        detail->phone_finish_ms   = phone_available;
+        detail->return_finish_ms  = return_wave_available;
+        detail->reduce_tail_ms    = profile.reduce_ms;
+        detail->done_ms           = done_ms;
+
+        const double serial_ms =
+            h2d_sum_ms + cpu_sum_ms + phone_sum_ms + d2h_sum_ms + profile.reduce_ms;
+        detail->overlap_saved_ms = std::max(0.0, serial_ms - done_ms);
+    }
+
     return true;
 }
 
@@ -1710,9 +1755,10 @@ bool llama_hybrid_runtime_predict_tensor_compute(
     }
 
     double per_layer_tensor_pipeline = 0.0;
+    llama_hybrid_tensor_ffn_detail pipeline_detail;
     if (!llama_hybrid_tensor_ffn_cost(
             profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens,
-            per_layer_tensor_pipeline)) {
+            per_layer_tensor_pipeline, &pipeline_detail)) {
         return false;
     }
 
@@ -1729,6 +1775,20 @@ bool llama_hybrid_runtime_predict_tensor_compute(
     prediction.pc_compute_ms      = prediction.attn_misc_ms + prediction.pc_ffn_ms;
     prediction.tensor_total_ms    =
         plan.tensor_layers * (per_layer_attn_misc + per_layer_tensor_pipeline);
+
+    const double tensor_layers = (double) plan.tensor_layers;
+    prediction.tensor_chunks             = pipeline_detail.chunks;
+    prediction.pipeline_h2d_sum_ms       = tensor_layers * pipeline_detail.h2d_sum_ms;
+    prediction.pipeline_pc_ffn_sum_ms    = tensor_layers * pipeline_detail.pc_ffn_sum_ms;
+    prediction.pipeline_phone_sum_ms     = tensor_layers * pipeline_detail.phone_sum_ms;
+    prediction.pipeline_d2h_sum_ms       = tensor_layers * pipeline_detail.d2h_sum_ms;
+    prediction.pipeline_h2d_finish_ms    = tensor_layers * pipeline_detail.h2d_finish_ms;
+    prediction.pipeline_pc_finish_ms     = tensor_layers * pipeline_detail.pc_finish_ms;
+    prediction.pipeline_phone_finish_ms  = tensor_layers * pipeline_detail.phone_finish_ms;
+    prediction.pipeline_return_finish_ms = tensor_layers * pipeline_detail.return_finish_ms;
+    prediction.pipeline_reduce_tail_ms   = tensor_layers * pipeline_detail.reduce_tail_ms;
+    prediction.pipeline_done_ms          = tensor_layers * pipeline_detail.done_ms;
+    prediction.pipeline_overlap_saved_ms = tensor_layers * pipeline_detail.overlap_saved_ms;
 
     return std::isfinite(prediction.attn_misc_ms) &&
            std::isfinite(prediction.pc_ffn_ms) &&

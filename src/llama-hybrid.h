@@ -201,6 +201,21 @@ struct llama_hybrid_tensor_compute_prediction {
     double pc_ffn_ms       = 0.0;
     double pc_compute_ms   = 0.0;
     double tensor_total_ms = 0.0;
+
+    // Detailed Tensor-Split FFN pipeline prediction. These are full-stage
+    // totals (already multiplied by tensor_layers), except tensor_chunks.
+    int    tensor_chunks             = 0;
+    double pipeline_h2d_sum_ms       = 0.0;
+    double pipeline_pc_ffn_sum_ms    = 0.0;
+    double pipeline_phone_sum_ms     = 0.0;
+    double pipeline_d2h_sum_ms       = 0.0;
+    double pipeline_h2d_finish_ms    = 0.0;
+    double pipeline_pc_finish_ms     = 0.0;
+    double pipeline_phone_finish_ms  = 0.0;
+    double pipeline_return_finish_ms = 0.0;
+    double pipeline_reduce_tail_ms   = 0.0;
+    double pipeline_done_ms          = 0.0;
+    double pipeline_overlap_saved_ms = 0.0;
 };
 
 struct llama_hybrid_full_prefill_prediction {
