@@ -72,10 +72,18 @@ static void ggml_alloc_size_trace_log(
         return;
     }
 
+    const double avg_remote_ms =
+        s.rpc_remote_calls > 0 ? (s.rpc_remote_us / 1000.0) / s.rpc_remote_calls : 0.0;
+    const double avg_mul_mat_id_ms =
+        s.rpc_mul_mat_id_calls > 0 ? (s.rpc_mul_mat_id_us / 1000.0) / s.rpc_mul_mat_id_calls : 0.0;
+    const double remote_wall_pct =
+        wall_us > 0 ? 100.0 * s.rpc_remote_us / wall_us : 0.0;
+
     GGML_LOG_ERROR(
         "[RPC_GET_ALLOC_SIZE_SUM] phase=%s wall_ms=%.3f calls=%" PRId64 " aggregate_ms=%.3f "
         "meta_calls=%" PRId64 " meta_ms=%.3f rpc_buft_calls=%" PRId64 " rpc_buft_ms=%.3f "
-        "remote_calls=%" PRId64 " remote_ms=%.3f mul_mat_id_calls=%" PRId64 " mul_mat_id_ms=%.3f "
+        "remote_calls=%" PRId64 " remote_ms=%.3f avg_remote_ms=%.3f remote_wall_pct=%.1f "
+        "mul_mat_id_calls=%" PRId64 " mul_mat_id_ms=%.3f avg_mul_mat_id_ms=%.3f "
         "flash_attn_calls=%" PRId64 " flash_attn_ms=%.3f quantized_calls=%" PRId64 " quantized_ms=%.3f "
         "max_rpc_buft_ms=%.3f max_remote_ms=%.3f\n",
         phase,
@@ -88,8 +96,11 @@ static void ggml_alloc_size_trace_log(
         s.rpc_buft_us / 1000.0,
         s.rpc_remote_calls,
         s.rpc_remote_us / 1000.0,
+        avg_remote_ms,
+        remote_wall_pct,
         s.rpc_mul_mat_id_calls,
         s.rpc_mul_mat_id_us / 1000.0,
+        avg_mul_mat_id_ms,
         s.rpc_flash_attn_calls,
         s.rpc_flash_attn_us / 1000.0,
         s.rpc_quantized_calls,
