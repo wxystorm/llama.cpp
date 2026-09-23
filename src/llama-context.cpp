@@ -1587,7 +1587,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 std::max<int64_t>(
                     0,
                     prepare_total_us - apply_mctx_us - graph_params_us -
-                        reuse_check_us - reuse_sync_us - graph_reset_us -
                         graph_build_us - graph_alloc_us - set_inputs_us) / 1000.0);
         }
 
