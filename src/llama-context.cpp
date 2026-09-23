@@ -1455,21 +1455,29 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
-    const int64_t prepare_total_begin_us = log_formal_prepare ? ggml_time_us() : 0;
-    int64_t apply_mctx_us = 0;
-    int64_t graph_params_us = 0;
-    int64_t graph_build_us = 0;
-    int64_t graph_alloc_us = 0;
-    int64_t set_inputs_us = 0;
+    const bool log_stage_prepare =
+        ubatch.n_tokens > 1 &&
+        stage != nullptr;
+    const bool log_prepare_breakdown = log_formal_prepare || log_stage_prepare;
+
+    const int64_t prepare_total_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
+    int64_t apply_mctx_us    = 0;
+    int64_t graph_params_us  = 0;
+    int64_t reuse_check_us   = 0;
+    int64_t reuse_sync_us    = 0;
+    int64_t graph_reset_us   = 0;
+    int64_t graph_build_us   = 0;
+    int64_t graph_alloc_us   = 0;
+    int64_t set_inputs_us    = 0;
     bool reused_graph = false;
 
-    const int64_t apply_mctx_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+    const int64_t apply_mctx_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     if (apply_mctx && mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    if (log_formal_prepare) {
+    if (log_prepare_breakdown) {
         apply_mctx_us = ggml_time_us() - apply_mctx_begin_us;
     }
 
@@ -1477,11 +1485,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const int64_t graph_params_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+    const int64_t graph_params_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     auto gparams = graph_params(res, ubatch, mctx, gtype, sched_use);
-    if (log_formal_prepare) {
-        graph_params_us = ggml_time_us() - graph_params_begin_us;
-    }
     if (stage != nullptr) {
         const int n_layer = model.hparams.n_layer();
         GGML_ASSERT(stage->layer_begin >= 0);
@@ -1494,26 +1499,43 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         gparams.hybrid_output_head  = stage->layer_end == n_layer;
         gparams.hybrid_wave_probe   = stage->wave_probe;
     }
+    if (log_prepare_breakdown) {
+        graph_params_us = ggml_time_us() - graph_params_begin_us;
+    }
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const int64_t reuse_check_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
+    const bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
+    if (log_prepare_breakdown) {
+        reuse_check_us = ggml_time_us() - reuse_check_begin_us;
+    }
+
+    if (can_reuse_graph) {
         reused_graph = true;
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
+            const int64_t reuse_sync_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
             ggml_backend_sched_synchronize(sched_use);
+            if (log_prepare_breakdown) {
+                reuse_sync_us = ggml_time_us() - reuse_sync_begin_us;
+            }
         }
 
         n_reused++;
     } else {
+        const int64_t graph_reset_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         res->reset();
 
         ggml_backend_sched_reset(sched_use);
         ggml_backend_sched_set_eval_callback(sched_use, cparams.cb_eval, cparams.cb_eval_user_data);
+        if (log_prepare_breakdown) {
+            graph_reset_us = ggml_time_us() - graph_reset_begin_us;
+        }
 
-        const int64_t graph_build_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+        const int64_t graph_build_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
-        if (log_formal_prepare) {
+        if (log_prepare_breakdown) {
             graph_build_us = ggml_time_us() - graph_build_begin_us;
         }
 
@@ -1523,47 +1545,83 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
-        const int64_t graph_alloc_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+        const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        if (log_formal_prepare) {
+        if (log_prepare_breakdown) {
             graph_alloc_us = ggml_time_us() - graph_alloc_begin_us;
         }
     }
 
     // set the input data for the input tensors
     {
-        const int64_t set_inputs_begin_us = log_formal_prepare ? ggml_time_us() : 0;
+        const int64_t set_inputs_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        if (log_formal_prepare) {
+        if (log_prepare_breakdown) {
             set_inputs_us = ggml_time_us() - set_inputs_begin_us;
         }
     }
 
-    if (log_formal_prepare) {
+    if (log_prepare_breakdown) {
         const int64_t prepare_total_us = ggml_time_us() - prepare_total_begin_us;
-        LLAMA_LOG_ERROR(
-            "[FORMAL_PREPARE_BREAKDOWN] tokens=%u reused=%d total_ms=%.3f "
-            "apply_mctx_ms=%.3f graph_params_ms=%.3f build_graph_ms=%.3f "
-            "alloc_graph_ms=%.3f set_inputs_ms=%.3f unaccounted_ms=%.3f\n",
-            ubatch.n_tokens,
-            reused_graph ? 1 : 0,
-            prepare_total_us / 1000.0,
-            apply_mctx_us / 1000.0,
-            graph_params_us / 1000.0,
-            graph_build_us / 1000.0,
-            graph_alloc_us / 1000.0,
-            set_inputs_us / 1000.0,
-            std::max<int64_t>(
-                0,
-                prepare_total_us - apply_mctx_us - graph_params_us -
-                    graph_build_us - graph_alloc_us - set_inputs_us) / 1000.0);
+
+        if (log_formal_prepare) {
+            LLAMA_LOG_ERROR(
+                "[FORMAL_PREPARE_BREAKDOWN] tokens=%u reused=%d total_ms=%.3f "
+                "apply_mctx_ms=%.3f graph_params_ms=%.3f build_graph_ms=%.3f "
+                "alloc_graph_ms=%.3f set_inputs_ms=%.3f unaccounted_ms=%.3f\n",
+                ubatch.n_tokens,
+                reused_graph ? 1 : 0,
+                prepare_total_us / 1000.0,
+                apply_mctx_us / 1000.0,
+                graph_params_us / 1000.0,
+                graph_build_us / 1000.0,
+                graph_alloc_us / 1000.0,
+                set_inputs_us / 1000.0,
+                std::max<int64_t>(
+                    0,
+                    prepare_total_us - apply_mctx_us - graph_params_us -
+                        reuse_check_us - reuse_sync_us - graph_reset_us -
+                        graph_build_us - graph_alloc_us - set_inputs_us) / 1000.0);
+        }
+
+        if (log_stage_prepare) {
+            const int graph_nodes = gf != nullptr ? ggml_graph_n_nodes(gf) : 0;
+            const int graph_splits = ggml_backend_sched_get_n_splits(sched_use);
+            const int64_t accounted_us =
+                apply_mctx_us + graph_params_us + reuse_check_us + reuse_sync_us +
+                graph_reset_us + graph_build_us + graph_alloc_us + set_inputs_us;
+            LLAMA_LOG_ERROR(
+                "[STAGE_PREPARE_BREAKDOWN] stage=%s layers=[%d,%d) tokens=%u outputs=%d "
+                "reused=%d nodes=%d splits=%d total_ms=%.3f "
+                "apply_mctx_ms=%.3f graph_params_ms=%.3f reuse_check_ms=%.3f "
+                "reuse_sync_ms=%.3f reset_ms=%.3f build_graph_ms=%.3f "
+                "alloc_graph_ms=%.3f set_inputs_ms=%.3f unaccounted_ms=%.3f\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin,
+                stage->layer_end,
+                ubatch.n_tokens,
+                n_outputs,
+                reused_graph ? 1 : 0,
+                graph_nodes,
+                graph_splits,
+                prepare_total_us / 1000.0,
+                apply_mctx_us / 1000.0,
+                graph_params_us / 1000.0,
+                reuse_check_us / 1000.0,
+                reuse_sync_us / 1000.0,
+                graph_reset_us / 1000.0,
+                graph_build_us / 1000.0,
+                graph_alloc_us / 1000.0,
+                set_inputs_us / 1000.0,
+                std::max<int64_t>(0, prepare_total_us - accounted_us) / 1000.0);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
