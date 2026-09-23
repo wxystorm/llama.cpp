@@ -31,6 +31,73 @@
 
 // backend buffer type
 
+struct ggml_alloc_size_trace_stats {
+    int64_t calls                    = 0;
+    int64_t aggregate_us             = 0;
+    int64_t meta_calls               = 0;
+    int64_t meta_us                  = 0;
+    int64_t rpc_buft_calls           = 0;
+    int64_t rpc_buft_us              = 0;
+    int64_t rpc_remote_calls         = 0;
+    int64_t rpc_remote_us            = 0;
+    int64_t rpc_mul_mat_id_calls     = 0;
+    int64_t rpc_mul_mat_id_us        = 0;
+    int64_t rpc_flash_attn_calls     = 0;
+    int64_t rpc_flash_attn_us        = 0;
+    int64_t rpc_quantized_calls      = 0;
+    int64_t rpc_quantized_us         = 0;
+    int64_t max_rpc_buft_us          = 0;
+    int64_t max_rpc_remote_us        = 0;
+};
+
+static thread_local bool ggml_alloc_size_trace_active = false;
+static thread_local ggml_alloc_size_trace_stats ggml_alloc_size_trace_current {};
+
+static void ggml_alloc_size_trace_begin() {
+    ggml_alloc_size_trace_current = {};
+    ggml_alloc_size_trace_active = true;
+}
+
+static ggml_alloc_size_trace_stats ggml_alloc_size_trace_end() {
+    ggml_alloc_size_trace_active = false;
+    return ggml_alloc_size_trace_current;
+}
+
+static void ggml_alloc_size_trace_log(
+        const char * phase,
+        int64_t wall_us,
+        const ggml_alloc_size_trace_stats & s) {
+    const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
+    if (!timing_debug && wall_us < 10000 && s.rpc_remote_calls == 0) {
+        return;
+    }
+
+    GGML_LOG_ERROR(
+        "[RPC_GET_ALLOC_SIZE_SUM] phase=%s wall_ms=%.3f calls=%" PRId64 " aggregate_ms=%.3f "
+        "meta_calls=%" PRId64 " meta_ms=%.3f rpc_buft_calls=%" PRId64 " rpc_buft_ms=%.3f "
+        "remote_calls=%" PRId64 " remote_ms=%.3f mul_mat_id_calls=%" PRId64 " mul_mat_id_ms=%.3f "
+        "flash_attn_calls=%" PRId64 " flash_attn_ms=%.3f quantized_calls=%" PRId64 " quantized_ms=%.3f "
+        "max_rpc_buft_ms=%.3f max_remote_ms=%.3f\n",
+        phase,
+        wall_us / 1000.0,
+        s.calls,
+        s.aggregate_us / 1000.0,
+        s.meta_calls,
+        s.meta_us / 1000.0,
+        s.rpc_buft_calls,
+        s.rpc_buft_us / 1000.0,
+        s.rpc_remote_calls,
+        s.rpc_remote_us / 1000.0,
+        s.rpc_mul_mat_id_calls,
+        s.rpc_mul_mat_id_us / 1000.0,
+        s.rpc_flash_attn_calls,
+        s.rpc_flash_attn_us / 1000.0,
+        s.rpc_quantized_calls,
+        s.rpc_quantized_us / 1000.0,
+        s.max_rpc_buft_us / 1000.0,
+        s.max_rpc_remote_us / 1000.0);
+}
+
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->iface.get_name(buft);
@@ -61,13 +128,67 @@ size_t ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 
 size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     GGML_ASSERT(buft);
+
+    const bool trace = ggml_alloc_size_trace_active;
+    const int64_t begin_us = trace ? ggml_time_us() : 0;
+
     // get_alloc_size is optional, defaults to ggml_nbytes
+    size_t size = ggml_nbytes(tensor);
     if (buft->iface.get_alloc_size) {
-        size_t size = buft->iface.get_alloc_size(buft, tensor);
+        size = buft->iface.get_alloc_size(buft, tensor);
         assert(size >= ggml_nbytes(tensor));
-        return size;
     }
-    return ggml_nbytes(tensor);
+
+    if (trace) {
+        const int64_t elapsed_us = ggml_time_us() - begin_us;
+        auto & s = ggml_alloc_size_trace_current;
+        s.calls += 1;
+        s.aggregate_us += elapsed_us;
+
+        const char * buft_name = ggml_backend_buft_name(buft);
+        const bool is_meta = strncmp(buft_name, "Meta(", 5) == 0;
+        const bool is_rpc  = strncmp(buft_name, "RPC", 3) == 0;
+
+        if (is_meta) {
+            s.meta_calls += 1;
+            s.meta_us += elapsed_us;
+        }
+
+        if (is_rpc) {
+            s.rpc_buft_calls += 1;
+            s.rpc_buft_us += elapsed_us;
+            s.max_rpc_buft_us = std::max(s.max_rpc_buft_us, elapsed_us);
+
+            const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+            const bool is_flash_attn = tensor->op == GGML_OP_FLASH_ATTN_EXT;
+            const bool is_quantized_special =
+                ggml_is_quantized(tensor->type) &&
+                (tensor->ne[0] % 512 != 0) &&
+                tensor->view_src == nullptr;
+            const bool is_remote_query =
+                is_mul_mat_id || is_flash_attn || is_quantized_special;
+
+            if (is_remote_query) {
+                s.rpc_remote_calls += 1;
+                s.rpc_remote_us += elapsed_us;
+                s.max_rpc_remote_us = std::max(s.max_rpc_remote_us, elapsed_us);
+            }
+            if (is_mul_mat_id) {
+                s.rpc_mul_mat_id_calls += 1;
+                s.rpc_mul_mat_id_us += elapsed_us;
+            }
+            if (is_flash_attn) {
+                s.rpc_flash_attn_calls += 1;
+                s.rpc_flash_attn_us += elapsed_us;
+            }
+            if (is_quantized_special) {
+                s.rpc_quantized_calls += 1;
+                s.rpc_quantized_us += elapsed_us;
+            }
+        }
+    }
+
+    return size;
 }
 
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
@@ -1535,9 +1656,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     int64_t first_alloc_us = 0;
     if (!backend_ids_changed) {
         first_alloc_attempted = true;
+        ggml_alloc_size_trace_begin();
         const int64_t first_alloc_begin_us = ggml_time_us();
         first_alloc_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
         first_alloc_us = ggml_time_us() - first_alloc_begin_us;
+        const auto first_alloc_trace = ggml_alloc_size_trace_end();
+        ggml_alloc_size_trace_log("first_alloc", first_alloc_us, first_alloc_trace);
     }
 
     const bool need_realloc = backend_ids_changed || !first_alloc_ok;
@@ -1575,14 +1699,20 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
         sync_us = ggml_time_us() - sync_begin_us;
 
+        ggml_alloc_size_trace_begin();
         const int64_t reserve_begin_us = ggml_time_us();
         reserve_ok = ggml_gallocr_reserve_n(
             sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         reserve_us = ggml_time_us() - reserve_begin_us;
+        const auto reserve_trace = ggml_alloc_size_trace_end();
+        ggml_alloc_size_trace_log("reserve", reserve_us, reserve_trace);
 
+        ggml_alloc_size_trace_begin();
         const int64_t second_alloc_begin_us = ggml_time_us();
         second_alloc_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
         second_alloc_us = ggml_time_us() - second_alloc_begin_us;
+        const auto second_alloc_trace = ggml_alloc_size_trace_end();
+        ggml_alloc_size_trace_log("second_alloc", second_alloc_us, second_alloc_trace);
         if (!second_alloc_ok) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
         }
