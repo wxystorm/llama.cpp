@@ -322,6 +322,23 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+
+    // RPC GET_ALLOC_SIZE is called repeatedly by gallocr for the same logical
+    // allocation request. Keep two bounded caches:
+    //   exact:      includes tensor identities and catches reserve/alloc repeats;
+    //   structural: ignores graph-local identities and catches equal op/shape
+    //               requests across layers/chunks.
+    std::mutex alloc_size_cache_mutex;
+    std::unordered_map<std::string, size_t> alloc_size_exact_cache;
+    std::unordered_map<std::string, size_t> alloc_size_structural_cache;
+
+    uint64_t alloc_size_lookups          = 0;
+    uint64_t alloc_size_exact_hits       = 0;
+    uint64_t alloc_size_structural_hits  = 0;
+    uint64_t alloc_size_misses           = 0;
+    uint64_t alloc_size_exact_clears     = 0;
+    uint64_t alloc_size_structural_clears = 0;
+    int64_t  alloc_size_miss_rpc_us      = 0;
 };
 
 struct rpc_graph_snapshot_context {
@@ -800,6 +817,100 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
+}
+
+static constexpr size_t RPC_ALLOC_SIZE_EXACT_CACHE_MAX      = 16384;
+static constexpr size_t RPC_ALLOC_SIZE_STRUCTURAL_CACHE_MAX = 4096;
+static constexpr uint64_t RPC_ALLOC_SIZE_CACHE_LOG_INTERVAL = 512;
+
+static std::string rpc_alloc_size_key_bytes(const rpc_msg_get_alloc_size_req & request) {
+    return std::string(
+        reinterpret_cast<const char *>(&request),
+        sizeof(request));
+}
+
+static bool rpc_alloc_size_structural_cache_eligible(
+        const rpc_msg_get_alloc_size_req & request) {
+    // Be conservative: structural reuse is enabled only for planning tensors
+    // that are not tied to a concrete remote buffer/data address.
+    if (request.tensor.buffer != 0 || request.tensor.data != 0) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (request.srcs[i].id == 0) {
+            continue;
+        }
+        if (request.srcs[i].buffer != 0 || request.srcs[i].data != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void rpc_alloc_size_normalize_tensor(rpc_tensor & tensor) {
+    // These fields describe graph-local identity, not the allocation size.
+    tensor.id = 0;
+    tensor.buffer = 0;
+    tensor.data = 0;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        tensor.src[i] = 0;
+    }
+
+    // Preserve whether this is a view, while removing the graph-local pointer.
+    tensor.view_src = tensor.view_src != 0 ? 1 : 0;
+
+    // Tensor names do not affect backend allocation requirements.
+    memset(tensor.name, 0, sizeof(tensor.name));
+    memset(tensor.padding, 0, sizeof(tensor.padding));
+}
+
+static std::string rpc_alloc_size_structural_key(
+        const rpc_msg_get_alloc_size_req & request) {
+    rpc_msg_get_alloc_size_req normalized = request;
+    rpc_alloc_size_normalize_tensor(normalized.tensor);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        rpc_alloc_size_normalize_tensor(normalized.srcs[i]);
+    }
+    return rpc_alloc_size_key_bytes(normalized);
+}
+
+static bool rpc_alloc_size_cache_enabled() {
+    const char * value = std::getenv("GGML_RPC_ALLOC_SIZE_CACHE");
+    return value == nullptr || strcmp(value, "0") != 0;
+}
+
+static void rpc_alloc_size_cache_log_locked(
+        const ggml_backend_rpc_buffer_type_context * ctx) {
+    const uint64_t hits = ctx->alloc_size_exact_hits + ctx->alloc_size_structural_hits;
+    const double hit_rate =
+        ctx->alloc_size_lookups > 0 ?
+            100.0 * hits / ctx->alloc_size_lookups :
+            0.0;
+    const double avg_miss_rpc_ms =
+        ctx->alloc_size_misses > 0 ?
+            (ctx->alloc_size_miss_rpc_us / 1000.0) / ctx->alloc_size_misses :
+            0.0;
+
+    GGML_LOG_ERROR(
+        "[RPC_ALLOC_SIZE_CACHE] device=%u lookups=%" PRIu64
+        " exact_hits=%" PRIu64 " structural_hits=%" PRIu64
+        " misses=%" PRIu64 " saved_rpc=%" PRIu64
+        " hit_rate=%.1f miss_rpc_ms=%.3f avg_miss_rpc_ms=%.3f"
+        " exact_entries=%zu structural_entries=%zu"
+        " exact_clears=%" PRIu64 " structural_clears=%" PRIu64 "\n",
+        ctx->device,
+        ctx->alloc_size_lookups,
+        ctx->alloc_size_exact_hits,
+        ctx->alloc_size_structural_hits,
+        ctx->alloc_size_misses,
+        hits,
+        hit_rate,
+        ctx->alloc_size_miss_rpc_us / 1000.0,
+        avg_miss_rpc_ms,
+        ctx->alloc_size_exact_cache.size(),
+        ctx->alloc_size_structural_cache.size(),
+        ctx->alloc_size_exact_clears,
+        ctx->alloc_size_structural_clears);
 }
 
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1325,8 +1436,8 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
 
     if (rpc_get) {
-        ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-        auto sock = get_socket(buft_ctx->endpoint);
+        ggml_backend_rpc_buffer_type_context * buft_ctx =
+            (ggml_backend_rpc_buffer_type_context *)buft->context;
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -1339,10 +1450,90 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
-        rpc_msg_get_alloc_size_rsp response;
-        bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+        const bool cache_enabled = rpc_alloc_size_cache_enabled();
+        const bool structural_eligible =
+            cache_enabled && rpc_alloc_size_structural_cache_eligible(request);
+        std::string exact_key;
+        std::string structural_key;
+
+        if (cache_enabled) {
+            exact_key = rpc_alloc_size_key_bytes(request);
+            if (structural_eligible) {
+                structural_key = rpc_alloc_size_structural_key(request);
+            }
+
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_cache_mutex);
+            buft_ctx->alloc_size_lookups += 1;
+
+            auto exact_it = buft_ctx->alloc_size_exact_cache.find(exact_key);
+            if (exact_it != buft_ctx->alloc_size_exact_cache.end()) {
+                buft_ctx->alloc_size_exact_hits += 1;
+                if (buft_ctx->alloc_size_lookups % RPC_ALLOC_SIZE_CACHE_LOG_INTERVAL == 0) {
+                    rpc_alloc_size_cache_log_locked(buft_ctx);
+                }
+                return exact_it->second;
+            }
+
+            if (structural_eligible) {
+                auto structural_it =
+                    buft_ctx->alloc_size_structural_cache.find(structural_key);
+                if (structural_it != buft_ctx->alloc_size_structural_cache.end()) {
+                    buft_ctx->alloc_size_structural_hits += 1;
+
+                    if (buft_ctx->alloc_size_exact_cache.size() >= RPC_ALLOC_SIZE_EXACT_CACHE_MAX) {
+                        buft_ctx->alloc_size_exact_cache.clear();
+                        buft_ctx->alloc_size_exact_clears += 1;
+                    }
+                    buft_ctx->alloc_size_exact_cache.emplace(
+                        std::move(exact_key), structural_it->second);
+
+                    if (buft_ctx->alloc_size_lookups % RPC_ALLOC_SIZE_CACHE_LOG_INTERVAL == 0) {
+                        rpc_alloc_size_cache_log_locked(buft_ctx);
+                    }
+                    return structural_it->second;
+                }
+            }
+        }
+
+        auto sock = get_socket(buft_ctx->endpoint);
+        rpc_msg_get_alloc_size_rsp response {};
+        const int64_t rpc_begin_us = ggml_time_us();
+        bool status = send_rpc_cmd(
+            sock,
+            RPC_CMD_GET_ALLOC_SIZE,
+            &request,
+            sizeof(request),
+            &response,
+            sizeof(response));
+        const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
         RPC_STATUS_ASSERT(status);
+
+        if (cache_enabled) {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_cache_mutex);
+            buft_ctx->alloc_size_misses += 1;
+            buft_ctx->alloc_size_miss_rpc_us += rpc_us;
+
+            if (buft_ctx->alloc_size_exact_cache.size() >= RPC_ALLOC_SIZE_EXACT_CACHE_MAX) {
+                buft_ctx->alloc_size_exact_cache.clear();
+                buft_ctx->alloc_size_exact_clears += 1;
+            }
+            buft_ctx->alloc_size_exact_cache.emplace(
+                std::move(exact_key), response.alloc_size);
+
+            if (structural_eligible) {
+                if (buft_ctx->alloc_size_structural_cache.size() >= RPC_ALLOC_SIZE_STRUCTURAL_CACHE_MAX) {
+                    buft_ctx->alloc_size_structural_cache.clear();
+                    buft_ctx->alloc_size_structural_clears += 1;
+                }
+                buft_ctx->alloc_size_structural_cache.emplace(
+                    std::move(structural_key), response.alloc_size);
+            }
+
+            if (buft_ctx->alloc_size_lookups % RPC_ALLOC_SIZE_CACHE_LOG_INTERVAL == 0 ||
+                buft_ctx->alloc_size_misses == 1) {
+                rpc_alloc_size_cache_log_locked(buft_ctx);
+            }
+        }
 
         return response.alloc_size;
     }
