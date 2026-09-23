@@ -1622,7 +1622,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
-    return reserve_ok && second_alloc_ok;
+    // Preserve the original allocation semantics: reserve failure is diagnostic here;
+    // the second allocation result determines success.
+    return second_alloc_ok;
 }
 
 static void ggml_backend_sched_debug_tensor(
