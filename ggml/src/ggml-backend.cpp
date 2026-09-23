@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <cmath>
+#include <cinttypes>
 #include <vector>
 
 #ifdef __APPLE__
