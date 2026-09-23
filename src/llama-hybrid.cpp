@@ -5345,7 +5345,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
-    constraints.fixed_tensor_layers = 37;
+    
     // HYBRID_AUTO intentionally leaves topology, ratio and chunk choices unfixed.
     // Fixed fields remain available in llama_hybrid_constraints for targeted
     // diagnostics, but normal planning compares all supported alternatives.

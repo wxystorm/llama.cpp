@@ -893,7 +893,7 @@ static void rpc_alloc_size_cache_log_locked(
             (ctx->alloc_size_miss_rpc_us / 1000.0) / ctx->alloc_size_misses :
             0.0;
 
-    GGML_LOG_ERROR(
+    GGML_LOG_INFO(
         "[RPC_ALLOC_SIZE_CACHE] device=%u lookups=%" PRIu64
         " exact_hits=%" PRIu64 " structural_hits=%" PRIu64
         " misses=%" PRIu64 " saved_rpc=%" PRIu64
