@@ -2079,6 +2079,7 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const int64_t total_begin_us = ggml_time_us();
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     const ggml_init_params params = {
@@ -2093,14 +2094,41 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<int64_t> simple_alloc_us(n_simple_bufts, 0);
+    std::vector<size_t> simple_alloc_size(n_simple_bufts, 0);
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
+        ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+        const int64_t simple_begin_us = ggml_time_us();
+        bufs.push_back(ggml_backend_buft_alloc_buffer(simple_buft, size));
+        simple_alloc_us[i] = ggml_time_us() - simple_begin_us;
         GGML_ASSERT(bufs.back() != nullptr);
-        max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+        simple_alloc_size[i] = ggml_backend_buffer_get_size(bufs.back());
+        max_size = std::max(max_size, simple_alloc_size[i]);
     }
     ggml_backend_meta_buffer_context * buf_ctx =
         new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, stc_compute_2, bufs);
+
+    const int64_t total_us = ggml_time_us() - total_begin_us;
+    const bool timing_debug = std::getenv("GGML_ALLOC_TIMING_DEBUG") != nullptr;
+    if (timing_debug || total_us >= 10000) {
+        GGML_LOG_ERROR(
+            "[META_BUFFER_ALLOC] requested_mib=%.3f simple_backends=%zu total_ms=%.3f max_mib=%.3f\n",
+            size / 1048576.0,
+            n_simple_bufts,
+            total_us / 1000.0,
+            max_size / 1048576.0);
+        for (size_t i = 0; i < n_simple_bufts; ++i) {
+            ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+            GGML_LOG_ERROR(
+                "[META_BUFFER_ALLOC_SIMPLE] index=%zu buft=%s requested_mib=%.3f actual_mib=%.3f alloc_ms=%.3f\n",
+                i,
+                ggml_backend_buft_name(simple_buft),
+                size / 1048576.0,
+                simple_alloc_size[i] / 1048576.0,
+                simple_alloc_us[i] / 1000.0);
+        }
+    }
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }

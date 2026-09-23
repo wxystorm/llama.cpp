@@ -1508,6 +1508,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    const int64_t total_begin_us = ggml_time_us();
+
+    const int64_t scan_begin_us = ggml_time_us();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1525,9 +1528,28 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
     }
+    const int64_t scan_us = ggml_time_us() - scan_begin_us;
+
+    bool first_alloc_attempted = false;
+    bool first_alloc_ok = false;
+    int64_t first_alloc_us = 0;
+    if (!backend_ids_changed) {
+        first_alloc_attempted = true;
+        const int64_t first_alloc_begin_us = ggml_time_us();
+        first_alloc_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+        first_alloc_us = ggml_time_us() - first_alloc_begin_us;
+    }
+
+    const bool need_realloc = backend_ids_changed || !first_alloc_ok;
+    int64_t sync_us = 0;
+    std::vector<int64_t> sync_backend_us((size_t) sched->n_backends, 0);
+    int64_t reserve_us = 0;
+    int64_t second_alloc_us = 0;
+    bool reserve_ok = true;
+    bool second_alloc_ok = true;
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    if (need_realloc) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1545,18 +1567,62 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        const int64_t sync_begin_us = ggml_time_us();
         for (int i = 0; i < sched->n_backends; i++) {
+            const int64_t backend_sync_begin_us = ggml_time_us();
             ggml_backend_synchronize(sched->backends[i]);
+            sync_backend_us[(size_t) i] = ggml_time_us() - backend_sync_begin_us;
         }
+        sync_us = ggml_time_us() - sync_begin_us;
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        const int64_t reserve_begin_us = ggml_time_us();
+        reserve_ok = ggml_gallocr_reserve_n(
+            sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        reserve_us = ggml_time_us() - reserve_begin_us;
+
+        const int64_t second_alloc_begin_us = ggml_time_us();
+        second_alloc_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+        second_alloc_us = ggml_time_us() - second_alloc_begin_us;
+        if (!second_alloc_ok) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            return false;
         }
     }
 
-    return true;
+    const int64_t total_us = ggml_time_us() - total_begin_us;
+    const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
+    if (timing_debug || total_us >= 10000) {
+        GGML_LOG_ERROR(
+            "[SCHED_ALLOC_SPLITS] nodes=%d leafs=%d backends=%d backend_ids_changed=%d "
+            "first_alloc_attempted=%d first_alloc_ok=%d need_realloc=%d reserve_ok=%d second_alloc_ok=%d "
+            "total_ms=%.3f scan_ms=%.3f first_alloc_ms=%.3f sync_ms=%.3f reserve_ms=%.3f second_alloc_ms=%.3f\n",
+            sched->graph.n_nodes,
+            sched->graph.n_leafs,
+            sched->n_backends,
+            backend_ids_changed ? 1 : 0,
+            first_alloc_attempted ? 1 : 0,
+            first_alloc_ok ? 1 : 0,
+            need_realloc ? 1 : 0,
+            reserve_ok ? 1 : 0,
+            second_alloc_ok ? 1 : 0,
+            total_us / 1000.0,
+            scan_us / 1000.0,
+            first_alloc_us / 1000.0,
+            sync_us / 1000.0,
+            reserve_us / 1000.0,
+            second_alloc_us / 1000.0);
+
+        if (sync_us > 0) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                GGML_LOG_ERROR(
+                    "[SCHED_ALLOC_SYNC] backend=%d name=%s sync_ms=%.3f\n",
+                    i,
+                    ggml_backend_name(sched->backends[i]),
+                    sync_backend_us[(size_t) i] / 1000.0);
+            }
+        }
+    }
+
+    return reserve_ok && second_alloc_ok;
 }
 
 static void ggml_backend_sched_debug_tensor(
@@ -1995,12 +2061,36 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    const int64_t total_begin_us = ggml_time_us();
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const int64_t split_begin_us = ggml_time_us();
     ggml_backend_sched_split_graph(sched, graph);
+    const int64_t split_us = ggml_time_us() - split_begin_us;
 
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    const int64_t alloc_splits_begin_us = ggml_time_us();
+    const bool alloc_ok = ggml_backend_sched_alloc_splits(sched);
+    const int64_t alloc_splits_us = ggml_time_us() - alloc_splits_begin_us;
+    const int64_t total_us = ggml_time_us() - total_begin_us;
+
+    const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
+    if (timing_debug || total_us >= 10000) {
+        GGML_LOG_ERROR(
+            "[SCHED_ALLOC_BREAKDOWN] nodes=%d leafs=%d splits=%d backends=%d ok=%d "
+            "total_ms=%.3f split_graph_ms=%.3f alloc_splits_ms=%.3f\n",
+            graph->n_nodes,
+            graph->n_leafs,
+            sched->n_splits,
+            sched->n_backends,
+            alloc_ok ? 1 : 0,
+            total_us / 1000.0,
+            split_us / 1000.0,
+            alloc_splits_us / 1000.0);
+    }
+
+    if (!alloc_ok) {
         return false;
     }
 

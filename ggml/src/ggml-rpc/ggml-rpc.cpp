@@ -1239,6 +1239,8 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 }
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const int64_t total_begin_us = ggml_time_us();
+
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
     ggml_backend_dev_t dev =
     ggml_backend_buft_get_device(buft);
@@ -1247,9 +1249,31 @@ auto * dev_ctx =
     static_cast<ggml_backend_rpc_device_context *>(
         dev->context);
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
-    rpc_msg_alloc_buffer_rsp response;
+    rpc_msg_alloc_buffer_rsp response {};
+
+    const int64_t socket_begin_us = ggml_time_us();
     auto sock = get_socket(buft_ctx->endpoint);
+    const int64_t socket_us = ggml_time_us() - socket_begin_us;
+
+    const int64_t rpc_begin_us = ggml_time_us();
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+    const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
+    const int64_t total_us = ggml_time_us() - total_begin_us;
+
+    const bool timing_debug = std::getenv("GGML_ALLOC_TIMING_DEBUG") != nullptr;
+    if (timing_debug || total_us >= 10000) {
+        GGML_LOG_ERROR(
+            "[RPC_ALLOC_BUFFER] device=%u requested_mib=%.3f returned_mib=%.3f status=%d "
+            "total_ms=%.3f socket_ms=%.3f rpc_ms=%.3f\n",
+            buft_ctx->device,
+            size / 1048576.0,
+            status ? response.remote_size / 1048576.0 : 0.0,
+            status ? 1 : 0,
+            total_us / 1000.0,
+            socket_us / 1000.0,
+            rpc_us / 1000.0);
+    }
+
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
