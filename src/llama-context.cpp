@@ -3349,6 +3349,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         llm_graph_result * result = nullptr;
         const bool profile_tensor = stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
         const int64_t tensor_start_us = profile_tensor ? ggml_time_us() : 0;
+        llama_hybrid_stage_timing tensor_stage_timing {};
         if (profile_tensor) {
             const int n_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());
             for (int i = 0; i < n_backends; ++i) {
@@ -3378,7 +3379,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 job.ubatch, stage, token_begin, block_tokens, stage_input, stage_output,
                 ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched_pipe.get(), gf_res_pipe.get(),
                 job.ubatch_id, stage_index, block_index, block.action, block_outputs,
-                apply_mctx, true, status);
+                apply_mctx, true, status, profile_tensor ? &tensor_stage_timing : nullptr);
             if (result == nullptr || status != GGML_STATUS_SUCCESS) {
                 return nullptr;
             }
@@ -3403,6 +3404,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.d2h_us    += backend_profile.d2h_us;
                 profile.reduce_us += backend_profile.reduce_us;
                 profile.wait_us   += backend_profile.wait_us;
+                profile.graph_compute_count += backend_profile.graph_compute_count;
+                profile.graph_rebuild_count += backend_profile.graph_rebuild_count;
+                profile.graph_total_us += backend_profile.graph_total_us;
+                profile.graph_rebuild_us += backend_profile.graph_rebuild_us;
+                profile.graph_execute_us += backend_profile.graph_execute_us;
+                profile.graph_other_us += backend_profile.graph_other_us;
                 profile.lane_reuse_wait_count += backend_profile.lane_reuse_wait_count;
                 profile.lane_reuse_wait_us += backend_profile.lane_reuse_wait_us;
                 profile.lane_reuse_wait_max_us = std::max(
@@ -3423,10 +3430,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.layer_barrier_wait_count += backend_profile.layer_barrier_wait_count;
                 profile.layer_barrier_wait_us += backend_profile.layer_barrier_wait_us;
             }
+            const int64_t tensor_total_us = ggml_time_us() - tensor_start_us;
+            const int64_t tensor_stage_accounted_us =
+                tensor_stage_timing.prepare_us +
+                tensor_stage_timing.compute_range_us +
+                tensor_stage_timing.sync_us;
+            const int64_t tensor_stage_unaccounted_us =
+                std::max<int64_t>(0, tensor_total_us - tensor_stage_accounted_us);
+            LLAMA_LOG_ERROR(
+                "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f compute_range=%.3f "
+                "sync=%.3f unaccounted=%.3f meta_total=%.3f meta_rebuild=%.3f "
+                "meta_execute=%.3f meta_other=%.3f meta_calls=%" PRId64
+                " meta_rebuilds=%" PRId64 " blocks=%zu\n",
+                job.ubatch_id,
+                tensor_total_us / 1000.0,
+                tensor_stage_timing.prepare_us / 1000.0,
+                tensor_stage_timing.compute_range_us / 1000.0,
+                tensor_stage_timing.sync_us / 1000.0,
+                tensor_stage_unaccounted_us / 1000.0,
+                profile.graph_total_us / 1000.0,
+                profile.graph_rebuild_us / 1000.0,
+                profile.graph_execute_us / 1000.0,
+                profile.graph_other_us / 1000.0,
+                profile.graph_compute_count,
+                profile.graph_rebuild_count,
+                blocks.size());
             LLAMA_LOG_ERROR(
                 "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f pc_ffn=%.3f h2d=%.3f "
                 "phone=%.3f d2h=%.3f reduce=%.3f wait=%.3f ms\n",
-                job.ubatch_id, (ggml_time_us() - tensor_start_us) / 1000.0,
+                job.ubatch_id, tensor_total_us / 1000.0,
                 profile.attn_us / 1000.0, profile.pc_ffn_us / 1000.0,
                 profile.h2d_us / 1000.0, profile.phone_us / 1000.0,
                 profile.d2h_us / 1000.0, profile.reduce_us / 1000.0,

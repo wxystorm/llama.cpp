@@ -431,6 +431,16 @@ extern "C" {
         int64_t meta_total_us;
         int64_t other_main_us;
 
+        // Generic Meta graph timing. Unlike the fields above, these are
+        // collected for every Meta graph_compute call, including generalized
+        // staged MoE execution.
+        int64_t graph_compute_count;
+        int64_t graph_rebuild_count;
+        int64_t graph_total_us;
+        int64_t graph_rebuild_us;
+        int64_t graph_execute_us;
+        int64_t graph_other_us;
+
         int64_t wave_layer_start_count;
         int64_t wave_ii_count;
         int64_t wave_ii_sum_us;

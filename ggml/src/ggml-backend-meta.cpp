@@ -2718,6 +2718,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    const int64_t meta_rebuild_begin_us = needs_rebuild ? ggml_time_us() : 0;
+    int64_t meta_rebuild_us = 0;
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -3202,6 +3204,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
     }
+    if (needs_rebuild) {
+        meta_rebuild_us = ggml_time_us() - meta_rebuild_begin_us;
+    }
 
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
@@ -3261,6 +3266,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const bool meta_timing_debug =
+        pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
     size_t reduce_copy_detail_count = 0;
     int64_t pipeline_submit_sum_us = 0;
@@ -5653,6 +5660,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
+    const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
@@ -6321,6 +6329,30 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
+    const int64_t meta_execute_end_us = ggml_time_us();
+    const int64_t meta_graph_timing_end_us = meta_execute_end_us;
+    const int64_t meta_graph_total_all_us =
+        meta_graph_timing_end_us - meta_graph_start_us;
+    const int64_t meta_execute_us =
+        meta_execute_end_us - meta_execute_begin_us;
+    const int64_t meta_other_all_us = std::max<int64_t>(
+        0, meta_graph_total_all_us - meta_rebuild_us - meta_execute_us);
+
+    if (meta_timing_debug) {
+        printf(
+            "[META_GRAPH_TIMING] uid=%" PRIu64
+            " nodes=%d subgraphs=%zu needs_rebuild=%d "
+            "total_ms=%.3f rebuild_ms=%.3f execute_ms=%.3f other_ms=%.3f\n",
+            cgraph->uid,
+            cgraph->n_nodes,
+            backend_ctx->n_subgraphs,
+            needs_rebuild ? 1 : 0,
+            meta_graph_total_all_us / 1000.0,
+            meta_rebuild_us / 1000.0,
+            meta_execute_us / 1000.0,
+            meta_other_all_us / 1000.0);
+    }
+
     if (return_wavefront_graph) {
         printf(
             "[RETURN_WAVEFRONT_SUM] enabled=1 dependency_wait_count=%" PRId64
@@ -6449,6 +6481,14 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.d2h_us    += d2h_us;
         backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
         backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+        backend_ctx->tensor_profile.graph_compute_count += 1;
+        backend_ctx->tensor_profile.graph_total_us += meta_graph_total_all_us;
+        backend_ctx->tensor_profile.graph_rebuild_us += meta_rebuild_us;
+        backend_ctx->tensor_profile.graph_execute_us += meta_execute_us;
+        backend_ctx->tensor_profile.graph_other_us += meta_other_all_us;
+        if (needs_rebuild) {
+            backend_ctx->tensor_profile.graph_rebuild_count += 1;
+        }
         if (return_wavefront_graph) {
             backend_ctx->tensor_profile.compute_wall_us += compute_wall_us;
             backend_ctx->tensor_profile.reduce_wall_us  += reduce_wall_us;
