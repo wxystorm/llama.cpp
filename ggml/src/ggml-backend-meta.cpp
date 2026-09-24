@@ -6010,14 +6010,47 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
+    // Snapshot preparation must use exactly the same compatibility rule as
+    // the communication path below.  Otherwise RPC graph_compute() sees an
+    // active prepared snapshot and emits GRAPH_RECOMPUTE_SNAPSHOT even when
+    // specialized_communication() later chooses the conservative fence/copy
+    // path.  The produced snapshot is then never consumed, leaving the remote
+    // slot READY; after both slots fill, a later decode blocks forever waiting
+    // for a free slot.
+    //
+    // Dense decode chunks end directly in MUL_MAT and are compatible with the
+    // existing snapshot path.  Qwen3-MoE chunks end after expert aggregation
+    // (typically ADD), so do not prepare a snapshot for them yet.
+    const bool snapshot_compatible_decode_chunk =
+        phone_wdown != nullptr &&
+        pc_wdown != nullptr &&
+        phone_wdown->op == GGML_OP_MUL_MAT &&
+        pc_wdown->op == GGML_OP_MUL_MAT;
+
     if (phone_wdown != nullptr &&
             pc_wdown != nullptr &&
             phone_wdown->ne[1] == 1 &&
             (phone_wdown->flags &
                 GGML_TENSOR_FLAG_COMPUTE) &&
-            !decode_handoff_to_phone) {
+            !decode_handoff_to_phone &&
+            snapshot_compatible_decode_chunk) {
 
         prepare_graph_snapshot(i, phone_wdown);
+    } else if (pipeline_debug &&
+            phone_wdown != nullptr &&
+            pc_wdown != nullptr &&
+            !decode_handoff_to_phone &&
+            !snapshot_compatible_decode_chunk) {
+        int chunk = -1;
+        int layer = -1;
+        ggml_backend_meta_parse_decode_ffn_chunk(
+            phone_wdown->name, chunk, layer);
+        printf(
+            "[DECODE_SNAPSHOT_PREPARE_SKIP] layer=%d chunk=%d phone_op=%s pc_op=%s\n",
+            layer,
+            chunk,
+            ggml_op_name(phone_wdown->op),
+            ggml_op_name(pc_wdown->op));
     }
 }
 
