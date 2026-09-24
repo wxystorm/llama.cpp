@@ -886,6 +886,23 @@ void llama_context::synchronize() {
                 meta.simple_backend_compute_calls[j] +=
                     cur.simple_backend_compute_calls[j];
             }
+
+            meta.layer_timing_entries += cur.layer_timing_entries;
+            meta.layer_timing_layers += cur.layer_timing_layers;
+            meta.layer_pc_only_layers += cur.layer_pc_only_layers;
+            meta.layer_phone_only_layers += cur.layer_phone_only_layers;
+            meta.layer_tensor_layers += cur.layer_tensor_layers;
+            meta.layer_pc_only_compute_us += cur.layer_pc_only_compute_us;
+            meta.layer_pc_only_wall_us += cur.layer_pc_only_wall_us;
+            meta.layer_phone_only_compute_us += cur.layer_phone_only_compute_us;
+            meta.layer_phone_only_wall_us += cur.layer_phone_only_wall_us;
+            meta.layer_tensor_pc_compute_us += cur.layer_tensor_pc_compute_us;
+            meta.layer_tensor_phone_compute_us += cur.layer_tensor_phone_compute_us;
+            meta.layer_tensor_wall_us += cur.layer_tensor_wall_us;
+            meta.layer_copy_0to1_us += cur.layer_copy_0to1_us;
+            meta.layer_copy_1to0_us += cur.layer_copy_1to0_us;
+            meta.layer_orchestration_us += cur.layer_orchestration_us;
+            meta.layer_wall_us += cur.layer_wall_us;
         }
 
         const int64_t timeline_accounted_us =
@@ -970,6 +987,56 @@ void llama_context::synchronize() {
             meta.d2h_us / 1000.0,
             meta.reduce_us / 1000.0,
             meta.wait_us / 1000.0);
+
+        const double pc_only_per_layer_ms =
+            meta.layer_pc_only_layers > 0 ?
+                meta.layer_pc_only_compute_us /
+                    1000.0 / meta.layer_pc_only_layers : 0.0;
+        const double phone_only_per_layer_ms =
+            meta.layer_phone_only_layers > 0 ?
+                meta.layer_phone_only_compute_us /
+                    1000.0 / meta.layer_phone_only_layers : 0.0;
+        const double non_layer_execute_ms =
+            std::max(
+                0.0,
+                meta.graph_execute_us / 1000.0 -
+                    meta.layer_wall_us / 1000.0);
+
+        LLAMA_LOG_ERROR(
+            "[DECODE_META_LAYER] sample=%" PRId64
+            " entries=%" PRId64
+            " layers=%" PRId64
+            " pc_only_layers=%" PRId64
+            " pc_only_compute_ms=%.3f pc_only_per_layer_ms=%.3f "
+            "pc_only_wall_ms=%.3f "
+            "phone_only_layers=%" PRId64
+            " phone_only_compute_ms=%.3f phone_only_per_layer_ms=%.3f "
+            "phone_only_wall_ms=%.3f "
+            "tensor_layers=%" PRId64
+            " tensor_pc_ms=%.3f tensor_phone_ms=%.3f tensor_wall_ms=%.3f "
+            "copy_0to1_ms=%.3f copy_1to0_ms=%.3f "
+            "orchestration_ms=%.3f layer_wall_ms=%.3f "
+            "non_layer_execute_ms=%.3f\n",
+            decode_runtime_profile.sample_index,
+            meta.layer_timing_entries,
+            meta.layer_timing_layers,
+            meta.layer_pc_only_layers,
+            meta.layer_pc_only_compute_us / 1000.0,
+            pc_only_per_layer_ms,
+            meta.layer_pc_only_wall_us / 1000.0,
+            meta.layer_phone_only_layers,
+            meta.layer_phone_only_compute_us / 1000.0,
+            phone_only_per_layer_ms,
+            meta.layer_phone_only_wall_us / 1000.0,
+            meta.layer_tensor_layers,
+            meta.layer_tensor_pc_compute_us / 1000.0,
+            meta.layer_tensor_phone_compute_us / 1000.0,
+            meta.layer_tensor_wall_us / 1000.0,
+            meta.layer_copy_0to1_us / 1000.0,
+            meta.layer_copy_1to0_us / 1000.0,
+            meta.layer_orchestration_us / 1000.0,
+            meta.layer_wall_us / 1000.0,
+            non_layer_execute_ms);
 
         decode_runtime_profile.pending = false;
     }
