@@ -42,7 +42,7 @@ static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES = { 1, 2, 3, 4 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS      = 4;
-static constexpr std::array<int, 3>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS      = { 64, 128, 256 };
+static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS      = { 1, 64, 128, 256 };
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
@@ -2115,22 +2115,54 @@ struct llama_hybrid_decode_tensor_cost {
     double reduce_ms    = 0.0;
 };
 
+static bool llama_hybrid_decode_region_cost(
+        const std::vector<llama_hybrid_layer_compute_point> & layer_points,
+        const std::vector<llama_hybrid_attn_compute_point> & attn_points,
+        int kv_tokens,
+        int target_layers,
+        bool use_compute_est,
+        double & result_ms) {
+    result_ms = 0.0;
+    if (target_layers == 0) {
+        return true;
+    }
+    if (target_layers < 0) {
+        return false;
+    }
+
+    double layer_total = 0.0;
+    double attn_base   = 0.0;
+    double attn_kv     = 0.0;
+    if (!llama_hybrid_layer_block_total_cost(
+            layer_points, 1, target_layers,
+            use_compute_est, layer_total) ||
+        !llama_hybrid_attn_cost(
+            attn_points, 1, 1, attn_base) ||
+        !llama_hybrid_attn_cost(
+            attn_points, 1, kv_tokens, attn_kv)) {
+        return false;
+    }
+
+    // layer_total is measured/calibrated at token=1, kv=1.  Decode keeps one
+    // query token but attends over the target KV context, so add only the
+    // per-layer attention delta while preserving the measured depth effect
+    // for the rest of the CPU layer.
+    result_ms = std::max(
+        0.0,
+        layer_total +
+        target_layers * (attn_kv - attn_base));
+    return std::isfinite(result_ms);
+}
+
 static bool llama_hybrid_decode_layer_cost(
         const std::vector<llama_hybrid_layer_compute_point> & layer_points,
         const std::vector<llama_hybrid_attn_compute_point> & attn_points,
         int kv_tokens,
         bool use_compute_est,
         double & result_ms) {
-    double layer_base = 0.0;
-    double attn_base  = 0.0;
-    double attn_kv    = 0.0;
-    if (!llama_hybrid_layer_block_cost(layer_points, 1, use_compute_est, layer_base) ||
-        !llama_hybrid_attn_cost(attn_points, 1, 1, attn_base) ||
-        !llama_hybrid_attn_cost(attn_points, 1, kv_tokens, attn_kv)) {
-        return false;
-    }
-    result_ms = std::max(0.0, layer_base + attn_kv - attn_base);
-    return std::isfinite(result_ms);
+    return llama_hybrid_decode_region_cost(
+        layer_points, attn_points,
+        kv_tokens, 1, use_compute_est, result_ms);
 }
 
 static bool llama_hybrid_decode_tensor_layer_cost(
@@ -2272,6 +2304,64 @@ bool llama_hybrid_predict_decode_plan(
             profile.gpu_layer_blocks, profile.gpu_attn,
             kv_tokens, false, gpu_layer_ms);
 
+    std::vector<double> cpu_decode_region_ms(
+        (size_t) profile.n_layer + 1, 0.0);
+    for (int layers = 1; layers <= profile.n_layer; ++layers) {
+        if (!llama_hybrid_decode_region_cost(
+                profile.cpu_layer_blocks,
+                profile.cpu_attn,
+                kv_tokens,
+                layers,
+                false,
+                cpu_decode_region_ms[(size_t) layers])) {
+            LLAMA_LOG_ERROR(
+                "[DECODE_PLAN] unavailable reason=missing_cpu_depth_profile "
+                "layers=%d kv_tokens=%d\n",
+                layers, kv_tokens);
+            return false;
+        }
+    }
+
+    if (profile.is_moe &&
+        profile.n_layer >= LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS) {
+        double token1_one_layer_ms = 0.0;
+        double token1_sustained_per_layer_ms = 0.0;
+        const bool have_one_layer =
+            llama_hybrid_layer_block_cost_at_depth(
+                profile.cpu_layer_blocks,
+                1,
+                1,
+                false,
+                token1_one_layer_ms);
+        const bool have_sustained =
+            llama_hybrid_layer_block_cost_at_depth(
+                profile.cpu_layer_blocks,
+                1,
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                false,
+                token1_sustained_per_layer_ms);
+        if (have_one_layer && have_sustained) {
+            const int deep_layers = profile.n_layer;
+            LLAMA_LOG_ERROR(
+                "[DECODE_CPU_DEPTH] tokens=1 kv_tokens=%d "
+                "probe_layers=%d one_layer_base_ms=%.3f "
+                "sustained_per_layer_base_ms=%.3f sustained_over_one=%.3f "
+                "C1_ms=%.3f C%d_ms=%.3f C%d_ms=%.3f\n",
+                kv_tokens,
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                token1_one_layer_ms,
+                token1_sustained_per_layer_ms,
+                token1_one_layer_ms > 0.0 ?
+                    token1_sustained_per_layer_ms / token1_one_layer_ms : 0.0,
+                cpu_decode_region_ms[1],
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                cpu_decode_region_ms[
+                    (size_t) LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS],
+                deep_layers,
+                cpu_decode_region_ms[(size_t) deep_layers]);
+        }
+    }
+
     const auto ratios = llama_hybrid_decode_ratio_candidates(profile);
     if (ratios.empty()) {
         LLAMA_LOG_ERROR(
@@ -2333,7 +2423,7 @@ bool llama_hybrid_predict_decode_plan(
 
     llama_hybrid_constraints decode_constraints = constraints;
     decode_constraints.target_ubatch_tokens = 1;
-    decode_constraints.max_tensor_chunks = 4;
+    decode_constraints.max_tensor_chunks = 1;
 
     const size_t pc_budget = llama_hybrid_effective_budget(
         decode_constraints.pc_memory_budget,
@@ -2396,16 +2486,16 @@ bool llama_hybrid_predict_decode_plan(
                 plan.cpu_layers    = cpu_layers;
                 plan.gpu_layers    = gpu_layers;
                 plan.tensor_pc_ratio = tensor_layers > 0 ? best_ratio : 0.5f;
-                // First decode-planner revision intentionally does not alter
-                // the runtime chunk setting. The 1/2/3/4 micro-probe is the
-                // next step and will replace this placeholder.
+                // Current Qwen3-MoE measurements show LLAMA_CHUNKS=1 is the
+                // fastest correct decode setting on the target platform. Keep
+                // it fixed while the planner focuses on layer placement.
                 plan.llama_chunks = 1;
                 plan.kv_tokens = kv_tokens;
 
                 plan.predicted_gpu_ms =
                     gpu_layers * gpu_layer_ms;
                 plan.predicted_cpu_ms =
-                    cpu_layers * cpu_layer_ms;
+                    cpu_decode_region_ms[(size_t) cpu_layers];
                 plan.predicted_tensor_ms =
                     tensor_layers * best_tensor_cost.total_ms;
                 plan.predicted_phone_ms =
@@ -2473,13 +2563,15 @@ bool llama_hybrid_predict_decode_plan(
     }
 
     llama_hybrid_decode_plan_print(best_plan);
-    LLAMA_LOG_ERROR(
-        "[DECODE_CHUNK_PROBE] mode=DEFERRED candidates=%d,%d,%d,%d "
-        "selected_placeholder=1 note=prediction_only_no_runtime_change\n",
-        LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES[0],
-        LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES[1],
-        LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES[2],
-        LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES[3]);
+    if (profile.is_moe) {
+        LLAMA_LOG_ERROR(
+            "[DECODE_CHUNK] selected=1 mode=FIXED "
+            "reason=measured_fastest_correct_qwen3moe\n");
+    } else {
+        LLAMA_LOG_ERROR(
+            "[DECODE_CHUNK] selected=1 mode=BASELINE "
+            "reason=decode_chunk_search_not_enabled\n");
+    }
     return true;
 }
 
@@ -5488,7 +5580,8 @@ bool llama_hybrid_profile_moe_full_layer(
     // A one-layer MoE microbenchmark can be substantially cache-hot compared
     // with a real C=20..40 CPU stage. Add a small number of multi-layer block
     // probes to calibrate the sustained regime without turning startup into a
-    // long stress test.
+    // long stress test. Token=1 is the decode anchor; the larger anchors
+    // calibrate sustained prefill CPU stages.
     for (const int tokens : LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS) {
         if (tokens <= 0 || tokens > attn_desc.n_ctx_orig ||
             LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS > profile.n_layer) {
