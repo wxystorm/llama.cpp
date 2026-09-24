@@ -3494,11 +3494,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.profile_interpolated_chunks > 0 ? "INTERPOLATE" :
                     "EXACT";
 
+                const char * layer_profile_mode =
+                    cpu_prediction.profile_layer_exact ? "EXACT" :
+                    cpu_prediction.profile_layer_saturated ? "SATURATED" :
+                    "INTERPOLATE";
+
                 LLAMA_LOG_ERROR(
                     "[PRED_CPU_STAGE] ub=%d tokens=%d kv_tokens=%d layers=%d XC=%d "
                     "pred_total_ms=%.3f pred_per_layer_ms=%.3f "
                     "profile_mode=%s profile_range=[%d,%d] "
-                    "exact_chunks=%d interp_chunks=%d extrap_chunks=%d\n",
+                    "exact_chunks=%d interp_chunks=%d extrap_chunks=%d "
+                    "layer_profile_mode=%s layer_profile_range=[%d,%d]\n",
                     job.ubatch_id,
                     cpu_prediction.tokens,
                     cpu_prediction.kv_tokens,
@@ -3511,7 +3517,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.profile_max_tokens,
                     cpu_prediction.profile_exact_chunks,
                     cpu_prediction.profile_interpolated_chunks,
-                    cpu_prediction.profile_extrapolated_chunks);
+                    cpu_prediction.profile_extrapolated_chunks,
+                    layer_profile_mode,
+                    cpu_prediction.profile_min_layers,
+                    cpu_prediction.profile_max_layers);
 
                 LLAMA_LOG_ERROR(
                     "[PRED_CPU_ERROR] ub=%d actual_compute_ms=%.3f "

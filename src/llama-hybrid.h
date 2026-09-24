@@ -200,6 +200,11 @@ struct llama_hybrid_cpu_compute_prediction {
     int profile_interpolated_chunks = 0;
     int profile_extrapolated_chunks = 0;
 
+    int  profile_min_layers       = 0;
+    int  profile_max_layers       = 0;
+    bool profile_layer_exact      = false;
+    bool profile_layer_saturated  = false;
+
     double per_layer_ms = 0.0;
     double total_ms     = 0.0;
 };

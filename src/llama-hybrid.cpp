@@ -41,6 +41,8 @@ static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1
 static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES = { 1, 2, 3, 4 };
+static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS      = 4;
+static constexpr std::array<int, 3>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS      = { 64, 128, 256 };
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
@@ -1380,11 +1382,13 @@ static bool llama_hybrid_dual_transfer_cost(const llama_hybrid_profile & profile
     return false;
 }
 
-static bool llama_hybrid_layer_block_cost(const std::vector<llama_hybrid_layer_compute_point> & points,
-                                          int                                                    tokens,
-                                          bool                                                   use_compute_est,
-                                          double &                                               per_layer_ms) {
-    if (points.empty() || tokens <= 0) {
+static bool llama_hybrid_layer_block_cost_at_depth(
+        const std::vector<llama_hybrid_layer_compute_point> & points,
+        int tokens,
+        int profile_layers,
+        bool use_compute_est,
+        double & per_layer_ms) {
+    if (points.empty() || tokens <= 0 || profile_layers <= 0) {
         return false;
     }
 
@@ -1392,23 +1396,26 @@ static bool llama_hybrid_layer_block_cost(const std::vector<llama_hybrid_layer_c
     const llama_hybrid_layer_compute_point * lower = nullptr;
     const llama_hybrid_layer_compute_point * upper = nullptr;
     for (const auto & point : points) {
-        if (point.layers <= 0) {
+        if (point.layers != profile_layers) {
             continue;
         }
         if (point.tokens == tokens) {
             exact = &point;
             break;
         }
-        if (point.tokens < tokens && (lower == nullptr || point.tokens > lower->tokens)) {
+        if (point.tokens < tokens &&
+            (lower == nullptr || point.tokens > lower->tokens)) {
             lower = &point;
         }
-        if (point.tokens > tokens && (upper == nullptr || point.tokens < upper->tokens)) {
+        if (point.tokens > tokens &&
+            (upper == nullptr || point.tokens < upper->tokens)) {
             upper = &point;
         }
     }
 
     const auto value = [&](const llama_hybrid_layer_compute_point * point) {
-        const double total = use_compute_est ? point->compute_est_ms : point->wall_ms;
+        const double total =
+            use_compute_est ? point->compute_est_ms : point->wall_ms;
         return total / point->layers;
     };
 
@@ -1426,7 +1433,8 @@ static bool llama_hybrid_layer_block_cost(const std::vector<llama_hybrid_layer_c
     if (upper == nullptr) {
         const llama_hybrid_layer_compute_point * prev = nullptr;
         for (const auto & point : points) {
-            if (point.layers > 0 && point.tokens < lower->tokens &&
+            if (point.layers == profile_layers &&
+                point.tokens < lower->tokens &&
                 (prev == nullptr || point.tokens > prev->tokens)) {
                 prev = &point;
             }
@@ -1437,16 +1445,102 @@ static bool llama_hybrid_layer_block_cost(const std::vector<llama_hybrid_layer_c
         }
         const double lower_ms = value(lower);
         const double prev_ms  = value(prev);
-        const double slope    = std::max(0.0, (lower_ms - prev_ms) / (double) (lower->tokens - prev->tokens));
-        per_layer_ms = lower_ms + slope * (tokens - lower->tokens);
+        const double slope = std::max(
+            0.0,
+            (lower_ms - prev_ms) /
+                (double) (lower->tokens - prev->tokens));
+        per_layer_ms =
+            lower_ms + slope * (tokens - lower->tokens);
         return true;
     }
 
     const double lower_ms = value(lower);
     const double upper_ms = value(upper);
-    const double t        = (double) (tokens - lower->tokens) / (upper->tokens - lower->tokens);
-    per_layer_ms          = lower_ms + t * (upper_ms - lower_ms);
+    const double t =
+        (double) (tokens - lower->tokens) /
+        (double) (upper->tokens - lower->tokens);
+    per_layer_ms = lower_ms + t * (upper_ms - lower_ms);
     return true;
+}
+
+static bool llama_hybrid_layer_block_cost(
+        const std::vector<llama_hybrid_layer_compute_point> & points,
+        int tokens,
+        bool use_compute_est,
+        double & per_layer_ms) {
+    int min_layers = std::numeric_limits<int>::max();
+    for (const auto & point : points) {
+        if (point.layers > 0) {
+            min_layers = std::min(min_layers, point.layers);
+        }
+    }
+    if (min_layers == std::numeric_limits<int>::max()) {
+        return false;
+    }
+    return llama_hybrid_layer_block_cost_at_depth(
+        points, tokens, min_layers, use_compute_est, per_layer_ms);
+}
+
+static bool llama_hybrid_layer_block_total_cost(
+        const std::vector<llama_hybrid_layer_compute_point> & points,
+        int tokens,
+        int target_layers,
+        bool use_compute_est,
+        double & total_ms) {
+    total_ms = 0.0;
+    if (target_layers == 0) {
+        return true;
+    }
+    if (points.empty() || tokens <= 0 || target_layers < 0) {
+        return false;
+    }
+
+    std::vector<std::pair<int, double>> depth_costs;
+    std::set<int> seen_layers;
+    for (const auto & point : points) {
+        if (point.layers <= 0 || !seen_layers.insert(point.layers).second) {
+            continue;
+        }
+        double per_layer_ms = 0.0;
+        if (llama_hybrid_layer_block_cost_at_depth(
+                points, tokens, point.layers, use_compute_est,
+                per_layer_ms)) {
+            depth_costs.emplace_back(point.layers, per_layer_ms);
+        }
+    }
+    if (depth_costs.empty()) {
+        return false;
+    }
+    std::sort(depth_costs.begin(), depth_costs.end());
+
+    double per_layer_ms = depth_costs.front().second;
+    if (target_layers <= depth_costs.front().first) {
+        per_layer_ms = depth_costs.front().second;
+    } else if (target_layers >= depth_costs.back().first) {
+        // A measured multi-layer block represents the sustained regime. Once
+        // the requested stage is deeper than the largest probe, clamp to that
+        // sustained per-layer rate rather than extrapolating a 1-layer rate.
+        per_layer_ms = depth_costs.back().second;
+    } else {
+        for (size_t i = 0; i + 1 < depth_costs.size(); ++i) {
+            if (target_layers < depth_costs[i].first ||
+                target_layers > depth_costs[i + 1].first) {
+                continue;
+            }
+            const double t =
+                (double) (target_layers - depth_costs[i].first) /
+                (double) (depth_costs[i + 1].first -
+                          depth_costs[i].first);
+            per_layer_ms =
+                depth_costs[i].second +
+                t * (depth_costs[i + 1].second -
+                     depth_costs[i].second);
+            break;
+        }
+    }
+
+    total_ms = target_layers * std::max(0.0, per_layer_ms);
+    return std::isfinite(total_ms);
 }
 
 static bool llama_hybrid_phone_block_cost(const llama_hybrid_profile & profile, int layers, double & result_ms) {
@@ -2451,17 +2545,21 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
             coarse_kv_tokens = std::min(coarse_kv_tokens, profile.n_ctx_train);
         }
 
-        double cpu_layer_base = 0.0;
+        double cpu_layer_total = 0.0;
         double cpu_attn_base  = 0.0;
         double cpu_attn_kv    = 0.0;
-        if (llama_hybrid_layer_block_cost(
-                profile.cpu_layer_blocks, work_tokens, false, cpu_layer_base) &&
+        const int coarse_cpu_depth = std::max(1, model.layers);
+        if (llama_hybrid_layer_block_total_cost(
+                profile.cpu_layer_blocks, work_tokens,
+                coarse_cpu_depth, false, cpu_layer_total) &&
             llama_hybrid_attn_cost(
                 profile.cpu_attn, work_tokens, work_tokens, cpu_attn_base) &&
             llama_hybrid_attn_cost(
                 profile.cpu_attn, work_tokens, coarse_kv_tokens, cpu_attn_kv)) {
             model.cpu_cost = std::max(
-                0.0, cpu_layer_base + cpu_attn_kv - cpu_attn_base);
+                0.0,
+                cpu_layer_total / coarse_cpu_depth +
+                cpu_attn_kv - cpu_attn_base);
         } else if (profile.cpu_full_layer_ms > 0.0) {
             model.cpu_cost = profile.cpu_full_layer_ms * token_scale;
         }
@@ -2995,15 +3093,22 @@ static bool llama_hybrid_layer_region_cost(
     }
 
     for (const int tokens : chunks) {
-        double layer_base = 0.0;
-        double attn_base  = 0.0;
-        double attn_kv    = 0.0;
-        if (!llama_hybrid_layer_block_cost(layer_points, tokens, use_compute_est, layer_base) ||
-            !llama_hybrid_attn_cost(attn_points, tokens, tokens, attn_base) ||
-            !llama_hybrid_attn_cost(attn_points, tokens, kv_tokens, attn_kv)) {
+        double layer_block_total = 0.0;
+        double attn_base         = 0.0;
+        double attn_kv           = 0.0;
+        if (!llama_hybrid_layer_block_total_cost(
+                layer_points, tokens, layers, use_compute_est,
+                layer_block_total) ||
+            !llama_hybrid_attn_cost(
+                attn_points, tokens, tokens, attn_base) ||
+            !llama_hybrid_attn_cost(
+                attn_points, tokens, kv_tokens, attn_kv)) {
             return false;
         }
-        result_ms += layers * std::max(0.0, layer_base + attn_kv - attn_base);
+        result_ms += std::max(
+            0.0,
+            layer_block_total +
+            layers * (attn_kv - attn_base));
     }
     return std::isfinite(result_ms);
 }
@@ -3056,16 +3161,22 @@ bool llama_hybrid_runtime_predict_cpu_compute(
 
     int profile_min_tokens = std::numeric_limits<int>::max();
     int profile_max_tokens = 0;
+    int profile_min_layers = std::numeric_limits<int>::max();
+    int profile_max_layers = 0;
     std::set<int> profile_tokens;
+    std::set<int> profile_layers;
     for (const auto & point : profile.cpu_layer_blocks) {
         if (point.layers <= 0 || point.tokens <= 0) {
             continue;
         }
         profile_tokens.insert(point.tokens);
+        profile_layers.insert(point.layers);
         profile_min_tokens = std::min(profile_min_tokens, point.tokens);
         profile_max_tokens = std::max(profile_max_tokens, point.tokens);
+        profile_min_layers = std::min(profile_min_layers, point.layers);
+        profile_max_layers = std::max(profile_max_layers, point.layers);
     }
-    if (profile_tokens.empty()) {
+    if (profile_tokens.empty() || profile_layers.empty()) {
         return false;
     }
 
@@ -3098,6 +3209,12 @@ bool llama_hybrid_runtime_predict_cpu_compute(
     prediction.profile_exact_chunks         = exact_chunks;
     prediction.profile_interpolated_chunks  = interpolated_chunks;
     prediction.profile_extrapolated_chunks  = extrapolated_chunks;
+    prediction.profile_min_layers           = profile_min_layers;
+    prediction.profile_max_layers           = profile_max_layers;
+    prediction.profile_layer_exact          =
+        profile_layers.count(cpu_layers) != 0;
+    prediction.profile_layer_saturated      =
+        cpu_layers > profile_max_layers;
     prediction.total_ms                     = total_ms;
     prediction.per_layer_ms                 =
         cpu_layers > 0 ? total_ms / cpu_layers : 0.0;
@@ -5109,6 +5226,172 @@ static bool llama_hybrid_profile_moe_misc_point(
     return true;
 }
 
+static bool llama_hybrid_profile_moe_branch_block_point(
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_moe_desc &  moe_desc,
+        ggml_backend_t                 backend,
+        int                            n_layers,
+        int                            tokens,
+        llama_hybrid_graph_timing &    timing) {
+    if (backend == nullptr || n_layers <= 0 || tokens <= 0 ||
+        moe_desc.n_embd <= 0 || moe_desc.n_ff_exp <= 0 ||
+        moe_desc.n_expert <= 0 || moe_desc.n_expert_used <= 0 ||
+        moe_desc.n_expert_used > moe_desc.n_expert ||
+        moe_desc.ffn_norm_type < 0 ||
+        moe_desc.ffn_norm_type >= GGML_TYPE_COUNT ||
+        moe_desc.router_type < 0 ||
+        moe_desc.router_type >= GGML_TYPE_COUNT ||
+        moe_desc.gate_exps_type < 0 ||
+        moe_desc.gate_exps_type >= GGML_TYPE_COUNT ||
+        moe_desc.up_exps_type < 0 ||
+        moe_desc.up_exps_type >= GGML_TYPE_COUNT ||
+        moe_desc.down_exps_type < 0 ||
+        moe_desc.down_exps_type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+
+    const size_t graph_size =
+        (size_t) n_layers * 64 + 32;
+    const size_t tensor_budget =
+        192 + (size_t) n_layers * 96;
+    const ggml_init_params params = {
+        /*.mem_size   =*/tensor_budget * ggml_tensor_overhead() +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    const int64_t k = moe_desc.n_expert_used;
+    ggml_tensor * cur = ggml_new_tensor_2d(
+        ctx.get(), GGML_TYPE_F32, moe_desc.n_embd, tokens);
+
+    for (int il = 0; il < n_layers; ++il) {
+        // Distinct synthetic weights per layer are essential here: the point
+        // of this probe is to expose sustained weight-streaming behaviour that
+        // a one-layer cache-hot microbenchmark cannot see.
+        ggml_tensor * norm_w = ggml_new_tensor_1d(
+            ctx.get(), moe_desc.ffn_norm_type, moe_desc.n_embd);
+        ggml_tensor * router_w = ggml_new_tensor_2d(
+            ctx.get(), moe_desc.router_type,
+            moe_desc.n_embd, moe_desc.n_expert);
+        ggml_tensor * w_gate = ggml_new_tensor_3d(
+            ctx.get(), moe_desc.gate_exps_type,
+            moe_desc.n_embd, moe_desc.n_ff_exp,
+            moe_desc.n_expert);
+        ggml_tensor * w_up = ggml_new_tensor_3d(
+            ctx.get(), moe_desc.up_exps_type,
+            moe_desc.n_embd, moe_desc.n_ff_exp,
+            moe_desc.n_expert);
+        ggml_tensor * w_down = ggml_new_tensor_3d(
+            ctx.get(), moe_desc.down_exps_type,
+            moe_desc.n_ff_exp, moe_desc.n_embd,
+            moe_desc.n_expert);
+
+        ggml_tensor * norm =
+            ggml_rms_norm(ctx.get(), cur, attn_desc.rms_eps);
+        norm = ggml_mul(ctx.get(), norm, norm_w);
+
+        ggml_tensor * logits =
+            ggml_mul_mat(ctx.get(), router_w, norm);
+        ggml_tensor * probs =
+            ggml_soft_max(ctx.get(), logits);
+        ggml_tensor * selected =
+            ggml_argsort_top_k(ctx.get(), probs, (int) k);
+
+        probs = ggml_reshape_3d(
+            ctx.get(), probs, 1, moe_desc.n_expert, tokens);
+        ggml_tensor * mix_weights =
+            ggml_get_rows(ctx.get(), probs, selected);
+        mix_weights = ggml_reshape_2d(
+            ctx.get(), mix_weights, k, tokens);
+        ggml_tensor * weights_sum =
+            ggml_sum_rows(ctx.get(), mix_weights);
+        weights_sum = ggml_clamp(
+            ctx.get(), weights_sum, 6.103515625e-5f, INFINITY);
+        mix_weights =
+            ggml_div(ctx.get(), mix_weights, weights_sum);
+        mix_weights = ggml_reshape_3d(
+            ctx.get(), mix_weights, 1, k, tokens);
+
+        ggml_tensor * input3 = ggml_reshape_3d(
+            ctx.get(), norm, moe_desc.n_embd, 1, tokens);
+        ggml_tensor * gate =
+            ggml_mul_mat_id(ctx.get(), w_gate, input3, selected);
+        gate = ggml_silu(ctx.get(), gate);
+        ggml_tensor * up =
+            ggml_mul_mat_id(ctx.get(), w_up, input3, selected);
+        ggml_tensor * hidden =
+            ggml_mul(ctx.get(), gate, up);
+        ggml_tensor * experts =
+            ggml_mul_mat_id(ctx.get(), w_down, hidden, selected);
+        experts = ggml_mul(ctx.get(), experts, mix_weights);
+
+        std::vector<ggml_tensor *> expert_views;
+        expert_views.reserve((size_t) k);
+        for (int64_t ie = 0; ie < k; ++ie) {
+            expert_views.push_back(ggml_view_2d(
+                ctx.get(), experts, moe_desc.n_embd, tokens,
+                experts->nb[2], ie * experts->nb[1]));
+        }
+
+        ggml_tensor * branch = expert_views.front();
+        for (size_t ie = 1; ie < expert_views.size(); ++ie) {
+            branch = ggml_add(ctx.get(), branch, expert_views[ie]);
+        }
+        if (k == 1) {
+            branch = ggml_cont(ctx.get(), branch);
+        }
+        cur = ggml_add(ctx.get(), branch, cur);
+    }
+
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+    static std::atomic<uint64_t> next_moe_block_uid{
+        (uint64_t(1) << 62) | (uint64_t(1) << 55)
+    };
+    graph->uid =
+        next_moe_block_uid.fetch_add(1, std::memory_order_relaxed);
+    ggml_build_forward_expand(graph, cur);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (!ggml_backend_supports_op(backend, node)) {
+            LLAMA_LOG_ERROR(
+                "%s: backend=%s layers=%d tokens=%d unsupported "
+                "op=%s node=%s\n",
+                __func__, ggml_backend_name(backend),
+                n_layers, tokens,
+                ggml_op_name(node->op), node->name);
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        LLAMA_LOG_ERROR(
+            "%s: allocation failed backend=%s layers=%d tokens=%d\n",
+            __func__, ggml_backend_name(backend),
+            n_layers, tokens);
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    if (!llama_hybrid_profile_graph_timing(
+            backend, graph, timing)) {
+        LLAMA_LOG_ERROR(
+            "%s: execution failed backend=%s layers=%d tokens=%d\n",
+            __func__, ggml_backend_name(backend),
+            n_layers, tokens);
+        return false;
+    }
+    return true;
+}
+
 bool llama_hybrid_profile_moe_full_layer(
         llama_hybrid_profile &         profile,
         const llama_hybrid_attn_desc & attn_desc,
@@ -5200,6 +5483,51 @@ bool llama_hybrid_profile_moe_full_layer(
         if (tokens == profile.probe_tokens) {
             profile.cpu_full_layer_ms = cpu_ms;
         }
+    }
+
+    // A one-layer MoE microbenchmark can be substantially cache-hot compared
+    // with a real C=20..40 CPU stage. Add a small number of multi-layer block
+    // probes to calibrate the sustained regime without turning startup into a
+    // long stress test.
+    for (const int tokens : LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig ||
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS > profile.n_layer) {
+            continue;
+        }
+
+        llama_hybrid_graph_timing branch_timing;
+        if (!llama_hybrid_profile_moe_branch_block_point(
+                attn_desc, moe_desc, cpu_backend,
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                tokens, branch_timing)) {
+            return false;
+        }
+
+        double attn_ms = 0.0;
+        if (!llama_hybrid_attn_cost(
+                profile.cpu_attn, tokens, tokens, attn_ms)) {
+            return false;
+        }
+
+        const double total_ms =
+            branch_timing.wall_ms +
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS * attn_ms;
+        profile.cpu_layer_blocks.push_back({
+            tokens,
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+            total_ms,
+            total_ms
+        });
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_CPU_DEPTH] kind=moe_block layers=%d "
+            "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
+            "total_ms=%.3f per_layer_ms=%.3f\n",
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+            tokens,
+            branch_timing.wall_ms,
+            attn_ms,
+            total_ms,
+            total_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS);
     }
 
     // Keep phone full-layer probes at the existing small-token anchors; large
