@@ -1,6 +1,18 @@
 #include "llama-hybrid.h"
 #include "models.h"
 
+#include <cstdlib>
+
+static int qwen3moe_ffn_chunk_count() {
+    constexpr int default_chunks = 1;
+    const char * value = std::getenv("LLAMA_CHUNKS");
+    if (value == nullptr) {
+        return default_chunks;
+    }
+    const int chunks = std::atoi(value);
+    return chunks > 0 ? chunks : default_chunks;
+}
+
 void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -146,8 +158,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         const llama_hybrid_layer_mode hybrid_mode =
             model.hybrid_layer_mode(il);
+        const int n_decode_chunks =
+            std::min<int64_t>(qwen3moe_ffn_chunk_count(), n_embd);
         const int planned_chunk_tokens =
             llama_hybrid_runtime_prefill_chunk_tokens();
+        const bool use_decode_chunked_moe =
+            n_tokens == 1 &&
+            n_decode_chunks > 1 &&
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            loras->empty() &&
+            cvec->tensor_for(il) == nullptr;
         const bool use_prefill_chunked_moe =
             n_tokens > 1 &&
             cur->ne[1] > 1 &&
@@ -210,6 +231,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
             cur = ggml_add(ctx0, cur, ffn_inp);
         } else {
+            std::vector<ggml_tensor *> decode_down_chunks;
             ggml_tensor * moe_out =
                 build_moe_ffn(cur,
                         model.layers[il].ffn_gate_inp,
@@ -225,9 +247,46 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         nullptr, nullptr,
                         model.layers[il].ffn_up_exps_s,
                         model.layers[il].ffn_gate_exps_s,
-                        model.layers[il].ffn_down_exps_s);
-            cb(moe_out, "ffn_moe_out", il);
-            cur = ggml_add(ctx0, moe_out, ffn_inp);
+                        model.layers[il].ffn_down_exps_s,
+                        nullptr,
+                        use_decode_chunked_moe ? n_decode_chunks : 1,
+                        use_decode_chunked_moe ? &decode_down_chunks : nullptr);
+
+            if (use_decode_chunked_moe) {
+                GGML_ASSERT(
+                    (int) decode_down_chunks.size() == n_decode_chunks);
+
+                std::vector<ggml_tensor *> output_chunks;
+                output_chunks.reserve(decode_down_chunks.size());
+
+                int64_t embd_begin = 0;
+                for (ggml_tensor * down_chunk : decode_down_chunks) {
+                    const int64_t embd_count = down_chunk->ne[0];
+                    GGML_ASSERT(embd_count > 0);
+
+                    ggml_tensor * residual_chunk =
+                        ggml_view_2d(
+                            ctx0,
+                            ffn_inp,
+                            embd_count,
+                            ffn_inp->ne[1],
+                            ffn_inp->nb[1],
+                            embd_begin * ffn_inp->nb[0]);
+                    output_chunks.push_back(
+                        ggml_add(ctx0, down_chunk, residual_chunk));
+                    embd_begin += embd_count;
+                }
+                GGML_ASSERT(embd_begin == ffn_inp->ne[0]);
+
+                cur = output_chunks[0];
+                for (size_t i = 1; i < output_chunks.size(); ++i) {
+                    cur = ggml_concat(
+                        ctx0, cur, output_chunks[i], 0);
+                }
+            } else {
+                cb(moe_out, "ffn_moe_out", il);
+                cur = ggml_add(ctx0, moe_out, ffn_inp);
+            }
         }
 
         cur = build_cvec(cur, il);

@@ -4841,16 +4841,29 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
     uint64_t res = base;
 
-    if (model.arch == LLM_ARCH_LLAMA && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        constexpr uint32_t default_chunks = 2;
+    const bool decode_chunked_arch =
+        model.arch == LLM_ARCH_LLAMA ||
+        model.arch == LLM_ARCH_QWEN2 ||
+        model.arch == LLM_ARCH_QWEN3 ||
+        model.arch == LLM_ARCH_QWEN3MOE;
+    if (decode_chunked_arch &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        const uint32_t default_chunks =
+            model.arch == LLM_ARCH_QWEN3MOE ? 1u : 2u;
         const char * value = std::getenv("LLAMA_CHUNKS");
-        const int configured_chunks = value == nullptr ? default_chunks : std::atoi(value);
+        const int configured_chunks =
+            value == nullptr ? (int) default_chunks : std::atoi(value);
         const uint32_t n_chunks = std::min<uint32_t>(
-                configured_chunks > 0 ? configured_chunks : default_chunks, model.hparams.n_embd);
+                configured_chunks > 0 ?
+                    (uint32_t) configured_chunks : default_chunks,
+                model.hparams.n_embd);
 
-        // Each decode chunk adds down, reduction, RMS preparation, and partial
-        // Q/K/V tensors. This arena is shared by prefill and decode graphs.
-        res += (uint64_t) model.hparams.n_layer() * (24ull*n_chunks + 24ull);
+        // MoE decode chunking repeats the down-projection/aggregation tail for
+        // each output slice, so reserve more headroom than dense FFN chunking.
+        const uint64_t nodes_per_chunk =
+            model.arch == LLM_ARCH_QWEN3MOE ? 48ull : 24ull;
+        res += (uint64_t) model.hparams.n_layer() *
+            (nodes_per_chunk*n_chunks + 24ull);
     }
 
     const int chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();

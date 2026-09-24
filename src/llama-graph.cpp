@@ -1833,7 +1833,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+                 int   down_chunks,
+ std::vector<ggml_tensor *> * down_chunk_outputs) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1854,7 +1856,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        down_chunks,
+        down_chunk_outputs
     );
 }
 
@@ -1882,7 +1886,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+                 int   down_chunks,
+ std::vector<ggml_tensor *> * down_chunk_outputs) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2155,6 +2161,111 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             } break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    const int n_down_chunks = std::min<int64_t>(
+        std::max(1, down_chunks), n_embd);
+
+    if (n_down_chunks > 1) {
+        // Decode Tensor-Split can return/reduce independent slices of the
+        // hidden state as soon as each down projection finishes. Only the
+        // output dimension of the down projection is chunked: Router, Top-K,
+        // gate/up and the expert hidden activations above are still computed
+        // exactly once.
+        GGML_ASSERT(down_exps_b == nullptr);
+
+        std::vector<ggml_tensor *> moe_chunks;
+        moe_chunks.reserve((size_t) n_down_chunks);
+
+        if (down_chunk_outputs != nullptr) {
+            down_chunk_outputs->clear();
+            down_chunk_outputs->reserve((size_t) n_down_chunks);
+        }
+
+        for (int chunk = 0; chunk < n_down_chunks; ++chunk) {
+            const int64_t embd_begin =
+                n_embd * chunk / n_down_chunks;
+            const int64_t embd_end =
+                n_embd * (chunk + 1) / n_down_chunks;
+            const int64_t embd_count = embd_end - embd_begin;
+            GGML_ASSERT(embd_count > 0);
+
+            ggml_tensor * down_chunk = ggml_view_3d(
+                ctx0,
+                down_exps,
+                down_exps->ne[0],
+                embd_count,
+                down_exps->ne[2],
+                down_exps->nb[1],
+                down_exps->nb[2],
+                embd_begin * down_exps->nb[1]);
+
+            ggml_tensor * experts_chunk =
+                build_lora_mm_id(
+                    down_chunk, cur, selected_experts, down_exps_s);
+
+            const std::string raw_name =
+                "ffn_moe_down_part_" + std::to_string(chunk);
+            cb(experts_chunk, raw_name.c_str(), il);
+
+            if (!weight_before_ffn) {
+                experts_chunk =
+                    ggml_mul(ctx0, experts_chunk, weights);
+                const std::string weighted_name =
+                    "ffn_moe_weighted_part_" + std::to_string(chunk);
+                cb(experts_chunk, weighted_name.c_str(), il);
+            }
+
+            ggml_build_forward_expand(gf, experts_chunk);
+
+            std::vector<ggml_tensor *> cur_experts(
+                hparams.n_expert_used, nullptr);
+            GGML_ASSERT(!cur_experts.empty());
+
+            for (uint32_t ie = 0; ie < hparams.n_expert_used; ++ie) {
+                cur_experts[ie] = ggml_view_2d(
+                    ctx0,
+                    experts_chunk,
+                    embd_count,
+                    n_tokens,
+                    experts_chunk->nb[2],
+                    ie * experts_chunk->nb[1]);
+                ggml_build_forward_expand(gf, cur_experts[ie]);
+            }
+
+            ggml_tensor * moe_chunk = cur_experts[0];
+            for (uint32_t ie = 1; ie < hparams.n_expert_used; ++ie) {
+                moe_chunk =
+                    ggml_add(ctx0, moe_chunk, cur_experts[ie]);
+                ggml_build_forward_expand(gf, moe_chunk);
+            }
+
+            if (hparams.n_expert_used == 1) {
+                moe_chunk = ggml_cont(ctx0, moe_chunk);
+            }
+
+            const std::string chunk_name =
+                "ffn_down_chunk_" + std::to_string(chunk);
+            cb(moe_chunk, chunk_name.c_str(), il);
+            ggml_build_forward_expand(gf, moe_chunk);
+
+            moe_chunks.push_back(moe_chunk);
+            if (down_chunk_outputs != nullptr) {
+                down_chunk_outputs->push_back(moe_chunk);
+            }
+        }
+
+        ggml_tensor * moe_out = moe_chunks[0];
+        for (int chunk = 1; chunk < n_down_chunks; ++chunk) {
+            moe_out = ggml_concat(
+                ctx0, moe_out, moe_chunks[(size_t) chunk], 0);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
+    if (down_chunk_outputs != nullptr) {
+        down_chunk_outputs->clear();
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
