@@ -441,6 +441,15 @@ extern "C" {
         int64_t graph_execute_us;
         int64_t graph_other_us;
 
+        // Generic per-simple-backend compute timing accumulated inside Meta.
+        // Index 0 is the primary backend (PC CPU in the hybrid setup);
+        // index 1 is the secondary backend (Phone/RPC).
+        // These totals may overlap in wall time because Meta can execute
+        // simple backends concurrently.
+        int64_t simple_backend_count;
+        int64_t simple_backend_compute_us[GGML_BACKEND_META_MAX_DEVICES];
+        int64_t simple_backend_compute_calls[GGML_BACKEND_META_MAX_DEVICES];
+
         int64_t wave_layer_start_count;
         int64_t wave_ii_count;
         int64_t wave_ii_sum_us;

@@ -874,6 +874,18 @@ void llama_context::synchronize() {
             meta.graph_execute_us +=
                 cur.graph_execute_us;
             meta.graph_other_us += cur.graph_other_us;
+            meta.simple_backend_count =
+                std::max(
+                    meta.simple_backend_count,
+                    cur.simple_backend_count);
+            for (int j = 0;
+                 j < GGML_BACKEND_META_MAX_DEVICES;
+                 ++j) {
+                meta.simple_backend_compute_us[j] +=
+                    cur.simple_backend_compute_us[j];
+                meta.simple_backend_compute_calls[j] +=
+                    cur.simple_backend_compute_calls[j];
+            }
         }
 
         const int64_t timeline_accounted_us =
@@ -905,12 +917,36 @@ void llama_context::synchronize() {
             residual_us / 1000.0,
             decode_runtime_profile.n_splits);
 
+        const double simple0_ms =
+            meta.simple_backend_count > 0 ?
+                meta.simple_backend_compute_us[0] / 1000.0 : 0.0;
+        const double simple1_ms =
+            meta.simple_backend_count > 1 ?
+                meta.simple_backend_compute_us[1] / 1000.0 : 0.0;
+        const int64_t simple0_calls =
+            meta.simple_backend_count > 0 ?
+                meta.simple_backend_compute_calls[0] : 0;
+        const int64_t simple1_calls =
+            meta.simple_backend_count > 1 ?
+                meta.simple_backend_compute_calls[1] : 0;
+        const double simple_max_ms =
+            std::max(simple0_ms, simple1_ms);
+        const double meta_uncovered_ms =
+            std::max(
+                0.0,
+                meta.graph_execute_us / 1000.0 -
+                    simple_max_ms);
+
         LLAMA_LOG_ERROR(
             "[DECODE_META] sample=%" PRId64
             " graph_calls=%" PRId64
             " rebuilds=%" PRId64
             " graph_total_ms=%.3f rebuild_ms=%.3f "
             "execute_ms=%.3f other_ms=%.3f "
+            "simple_count=%" PRId64
+            " simple0_ms=%.3f simple0_calls=%" PRId64
+            " simple1_ms=%.3f simple1_calls=%" PRId64
+            " execute_minus_simple_max_ms=%.3f "
             "attn_ms=%.3f pc_ffn_ms=%.3f "
             "h2d_ms=%.3f phone_ms=%.3f d2h_ms=%.3f "
             "reduce_ms=%.3f wait_ms=%.3f\n",
@@ -921,6 +957,12 @@ void llama_context::synchronize() {
             meta.graph_rebuild_us / 1000.0,
             meta.graph_execute_us / 1000.0,
             meta.graph_other_us / 1000.0,
+            meta.simple_backend_count,
+            simple0_ms,
+            simple0_calls,
+            simple1_ms,
+            simple1_calls,
+            meta_uncovered_ms,
             meta.attn_us / 1000.0,
             meta.pc_ffn_us / 1000.0,
             meta.h2d_us / 1000.0,

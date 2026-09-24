@@ -2299,6 +2299,7 @@ struct ggml_backend_meta_compute_workers {
     std::vector<std::thread> workers;
     std::vector<ggml_status> statuses;
     std::vector<int64_t> backend_time_us;
+    std::vector<int64_t> backend_call_count;
     std::vector<int64_t> completed_time_us;
 
     std::mutex mutex;
@@ -2314,6 +2315,7 @@ struct ggml_backend_meta_compute_workers {
         n_backends(n_backends),
         statuses(n_backends, GGML_STATUS_SUCCESS),
         backend_time_us(n_backends, 0),
+        backend_call_count(n_backends, 0),
         completed_time_us(n_backends, 0),
         generation(n_backends, 0),
         completed_generation(n_backends, 0),
@@ -2347,6 +2349,7 @@ struct ggml_backend_meta_compute_workers {
                     lock.lock();
                     statuses[j] = status;
                     backend_time_us[j] += elapsed_us;
+                    backend_call_count[j] += 1;
                     completed_time_us[j] = completed_us;
                     completed_generation[j] = seen_generation;
                     done_cv.notify_all();
@@ -2373,6 +2376,7 @@ struct ggml_backend_meta_compute_workers {
             const ggml_status status = ggml_backend_graph_compute_async(
                     bcj.backend, bcj.cgraphs[i].cgraph_main);
             backend_time_us[0] += ggml_time_us() - start_us;
+            backend_call_count[0] += 1;
             return status;
         }
 
@@ -2416,6 +2420,7 @@ struct ggml_backend_meta_compute_workers {
 
     void reset_timings() {
         std::fill(backend_time_us.begin(), backend_time_us.end(), 0);
+        std::fill(backend_call_count.begin(), backend_call_count.end(), 0);
     }
 };
 
@@ -6601,6 +6606,19 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.graph_rebuild_us += meta_rebuild_us;
         backend_ctx->tensor_profile.graph_execute_us += meta_execute_us;
         backend_ctx->tensor_profile.graph_other_us += meta_other_all_us;
+        backend_ctx->tensor_profile.simple_backend_count =
+            std::max<int64_t>(
+                backend_ctx->tensor_profile.simple_backend_count,
+                (int64_t) n_backends);
+        for (size_t j = 0;
+             j < n_backends &&
+             j < GGML_BACKEND_META_MAX_DEVICES;
+             ++j) {
+            backend_ctx->tensor_profile.simple_backend_compute_us[j] +=
+                compute_workers.backend_time_us[j];
+            backend_ctx->tensor_profile.simple_backend_compute_calls[j] +=
+                compute_workers.backend_call_count[j];
+        }
         if (needs_rebuild) {
             backend_ctx->tensor_profile.graph_rebuild_count += 1;
         }
