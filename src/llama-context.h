@@ -525,6 +525,20 @@ private:
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
+    struct decode_runtime_profile_state {
+        bool pending = false;
+
+        int64_t sample_index      = 0;
+        int64_t prepare_us        = 0;
+        int64_t split_prepare_us  = 0;
+        int64_t split_submit_us   = 0;
+        int64_t output_submit_us  = 0;
+        int     n_splits          = 0;
+    };
+
+    decode_runtime_profile_state decode_runtime_profile;
+    int64_t decode_runtime_profile_count = 0;
+
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 

@@ -827,7 +827,110 @@ void llama_context::synchronize() {
         return;
     }
 
+    const bool decode_profile_pending =
+        decode_runtime_profile.pending &&
+        n_queued_tokens == 1;
+    const int64_t sync_begin_us =
+        decode_profile_pending ? ggml_time_us() : 0;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (decode_profile_pending) {
+        const int64_t sync_us =
+            ggml_time_us() - sync_begin_us;
+        const int64_t total_us =
+            t_compute_start_us > 0 ?
+                ggml_time_us() - t_compute_start_us : 0;
+
+        ggml_backend_meta_tensor_profile meta {};
+        const int n_backends =
+            ggml_backend_sched_get_n_backends(sched.get());
+        for (int ib = 0; ib < n_backends; ++ib) {
+            ggml_backend_meta_tensor_profile cur {};
+            if (!ggml_backend_meta_tensor_profile_get(
+                    ggml_backend_sched_get_backend(
+                        sched.get(), ib),
+                    &cur)) {
+                continue;
+            }
+            meta.attn_us += cur.attn_us;
+            meta.pc_ffn_us += cur.pc_ffn_us;
+            meta.h2d_us += cur.h2d_us;
+            meta.phone_us += cur.phone_us;
+            meta.d2h_us += cur.d2h_us;
+            meta.reduce_us += cur.reduce_us;
+            meta.wait_us += cur.wait_us;
+            meta.compute_wall_us += cur.compute_wall_us;
+            meta.reduce_wall_us += cur.reduce_wall_us;
+            meta.meta_total_us += cur.meta_total_us;
+            meta.other_main_us += cur.other_main_us;
+            meta.graph_compute_count +=
+                cur.graph_compute_count;
+            meta.graph_rebuild_count +=
+                cur.graph_rebuild_count;
+            meta.graph_total_us += cur.graph_total_us;
+            meta.graph_rebuild_us +=
+                cur.graph_rebuild_us;
+            meta.graph_execute_us +=
+                cur.graph_execute_us;
+            meta.graph_other_us += cur.graph_other_us;
+        }
+
+        const int64_t timeline_accounted_us =
+            decode_runtime_profile.prepare_us +
+            decode_runtime_profile.split_prepare_us +
+            decode_runtime_profile.split_submit_us +
+            decode_runtime_profile.output_submit_us +
+            sync_us;
+        const int64_t residual_us =
+            std::max<int64_t>(
+                0, total_us - timeline_accounted_us);
+
+        LLAMA_LOG_ERROR(
+            "[DECODE_RUNTIME] sample=%" PRId64
+            " total_ms=%.3f prepare_ms=%.3f "
+            "split_prepare_ms=%.3f split_submit_ms=%.3f "
+            "output_submit_ms=%.3f sync_ms=%.3f "
+            "residual_ms=%.3f splits=%d\n",
+            decode_runtime_profile.sample_index,
+            total_us / 1000.0,
+            decode_runtime_profile.prepare_us / 1000.0,
+            decode_runtime_profile.split_prepare_us /
+                1000.0,
+            decode_runtime_profile.split_submit_us /
+                1000.0,
+            decode_runtime_profile.output_submit_us /
+                1000.0,
+            sync_us / 1000.0,
+            residual_us / 1000.0,
+            decode_runtime_profile.n_splits);
+
+        LLAMA_LOG_ERROR(
+            "[DECODE_META] sample=%" PRId64
+            " graph_calls=%" PRId64
+            " rebuilds=%" PRId64
+            " graph_total_ms=%.3f rebuild_ms=%.3f "
+            "execute_ms=%.3f other_ms=%.3f "
+            "attn_ms=%.3f pc_ffn_ms=%.3f "
+            "h2d_ms=%.3f phone_ms=%.3f d2h_ms=%.3f "
+            "reduce_ms=%.3f wait_ms=%.3f\n",
+            decode_runtime_profile.sample_index,
+            meta.graph_compute_count,
+            meta.graph_rebuild_count,
+            meta.graph_total_us / 1000.0,
+            meta.graph_rebuild_us / 1000.0,
+            meta.graph_execute_us / 1000.0,
+            meta.graph_other_us / 1000.0,
+            meta.attn_us / 1000.0,
+            meta.pc_ffn_us / 1000.0,
+            meta.h2d_us / 1000.0,
+            meta.phone_us / 1000.0,
+            meta.d2h_us / 1000.0,
+            meta.reduce_us / 1000.0,
+            meta.wait_us / 1000.0);
+
+        decode_runtime_profile.pending = false;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2432,10 +2535,115 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
 
     const bool batched = ubatch.n_tokens > 1;
+    const bool decode_token =
+        ubatch.n_tokens == 1 && sched_use == sched.get();
 
-    const int64_t compute_begin_us = batched ? ggml_time_us() : 0;
-    ret = graph_compute_range(sched_use, 0, n_splits, batched);
-    const int64_t compute_us = batched ? ggml_time_us() - compute_begin_us : 0;
+    bool decode_profile_this_token = false;
+    if (decode_token) {
+        const int64_t sample_index =
+            ++decode_runtime_profile_count;
+        decode_profile_this_token =
+            sample_index <= 8 || (sample_index % 16) == 0;
+
+        if (decode_profile_this_token) {
+            decode_runtime_profile = {};
+            decode_runtime_profile.pending = true;
+            decode_runtime_profile.sample_index = sample_index;
+            decode_runtime_profile.prepare_us = prepare_us;
+            decode_runtime_profile.n_splits = n_splits;
+
+            // The Meta profile is cumulative. Reset it immediately before the
+            // real decode graph so the later synchronize() log describes this
+            // exact token only.
+            const int n_backends =
+                ggml_backend_sched_get_n_backends(sched_use);
+            for (int ib = 0; ib < n_backends; ++ib) {
+                ggml_backend_meta_tensor_profile_reset(
+                    ggml_backend_sched_get_backend(sched_use, ib));
+            }
+        }
+    }
+
+    const int64_t compute_begin_us =
+        (batched || decode_profile_this_token) ?
+            ggml_time_us() : 0;
+
+    if (decode_profile_this_token) {
+        // Keep the scheduler semantics identical to compute_range(): prepare
+        // and submit every split in order, but do not add any synchronization.
+        // The split timings therefore measure scheduler/dispatch wall time,
+        // while the actual completion time is captured later in synchronize().
+        ret = GGML_STATUS_SUCCESS;
+        for (int split_id = 0;
+             split_id < n_splits &&
+             ret == GGML_STATUS_SUCCESS;
+             ++split_id) {
+            ggml_backend_t split_backend =
+                ggml_backend_sched_get_split_backend(
+                    sched_use, split_id);
+
+            const int64_t split_prepare_begin_us =
+                ggml_time_us();
+            ret = ggml_backend_sched_prepare_split(
+                sched_use, split_id);
+            const int64_t split_prepare_us =
+                ggml_time_us() - split_prepare_begin_us;
+
+            int64_t split_submit_us = 0;
+            if (ret == GGML_STATUS_SUCCESS) {
+                const int64_t split_submit_begin_us =
+                    ggml_time_us();
+                ret = ggml_backend_sched_compute_split(
+                    sched_use, split_id);
+                split_submit_us =
+                    ggml_time_us() - split_submit_begin_us;
+            }
+
+            decode_runtime_profile.split_prepare_us +=
+                split_prepare_us;
+            decode_runtime_profile.split_submit_us +=
+                split_submit_us;
+
+            ggml_backend_dev_t split_dev =
+                split_backend != nullptr ?
+                    ggml_backend_get_device(split_backend) : nullptr;
+            LLAMA_LOG_ERROR(
+                "[DECODE_SPLIT_SUBMIT] sample=%" PRId64
+                " split=%d/%d backend=%s type=%d "
+                "prepare_ms=%.3f submit_ms=%.3f status=%d\n",
+                decode_runtime_profile.sample_index,
+                split_id,
+                n_splits,
+                split_backend != nullptr ?
+                    ggml_backend_name(split_backend) : "(null)",
+                split_dev != nullptr ?
+                    (int) ggml_backend_dev_type(split_dev) : -1,
+                split_prepare_us / 1000.0,
+                split_submit_us / 1000.0,
+                (int) ret);
+        }
+    } else {
+        ret = graph_compute_range(
+            sched_use, 0, n_splits, batched);
+    }
+
+    const int64_t compute_us =
+        (batched || decode_profile_this_token) ?
+            ggml_time_us() - compute_begin_us : 0;
+
+    if (decode_profile_this_token) {
+        LLAMA_LOG_ERROR(
+            "[DECODE_DISPATCH] sample=%" PRId64
+            " splits=%d prepare_graph_ms=%.3f "
+            "split_prepare_ms=%.3f split_submit_ms=%.3f "
+            "dispatch_wall_ms=%.3f\n",
+            decode_runtime_profile.sample_index,
+            n_splits,
+            prepare_us / 1000.0,
+            decode_runtime_profile.split_prepare_us / 1000.0,
+            decode_runtime_profile.split_submit_us / 1000.0,
+            compute_us / 1000.0);
+    }
 
     if (batched) {
         LLAMA_LOG_ERROR(
@@ -4168,8 +4376,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs) * n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0,
-                                              n_outputs * n_vocab * sizeof(float));
+
+                const int64_t output_submit_begin_us =
+                    decode_runtime_profile.pending ?
+                        ggml_time_us() : 0;
+                ggml_backend_tensor_get_async(
+                    backend_res,
+                    t_logits,
+                    logits_out,
+                    0,
+                    n_outputs * n_vocab * sizeof(float));
+                if (decode_runtime_profile.pending) {
+                    decode_runtime_profile.output_submit_us +=
+                        ggml_time_us() -
+                        output_submit_begin_us;
+                    LLAMA_LOG_ERROR(
+                        "[DECODE_OUTPUT_SUBMIT] sample=%" PRId64
+                        " backend=%s bytes=%zu submit_ms=%.3f\n",
+                        decode_runtime_profile.sample_index,
+                        ggml_backend_name(backend_res),
+                        (size_t) n_outputs *
+                            (size_t) n_vocab *
+                            sizeof(float),
+                        decode_runtime_profile.output_submit_us /
+                            1000.0);
+                }
             }
         }
 
