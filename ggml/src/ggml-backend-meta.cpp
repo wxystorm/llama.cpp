@@ -4986,8 +4986,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
             ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
 
+        // Dense decode chunking has a single down-projection MUL_MAT as
+        // the reduction boundary. The RPC snapshot fast path was designed for
+        // that shape. A MoE chunk boundary is the terminal expert-aggregation
+        // node after a delayed all-reduce chain; snapshotting that boundary can
+        // race/fuse against a graph shape it was never designed to represent.
+        // Keep MoE decode chunks on the conservative fence -> copy -> reduce
+        // path until a dependency-complete MoE snapshot path is implemented.
+        const bool snapshot_compatible_decode_chunk =
+            node_src->op == GGML_OP_MUL_MAT &&
+            node_dst->op == GGML_OP_MUL_MAT;
         const bool use_snapshot_pipeline =
-            !handoff_to_phone && snapshot_arm != nullptr && set_snapshot_read != nullptr;
+            !handoff_to_phone &&
+            snapshot_compatible_decode_chunk &&
+            snapshot_arm != nullptr &&
+            set_snapshot_read != nullptr;
+
+        if (pipeline_debug &&
+            !handoff_to_phone &&
+            !snapshot_compatible_decode_chunk) {
+            printf(
+                "[DECODE_SNAPSHOT_SKIP] layer=%d chunk=%d phone_op=%s pc_op=%s\n",
+                decode_layer_0,
+                decode_chunk_0,
+                ggml_op_name(node_src->op),
+                ggml_op_name(node_dst->op));
+        }
+
         const uint64_t snapshot_seq =
             snapshot_prepares[i].prepared ?
                 snapshot_prepares[i].seq :
