@@ -72,6 +72,14 @@ struct llama_hybrid_attn_compute_point {
     size_t runtime_bytes = 0;
 };
 
+struct llama_hybrid_decode_ratio_block_point {
+    float  pc_ratio             = 0.0f;
+    int    layers               = 0;
+    double cpu_wall_ms          = 0.0;
+    double phone_wall_ms        = 0.0;
+    double phone_compute_est_ms = 0.0;
+};
+
 struct llama_hybrid_phone_block_point {
     int layers    = 0;
     int tokens    = 0;
@@ -142,6 +150,7 @@ struct llama_hybrid_profile {
     std::vector<llama_hybrid_layer_compute_point> phone_layer_blocks;
     std::vector<llama_hybrid_layer_compute_point> gpu_layer_blocks;
 
+    std::vector<llama_hybrid_decode_ratio_block_point> decode_ratio_blocks;
     std::vector<llama_hybrid_phone_block_point> phone_blocks;
 
     double cpu_attn_ms       = 0.0;

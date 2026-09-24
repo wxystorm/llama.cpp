@@ -40,8 +40,9 @@ static constexpr std::array<int, 8>   LLAMA_HYBRID_REGION_CHUNK_CANDIDATES = { 8
 static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
-static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS      = 4;
-static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS      = { 1, 64, 128, 256 };
+static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS       = 4;
+static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS       = { 1, 64, 128, 256 };
+static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 4;
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
@@ -1319,7 +1320,8 @@ static bool llama_hybrid_ffn_cost(const std::vector<llama_hybrid_ffn_compute_poi
 
 static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_point> & points,
                                        size_t                                           bytes,
-                                       double &                                         result_ms) {
+                                       double &                                         result_ms,
+                                       bool                                             use_confirmed_wall = false) {
     if (bytes == 0) {
         result_ms = 0.0;
         return true;
@@ -1328,11 +1330,18 @@ static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_p
         return false;
     }
 
+    const auto value = [&](const llama_hybrid_transfer_point * point) {
+        if (use_confirmed_wall && point->confirmed_wall_ms > 0.0) {
+            return point->confirmed_wall_ms;
+        }
+        return point->ms;
+    };
+
     const llama_hybrid_transfer_point * lower = nullptr;
     const llama_hybrid_transfer_point * upper = nullptr;
     for (const auto & point : points) {
         if (point.bytes == bytes) {
-            result_ms = point.ms;
+            result_ms = value(&point);
             return true;
         }
         if (point.bytes < bytes && (lower == nullptr || point.bytes > lower->bytes)) {
@@ -1344,7 +1353,7 @@ static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_p
     }
 
     if (lower == nullptr) {
-        result_ms = upper->ms;
+        result_ms = value(upper);
         return true;
     }
     if (upper == nullptr) {
@@ -1355,16 +1364,26 @@ static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_p
             }
         }
         if (prev == nullptr || lower->bytes == prev->bytes) {
-            result_ms = lower->ms;
+            result_ms = value(lower);
             return true;
         }
-        const double slope = std::max(0.0, (lower->ms - prev->ms) / (double) (lower->bytes - prev->bytes));
-        result_ms = lower->ms + slope * (double) (bytes - lower->bytes);
+        const double lower_ms = value(lower);
+        const double prev_ms  = value(prev);
+        const double slope = std::max(
+            0.0,
+            (lower_ms - prev_ms) /
+                (double) (lower->bytes - prev->bytes));
+        result_ms =
+            lower_ms + slope * (double) (bytes - lower->bytes);
         return true;
     }
 
-    const double t = (double) (bytes - lower->bytes) / (double) (upper->bytes - lower->bytes);
-    result_ms      = lower->ms + t * (upper->ms - lower->ms);
+    const double lower_ms = value(lower);
+    const double upper_ms = value(upper);
+    const double t =
+        (double) (bytes - lower->bytes) /
+        (double) (upper->bytes - lower->bytes);
+    result_ms = lower_ms + t * (upper_ms - lower_ms);
     return true;
 }
 
@@ -2112,6 +2131,9 @@ struct llama_hybrid_decode_tensor_cost {
     double h2d_ms       = 0.0;
     double d2h_ms       = 0.0;
     double reduce_ms    = 0.0;
+
+    int  ratio_profile_layers = 1;
+    bool phone_wall_fallback  = false;
 };
 
 static bool llama_hybrid_decode_region_cost(
@@ -2164,6 +2186,19 @@ static bool llama_hybrid_decode_layer_cost(
         kv_tokens, 1, use_compute_est, result_ms);
 }
 
+static const llama_hybrid_decode_ratio_block_point *
+llama_hybrid_decode_ratio_block_find(
+        const llama_hybrid_profile & profile,
+        float pc_ratio) {
+    for (const auto & point : profile.decode_ratio_blocks) {
+        if (point.layers > 0 &&
+            std::fabs(point.pc_ratio - pc_ratio) < 1e-4f) {
+            return &point;
+        }
+    }
+    return nullptr;
+}
+
 static bool llama_hybrid_decode_tensor_layer_cost(
         const llama_hybrid_profile & profile,
         int kv_tokens,
@@ -2188,12 +2223,32 @@ static bool llama_hybrid_decode_tensor_layer_cost(
         return false;
     }
 
+    if (const auto * block =
+            llama_hybrid_decode_ratio_block_find(profile, pc_ratio)) {
+        cost.ratio_profile_layers = block->layers;
+        cost.pc_ffn_ms =
+            block->cpu_wall_ms / block->layers;
+
+        const double phone_compute_per_layer =
+            block->phone_compute_est_ms / block->layers;
+        const double phone_wall_per_layer =
+            block->phone_wall_ms / block->layers;
+        if (phone_compute_per_layer > 0.0) {
+            cost.phone_ffn_ms = phone_compute_per_layer;
+        } else {
+            cost.phone_ffn_ms = phone_wall_per_layer;
+            cost.phone_wall_fallback = true;
+        }
+    }
+
     const size_t hidden_bytes =
         (size_t) profile.n_embd * sizeof(float);
     if (!llama_hybrid_transfer_cost(
-            profile.pc_to_phone, hidden_bytes, cost.h2d_ms) ||
+            profile.pc_to_phone, hidden_bytes,
+            cost.h2d_ms, true) ||
         !llama_hybrid_transfer_cost(
-            profile.phone_to_pc, hidden_bytes, cost.d2h_ms)) {
+            profile.phone_to_pc, hidden_bytes,
+            cost.d2h_ms)) {
         return false;
     }
 
@@ -2375,8 +2430,9 @@ bool llama_hybrid_predict_decode_plan(
         }
         LLAMA_LOG_ERROR(
             "[DECODE_RATIO] R=%.5f layer_ms=%.3f base_ms=%.3f "
-            "pc_ffn_ms=%.3f phone_ffn_ms=%.3f h2d_ms=%.3f "
-            "d2h_ms=%.3f reduce_ms=%.3f\n",
+            "pc_ffn_ms=%.3f phone_ffn_ms=%.3f h2d_wall_ms=%.3f "
+            "d2h_ms=%.3f reduce_ms=%.3f profile_layers=%d "
+            "phone_wall_fallback=%d\n",
             ratio,
             tensor_cost.total_ms,
             tensor_cost.base_ms,
@@ -2384,7 +2440,9 @@ bool llama_hybrid_predict_decode_plan(
             tensor_cost.phone_ffn_ms,
             tensor_cost.h2d_ms,
             tensor_cost.d2h_ms,
-            tensor_cost.reduce_ms);
+            tensor_cost.reduce_ms,
+            tensor_cost.ratio_profile_layers,
+            tensor_cost.phone_wall_fallback ? 1 : 0);
         if (!ratio_found || tensor_cost.total_ms < best_tensor_cost.total_ms) {
             ratio_found = true;
             best_ratio = ratio;
@@ -2405,9 +2463,11 @@ bool llama_hybrid_predict_decode_plan(
     double pc_to_phone_ms = 0.0;
     double phone_to_pc_ms = 0.0;
     if (!llama_hybrid_transfer_cost(
-            profile.pc_to_phone, hidden_bytes, pc_to_phone_ms) ||
+            profile.pc_to_phone, hidden_bytes,
+            pc_to_phone_ms, true) ||
         !llama_hybrid_transfer_cost(
-            profile.phone_to_pc, hidden_bytes, phone_to_pc_ms)) {
+            profile.phone_to_pc, hidden_bytes,
+            phone_to_pc_ms)) {
         return false;
     }
     if (have_gpu &&
@@ -4656,6 +4716,164 @@ static bool llama_hybrid_profile_moe_ffn_point(
     return true;
 }
 
+static bool llama_hybrid_profile_moe_decode_ratio_block_point(
+        const llama_hybrid_moe_desc & desc,
+        ggml_backend_t                backend,
+        int                           backend_index,
+        float                         pc_ratio,
+        int                           n_layers,
+        llama_hybrid_graph_timing &   timing) {
+    if (backend == nullptr ||
+        (backend_index != 0 && backend_index != 1) ||
+        pc_ratio <= 0.0f || pc_ratio >= 1.0f ||
+        n_layers <= 0 ||
+        desc.n_embd <= 0 || desc.n_ff_exp <= 0 ||
+        desc.n_expert <= 0 || desc.n_expert_used <= 0 ||
+        desc.n_expert_used > desc.n_expert) {
+        return false;
+    }
+
+    const int64_t n_ff_shard = llama_hybrid_ffn_shard_size(
+        desc.n_ff_exp, desc.down_exps_type,
+        pc_ratio, backend_index);
+    if (n_ff_shard <= 0) {
+        return false;
+    }
+
+    const int tokens = 1;
+    const int64_t k = desc.n_expert_used;
+    const size_t graph_size =
+        (size_t) n_layers * 64 + 32;
+    const size_t tensor_budget =
+        128 + (size_t) n_layers * 96;
+    const ggml_init_params params = {
+        /*.mem_size   =*/tensor_budget * ggml_tensor_overhead() +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * cur = ggml_new_tensor_2d(
+        ctx.get(), GGML_TYPE_F32, desc.n_embd, tokens);
+
+    for (int il = 0; il < n_layers; ++il) {
+        ggml_tensor * router_w = ggml_new_tensor_2d(
+            ctx.get(), desc.router_type,
+            desc.n_embd, desc.n_expert);
+        ggml_tensor * w_gate = ggml_new_tensor_3d(
+            ctx.get(), desc.gate_exps_type,
+            desc.n_embd, n_ff_shard, desc.n_expert);
+        ggml_tensor * w_up = ggml_new_tensor_3d(
+            ctx.get(), desc.up_exps_type,
+            desc.n_embd, n_ff_shard, desc.n_expert);
+        ggml_tensor * w_down = ggml_new_tensor_3d(
+            ctx.get(), desc.down_exps_type,
+            n_ff_shard, desc.n_embd, desc.n_expert);
+
+        ggml_tensor * logits =
+            ggml_mul_mat(ctx.get(), router_w, cur);
+        ggml_tensor * probs =
+            ggml_soft_max(ctx.get(), logits);
+        ggml_tensor * selected =
+            ggml_argsort_top_k(ctx.get(), probs, (int) k);
+
+        probs = ggml_reshape_3d(
+            ctx.get(), probs, 1, desc.n_expert, tokens);
+        ggml_tensor * mix_weights =
+            ggml_get_rows(ctx.get(), probs, selected);
+        mix_weights = ggml_reshape_2d(
+            ctx.get(), mix_weights, k, tokens);
+        ggml_tensor * weights_sum =
+            ggml_sum_rows(ctx.get(), mix_weights);
+        weights_sum = ggml_clamp(
+            ctx.get(), weights_sum, 6.103515625e-5f, INFINITY);
+        mix_weights =
+            ggml_div(ctx.get(), mix_weights, weights_sum);
+        mix_weights = ggml_reshape_3d(
+            ctx.get(), mix_weights, 1, k, tokens);
+
+        ggml_tensor * input3 = ggml_reshape_3d(
+            ctx.get(), cur, desc.n_embd, 1, tokens);
+        ggml_tensor * gate =
+            ggml_mul_mat_id(ctx.get(), w_gate, input3, selected);
+        gate = ggml_silu(ctx.get(), gate);
+        ggml_tensor * up =
+            ggml_mul_mat_id(ctx.get(), w_up, input3, selected);
+        ggml_tensor * hidden =
+            ggml_mul(ctx.get(), gate, up);
+        ggml_tensor * experts =
+            ggml_mul_mat_id(ctx.get(), w_down, hidden, selected);
+        experts = ggml_mul(ctx.get(), experts, mix_weights);
+
+        std::vector<ggml_tensor *> expert_views;
+        expert_views.reserve((size_t) k);
+        for (int64_t ie = 0; ie < k; ++ie) {
+            expert_views.push_back(ggml_view_2d(
+                ctx.get(), experts, desc.n_embd, tokens,
+                experts->nb[2], ie * experts->nb[1]));
+        }
+
+        ggml_tensor * branch = expert_views.front();
+        for (size_t ie = 1; ie < expert_views.size(); ++ie) {
+            branch = ggml_add(
+                ctx.get(), branch, expert_views[ie]);
+        }
+        if (k == 1) {
+            branch = ggml_cont(ctx.get(), branch);
+        }
+
+        cur = branch;
+    }
+
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+    static std::atomic<uint64_t> next_decode_ratio_uid{
+        (uint64_t(1) << 62) | (uint64_t(1) << 54)
+    };
+    graph->uid =
+        next_decode_ratio_uid.fetch_add(
+            1, std::memory_order_relaxed);
+    ggml_build_forward_expand(graph, cur);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (!ggml_backend_supports_op(backend, node)) {
+            LLAMA_LOG_ERROR(
+                "%s: backend=%s R=%.5f layers=%d unsupported "
+                "op=%s node=%s\n",
+                __func__, ggml_backend_name(backend),
+                pc_ratio, n_layers,
+                ggml_op_name(node->op), node->name);
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        LLAMA_LOG_ERROR(
+            "%s: allocation failed backend=%s R=%.5f layers=%d\n",
+            __func__, ggml_backend_name(backend),
+            pc_ratio, n_layers);
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    if (!llama_hybrid_profile_graph_timing(
+            backend, graph, timing)) {
+        LLAMA_LOG_ERROR(
+            "%s: execution failed backend=%s R=%.5f layers=%d\n",
+            __func__, ggml_backend_name(backend),
+            pc_ratio, n_layers);
+        return false;
+    }
+    return true;
+}
+
 static bool llama_hybrid_profile_moe_router_point(
         const llama_hybrid_attn_desc & attn_desc,
         const llama_hybrid_moe_desc &  moe_desc,
@@ -4696,6 +4914,7 @@ bool llama_hybrid_profile_moe_ffn(
     llama_hybrid_update_weight_bytes(profile);
     profile.cpu_ffn.clear();
     profile.phone_ffn.clear();
+    profile.decode_ratio_blocks.clear();
 
     if (profile.rpc_fence_ms <= 0.0 &&
         !llama_hybrid_profile_rpc_fence(
@@ -4782,6 +5001,74 @@ bool llama_hybrid_profile_moe_ffn(
                     phone_branch_ms, phone_runtime_bytes);
             }
         }
+    }
+
+    std::vector<float> decode_pc_ratios;
+    for (const auto & point : profile.cpu_ffn) {
+        if (point.tokens == 1 &&
+            point.local_ratio > 0.0f &&
+            point.local_ratio < 1.0f) {
+            decode_pc_ratios.push_back(point.local_ratio);
+        }
+    }
+    std::sort(decode_pc_ratios.begin(), decode_pc_ratios.end());
+    decode_pc_ratios.erase(
+        std::unique(
+            decode_pc_ratios.begin(),
+            decode_pc_ratios.end(),
+            [](float a, float b) {
+                return std::fabs(a - b) < 1e-4f;
+            }),
+        decode_pc_ratios.end());
+
+    for (const float pc_ratio : decode_pc_ratios) {
+        llama_hybrid_graph_timing cpu_timing;
+        llama_hybrid_graph_timing phone_timing;
+        const bool cpu_ok =
+            llama_hybrid_profile_moe_decode_ratio_block_point(
+                desc, cpu_backend, 0, pc_ratio,
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+                cpu_timing);
+        const bool phone_ok =
+            llama_hybrid_profile_moe_decode_ratio_block_point(
+                desc, phone_backend, 1, pc_ratio,
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+                phone_timing);
+        if (!cpu_ok || !phone_ok) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
+                "status=SKIP cpu_ok=%d phone_ok=%d\n",
+                pc_ratio,
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+                cpu_ok ? 1 : 0,
+                phone_ok ? 1 : 0);
+            continue;
+        }
+
+        profile.decode_ratio_blocks.push_back({
+            pc_ratio,
+            LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+            cpu_timing.wall_ms,
+            phone_timing.wall_ms,
+            phone_timing.compute_est_ms,
+        });
+
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
+            "cpu_total_ms=%.3f cpu_per_layer_ms=%.3f "
+            "phone_wall_total_ms=%.3f phone_wall_per_layer_ms=%.3f "
+            "phone_compute_total_ms=%.3f phone_compute_per_layer_ms=%.3f\n",
+            pc_ratio,
+            LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+            cpu_timing.wall_ms,
+            cpu_timing.wall_ms /
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+            phone_timing.wall_ms,
+            phone_timing.wall_ms /
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
+            phone_timing.compute_est_ms,
+            phone_timing.compute_est_ms /
+                LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS);
     }
 
     return !profile.cpu_ffn.empty() && !profile.phone_ffn.empty();
