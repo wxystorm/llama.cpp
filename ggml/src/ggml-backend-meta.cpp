@@ -4986,6 +4986,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
             ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
 
+        ggml_tensor * node_src = nodes[j_src];
+        ggml_tensor * node_dst = nodes[j_dst];
+
         // Dense decode chunking has a single down-projection MUL_MAT as
         // the reduction boundary. The RPC snapshot fast path was designed for
         // that shape. A MoE chunk boundary is the terminal expert-aggregation
@@ -5028,9 +5031,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         // -----------------------------------------------------
         // 这些对象仍然由主线程准备，不要放进 transfer worker
         // -----------------------------------------------------
-
-        ggml_tensor * node_src = nodes[j_src];
-        ggml_tensor * node_dst = nodes[j_dst];
 
         ggml_tensor * pc_residual = handoff_to_phone ?
             find_recent_ffn_inp(0, i, decode_layer_0) : nullptr;
