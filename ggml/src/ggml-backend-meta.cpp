@@ -6631,10 +6631,6 @@ auto prefill_norm_sg_has_prework =
                 compute_workers.backend_call_count[j];
         }
 
-        int64_t layer_wall_us = 0;
-        int64_t layer_copy_0to1_us = 0;
-        int64_t layer_copy_1to0_us = 0;
-        int64_t layer_orchestration_us = 0;
         for (const auto & entry : layer_timings) {
             const int first_layer = entry.first.first;
             const int last_layer  = entry.first.second;
@@ -6663,11 +6659,6 @@ auto prefill_norm_sg_has_prework =
                         timing.copy_1to0_us);
             backend_ctx->tensor_profile.layer_orchestration_us +=
                 orchestration_us;
-
-            layer_wall_us += timing.total_us;
-            layer_copy_0to1_us += timing.copy_0to1_us;
-            layer_copy_1to0_us += timing.copy_1to0_us;
-            layer_orchestration_us += orchestration_us;
 
             if (timing.pc_active && !timing.phone_active) {
                 backend_ctx->tensor_profile.layer_pc_only_layers += n_layers;
