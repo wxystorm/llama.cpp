@@ -2536,7 +2536,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
 
     const bool batched = ubatch.n_tokens > 1;
     const bool decode_token =
-        ubatch.n_tokens == 1 && sched_use == sched.get();
+        ubatch.n_tokens == 1 &&
+        gtype != LLM_GRAPH_TYPE_ENCODER &&
+        sched_use == sched.get();
 
     bool decode_profile_this_token = false;
     if (decode_token) {
