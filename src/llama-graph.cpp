@@ -2167,12 +2167,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         std::max(1, down_chunks), n_embd);
 
     if (n_down_chunks > 1) {
-        // Decode Tensor-Split can return/reduce independent slices of the
-        // hidden state as soon as each down projection finishes. Only the
-        // output dimension of the down projection is chunked: Router, Top-K,
-        // gate/up and the expert hidden activations above are still computed
-        // exactly once.
         GGML_ASSERT(down_exps_b == nullptr);
+
+        // Keep MUL_MAT_ID on the original contiguous expert tensor.
+        experts = build_lora_mm_id(
+            down_exps, cur, selected_experts, down_exps_s);
+        cb(experts, "ffn_moe_down", il);
+
+        if (down_exps_s) {
+            cb(experts, "ffn_moe_down_scaled", il);
+        }
 
         std::vector<ggml_tensor *> moe_chunks;
         moe_chunks.reserve((size_t) n_down_chunks);
@@ -2190,19 +2194,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int64_t embd_count = embd_end - embd_begin;
             GGML_ASSERT(embd_count > 0);
 
-            ggml_tensor * down_chunk = ggml_view_3d(
+            ggml_tensor * experts_chunk = ggml_view_3d(
                 ctx0,
-                down_exps,
-                down_exps->ne[0],
+                experts,
                 embd_count,
-                down_exps->ne[2],
-                down_exps->nb[1],
-                down_exps->nb[2],
-                embd_begin * down_exps->nb[1]);
-
-            ggml_tensor * experts_chunk =
-                build_lora_mm_id(
-                    down_chunk, cur, selected_experts, down_exps_s);
+                experts->ne[1],
+                experts->ne[2],
+                experts->nb[1],
+                experts->nb[2],
+                embd_begin * experts->nb[0]);
 
             const std::string raw_name =
                 "ffn_moe_down_part_" + std::to_string(chunk);
