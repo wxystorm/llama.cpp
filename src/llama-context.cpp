@@ -3404,8 +3404,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         bool apply_mctx = false;
         llm_graph_result * result = nullptr;
+        const bool profile_cpu    = stage.kind == llama_hybrid_runtime_stage_kind::CPU;
         const bool profile_tensor = stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
+        const int64_t cpu_start_us    = profile_cpu    ? ggml_time_us() : 0;
         const int64_t tensor_start_us = profile_tensor ? ggml_time_us() : 0;
+        llama_hybrid_stage_timing cpu_stage_timing {};
         llama_hybrid_stage_timing tensor_stage_timing {};
         if (profile_tensor) {
             const int n_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());
@@ -3436,7 +3439,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 job.ubatch, stage, token_begin, block_tokens, stage_input, stage_output,
                 ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched_pipe.get(), gf_res_pipe.get(),
                 job.ubatch_id, stage_index, block_index, block.action, block_outputs,
-                apply_mctx, true, status, profile_tensor ? &tensor_stage_timing : nullptr);
+                apply_mctx, true, status,
+                profile_tensor ? &tensor_stage_timing :
+                profile_cpu ? &cpu_stage_timing : nullptr);
             if (result == nullptr || status != GGML_STATUS_SUCCESS) {
                 return nullptr;
             }
@@ -3445,6 +3450,81 @@ int llama_context::decode(const llama_batch & batch_inp) {
         static_cast<llama_kv_cache_context *>(mctx.get())->clear_stage_range();
         job.hidden = std::move(next_hidden);
         job.stage_index++;
+
+        if (profile_cpu) {
+            const int64_t cpu_total_us = ggml_time_us() - cpu_start_us;
+            const int64_t cpu_accounted_us =
+                cpu_stage_timing.prepare_us +
+                cpu_stage_timing.compute_range_us +
+                cpu_stage_timing.sync_us;
+            const int64_t cpu_unaccounted_us =
+                std::max<int64_t>(0, cpu_total_us - cpu_accounted_us);
+            const int cpu_layers = stage.layer_end - stage.layer_begin;
+
+            LLAMA_LOG_ERROR(
+                "[CPU_STAGE_TIMING] ub=%d tokens=%u layers=[%d,%d) n_layers=%d XC=%d "
+                "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
+                "unaccounted_ms=%.3f blocks=%zu\n",
+                job.ubatch_id,
+                job.ubatch.n_tokens,
+                stage.layer_begin,
+                stage.layer_end,
+                cpu_layers,
+                stage.macro_tokens,
+                cpu_total_us / 1000.0,
+                cpu_stage_timing.prepare_us / 1000.0,
+                cpu_stage_timing.compute_range_us / 1000.0,
+                cpu_stage_timing.sync_us / 1000.0,
+                cpu_unaccounted_us / 1000.0,
+                blocks.size());
+
+            llama_hybrid_cpu_compute_prediction cpu_prediction;
+            if (llama_hybrid_runtime_predict_cpu_compute(
+                    (int) job.ubatch.n_tokens, cpu_prediction)) {
+                const double actual_compute_ms =
+                    cpu_stage_timing.compute_range_us / 1000.0;
+                const double actual_per_layer_ms =
+                    cpu_layers > 0 ? actual_compute_ms / cpu_layers : 0.0;
+                const double compute_ratio =
+                    cpu_prediction.total_ms > 0.0 ?
+                        actual_compute_ms / cpu_prediction.total_ms : 0.0;
+
+                const char * profile_mode =
+                    cpu_prediction.profile_extrapolated_chunks > 0 ? "EXTRAPOLATE" :
+                    cpu_prediction.profile_interpolated_chunks > 0 ? "INTERPOLATE" :
+                    "EXACT";
+
+                LLAMA_LOG_ERROR(
+                    "[PRED_CPU_STAGE] ub=%d tokens=%d kv_tokens=%d layers=%d XC=%d "
+                    "pred_total_ms=%.3f pred_per_layer_ms=%.3f "
+                    "profile_mode=%s profile_range=[%d,%d] "
+                    "exact_chunks=%d interp_chunks=%d extrap_chunks=%d\n",
+                    job.ubatch_id,
+                    cpu_prediction.tokens,
+                    cpu_prediction.kv_tokens,
+                    cpu_prediction.cpu_layers,
+                    cpu_prediction.cpu_chunk_tokens,
+                    cpu_prediction.total_ms,
+                    cpu_prediction.per_layer_ms,
+                    profile_mode,
+                    cpu_prediction.profile_min_tokens,
+                    cpu_prediction.profile_max_tokens,
+                    cpu_prediction.profile_exact_chunks,
+                    cpu_prediction.profile_interpolated_chunks,
+                    cpu_prediction.profile_extrapolated_chunks);
+
+                LLAMA_LOG_ERROR(
+                    "[PRED_CPU_ERROR] ub=%d actual_compute_ms=%.3f "
+                    "actual_per_layer_ms=%.3f pred_compute_ms=%.3f "
+                    "actual_over_pred=%.3f\n",
+                    job.ubatch_id,
+                    actual_compute_ms,
+                    actual_per_layer_ms,
+                    cpu_prediction.total_ms,
+                    compute_ratio);
+            }
+        }
+
         if (profile_tensor) {
             ggml_backend_meta_tensor_profile profile {};
             const int n_backends = ggml_backend_sched_get_n_backends(sched_pipe.get());

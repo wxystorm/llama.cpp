@@ -37,7 +37,8 @@ static constexpr int                  LLAMA_HYBRID_REFERENCE_TOKENS        = 128
 static constexpr int                  LLAMA_HYBRID_PROFILE_BLOCK_LAYERS    = 5;
 static constexpr std::array<int, 9>   LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20, 24, 32, 48, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_REGION_CHUNK_CANDIDATES = { 8, 16, 32, 64, 96, 128, 192, 256 };
-static constexpr std::array<int, 4>   LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS  = { 8, 16, 32, 64 };
+static constexpr std::array<int, 8>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 8, 16, 32, 64, 96, 128, 192, 256 };
+static constexpr std::array<int, 4>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 8, 16, 32, 64 };
 static constexpr std::array<int, 7>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 8, 16, 32, 64, 128, 192, 256 };
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
@@ -2053,7 +2054,39 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
     }
 
     const double token_scale = (double) work_tokens / probe_tokens;
-    model.cpu_cost   = profile.cpu_full_layer_ms > 0.0 ? profile.cpu_full_layer_ms * token_scale : 1e12;
+
+    // CPU-only stages are allowed to use XC up to 256. Use the measured
+    // large-token layer profile here as well as in the expensive scorer;
+    // otherwise the coarse pass can prune plans using a probe-token linear
+    // extrapolation before the accurate scorer ever sees them.
+    model.cpu_cost = 1e12;
+    {
+        int coarse_kv_tokens = constraints.score_kv_tokens;
+        if (coarse_kv_tokens <= 0) {
+            coarse_kv_tokens = constraints.target_ctx > 0 ?
+                constraints.target_ctx : profile.n_ctx_train;
+        }
+        coarse_kv_tokens = std::max(coarse_kv_tokens, work_tokens);
+        if (profile.n_ctx_train > 0) {
+            coarse_kv_tokens = std::min(coarse_kv_tokens, profile.n_ctx_train);
+        }
+
+        double cpu_layer_base = 0.0;
+        double cpu_attn_base  = 0.0;
+        double cpu_attn_kv    = 0.0;
+        if (llama_hybrid_layer_block_cost(
+                profile.cpu_layer_blocks, work_tokens, false, cpu_layer_base) &&
+            llama_hybrid_attn_cost(
+                profile.cpu_attn, work_tokens, work_tokens, cpu_attn_base) &&
+            llama_hybrid_attn_cost(
+                profile.cpu_attn, work_tokens, coarse_kv_tokens, cpu_attn_kv)) {
+            model.cpu_cost = std::max(
+                0.0, cpu_layer_base + cpu_attn_kv - cpu_attn_base);
+        } else if (profile.cpu_full_layer_ms > 0.0) {
+            model.cpu_cost = profile.cpu_full_layer_ms * token_scale;
+        }
+    }
+
     const double phone_base = profile.phone_full_layer_compute_est_ms > 0.0 ?
         profile.phone_full_layer_compute_est_ms : profile.phone_full_layer_ms;
     model.phone_cost = phone_base > 0.0 ? phone_base * token_scale : 1e12;
@@ -2593,6 +2626,104 @@ static bool llama_hybrid_layer_region_cost(
         result_ms += layers * std::max(0.0, layer_base + attn_kv - attn_base);
     }
     return std::isfinite(result_ms);
+}
+
+bool llama_hybrid_runtime_predict_cpu_compute(
+        int tokens, llama_hybrid_cpu_compute_prediction & prediction) {
+    prediction = {};
+    if (tokens <= 0) {
+        return false;
+    }
+
+    llama_hybrid_plan plan;
+    llama_hybrid_profile profile;
+    llama_hybrid_constraints constraints;
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        if (!g_llama_hybrid_runtime_plan.has_value() ||
+            !g_llama_hybrid_runtime_profile.has_value() ||
+            !g_llama_hybrid_runtime_constraints.has_value()) {
+            return false;
+        }
+        plan        = *g_llama_hybrid_runtime_plan;
+        profile     = *g_llama_hybrid_runtime_profile;
+        constraints = *g_llama_hybrid_runtime_constraints;
+    }
+
+    const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
+    if (cpu_layers <= 0 || plan.cpu_chunk_tokens <= 0 ||
+        profile.cpu_layer_blocks.empty()) {
+        return false;
+    }
+
+    int kv_tokens = constraints.score_kv_tokens;
+    if (kv_tokens <= 0) {
+        kv_tokens = constraints.target_ctx > 0 ?
+            constraints.target_ctx : profile.n_ctx_train;
+    }
+    kv_tokens = std::max(kv_tokens, tokens);
+    if (profile.n_ctx_train > 0) {
+        kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
+    }
+
+    double total_ms = 0.0;
+    if (!llama_hybrid_layer_region_cost(
+            profile, profile.cpu_layer_blocks, profile.cpu_attn,
+            cpu_layers, tokens, plan.cpu_chunk_tokens, kv_tokens,
+            false, total_ms)) {
+        return false;
+    }
+
+    int profile_min_tokens = std::numeric_limits<int>::max();
+    int profile_max_tokens = 0;
+    std::set<int> profile_tokens;
+    for (const auto & point : profile.cpu_layer_blocks) {
+        if (point.layers <= 0 || point.tokens <= 0) {
+            continue;
+        }
+        profile_tokens.insert(point.tokens);
+        profile_min_tokens = std::min(profile_min_tokens, point.tokens);
+        profile_max_tokens = std::max(profile_max_tokens, point.tokens);
+    }
+    if (profile_tokens.empty()) {
+        return false;
+    }
+
+    const auto chunks =
+        llama_hybrid_split_by_chunk_size(tokens, plan.cpu_chunk_tokens);
+    if (chunks.empty()) {
+        return false;
+    }
+
+    int exact_chunks = 0;
+    int interpolated_chunks = 0;
+    int extrapolated_chunks = 0;
+    for (const int chunk_tokens : chunks) {
+        if (profile_tokens.count(chunk_tokens) != 0) {
+            ++exact_chunks;
+        } else if (chunk_tokens < profile_min_tokens ||
+                   chunk_tokens > profile_max_tokens) {
+            ++extrapolated_chunks;
+        } else {
+            ++interpolated_chunks;
+        }
+    }
+
+    prediction.tokens                      = tokens;
+    prediction.kv_tokens                   = kv_tokens;
+    prediction.cpu_layers                  = cpu_layers;
+    prediction.cpu_chunk_tokens            = plan.cpu_chunk_tokens;
+    prediction.profile_min_tokens           = profile_min_tokens;
+    prediction.profile_max_tokens           = profile_max_tokens;
+    prediction.profile_exact_chunks         = exact_chunks;
+    prediction.profile_interpolated_chunks  = interpolated_chunks;
+    prediction.profile_extrapolated_chunks  = extrapolated_chunks;
+    prediction.total_ms                     = total_ms;
+    prediction.per_layer_ms                 =
+        cpu_layers > 0 ? total_ms / cpu_layers : 0.0;
+
+    return std::isfinite(prediction.total_ms) &&
+           std::isfinite(prediction.per_layer_ms);
 }
 
 enum class llama_hybrid_sim_stage_kind {
@@ -4403,9 +4534,9 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
     };
 
     if (!profile_backend(cpu_backend, profile.cpu_attn, &profile.cpu_attn_ms,
-                         LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS) ||
+                         LLAMA_HYBRID_CPU_LAYER_TOKENS) ||
         !profile_backend(phone_backend, profile.phone_attn, &profile.phone_attn_ms,
-                         LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS) ||
+                         LLAMA_HYBRID_PHONE_LAYER_TOKENS) ||
         (gpu_backend != nullptr &&
          !profile_backend(gpu_backend, profile.gpu_attn, nullptr, LLAMA_HYBRID_GPU_LAYER_TOKENS))) {
         return false;
@@ -4662,14 +4793,18 @@ bool llama_hybrid_profile_moe_full_layer(
         return true;
     };
 
-    for (const int tokens : LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS) {
+    // CPU-only regions are searched up to XC=256. Probe those token sizes
+    // directly instead of extrapolating the 32->64 slope into the large-token
+    // regime. Passing nullptr for expert_points measures Router + Top-K +
+    // full local expert compute on the CPU backend at the requested token size.
+    for (const int tokens : LLAMA_HYBRID_CPU_LAYER_TOKENS) {
         if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
             continue;
         }
 
         double cpu_ms = 0.0;
         if (!profile_one(
-                cpu_backend, profile.cpu_attn, &profile.cpu_ffn, 0,
+                cpu_backend, profile.cpu_attn, nullptr, 0,
                 tokens, cpu_ms)) {
             return false;
         }
@@ -4678,6 +4813,14 @@ bool llama_hybrid_profile_moe_full_layer(
         });
         if (tokens == profile.probe_tokens) {
             profile.cpu_full_layer_ms = cpu_ms;
+        }
+    }
+
+    // Keep phone full-layer probes at the existing small-token anchors; large
+    // CPU anchors are specifically for the PC CPU-only planner stage.
+    for (const int tokens : LLAMA_HYBRID_PHONE_LAYER_TOKENS) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+            continue;
         }
 
         double phone_ms = 0.0;
@@ -4693,7 +4836,6 @@ bool llama_hybrid_profile_moe_full_layer(
             profile.phone_full_layer_ms = phone_ms;
             profile.phone_full_layer_compute_est_ms = phone_ms;
         }
-
     }
 
     if (gpu_backend != nullptr) {
@@ -5087,7 +5229,7 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
     profile.phone_full_layer_compute_est_ms = 0.0;
     profile.gpu_full_layer_ms              = 0.0;
 
-    for (const int tokens : LLAMA_HYBRID_CPU_PHONE_LAYER_TOKENS) {
+    for (const int tokens : LLAMA_HYBRID_CPU_LAYER_TOKENS) {
         if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
             continue;
         }
@@ -5103,6 +5245,12 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
             "per_layer_ms=%.3f\n",
             ggml_backend_name(cpu_backend), block_layers, tokens, cpu_timing.wall_ms,
             cpu_timing.wall_ms / block_layers);
+    }
+
+    for (const int tokens : LLAMA_HYBRID_PHONE_LAYER_TOKENS) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+            continue;
+        }
 
         llama_hybrid_graph_timing phone_timing;
         if (!llama_hybrid_profile_layer_block_point(attn_desc, ffn_desc, phone_backend, block_layers, tokens,

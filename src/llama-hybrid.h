@@ -188,6 +188,22 @@ struct llama_hybrid_profile {
     int    n_ctx_train                  = 0;
 };
 
+struct llama_hybrid_cpu_compute_prediction {
+    int tokens           = 0;
+    int kv_tokens        = 0;
+    int cpu_layers       = 0;
+    int cpu_chunk_tokens = 0;
+
+    int profile_min_tokens          = 0;
+    int profile_max_tokens          = 0;
+    int profile_exact_chunks        = 0;
+    int profile_interpolated_chunks = 0;
+    int profile_extrapolated_chunks = 0;
+
+    double per_layer_ms = 0.0;
+    double total_ms     = 0.0;
+};
+
 struct llama_hybrid_tensor_compute_prediction {
     int   tokens              = 0;
     int   kv_tokens           = 0;
@@ -455,6 +471,8 @@ LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
 LLAMA_API void llama_hybrid_runtime_wave_calibration_set(const llama_hybrid_wave_calibration & calibration);
 LLAMA_API bool llama_hybrid_runtime_wave_calibration_get(llama_hybrid_wave_calibration & calibration);
+LLAMA_API bool llama_hybrid_runtime_predict_cpu_compute(
+    int tokens, llama_hybrid_cpu_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(
