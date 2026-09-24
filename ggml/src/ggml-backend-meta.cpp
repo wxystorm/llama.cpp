@@ -4939,10 +4939,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             handoff_to_phone && decode_is_last_down_chunk(i, decode_layer_0);
 
         ggml_tensor * phone_next_wdown = get_ffn_down_boundary_node(j_src, i + 1);
+        ggml_tensor * pc_next_wdown    = get_ffn_down_boundary_node(j_dst, i + 1);
         const bool next_is_ffn_down_chunk =
-            phone_next_wdown != nullptr && get_ffn_down_boundary_node(j_dst, i + 1) != nullptr;
+            phone_next_wdown != nullptr && pc_next_wdown != nullptr;
+
+        // The legacy decode overlap executes only the terminal node of the
+        // next Phone chunk as a one-node early graph. This is valid for dense
+        // FFN chunking because ffn_down_chunk_* is the down-projection
+        // MUL_MAT itself and all of its inputs are already ready.
+        //
+        // Qwen3-MoE chunking names the boundary after expert weighting and
+        // aggregation. Its terminal node is typically ADD and depends on the
+        // chunk-local MUL_MAT_ID/weight/aggregation chain. Running only that
+        // ADD early consumes inputs that have not been computed yet and
+        // corrupts the hidden state. Keep MoE on the normal ordered path until
+        // an early graph containing the complete dependency chain is built.
+        const bool next_chunk_supports_single_node_early =
+            next_is_ffn_down_chunk &&
+            phone_next_wdown->op == GGML_OP_MUL_MAT &&
+            pc_next_wdown->op == GGML_OP_MUL_MAT;
+
+        if (pipeline_debug &&
+            next_is_ffn_down_chunk &&
+            !next_chunk_supports_single_node_early) {
+            printf(
+                "[DECODE_EARLY_SKIP] layer=%d chunk=%d next_phone_op=%s next_pc_op=%s\n",
+                decode_layer_0,
+                decode_chunk_0 + 1,
+                ggml_op_name(phone_next_wdown->op),
+                ggml_op_name(pc_next_wdown->op));
+        }
+
         ggml_cgraph * phone_early_graph = nullptr;
-        if (next_is_ffn_down_chunk) {
+        if (next_chunk_supports_single_node_early) {
             phone_early_graph = get_early_graph(j_src, i + 1);
             phone_early_graph->nodes[0] = phone_next_wdown;
             phone_early_graph->n_nodes = 1;
