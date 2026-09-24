@@ -548,6 +548,12 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
     LLAMA_LOG_INFO("[HYBRID_PROFILE] phone attn_ms=%.3f full_layer_ms=%.3f full_layer_compute_est_ms=%.3f\n",
                    profile.phone_attn_ms, profile.phone_full_layer_ms, profile.phone_full_layer_compute_est_ms);
     LLAMA_LOG_INFO("[HYBRID_PROFILE] gpu full_layer_ms=%.3f\n", profile.gpu_full_layer_ms);
+    LLAMA_LOG_ERROR(
+        "[HYBRID_PROFILE_DECODE_TAIL_SUMMARY] norm_ms=%.3f "
+        "lm_head_ms=%.3f total_ms=%.3f\n",
+        profile.decode_tail_norm_ms,
+        profile.decode_tail_lm_head_ms,
+        profile.decode_tail_ms);
 
     llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
@@ -2123,6 +2129,133 @@ static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_
 
 
 
+static bool llama_hybrid_profile_decode_tail(
+        llama_hybrid_profile &           profile,
+        const llama_hybrid_output_desc & desc,
+        float                            rms_eps,
+        ggml_backend_t                   cpu_backend) {
+    profile.decode_tail_norm_ms = 0.0;
+    profile.decode_tail_lm_head_ms = 0.0;
+    profile.decode_tail_ms = 0.0;
+
+    if (cpu_backend == nullptr ||
+        desc.n_embd <= 0 || desc.n_vocab <= 0 ||
+        desc.norm_type < 0 || desc.norm_type >= GGML_TYPE_COUNT ||
+        desc.output_type < 0 || desc.output_type >= GGML_TYPE_COUNT ||
+        rms_eps <= 0.0f) {
+        return false;
+    }
+
+    static constexpr size_t graph_size = 16;
+    const ggml_init_params params = {
+        /*.mem_size   =*/48 * ggml_tensor_overhead() +
+                         2 * ggml_graph_overhead_custom(
+                             graph_size, false),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * input =
+        ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, desc.n_embd, 1);
+    ggml_tensor * norm_w =
+        ggml_new_tensor_1d(
+            ctx.get(), desc.norm_type, desc.n_embd);
+    ggml_tensor * output_w =
+        ggml_new_tensor_2d(
+            ctx.get(), desc.output_type,
+            desc.n_embd, desc.n_vocab);
+
+    ggml_tensor * norm =
+        ggml_rms_norm(ctx.get(), input, rms_eps);
+    norm = ggml_mul(ctx.get(), norm, norm_w);
+    ggml_tensor * logits =
+        ggml_mul_mat(ctx.get(), output_w, norm);
+
+    ggml_cgraph * graph_norm =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_cgraph * graph_full =
+        ggml_new_graph_custom(ctx.get(), graph_size, false);
+
+    static std::atomic<uint64_t> next_tail_uid{
+        (uint64_t(1) << 62) | (uint64_t(1) << 53)
+    };
+    graph_norm->uid =
+        next_tail_uid.fetch_add(1, std::memory_order_relaxed);
+    graph_full->uid =
+        next_tail_uid.fetch_add(1, std::memory_order_relaxed);
+
+    ggml_build_forward_expand(graph_norm, norm);
+    ggml_build_forward_expand(graph_full, logits);
+
+    for (int i = 0; i < graph_full->n_nodes; ++i) {
+        ggml_tensor * node = graph_full->nodes[i];
+        if (!ggml_backend_supports_op(cpu_backend, node)) {
+            LLAMA_LOG_ERROR(
+                "%s: CPU does not support output-tail op=%s node=%s "
+                "output_type=%s\n",
+                __func__,
+                ggml_op_name(node->op),
+                node->name,
+                ggml_type_name(desc.output_type));
+            return false;
+        }
+    }
+
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), cpu_backend));
+    if (!buffer) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to allocate output-tail probe "
+            "n_embd=%" PRId64 " n_vocab=%" PRId64 "\n",
+            __func__, desc.n_embd, desc.n_vocab);
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    llama_hybrid_graph_timing norm_timing;
+    llama_hybrid_graph_timing full_timing;
+    if (!llama_hybrid_profile_graph_timing(
+            cpu_backend, graph_norm, norm_timing) ||
+        !llama_hybrid_profile_graph_timing(
+            cpu_backend, graph_full, full_timing)) {
+        LLAMA_LOG_ERROR(
+            "%s: output-tail graph execution failed\n", __func__);
+        return false;
+    }
+
+    profile.decode_tail_norm_ms =
+        std::max(0.0, norm_timing.wall_ms);
+    profile.decode_tail_ms =
+        std::max(profile.decode_tail_norm_ms, full_timing.wall_ms);
+    profile.decode_tail_lm_head_ms =
+        std::max(
+            0.0,
+            profile.decode_tail_ms -
+                profile.decode_tail_norm_ms);
+
+    LLAMA_LOG_ERROR(
+        "[HYBRID_PROFILE_DECODE_TAIL] placement=CPU_PRIMARY "
+        "tokens=1 n_embd=%" PRId64 " n_vocab=%" PRId64
+        " norm_type=%s output_type=%s tied=%d "
+        "norm_ms=%.3f lm_head_ms=%.3f total_ms=%.3f\n",
+        desc.n_embd,
+        desc.n_vocab,
+        ggml_type_name(desc.norm_type),
+        ggml_type_name(desc.output_type),
+        desc.tied_output ? 1 : 0,
+        profile.decode_tail_norm_ms,
+        profile.decode_tail_lm_head_ms,
+        profile.decode_tail_ms);
+
+    return std::isfinite(profile.decode_tail_ms);
+}
+
+
 struct llama_hybrid_decode_tensor_cost {
     double total_ms     = 0.0;
     double base_ms      = 0.0;
@@ -2297,7 +2430,8 @@ void llama_hybrid_decode_plan_print(
         "[DECODE_PLAN] T=%d P=%d C=%d G=%d R=%.3f LLAMA_CHUNKS=%d "
         "kv_tokens=%d predicted_ms=%.3f predicted_tps=%.3f "
         "gpu_ms=%.3f cpu_ms=%.3f tensor_ms=%.3f phone_ms=%.3f "
-        "boundary_ms=%.3f pc_mib=%.1f phone_mib=%.1f gpu_mib=%.1f "
+        "boundary_ms=%.3f tail_ms=%.3f "
+        "pc_mib=%.1f phone_mib=%.1f gpu_mib=%.1f "
         "mode=PREDICT_ONLY applied=0\n",
         plan.tensor_layers,
         plan.phone_layers,
@@ -2313,6 +2447,7 @@ void llama_hybrid_decode_plan_print(
         plan.predicted_tensor_ms,
         plan.predicted_phone_ms,
         plan.predicted_boundary_ms,
+        plan.predicted_tail_ms,
         plan.pc_memory / 1048576.0,
         plan.phone_memory / 1048576.0,
         plan.gpu_memory / 1048576.0);
@@ -2555,6 +2690,8 @@ bool llama_hybrid_predict_decode_plan(
                     tensor_layers * best_tensor_cost.total_ms;
                 plan.predicted_phone_ms =
                     phone_layers * phone_layer_ms;
+                plan.predicted_tail_ms =
+                    std::max(0.0, profile.decode_tail_ms);
 
                 if (gpu_layers > 0 && gpu_layers < profile.n_layer) {
                     plan.predicted_boundary_ms += gpu_to_pc_ms;
@@ -2571,7 +2708,8 @@ bool llama_hybrid_predict_decode_plan(
                     plan.predicted_cpu_ms +
                     plan.predicted_tensor_ms +
                     plan.predicted_phone_ms +
-                    plan.predicted_boundary_ms;
+                    plan.predicted_boundary_ms +
+                    plan.predicted_tail_ms;
                 plan.pc_memory    = memory_plan.pc_memory;
                 plan.phone_memory = memory_plan.phone_memory;
                 plan.gpu_memory   = memory_plan.gpu_memory;
@@ -6502,17 +6640,19 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
 
     const int probe_layer = n_layer / 2;
-    llama_hybrid_ffn_desc  ffn_desc;
-    llama_hybrid_moe_desc  moe_desc;
-    llama_hybrid_attn_desc attn_desc;
+    llama_hybrid_ffn_desc    ffn_desc;
+    llama_hybrid_moe_desc    moe_desc;
+    llama_hybrid_attn_desc   attn_desc;
+    llama_hybrid_output_desc output_desc;
 
     const bool desc_ok = is_qwen3_moe ?
         ml.get_hybrid_moe_desc(probe_layer, moe_desc) :
         ml.get_hybrid_ffn_desc(probe_layer, ffn_desc);
     if (!desc_ok ||
-        !ml.get_hybrid_attn_desc(probe_layer, attn_desc)) {
+        !ml.get_hybrid_attn_desc(probe_layer, attn_desc) ||
+        !ml.get_hybrid_output_desc(output_desc)) {
         LLAMA_LOG_ERROR(
-            "%s: failed to describe probe layer %d\n",
+            "%s: failed to describe probe layer/output at layer %d\n",
             __func__, probe_layer);
         return false;
     }
@@ -6544,7 +6684,9 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         !llama_hybrid_profile_rpc(
             profile, cpu.get(), phone.get()) ||
         !llama_hybrid_profile_attention(
-            profile, attn_desc, cpu.get(), phone.get(), gpu.get())) {
+            profile, attn_desc, cpu.get(), phone.get(), gpu.get()) ||
+        !llama_hybrid_profile_decode_tail(
+            profile, output_desc, attn_desc.rms_eps, cpu.get())) {
         LLAMA_LOG_ERROR("%s: common profiling failed\n", __func__);
         return false;
     }
@@ -6582,10 +6724,15 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
-    constraints.fixed_tensor_layers = 37;
-    // HYBRID_AUTO intentionally leaves topology, ratio and chunk choices unfixed.
-    // Fixed fields remain available in llama_hybrid_constraints for targeted
-    // diagnostics, but normal planning compares all supported alternatives.
+
+    // Targeted decode validation run: keep the runtime/prefill placement fixed
+    // to the plan that already produced a real decode measurement.
+    // pc_layers includes the CUDA prefix, so C=46 with G=10 means
+    // 10 GPU PC_ONLY layers + 36 CPU PC_ONLY layers.
+    constraints.fixed_tensor_layers = 0;
+    constraints.fixed_phone_layers  = 2;
+    constraints.fixed_pc_layers     = 46;
+    constraints.fixed_gpu_pc_layers = 10;
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(

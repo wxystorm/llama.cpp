@@ -57,6 +57,17 @@ struct llama_hybrid_moe_desc {
     size_t expert_weight_bytes = 0;
 };
 
+struct llama_hybrid_output_desc {
+    int64_t n_embd  = 0;
+    int64_t n_vocab = 0;
+
+    ggml_type norm_type   = GGML_TYPE_COUNT;
+    ggml_type output_type = GGML_TYPE_COUNT;
+
+    size_t weight_bytes = 0;
+    bool   tied_output  = false;
+};
+
 
 struct llama_hybrid_layer_compute_point {
     int    tokens         = 0;
@@ -161,6 +172,10 @@ struct llama_hybrid_profile {
     double phone_full_layer_compute_est_ms = 0.0;
 
     double gpu_full_layer_ms = 0.0;
+
+    double decode_tail_norm_ms    = 0.0;
+    double decode_tail_lm_head_ms = 0.0;
+    double decode_tail_ms         = 0.0;
 
     std::vector<llama_hybrid_transfer_point> gpu_to_pc;
     std::vector<llama_hybrid_transfer_point> pc_to_phone;
@@ -348,8 +363,9 @@ struct llama_hybrid_decode_plan {
     double predicted_gpu_ms    = 0.0;
     double predicted_cpu_ms    = 0.0;
     double predicted_tensor_ms = 0.0;
-    double predicted_phone_ms  = 0.0;
+    double predicted_phone_ms   = 0.0;
     double predicted_boundary_ms = 0.0;
+    double predicted_tail_ms     = 0.0;
 
     size_t pc_memory    = 0;
     size_t phone_memory = 0;

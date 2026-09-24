@@ -23,6 +23,7 @@ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffe
 struct llama_hybrid_ffn_desc;
 struct llama_hybrid_moe_desc;
 struct llama_hybrid_attn_desc;
+struct llama_hybrid_output_desc;
 
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
@@ -196,6 +197,8 @@ struct LLAMA_API llama_model_loader {
     bool get_hybrid_moe_desc(int layer, llama_hybrid_moe_desc & desc);
 
     bool get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc & desc);
+
+    bool get_hybrid_output_desc(llama_hybrid_output_desc & desc) const;
 
     bool get_hybrid_weight_bytes(int                   n_layer,
                                  size_t &              total_bytes,

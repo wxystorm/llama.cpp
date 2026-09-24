@@ -958,6 +958,44 @@ bool llama_model_loader::get_hybrid_moe_desc(int layer, llama_hybrid_moe_desc & 
     return true;
 }
 
+
+bool llama_model_loader::get_hybrid_output_desc(
+        llama_hybrid_output_desc & desc) const {
+    const LLM_TN tn(get_arch());
+
+    const ggml_tensor * output_norm =
+        get_tensor_meta(
+            tn(LLM_TENSOR_OUTPUT_NORM, "weight").str().c_str());
+    const ggml_tensor * output =
+        get_tensor_meta(
+            tn(LLM_TENSOR_OUTPUT, "weight").str().c_str());
+
+    bool tied_output = false;
+    if (output == nullptr) {
+        output = get_tensor_meta(
+            tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+        tied_output = true;
+    }
+
+    if (output_norm == nullptr || output == nullptr ||
+        ggml_n_dims(output_norm) != 1 ||
+        ggml_n_dims(output) != 2 ||
+        output->ne[0] <= 0 || output->ne[1] <= 0 ||
+        output_norm->ne[0] != output->ne[0]) {
+        return false;
+    }
+
+    desc = {};
+    desc.n_embd      = output->ne[0];
+    desc.n_vocab     = output->ne[1];
+    desc.norm_type   = output_norm->type;
+    desc.output_type = output->type;
+    desc.weight_bytes =
+        ggml_nbytes(output_norm) + ggml_nbytes(output);
+    desc.tied_output = tied_output;
+    return true;
+}
+
 bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc & desc) {
     if (layer < 0) {
         return false;
