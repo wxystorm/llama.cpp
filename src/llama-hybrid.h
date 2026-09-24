@@ -319,6 +319,29 @@ struct llama_hybrid_wave_calibration {
     double barrier_ms         = 0.0;
 };
 
+struct llama_hybrid_decode_plan {
+    int tensor_layers = 0;
+    int phone_layers  = 0;
+    int cpu_layers    = 0;
+    int gpu_layers    = 0;
+
+    float tensor_pc_ratio = 0.0f;
+    int   llama_chunks    = 1;
+
+    int kv_tokens = 0;
+
+    double predicted_ms        = 0.0;
+    double predicted_gpu_ms    = 0.0;
+    double predicted_cpu_ms    = 0.0;
+    double predicted_tensor_ms = 0.0;
+    double predicted_phone_ms  = 0.0;
+    double predicted_boundary_ms = 0.0;
+
+    size_t pc_memory    = 0;
+    size_t phone_memory = 0;
+    size_t gpu_memory   = 0;
+};
+
 struct llama_hybrid_plan {
     int tensor_layers = 0;
     int phone_layers  = 0;
@@ -401,6 +424,7 @@ class llama_model_loader;
 
 LLAMA_API void llama_hybrid_profile_print(const llama_hybrid_profile & profile);
 LLAMA_API void llama_hybrid_plan_print(const llama_hybrid_plan & plan);
+LLAMA_API void llama_hybrid_decode_plan_print(const llama_hybrid_decode_plan & plan);
 
 LLAMA_API bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
                                                  ggml_backend_t         gpu_backend,
@@ -466,6 +490,10 @@ LLAMA_API std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(
 LLAMA_API bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
                                        const llama_hybrid_constraints & constraints,
                                        llama_hybrid_plan &              plan);
+LLAMA_API bool llama_hybrid_predict_decode_plan(
+    const llama_hybrid_profile & profile,
+    const llama_hybrid_constraints & constraints,
+    llama_hybrid_decode_plan & best_plan);
 
 LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
