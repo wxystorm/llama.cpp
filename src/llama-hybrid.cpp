@@ -40,7 +40,6 @@ static constexpr std::array<int, 8>   LLAMA_HYBRID_REGION_CHUNK_CANDIDATES = { 8
 static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
-static constexpr std::array<int, 4>   LLAMA_HYBRID_DECODE_CHUNK_CANDIDATES = { 1, 2, 3, 4 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS      = 4;
 static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS      = { 1, 64, 128, 256 };
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
@@ -2284,16 +2283,12 @@ bool llama_hybrid_predict_decode_plan(
     }
 
     double gpu_layer_ms = 0.0;
-    double cpu_layer_ms = 0.0;
     double phone_layer_ms = 0.0;
     if (!llama_hybrid_decode_layer_cost(
-            profile.cpu_layer_blocks, profile.cpu_attn,
-            kv_tokens, false, cpu_layer_ms) ||
-        !llama_hybrid_decode_layer_cost(
             profile.phone_layer_blocks, profile.phone_attn,
             kv_tokens, true, phone_layer_ms)) {
         LLAMA_LOG_ERROR(
-            "[DECODE_PLAN] unavailable reason=missing_cpu_or_phone_decode_profile kv_tokens=%d\n",
+            "[DECODE_PLAN] unavailable reason=missing_phone_decode_profile kv_tokens=%d\n",
             kv_tokens);
         return false;
     }
