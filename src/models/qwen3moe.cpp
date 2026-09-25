@@ -1,6 +1,7 @@
 #include "llama-hybrid.h"
 #include "models.h"
 
+#include <cinttypes>
 #include <cstdlib>
 
 static int qwen3moe_ffn_chunk_count() {
