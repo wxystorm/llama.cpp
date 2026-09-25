@@ -3542,9 +3542,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
             "[HYBRID_PIPE] mode=GPU_DOWNSTREAM batch=%u ubatch=%u macros=%u stages=%zu\n",
             n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size());
     } else if (stage_serial_runtime_enabled) {
-        runtime_ubatch = std::min<uint32_t>(cparams.n_ubatch, runtime_stages.front().macro_tokens);
-        LLAMA_LOG_INFO("[HYBRID_EXEC] mode=serial batch=%u ubatch=%u stages=%zu\n",
-                        n_tokens_all, runtime_ubatch, runtime_stages.size());
+        // Serial staged execution already materializes every stage output into
+        // a full hidden buffer. Use the largest stage macro for the memory
+        // ubatch so an upstream small macro can be accumulated before a
+        // downstream larger macro. Example:
+        //
+        //   XG=64, XC=256, XT=48
+        //   GPU:    64 + 64 + 64 + 64
+        //             -> one contiguous 256-token hidden buffer
+        //   CPU:   256
+        //   TENSOR:256 (internally split by XT)
+        //
+        // Using the first-stage macro here used to force the entire staged
+        // path down to XG, so XC=256 was never realized at runtime.
+        uint32_t serial_macro = 1;
+        for (const auto & stage : runtime_stages) {
+            serial_macro = std::max<uint32_t>(
+                serial_macro, (uint32_t) stage.macro_tokens);
+        }
+        runtime_ubatch =
+            std::min<uint32_t>(cparams.n_ubatch, serial_macro);
+        LLAMA_LOG_INFO(
+            "[HYBRID_EXEC] mode=serial batch=%u ubatch=%u "
+            "front_macro=%d max_macro=%u stages=%zu\n",
+            n_tokens_all, runtime_ubatch,
+            runtime_stages.front().macro_tokens,
+            serial_macro, runtime_stages.size());
     }
 
     bool did_optimize = false;
