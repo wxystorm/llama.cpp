@@ -41,7 +41,6 @@ static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1
 static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS       = 4;
-static constexpr std::array<int, 3>   LLAMA_HYBRID_MOE_CPU_BLOCK_DEPTHS       = { 4, 16, 32 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS       = { 1, 64, 128, 256 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_LOW_TENSOR_ANCHORS          = { 1, 2, 4, 8 };
 static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 4;
@@ -6031,53 +6030,49 @@ bool llama_hybrid_profile_moe_full_layer(
         }
     }
 
-    // A one-layer MoE microbenchmark can be substantially cache-hot compared
-    // with a real C=20..40 direct-CPU stage. Probe multiple region depths so
-    // the planner sees the same sustained execution regime as CPU_DIRECT.
-    // Keep token=1 at depth=4 to avoid making decode calibration expensive;
-    // prefill anchors also probe 16/32 layers.
+    // The 4-layer MoE block uses distinct synthetic expert weights per layer,
+    // so it already exceeds cache-hot one-layer behaviour and is a practical
+    // sustained anchor for CPU_DIRECT without allocating tens of layers of
+    // temporary expert weights during startup.
     for (const int tokens : LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS) {
-        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig ||
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS > profile.n_layer) {
             continue;
         }
 
-        for (const int depth : LLAMA_HYBRID_MOE_CPU_BLOCK_DEPTHS) {
-            if (depth > profile.n_layer || (tokens == 1 && depth != LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS)) {
-                continue;
-            }
-
-            llama_hybrid_graph_timing branch_timing;
-            if (!llama_hybrid_profile_moe_branch_block_point(
-                    attn_desc, moe_desc, cpu_backend,
-                    depth, tokens, branch_timing)) {
-                return false;
-            }
-
-            double attn_ms = 0.0;
-            if (!llama_hybrid_attn_cost(
-                    profile.cpu_attn, tokens, tokens, attn_ms)) {
-                return false;
-            }
-
-            const double total_ms =
-                branch_timing.wall_ms + depth * attn_ms;
-            profile.cpu_layer_blocks.push_back({
-                tokens,
-                depth,
-                total_ms,
-                total_ms
-            });
-            LLAMA_LOG_ERROR(
-                "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
-                "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
-                "total_ms=%.3f per_layer_ms=%.3f\n",
-                depth,
-                tokens,
-                branch_timing.wall_ms,
-                attn_ms,
-                total_ms,
-                total_ms / depth);
+        llama_hybrid_graph_timing branch_timing;
+        if (!llama_hybrid_profile_moe_branch_block_point(
+                attn_desc, moe_desc, cpu_backend,
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                tokens, branch_timing)) {
+            return false;
         }
+
+        double attn_ms = 0.0;
+        if (!llama_hybrid_attn_cost(
+                profile.cpu_attn, tokens, tokens, attn_ms)) {
+            return false;
+        }
+
+        const double total_ms =
+            branch_timing.wall_ms +
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS * attn_ms;
+        profile.cpu_layer_blocks.push_back({
+            tokens,
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+            total_ms,
+            total_ms
+        });
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
+            "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
+            "total_ms=%.3f per_layer_ms=%.3f\n",
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+            tokens,
+            branch_timing.wall_ms,
+            attn_ms,
+            total_ms,
+            total_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS);
     }
 
     // Keep phone full-layer probes at the existing small-token anchors; large
