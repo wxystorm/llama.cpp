@@ -41,7 +41,9 @@ static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1
 static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS       = 4;
+static constexpr std::array<int, 3>   LLAMA_HYBRID_MOE_CPU_BLOCK_DEPTHS       = { 4, 16, 32 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS       = { 1, 64, 128, 256 };
+static constexpr std::array<int, 4>   LLAMA_HYBRID_LOW_TENSOR_ANCHORS          = { 1, 2, 4, 8 };
 static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 4;
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
@@ -2991,6 +2993,21 @@ static bool llama_hybrid_coarse_memory_possible(
     return true;
 }
 
+static double llama_hybrid_tensor_depth_factor(int tensor_layers) {
+    if (tensor_layers <= 1) {
+        return 1.0;
+    }
+
+    // Single-layer/chunk probes represent an optimistic overlap envelope.
+    // Real deep Tensor regions repeatedly cross the RPC return/reduce barrier,
+    // so retain a conservative depth-dependent correction. It rises quickly
+    // for the first few layers and saturates instead of growing without bound.
+    constexpr double max_penalty = 0.25;
+    constexpr double depth_scale = 8.0;
+    const double x = (double) (tensor_layers - 1) / depth_scale;
+    return 1.0 + max_penalty * (1.0 - std::exp(-x));
+}
+
 static bool llama_hybrid_coarse_plan_score(
         const llama_hybrid_lp_model & model,
         const llama_hybrid_plan &    plan,
@@ -3002,9 +3019,11 @@ static bool llama_hybrid_coarse_plan_score(
         return false;
     }
 
+    const double tensor_depth_factor =
+        llama_hybrid_tensor_depth_factor(plan.tensor_layers);
     double downstream_ms =
         cpu_layers * model.cpu_cost +
-        plan.tensor_layers * model.tensor_cost +
+        plan.tensor_layers * model.tensor_cost * tensor_depth_factor +
         plan.phone_layers * model.phone_cost;
 
     if (plan.phone_layers > 0) {
@@ -3102,6 +3121,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         (profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS);
 
     std::array<std::vector<llama_hybrid_coarse_candidate>, 16> family_top;
+    std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_LOW_TENSOR_ANCHORS.size()> low_tensor_top;
     std::vector<llama_hybrid_coarse_candidate> global_top;
     std::vector<llama_hybrid_coarse_candidate> margin_pool;
 
@@ -3269,6 +3289,14 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                         llama_hybrid_coarse_insert_top(
                             family_top[(size_t) candidate.family], candidate,
                             LLAMA_HYBRID_COARSE_FAMILY_TOP_K);
+                        for (size_t ia = 0; ia < LLAMA_HYBRID_LOW_TENSOR_ANCHORS.size(); ++ia) {
+                            if (plan.tensor_layers == LLAMA_HYBRID_LOW_TENSOR_ANCHORS[ia]) {
+                                llama_hybrid_coarse_insert_top(
+                                    low_tensor_top[ia], candidate,
+                                    LLAMA_HYBRID_COARSE_FAMILY_TOP_K);
+                                break;
+                            }
+                        }
                         llama_hybrid_coarse_insert_top(
                             global_top, candidate,
                             LLAMA_HYBRID_COARSE_GLOBAL_TOP_K);
@@ -3304,6 +3332,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             keep_unique(candidate);
         }
     }
+    for (const auto & bucket : low_tensor_top) {
+        for (const auto & candidate : bucket) {
+            keep_unique(candidate);
+        }
+    }
     for (const auto & candidate : global_top) {
         keep_unique(candidate);
     }
@@ -3320,7 +3353,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d max_tensor_chunks=%d pc_budget=%zu "
         "phone_budget=%zu gpu_budget=%zu gpu_runtime_reserve=%zu total=%zu coarse_scoreable=%zu kept=%zu "
         "reject_chunks=%zu reject_coarse_memory=%zu ratio_evals=%zu best_coarse_ms=%.3f "
-        "family_top_k=%zu global_top_k=%zu margin_pool=%zu margin=%.2f\n",
+        "family_top_k=%zu low_tensor_anchors=1,2,4,8 global_top_k=%zu margin_pool=%zu margin=%.2f\n",
         constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train,
         constraints.target_ubatch_tokens > 0 ? constraints.target_ubatch_tokens : profile.probe_tokens,
         profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS,
@@ -3635,6 +3668,7 @@ static bool llama_hybrid_sim_stage_cost(
                     block_ms = stage.layers * (
                         cpu_attn_kv + llama_hybrid_tensor_misc_cost(
                             profile, tokens, cpu_layer_base, cpu_attn_base) + tensor_ffn_ms);
+                    block_ms *= llama_hybrid_tensor_depth_factor(stage.layers);
                 }
                 break;
             case llama_hybrid_sim_stage_kind::PHONE:
@@ -5998,49 +6032,52 @@ bool llama_hybrid_profile_moe_full_layer(
     }
 
     // A one-layer MoE microbenchmark can be substantially cache-hot compared
-    // with a real C=20..40 CPU stage. Add a small number of multi-layer block
-    // probes to calibrate the sustained regime without turning startup into a
-    // long stress test. Token=1 is the decode anchor; the larger anchors
-    // calibrate sustained prefill CPU stages.
+    // with a real C=20..40 direct-CPU stage. Probe multiple region depths so
+    // the planner sees the same sustained execution regime as CPU_DIRECT.
+    // Keep token=1 at depth=4 to avoid making decode calibration expensive;
+    // prefill anchors also probe 16/32 layers.
     for (const int tokens : LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS) {
-        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig ||
-            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS > profile.n_layer) {
+        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
             continue;
         }
 
-        llama_hybrid_graph_timing branch_timing;
-        if (!llama_hybrid_profile_moe_branch_block_point(
-                attn_desc, moe_desc, cpu_backend,
-                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
-                tokens, branch_timing)) {
-            return false;
-        }
+        for (const int depth : LLAMA_HYBRID_MOE_CPU_BLOCK_DEPTHS) {
+            if (depth > profile.n_layer || (tokens == 1 && depth != LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS)) {
+                continue;
+            }
 
-        double attn_ms = 0.0;
-        if (!llama_hybrid_attn_cost(
-                profile.cpu_attn, tokens, tokens, attn_ms)) {
-            return false;
-        }
+            llama_hybrid_graph_timing branch_timing;
+            if (!llama_hybrid_profile_moe_branch_block_point(
+                    attn_desc, moe_desc, cpu_backend,
+                    depth, tokens, branch_timing)) {
+                return false;
+            }
 
-        const double total_ms =
-            branch_timing.wall_ms +
-            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS * attn_ms;
-        profile.cpu_layer_blocks.push_back({
-            tokens,
-            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
-            total_ms,
-            total_ms
-        });
-        LLAMA_LOG_ERROR(
-            "[HYBRID_PROFILE_CPU_DEPTH] kind=moe_block layers=%d "
-            "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
-            "total_ms=%.3f per_layer_ms=%.3f\n",
-            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
-            tokens,
-            branch_timing.wall_ms,
-            attn_ms,
-            total_ms,
-            total_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS);
+            double attn_ms = 0.0;
+            if (!llama_hybrid_attn_cost(
+                    profile.cpu_attn, tokens, tokens, attn_ms)) {
+                return false;
+            }
+
+            const double total_ms =
+                branch_timing.wall_ms + depth * attn_ms;
+            profile.cpu_layer_blocks.push_back({
+                tokens,
+                depth,
+                total_ms,
+                total_ms
+            });
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
+                "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
+                "total_ms=%.3f per_layer_ms=%.3f\n",
+                depth,
+                tokens,
+                branch_timing.wall_ms,
+                attn_ms,
+                total_ms,
+                total_ms / depth);
+        }
     }
 
     // Keep phone full-layer probes at the existing small-token anchors; large
