@@ -198,8 +198,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         stage_graph &&
         n_tokens > 1 &&
         ubatch.n_pos == 1 &&
-        !ubatch.equal_seqs() &&
         ubatch.n_seqs_unq == 1 &&
+        (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
         model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
         planned_chunk_tokens > 0 &&
         layer_end - layer_begin > 1 &&
@@ -230,6 +230,20 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         moe_stage_wavefront =
             wave_chunk_sizes.size() > 1 &&
             wave_attn_group_counts.size() > 1;
+    }
+
+    if (return_wavefront_requested && stage_graph && n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d tokens=%" PRId64
+            " layers=[%d,%d) equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
+            "XT=%d target=%d chunks=%zu groups=%zu\n",
+            moe_stage_wavefront ? 1 : 0,
+            n_tokens, layer_begin, layer_end,
+            ubatch.equal_seqs() ? 1 : 0,
+            ubatch.n_seqs, ubatch.n_seqs_unq,
+            planned_chunk_tokens, wave_attn_target_tokens,
+            wave_chunk_sizes.size(),
+            wave_attn_group_counts.size());
     }
 
     llm_graph_input_attn_kv * inp_attn =

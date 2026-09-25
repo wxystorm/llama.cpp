@@ -64,14 +64,22 @@ static bool can_reuse_kq_mask(
 static llama_ubatch llama_graph_ubatch_range(
         const llama_ubatch & source, uint32_t token_begin, uint32_t token_count) {
     GGML_ASSERT(source.n_pos == 1);
-    GGML_ASSERT(!source.equal_seqs());
+    GGML_ASSERT(!source.equal_seqs() || source.n_seqs == 1);
     GGML_ASSERT(token_begin <= source.n_tokens);
     GGML_ASSERT(token_count <= source.n_tokens - token_begin);
 
     llama_ubatch result = source;
-    result.n_tokens     = token_count;
-    result.n_seq_tokens = 1;
-    result.n_seqs       = token_count;
+    result.n_tokens = token_count;
+    if (source.equal_seqs()) {
+        // A normal single-sequence prompt is represented as equal_seqs=true,
+        // n_seqs=1, n_seq_tokens=n_tokens.  Preserve that representation when
+        // building a token-range KV/mask input for coarse Attention groups.
+        result.n_seq_tokens = token_count;
+        result.n_seqs       = 1;
+    } else {
+        result.n_seq_tokens = 1;
+        result.n_seqs       = token_count;
+    }
     result.token        = source.token != nullptr ? source.token + token_begin : nullptr;
     // The range object is used only by KV-index/mask inputs. Hidden-state
     // loading remains owned by llm_graph_input_stage.

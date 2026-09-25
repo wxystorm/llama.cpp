@@ -6107,10 +6107,18 @@ auto prefill_norm_sg_has_prework =
         }
 
         if (return_wavefront_graph) {
-            // Return-wavefront currently relies on the dense optimized input
-            // pipeline.  A graph that fell back to generic MoE handoff must
-            // never enter this path.
-            GGML_ASSERT(has_async_prefill_input);
+            // Dense graphs normally arrive here with an async PC->Phone input
+            // task. MoE can insert Router/Top-K/expert subgraphs between the
+            // norm and down boundaries, so Meta may legitimately fall back to
+            // the generic handoff path. That path is dependency-correct; it
+            // only gives up some H2D overlap, so allow it in the return
+            // wavefront instead of rejecting the whole MoE experiment.
+            if (!has_async_prefill_input && pipeline_debug) {
+                GGML_LOG_INFO(
+                    "[RETURN_WAVEFRONT_INPUT_FALLBACK] layer=%d chunk=%d "
+                    "mode=generic_handoff\n",
+                    prefill_down_layer, prefill_down_chunk);
+            }
             // Bound Phone producer pressure by producer completion, not by
             // full snapshot return completion. The snapshot client publishes
             // seq readiness as soon as the first payload byte arrives, which
