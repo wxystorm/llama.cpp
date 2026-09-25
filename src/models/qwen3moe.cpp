@@ -84,7 +84,10 @@ static std::vector<int> qwen3moe_wave_attn_group_counts(
                     take_tokens > ideal_tokens ?
                         take_tokens - ideal_tokens :
                         ideal_tokens - take_tokens;
-                if (stop_error <= take_error) {
+                // On an equal-distance boundary prefer the larger coarse
+                // Attention group. Starting the next layer a little later is
+                // preferable to reintroducing an XT-sized Attention kernel.
+                if (stop_error < take_error) {
                     break;
                 }
             }
@@ -230,18 +233,43 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         moe_stage_wavefront =
             wave_chunk_sizes.size() > 1 &&
             wave_attn_group_counts.size() > 1;
+
+        // Do not call a layout "coarse" if any Attention group collapses back
+        // to roughly one XT chunk. This is the failure mode of 192 tokens with
+        // XT=64,target=128: the only two-group partition is 128+64. The small
+        // 64-token Attention can cost more than the return barrier it hides.
+        // Requiring >= 75% of the target keeps useful layouts such as
+        // 103+153 (target=128) and 128+128, while falling back for 128+64.
+        if (moe_stage_wavefront) {
+            const int min_group_tokens =
+                std::max(1, (wave_attn_target_tokens * 3 + 3) / 4);
+            size_t chunk_begin = 0;
+            for (const int group_chunks : wave_attn_group_counts) {
+                int group_tokens = 0;
+                for (int i = 0; i < group_chunks; ++i) {
+                    group_tokens +=
+                        wave_chunk_sizes[chunk_begin + (size_t) i];
+                }
+                if (group_tokens < min_group_tokens) {
+                    moe_stage_wavefront = false;
+                    break;
+                }
+                chunk_begin += (size_t) group_chunks;
+            }
+        }
     }
 
     if (return_wavefront_requested && stage_graph && n_tokens > 1) {
         LLAMA_LOG_ERROR(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d tokens=%" PRId64
             " layers=[%d,%d) equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
-            "XT=%d target=%d chunks=%zu groups=%zu\n",
+            "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
             moe_stage_wavefront ? 1 : 0,
             n_tokens, layer_begin, layer_end,
             ubatch.equal_seqs() ? 1 : 0,
             ubatch.n_seqs, ubatch.n_seqs_unq,
             planned_chunk_tokens, wave_attn_target_tokens,
+            std::max(1, (wave_attn_target_tokens * 3 + 3) / 4),
             wave_chunk_sizes.size(),
             wave_attn_group_counts.size());
     }
