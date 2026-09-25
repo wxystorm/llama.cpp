@@ -2246,7 +2246,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ubatch, token_begin, block_tokens, stage_input);
     n_outputs = block_outputs;
 
-    LLAMA_LOG_INFO(
+    LLAMA_LOG_ERROR(
         "[HYBRID_EXEC] ub=%d stage=%zu kind=%s layers=[%d,%d) block=%zu action=%s tokens=[%u,%u)\n",
         ubatch_id, stage_index, llama_hybrid_runtime_stage_name(stage.kind), stage.layer_begin, stage.layer_end,
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
@@ -2670,6 +2670,22 @@ llm_graph_result * llama_context::process_ubatch_staged(
         const auto & stage = stages[stage_index];
         const bool first_stage = stage_index == 0;
         const bool last_stage  = stage_index + 1 == stages.size();
+        const bool profile_cpu =
+            stage.kind == llama_hybrid_runtime_stage_kind::CPU;
+        const bool profile_tensor =
+            stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
+        llama_hybrid_stage_timing stage_timing {};
+        const int64_t stage_wall_begin_us =
+            (profile_cpu || profile_tensor) ? ggml_time_us() : 0;
+
+        if (profile_tensor) {
+            const int n_backends =
+                ggml_backend_sched_get_n_backends(sched_use);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_meta_tensor_profile_reset(
+                    ggml_backend_sched_get_backend(sched_use, i));
+            }
+        }
 
         std::vector<llama_hybrid_boundary_block> blocks;
         if (first_stage) {
@@ -2712,11 +2728,162 @@ llm_graph_result * llama_context::process_ubatch_staged(
 
             result = run_hybrid_stage_block(
                 ubatch, stage, token_begin, block_tokens, stage_input, stage_output, gtype, mctx, sched_use,
-                res_use, ubatch_id, stage_index, block_index, block.action, block_outputs, apply_mctx, true, ret);
+                res_use, ubatch_id, stage_index, block_index, block.action, block_outputs, apply_mctx, true, ret,
+                (profile_cpu || profile_tensor) ? &stage_timing : nullptr);
             if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
                 finish(ret);
                 return nullptr;
             }
+        }
+
+        if (profile_cpu) {
+            const int64_t stage_total_us =
+                ggml_time_us() - stage_wall_begin_us;
+            const int64_t accounted_us =
+                stage_timing.prepare_us +
+                stage_timing.compute_range_us +
+                stage_timing.sync_us;
+            LLAMA_LOG_ERROR(
+                "[CPU_STAGE_TIMING] ub=%d tokens=%u layers=[%d,%d) "
+                "n_layers=%d XC=%d total_ms=%.3f prepare_ms=%.3f "
+                "compute_ms=%.3f sync_ms=%.3f unaccounted_ms=%.3f "
+                "blocks=%zu mode=SERIAL_ACCUMULATE\n",
+                ubatch_id, ubatch.n_tokens,
+                stage.layer_begin, stage.layer_end,
+                stage.layer_end - stage.layer_begin,
+                stage.macro_tokens,
+                stage_total_us / 1000.0,
+                stage_timing.prepare_us / 1000.0,
+                stage_timing.compute_range_us / 1000.0,
+                stage_timing.sync_us / 1000.0,
+                std::max<int64_t>(0, stage_total_us - accounted_us) / 1000.0,
+                blocks.size());
+        }
+
+        if (profile_tensor) {
+            ggml_backend_meta_tensor_profile profile {};
+            const int n_backends =
+                ggml_backend_sched_get_n_backends(sched_use);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_meta_tensor_profile backend_profile {};
+                if (!ggml_backend_meta_tensor_profile_get(
+                        ggml_backend_sched_get_backend(sched_use, i),
+                        &backend_profile)) {
+                    continue;
+                }
+                profile.attn_us   += backend_profile.attn_us;
+                profile.pc_ffn_us += backend_profile.pc_ffn_us;
+                profile.h2d_us    += backend_profile.h2d_us;
+                profile.phone_us  += backend_profile.phone_us;
+                profile.d2h_us    += backend_profile.d2h_us;
+                profile.reduce_us += backend_profile.reduce_us;
+                profile.wait_us   += backend_profile.wait_us;
+                profile.graph_compute_count +=
+                    backend_profile.graph_compute_count;
+                profile.graph_rebuild_count +=
+                    backend_profile.graph_rebuild_count;
+                profile.graph_total_us +=
+                    backend_profile.graph_total_us;
+                profile.graph_rebuild_us +=
+                    backend_profile.graph_rebuild_us;
+                profile.graph_execute_us +=
+                    backend_profile.graph_execute_us;
+                profile.graph_other_us +=
+                    backend_profile.graph_other_us;
+                profile.lane_reuse_wait_count +=
+                    backend_profile.lane_reuse_wait_count;
+                profile.lane_reuse_wait_us +=
+                    backend_profile.lane_reuse_wait_us;
+                profile.lane_reuse_wait_max_us = std::max(
+                    profile.lane_reuse_wait_max_us,
+                    backend_profile.lane_reuse_wait_max_us);
+                for (size_t lane = 0; lane < 2; ++lane) {
+                    profile.lane_reuse_wait_count_by_lane[lane] +=
+                        backend_profile.lane_reuse_wait_count_by_lane[lane];
+                    profile.lane_reuse_wait_us_by_lane[lane] +=
+                        backend_profile.lane_reuse_wait_us_by_lane[lane];
+                }
+                if (backend_profile.layer_barrier_wait_count > 0 &&
+                    backend_profile.layer_barrier_wait_max_us >=
+                        profile.layer_barrier_wait_max_us) {
+                    profile.layer_barrier_wait_max_us =
+                        backend_profile.layer_barrier_wait_max_us;
+                    profile.layer_barrier_wait_max_layer =
+                        backend_profile.layer_barrier_wait_max_layer;
+                    profile.layer_barrier_wait_max_pending =
+                        backend_profile.layer_barrier_wait_max_pending;
+                    profile.layer_barrier_wait_max_last_lane =
+                        backend_profile.layer_barrier_wait_max_last_lane;
+                }
+                profile.layer_barrier_wait_count +=
+                    backend_profile.layer_barrier_wait_count;
+                profile.layer_barrier_wait_us +=
+                    backend_profile.layer_barrier_wait_us;
+            }
+
+            const int64_t stage_total_us =
+                ggml_time_us() - stage_wall_begin_us;
+            const int64_t accounted_us =
+                stage_timing.prepare_us +
+                stage_timing.compute_range_us +
+                stage_timing.sync_us;
+            LLAMA_LOG_ERROR(
+                "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f "
+                "compute_range=%.3f sync=%.3f unaccounted=%.3f "
+                "meta_total=%.3f meta_rebuild=%.3f meta_execute=%.3f "
+                "meta_other=%.3f meta_calls=%" PRId64
+                " meta_rebuilds=%" PRId64
+                " blocks=%zu mode=SERIAL_ACCUMULATE\n",
+                ubatch_id,
+                stage_total_us / 1000.0,
+                stage_timing.prepare_us / 1000.0,
+                stage_timing.compute_range_us / 1000.0,
+                stage_timing.sync_us / 1000.0,
+                std::max<int64_t>(0, stage_total_us - accounted_us) / 1000.0,
+                profile.graph_total_us / 1000.0,
+                profile.graph_rebuild_us / 1000.0,
+                profile.graph_execute_us / 1000.0,
+                profile.graph_other_us / 1000.0,
+                profile.graph_compute_count,
+                profile.graph_rebuild_count,
+                blocks.size());
+
+            LLAMA_LOG_ERROR(
+                "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f "
+                "pc_ffn=%.3f h2d=%.3f phone=%.3f d2h=%.3f "
+                "reduce=%.3f wait=%.3f ms mode=SERIAL_ACCUMULATE\n",
+                ubatch_id, stage_total_us / 1000.0,
+                profile.attn_us / 1000.0,
+                profile.pc_ffn_us / 1000.0,
+                profile.h2d_us / 1000.0,
+                profile.phone_us / 1000.0,
+                profile.d2h_us / 1000.0,
+                profile.reduce_us / 1000.0,
+                profile.wait_us / 1000.0);
+
+            LLAMA_LOG_ERROR(
+                "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64
+                " lane_reuse_ms=%.3f lane_reuse_max_ms=%.3f "
+                "lane0_count=%" PRId64 " lane0_ms=%.3f "
+                "lane1_count=%" PRId64 " lane1_ms=%.3f "
+                "layer_barrier_count=%" PRId64
+                " layer_barrier_ms=%.3f layer_barrier_max_ms=%.3f "
+                "max_layer=%" PRId64 " max_pending=%" PRId64
+                " max_last_lane=%" PRId64
+                " mode=SERIAL_ACCUMULATE\n",
+                profile.lane_reuse_wait_count,
+                profile.lane_reuse_wait_us / 1000.0,
+                profile.lane_reuse_wait_max_us / 1000.0,
+                profile.lane_reuse_wait_count_by_lane[0],
+                profile.lane_reuse_wait_us_by_lane[0] / 1000.0,
+                profile.lane_reuse_wait_count_by_lane[1],
+                profile.lane_reuse_wait_us_by_lane[1] / 1000.0,
+                profile.layer_barrier_wait_count,
+                profile.layer_barrier_wait_us / 1000.0,
+                profile.layer_barrier_wait_max_us / 1000.0,
+                profile.layer_barrier_wait_max_layer,
+                profile.layer_barrier_wait_max_pending,
+                profile.layer_barrier_wait_max_last_lane);
         }
     }
 
@@ -3562,7 +3729,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         runtime_ubatch =
             std::min<uint32_t>(cparams.n_ubatch, serial_macro);
-        LLAMA_LOG_INFO(
+        LLAMA_LOG_ERROR(
             "[HYBRID_EXEC] mode=serial batch=%u ubatch=%u "
             "front_macro=%d max_macro=%u stages=%zu\n",
             n_tokens_all, runtime_ubatch,
