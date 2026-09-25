@@ -6725,14 +6725,14 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
 
-    // Targeted decode validation run: keep the runtime/prefill placement fixed
-    // to the plan that already produced a real decode measurement.
-    // pc_layers includes the CUDA prefix, so C=46 with G=10 means
-    // 10 GPU PC_ONLY layers + 36 CPU PC_ONLY layers.
-    constraints.fixed_tensor_layers = 0;
-    constraints.fixed_phone_layers  = 2;
-    constraints.fixed_pc_layers     = 46;
-    constraints.fixed_gpu_pc_layers = 10;
+    // Targeted CPU_DIRECT decode validation run. Keep the runtime placement
+    // identical to the measured decode plan while changing only the CPU path:
+    // G=11 + 36 CPU PC_ONLY + T=1 + P=0. pc_layers includes the CUDA prefix,
+    // so C=47 with G=11 means 11 GPU PC_ONLY + 36 CPU PC_ONLY layers.
+    constraints.fixed_tensor_layers = 1;
+    constraints.fixed_phone_layers  = 0;
+    constraints.fixed_pc_layers     = 47;
+    constraints.fixed_gpu_pc_layers = 11;
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
