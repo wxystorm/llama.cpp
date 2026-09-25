@@ -1636,21 +1636,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         };
     }
 
-    // 关键：CPU PC_ONLY 仍留在原来的 META 中。
-    // split_state 会把它 force 到 primary。
-    if (meta_dev == nullptr) {
-        throw std::runtime_error(format(
-            "%s: no Meta backend found for PC_ONLY layer %d",
-            __func__, il));
-    }
-
+    // A PC_ONLY layer assigned to CPU does not need Meta/RPC at all.
+    // Place both its weights and graph directly on the CPU backend. Meta is
+    // reserved for TENSOR_SPLIT / PHONE_ONLY layers that actually need the
+    // secondary RPC backend.
     LLAMA_LOG_ERROR(
-        "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=META_PRIMARY\n",
-        il);
+        "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CPU_DIRECT device=%s\n",
+        il, ggml_backend_dev_name(cpu_dev));
 
     return {
-        meta_dev,
-        &pimpl->gpu_buft_list.at(meta_dev)
+        cpu_dev,
+        &pimpl->cpu_buft_list
     };
 }
 
