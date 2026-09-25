@@ -2778,6 +2778,18 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.d2h_us    += backend_profile.d2h_us;
                 profile.reduce_us += backend_profile.reduce_us;
                 profile.wait_us   += backend_profile.wait_us;
+                profile.return_transfer_count +=
+                    backend_profile.return_transfer_count;
+                profile.return_payload_bytes +=
+                    backend_profile.return_payload_bytes;
+                profile.return_request_us +=
+                    backend_profile.return_request_us;
+                profile.return_ready_wait_us +=
+                    backend_profile.return_ready_wait_us;
+                profile.return_recv_payload_us +=
+                    backend_profile.return_recv_payload_us;
+                profile.return_rpc_total_us +=
+                    backend_profile.return_rpc_total_us;
                 profile.graph_compute_count +=
                     backend_profile.graph_compute_count;
                 profile.graph_rebuild_count +=
@@ -2884,6 +2896,42 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.layer_barrier_wait_max_layer,
                 profile.layer_barrier_wait_max_pending,
                 profile.layer_barrier_wait_max_last_lane);
+
+            if (profile.return_transfer_count > 0) {
+                const int64_t exposed_wait_us =
+                    profile.lane_reuse_wait_us +
+                    profile.layer_barrier_wait_us;
+                const int64_t overlap_est_us =
+                    std::max<int64_t>(
+                        0, profile.return_rpc_total_us -
+                            exposed_wait_us);
+                const double overlap_ratio =
+                    profile.return_rpc_total_us > 0 ?
+                        (double) overlap_est_us /
+                            (double) profile.return_rpc_total_us :
+                        0.0;
+                LLAMA_LOG_ERROR(
+                    "[RETURN_CRITICAL_PATH] ub=%d returns=%" PRId64
+                    " payload_mib=%.3f request_ms=%.3f ready_wait_ms=%.3f "
+                    "recv_payload_ms=%.3f rpc_total_ms=%.3f "
+                    "d2h_accounted_ms=%.3f lane_wait_ms=%.3f "
+                    "barrier_wait_ms=%.3f exposed_wait_ms=%.3f "
+                    "overlap_est_ms=%.3f overlap_ratio=%.3f "
+                    "mode=SERIAL_ACCUMULATE\n",
+                    ubatch_id,
+                    profile.return_transfer_count,
+                    profile.return_payload_bytes / 1048576.0,
+                    profile.return_request_us / 1000.0,
+                    profile.return_ready_wait_us / 1000.0,
+                    profile.return_recv_payload_us / 1000.0,
+                    profile.return_rpc_total_us / 1000.0,
+                    profile.d2h_us / 1000.0,
+                    profile.lane_reuse_wait_us / 1000.0,
+                    profile.layer_barrier_wait_us / 1000.0,
+                    exposed_wait_us / 1000.0,
+                    overlap_est_us / 1000.0,
+                    overlap_ratio);
+            }
         }
     }
 
@@ -4167,6 +4215,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.d2h_us    += backend_profile.d2h_us;
                 profile.reduce_us += backend_profile.reduce_us;
                 profile.wait_us   += backend_profile.wait_us;
+                profile.return_transfer_count +=
+                    backend_profile.return_transfer_count;
+                profile.return_payload_bytes +=
+                    backend_profile.return_payload_bytes;
+                profile.return_request_us +=
+                    backend_profile.return_request_us;
+                profile.return_ready_wait_us +=
+                    backend_profile.return_ready_wait_us;
+                profile.return_recv_payload_us +=
+                    backend_profile.return_recv_payload_us;
+                profile.return_rpc_total_us +=
+                    backend_profile.return_rpc_total_us;
                 profile.graph_compute_count += backend_profile.graph_compute_count;
                 profile.graph_rebuild_count += backend_profile.graph_rebuild_count;
                 profile.graph_total_us += backend_profile.graph_total_us;
@@ -4301,6 +4361,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.layer_barrier_wait_count, profile.layer_barrier_wait_us / 1000.0,
                 profile.layer_barrier_wait_max_us / 1000.0, profile.layer_barrier_wait_max_layer,
                 profile.layer_barrier_wait_max_pending, profile.layer_barrier_wait_max_last_lane);
+
+            if (profile.return_transfer_count > 0) {
+                const int64_t exposed_wait_us =
+                    profile.lane_reuse_wait_us +
+                    profile.layer_barrier_wait_us;
+                const int64_t overlap_est_us =
+                    std::max<int64_t>(
+                        0, profile.return_rpc_total_us -
+                            exposed_wait_us);
+                const double overlap_ratio =
+                    profile.return_rpc_total_us > 0 ?
+                        (double) overlap_est_us /
+                            (double) profile.return_rpc_total_us :
+                        0.0;
+                LLAMA_LOG_ERROR(
+                    "[RETURN_CRITICAL_PATH] ub=%d returns=%" PRId64
+                    " payload_mib=%.3f request_ms=%.3f ready_wait_ms=%.3f "
+                    "recv_payload_ms=%.3f rpc_total_ms=%.3f "
+                    "d2h_accounted_ms=%.3f lane_wait_ms=%.3f "
+                    "barrier_wait_ms=%.3f exposed_wait_ms=%.3f "
+                    "overlap_est_ms=%.3f overlap_ratio=%.3f\n",
+                    job.ubatch_id,
+                    profile.return_transfer_count,
+                    profile.return_payload_bytes / 1048576.0,
+                    profile.return_request_us / 1000.0,
+                    profile.return_ready_wait_us / 1000.0,
+                    profile.return_recv_payload_us / 1000.0,
+                    profile.return_rpc_total_us / 1000.0,
+                    profile.d2h_us / 1000.0,
+                    profile.lane_reuse_wait_us / 1000.0,
+                    profile.layer_barrier_wait_us / 1000.0,
+                    exposed_wait_us / 1000.0,
+                    overlap_est_us / 1000.0,
+                    overlap_ratio);
+            }
         }
         LLAMA_LOG_ERROR(
             "[HYBRID_PIPE] ub=%d %s_PHASE_END stage=%zu\n",

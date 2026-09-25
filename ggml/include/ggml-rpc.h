@@ -62,6 +62,9 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_WAIT_SNAPSHOT_READY_PROC \
     "ggml_backend_rpc_wait_snapshot_ready"
+
+#define GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC \
+    "ggml_backend_rpc_get_snapshot_stats"
     
 #define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
     "ggml_backend_rpc_prepare_fused_ffn_input"
@@ -117,6 +120,19 @@ using ggml_backend_rpc_set_snapshot_read_t = void (*)(
 using ggml_backend_rpc_wait_snapshot_ready_t = bool (*)(
         ggml_backend_t backend,
         uint64_t seq);
+
+struct ggml_backend_rpc_snapshot_stats {
+    uint64_t transfer_count;
+    uint64_t payload_bytes;
+    int64_t  request_us;
+    int64_t  ready_first_byte_us;
+    int64_t  recv_payload_us;
+    int64_t  total_us;
+};
+
+using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
+        ggml_backend_t backend,
+        struct ggml_backend_rpc_snapshot_stats * stats);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);

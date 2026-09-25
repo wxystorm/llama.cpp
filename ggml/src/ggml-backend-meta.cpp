@@ -2600,6 +2600,23 @@ static ggml_backend_rpc_set_snapshot_read_t ggml_backend_meta_get_snapshot_read_
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_SNAPSHOT_READ_PROC));
 }
 
+static ggml_backend_rpc_get_snapshot_stats_t ggml_backend_meta_get_snapshot_stats_getter(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_get_snapshot_stats_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC));
+}
+
 static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_ready_waiter(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -2748,6 +2765,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    ggml_backend_rpc_snapshot_stats rpc_snapshot_stats_begin {};
+    ggml_backend_rpc_get_snapshot_stats_t rpc_snapshot_stats_getter = nullptr;
+    bool have_rpc_snapshot_stats = false;
+    if (n_backends > 1) {
+        rpc_snapshot_stats_getter =
+            ggml_backend_meta_get_snapshot_stats_getter(
+                backend_ctx->backend_configs[1].backend);
+        if (rpc_snapshot_stats_getter != nullptr) {
+            have_rpc_snapshot_stats =
+                rpc_snapshot_stats_getter(
+                    backend_ctx->backend_configs[1].backend,
+                    &rpc_snapshot_stats_begin);
+        }
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -6584,6 +6616,71 @@ auto prefill_norm_sg_has_prework =
     const int64_t h2d_us = n_backends > 1 ? reduce_copy_by_direction[1].total_us : 0;
     const int64_t d2h_us = n_backends > 1 ? reduce_copy_by_direction[n_backends].total_us : 0;
     const int64_t tensor_reduce_us = reduce_add_us + reduce_zero_us + reduce_comm_us;
+
+    ggml_backend_rpc_snapshot_stats rpc_snapshot_stats_end {};
+    int64_t return_transfer_count = 0;
+    int64_t return_payload_bytes = 0;
+    int64_t return_request_us = 0;
+    int64_t return_ready_wait_us = 0;
+    int64_t return_recv_payload_us = 0;
+    int64_t return_rpc_total_us = 0;
+    if (have_rpc_snapshot_stats &&
+        rpc_snapshot_stats_getter(
+            backend_ctx->backend_configs[1].backend,
+            &rpc_snapshot_stats_end)) {
+        return_transfer_count = (int64_t) (
+            rpc_snapshot_stats_end.transfer_count -
+            rpc_snapshot_stats_begin.transfer_count);
+        return_payload_bytes = (int64_t) (
+            rpc_snapshot_stats_end.payload_bytes -
+            rpc_snapshot_stats_begin.payload_bytes);
+        return_request_us =
+            rpc_snapshot_stats_end.request_us -
+            rpc_snapshot_stats_begin.request_us;
+        return_ready_wait_us =
+            rpc_snapshot_stats_end.ready_first_byte_us -
+            rpc_snapshot_stats_begin.ready_first_byte_us;
+        return_recv_payload_us =
+            rpc_snapshot_stats_end.recv_payload_us -
+            rpc_snapshot_stats_begin.recv_payload_us;
+        return_rpc_total_us =
+            rpc_snapshot_stats_end.total_us -
+            rpc_snapshot_stats_begin.total_us;
+    }
+
+    const int64_t explicit_return_wait_us =
+        lane_reuse_wait_us + layer_barrier_wait_us;
+    const int64_t return_overlap_est_us =
+        std::max<int64_t>(
+            0, return_rpc_total_us - explicit_return_wait_us);
+    const double return_overlap_ratio =
+        return_rpc_total_us > 0 ?
+            (double) return_overlap_est_us /
+                (double) return_rpc_total_us :
+            0.0;
+
+    if (return_transfer_count > 0) {
+        printf(
+            "[RETURN_CRITICAL_PATH_GRAPH] returns=%" PRId64
+            " payload_mib=%.3f request_ms=%.3f ready_wait_ms=%.3f "
+            "recv_payload_ms=%.3f rpc_total_ms=%.3f "
+            "d2h_accounted_ms=%.3f lane_wait_ms=%.3f "
+            "barrier_wait_ms=%.3f exposed_wait_ms=%.3f "
+            "overlap_est_ms=%.3f overlap_ratio=%.3f\n",
+            return_transfer_count,
+            return_payload_bytes / 1048576.0,
+            return_request_us / 1000.0,
+            return_ready_wait_us / 1000.0,
+            return_recv_payload_us / 1000.0,
+            return_rpc_total_us / 1000.0,
+            d2h_us / 1000.0,
+            lane_reuse_wait_us / 1000.0,
+            layer_barrier_wait_us / 1000.0,
+            explicit_return_wait_us / 1000.0,
+            return_overlap_est_us / 1000.0,
+            return_overlap_ratio);
+    }
+
     const int64_t meta_graph_end_us = return_wavefront_graph ? ggml_time_us() : 0;
     const int64_t meta_total_us =
         return_wavefront_graph ? meta_graph_end_us - meta_graph_start_us : 0;
@@ -6620,6 +6717,18 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.d2h_us    += d2h_us;
         backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
         backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+        backend_ctx->tensor_profile.return_transfer_count +=
+            return_transfer_count;
+        backend_ctx->tensor_profile.return_payload_bytes +=
+            return_payload_bytes;
+        backend_ctx->tensor_profile.return_request_us +=
+            return_request_us;
+        backend_ctx->tensor_profile.return_ready_wait_us +=
+            return_ready_wait_us;
+        backend_ctx->tensor_profile.return_recv_payload_us +=
+            return_recv_payload_us;
+        backend_ctx->tensor_profile.return_rpc_total_us +=
+            return_rpc_total_us;
         backend_ctx->tensor_profile.graph_compute_count += 1;
         backend_ctx->tensor_profile.graph_total_us += meta_graph_total_all_us;
         backend_ctx->tensor_profile.graph_rebuild_us += meta_rebuild_us;

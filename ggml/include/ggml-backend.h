@@ -499,6 +499,14 @@ extern "C" {
         int64_t layer_barrier_wait_max_layer;
         int64_t layer_barrier_wait_max_pending;
         int64_t layer_barrier_wait_max_last_lane;
+
+        // Snapshot-return timing reported by the RPC client.
+        int64_t return_transfer_count;
+        int64_t return_payload_bytes;
+        int64_t return_request_us;
+        int64_t return_ready_wait_us;
+        int64_t return_recv_payload_us;
+        int64_t return_rpc_total_us;
     };
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);

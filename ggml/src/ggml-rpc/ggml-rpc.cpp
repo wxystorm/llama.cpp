@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <optional>
@@ -306,6 +307,15 @@ struct rpc_snapshot_ready_context {
     std::unordered_set<uint64_t> ready_seqs;
 };
 
+struct rpc_snapshot_client_stats {
+    std::atomic<uint64_t> transfer_count { 0 };
+    std::atomic<uint64_t> payload_bytes { 0 };
+    std::atomic<int64_t> request_us { 0 };
+    std::atomic<int64_t> ready_first_byte_us { 0 };
+    std::atomic<int64_t> recv_payload_us { 0 };
+    std::atomic<int64_t> total_us { 0 };
+};
+
 struct ggml_backend_rpc_device_context {
     std::string endpoint;
     uint32_t    device;
@@ -314,6 +324,7 @@ struct ggml_backend_rpc_device_context {
     std::unordered_set<uint64_t> graph_uids;
     rpc_pending_fused_ffn_input fused_ffn;
     rpc_snapshot_ready_context snapshot_ready;
+    rpc_snapshot_client_stats snapshot_client_stats;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -589,6 +600,33 @@ static void rpc_mark_snapshot_ready(
         device_ctx->snapshot_ready.ready_seqs.insert(seq);
     }
     device_ctx->snapshot_ready.cv.notify_all();
+}
+
+static bool ggml_backend_rpc_get_snapshot_stats(
+        ggml_backend_t backend,
+        ggml_backend_rpc_snapshot_stats * stats) {
+    if (backend == nullptr || stats == nullptr) {
+        return false;
+    }
+    auto * dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || dev->context == nullptr) {
+        return false;
+    }
+    auto * ctx =
+        static_cast<ggml_backend_rpc_device_context *>(dev->context);
+    stats->transfer_count =
+        ctx->snapshot_client_stats.transfer_count.load(std::memory_order_relaxed);
+    stats->payload_bytes =
+        ctx->snapshot_client_stats.payload_bytes.load(std::memory_order_relaxed);
+    stats->request_us =
+        ctx->snapshot_client_stats.request_us.load(std::memory_order_relaxed);
+    stats->ready_first_byte_us =
+        ctx->snapshot_client_stats.ready_first_byte_us.load(std::memory_order_relaxed);
+    stats->recv_payload_us =
+        ctx->snapshot_client_stats.recv_payload_us.load(std::memory_order_relaxed);
+    stats->total_us =
+        ctx->snapshot_client_stats.total_us.load(std::memory_order_relaxed);
+    return true;
 }
 
 static bool ggml_backend_rpc_wait_snapshot_ready(
@@ -1245,6 +1283,20 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         }
 
         const int64_t done_us = ggml_time_us();
+
+        if (ctx->device_ctx != nullptr) {
+            auto & stats = ctx->device_ctx->snapshot_client_stats;
+            stats.transfer_count.fetch_add(1, std::memory_order_relaxed);
+            stats.payload_bytes.fetch_add(size, std::memory_order_relaxed);
+            stats.request_us.fetch_add(
+                request_done_us - t0, std::memory_order_relaxed);
+            stats.ready_first_byte_us.fetch_add(
+                ready_first_byte_us, std::memory_order_relaxed);
+            stats.recv_payload_us.fetch_add(
+                recv_rest_us, std::memory_order_relaxed);
+            stats.total_us.fetch_add(
+                done_us - t0, std::memory_order_relaxed);
+        }
 
         if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
             printf(
@@ -4408,6 +4460,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_WAIT_SNAPSHOT_READY_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_wait_snapshot_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_get_snapshot_stats);
     }
     if (std::strcmp(
             name,
