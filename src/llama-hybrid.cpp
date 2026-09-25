@@ -66,6 +66,15 @@ static std::optional<llama_hybrid_profile>     g_llama_hybrid_runtime_profile;
 static std::optional<llama_hybrid_constraints> g_llama_hybrid_runtime_constraints;
 static std::optional<llama_hybrid_wave_calibration> g_llama_hybrid_runtime_wave_calibration;
 
+static bool llama_hybrid_select_tensor_chunks(
+        const llama_hybrid_profile & profile,
+        float                        pc_ratio,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        int                          max_chunks,
+        std::vector<int> &           result);
+static double llama_hybrid_tensor_depth_factor(int tensor_layers);
+
 static bool llama_hybrid_runtime_plan_valid(const llama_hybrid_plan & plan) {
     return plan.tensor_layers >= 0 && plan.phone_layers >= 0 && plan.pc_layers >= 0 &&
            plan.tensor_layers + plan.phone_layers + plan.pc_layers > 0 && plan.tensor_pc_ratio > 0.0f &&
@@ -237,6 +246,54 @@ std::vector<int> llama_hybrid_split_tensor_chunks(int tokens, int chunk_tokens) 
         merged_tokens <= max_merged) {
         result[result.size() - 2] = merged_tokens;
         result.pop_back();
+    }
+
+    return result;
+}
+
+static std::vector<std::vector<int>> llama_hybrid_tensor_chunk_layout_candidates(
+        int tokens, int chunk_tokens) {
+    std::vector<std::vector<int>> result;
+    if (tokens <= 0 || chunk_tokens <= 0) {
+        return result;
+    }
+
+    const auto add_unique = [&](std::vector<int> layout) {
+        if (layout.empty()) {
+            return;
+        }
+        if (std::find(result.begin(), result.end(), layout) == result.end()) {
+            result.push_back(std::move(layout));
+        }
+    };
+
+    const std::vector<int> raw =
+        llama_hybrid_split_by_chunk_size(tokens, chunk_tokens);
+    add_unique(raw);
+
+    // Keep the previous tiny-tail merge as a candidate rather than a rule.
+    add_unique(llama_hybrid_split_tensor_chunks(tokens, chunk_tokens));
+
+    // XT is a nominal micro-batch scale, not a hard size. Search balanced
+    // layouts down to the fewest chunks whose largest chunk stays <= 1.25 XT.
+    // This lets the cost model trade fewer RPC waves against larger kernels and
+    // naturally account for odd/even dual-return pairing.
+    const int slack            = std::max(1, chunk_tokens / 4);
+    const int max_chunk_tokens = chunk_tokens + slack;
+    const int raw_chunks       = (int) raw.size();
+    const int min_chunks       = std::max(
+        1, (tokens + max_chunk_tokens - 1) / max_chunk_tokens);
+
+    for (int n_chunks = raw_chunks; n_chunks >= min_chunks; --n_chunks) {
+        std::vector<int> balanced =
+            llama_hybrid_split_chunks(tokens, n_chunks);
+        if (balanced.empty()) {
+            continue;
+        }
+        if (*std::max_element(balanced.begin(), balanced.end()) <=
+            max_chunk_tokens) {
+            add_unique(std::move(balanced));
+        }
     }
 
     return result;
@@ -627,9 +684,11 @@ void llama_hybrid_plan_print(const llama_hybrid_plan & plan) {
                    plan.phone_memory, plan.gpu_memory);
     LLAMA_LOG_INFO(
         "[HYBRID_PLAN_COST] tensor=%.3f phone=%.3f pc_cpu=%.3f pc_gpu=%.3f handoff=%.3f "
-        "additive=%.3f makespan=%.3f\n",
+        "tensor_depth_factor=%.3f additive=%.3f makespan=%.3f\n",
                    plan.predicted_tensor_ms, plan.predicted_phone_ms, plan.predicted_pc_cpu_ms,
-                   plan.predicted_pc_gpu_ms, plan.predicted_handoff_ms, additive_ms, plan.predicted_ms);
+                   plan.predicted_pc_gpu_ms, plan.predicted_handoff_ms,
+                   llama_hybrid_tensor_depth_factor(plan.tensor_layers),
+                   additive_ms, plan.predicted_ms);
     LLAMA_LOG_INFO(
         "[HYBRID_PLAN_PIPE] gpu_busy=%.3f downstream=%.3f gpu_wait=%.3f tensor_peak_mib=%.2f "
         "phone_peak_mib=%.2f\n",
@@ -1036,13 +1095,25 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
                 return false;
             }
 
-            const int chunk_tokens =
-                std::min(tensor_macro_tokens, plan.tensor_chunk_tokens);
-            if (chunk_tokens <= 0) {
+            std::vector<int> tensor_chunks;
+            if (!llama_hybrid_select_tensor_chunks(
+                    profile, pc_ratio, tensor_macro_tokens,
+                    plan.tensor_chunk_tokens,
+                    constraints.max_tensor_chunks,
+                    tensor_chunks)) {
+                // Memory estimation must remain usable before/without timing
+                // profiles. The legacy tiny-tail layout is a safe fallback;
+                // profiled planning/runtime will use the cost-selected layout.
+                tensor_chunks = llama_hybrid_split_tensor_chunks(
+                    tensor_macro_tokens, plan.tensor_chunk_tokens);
+            }
+            if (tensor_chunks.empty()) {
                 return false;
             }
-            const int chunks =
-                (tensor_macro_tokens + chunk_tokens - 1) / chunk_tokens;
+
+            const int chunk_tokens =
+                *std::max_element(
+                    tensor_chunks.begin(), tensor_chunks.end());
 
             size_t pc_ffn_runtime    = 0;
             size_t phone_ffn_runtime = 0;
@@ -1055,19 +1126,25 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
                 return false;
             }
 
-            const size_t live_chunks =
-                (size_t) std::min(chunks, 2);
-            if (profile.n_embd <= 0 || chunk_tokens <= 0 ||
+            std::vector<int> largest_chunks = tensor_chunks;
+            std::sort(
+                largest_chunks.begin(), largest_chunks.end(),
+                [](int a, int b) { return a > b; });
+            size_t transfer_tokens =
+                (size_t) largest_chunks[0];
+            if (largest_chunks.size() > 1) {
+                transfer_tokens += (size_t) largest_chunks[1];
+            }
+            if (profile.n_embd <= 0 || transfer_tokens == 0 ||
                 (size_t) profile.n_embd >
                     std::numeric_limits<size_t>::max() /
-                    (size_t) chunk_tokens / sizeof(float) /
-                    live_chunks) {
+                    transfer_tokens / sizeof(float)) {
                 return false;
             }
             const size_t transfer_runtime =
                 (size_t) profile.n_embd *
-                (size_t) chunk_tokens *
-                sizeof(float) * live_chunks;
+                transfer_tokens *
+                sizeof(float);
 
             size_t pc_ffn_stage = 0;
             size_t phone_ffn_stage = 0;
@@ -1646,13 +1723,12 @@ struct llama_hybrid_tensor_ffn_detail {
     double overlap_saved_ms  = 0.0;
 };
 
-static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
-                                         float                        pc_ratio,
-                                         int                          total_tokens,
-                                         int                          chunk_tokens,
-                                         double &                     result_ms,
-                                         llama_hybrid_tensor_ffn_detail * detail = nullptr) {
-    const std::vector<int> chunks = llama_hybrid_split_tensor_chunks(total_tokens, chunk_tokens);
+static bool llama_hybrid_tensor_ffn_cost_for_chunks(
+        const llama_hybrid_profile & profile,
+        float                        pc_ratio,
+        const std::vector<int> &     chunks,
+        double &                     result_ms,
+        llama_hybrid_tensor_ffn_detail * detail = nullptr) {
     if (chunks.empty()) {
         return false;
     }
@@ -1757,6 +1833,121 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
     return true;
 }
 
+static bool llama_hybrid_select_tensor_chunks(
+        const llama_hybrid_profile & profile,
+        float                        pc_ratio,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        int                          max_chunks,
+        std::vector<int> &           result) {
+    result.clear();
+    if (total_tokens <= 0 || chunk_tokens <= 0 ||
+        pc_ratio <= 0.0f || pc_ratio >= 1.0f) {
+        return false;
+    }
+
+    const auto candidates =
+        llama_hybrid_tensor_chunk_layout_candidates(
+            total_tokens, chunk_tokens);
+    if (candidates.empty()) {
+        return false;
+    }
+
+    double best_ms = std::numeric_limits<double>::infinity();
+    bool found = false;
+
+    // Prefer layouts covered by the profiled token range. If none survive,
+    // fall back to all legal layouts so runtime graph construction still has
+    // a deterministic answer.
+    for (int pass = 0; pass < 2 && !found; ++pass) {
+        const bool enforce_profile_min =
+            pass == 0 && profile.probe_chunk_min_tokens > 0;
+
+        for (const auto & chunks : candidates) {
+            if (max_chunks > 0 &&
+                chunks.size() > (size_t) max_chunks) {
+                continue;
+            }
+            if (enforce_profile_min &&
+                *std::min_element(chunks.begin(), chunks.end()) <
+                    profile.probe_chunk_min_tokens) {
+                continue;
+            }
+
+            double candidate_ms = 0.0;
+            if (!llama_hybrid_tensor_ffn_cost_for_chunks(
+                    profile, pc_ratio, chunks, candidate_ms)) {
+                continue;
+            }
+
+            const bool better =
+                !found ||
+                candidate_ms < best_ms - 1e-9 ||
+                (std::fabs(candidate_ms - best_ms) <= 1e-9 &&
+                 chunks.size() < result.size());
+            if (better) {
+                best_ms = candidate_ms;
+                result = chunks;
+                found = true;
+            }
+        }
+    }
+
+    return found;
+}
+
+static bool llama_hybrid_tensor_ffn_cost(
+        const llama_hybrid_profile & profile,
+        float                        pc_ratio,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        double &                     result_ms,
+        llama_hybrid_tensor_ffn_detail * detail = nullptr,
+        int                          max_chunks = 0) {
+    std::vector<int> chunks;
+    if (!llama_hybrid_select_tensor_chunks(
+            profile, pc_ratio, total_tokens, chunk_tokens,
+            max_chunks, chunks)) {
+        return false;
+    }
+    return llama_hybrid_tensor_ffn_cost_for_chunks(
+        profile, pc_ratio, chunks, result_ms, detail);
+}
+
+std::vector<int> llama_hybrid_runtime_tensor_chunks(
+        int tokens, int chunk_tokens) {
+    if (tokens <= 0 || chunk_tokens <= 0) {
+        return {};
+    }
+
+    llama_hybrid_plan plan;
+    llama_hybrid_profile profile;
+    llama_hybrid_constraints constraints;
+    bool have_runtime_profile = false;
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        if (g_llama_hybrid_runtime_plan.has_value() &&
+            g_llama_hybrid_runtime_profile.has_value() &&
+            g_llama_hybrid_runtime_constraints.has_value()) {
+            plan        = *g_llama_hybrid_runtime_plan;
+            profile     = *g_llama_hybrid_runtime_profile;
+            constraints = *g_llama_hybrid_runtime_constraints;
+            have_runtime_profile = true;
+        }
+    }
+
+    if (have_runtime_profile) {
+        std::vector<int> chunks;
+        if (llama_hybrid_select_tensor_chunks(
+                profile, plan.tensor_pc_ratio, tokens, chunk_tokens,
+                constraints.max_tensor_chunks, chunks)) {
+            return chunks;
+        }
+    }
+
+    return llama_hybrid_split_tensor_chunks(tokens, chunk_tokens);
+}
+
 static double llama_hybrid_tensor_misc_cost(const llama_hybrid_profile & profile,
                                              int                          tokens,
                                              double                       cpu_layer_base_ms,
@@ -1803,9 +1994,11 @@ bool llama_hybrid_runtime_predict_tensor_compute(
         kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
     }
 
-    const std::vector<int> chunks =
-        llama_hybrid_split_by_chunk_size(tokens, plan.tensor_chunk_tokens);
-    if (chunks.empty()) {
+    std::vector<int> chunks;
+    if (!llama_hybrid_select_tensor_chunks(
+            profile, plan.tensor_pc_ratio, tokens,
+            plan.tensor_chunk_tokens, constraints.max_tensor_chunks,
+            chunks)) {
         return false;
     }
 
@@ -1903,7 +2096,8 @@ bool llama_hybrid_runtime_predict_tensor_compute(
     llama_hybrid_tensor_ffn_detail pipeline_detail;
     if (!llama_hybrid_tensor_ffn_cost(
             profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens,
-            per_layer_tensor_pipeline, &pipeline_detail)) {
+            per_layer_tensor_pipeline, &pipeline_detail,
+            constraints.max_tensor_chunks)) {
         return false;
     }
 
@@ -2879,19 +3073,48 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
         profile.phone_full_layer_compute_est_ms : profile.phone_full_layer_ms;
     model.phone_cost = phone_base > 0.0 ? phone_base * token_scale : 1e12;
 
-    double pc_ffn_ms = 0.0;
-    double phone_ffn_ms = 0.0;
-    double return_ms = 0.0;
-    const int inner_tokens = std::min(work_tokens, tensor_chunk_tokens);
-    const size_t bytes = (size_t) profile.n_embd * (size_t) inner_tokens * sizeof(float);
-    if (!llama_hybrid_ffn_cost(profile.cpu_ffn, inner_tokens, pc_ratio, pc_ffn_ms) ||
-        !llama_hybrid_ffn_cost(profile.phone_ffn, inner_tokens, 1.0f - pc_ratio, phone_ffn_ms) ||
-        !llama_hybrid_transfer_cost(profile.snapshot_phone_to_pc, bytes, return_ms)) {
+    double tensor_pipeline_ms = 0.0;
+    if (!llama_hybrid_tensor_ffn_cost(
+            profile, pc_ratio, work_tokens, tensor_chunk_tokens,
+            tensor_pipeline_ms, nullptr,
+            constraints.max_tensor_chunks)) {
         return false;
     }
-    const int inner_chunks = (work_tokens + inner_tokens - 1) / inner_tokens;
-    const double tensor_attn = std::max(0.0, profile.cpu_attn_ms) * token_scale;
-    model.tensor_cost = tensor_attn + inner_chunks * std::max(pc_ffn_ms, phone_ffn_ms + return_ms);
+
+    int tensor_kv_tokens = constraints.score_kv_tokens;
+    if (tensor_kv_tokens <= 0) {
+        tensor_kv_tokens = constraints.target_ctx > 0 ?
+            constraints.target_ctx : profile.n_ctx_train;
+    }
+    tensor_kv_tokens = std::max(tensor_kv_tokens, work_tokens);
+    if (profile.n_ctx_train > 0) {
+        tensor_kv_tokens =
+            std::min(tensor_kv_tokens, profile.n_ctx_train);
+    }
+
+    double cpu_layer_base = 0.0;
+    double cpu_attn_base  = 0.0;
+    double cpu_attn_kv    = 0.0;
+    if (llama_hybrid_layer_block_cost(
+            profile.cpu_layer_blocks, work_tokens, false,
+            cpu_layer_base) &&
+        llama_hybrid_attn_cost(
+            profile.cpu_attn, work_tokens, work_tokens,
+            cpu_attn_base) &&
+        llama_hybrid_attn_cost(
+            profile.cpu_attn, work_tokens, tensor_kv_tokens,
+            cpu_attn_kv)) {
+        model.tensor_cost =
+            cpu_attn_kv +
+            llama_hybrid_tensor_misc_cost(
+                profile, work_tokens,
+                cpu_layer_base, cpu_attn_base) +
+            tensor_pipeline_ms;
+    } else {
+        const double tensor_attn =
+            std::max(0.0, profile.cpu_attn_ms) * token_scale;
+        model.tensor_cost = tensor_attn + tensor_pipeline_ms;
+    }
 
     if (profile.layer_weight_bytes.size() != (size_t) profile.n_layer ||
         profile.layer_attn_forced_bytes.size() != (size_t) profile.n_layer ||
@@ -3159,13 +3382,21 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         if (chunk_tokens <= 0 || chunk_tokens > score_tokens) {
             continue;
         }
-        const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(score_tokens, chunk_tokens);
-        if (chunks.empty() ||
-            *std::min_element(chunks.begin(), chunks.end()) < profile.probe_chunk_min_tokens) {
-            continue;
-        }
-        const bool tensor_chunk_valid = constraints.max_tensor_chunks <= 0 ||
-            chunks.size() <= (size_t) constraints.max_tensor_chunks;
+        const auto chunk_layouts =
+            llama_hybrid_tensor_chunk_layout_candidates(
+                score_tokens, chunk_tokens);
+        const bool tensor_chunk_valid =
+            std::any_of(
+                chunk_layouts.begin(), chunk_layouts.end(),
+                [&](const std::vector<int> & chunks) {
+                    return !chunks.empty() &&
+                        *std::min_element(
+                            chunks.begin(), chunks.end()) >=
+                            profile.probe_chunk_min_tokens &&
+                        (constraints.max_tensor_chunks <= 0 ||
+                         chunks.size() <=
+                            (size_t) constraints.max_tensor_chunks);
+                });
         if (!tensor_chunk_valid) {
             ++reject_chunks;
         }
@@ -3624,6 +3855,7 @@ static bool llama_hybrid_sim_stage_cost(
         size_t                                      stage_index,
         int                                         job_tokens,
         int                                         kv_tokens,
+        int                                         max_tensor_chunks,
         double &                                    result_ms) {
     if (stage_index >= stages.size() || job_tokens <= 0) {
         return false;
@@ -3681,7 +3913,9 @@ static bool llama_hybrid_sim_stage_cost(
                     double cpu_attn_base = 0.0;
                     double cpu_attn_kv = 0.0;
                     if (!llama_hybrid_tensor_ffn_cost(
-                            profile, plan.tensor_pc_ratio, tokens, plan.tensor_chunk_tokens, tensor_ffn_ms) ||
+                            profile, plan.tensor_pc_ratio, tokens,
+                            plan.tensor_chunk_tokens, tensor_ffn_ms,
+                            nullptr, max_tensor_chunks) ||
                         !llama_hybrid_layer_block_cost(
                             profile.cpu_layer_blocks, tokens, false, cpu_layer_base) ||
                         !llama_hybrid_attn_cost(profile.cpu_attn, tokens, tokens, cpu_attn_base) ||
@@ -3820,7 +4054,10 @@ static bool llama_hybrid_simulate_prefill(
 
     const auto run_stage = [&](llama_hybrid_sim_job job, llama_hybrid_sim_stage_kind kind) {
         double stage_ms = 0.0;
-        if (!llama_hybrid_sim_stage_cost(profile, plan, stages, job.stage_index, job.tokens, kv_tokens, stage_ms)) {
+        if (!llama_hybrid_sim_stage_cost(
+                profile, plan, stages, job.stage_index,
+                job.tokens, kv_tokens,
+                constraints.max_tensor_chunks, stage_ms)) {
             return false;
         }
         host_ms += stage_ms;
@@ -3890,7 +4127,9 @@ static bool llama_hybrid_simulate_prefill(
 
         const int job_tokens = macro_jobs[i];
         double gpu_ms = 0.0;
-        if (!llama_hybrid_sim_stage_cost(profile, plan, stages, 0, job_tokens, kv_tokens, gpu_ms)) {
+        if (!llama_hybrid_sim_stage_cost(
+                profile, plan, stages, 0, job_tokens, kv_tokens,
+                constraints.max_tensor_chunks, gpu_ms)) {
             return false;
         }
         gpu_job = {
@@ -4075,7 +4314,8 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
             double tensor_ffn_ms = 0.0;
             if (!llama_hybrid_tensor_ffn_cost(
                     profile, candidate.tensor_pc_ratio, macro_tokens,
-                    candidate.tensor_chunk_tokens, tensor_ffn_ms)) {
+                    candidate.tensor_chunk_tokens, tensor_ffn_ms,
+                    nullptr, constraints.max_tensor_chunks)) {
                 return false;
             }
 

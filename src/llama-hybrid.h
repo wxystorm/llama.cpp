@@ -538,6 +538,8 @@ LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(
     int tokens, llama_hybrid_full_prefill_prediction & prediction);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
+LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(
+    int tokens, int chunk_tokens);
 LLAMA_API int  llama_hybrid_runtime_prefill_attn_group_chunks();
 LLAMA_API bool llama_hybrid_runtime_prefill_dag_enabled();
 LLAMA_API int  llama_hybrid_runtime_prefill_dag_max_ahead();
