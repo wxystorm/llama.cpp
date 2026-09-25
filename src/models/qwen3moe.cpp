@@ -503,6 +503,26 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * group_ffn_inp =
                     ggml_add(ctx0, attn, group_inp);
 
+                // Keep FFN normalization coarse as well. The old wavefront
+                // normalized every XT chunk independently, fragmenting a PC
+                // operation that the normal Qwen3-MoE path performs once for
+                // the whole macro. Normalize once per coarse Attention group,
+                // then expose XT-granular views for Router/Top-K/experts and
+                // Meta's existing prefill chunk boundary detection.
+                ggml_tensor * group_ffn_norm =
+                    build_norm(
+                        group_ffn_inp,
+                        model.layers[wave_layer].ffn_norm,
+                        NULL, LLM_NORM_RMS, wave_layer);
+                const std::string group_norm_name =
+                    "prefill_wave_ffn_norm_group_" +
+                    std::to_string(group_start) + "_" +
+                    std::to_string(group_chunk_count);
+                cb(
+                    group_ffn_norm,
+                    group_norm_name.c_str(),
+                    wave_layer);
+
                 int64_t group_offset_tokens = 0;
                 for (size_t ci = group_start;
                      ci < group_end;
@@ -525,10 +545,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         wave_layer);
 
                     ggml_tensor * ffn_norm =
-                        build_norm(
-                            ffn_inp,
-                            model.layers[wave_layer].ffn_norm,
-                            NULL, LLM_NORM_RMS, wave_layer);
+                        ggml_view_2d(
+                            ctx0, group_ffn_norm,
+                            group_ffn_norm->ne[0], count,
+                            group_ffn_norm->nb[1],
+                            group_offset_tokens *
+                                group_ffn_norm->nb[1]);
                     const std::string norm_name =
                         "prefill_ffn_norm_chunk_" +
                         std::to_string(ci);
