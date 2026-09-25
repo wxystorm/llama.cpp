@@ -218,6 +218,30 @@ std::vector<int> llama_hybrid_split_by_chunk_size(int tokens, int chunk_tokens) 
     return result;
 }
 
+std::vector<int> llama_hybrid_split_tensor_chunks(int tokens, int chunk_tokens) {
+    std::vector<int> result = llama_hybrid_split_by_chunk_size(tokens, chunk_tokens);
+    if (result.size() < 2 || chunk_tokens <= 0) {
+        return result;
+    }
+
+    // Tiny Tensor tails still pay a complete RPC snapshot/return transaction
+    // and run inefficient small kernels. Merge only tails <= 1/4 XT into the
+    // previous full chunk, while bounding the merged chunk to <= 1.25 XT.
+    const int tail          = result.back();
+    const int threshold     = chunk_tokens / 4;
+    const int merged_tokens = result[result.size() - 2] + tail;
+    const int max_merged    = chunk_tokens + threshold;
+
+    if (tail < chunk_tokens &&
+        tail <= threshold &&
+        merged_tokens <= max_merged) {
+        result[result.size() - 2] = merged_tokens;
+        result.pop_back();
+    }
+
+    return result;
+}
+
 std::vector<llama_hybrid_boundary_block> llama_hybrid_plan_boundary(
         int tokens, int upstream_chunk_tokens, int downstream_chunk_tokens) {
     if (tokens <= 0 || upstream_chunk_tokens <= 0 || downstream_chunk_tokens <= 0) {
@@ -1628,7 +1652,7 @@ static bool llama_hybrid_tensor_ffn_cost(const llama_hybrid_profile & profile,
                                          int                          chunk_tokens,
                                          double &                     result_ms,
                                          llama_hybrid_tensor_ffn_detail * detail = nullptr) {
-    const std::vector<int> chunks = llama_hybrid_split_by_chunk_size(total_tokens, chunk_tokens);
+    const std::vector<int> chunks = llama_hybrid_split_tensor_chunks(total_tokens, chunk_tokens);
     if (chunks.empty()) {
         return false;
     }
