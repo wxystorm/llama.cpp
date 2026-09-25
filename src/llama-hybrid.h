@@ -466,6 +466,7 @@ LLAMA_API bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile,
 
 LLAMA_API std::vector<int> llama_hybrid_split_chunks(int tokens, int n_chunks);
 LLAMA_API std::vector<int> llama_hybrid_split_by_chunk_size(int tokens, int chunk_tokens);
+LLAMA_API std::vector<int> llama_hybrid_split_tensor_chunks(int tokens, int chunk_tokens);
 LLAMA_API std::vector<int> llama_hybrid_probe_chunk_tokens(const llama_hybrid_profile & profile);
 LLAMA_API std::vector<llama_hybrid_boundary_block> llama_hybrid_plan_boundary(
     int tokens, int upstream_chunk_tokens, int downstream_chunk_tokens);
