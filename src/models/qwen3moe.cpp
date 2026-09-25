@@ -25,6 +25,16 @@ static int qwen3moe_wave_attn_target_tokens() {
     return tokens > 0 ? tokens : 0;
 }
 
+static int qwen3moe_wave_attn_min_group_tokens(int target_tokens) {
+    const char * value =
+        std::getenv("LLAMA_HYBRID_ATTN_MIN_GROUP_TOKENS");
+    if (value != nullptr) {
+        const int tokens = std::atoi(value);
+        return std::max(1, tokens);
+    }
+    return std::max(1, (target_tokens * 3 + 3) / 4);
+}
+
 static std::vector<int> qwen3moe_wave_attn_group_counts(
         const std::vector<int> & chunk_sizes,
         int                      target_tokens) {
@@ -242,7 +252,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         // 103+153 (target=128) and 128+128, while falling back for 128+64.
         if (moe_stage_wavefront) {
             const int min_group_tokens =
-                std::max(1, (wave_attn_target_tokens * 3 + 3) / 4);
+                qwen3moe_wave_attn_min_group_tokens(
+                    wave_attn_target_tokens);
             size_t chunk_begin = 0;
             for (const int group_chunks : wave_attn_group_counts) {
                 int group_tokens = 0;
@@ -269,7 +280,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             ubatch.equal_seqs() ? 1 : 0,
             ubatch.n_seqs, ubatch.n_seqs_unq,
             planned_chunk_tokens, wave_attn_target_tokens,
-            std::max(1, (wave_attn_target_tokens * 3 + 3) / 4),
+            qwen3moe_wave_attn_min_group_tokens(
+                wave_attn_target_tokens),
             wave_chunk_sizes.size(),
             wave_attn_group_counts.size());
     }
