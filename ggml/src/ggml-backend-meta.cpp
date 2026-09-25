@@ -6193,8 +6193,19 @@ auto prefill_norm_sg_has_prework =
         const ggml_status phone_status = compute_workers.wait(1);
 
         if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
-            GGML_ASSERT(snapshot_prepares[i].prepared);
-            return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
+            if (snapshot_prepares[i].prepared) {
+                return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
+            } else if (pipeline_debug) {
+                // MoE can end a logical prefill-down subgraph with a mirrored
+                // boundary node that is not COMPUTE on Phone. In that case no
+                // RPC snapshot was prepared and communication falls back to
+                // the synchronous/generic reduce path below. There is no
+                // snapshot producer credit to track.
+                GGML_LOG_INFO(
+                    "[RETURN_WAVEFRONT_SNAPSHOT_FALLBACK] sg=%zu "
+                    "layer=%d chunk=%d reason=no_prepared_snapshot\n",
+                    i, prefill_down_layer, prefill_down_chunk);
+            }
         }
 
         const int64_t chunk_submit_end_us = ggml_time_us();
