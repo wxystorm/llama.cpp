@@ -179,10 +179,37 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cvec->tensor_for(il) == nullptr;
 
         if (use_prefill_chunked_moe) {
-            const std::vector<int> chunk_sizes =
+            const std::vector<int> raw_chunk_sizes =
                 llama_hybrid_split_by_chunk_size(
                     (int) cur->ne[1], planned_chunk_tokens);
+            const std::vector<int> chunk_sizes =
+                llama_hybrid_split_tensor_chunks(
+                    (int) cur->ne[1], planned_chunk_tokens);
             GGML_ASSERT(!chunk_sizes.empty());
+
+            if (il == layer_begin) {
+                auto chunk_list = [](const std::vector<int> & sizes) {
+                    std::string result;
+                    for (size_t i = 0; i < sizes.size(); ++i) {
+                        if (i > 0) {
+                            result += ",";
+                        }
+                        result += std::to_string(sizes[i]);
+                    }
+                    return result;
+                };
+
+                const bool merged = raw_chunk_sizes != chunk_sizes;
+                const int tail = raw_chunk_sizes.empty() ? 0 : raw_chunk_sizes.back();
+                LLAMA_LOG_ERROR(
+                    "[TENSOR_CHUNK_PLAN] tokens=%" PRId64 " XT=%d raw=%s final=%s "
+                    "action=%s tail=%d threshold=%d\n",
+                    cur->ne[1], planned_chunk_tokens,
+                    chunk_list(raw_chunk_sizes).c_str(),
+                    chunk_list(chunk_sizes).c_str(),
+                    merged ? "MERGE_TINY_TAIL" : "KEEP",
+                    tail, planned_chunk_tokens / 4);
+            }
 
             std::vector<ggml_tensor *> chunks;
             chunks.reserve(chunk_sizes.size());
