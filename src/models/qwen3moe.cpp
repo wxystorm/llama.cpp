@@ -188,7 +188,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     (int) cur->ne[1], planned_chunk_tokens);
             GGML_ASSERT(!chunk_sizes.empty());
 
-            if (il == layer_begin) {
+            const bool first_tensor_layer =
+                il == layer_begin ||
+                model.hybrid_layer_mode(il - 1) !=
+                    llama_hybrid_layer_mode::TENSOR_SPLIT;
+            if (first_tensor_layer) {
                 auto chunk_list = [](const std::vector<int> & sizes) {
                     std::string result;
                     for (size_t i = 0; i < sizes.size(); ++i) {

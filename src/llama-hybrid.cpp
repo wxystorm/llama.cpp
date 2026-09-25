@@ -7087,6 +7087,62 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             g_llama_hybrid_runtime_profile = profile;
             g_llama_hybrid_runtime_constraints = constraints;
         }
+
+        if (best_plan.tensor_layers > 0) {
+            const int work_tokens =
+                constraints.target_ubatch_tokens > 0 ?
+                    constraints.target_ubatch_tokens :
+                    (profile.reference_tokens > 0 ?
+                        profile.reference_tokens :
+                        LLAMA_HYBRID_REFERENCE_TOKENS);
+            const int cpu_layers =
+                best_plan.pc_layers - best_plan.gpu_pc_layers;
+            int tensor_macro_tokens = work_tokens;
+            if (cpu_layers > 0) {
+                tensor_macro_tokens =
+                    std::min(work_tokens, best_plan.cpu_chunk_tokens);
+            } else if (best_plan.gpu_pc_layers > 0) {
+                tensor_macro_tokens =
+                    std::min(work_tokens, best_plan.gpu_chunk_tokens);
+            }
+
+            const auto raw_chunks =
+                llama_hybrid_split_by_chunk_size(
+                    tensor_macro_tokens,
+                    best_plan.tensor_chunk_tokens);
+            std::vector<int> selected_chunks;
+            if (llama_hybrid_select_tensor_chunks(
+                    profile, best_plan.tensor_pc_ratio,
+                    tensor_macro_tokens,
+                    best_plan.tensor_chunk_tokens,
+                    constraints.max_tensor_chunks,
+                    selected_chunks)) {
+                const auto chunk_list =
+                    [](const std::vector<int> & sizes) {
+                        std::string result;
+                        for (size_t i = 0; i < sizes.size(); ++i) {
+                            if (i > 0) {
+                                result += ",";
+                            }
+                            result += std::to_string(sizes[i]);
+                        }
+                        return result;
+                    };
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_TENSOR_LAYOUT] T=%d R=%.3f macro_tokens=%d "
+                    "XT=%d raw=%s final=%s chunks=%zu->%zu "
+                    "depth_factor=%.3f\n",
+                    best_plan.tensor_layers,
+                    best_plan.tensor_pc_ratio,
+                    tensor_macro_tokens,
+                    best_plan.tensor_chunk_tokens,
+                    chunk_list(raw_chunks).c_str(),
+                    chunk_list(selected_chunks).c_str(),
+                    raw_chunks.size(), selected_chunks.size(),
+                    llama_hybrid_tensor_depth_factor(
+                        best_plan.tensor_layers));
+            }
+        }
     }
 
     if (found) {
