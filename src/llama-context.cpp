@@ -887,22 +887,30 @@ void llama_context::synchronize() {
                     cur.simple_backend_compute_calls[j];
             }
 
-            meta.layer_timing_entries += cur.layer_timing_entries;
-            meta.layer_timing_layers += cur.layer_timing_layers;
-            meta.layer_pc_only_layers += cur.layer_pc_only_layers;
-            meta.layer_phone_only_layers += cur.layer_phone_only_layers;
-            meta.layer_tensor_layers += cur.layer_tensor_layers;
-            meta.layer_pc_only_compute_us += cur.layer_pc_only_compute_us;
-            meta.layer_pc_only_wall_us += cur.layer_pc_only_wall_us;
-            meta.layer_phone_only_compute_us += cur.layer_phone_only_compute_us;
-            meta.layer_phone_only_wall_us += cur.layer_phone_only_wall_us;
-            meta.layer_tensor_pc_compute_us += cur.layer_tensor_pc_compute_us;
-            meta.layer_tensor_phone_compute_us += cur.layer_tensor_phone_compute_us;
-            meta.layer_tensor_wall_us += cur.layer_tensor_wall_us;
-            meta.layer_copy_0to1_us += cur.layer_copy_0to1_us;
-            meta.layer_copy_1to0_us += cur.layer_copy_1to0_us;
-            meta.layer_orchestration_us += cur.layer_orchestration_us;
-            meta.layer_wall_us += cur.layer_wall_us;
+            for (int64_t ie = 0;
+                 ie < cur.layer_timing_entries &&
+                 ie < GGML_BACKEND_META_MAX_LAYER_TIMINGS;
+                 ++ie) {
+                const int64_t dst = meta.layer_timing_entries;
+                if (dst >= GGML_BACKEND_META_MAX_LAYER_TIMINGS) {
+                    break;
+                }
+                meta.layer_timing_first[dst] =
+                    cur.layer_timing_first[ie];
+                meta.layer_timing_last[dst] =
+                    cur.layer_timing_last[ie];
+                meta.layer_timing_pc_compute_us[dst] =
+                    cur.layer_timing_pc_compute_us[ie];
+                meta.layer_timing_phone_compute_us[dst] =
+                    cur.layer_timing_phone_compute_us[ie];
+                meta.layer_timing_copy_0to1_us[dst] =
+                    cur.layer_timing_copy_0to1_us[ie];
+                meta.layer_timing_copy_1to0_us[dst] =
+                    cur.layer_timing_copy_1to0_us[ie];
+                meta.layer_timing_wall_us[dst] =
+                    cur.layer_timing_wall_us[ie];
+                meta.layer_timing_entries = dst + 1;
+            }
         }
 
         const int64_t timeline_accounted_us =
@@ -988,54 +996,154 @@ void llama_context::synchronize() {
             meta.reduce_us / 1000.0,
             meta.wait_us / 1000.0);
 
+        int64_t classified_layers = 0;
+        int64_t pc_only_layers = 0;
+        int64_t phone_only_layers = 0;
+        int64_t tensor_layers = 0;
+        int64_t mixed_entries = 0;
+
+        int64_t pc_only_compute_us = 0;
+        int64_t pc_only_wall_us = 0;
+        int64_t phone_only_submit_us = 0;
+        int64_t phone_only_wall_us = 0;
+        int64_t tensor_pc_compute_us = 0;
+        int64_t tensor_phone_submit_us = 0;
+        int64_t tensor_wall_us = 0;
+        int64_t copy_0to1_us = 0;
+        int64_t copy_1to0_us = 0;
+        int64_t orchestration_us = 0;
+        int64_t layer_wall_us = 0;
+
+        for (int64_t ie = 0;
+             ie < meta.layer_timing_entries &&
+             ie < GGML_BACKEND_META_MAX_LAYER_TIMINGS;
+             ++ie) {
+            const int first_layer =
+                meta.layer_timing_first[ie];
+            const int last_layer =
+                meta.layer_timing_last[ie];
+            if (first_layer < 0 || last_layer < first_layer) {
+                continue;
+            }
+
+            int n_pc = 0;
+            int n_phone = 0;
+            int n_tensor = 0;
+            for (int il = first_layer; il <= last_layer; ++il) {
+                switch (model.hybrid_layer_mode(il)) {
+                    case llama_hybrid_layer_mode::PC_ONLY:
+                        ++n_pc;
+                        break;
+                    case llama_hybrid_layer_mode::PHONE_ONLY:
+                        ++n_phone;
+                        break;
+                    case llama_hybrid_layer_mode::TENSOR_SPLIT:
+                        ++n_tensor;
+                        break;
+                }
+            }
+
+            const int n_layers =
+                n_pc + n_phone + n_tensor;
+            if (n_layers <= 0) {
+                continue;
+            }
+            classified_layers += n_layers;
+
+            const int64_t pc_us =
+                meta.layer_timing_pc_compute_us[ie];
+            const int64_t phone_us =
+                meta.layer_timing_phone_compute_us[ie];
+            const int64_t c01_us =
+                meta.layer_timing_copy_0to1_us[ie];
+            const int64_t c10_us =
+                meta.layer_timing_copy_1to0_us[ie];
+            const int64_t wall_us =
+                meta.layer_timing_wall_us[ie];
+            const int64_t orchestration_entry_us =
+                std::max<int64_t>(
+                    0,
+                    wall_us -
+                        std::max(pc_us, phone_us) -
+                        c01_us - c10_us);
+
+            copy_0to1_us += c01_us;
+            copy_1to0_us += c10_us;
+            orchestration_us += orchestration_entry_us;
+            layer_wall_us += wall_us;
+
+            if (n_pc == n_layers) {
+                pc_only_layers += n_layers;
+                pc_only_compute_us += pc_us;
+                pc_only_wall_us += wall_us;
+            } else if (n_phone == n_layers) {
+                phone_only_layers += n_layers;
+                phone_only_submit_us += phone_us;
+                phone_only_wall_us += wall_us;
+            } else if (n_tensor == n_layers) {
+                tensor_layers += n_layers;
+                tensor_pc_compute_us += pc_us;
+                tensor_phone_submit_us += phone_us;
+                tensor_wall_us += wall_us;
+            } else {
+                // Fused timing ranges should normally stay within one placement
+                // region. Keep the entry visible instead of silently assigning
+                // it to the wrong region.
+                ++mixed_entries;
+            }
+        }
+
         const double pc_only_per_layer_ms =
-            meta.layer_pc_only_layers > 0 ?
-                meta.layer_pc_only_compute_us /
-                    1000.0 / meta.layer_pc_only_layers : 0.0;
-        const double phone_only_per_layer_ms =
-            meta.layer_phone_only_layers > 0 ?
-                meta.layer_phone_only_compute_us /
-                    1000.0 / meta.layer_phone_only_layers : 0.0;
+            pc_only_layers > 0 ?
+                pc_only_compute_us /
+                    1000.0 / pc_only_layers : 0.0;
+        const double phone_only_wall_per_layer_ms =
+            phone_only_layers > 0 ?
+                phone_only_wall_us /
+                    1000.0 / phone_only_layers : 0.0;
         const double non_layer_execute_ms =
             std::max(
                 0.0,
                 meta.graph_execute_us / 1000.0 -
-                    meta.layer_wall_us / 1000.0);
+                    layer_wall_us / 1000.0);
 
         LLAMA_LOG_ERROR(
             "[DECODE_META_LAYER] sample=%" PRId64
             " entries=%" PRId64
             " layers=%" PRId64
+            " mixed_entries=%" PRId64
             " pc_only_layers=%" PRId64
             " pc_only_compute_ms=%.3f pc_only_per_layer_ms=%.3f "
             "pc_only_wall_ms=%.3f "
             "phone_only_layers=%" PRId64
-            " phone_only_compute_ms=%.3f phone_only_per_layer_ms=%.3f "
-            "phone_only_wall_ms=%.3f "
+            " phone_submit_ms=%.3f phone_wall_ms=%.3f "
+            "phone_wall_per_layer_ms=%.3f "
             "tensor_layers=%" PRId64
-            " tensor_pc_ms=%.3f tensor_phone_ms=%.3f tensor_wall_ms=%.3f "
+            " tensor_pc_ms=%.3f tensor_phone_submit_ms=%.3f "
+            "tensor_wall_ms=%.3f "
             "copy_0to1_ms=%.3f copy_1to0_ms=%.3f "
             "orchestration_ms=%.3f layer_wall_ms=%.3f "
             "non_layer_execute_ms=%.3f\n",
             decode_runtime_profile.sample_index,
             meta.layer_timing_entries,
-            meta.layer_timing_layers,
-            meta.layer_pc_only_layers,
-            meta.layer_pc_only_compute_us / 1000.0,
+            classified_layers,
+            mixed_entries,
+            pc_only_layers,
+            pc_only_compute_us / 1000.0,
             pc_only_per_layer_ms,
-            meta.layer_pc_only_wall_us / 1000.0,
-            meta.layer_phone_only_layers,
-            meta.layer_phone_only_compute_us / 1000.0,
-            phone_only_per_layer_ms,
-            meta.layer_phone_only_wall_us / 1000.0,
-            meta.layer_tensor_layers,
-            meta.layer_tensor_pc_compute_us / 1000.0,
-            meta.layer_tensor_phone_compute_us / 1000.0,
-            meta.layer_tensor_wall_us / 1000.0,
-            meta.layer_copy_0to1_us / 1000.0,
-            meta.layer_copy_1to0_us / 1000.0,
-            meta.layer_orchestration_us / 1000.0,
-            meta.layer_wall_us / 1000.0,
+            pc_only_wall_us / 1000.0,
+            phone_only_layers,
+            phone_only_submit_us / 1000.0,
+            phone_only_wall_us / 1000.0,
+            phone_only_wall_per_layer_ms,
+            tensor_layers,
+            tensor_pc_compute_us / 1000.0,
+            tensor_phone_submit_us / 1000.0,
+            tensor_wall_us / 1000.0,
+            copy_0to1_us / 1000.0,
+            copy_1to0_us / 1000.0,
+            orchestration_us / 1000.0,
+            layer_wall_us / 1000.0,
             non_layer_execute_ms);
 
         decode_runtime_profile.pending = false;

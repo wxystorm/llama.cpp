@@ -372,6 +372,7 @@ extern "C" {
     //
 
 #define GGML_BACKEND_META_MAX_DEVICES 16
+#define GGML_BACKEND_META_MAX_LAYER_TIMINGS 512
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
@@ -450,26 +451,18 @@ extern "C" {
         int64_t simple_backend_compute_us[GGML_BACKEND_META_MAX_DEVICES];
         int64_t simple_backend_compute_calls[GGML_BACKEND_META_MAX_DEVICES];
 
-        // Layer-scoped timing collected from Meta's subgraph loop. These
-        // exclude output-only subgraphs that cannot be mapped to a transformer
-        // layer. They are intended to calibrate decode placement against the
-        // real Meta runtime rather than a bare simple backend.
+        // Raw layer-scoped timing entries from Meta's subgraph loop.
+        // Meta deliberately does not infer PC_ONLY / TENSOR_SPLIT / PHONE_ONLY
+        // here. The caller owns the placement policy and classifies these
+        // entries using the same source of truth that loaded the model.
         int64_t layer_timing_entries;
-        int64_t layer_timing_layers;
-        int64_t layer_pc_only_layers;
-        int64_t layer_phone_only_layers;
-        int64_t layer_tensor_layers;
-        int64_t layer_pc_only_compute_us;
-        int64_t layer_pc_only_wall_us;
-        int64_t layer_phone_only_compute_us;
-        int64_t layer_phone_only_wall_us;
-        int64_t layer_tensor_pc_compute_us;
-        int64_t layer_tensor_phone_compute_us;
-        int64_t layer_tensor_wall_us;
-        int64_t layer_copy_0to1_us;
-        int64_t layer_copy_1to0_us;
-        int64_t layer_orchestration_us;
-        int64_t layer_wall_us;
+        int32_t layer_timing_first[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int32_t layer_timing_last[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int64_t layer_timing_pc_compute_us[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int64_t layer_timing_phone_compute_us[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int64_t layer_timing_copy_0to1_us[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int64_t layer_timing_copy_1to0_us[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
+        int64_t layer_timing_wall_us[GGML_BACKEND_META_MAX_LAYER_TIMINGS];
 
         int64_t wave_layer_start_count;
         int64_t wave_ii_count;

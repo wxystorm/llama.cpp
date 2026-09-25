@@ -5713,8 +5713,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         int64_t copy_0to1_us     = 0;
         int64_t copy_1to0_us     = 0;
         int64_t total_us         = 0;
-        bool    pc_active        = false;
-        bool    phone_active     = false;
     };
     std::map<std::pair<int, int>, meta_layer_timing> layer_timings;
 
@@ -5751,7 +5749,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        const size_t timing_start_sg = i;
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
@@ -6399,14 +6396,6 @@ auto prefill_norm_sg_has_prework =
                 timing.copy_0to1_us += copy_time_snapshot(0, 1) - copy_0to1_before;
                 timing.copy_1to0_us += copy_time_snapshot(1, 0) - copy_1to0_before;
             }
-            for (size_t sg = timing_start_sg;
-                 sg <= communication_sg && sg < backend_ctx->n_subgraphs;
-                 ++sg) {
-                timing.pc_active =
-                    timing.pc_active || subgraph_will_execute_pc(sg);
-                timing.phone_active =
-                    timing.phone_active || subgraph_will_execute_phone(sg);
-            }
             timing.total_us += ggml_time_us() - layer_wall_start_us;
         }
 
@@ -6635,52 +6624,32 @@ auto prefill_norm_sg_has_prework =
             const int first_layer = entry.first.first;
             const int last_layer  = entry.first.second;
             const meta_layer_timing & timing = entry.second;
-            const int64_t n_layers =
-                first_layer >= 0 && last_layer >= first_layer ?
-                    (int64_t) last_layer - first_layer + 1 : 0;
-            if (n_layers <= 0) {
+            if (first_layer < 0 || last_layer < first_layer) {
                 continue;
             }
 
-            ++backend_ctx->tensor_profile.layer_timing_entries;
-            backend_ctx->tensor_profile.layer_timing_layers += n_layers;
-            backend_ctx->tensor_profile.layer_wall_us += timing.total_us;
-            backend_ctx->tensor_profile.layer_copy_0to1_us += timing.copy_0to1_us;
-            backend_ctx->tensor_profile.layer_copy_1to0_us += timing.copy_1to0_us;
-
-            const int64_t compute_critical_us =
-                std::max(timing.compute_pc_us, timing.compute_phone_us);
-            const int64_t orchestration_us =
-                std::max<int64_t>(
-                    0,
-                    timing.total_us -
-                        compute_critical_us -
-                        timing.copy_0to1_us -
-                        timing.copy_1to0_us);
-            backend_ctx->tensor_profile.layer_orchestration_us +=
-                orchestration_us;
-
-            if (timing.pc_active && !timing.phone_active) {
-                backend_ctx->tensor_profile.layer_pc_only_layers += n_layers;
-                backend_ctx->tensor_profile.layer_pc_only_compute_us +=
-                    timing.compute_pc_us;
-                backend_ctx->tensor_profile.layer_pc_only_wall_us +=
-                    timing.total_us;
-            } else if (!timing.pc_active && timing.phone_active) {
-                backend_ctx->tensor_profile.layer_phone_only_layers += n_layers;
-                backend_ctx->tensor_profile.layer_phone_only_compute_us +=
-                    timing.compute_phone_us;
-                backend_ctx->tensor_profile.layer_phone_only_wall_us +=
-                    timing.total_us;
-            } else if (timing.pc_active && timing.phone_active) {
-                backend_ctx->tensor_profile.layer_tensor_layers += n_layers;
-                backend_ctx->tensor_profile.layer_tensor_pc_compute_us +=
-                    timing.compute_pc_us;
-                backend_ctx->tensor_profile.layer_tensor_phone_compute_us +=
-                    timing.compute_phone_us;
-                backend_ctx->tensor_profile.layer_tensor_wall_us +=
-                    timing.total_us;
+            const int64_t dst =
+                backend_ctx->tensor_profile.layer_timing_entries;
+            if (dst >= GGML_BACKEND_META_MAX_LAYER_TIMINGS) {
+                break;
             }
+
+            backend_ctx->tensor_profile.layer_timing_first[dst] =
+                first_layer;
+            backend_ctx->tensor_profile.layer_timing_last[dst] =
+                last_layer;
+            backend_ctx->tensor_profile.layer_timing_pc_compute_us[dst] =
+                timing.compute_pc_us;
+            backend_ctx->tensor_profile.layer_timing_phone_compute_us[dst] =
+                timing.compute_phone_us;
+            backend_ctx->tensor_profile.layer_timing_copy_0to1_us[dst] =
+                timing.copy_0to1_us;
+            backend_ctx->tensor_profile.layer_timing_copy_1to0_us[dst] =
+                timing.copy_1to0_us;
+            backend_ctx->tensor_profile.layer_timing_wall_us[dst] =
+                timing.total_us;
+            backend_ctx->tensor_profile.layer_timing_entries =
+                dst + 1;
         }
 
         if (needs_rebuild) {
