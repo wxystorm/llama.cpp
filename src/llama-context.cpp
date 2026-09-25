@@ -5506,6 +5506,25 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             }
         }
 
+        // Decode PC_ONLY CPU layers must stay as one CPU region. The generic
+        // scheduler deliberately expands higher-priority GPU assignments across
+        // unassigned ops while not expanding CPU, which otherwise fragments a
+        // direct-CPU layer into CPU/CUDA/CPU/CUDA subgraphs. Pin every callback
+        // node in a single-token PC_ONLY CPU layer to the raw CPU backend.
+        //
+        // Keep this strictly decode-only so the staged prefill path remains
+        // unchanged. Tensor/Phone layers still use Meta because their dev_layer
+        // is the Meta device, not the raw CPU device.
+        if (ubatch.n_tokens == 1 &&
+            il >= 0 &&
+            backend_cpu != nullptr &&
+            model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::PC_ONLY &&
+            model.dev_layer(il) == ggml_backend_get_device(backend_cpu) &&
+            ggml_backend_supports_op(backend_cpu, cur)) {
+            ggml_backend_sched_set_tensor_backend(sched_use, cur, backend_cpu);
+            return;
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
