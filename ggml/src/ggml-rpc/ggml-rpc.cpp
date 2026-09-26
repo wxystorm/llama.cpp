@@ -2249,6 +2249,46 @@ struct rpc_snapshot_breakdown {
     int64_t  send_us       = 0;
 };
 
+// OpenCL keeps backend-private tensor state in tensor->extra (cl_mem,
+// quantized sub-buffers/images, offsets, etc.). RPC reconstructs ggml_tensor
+// objects for each request, so that pointer is otherwise lost. Keep this
+// cache strictly OpenCL-only so the existing CPU/CUDA RPC paths are untouched.
+struct rpc_opencl_tensor_extra_key {
+    ggml_backend_buffer_t buffer = nullptr;
+    uint64_t data = 0;
+    enum ggml_type type = GGML_TYPE_F32;
+    std::array<int64_t, GGML_MAX_DIMS> ne {};
+    std::array<size_t, GGML_MAX_DIMS> nb {};
+    std::string name;
+
+    bool operator==(const rpc_opencl_tensor_extra_key & other) const {
+        return buffer == other.buffer &&
+               data == other.data &&
+               type == other.type &&
+               ne == other.ne &&
+               nb == other.nb &&
+               name == other.name;
+    }
+};
+
+struct rpc_opencl_tensor_extra_key_hash {
+    size_t operator()(const rpc_opencl_tensor_extra_key & key) const {
+        size_t h = std::hash<uintptr_t>{}(
+            reinterpret_cast<uintptr_t>(key.buffer));
+        auto mix = [&](size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix(std::hash<uint64_t>{}(key.data));
+        mix(std::hash<int>{}((int) key.type));
+        for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+            mix(std::hash<int64_t>{}(key.ne[i]));
+            mix(std::hash<size_t>{}(key.nb[i]));
+        }
+        mix(std::hash<std::string>{}(key.name));
+        return h;
+    }
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
@@ -2294,6 +2334,12 @@ public:
     };
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+    bool is_opencl_tensor(const ggml_tensor * tensor) const;
+    rpc_opencl_tensor_extra_key opencl_tensor_extra_key(const ggml_tensor * tensor) const;
+    bool restore_opencl_tensor_extra(ggml_tensor * tensor);
+    bool ensure_opencl_tensor_extra(ggml_tensor * tensor);
+    void remember_opencl_tensor_extra(ggml_tensor * tensor);
+    void erase_opencl_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -2304,6 +2350,15 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+
+    // Non-owning OpenCL-only tensor state. Entries are removed before the
+    // corresponding backend buffer is freed.
+    std::unordered_map<
+        rpc_opencl_tensor_extra_key,
+        void *,
+        rpc_opencl_tensor_extra_key_hash> opencl_tensor_extras;
+    std::mutex opencl_tensor_extras_mutex;
+
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
@@ -2318,6 +2373,102 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+}
+
+bool rpc_server::is_opencl_tensor(const ggml_tensor * tensor) const {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->buffer->buft == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_backend_buft_name(tensor->buffer->buft);
+    return name != nullptr && std::strcmp(name, "OpenCL") == 0;
+}
+
+rpc_opencl_tensor_extra_key rpc_server::opencl_tensor_extra_key(
+        const ggml_tensor * tensor) const {
+    rpc_opencl_tensor_extra_key key;
+    key.buffer = tensor->buffer;
+    key.data = reinterpret_cast<uint64_t>(tensor->data);
+    key.type = tensor->type;
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        key.ne[i] = tensor->ne[i];
+        key.nb[i] = tensor->nb[i];
+    }
+    key.name = tensor->name;
+    return key;
+}
+
+bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
+    if (!is_opencl_tensor(tensor)) {
+        return false;
+    }
+
+    const rpc_opencl_tensor_extra_key key = opencl_tensor_extra_key(tensor);
+    std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
+    const auto it = opencl_tensor_extras.find(key);
+    if (it == opencl_tensor_extras.end()) {
+        return false;
+    }
+
+    tensor->extra = it->second;
+    LOG_DBG(
+        "[RPC_OPENCL_EXTRA] action=RESTORE name=%s buffer=%p data=%p extra=%p\n",
+        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+    return true;
+}
+
+bool rpc_server::ensure_opencl_tensor_extra(ggml_tensor * tensor) {
+    // Deliberately leave every non-OpenCL backend on the pre-existing RPC path.
+    if (!is_opencl_tensor(tensor)) {
+        return true;
+    }
+
+    if (tensor->extra != nullptr || restore_opencl_tensor_extra(tensor)) {
+        return true;
+    }
+
+    const ggml_status status =
+        ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
+    if (status != GGML_STATUS_SUCCESS || tensor->extra == nullptr) {
+        GGML_LOG_ERROR(
+            "[RPC_OPENCL_EXTRA] action=INIT_FAILED name=%s status=%d extra=%p\n",
+            tensor->name, (int) status, tensor->extra);
+        return false;
+    }
+
+    LOG_DBG(
+        "[RPC_OPENCL_EXTRA] action=INIT name=%s buffer=%p data=%p extra=%p\n",
+        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+    return true;
+}
+
+void rpc_server::remember_opencl_tensor_extra(ggml_tensor * tensor) {
+    if (!is_opencl_tensor(tensor) || tensor->extra == nullptr) {
+        return;
+    }
+
+    const rpc_opencl_tensor_extra_key key = opencl_tensor_extra_key(tensor);
+    {
+        std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
+        opencl_tensor_extras[key] = tensor->extra;
+    }
+
+    LOG_DBG(
+        "[RPC_OPENCL_EXTRA] action=REMEMBER name=%s buffer=%p data=%p extra=%p\n",
+        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+}
+
+void rpc_server::erase_opencl_tensor_extras_for_buffer(
+        ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
+    for (auto it = opencl_tensor_extras.begin();
+         it != opencl_tensor_extras.end();) {
+        if (it->first.buffer == buffer) {
+            it = opencl_tensor_extras.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -2423,6 +2574,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    erase_opencl_tensor_extras_for_buffer(buffer);
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -2553,7 +2705,18 @@ bool rpc_server::set_tensor_direct(
         }
     }
 
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
+
     ggml_backend_tensor_set(tensor, data, offset, size);
+
+    // OpenCL quantized set_tensor may replace the generic extra with a
+    // type-specific object. Preserve the post-write pointer.
+    remember_opencl_tensor_extra(tensor);
     return true;
 }
 
@@ -2638,7 +2801,15 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
+
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    remember_opencl_tensor_extra(tensor);
     response.result = 1;
     return true;
 }
@@ -2658,6 +2829,18 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p\n", __func__, (void*)tensor->buffer, tensor->data);
+
+    if (is_opencl_tensor(tensor)) {
+        if (!ensure_opencl_tensor_extra(tensor)) {
+            GGML_LOG_ERROR(
+                "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+                __func__, tensor->name);
+            return false;
+        }
+        remember_opencl_tensor_extra(tensor);
+        return true;
+    }
+
     // Call the backend's buffer_init_tensor function
     ggml_backend_buffer_t buffer = tensor->buffer;
     if (buffer && buffer->iface.init_tensor) {
@@ -2693,6 +2876,13 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
+
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
 
     // sanitize tensor->data
     {
@@ -2745,6 +2935,12 @@ bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
 
     ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
+        return false;
+    }
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
         return false;
     }
 
@@ -2936,6 +3132,13 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
         GGML_LOG_ERROR("[%s] error deserializing tensors\n", __func__);
         return false;
     }
+    if (!ensure_opencl_tensor_extra(src) ||
+        !ensure_opencl_tensor_extra(dst)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state\n",
+            __func__);
+        return false;
+    }
 
     uint64_t src_size   = (uint64_t) ggml_nbytes(src);
     uint64_t dst_data   = (uint64_t) dst->data;
@@ -3014,6 +3217,13 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+
+    if (!ensure_opencl_tensor_extra(result)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for node '%s'\n",
+            __func__, result->name);
+        return nullptr;
+    }
     return result;
 }
 
@@ -3297,6 +3507,13 @@ bool rpc_server::set_tensor_from_local_file(
         return true;
     }
 
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
+
     const size_t name_len =
         strnlen(request.tensor.name, GGML_MAX_NAME);
 
@@ -3500,6 +3717,7 @@ bool rpc_server::set_tensor_from_local_file(
             staging.data(),
             static_cast<size_t>(dst_i),
             staging.size());
+        remember_opencl_tensor_extra(tensor);
     }
 
     GGML_LOG_DEBUG(
