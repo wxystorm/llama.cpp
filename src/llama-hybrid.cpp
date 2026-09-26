@@ -412,6 +412,63 @@ static void * llama_hybrid_rpc_get_proc_address(ggml_backend_t backend, const ch
     return reg == nullptr ? nullptr : ggml_backend_reg_get_proc_address(reg, name);
 }
 
+// Synthetic HYBRID_PROFILE graphs allocate zero-filled weight storage instead
+// of loading real model weights. That is sufficient for CPU/CUDA, but an
+// OpenCL RPC server with GGML_OPENCL_SOA_Q must still run its quantized
+// set_tensor path once so Q4_K/Q5_K/Q6_K/etc. receive their backend-private
+// SoA sub-buffers/images. Keep this RPC-only: non-RPC CPU/CUDA profiling keeps
+// the existing buffer_clear behavior unchanged.
+static bool llama_hybrid_profile_init_rpc_quantized_leafs(
+        ggml_backend_t backend,
+        ggml_cgraph *  graph) {
+    const auto init_zero =
+        reinterpret_cast<ggml_backend_rpc_init_zero_tensor_t>(
+            llama_hybrid_rpc_get_proc_address(
+                backend,
+                GGML_BACKEND_RPC_INIT_ZERO_TENSOR_PROC));
+
+    if (init_zero == nullptr) {
+        return true;
+    }
+
+    size_t initialized = 0;
+    size_t initialized_bytes = 0;
+
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        ggml_tensor * leaf = graph->leafs[i];
+        if (leaf == nullptr ||
+            leaf->buffer == nullptr ||
+            !ggml_is_quantized(leaf->type)) {
+            continue;
+        }
+
+        if (!init_zero(leaf)) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PROFILE_RPC_QUANT_INIT] status=FAILED "
+                "backend=%s leaf=%s type=%s bytes=%zu\n",
+                ggml_backend_name(backend),
+                leaf->name,
+                ggml_type_name(leaf->type),
+                ggml_nbytes(leaf));
+            return false;
+        }
+
+        ++initialized;
+        initialized_bytes += ggml_nbytes(leaf);
+    }
+
+    if (initialized > 0) {
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_RPC_QUANT_INIT] status=OK backend=%s "
+            "tensors=%zu bytes=%zu\n",
+            ggml_backend_name(backend),
+            initialized,
+            initialized_bytes);
+    }
+
+    return true;
+}
+
 static bool llama_hybrid_profile_rpc_fence(ggml_backend_t backend, double & result_ms) {
     const auto rpc_fence = reinterpret_cast<ggml_backend_rpc_fence_t>(
         llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_FENCE_PROC));
@@ -444,6 +501,11 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
                                               ggml_cgraph *               graph,
                                               llama_hybrid_graph_timing & result) {
     if (backend == nullptr || graph == nullptr) {
+        return false;
+    }
+
+    if (!llama_hybrid_profile_init_rpc_quantized_leafs(
+            backend, graph)) {
         return false;
     }
 
