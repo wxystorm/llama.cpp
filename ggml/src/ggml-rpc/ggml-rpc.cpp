@@ -2269,15 +2269,17 @@ struct rpc_tensor_extra_key {
     enum ggml_type type = GGML_TYPE_F32;
     std::array<int64_t, GGML_MAX_DIMS> ne {};
     std::array<size_t, GGML_MAX_DIMS> nb {};
-    std::string name;
 
     bool operator==(const rpc_tensor_extra_key & other) const {
+        // Tensor names are graph-local labels. RPC graph reconstruction can
+        // rename a persistent model weight (for example blk.*.weight -> leaf_1)
+        // while keeping the exact same remote storage. Backend-private OpenCL
+        // state must therefore be keyed by storage/layout identity, not name.
         return buffer == other.buffer &&
                data == other.data &&
                type == other.type &&
                ne == other.ne &&
-               nb == other.nb &&
-               name == other.name;
+               nb == other.nb;
     }
 };
 
@@ -2294,7 +2296,6 @@ struct rpc_tensor_extra_key_hash {
             mix(std::hash<int64_t>{}(key.ne[i]));
             mix(std::hash<size_t>{}(key.nb[i]));
         }
-        mix(std::hash<std::string>{}(key.name));
         return h;
     }
 };
@@ -2410,7 +2411,6 @@ rpc_tensor_extra_key rpc_server::tensor_extra_key(
         key.ne[i] = tensor->ne[i];
         key.nb[i] = tensor->nb[i];
     }
-    key.name = tensor->name;
     return key;
 }
 
@@ -2440,7 +2440,7 @@ bool rpc_server::restore_tensor_extra(ggml_tensor * tensor) {
     if (rpc_tensor_extra_trace_enabled()) {
         fprintf(
             stderr,
-            "[RPC_TENSOR_EXTRA] action=RESTORE name='%s' type=%s buffer=%p data=%p extra=%p\n",
+            "[RPC_TENSOR_EXTRA] action=RESTORE_BY_STORAGE name='%s' type=%s buffer=%p data=%p extra=%p\n",
             tensor->name,
             ggml_type_name(tensor->type),
             (void *) tensor->buffer,
@@ -3304,33 +3304,44 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     if (result->buffer != nullptr) {
         std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
 
-        const bool persistent_opencl_quantized_weight =
-            rpc_is_opencl_buffer(result->buffer) &&
-            ggml_is_quantized(result->type) &&
-            should_use_local_file_tensor(result);
+        // Always try the persistent backend-state map first. The graph-local
+        // tensor name is not stable across RPC reconstruction, but buffer/data
+        // storage identity is.
+        const bool restored = restore_tensor_extra(result);
 
-        if (persistent_opencl_quantized_weight) {
-            // Model weights have already passed through OpenCL set_tensor(),
-            // which may replace the generic extra with a type-specific layout
-            // object (Q4_K/Q6_K/etc.). Reinitializing a missing entry here would
-            // create a generic ggml_tensor_extra_cl and later quantized matmul
-            // code would reinterpret it as the specialized type.
-            if (!restore_tensor_extra(result)) {
-                GGML_LOG_ERROR(
-                    "[RPC_TENSOR_EXTRA_FATAL] missing OpenCL quantized weight state "
-                    "name='%s' type=%s buffer=%p data=%p\n",
-                    result->name,
-                    ggml_type_name(result->type),
-                    (void *) result->buffer,
-                    result->data);
-                return nullptr;
-            }
-        } else if (!ensure_tensor_extra(result)) {
+        const bool opencl_k_quant_leaf =
+            rpc_is_opencl_buffer(result->buffer) &&
+            result->op == GGML_OP_NONE &&
+            result->view_src == nullptr &&
+            (result->type == GGML_TYPE_Q4_K ||
+             result->type == GGML_TYPE_Q5_K ||
+             result->type == GGML_TYPE_Q6_K);
+
+        if (!restored && opencl_k_quant_leaf) {
+            // These OpenCL K-quant leaves use type-specific tensor extras
+            // produced by set_tensor(). Falling back to init_tensor() would
+            // create a generic ggml_tensor_extra_cl; q4_K/q5_K/q6_K matmul
+            // would then reinterpret it as a specialized struct and can crash
+            // inside the Qualcomm OpenCL driver.
+            GGML_LOG_ERROR(
+                "[RPC_TENSOR_EXTRA_FATAL] missing OpenCL K-quant leaf state "
+                "name='%s' type=%s buffer=%p data=%p "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                result->name,
+                ggml_type_name(result->type),
+                (void *) result->buffer,
+                result->data,
+                result->ne[0], result->ne[1], result->ne[2], result->ne[3]);
+            return nullptr;
+        }
+
+        if (!restored && !ensure_tensor_extra(result)) {
             GGML_LOG_ERROR(
                 "[%s] failed to initialize backend tensor state for node '%s'\n",
                 __func__, result->name);
             return nullptr;
         }
+
         remember_tensor_extra(result);
     }
     return result;
