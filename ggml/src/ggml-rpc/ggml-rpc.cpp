@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <algorithm>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
