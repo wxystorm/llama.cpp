@@ -514,8 +514,11 @@ struct ggml_backend_opencl_context {
     ggml_cl_version platform_version;
     ggml_cl_version opencl_c_version;
 
-    // argsort is loaded in supports_op because its availability depends on how
-    // many workgroups are allowed, which requires kernel compilation.
+    // argsort is lazy-loaded because its availability depends on the compiled
+    // kernel's workgroup limit. RPC graph execution can reach ggml_cl_argsort()
+    // without a preceding supports_op() call, so initialization must be safe
+    // from both capability checks and the execution path.
+    std::once_flag argsort_load_once;
     bool kernels_loaded_argsort = false;
     // rest of the kernels are currently always loaded in alloc_buffer.
     bool kernels_loaded = false;
@@ -1155,15 +1158,14 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
 }
 
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
-    // compiler options for general kernels
-    auto opencl_c_std =
-        std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
-    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
-                               " -cl-mad-enable -cl-unsafe-math-optimizations"
-                               " -cl-finite-math-only -cl-fast-relaxed-math";
+    std::call_once(backend_ctx->argsort_load_once, [backend_ctx]() {
+        // compiler options for general kernels
+        auto opencl_c_std =
+            std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
+        std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+                                   " -cl-mad-enable -cl-unsafe-math-optimizations"
+                                   " -cl-finite-math-only -cl-fast-relaxed-math";
 
-    // argsort
-    if (!backend_ctx->kernels_loaded_argsort) {
         cl_int err;
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
@@ -1177,7 +1179,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
         backend_ctx->kernels_loaded_argsort = true;
-    }
+    });
 }
 
 static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
@@ -22105,7 +22107,11 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
 
     int order = (enum ggml_sort_order) dst->op_params[0];
 
+    // RPC graph execution may bypass supports_op(), where this kernel is
+    // normally lazy-loaded. Ensure it exists at the point of use as well.
+    load_cl_kernels_argsort(backend_ctx);
     cl_kernel kernel = backend_ctx->kernel_argsort_f32_i32;
+    GGML_ASSERT(kernel != nullptr);
 
     CL_CHECK(clSetKernelArg(kernel,   0, sizeof(cl_mem),            &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,   1, sizeof(cl_ulong),          &offset0));
