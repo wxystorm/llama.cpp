@@ -2497,6 +2497,15 @@ private:
         rpc_opencl_tensor_storage_key,
         rpc_opencl_tensor_storage_entry,
         rpc_opencl_tensor_storage_key_hash> opencl_tensor_storage_extras;
+
+    // Tracks synthetic profiling tensors that have actually run through the
+    // OpenCL quantized set_tensor path. Do not infer this from the ordinary
+    // extra cache: INIT_TENSOR can legitimately cache only the generic
+    // ggml_tensor_extra_cl object before SoA conversion has happened.
+    std::unordered_set<
+        rpc_opencl_tensor_storage_key,
+        rpc_opencl_tensor_storage_key_hash> opencl_profile_zero_initialized;
+
     std::mutex opencl_tensor_extras_mutex;
 
     // store computed graphs for each backend by graph uid
@@ -2802,6 +2811,14 @@ void rpc_server::erase_opencl_tensor_extras_for_buffer(
          it != opencl_tensor_storage_extras.end();) {
         if (it->first.buffer == buffer) {
             it = opencl_tensor_storage_extras.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = opencl_profile_zero_initialized.begin();
+         it != opencl_profile_zero_initialized.end();) {
+        if (it->buffer == buffer) {
+            it = opencl_profile_zero_initialized.erase(it);
         } else {
             ++it;
         }
@@ -3221,12 +3238,21 @@ bool rpc_server::init_zero_tensor(
         return true;
     }
 
+    const rpc_opencl_tensor_storage_key storage_key =
+        opencl_tensor_storage_key(tensor);
+
     // Repeated initialization of the same profiling tensor is unnecessary and
     // unsafe for SoA quantization: set_tensor expects the generic allocation
-    // extra as its input and replaces it with a type-specific extra.
-    if (restore_opencl_tensor_extra(tensor)) {
-        response.result = 1;
-        return true;
+    // extra as its input and replaces it with a type-specific extra. Track
+    // successful profile initialization explicitly instead of treating an
+    // ordinary extra-cache hit as proof that SoA conversion already happened.
+    {
+        std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
+        if (opencl_profile_zero_initialized.find(storage_key) !=
+            opencl_profile_zero_initialized.end()) {
+            response.result = 1;
+            return true;
+        }
     }
 
     if (!ensure_opencl_tensor_extra(tensor)) {
@@ -3263,6 +3289,11 @@ bool rpc_server::init_zero_tensor(
     // Q4_K/Q5_K/Q6_K/etc. SoA object. Cache that final pointer so subsequent
     // graph reconstruction restores the correct layout.
     remember_opencl_tensor_extra(tensor);
+
+    {
+        std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
+        opencl_profile_zero_initialized.insert(storage_key);
+    }
 
     if (rpc_opencl_extra_debug_enabled()) {
         GGML_LOG_ERROR(
