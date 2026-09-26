@@ -5,7 +5,7 @@ __kernel void kernel_moe_histogram(
     __global int * hist,
     uint N,
     uint topK,
-    uint n_experts
+    uint router_stride
 ) {
     uint n = get_global_id(0);
     uint k = get_global_id(1);
@@ -14,7 +14,7 @@ __kernel void kernel_moe_histogram(
         return;
     }
 
-    int expert_id = input[n * n_experts + k];
+    int expert_id = input[n * router_stride + k];
     atomic_inc(&hist[expert_id]);
 }
 
@@ -47,7 +47,7 @@ __kernel void kernel_moe_scatter(
     __global int * slot_counter,
     int N,
     int topK,
-    uint n_experts
+    uint router_stride
 ) {
     uint n = get_global_id(0);
     uint k = get_global_id(1);
@@ -56,7 +56,7 @@ __kernel void kernel_moe_scatter(
         return;
     }
 
-    int val = input[n * n_experts + k];
+    int val = input[n * router_stride + k];
 
     int local_slot = atomic_inc(&slot_counter[val]);
 
