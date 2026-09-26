@@ -2290,6 +2290,40 @@ struct rpc_opencl_tensor_extra_key_hash {
     }
 };
 
+// Graph reconstruction can legitimately change tensor metadata such as name,
+// ne/nb while still referring to the same OpenCL allocation. Keep a second,
+// storage-level key so a strict-key miss does not silently replace a quantized
+// type-specific extra with the generic ggml_tensor_extra_cl layout.
+struct rpc_opencl_tensor_storage_key {
+    ggml_backend_buffer_t buffer = nullptr;
+    uint64_t data = 0;
+    enum ggml_type type = GGML_TYPE_F32;
+
+    bool operator==(const rpc_opencl_tensor_storage_key & other) const {
+        return buffer == other.buffer &&
+               data == other.data &&
+               type == other.type;
+    }
+};
+
+struct rpc_opencl_tensor_storage_key_hash {
+    size_t operator()(const rpc_opencl_tensor_storage_key & key) const {
+        size_t h = std::hash<uintptr_t>{}(
+            reinterpret_cast<uintptr_t>(key.buffer));
+        auto mix = [&](size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix(std::hash<uint64_t>{}(key.data));
+        mix(std::hash<int>{}((int) key.type));
+        return h;
+    }
+};
+
+struct rpc_opencl_tensor_storage_entry {
+    void * extra = nullptr;
+    bool ambiguous = false;
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
@@ -2337,8 +2371,11 @@ private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     bool is_opencl_tensor(const ggml_tensor * tensor) const;
     rpc_opencl_tensor_extra_key opencl_tensor_extra_key(const ggml_tensor * tensor) const;
+    rpc_opencl_tensor_storage_key opencl_tensor_storage_key(const ggml_tensor * tensor) const;
     bool restore_opencl_tensor_extra(ggml_tensor * tensor);
-    bool ensure_opencl_tensor_extra(ggml_tensor * tensor);
+    bool ensure_opencl_tensor_extra(
+        ggml_tensor * tensor,
+        bool allow_quantized_weight_init = true);
     void remember_opencl_tensor_extra(ggml_tensor * tensor);
     void erase_opencl_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -2358,6 +2395,10 @@ private:
         rpc_opencl_tensor_extra_key,
         void *,
         rpc_opencl_tensor_extra_key_hash> opencl_tensor_extras;
+    std::unordered_map<
+        rpc_opencl_tensor_storage_key,
+        rpc_opencl_tensor_storage_entry,
+        rpc_opencl_tensor_storage_key_hash> opencl_tensor_storage_extras;
     std::mutex opencl_tensor_extras_mutex;
 
     // store computed graphs for each backend by graph uid
@@ -2399,26 +2440,74 @@ rpc_opencl_tensor_extra_key rpc_server::opencl_tensor_extra_key(
     return key;
 }
 
+rpc_opencl_tensor_storage_key rpc_server::opencl_tensor_storage_key(
+        const ggml_tensor * tensor) const {
+    rpc_opencl_tensor_storage_key key;
+    key.buffer = tensor->buffer;
+    key.data = reinterpret_cast<uint64_t>(tensor->data);
+    key.type = tensor->type;
+    return key;
+}
+
 bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
     if (!is_opencl_tensor(tensor)) {
         return false;
     }
 
-    const rpc_opencl_tensor_extra_key key = opencl_tensor_extra_key(tensor);
+    const rpc_opencl_tensor_extra_key exact_key =
+        opencl_tensor_extra_key(tensor);
+    const rpc_opencl_tensor_storage_key storage_key =
+        opencl_tensor_storage_key(tensor);
+
     std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
-    const auto it = opencl_tensor_extras.find(key);
-    if (it == opencl_tensor_extras.end()) {
+
+    const auto exact_it = opencl_tensor_extras.find(exact_key);
+    if (exact_it != opencl_tensor_extras.end()) {
+        tensor->extra = exact_it->second;
+        LOG_DBG(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_EXACT name=%s buffer=%p data=%p extra=%p\n",
+            tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+        return true;
+    }
+
+    const auto storage_it =
+        opencl_tensor_storage_extras.find(storage_key);
+    if (storage_it == opencl_tensor_storage_extras.end()) {
         return false;
     }
 
-    tensor->extra = it->second;
+    if (storage_it->second.ambiguous ||
+        storage_it->second.extra == nullptr) {
+        GGML_LOG_ERROR(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_CONFLICT "
+            "name=%s buffer=%p data=%p type=%d\n",
+            tensor->name,
+            (void *) tensor->buffer,
+            tensor->data,
+            (int) tensor->type);
+        return false;
+    }
+
+    tensor->extra = storage_it->second.extra;
+
+    // Remember the reconstructed metadata variant as an exact alias. Future
+    // reconstructions then take the strict path without another fallback.
+    opencl_tensor_extras.emplace(exact_key, tensor->extra);
+
     LOG_DBG(
-        "[RPC_OPENCL_EXTRA] action=RESTORE name=%s buffer=%p data=%p extra=%p\n",
-        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+        "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE name=%s "
+        "buffer=%p data=%p type=%d extra=%p\n",
+        tensor->name,
+        (void *) tensor->buffer,
+        tensor->data,
+        (int) tensor->type,
+        tensor->extra);
     return true;
 }
 
-bool rpc_server::ensure_opencl_tensor_extra(ggml_tensor * tensor) {
+bool rpc_server::ensure_opencl_tensor_extra(
+        ggml_tensor * tensor,
+        bool allow_quantized_weight_init) {
     // Deliberately leave every non-OpenCL backend on the pre-existing RPC path.
     if (!is_opencl_tensor(tensor)) {
         return true;
@@ -2426,6 +2515,28 @@ bool rpc_server::ensure_opencl_tensor_extra(ggml_tensor * tensor) {
 
     if (tensor->extra != nullptr || restore_opencl_tensor_extra(tensor)) {
         return true;
+    }
+
+    // During graph reconstruction, a model weight that has already gone
+    // through OpenCL quantized set_tensor must recover its type-specific extra.
+    // Creating a fresh generic extra here is unsafe: Q4_K/Q5_K/Q6_K kernels
+    // later reinterpret tensor->extra as their specialized layouts and may pass
+    // offsets or unrelated bytes to the driver as cl_mem handles.
+    //
+    // Views are exempt because OpenCL buffer_init_tensor safely reuses the
+    // already-restored parent view_src extra.
+    if (!allow_quantized_weight_init &&
+        tensor->view_src == nullptr &&
+        ggml_is_quantized(tensor->type) &&
+        should_use_local_file_tensor(tensor)) {
+        GGML_LOG_ERROR(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_QUANT_WEIGHT "
+            "name=%s buffer=%p data=%p type=%d\n",
+            tensor->name,
+            (void *) tensor->buffer,
+            tensor->data,
+            (int) tensor->type);
+        return false;
     }
 
     const ggml_status status =
@@ -2448,15 +2559,71 @@ void rpc_server::remember_opencl_tensor_extra(ggml_tensor * tensor) {
         return;
     }
 
-    const rpc_opencl_tensor_extra_key key = opencl_tensor_extra_key(tensor);
+    const rpc_opencl_tensor_extra_key exact_key =
+        opencl_tensor_extra_key(tensor);
+    const rpc_opencl_tensor_storage_key storage_key =
+        opencl_tensor_storage_key(tensor);
+
+    bool storage_conflict = false;
     {
         std::lock_guard<std::mutex> lock(opencl_tensor_extras_mutex);
-        opencl_tensor_extras[key] = tensor->extra;
+
+        void * previous_exact = nullptr;
+        bool had_exact = false;
+
+        auto exact_it = opencl_tensor_extras.find(exact_key);
+        if (exact_it != opencl_tensor_extras.end()) {
+            had_exact = true;
+            previous_exact = exact_it->second;
+            exact_it->second = tensor->extra;
+        } else {
+            opencl_tensor_extras.emplace(exact_key, tensor->extra);
+        }
+
+        auto storage_it =
+            opencl_tensor_storage_extras.find(storage_key);
+        if (storage_it == opencl_tensor_storage_extras.end()) {
+            opencl_tensor_storage_extras.emplace(
+                storage_key,
+                rpc_opencl_tensor_storage_entry {
+                    /* .extra = */ tensor->extra,
+                    /* .ambiguous = */ false,
+                });
+        } else if (!storage_it->second.ambiguous &&
+                   storage_it->second.extra != tensor->extra) {
+            // The same exact tensor can legitimately transition from the
+            // generic allocation extra to a type-specific quantized extra
+            // during set_tensor. Treat that as replacement, not ambiguity.
+            if (had_exact &&
+                storage_it->second.extra == previous_exact) {
+                storage_it->second.extra = tensor->extra;
+            } else {
+                storage_it->second.extra = nullptr;
+                storage_it->second.ambiguous = true;
+                storage_conflict = true;
+            }
+        }
     }
 
-    LOG_DBG(
-        "[RPC_OPENCL_EXTRA] action=REMEMBER name=%s buffer=%p data=%p extra=%p\n",
-        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+    if (storage_conflict) {
+        GGML_LOG_ERROR(
+            "[RPC_OPENCL_EXTRA] action=REMEMBER_STORAGE_CONFLICT "
+            "name=%s buffer=%p data=%p type=%d extra=%p\n",
+            tensor->name,
+            (void *) tensor->buffer,
+            tensor->data,
+            (int) tensor->type,
+            tensor->extra);
+    } else {
+        LOG_DBG(
+            "[RPC_OPENCL_EXTRA] action=REMEMBER name=%s "
+            "buffer=%p data=%p type=%d extra=%p\n",
+            tensor->name,
+            (void *) tensor->buffer,
+            tensor->data,
+            (int) tensor->type,
+            tensor->extra);
+    }
 }
 
 void rpc_server::erase_opencl_tensor_extras_for_buffer(
@@ -2466,6 +2633,14 @@ void rpc_server::erase_opencl_tensor_extras_for_buffer(
          it != opencl_tensor_extras.end();) {
         if (it->first.buffer == buffer) {
             it = opencl_tensor_extras.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = opencl_tensor_storage_extras.begin();
+         it != opencl_tensor_storage_extras.end();) {
+        if (it->first.buffer == buffer) {
+            it = opencl_tensor_storage_extras.erase(it);
         } else {
             ++it;
         }
@@ -3219,9 +3394,11 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     }
     result->view_offs = tensor->view_offs;
 
-    if (!ensure_opencl_tensor_extra(result)) {
+    if (!ensure_opencl_tensor_extra(
+            result,
+            /* allow_quantized_weight_init = */ false)) {
         GGML_LOG_ERROR(
-            "[%s] failed to initialize OpenCL tensor state for node '%s'\n",
+            "[%s] failed to restore OpenCL tensor state for node '%s'\n",
             __func__, result->name);
         return nullptr;
     }
@@ -3508,13 +3685,6 @@ bool rpc_server::set_tensor_from_local_file(
         return true;
     }
 
-    if (!ensure_opencl_tensor_extra(tensor)) {
-        GGML_LOG_ERROR(
-            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
-            __func__, tensor->name);
-        return false;
-    }
-
     const size_t name_len =
         strnlen(request.tensor.name, GGML_MAX_NAME);
 
@@ -3537,6 +3707,7 @@ bool rpc_server::set_tensor_from_local_file(
      */
     if (request.n_copies == 0 ||
         request.copy_size == 0) {
+        response.result = 1;
         return true;
     }
 
@@ -3558,6 +3729,37 @@ bool rpc_server::set_tensor_from_local_file(
 
     const uint64_t tensor_nbytes =
         static_cast<uint64_t>(ggml_nbytes(tensor));
+
+    // OpenCL quantized set_tensor performs layout conversion and replaces the
+    // generic extra with a type-specific object. It is therefore not a safe
+    // partial/repeated write primitive. Only permit one complete destination
+    // overwrite; other backends keep the existing 2D behavior unchanged.
+    if (is_opencl_tensor(tensor) &&
+        ggml_is_quantized(tensor->type) &&
+        (request.n_copies != 1 ||
+         request.dst_offset != 0 ||
+         request.copy_size != tensor_nbytes)) {
+        GGML_LOG_ERROR(
+            "[RPC_OPENCL_EXTRA] action=REJECT_PARTIAL_QUANT_SET "
+            "name=%s type=%d dst_offset=%" PRIu64
+            " copy_size=%" PRIu64 " n_copies=%" PRIu64
+            " tensor_size=%" PRIu64 "\n",
+            tensor->name,
+            (int) tensor->type,
+            request.dst_offset,
+            request.copy_size,
+            request.n_copies,
+            tensor_nbytes);
+        response.result = 2;
+        return true;
+    }
+
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
 
     /*
      * 验证最后一次目标写入不会越过局部目标张量。
