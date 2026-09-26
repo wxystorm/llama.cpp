@@ -20,6 +20,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <functional>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -3496,6 +3497,20 @@ bool rpc_server::set_tensor_from_local_file(
         return true;
     }
 
+    // Quantized accelerator backends such as OpenCL transform the complete
+    // tensor in a single set_tensor call and may replace tensor->extra with a
+    // type-specific object. Repeating that conversion for 2D fragments would
+    // reinterpret the specialized extra as the generic allocation metadata.
+    // Current model loading uses n_copies=1; reject unsupported fragmented
+    // accelerator loads before touching the destination.
+    if (request.n_copies > 1 && tensor->extra != nullptr) {
+        GGML_LOG_ERROR(
+            "[%s] backend-private tensor state with n_copies>1 is not "
+            "supported for local RPC loading: name='%s' n_copies=%" PRIu64 "\n",
+            __func__, request.tensor.name, request.n_copies);
+        return false;
+    }
+
     const size_t name_len =
         strnlen(request.tensor.name, GGML_MAX_NAME);
 
@@ -3701,13 +3716,6 @@ bool rpc_server::set_tensor_from_local_file(
             staging.size());
 
         remember_tensor_extra(tensor);
-        if (request.n_copies > 1 && tensor->extra != nullptr) {
-            GGML_LOG_ERROR(
-                "[%s] backend-private tensor state with n_copies>1 is not "
-                "supported for local RPC loading: name='%s' n_copies=%" PRIu64 "\n",
-                __func__, name.c_str(), request.n_copies);
-            return false;
-        }
     }
 
     GGML_LOG_DEBUG(
