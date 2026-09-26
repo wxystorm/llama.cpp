@@ -412,6 +412,53 @@ static void * llama_hybrid_rpc_get_proc_address(ggml_backend_t backend, const ch
     return reg == nullptr ? nullptr : ggml_backend_reg_get_proc_address(reg, name);
 }
 
+
+static bool llama_hybrid_prepare_rpc_quantized_probe_tensors(
+        ggml_context * ctx,
+        ggml_backend_t backend) {
+    if (ctx == nullptr || backend == nullptr) {
+        return false;
+    }
+
+    // Preserve the original CPU/GPU path exactly: only RPC backends enter here.
+    if (llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_FENCE_PROC) == nullptr) {
+        return true;
+    }
+
+    const auto init_zero_quant = reinterpret_cast<ggml_backend_rpc_init_zero_quant_t>(
+        llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_INIT_ZERO_QUANT_PROC));
+    if (init_zero_quant == nullptr) {
+        LLAMA_LOG_ERROR("%s: RPC backend lacks synthetic quantized init\n", __func__);
+        return false;
+    }
+
+    size_t count = 0;
+    size_t bytes = 0;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+         tensor != nullptr;
+         tensor = ggml_get_next_tensor(ctx, tensor)) {
+        if (!ggml_is_quantized(tensor->type) ||
+            tensor->op != GGML_OP_NONE ||
+            tensor->view_src != nullptr) {
+            continue;
+        }
+        if (!init_zero_quant(backend, tensor)) {
+            LLAMA_LOG_ERROR(
+                "%s: init failed tensor='%s' type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                __func__, tensor->name, ggml_type_name(tensor->type),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+            return false;
+        }
+        ++count;
+        bytes += ggml_nbytes(tensor);
+    }
+    if (count > 0) {
+        LLAMA_LOG_INFO("[HYBRID_PROFILE_RPC_QUANT_INIT] backend=%s tensors=%zu bytes=%zu\n",
+                       ggml_backend_name(backend), count, bytes);
+    }
+    return true;
+}
+
 static bool llama_hybrid_profile_rpc_fence(ggml_backend_t backend, double & result_ms) {
     const auto rpc_fence = reinterpret_cast<ggml_backend_rpc_fence_t>(
         llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_FENCE_PROC));
@@ -4901,6 +4948,9 @@ static bool llama_hybrid_profile_ffn_point(const llama_hybrid_ffn_desc & desc,
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     const size_t total_buffer = ggml_backend_buffer_get_size(buffer.get());
     size_t       weight_bytes = 0;
@@ -5112,6 +5162,9 @@ static bool llama_hybrid_profile_moe_ffn_point(
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     std::vector<int32_t> ids_data((size_t) k * (size_t) tokens);
     for (int t = 0; t < tokens; ++t) {
@@ -5297,6 +5350,9 @@ static bool llama_hybrid_profile_moe_decode_ratio_block_point(
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     if (!llama_hybrid_profile_graph_timing(
             backend, graph, timing)) {
@@ -5620,6 +5676,12 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     const size_t total_buffer = ggml_backend_buffer_get_size(buffer.get());
     size_t       weight_bytes = 0;
@@ -5719,6 +5781,9 @@ static bool llama_hybrid_profile_attn_kv_kernel_point(const llama_hybrid_attn_de
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     const size_t total_buffer = ggml_backend_buffer_get_size(buffer.get());
     size_t       persistent_kv = 0;
@@ -6020,6 +6085,9 @@ static bool llama_hybrid_profile_moe_misc_point(
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     llama_hybrid_graph_timing timing;
     if (!llama_hybrid_profile_graph_timing(
@@ -6189,6 +6257,9 @@ static bool llama_hybrid_profile_moe_branch_block_point(
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     if (!llama_hybrid_profile_graph_timing(
             backend, graph, timing)) {
@@ -6594,6 +6665,9 @@ static bool llama_hybrid_profile_full_layer_point(const llama_hybrid_attn_desc &
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     std::vector<int32_t> pos_data(tokens);
     for (int i = 0; i < tokens; ++i) {
@@ -6685,6 +6759,9 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     std::vector<int32_t> pos_data(tokens);
     for (int i = 0; i < tokens; ++i) {

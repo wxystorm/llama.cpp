@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    3
+#define RPC_PROTO_PATCH_VERSION    4
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -69,7 +69,14 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
     "ggml_backend_rpc_prepare_fused_ffn_input"
 
+#define GGML_BACKEND_RPC_INIT_ZERO_QUANT_PROC \
+    "ggml_backend_rpc_init_zero_quantized_tensor"
+
 typedef bool (*ggml_backend_rpc_prepare_fused_ffn_input_t)(
+    ggml_backend_t backend,
+    const ggml_tensor * tensor);
+
+typedef bool (*ggml_backend_rpc_init_zero_quant_t)(
     ggml_backend_t backend,
     const ggml_tensor * tensor);
 

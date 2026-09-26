@@ -86,6 +86,7 @@ enum rpc_cmd {
     RPC_CMD_GET_SNAPSHOT,
     RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
     RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
+    RPC_CMD_INIT_ZERO_QUANTIZED_TENSOR,
     RPC_CMD_COUNT,
 };
 
@@ -96,6 +97,7 @@ static_assert(RPC_CMD_SNAPSHOT_TENSOR == 19, "RPC_CMD_SNAPSHOT_TENSOR must be be
 static_assert(RPC_CMD_GET_SNAPSHOT == 20, "RPC_CMD_GET_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT == 21, "RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT == 22,"RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INIT_ZERO_QUANTIZED_TENSOR == 23, "RPC_CMD_INIT_ZERO_QUANTIZED_TENSOR must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -126,6 +128,10 @@ struct rpc_msg_get_alloc_size_rsp {
 };
 
 struct rpc_msg_init_tensor_req {
+    rpc_tensor tensor;
+};
+
+struct rpc_msg_init_zero_quantized_tensor_req {
     rpc_tensor tensor;
 };
 
@@ -1644,6 +1650,24 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+
+static bool ggml_backend_rpc_init_zero_quantized_tensor(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor) {
+    if (backend == nullptr || tensor == nullptr || !ggml_backend_is_rpc(backend) ||
+        tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+        return false;
+    }
+    auto * buffer_ctx = static_cast<ggml_backend_rpc_buffer_context *>(tensor->buffer->context);
+    if (buffer_ctx == nullptr || buffer_ctx->sock == nullptr) {
+        return false;
+    }
+    rpc_msg_init_zero_quantized_tensor_req request {};
+    request.tensor = serialize_tensor(tensor);
+    return send_rpc_cmd(buffer_ctx->sock, RPC_CMD_INIT_ZERO_QUANTIZED_TENSOR,
+                        &request, sizeof(request), nullptr, 0);
+}
+
 static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     rpc_msg_synchronize_req request {};
@@ -2338,6 +2362,7 @@ public:
     bool snapshot_tensor_direct(uint32_t device, uint32_t slot, uint64_t seq, ggml_tensor * tensor, uint64_t offset, uint64_t size);
     bool send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
+    bool init_zero_quantized_tensor(const rpc_msg_init_zero_quantized_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
@@ -2939,6 +2964,52 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
             return false;
         }
         remember_tensor_extra(tensor);
+    }
+    return true;
+}
+
+
+bool rpc_server::init_zero_quantized_tensor(
+        const rpc_msg_init_zero_quantized_tensor_req & request) {
+    const ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // Do not alter CPU/CUDA/etc. behavior. This RPC command is a no-op unless
+    // the server-side destination buffer is OpenCL and the tensor is quantized.
+    if (!rpc_is_opencl_buffer(tensor->buffer) || !ggml_is_quantized(tensor->type)) {
+        return true;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> zeros;
+    try {
+        zeros.resize(nbytes, 0);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("[%s] zero allocation failed: name='%s' type=%s bytes=%zu\n",
+                       __func__, tensor->name, ggml_type_name(tensor->type), nbytes);
+        return false;
+    }
+    if (!set_tensor_with_extra(tensor, zeros.data(), 0, nbytes)) {
+        GGML_LOG_ERROR("[%s] OpenCL quantized init failed: name='%s' type=%s bytes=%zu\n",
+                       __func__, tensor->name, ggml_type_name(tensor->type), nbytes);
+        return false;
+    }
+    if (rpc_tensor_extra_trace_enabled()) {
+        fprintf(stderr,
+                "[RPC_SYNTH_QUANT_INIT] name='%s' type=%s buffer=%p data=%p extra=%p bytes=%zu\n",
+                tensor->name, ggml_type_name(tensor->type), (void *) tensor->buffer,
+                tensor->data, tensor->extra, nbytes);
+        fflush(stderr);
     }
     return true;
 }
@@ -4428,6 +4499,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_INIT_ZERO_QUANTIZED_TENSOR: {
+                rpc_msg_init_zero_quantized_tensor_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.init_zero_quantized_tensor(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -4911,6 +4995,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_prepare_fused_ffn_input);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INIT_ZERO_QUANT_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_init_zero_quantized_tensor);
     }
     GGML_UNUSED(reg);
 
