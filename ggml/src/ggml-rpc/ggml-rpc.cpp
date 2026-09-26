@@ -2292,8 +2292,10 @@ public:
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
         snapshot_devices.reserve(backends.size());
+        graph_compute_mutexes.reserve(backends.size());
         for (size_t i = 0; i < backends.size(); ++i) {
             snapshot_devices.emplace_back(std::make_unique<rpc_snapshot_device>());
+            graph_compute_mutexes.emplace_back(std::make_unique<std::mutex>());
         }
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
@@ -2365,8 +2367,12 @@ private:
     // serialized across those threads.
     std::recursive_mutex tensor_extras_mutex;
 
-    // store computed graphs for each backend by graph uid
+    // store computed graphs for each backend by graph uid. All access to one
+    // device's graph cache and backend compute is serialized by the matching
+    // mutex below. This also protects graph_entry.buffer from resize while a
+    // recompute thread is still using the graph stored inside it.
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+    std::vector<std::unique_ptr<std::mutex>> graph_compute_mutexes;
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
     std::mutex snapshot_breakdown_mutex;
@@ -3260,6 +3266,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (device >= backends.size()) {
         return false;
     }
+
+    // RPC uses multiple sockets (main graph traffic plus snapshot lanes), but
+    // the remote accelerator backend and stored_graphs cache are shared.
+    // Serialize graph construction/compute per device to prevent concurrent
+    // unordered_map mutation, graph buffer resize, and OpenCL backend calls.
+    std::unique_lock<std::mutex> graph_lock(*graph_compute_mutexes[device]);
+
     uint64_t graph_uid;
     memcpy(&graph_uid, src, sizeof(graph_uid));
     src += sizeof(graph_uid);
@@ -3315,6 +3328,15 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+        printf(
+            "[RPC_GRAPH_SERVER_BEGIN] device=%u uid=%" PRIu64
+            " nodes=%d tensors=%u\n",
+            device, graph_uid, graph->n_nodes, n_tensors);
+        fflush(stdout);
+    }
+
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
@@ -3343,6 +3365,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (device >= backends.size()) {
         return false;
     }
+    std::unique_lock<std::mutex> graph_lock(*graph_compute_mutexes[device]);
+
     auto it = stored_graphs[device].find(request.graph_uid);
     if (it == stored_graphs[device].end() || it->second.graph == nullptr) {
         return false;
@@ -3376,6 +3400,12 @@ bool rpc_server::graph_recompute_snapshot(
     if (request.device >= backends.size() || request.slot >= 2) {
         return false;
     }
+
+    // Keep the lock through snapshot_tensor_direct(): the graph output buffer
+    // must not be overwritten by another recompute before it is copied into
+    // the snapshot slot.
+    std::unique_lock<std::mutex> graph_lock(
+        *graph_compute_mutexes[request.device]);
 
     auto it = stored_graphs[request.device].find(request.graph_uid);
     if (it == stored_graphs[request.device].end() || it->second.graph == nullptr) {
