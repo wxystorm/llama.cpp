@@ -4096,13 +4096,16 @@ bool rpc_server::set_tensor_from_local_file(
 
     // OpenCL quantized set_tensor performs layout conversion and replaces the
     // generic extra with a type-specific object. It is therefore not a safe
-    // partial/repeated write primitive. Only permit one complete destination
-    // overwrite; other backends keep the existing 2D behavior unchanged.
-    if (is_opencl_tensor(tensor) &&
-        ggml_is_quantized(tensor->type) &&
-        (request.n_copies != 1 ||
-         request.dst_offset != 0 ||
-         request.copy_size != tensor_nbytes)) {
+    // partial/repeated write primitive. Gather a complete destination before
+    // writing once; other backends keep the existing 2D behavior unchanged.
+    const bool opencl_quantized =
+        is_opencl_tensor(tensor) && ggml_is_quantized(tensor->type);
+    const bool complete_destination =
+        request.dst_offset == 0 &&
+        (request.n_copies == 1 || request.dst_stride == request.copy_size) &&
+        tensor_nbytes % request.copy_size == 0 &&
+        tensor_nbytes / request.copy_size == request.n_copies;
+    if (opencl_quantized && !complete_destination) {
         GGML_LOG_ERROR(
             "[RPC_OPENCL_EXTRA] action=REJECT_PARTIAL_QUANT_SET "
             "name=%s type=%d dst_offset=%" PRIu64
@@ -4201,23 +4204,27 @@ bool rpc_server::set_tensor_from_local_file(
         }
     }
 
-    /*
-     * 每次只申请一行/一个 chunk 的临时空间。
-     *
-     * 不需要申请 copy_size * n_copies，
-     * 因为源张量中这些区域可能并不连续。
-     */
+    // Even without source metadata, do not allow source offset arithmetic to wrap.
+    if (opencl_quantized && !range_2d_fits(
+            request.src_offset, request.copy_size, request.n_copies,
+            request.src_stride, UINT64_MAX)) {
+        return false;
+    }
+
+    // Quantized OpenCL writes need the whole shard for layout conversion.
+    // Other backends retain one-row staging and incremental writes.
+    const size_t staging_size = static_cast<size_t>(
+        opencl_quantized ? tensor_nbytes : request.copy_size);
     std::vector<uint8_t> staging;
 
     try {
-        staging.resize(
-            static_cast<size_t>(request.copy_size));
+        staging.resize(staging_size);
     } catch (const std::bad_alloc &) {
         GGML_LOG_ERROR(
             "[%s] failed to allocate %" PRIu64
             " staging bytes\n",
             __func__,
-            request.copy_size);
+            static_cast<uint64_t>(staging_size));
         return false;
     }
 
@@ -4259,8 +4266,8 @@ bool rpc_server::set_tensor_from_local_file(
                 local_tensor_source.user_data,
                 name.c_str(),
                 src_i,
-                staging.data(),
-                staging.size())) {
+                staging.data() + (opencl_quantized ? static_cast<size_t>(dst_i) : 0),
+                static_cast<size_t>(request.copy_size))) {
 
             GGML_LOG_ERROR(
                 "[%s] failed to read local tensor: "
@@ -4279,12 +4286,25 @@ bool rpc_server::set_tensor_from_local_file(
          * tensor->data 已经是远端目标张量基址。
          * dst_i 是相对于该基址的目标偏移。
          */
-        ggml_backend_tensor_set(
-            tensor,
-            staging.data(),
-            static_cast<size_t>(dst_i),
-            staging.size());
+        if (!opencl_quantized) {
+            ggml_backend_tensor_set(
+                tensor,
+                staging.data(),
+                static_cast<size_t>(dst_i),
+                staging.size());
+            remember_opencl_tensor_extra(tensor);
+        }
+    }
+
+    if (opencl_quantized) {
+        ggml_backend_tensor_set(tensor, staging.data(), 0, staging.size());
         remember_opencl_tensor_extra(tensor);
+        if (rpc_opencl_extra_debug_enabled()) {
+            GGML_LOG_ERROR(
+                "[RPC_OPENCL_EXTRA] action=SET_QUANT_FULL_STAGED "
+                "name=%s bytes=%zu n_copies=%" PRIu64 "\n",
+                tensor->name, staging.size(), request.n_copies);
+        }
     }
 
     GGML_LOG_DEBUG(
