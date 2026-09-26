@@ -6369,6 +6369,35 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+static void ggml_opencl_trace_tensor(int node_idx, const char * role, const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        fprintf(stderr, "[OPENCL_TENSOR] i=%d role=%s tensor=(null)\n", node_idx, role);
+        return;
+    }
+
+    fprintf(
+        stderr,
+        "[OPENCL_TENSOR] i=%d role=%s tensor=%p op=%s type=%s name='%s' "
+        "buffer=%p data=%p extra=%p view=%p view_extra=%p view_offs=%zu "
+        "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "nb=[%zu,%zu,%zu,%zu] flags=0x%x\n",
+        node_idx,
+        role,
+        (const void *) tensor,
+        ggml_op_name(tensor->op),
+        ggml_type_name(tensor->type),
+        tensor->name,
+        (void *) tensor->buffer,
+        tensor->data,
+        tensor->extra,
+        (const void *) tensor->view_src,
+        tensor->view_src != nullptr ? tensor->view_src->extra : nullptr,
+        tensor->view_offs,
+        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+        tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+        (unsigned) tensor->flags);
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     const bool rpc_trace = std::getenv("GGML_OPENCL_RPC_TRACE") != nullptr;
@@ -6409,6 +6438,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 node != nullptr ? (const void *) node->view_src : nullptr,
                 node != nullptr && node->view_src != nullptr ? node->view_src->extra : nullptr,
                 node != nullptr ? node->flags : 0u);
+            ggml_opencl_trace_tensor(i, "node", node);
+            ggml_opencl_trace_tensor(i, "src0", s0);
+            ggml_opencl_trace_tensor(i, "src1", s1);
+            ggml_opencl_trace_tensor(i, "src2", s2);
             fflush(stderr);
         }
 
@@ -7355,8 +7388,8 @@ struct ggml_backend_opencl_buffer_context {
         }
         temp_tensor_extras_q6_K_in_use.clear();
 
-        q8_0_soa_tensors.clear();
-        q4_0_soa_tensors.clear();
+        q8_0_soa_extras.clear();
+        q4_0_soa_extras.clear();
     }
 
     // Pools for extras. Available extras are in `temp_tensor_extras`. Extras
@@ -7393,12 +7426,15 @@ struct ggml_backend_opencl_buffer_context {
     // Two types of tensors get SOA'ed - normal weights and MoE weights.
     // In Q8_0's case, we only have normal weights. If we ever have Q8_0 as MoE
     // weights, they need to be added to this set in `set_tensors`.
-    std::unordered_set<const ggml_tensor *> q8_0_soa_tensors;
+    // Use backend-private extra identity rather than ggml_tensor* identity.
+    // RPC reconstructs temporary ggml_tensor objects for each graph, while the
+    // specialized OpenCL extra attached to the persistent weight stays stable.
+    std::unordered_set<const void *> q8_0_soa_extras;
 
     // Same for q4_0. KV-cache q4_0 tensors are allocated but never pass
     // through set_tensor, so they stay AoS and aren't in this set.
     // In Q4_0's case, in addition to normal weights, we have MoE weights.
-    std::unordered_set<const ggml_tensor *> q4_0_soa_tensors;
+    std::unordered_set<const void *> q4_0_soa_extras;
 
     // The buffer_context is initially created by ggml_backend_buft_alloc_buffer
     // before any tensor is initialized (at the beginning of alloc_tensor_range).
@@ -7651,7 +7687,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
             tensor->extra = extra;
             // MoE tensors are also SOA'ed
-            ctx->q4_0_soa_tensors.insert(tensor);
+            ctx->q4_0_soa_extras.insert(tensor->extra);
 
             return;
         }
@@ -7680,7 +7716,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q4_0_soa_tensors.insert(tensor);
+        ctx->q4_0_soa_extras.insert(tensor->extra);
 
         // transpose the weights and scales
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -8292,7 +8328,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
-        ctx->q8_0_soa_tensors.insert(tensor);
+        ctx->q8_0_soa_extras.insert(tensor->extra);
 
         // Transpose the weights and scales
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -10651,7 +10687,7 @@ static bool ggml_cl_is_q8_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q8_0_soa_tensors.count(key) > 0;
+    return key->extra != nullptr && ctx->q8_0_soa_extras.count(key->extra) > 0;
 }
 
 // check if a Q4_0 tensor has been SOA'ed in set_tensor
@@ -10665,7 +10701,7 @@ static bool ggml_cl_is_q4_0_soa(const ggml_tensor * tensor) {
         return false;
     }
     const ggml_tensor * key = tensor->view_src != nullptr ? tensor->view_src : tensor;
-    return ctx->q4_0_soa_tensors.count(key) > 0;
+    return key->extra != nullptr && ctx->q4_0_soa_extras.count(key->extra) > 0;
 }
 
 static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

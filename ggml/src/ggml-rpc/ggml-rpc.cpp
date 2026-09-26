@@ -27,6 +27,11 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
+static bool rpc_tensor_extra_trace_enabled() {
+    return RPC_DEBUG != nullptr ||
+           std::getenv("GGML_OPENCL_RPC_TRACE") != nullptr ||
+           std::getenv("GGML_RPC_TENSOR_EXTRA_TRACE") != nullptr;
+}
 
 namespace fs = std::filesystem;
 
@@ -1031,6 +1036,14 @@ static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
     }
 
     return false;
+}
+
+static bool rpc_is_opencl_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_buffer_name(buffer);
+    return name != nullptr && strcmp(name, "OpenCL") == 0;
 }
 
 static ggml_backend_local_file_result
@@ -2410,13 +2423,31 @@ bool rpc_server::restore_tensor_extra(ggml_tensor * tensor) {
     std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
     const auto it = tensor_extras.find(key);
     if (it == tensor_extras.end()) {
+        if (rpc_tensor_extra_trace_enabled()) {
+            fprintf(
+                stderr,
+                "[RPC_TENSOR_EXTRA] action=MISS name='%s' type=%s buffer=%p data=%p\n",
+                tensor->name,
+                ggml_type_name(tensor->type),
+                (void *) tensor->buffer,
+                tensor->data);
+            fflush(stderr);
+        }
         return false;
     }
 
     tensor->extra = it->second;
-    LOG_DBG(
-        "[RPC_TENSOR_EXTRA] action=RESTORE name=%s buffer=%p data=%p extra=%p\n",
-        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+    if (rpc_tensor_extra_trace_enabled()) {
+        fprintf(
+            stderr,
+            "[RPC_TENSOR_EXTRA] action=RESTORE name='%s' type=%s buffer=%p data=%p extra=%p\n",
+            tensor->name,
+            ggml_type_name(tensor->type),
+            (void *) tensor->buffer,
+            tensor->data,
+            tensor->extra);
+        fflush(stderr);
+    }
     return true;
 }
 
@@ -2430,9 +2461,17 @@ void rpc_server::remember_tensor_extra(ggml_tensor * tensor) {
         std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
         tensor_extras[key] = tensor->extra;
     }
-    LOG_DBG(
-        "[RPC_TENSOR_EXTRA] action=REMEMBER name=%s buffer=%p data=%p extra=%p\n",
-        tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+    if (rpc_tensor_extra_trace_enabled()) {
+        fprintf(
+            stderr,
+            "[RPC_TENSOR_EXTRA] action=REMEMBER name='%s' type=%s buffer=%p data=%p extra=%p\n",
+            tensor->name,
+            ggml_type_name(tensor->type),
+            (void *) tensor->buffer,
+            tensor->data,
+            tensor->extra);
+        fflush(stderr);
+    }
 }
 
 bool rpc_server::ensure_tensor_extra(ggml_tensor * tensor) {
@@ -2461,9 +2500,17 @@ bool rpc_server::ensure_tensor_extra(ggml_tensor * tensor) {
 
     if (tensor->extra != nullptr) {
         remember_tensor_extra(tensor);
-        LOG_DBG(
-            "[RPC_TENSOR_EXTRA] action=INIT name=%s buffer=%p data=%p extra=%p\n",
-            tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
+        if (rpc_tensor_extra_trace_enabled()) {
+            fprintf(
+                stderr,
+                "[RPC_TENSOR_EXTRA] action=INIT name='%s' type=%s buffer=%p data=%p extra=%p\n",
+                tensor->name,
+                ggml_type_name(tensor->type),
+                (void *) tensor->buffer,
+                tensor->data,
+                tensor->extra);
+            fflush(stderr);
+        }
     }
     return true;
 }
@@ -2483,7 +2530,21 @@ bool rpc_server::set_tensor_with_extra(
         return false;
     }
 
+    void * extra_before = tensor->extra;
     ggml_backend_tensor_set(tensor, data, offset, size);
+
+    if (rpc_tensor_extra_trace_enabled()) {
+        fprintf(
+            stderr,
+            "[RPC_TENSOR_SET] name='%s' type=%s offset=%zu size=%zu extra_before=%p extra_after=%p\n",
+            tensor->name,
+            ggml_type_name(tensor->type),
+            offset,
+            size,
+            extra_before,
+            tensor->extra);
+        fflush(stderr);
+    }
 
     // Quantized accelerator backends can replace the generic allocation extra
     // with a type-specific object during set_tensor. Persist the final pointer
@@ -3242,7 +3303,29 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     // images), or initialize scratch/view metadata after view_src is linked.
     if (result->buffer != nullptr) {
         std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
-        if (!ensure_tensor_extra(result)) {
+
+        const bool persistent_opencl_quantized_weight =
+            rpc_is_opencl_buffer(result->buffer) &&
+            ggml_is_quantized(result->type) &&
+            should_use_local_file_tensor(result);
+
+        if (persistent_opencl_quantized_weight) {
+            // Model weights have already passed through OpenCL set_tensor(),
+            // which may replace the generic extra with a type-specific layout
+            // object (Q4_K/Q6_K/etc.). Reinitializing a missing entry here would
+            // create a generic ggml_tensor_extra_cl and later quantized matmul
+            // code would reinterpret it as the specialized type.
+            if (!restore_tensor_extra(result)) {
+                GGML_LOG_ERROR(
+                    "[RPC_TENSOR_EXTRA_FATAL] missing OpenCL quantized weight state "
+                    "name='%s' type=%s buffer=%p data=%p\n",
+                    result->name,
+                    ggml_type_name(result->type),
+                    (void *) result->buffer,
+                    result->data);
+                return nullptr;
+            }
+        } else if (!ensure_tensor_extra(result)) {
             GGML_LOG_ERROR(
                 "[%s] failed to initialize backend tensor state for node '%s'\n",
                 __func__, result->name);
@@ -3585,13 +3668,6 @@ bool rpc_server::set_tensor_from_local_file(
         return false;
     }
 
-    if (!ensure_tensor_extra(tensor)) {
-        GGML_LOG_ERROR(
-            "[%s] failed to initialize backend tensor state for '%s'\n",
-            __func__, tensor->name);
-        return false;
-    }
-
     if (local_tensor_source.read == nullptr) {
         GGML_LOG_ERROR(
             "[%s] no local tensor source registered\n",
@@ -3613,6 +3689,43 @@ bool rpc_server::set_tensor_from_local_file(
     const std::string name(
         request.tensor.name,
         name_len);
+
+    const uint64_t tensor_nbytes =
+        static_cast<uint64_t>(ggml_nbytes(tensor));
+
+    // OpenCL quantized set_tensor() converts the complete weight into a
+    // backend-specific layout and may read ggml_nbytes(tensor) regardless of
+    // the requested fragment size. Only use the server-local fast path for a
+    // complete one-shot tensor load; otherwise ask the client to fall back to
+    // the ordinary transfer path.
+    if (rpc_is_opencl_buffer(tensor->buffer) &&
+        ggml_is_quantized(tensor->type) &&
+        (request.n_copies != 1 ||
+         request.src_offset != 0 ||
+         request.dst_offset != 0 ||
+         request.copy_size != tensor_nbytes)) {
+        GGML_LOG_INFO(
+            "[RPC_LOCAL_OPENCL_QUANT] action=FALLBACK name='%s' type=%s "
+            "src_offset=%" PRIu64 " dst_offset=%" PRIu64
+            " copy_size=%" PRIu64 " n_copies=%" PRIu64
+            " tensor_size=%" PRIu64 "\n",
+            name.c_str(),
+            ggml_type_name(tensor->type),
+            request.src_offset,
+            request.dst_offset,
+            request.copy_size,
+            request.n_copies,
+            tensor_nbytes);
+        response.result = 0;
+        return true;
+    }
+
+    if (!ensure_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize backend tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
 
     // Quantized accelerator backends such as OpenCL transform the complete
     // tensor in a single set_tensor call and may replace tensor->extra with a
@@ -3636,6 +3749,7 @@ bool rpc_server::set_tensor_from_local_file(
      */
     if (request.n_copies == 0 ||
         request.copy_size == 0) {
+        response.result = 1;
         return true;
     }
 
@@ -3654,9 +3768,6 @@ bool rpc_server::set_tensor_from_local_file(
             name.c_str());
         return false;
     }
-
-    const uint64_t tensor_nbytes =
-        static_cast<uint64_t>(ggml_nbytes(tensor));
 
     /*
      * 验证最后一次目标写入不会越过局部目标张量。
