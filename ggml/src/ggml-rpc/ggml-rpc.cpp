@@ -2334,6 +2334,11 @@ private:
     rpc_tensor_extra_key tensor_extra_key(const ggml_tensor * tensor) const;
     bool restore_tensor_extra(ggml_tensor * tensor);
     bool ensure_tensor_extra(ggml_tensor * tensor);
+    bool set_tensor_with_extra(
+        ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size);
     void remember_tensor_extra(ggml_tensor * tensor);
     void erase_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -2346,6 +2351,7 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::mutex buffers_mutex;
 
     // Backend-private tensor state (for example OpenCL cl_mem/subbuffer/image
     // handles) is not serialized by RPC. Keep non-owning pointers here and
@@ -2354,7 +2360,10 @@ private:
         rpc_tensor_extra_key,
         void *,
         rpc_tensor_extra_key_hash> tensor_extras;
-    std::mutex tensor_extras_mutex;
+    // RPC serves several sockets concurrently. OpenCL init/set tensor mutate
+    // backend-owned tensor-extra pools, so the state transition must be
+    // serialized across those threads.
+    std::recursive_mutex tensor_extras_mutex;
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -2392,7 +2401,7 @@ bool rpc_server::restore_tensor_extra(ggml_tensor * tensor) {
     }
 
     const rpc_tensor_extra_key key = tensor_extra_key(tensor);
-    std::lock_guard<std::mutex> lock(tensor_extras_mutex);
+    std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
     const auto it = tensor_extras.find(key);
     if (it == tensor_extras.end()) {
         return false;
@@ -2412,7 +2421,7 @@ void rpc_server::remember_tensor_extra(ggml_tensor * tensor) {
 
     const rpc_tensor_extra_key key = tensor_extra_key(tensor);
     {
-        std::lock_guard<std::mutex> lock(tensor_extras_mutex);
+        std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
         tensor_extras[key] = tensor->extra;
     }
     LOG_DBG(
@@ -2421,6 +2430,7 @@ void rpc_server::remember_tensor_extra(ggml_tensor * tensor) {
 }
 
 bool rpc_server::ensure_tensor_extra(ggml_tensor * tensor) {
+    std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         return false;
     }
@@ -2452,9 +2462,33 @@ bool rpc_server::ensure_tensor_extra(ggml_tensor * tensor) {
     return true;
 }
 
+bool rpc_server::set_tensor_with_extra(
+        ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size) {
+    std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
+
+    if (!ensure_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[RPC_TENSOR_EXTRA] failed to initialize backend tensor state "
+            "for '%s' before set_tensor\n",
+            tensor != nullptr ? tensor->name : "(null)");
+        return false;
+    }
+
+    ggml_backend_tensor_set(tensor, data, offset, size);
+
+    // Quantized accelerator backends can replace the generic allocation extra
+    // with a type-specific object during set_tensor. Persist the final pointer
+    // before any other RPC socket thread can restore this tensor.
+    remember_tensor_extra(tensor);
+    return true;
+}
+
 void rpc_server::erase_tensor_extras_for_buffer(
         ggml_backend_buffer_t buffer) {
-    std::lock_guard<std::mutex> lock(tensor_extras_mutex);
+    std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
     for (auto it = tensor_extras.begin(); it != tensor_extras.end();) {
         if (it->first.buffer == buffer) {
             it = tensor_extras.erase(it);
@@ -2517,7 +2551,10 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
         GGML_LOG_INFO("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        {
+            std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
+            buffers.insert(buffer);
+        }
     } else {
         //LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -2551,6 +2588,7 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
@@ -2563,19 +2601,23 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
-        GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
-        return false;
+    {
+        std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
+        if (buffers.find(buffer) == buffers.end()) {
+            GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+            return false;
+        }
+        buffers.erase(buffer);
     }
     erase_tensor_extras_for_buffer(buffer);
     ggml_backend_buffer_free(buffer);
-    buffers.erase(buffer);
     return true;
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
@@ -2610,8 +2652,11 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
-        result->buffer = nullptr;
+    if (result->buffer) {
+        std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
+        if (buffers.find(result->buffer) == buffers.end()) {
+            result->buffer = nullptr;
+        }
     }
 
     if (result->buffer) {
@@ -2698,19 +2743,7 @@ bool rpc_server::set_tensor_direct(
         }
     }
 
-    if (!ensure_tensor_extra(tensor)) {
-        GGML_LOG_ERROR(
-            "[%s] failed to initialize backend tensor state for '%s'\n",
-            __func__, tensor->name);
-        return false;
-    }
-
-    ggml_backend_tensor_set(tensor, data, offset, size);
-
-    // Some backends (notably OpenCL quantized weights) replace the generic
-    // extra created by init_tensor with a type-specific object in set_tensor.
-    remember_tensor_extra(tensor);
-    return true;
+    return set_tensor_with_extra(tensor, data, offset, size);
 }
 
 bool rpc_server::set_tensor_recompute_snapshot(const std::vector<uint8_t> & input) {
@@ -2794,15 +2827,13 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    if (!ensure_tensor_extra(tensor)) {
-        GGML_LOG_ERROR(
-            "[%s] failed to initialize backend tensor state for '%s'\n",
-            __func__, tensor->name);
+    if (!set_tensor_with_extra(
+            tensor,
+            cached_file.data(),
+            request.offset,
+            size)) {
         return false;
     }
-
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
-    remember_tensor_extra(tensor);
     response.result = 1;
     return true;
 }
@@ -2831,10 +2862,13 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     // metadata cannot live in the temporary tensor object itself. Initialize
     // it once and keep the resulting pointer in tensor_extras for later SET,
     // GET, COPY, snapshot and graph reconstruction calls.
-    if (!ensure_tensor_extra(tensor)) {
-        return false;
+    {
+        std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
+        if (!ensure_tensor_extra(tensor)) {
+            return false;
+        }
+        remember_tensor_extra(tensor);
     }
-    remember_tensor_extra(tensor);
     return true;
 }
 
@@ -3196,13 +3230,16 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 
     // Restore weight-specific backend state (e.g. OpenCL Q4_K subbuffers and
     // images), or initialize scratch/view metadata after view_src is linked.
-    if (result->buffer != nullptr && !ensure_tensor_extra(result)) {
-        GGML_LOG_ERROR(
-            "[%s] failed to initialize backend tensor state for node '%s'\n",
-            __func__, result->name);
-        return nullptr;
+    if (result->buffer != nullptr) {
+        std::lock_guard<std::recursive_mutex> state_lock(tensor_extras_mutex);
+        if (!ensure_tensor_extra(result)) {
+            GGML_LOG_ERROR(
+                "[%s] failed to initialize backend tensor state for node '%s'\n",
+                __func__, result->name);
+            return nullptr;
+        }
+        remember_tensor_extra(result);
     }
-    remember_tensor_extra(result);
     return result;
 }
 
@@ -3413,10 +3450,16 @@ rpc_server::~rpc_server() {
             lane, stats.requests, stats.ready_wait_us / 1000.0, stats.send_us / 1000.0, stats.bytes);
     }
     {
-        std::lock_guard<std::mutex> lock(tensor_extras_mutex);
+        std::lock_guard<std::recursive_mutex> lock(tensor_extras_mutex);
         tensor_extras.clear();
     }
-    for (auto buffer : buffers) {
+    std::vector<ggml_backend_buffer_t> buffers_to_free;
+    {
+        std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
+        buffers_to_free.assign(buffers.begin(), buffers.end());
+        buffers.clear();
+    }
+    for (auto buffer : buffers_to_free) {
         ggml_backend_buffer_free(buffer);
     }
 }
@@ -3709,13 +3752,13 @@ bool rpc_server::set_tensor_from_local_file(
          * tensor->data 已经是远端目标张量基址。
          * dst_i 是相对于该基址的目标偏移。
          */
-        ggml_backend_tensor_set(
-            tensor,
-            staging.data(),
-            static_cast<size_t>(dst_i),
-            staging.size());
-
-        remember_tensor_extra(tensor);
+        if (!set_tensor_with_extra(
+                tensor,
+                staging.data(),
+                static_cast<size_t>(dst_i),
+                staging.size())) {
+            return false;
+        }
     }
 
     GGML_LOG_DEBUG(
