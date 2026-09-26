@@ -2653,19 +2653,23 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
     if (result->buffer) {
+        // Keep registration validation and buffer metadata reads in one
+        // critical section so free_buffer cannot remove/free the object between
+        // the lookup and get_base/get_size.
         std::lock_guard<std::mutex> buffers_lock(buffers_mutex);
         if (buffers.find(result->buffer) == buffers.end()) {
             result->buffer = nullptr;
+        } else {
+            const uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
+            const uint64_t buffer_start =
+                (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+            const uint64_t buffer_size =
+                (uint64_t) ggml_backend_buffer_get_size(result->buffer);
+            GGML_ASSERT(tensor->data + tensor_size >= tensor->data);
+            GGML_ASSERT(
+                tensor->data >= buffer_start &&
+                tensor->data + tensor_size <= buffer_start + buffer_size);
         }
-    }
-
-    if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
-        uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
     }
 
     result->op = (ggml_op) tensor->op;
