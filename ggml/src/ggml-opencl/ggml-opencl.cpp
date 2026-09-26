@@ -6372,6 +6372,82 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Keep node-level tracing opt-in because synchronizing after every OpenCL
+    // op is intentionally expensive and changes timing. Reuse the RPC/OpenCL
+    // extra debug switch as well so the current RPC debugging command line
+    // automatically gets deterministic per-node fault localization.
+    const bool node_debug =
+        std::getenv("GGML_OPENCL_NODE_DEBUG") != nullptr ||
+        std::getenv("GGML_RPC_OPENCL_EXTRA_DEBUG") != nullptr;
+
+    auto log_node_begin = [&](int index, const ggml_tensor * node, const char * mode) {
+        if (!node_debug) {
+            return;
+        }
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        const ggml_tensor * src2 = node->src[2];
+
+        GGML_LOG_ERROR(
+            "[OPENCL_NODE_BEGIN] uid=%" PRIu64 " idx=%d/%d mode=%s "
+            "op=%s name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "dst_extra=%p "
+            "src0=%p src0_type=%s src0_extra=%p "
+            "src1=%p src1_type=%s src1_extra=%p "
+            "src2=%p src2_type=%s src2_extra=%p\n",
+            cgraph->uid,
+            index,
+            cgraph->n_nodes,
+            mode,
+            ggml_op_name(node->op),
+            node->name,
+            ggml_type_name(node->type),
+            node->ne[0],
+            node->ne[1],
+            node->ne[2],
+            node->ne[3],
+            node->extra,
+            (const void *) src0,
+            src0 != nullptr ? ggml_type_name(src0->type) : "null",
+            src0 != nullptr ? src0->extra : nullptr,
+            (const void *) src1,
+            src1 != nullptr ? ggml_type_name(src1->type) : "null",
+            src1 != nullptr ? src1->extra : nullptr,
+            (const void *) src2,
+            src2 != nullptr ? ggml_type_name(src2->type) : "null",
+            src2 != nullptr ? src2->extra : nullptr);
+        fflush(stderr);
+    };
+
+    auto sync_debug_node = [&](int index, const ggml_tensor * node, const char * mode) {
+        if (!node_debug) {
+            return;
+        }
+
+        GGML_LOG_ERROR(
+            "[OPENCL_NODE_SYNC_BEGIN] uid=%" PRIu64 " idx=%d op=%s mode=%s\n",
+            cgraph->uid,
+            index,
+            ggml_op_name(node->op),
+            mode);
+        fflush(stderr);
+
+        // OpenCL launches are asynchronous. Force completion only in debug mode
+        // so the final BEGIN/SYNC_BEGIN line identifies the actual failing op
+        // instead of a later node that happened to run before the driver fault
+        // became visible.
+        ggml_backend_synchronize(backend);
+
+        GGML_LOG_ERROR(
+            "[OPENCL_NODE_DONE] uid=%" PRIu64 " idx=%d op=%s mode=%s\n",
+            cgraph->uid,
+            index,
+            ggml_op_name(node->op),
+            mode);
+        fflush(stderr);
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -6389,26 +6465,50 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const int fused_i = i;
+            log_node_begin(fused_i, node, "FUSED_NORM_MUL_ADD");
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            sync_debug_node(fused_i, node, "FUSED_NORM_MUL_ADD");
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            const int fused_i = i;
+            log_node_begin(fused_i, node, "FUSED_GROUP_NORM_MUL_ADD");
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+            sync_debug_node(fused_i, node, "FUSED_GROUP_NORM_MUL_ADD");
             i += 2;
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            const int fused_i = i;
+            log_node_begin(fused_i, node, "FUSED_RMS_NORM_MUL");
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+            sync_debug_node(fused_i, node, "FUSED_RMS_NORM_MUL");
             i++;
             continue;
         }
 
+        log_node_begin(i, node, "DIRECT");
+
         bool ok = ggml_cl_compute_forward(backend, node);
+
+        if (node_debug) {
+            GGML_LOG_ERROR(
+                "[OPENCL_NODE_DISPATCH] uid=%" PRIu64 " idx=%d op=%s ok=%d\n",
+                cgraph->uid,
+                i,
+                ggml_op_name(node->op),
+                ok ? 1 : 0);
+            fflush(stderr);
+        }
+
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+
+        sync_debug_node(i, node, "DIRECT");
     }
 
     return GGML_STATUS_SUCCESS;
