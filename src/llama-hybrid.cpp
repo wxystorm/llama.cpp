@@ -5122,6 +5122,15 @@ static bool llama_hybrid_profile_moe_ffn_point(
     ggml_tensor * w_down = ggml_new_tensor_3d(
         ctx.get(), desc.down_exps_type, n_ff_shard, desc.n_embd, desc.n_expert);
 
+    // OpenCL Adreno MoE dispatch identifies expert weights by the same naming
+    // convention used by real model tensors. Keep synthetic HYBRID_PROFILE
+    // weights named as ffn_*_exps so RPC graph serialization does not turn
+    // them into anonymous leaf_N tensors and accidentally bypass the Q4_K/
+    // Q5_K/Q6_K MoE kernels.
+    ggml_set_name(w_gate, "ffn_gate_exps_probe");
+    ggml_set_name(w_up,   "ffn_up_exps_probe");
+    ggml_set_name(w_down, "ffn_down_exps_probe");
+
     ggml_tensor * input3 = ggml_reshape_3d(
         ctx.get(), input, desc.n_embd, 1, tokens);
     ggml_tensor * gate = ggml_mul_mat_id(ctx.get(), w_gate, input3, ids);
@@ -5270,6 +5279,10 @@ static bool llama_hybrid_profile_moe_decode_ratio_block_point(
         ggml_tensor * w_down = ggml_new_tensor_3d(
             ctx.get(), desc.down_exps_type,
             n_ff_shard, desc.n_embd, desc.n_expert);
+
+        ggml_set_name(w_gate, "ffn_gate_exps_probe");
+        ggml_set_name(w_up,   "ffn_up_exps_probe");
+        ggml_set_name(w_down, "ffn_down_exps_probe");
 
         ggml_tensor * logits =
             ggml_mul_mat(ctx.get(), router_w, cur);
@@ -6161,6 +6174,10 @@ static bool llama_hybrid_profile_moe_branch_block_point(
             ctx.get(), moe_desc.down_exps_type,
             moe_desc.n_ff_exp, moe_desc.n_embd,
             moe_desc.n_expert);
+
+        ggml_set_name(w_gate, "ffn_gate_exps_probe");
+        ggml_set_name(w_up,   "ffn_up_exps_probe");
+        ggml_set_name(w_down, "ffn_down_exps_probe");
 
         ggml_tensor * norm =
             ggml_rms_norm(ctx.get(), cur, attn_desc.rms_eps);
