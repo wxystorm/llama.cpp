@@ -20004,6 +20004,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_Q5_0: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -20182,6 +20190,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_Q5_1: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -20361,6 +20377,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_Q8_0: {
 #ifdef GGML_OPENCL_SOA_Q
@@ -20620,6 +20644,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_Q5_K: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -20800,6 +20832,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_Q6_K: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -20977,6 +21017,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 return;
             }
 #endif //GGML_OPENCL_USE_ADRENO_KERNELS
+            // UNSUPPORTED_MUL_MAT_ID_GUARD: these quantizations have no
+            // generic MUL_MAT_ID implementation. If the Adreno MoE predicate
+            // above did not match, falling through would reinterpret this
+            // tensor's backend-private extra as the next quantization type.
+            // Fail explicitly instead of passing bogus cl_mem handles.
+            GGML_ABORT(
+                "ggml_cl_mul_mat_id: unsupported %s tensor '%s' for this MoE path",
+                ggml_type_name(src0->type), src0->name);
         }
         case GGML_TYPE_MXFP4: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
