@@ -1009,6 +1009,16 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     RPC_STATUS_ASSERT(status);
 }
 */
+static bool rpc_is_k_quant_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K ||
+           type == GGML_TYPE_Q6_K;
+}
+
+static bool rpc_opencl_extra_debug_enabled() {
+    return std::getenv("GGML_RPC_OPENCL_EXTRA_DEBUG") != nullptr;
+}
+
 //用于判断是否需要传权重
 static bool should_use_local_file_tensor(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->name[0] == '\0') {
@@ -1108,6 +1118,21 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     const rpc_tensor serialized_tensor =
         serialize_tensor(tensor);
+
+    if (rpc_opencl_extra_debug_enabled() &&
+        rpc_is_k_quant_type(tensor->type)) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_CLIENT_SET_BEGIN] name=%s type=%d "
+            "local_buffer=%p remote_buffer=0x%" PRIx64
+            " data=0x%" PRIx64 " offset=%zu size=%zu\n",
+            tensor->name,
+            (int) tensor->type,
+            (void *) buffer,
+            serialized_tensor.buffer,
+            serialized_tensor.data,
+            offset,
+            size);
+    }
 
     if (ctx->device_ctx != nullptr) {
         auto & fused = ctx->device_ctx->fused_ffn;
@@ -1217,6 +1242,20 @@ static void ggml_backend_rpc_buffer_set_tensor(
         input.size());
 
     RPC_STATUS_ASSERT(status);
+
+    if (rpc_opencl_extra_debug_enabled() &&
+        rpc_is_k_quant_type(tensor->type)) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_CLIENT_SET_DONE] name=%s type=%d "
+            "remote_buffer=0x%" PRIx64 " data=0x%" PRIx64
+            " offset=%zu size=%zu\n",
+            tensor->name,
+            (int) tensor->type,
+            serialized_tensor.buffer,
+            serialized_tensor.data,
+            offset,
+            size);
+    }
 }
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -1777,6 +1816,23 @@ static void add_tensor(
             result.src[i] = 0;
         }
         result.flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+
+        if (rpc_opencl_extra_debug_enabled() &&
+            rpc_is_k_quant_type(tensor->type)) {
+            GGML_LOG_ERROR(
+                "[RPC_KQUANT_GRAPH_EXTERNAL] name=%s ptr=%p type=%d "
+                "local_buffer=%p remote_buffer=0x%" PRIx64
+                " data=0x%" PRIx64 " bytes=%zu view_src=%p\n",
+                tensor->name,
+                (void *) tensor,
+                (int) tensor->type,
+                (void *) tensor->buffer,
+                result.buffer,
+                result.data,
+                ggml_nbytes(tensor),
+                (void *) tensor->view_src);
+        }
+
         tensors.push_back(result);
         return;
     }
@@ -2932,6 +2988,24 @@ bool rpc_server::set_tensor_direct(
             in_tensor.name);
     }
 
+    const bool debug_k_quant =
+        rpc_opencl_extra_debug_enabled() &&
+        is_opencl_tensor(tensor) &&
+        rpc_is_k_quant_type(tensor->type);
+
+    if (debug_k_quant) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_SERVER_SET_BEGIN] name=%s type=%d "
+            "buffer=%p data=%p offset=%" PRIu64 " size=%zu extra=%p\n",
+            tensor->name,
+            (int) tensor->type,
+            (void *) tensor->buffer,
+            tensor->data,
+            offset,
+            size,
+            tensor->extra);
+    }
+
     // sanitize tensor->data
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
@@ -2953,9 +3027,31 @@ bool rpc_server::set_tensor_direct(
 
     ggml_backend_tensor_set(tensor, data, offset, size);
 
+    if (debug_k_quant) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_SERVER_SET_AFTER_BACKEND] name=%s type=%d "
+            "buffer=%p data=%p extra=%p\n",
+            tensor->name,
+            (int) tensor->type,
+            (void *) tensor->buffer,
+            tensor->data,
+            tensor->extra);
+    }
+
     // OpenCL quantized set_tensor may replace the generic extra with a
     // type-specific object. Preserve the post-write pointer.
     remember_opencl_tensor_extra(tensor);
+
+    if (debug_k_quant) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_SERVER_SET_REMEMBERED] name=%s type=%d "
+            "buffer=%p data=%p extra=%p\n",
+            tensor->name,
+            (int) tensor->type,
+            (void *) tensor->buffer,
+            tensor->data,
+            tensor->extra);
+    }
     return true;
 }
 
@@ -3371,6 +3467,26 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
         GGML_LOG_ERROR("[%s] error deserializing tensors\n", __func__);
         return false;
     }
+    const bool debug_k_quant =
+        rpc_opencl_extra_debug_enabled() &&
+        (rpc_is_k_quant_type(src->type) ||
+         rpc_is_k_quant_type(dst->type));
+
+    if (debug_k_quant) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_SERVER_COPY_BEGIN] "
+            "src_name=%s src_type=%d src_buffer=%p src_data=%p "
+            "dst_name=%s dst_type=%d dst_buffer=%p dst_data=%p\n",
+            src->name,
+            (int) src->type,
+            (void *) src->buffer,
+            src->data,
+            dst->name,
+            (int) dst->type,
+            (void *) dst->buffer,
+            dst->data);
+    }
+
     if (!ensure_opencl_tensor_extra(src) ||
         !ensure_opencl_tensor_extra(dst)) {
         GGML_LOG_ERROR(
@@ -3400,6 +3516,18 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
+
+    if (debug_k_quant) {
+        GGML_LOG_ERROR(
+            "[RPC_KQUANT_SERVER_COPY_DONE] result=%d "
+            "src_name=%s src_extra=%p dst_name=%s dst_extra=%p\n",
+            response.result ? 1 : 0,
+            src->name,
+            src->extra,
+            dst->name,
+            dst->extra);
+    }
+
     return true;
 }
 
