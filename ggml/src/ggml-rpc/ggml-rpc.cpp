@@ -2676,6 +2676,17 @@ bool rpc_server::ensure_opencl_tensor_extra(
         return true;
     }
 
+    // Meta may retain empty shards in RPC graphs. They have no uploaded
+    // weights or OpenCL extra, and OpenCL skips empty nodes at execution.
+    if (ggml_is_empty(tensor)) {
+        if (rpc_opencl_extra_debug_enabled()) {
+            GGML_LOG_ERROR(
+                "[RPC_OPENCL_EXTRA] action=SKIP_EMPTY name=%s type=%d\n",
+                tensor->name, (int) tensor->type);
+        }
+        return true;
+    }
+
     if (tensor->extra != nullptr || restore_opencl_tensor_extra(tensor)) {
         return true;
     }
