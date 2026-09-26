@@ -2473,6 +2473,62 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
     const auto storage_it =
         opencl_tensor_storage_extras.find(storage_key);
     if (storage_it == opencl_tensor_storage_extras.end()) {
+        // Report the nearest cached storage entry with the same buffer/type.
+        // This is intentionally diagnostics-only and remains OpenCL-local.
+        bool have_nearest = false;
+        uint64_t nearest_data = 0;
+        uint64_t nearest_delta = UINT64_MAX;
+        void * nearest_extra = nullptr;
+        bool nearest_ambiguous = false;
+        size_t same_buffer_type = 0;
+
+        for (const auto & entry : opencl_tensor_storage_extras) {
+            if (entry.first.buffer != storage_key.buffer ||
+                entry.first.type != storage_key.type) {
+                continue;
+            }
+
+            ++same_buffer_type;
+            const uint64_t candidate_data = entry.first.data;
+            const uint64_t delta =
+                candidate_data >= storage_key.data ?
+                    candidate_data - storage_key.data :
+                    storage_key.data - candidate_data;
+
+            if (!have_nearest || delta < nearest_delta) {
+                have_nearest = true;
+                nearest_data = candidate_data;
+                nearest_delta = delta;
+                nearest_extra = entry.second.extra;
+                nearest_ambiguous = entry.second.ambiguous;
+            }
+        }
+
+        if (have_nearest) {
+            GGML_LOG_ERROR(
+                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
+                "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
+                "same_buffer_type=%zu nearest_data=0x%" PRIx64
+                " delta=%" PRIu64 " nearest_extra=%p ambiguous=%d\n",
+                tensor->name,
+                (void *) tensor->buffer,
+                storage_key.data,
+                (int) tensor->type,
+                same_buffer_type,
+                nearest_data,
+                nearest_delta,
+                nearest_extra,
+                nearest_ambiguous ? 1 : 0);
+        } else {
+            GGML_LOG_ERROR(
+                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
+                "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
+                "same_buffer_type=0\n",
+                tensor->name,
+                (void *) tensor->buffer,
+                storage_key.data,
+                (int) tensor->type);
+        }
         return false;
     }
 
@@ -2517,25 +2573,32 @@ bool rpc_server::ensure_opencl_tensor_extra(
         return true;
     }
 
-    // During graph reconstruction, a model weight that has already gone
-    // through OpenCL quantized set_tensor must recover its type-specific extra.
-    // Creating a fresh generic extra here is unsafe: Q4_K/Q5_K/Q6_K kernels
-    // later reinterpret tensor->extra as their specialized layouts and may pass
-    // offsets or unrelated bytes to the driver as cl_mem handles.
-    //
-    // Views are exempt because OpenCL buffer_init_tensor safely reuses the
-    // already-restored parent view_src extra.
-    if (!allow_quantized_weight_init &&
+    // During graph reconstruction, K-quant leaf weights must recover the
+    // type-specific OpenCL extra produced by set_tensor. Scheduler/RPC graph
+    // reconstruction may rename them to "leaf_N", so model-name matching is
+    // not reliable here. A non-view GGML_OP_NONE K-quant tensor is a leaf
+    // storage tensor; letting it fall back to generic ggml_tensor_extra_cl
+    // would later reinterpret offset/size bytes as cl_mem handles.
+    const bool requires_k_quant_extra =
         tensor->view_src == nullptr &&
-        ggml_is_quantized(tensor->type) &&
-        should_use_local_file_tensor(tensor)) {
+        tensor->op == GGML_OP_NONE &&
+        (tensor->type == GGML_TYPE_Q4_K ||
+         tensor->type == GGML_TYPE_Q5_K ||
+         tensor->type == GGML_TYPE_Q6_K);
+
+    if (!allow_quantized_weight_init && requires_k_quant_extra) {
         GGML_LOG_ERROR(
-            "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_QUANT_WEIGHT "
-            "name=%s buffer=%p data=%p type=%d\n",
+            "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_K_QUANT_LEAF "
+            "name=%s buffer=%p data=%p type=%d ne=[%" PRId64 ",%" PRId64
+            ",%" PRId64 ",%" PRId64 "]\n",
             tensor->name,
             (void *) tensor->buffer,
             tensor->data,
-            (int) tensor->type);
+            (int) tensor->type,
+            tensor->ne[0],
+            tensor->ne[1],
+            tensor->ne[2],
+            tensor->ne[3]);
         return false;
     }
 
