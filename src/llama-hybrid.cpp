@@ -5679,9 +5679,6 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
     if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
         return false;
     }
-    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
-        return false;
-    }
 
     const size_t total_buffer = ggml_backend_buffer_get_size(buffer.get());
     size_t       weight_bytes = 0;
@@ -6014,6 +6011,9 @@ static bool llama_hybrid_profile_moe_router_point(
         return false;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
+    if (!llama_hybrid_prepare_rpc_quantized_probe_tensors(ctx.get(), backend)) {
+        return false;
+    }
 
     llama_hybrid_graph_timing timing;
     if (!llama_hybrid_profile_graph_timing(
