@@ -4299,6 +4299,26 @@ bool rpc_server::set_tensor_from_local_file(
     if (opencl_quantized) {
         ggml_backend_tensor_set(tensor, staging.data(), 0, staging.size());
         remember_opencl_tensor_extra(tensor);
+        const char * verify = std::getenv("GGML_RPC_VERIFY_QUANT_WEIGHTS");
+        if (verify != nullptr &&
+            (std::strcmp(verify, "1") == 0 || std::strstr(tensor->name, verify) != nullptr)) {
+            std::vector<uint8_t> readback(staging.size());
+            ggml_backend_tensor_get(tensor, readback.data(), 0, readback.size());
+            const auto mismatch = std::mismatch(staging.begin(), staging.end(), readback.begin());
+            if (mismatch.first != staging.end()) {
+                const size_t pos = static_cast<size_t>(mismatch.first - staging.begin());
+                GGML_LOG_ERROR(
+                    "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_MISMATCH "
+                    "name=%s type=%d offset=%zu expected=%u actual=%u bytes=%zu\n",
+                    tensor->name, (int) tensor->type, pos,
+                    (unsigned) staging[pos], (unsigned) readback[pos], staging.size());
+                response.result = 2;
+                return true;
+            }
+            GGML_LOG_ERROR(
+                "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_OK name=%s type=%d bytes=%zu\n",
+                tensor->name, (int) tensor->type, staging.size());
+        }
         if (rpc_opencl_extra_debug_enabled()) {
             GGML_LOG_ERROR(
                 "[RPC_OPENCL_EXTRA] action=SET_QUANT_FULL_STAGED "
