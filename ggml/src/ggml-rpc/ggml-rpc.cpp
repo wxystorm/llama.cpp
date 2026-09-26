@@ -3337,6 +3337,32 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         fflush(stdout);
     }
 
+    if (std::getenv("GGML_OPENCL_RPC_TRACE") != nullptr) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            const ggml_tensor * s0 = node != nullptr ? node->src[0] : nullptr;
+            const ggml_tensor * s1 = node != nullptr ? node->src[1] : nullptr;
+            const ggml_tensor * s2 = node != nullptr ? node->src[2] : nullptr;
+            printf(
+                "[RPC_GRAPH_NODE] i=%d node=%p op=%s type=%s name='%s'"
+                " extra=%p src0=%p/%p src1=%p/%p src2=%p/%p"
+                " view=%p/%p flags=0x%x\n",
+                i,
+                (const void *) node,
+                node != nullptr ? ggml_op_name(node->op) : "(null)",
+                node != nullptr ? ggml_type_name(node->type) : "(null)",
+                node != nullptr ? node->name : "(null)",
+                node != nullptr ? node->extra : nullptr,
+                (const void *) s0, s0 != nullptr ? s0->extra : nullptr,
+                (const void *) s1, s1 != nullptr ? s1->extra : nullptr,
+                (const void *) s2, s2 != nullptr ? s2->extra : nullptr,
+                node != nullptr ? (const void *) node->view_src : nullptr,
+                node != nullptr && node->view_src != nullptr ? node->view_src->extra : nullptr,
+                node != nullptr ? node->flags : 0u);
+        }
+        fflush(stdout);
+    }
+
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =

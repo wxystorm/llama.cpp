@@ -6371,44 +6371,174 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+    const bool rpc_trace = std::getenv("GGML_OPENCL_RPC_TRACE") != nullptr;
+
+    if (rpc_trace) {
+        fprintf(
+            stderr,
+            "[OPENCL_GRAPH_BEGIN] backend=%p ctx=%p graph=%p nodes=%d disable_fusion=%d\n",
+            (void *) backend,
+            (void *) backend_ctx,
+            (void *) cgraph,
+            cgraph != nullptr ? cgraph->n_nodes : -1,
+            backend_ctx != nullptr ? (int) backend_ctx->disable_fusion : -1);
+        fflush(stderr);
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        if (rpc_trace) {
+            const ggml_tensor * s0 = node != nullptr ? node->src[0] : nullptr;
+            const ggml_tensor * s1 = node != nullptr ? node->src[1] : nullptr;
+            const ggml_tensor * s2 = node != nullptr ? node->src[2] : nullptr;
+            fprintf(
+                stderr,
+                "[OPENCL_NODE_BEGIN] i=%d node=%p op=%s type=%s name='%s'"
+                " extra=%p src0=%p/%p src1=%p/%p src2=%p/%p"
+                " view=%p/%p flags=0x%x\n",
+                i,
+                (void *) node,
+                node != nullptr ? ggml_op_name(node->op) : "(null)",
+                node != nullptr ? ggml_type_name(node->type) : "(null)",
+                node != nullptr ? node->name : "(null)",
+                node != nullptr ? node->extra : nullptr,
+                (const void *) s0, s0 != nullptr ? s0->extra : nullptr,
+                (const void *) s1, s1 != nullptr ? s1->extra : nullptr,
+                (const void *) s2, s2 != nullptr ? s2->extra : nullptr,
+                node != nullptr ? (const void *) node->view_src : nullptr,
+                node != nullptr && node->view_src != nullptr ? node->view_src->extra : nullptr,
+                node != nullptr ? node->flags : 0u);
+            fflush(stderr);
+        }
 
         // NOTE: this may oversynchronize by synchronizing with
         //       backends/devices which don't compute 'cgraph's
         //       dependencies.
         sync_with_other_backends(backend);
 
+        if (rpc_trace) {
+            fprintf(stderr, "[OPENCL_NODE_AFTER_SYNC] i=%d\n", i);
+            fflush(stderr);
+        }
+
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_NODE_SKIP] i=%d reason=metadata_or_empty\n", i);
+                fflush(stderr);
+            }
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_NODE_SKIP] i=%d reason=compute_flag_clear\n", i);
+                fflush(stderr);
+            }
             continue;
         }
 
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
-            ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
-            i += 2;
-            continue;
+        if (!backend_ctx->disable_fusion) {
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=NORM_MUL_ADD begin\n", i);
+                fflush(stderr);
+            }
+            const bool fuse_norm =
+                ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD });
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=NORM_MUL_ADD result=%d\n", i, (int) fuse_norm);
+                fflush(stderr);
+            }
+            if (fuse_norm) {
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_BEGIN] i=%d kind=NORM_MUL_ADD\n", i);
+                    fflush(stderr);
+                }
+                ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_END] i=%d kind=NORM_MUL_ADD\n", i);
+                    fflush(stderr);
+                }
+                i += 2;
+                continue;
+            }
+
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=GROUP_NORM_MUL_ADD begin\n", i);
+                fflush(stderr);
+            }
+            const bool fuse_group =
+                ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD });
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=GROUP_NORM_MUL_ADD result=%d\n", i, (int) fuse_group);
+                fflush(stderr);
+            }
+            if (fuse_group) {
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_BEGIN] i=%d kind=GROUP_NORM_MUL_ADD\n", i);
+                    fflush(stderr);
+                }
+                ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_END] i=%d kind=GROUP_NORM_MUL_ADD\n", i);
+                    fflush(stderr);
+                }
+                i += 2;
+                continue;
+            }
+
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=RMS_NORM_MUL begin\n", i);
+                fflush(stderr);
+            }
+            const bool fuse_rms =
+                ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL });
+            if (rpc_trace) {
+                fprintf(stderr, "[OPENCL_FUSION_CHECK] i=%d kind=RMS_NORM_MUL result=%d\n", i, (int) fuse_rms);
+                fflush(stderr);
+            }
+            if (fuse_rms) {
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_BEGIN] i=%d kind=RMS_NORM_MUL\n", i);
+                    fflush(stderr);
+                }
+                ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
+                if (rpc_trace) {
+                    fprintf(stderr, "[OPENCL_FUSED_END] i=%d kind=RMS_NORM_MUL\n", i);
+                    fflush(stderr);
+                }
+                i++;
+                continue;
+            }
         }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
-            ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
-            i += 2;
-            continue;
-        }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-            ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
-            i++;
-            continue;
+
+        if (rpc_trace) {
+            fprintf(
+                stderr,
+                "[OPENCL_NODE_COMPUTE_BEGIN] i=%d op=%s name='%s'\n",
+                i, ggml_op_name(node->op), node->name);
+            fflush(stderr);
         }
 
         bool ok = ggml_cl_compute_forward(backend, node);
+
+        if (rpc_trace) {
+            fprintf(
+                stderr,
+                "[OPENCL_NODE_COMPUTE_END] i=%d op=%s ok=%d\n",
+                i, ggml_op_name(node->op), (int) ok);
+            fflush(stderr);
+        }
+
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (rpc_trace) {
+        fprintf(stderr, "[OPENCL_GRAPH_END] graph=%p\n", (void *) cgraph);
+        fflush(stderr);
     }
 
     return GGML_STATUS_SUCCESS;
