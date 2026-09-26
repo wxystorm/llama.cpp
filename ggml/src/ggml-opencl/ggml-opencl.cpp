@@ -609,6 +609,17 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_total_tiles;
     ggml_cl_buffer prealloc_slot_counter;
 
+    // Identity of the router indices currently materialized in the prealloc
+    // buffers above. The old path relied mostly on tensor names/toggle_reorder,
+    // which leaves the first anonymous/RPC synthetic MoE graph with null
+    // prealloc buffers and can also reuse a table for a different src2.
+    cl_mem   moe_router_cached_buffer = nullptr;
+    cl_ulong moe_router_cached_offset = 0;
+    int64_t  moe_router_cached_ne20   = 0;
+    int64_t  moe_router_cached_ne21   = 0;
+    size_t   moe_router_cached_nb0    = 0;
+    size_t   moe_router_cached_nb1    = 0;
+
     cl_program program_add;
     cl_program program_add_id;
     cl_program program_clamp;
@@ -19379,6 +19390,32 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 }
 
+static bool moe_router_reorder_needed(
+        const ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * src,
+        int ne20) {
+    GGML_ASSERT(src != nullptr);
+    GGML_ASSERT(src->extra != nullptr);
+
+    const ggml_tensor_extra_cl * extra =
+        (const ggml_tensor_extra_cl *) src->extra;
+    const cl_ulong offset = extra->offset + src->view_offs;
+
+    const bool buffers_ready =
+        backend_ctx->prealloc_post_router.buffer != nullptr &&
+        backend_ctx->prealloc_emap.buffer        != nullptr &&
+        backend_ctx->prealloc_total_tiles.buffer != nullptr;
+
+    return !buffers_ready ||
+           backend_ctx->toggle_reorder ||
+           backend_ctx->moe_router_cached_buffer != extra->data_device ||
+           backend_ctx->moe_router_cached_offset != offset ||
+           backend_ctx->moe_router_cached_ne20   != ne20 ||
+           backend_ctx->moe_router_cached_ne21   != src->ne[1] ||
+           backend_ctx->moe_router_cached_nb0    != src->nb[0] ||
+           backend_ctx->moe_router_cached_nb1    != src->nb[1];
+}
+
 static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20) {
     cl_int err;
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -19481,6 +19518,17 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
+
+    // The preprocessed router table now corresponds to this exact src2
+    // storage/layout. Subsequent gate/up/down MUL_MAT_ID ops in the same graph
+    // can reuse it; a different RPC graph/buffer will trigger a new reorder.
+    backend_ctx->moe_router_cached_buffer = extra->data_device;
+    backend_ctx->moe_router_cached_offset = offset;
+    backend_ctx->moe_router_cached_ne20   = ne20;
+    backend_ctx->moe_router_cached_ne21   = src->ne[1];
+    backend_ctx->moe_router_cached_nb0    = src->nb[0];
+    backend_ctx->moe_router_cached_nb1    = src->nb[1];
+    backend_ctx->toggle_reorder           = false;
 
     CL_CHECK(clReleaseMemObject(original_router_buf));
     CL_CHECK(clReleaseMemObject(hist_buf));
@@ -19659,9 +19707,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -19886,9 +19934,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -20077,9 +20125,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -20263,9 +20311,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -20530,9 +20578,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -20719,9 +20767,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -20906,9 +20954,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
@@ -21092,9 +21140,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) ||
+                        moe_router_reorder_needed(backend_ctx, src2, ne20)) {
                         moe_router_reoerder(backend, src2, ne20);
-                        backend_ctx->toggle_reorder = false;
                     }
 
                     cl_mem sub_buf_src1_pre, buf_src1_reordered, image_src1_reordered, sub_buf_dst, buf_dst_image;
