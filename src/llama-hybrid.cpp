@@ -49,9 +49,23 @@ static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
 
-static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION    = 0.70;
-static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION = 0.90;
-static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION   = 0.90;
+static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION            = 0.70;
+static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT = 0.90;
+static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION           = 0.90;
+
+static double llama_hybrid_phone_memory_fraction() {
+    const char * value = std::getenv("LLAMA_HYBRID_PHONE_MEMORY_FRACTION");
+    if (value == nullptr || *value == '\0') {
+        return LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT;
+    }
+
+    char * end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value || !std::isfinite(parsed)) {
+        return LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT;
+    }
+    return std::clamp(parsed, 0.0, 1.0);
+}
 
 // HYBRID_AUTO uses a two-level search.  The cheap pass ranks complete
 // (topology, XT, R) candidates, while the expensive pass expands stage
@@ -68,6 +82,13 @@ static std::optional<llama_hybrid_constraints> g_llama_hybrid_runtime_constraint
 static std::optional<llama_hybrid_wave_calibration> g_llama_hybrid_runtime_wave_calibration;
 
 static bool llama_hybrid_select_tensor_chunks(
+        const llama_hybrid_profile & profile,
+        float                        pc_ratio,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        int                          max_chunks,
+        std::vector<int> &           result);
+static bool llama_hybrid_select_tensor_phone_chunks(
         const llama_hybrid_profile & profile,
         float                        pc_ratio,
         int                          total_tokens,
@@ -634,14 +655,14 @@ bool llama_hybrid_profile_memory(llama_hybrid_profile & profile,
                    profile.phone_free_mem / mib, profile.phone_total_mem / mib);
 
     const size_t phone_default_budget =
-        (size_t) ((long double) profile.phone_free_mem * LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        (size_t) ((long double) profile.phone_free_mem * llama_hybrid_phone_memory_fraction());
     LLAMA_LOG_ERROR(
         "[HYBRID_PHONE_MEMORY] source=backend_device_report backend=%s "
         "free_mib=%.1f total_mib=%.1f fraction=%.2f default_budget_mib=%.1f\n",
         ggml_backend_name(phone_backend),
         profile.phone_free_mem / mib,
         profile.phone_total_mem / mib,
-        LLAMA_HYBRID_PHONE_MEMORY_FRACTION,
+        llama_hybrid_phone_memory_fraction(),
         phone_default_budget / mib);
 
     if (gpu_backend != nullptr) {
@@ -1112,10 +1133,24 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
         } else if (il < tensor_end) {
             const size_t pc_ffn    = llama_hybrid_ratio_bytes(ffn, pc_ratio);
             const size_t phone_ffn = ffn - pc_ffn;
-            if (!llama_hybrid_add_bytes(pc_memory, attn) || !llama_hybrid_add_bytes(pc_memory, pc_ffn) ||
-                !llama_hybrid_add_bytes(pc_memory, mirrored) || !llama_hybrid_add_bytes(pc_memory, kv_per_layer) ||
-                !llama_hybrid_add_bytes(phone_memory, phone_ffn) || !llama_hybrid_add_bytes(phone_memory, mirrored)) {
-                return false;
+            if (plan.tensor_phone_primary) {
+                if (!llama_hybrid_add_bytes(pc_memory, pc_ffn) ||
+                    !llama_hybrid_add_bytes(pc_memory, mirrored) ||
+                    !llama_hybrid_add_bytes(phone_memory, attn) ||
+                    !llama_hybrid_add_bytes(phone_memory, phone_ffn) ||
+                    !llama_hybrid_add_bytes(phone_memory, mirrored) ||
+                    !llama_hybrid_add_bytes(phone_memory, kv_per_layer)) {
+                    return false;
+                }
+            } else {
+                if (!llama_hybrid_add_bytes(pc_memory, attn) ||
+                    !llama_hybrid_add_bytes(pc_memory, pc_ffn) ||
+                    !llama_hybrid_add_bytes(pc_memory, mirrored) ||
+                    !llama_hybrid_add_bytes(pc_memory, kv_per_layer) ||
+                    !llama_hybrid_add_bytes(phone_memory, phone_ffn) ||
+                    !llama_hybrid_add_bytes(phone_memory, mirrored)) {
+                    return false;
+                }
             }
         } else {
             if (!llama_hybrid_add_bytes(phone_memory, attn) || !llama_hybrid_add_bytes(phone_memory, ffn) ||
@@ -1181,19 +1216,28 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
                 return false;
             }
 
-            size_t pc_tensor_attn_runtime = 0;
+            size_t tensor_attn_runtime = 0;
+            const auto & tensor_attn_points =
+                plan.tensor_phone_primary ? profile.phone_attn : profile.cpu_attn;
             if (!llama_hybrid_attn_runtime_bytes(
-                    profile.cpu_attn, tensor_macro_tokens,
-                    attn_kv_tokens, pc_tensor_attn_runtime)) {
+                    tensor_attn_points, tensor_macro_tokens,
+                    attn_kv_tokens, tensor_attn_runtime)) {
                 return false;
             }
 
             std::vector<int> tensor_chunks;
-            if (!llama_hybrid_select_tensor_chunks(
+            const bool selected_chunks = plan.tensor_phone_primary ?
+                llama_hybrid_select_tensor_phone_chunks(
                     profile, pc_ratio, tensor_macro_tokens,
                     plan.tensor_chunk_tokens,
                     constraints.max_tensor_chunks,
-                    tensor_chunks)) {
+                    tensor_chunks) :
+                llama_hybrid_select_tensor_chunks(
+                    profile, pc_ratio, tensor_macro_tokens,
+                    plan.tensor_chunk_tokens,
+                    constraints.max_tensor_chunks,
+                    tensor_chunks);
+            if (!selected_chunks) {
                 // Memory estimation must remain usable before/without timing
                 // profiles. The legacy tiny-tail layout is a safe fallback;
                 // profiled planning/runtime will use the cost-selected layout.
@@ -1252,12 +1296,21 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
                 return false;
             }
 
-            const size_t tensor_pc_peak =
-                std::max(pc_tensor_attn_runtime, pc_ffn_stage);
-            pc_runtime_peak =
-                std::max(pc_runtime_peak, tensor_pc_peak);
-            phone_runtime_peak =
-                std::max(phone_runtime_peak, phone_ffn_stage);
+            if (plan.tensor_phone_primary) {
+                pc_runtime_peak =
+                    std::max(pc_runtime_peak, pc_ffn_stage);
+                phone_runtime_peak =
+                    std::max(
+                        phone_runtime_peak,
+                        std::max(tensor_attn_runtime, phone_ffn_stage));
+            } else {
+                const size_t tensor_pc_peak =
+                    std::max(tensor_attn_runtime, pc_ffn_stage);
+                pc_runtime_peak =
+                    std::max(pc_runtime_peak, tensor_pc_peak);
+                phone_runtime_peak =
+                    std::max(phone_runtime_peak, phone_ffn_stage);
+            }
         }
 
         if (phone_layers > 0) {
@@ -2934,7 +2987,7 @@ bool llama_hybrid_predict_decode_plan(
     const size_t phone_budget = llama_hybrid_effective_budget(
         decode_constraints.phone_memory_budget,
         profile.phone_free_mem,
-        LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        llama_hybrid_phone_memory_fraction());
     const size_t gpu_budget = llama_hybrid_effective_budget(
         decode_constraints.gpu_memory_budget,
         profile.gpu_free_mem,
@@ -3262,7 +3315,7 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
-        constraints.phone_memory_budget, profile.phone_free_mem, LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        constraints.phone_memory_budget, profile.phone_free_mem, llama_hybrid_phone_memory_fraction());
 
     if (pc_budget > 0) {
         const double base = (double) profile.non_layer_weight_bytes;
@@ -3317,7 +3370,7 @@ static bool llama_hybrid_coarse_memory_possible(
         LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
         constraints.phone_memory_budget, profile.phone_free_mem,
-        LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        llama_hybrid_phone_memory_fraction());
     const size_t gpu_budget = llama_hybrid_effective_budget(
         constraints.gpu_memory_budget, profile.gpu_free_mem,
         LLAMA_HYBRID_GPU_MEMORY_FRACTION);
@@ -3435,7 +3488,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
-        constraints.phone_memory_budget, profile.phone_free_mem, LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        constraints.phone_memory_budget, profile.phone_free_mem, llama_hybrid_phone_memory_fraction());
     const size_t gpu_budget = llama_hybrid_effective_budget(
         constraints.gpu_memory_budget, profile.gpu_free_mem, LLAMA_HYBRID_GPU_MEMORY_FRACTION);
 
@@ -4492,7 +4545,7 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
-        constraints.phone_memory_budget, profile.phone_free_mem, LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        constraints.phone_memory_budget, profile.phone_free_mem, llama_hybrid_phone_memory_fraction());
     const size_t gpu_budget = llama_hybrid_effective_budget(
         constraints.gpu_memory_budget, profile.gpu_free_mem, LLAMA_HYBRID_GPU_MEMORY_FRACTION);
 
@@ -7162,7 +7215,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
-        constraints.phone_memory_budget, profile.phone_free_mem, LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+        constraints.phone_memory_budget, profile.phone_free_mem, llama_hybrid_phone_memory_fraction());
     const size_t gpu_budget = llama_hybrid_effective_budget(
         constraints.gpu_memory_budget, profile.gpu_free_mem, LLAMA_HYBRID_GPU_MEMORY_FRACTION);
 
