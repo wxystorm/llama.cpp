@@ -7568,7 +7568,6 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
-    constraints.fixed_tensor_layers = 10;
     // No fixed topology here: CPU_DIRECT is now part of the runtime model, so
     // HYBRID_AUTO must search placement and chunking jointly instead of being
     // constrained to the earlier T1/P0/C47/G11 validation layout.
@@ -7646,12 +7645,14 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             const int cpu_layers =
                 best_plan.pc_layers - best_plan.gpu_pc_layers;
             int tensor_macro_tokens = work_tokens;
-            if (cpu_layers > 0) {
-                tensor_macro_tokens =
-                    std::min(work_tokens, best_plan.cpu_chunk_tokens);
-            } else if (best_plan.gpu_pc_layers > 0) {
-                tensor_macro_tokens =
-                    std::min(work_tokens, best_plan.gpu_chunk_tokens);
+            if (!best_plan.tensor_phone_primary) {
+                if (cpu_layers > 0) {
+                    tensor_macro_tokens =
+                        std::min(work_tokens, best_plan.cpu_chunk_tokens);
+                } else if (best_plan.gpu_pc_layers > 0) {
+                    tensor_macro_tokens =
+                        std::min(work_tokens, best_plan.gpu_chunk_tokens);
+                }
             }
 
             const auto raw_chunks =
@@ -7659,12 +7660,21 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                     tensor_macro_tokens,
                     best_plan.tensor_chunk_tokens);
             std::vector<int> selected_chunks;
-            if (llama_hybrid_select_tensor_chunks(
-                    profile, best_plan.tensor_pc_ratio,
-                    tensor_macro_tokens,
-                    best_plan.tensor_chunk_tokens,
-                    constraints.max_tensor_chunks,
-                    selected_chunks)) {
+            const bool selected_layout =
+                best_plan.tensor_phone_primary ?
+                    llama_hybrid_select_tensor_phone_chunks(
+                        profile, best_plan.tensor_pc_ratio,
+                        tensor_macro_tokens,
+                        best_plan.tensor_chunk_tokens,
+                        constraints.max_tensor_chunks,
+                        selected_chunks) :
+                    llama_hybrid_select_tensor_chunks(
+                        profile, best_plan.tensor_pc_ratio,
+                        tensor_macro_tokens,
+                        best_plan.tensor_chunk_tokens,
+                        constraints.max_tensor_chunks,
+                        selected_chunks);
+            if (selected_layout) {
                 const auto chunk_list =
                     [](const std::vector<int> & sizes) {
                         std::string result;
@@ -7677,10 +7687,11 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                         return result;
                     };
                 LLAMA_LOG_ERROR(
-                    "[HYBRID_TENSOR_LAYOUT] T=%d R=%.3f macro_tokens=%d "
+                    "[HYBRID_TENSOR_LAYOUT] T=%d primary=%s R=%.3f macro_tokens=%d "
                     "XT=%d raw=%s final=%s chunks=%zu->%zu "
                     "depth_factor=%.3f\n",
                     best_plan.tensor_layers,
+                    best_plan.tensor_phone_primary ? "PHONE" : "PC",
                     best_plan.tensor_pc_ratio,
                     tensor_macro_tokens,
                     best_plan.tensor_chunk_tokens,
@@ -7702,7 +7713,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
     }
 
-    if (found && !llama_hybrid_sim_stages(best_plan).empty()) {
+    if (found && !best_plan.tensor_phone_primary &&
+        !llama_hybrid_sim_stages(best_plan).empty()) {
         const int reference_tokens = profile.reference_tokens > 0 ?
             profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS;
         const int work_tokens = constraints.target_ubatch_tokens > 0 ?
