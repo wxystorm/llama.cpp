@@ -4684,23 +4684,68 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             (is_ffn_down_chunk &&
              layer_attention_phone_owned(decode_layer_0));
         if (phone_primary_tensor_down) {
-            // Legacy specialized reduction assumes a PC-owned residual and
-            // folds that residual into the PC partial before handing the
-            // result to Phone. TP owns Attention/residual on Phone, so that
-            // assumption is invalid. Let the generic all-reduce materialize
-            // the complete FFN result on both devices; the normal Phone graph
-            // then applies the Phone-owned residual. This is correctness-first
-            // for both prefill and decode. A one-way reduce-to-Phone fast path
-            // can replace it later.
+            // TP owns Attention/residual on Phone. Reduce only the PC FFN
+            // partial into the Phone partial; do not fold residual here.
+            // The following Phone-owned graph applies residual normally.
+            handled = true;
+
+            constexpr size_t j_src = 0; // PC partial
+            constexpr size_t j_dst = 1; // Phone partial / owner
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
+
+            GGML_ASSERT(ggml_is_contiguous(node_src));
+            GGML_ASSERT(ggml_is_contiguous(node_dst));
+            GGML_ASSERT(ggml_nbytes(node_src) == ggml_nbytes(node_dst));
+
+            ggml_tensor * node_tmp = get_node_aux(node_dst);
+            set_tmp_data(node_tmp, j_dst, 0);
+
+            const int64_t copy_start_us = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                bcj_src.backend, bcj_dst.backend,
+                node_src, node_tmp);
+            const int64_t copy_us = ggml_time_us() - copy_start_us;
+            record_copy_wait(copy_us);
+            record_meta_copy(i, j_src, j_dst, node_src, copy_us);
+
+            ggml_tensor * node_red = get_node_aux(node_dst);
+            node_red->view_src =
+                node_dst->view_src == nullptr ?
+                    node_dst : node_dst->view_src;
+            node_red->view_offs = node_dst->view_offs;
+            node_red->op = GGML_OP_ADD;
+            node_red->src[0] = node_dst;
+            node_red->src[1] = node_tmp;
+            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red);
+
+            ggml_cgraph * cgraph_aux = get_cgraph_aux();
+            cgraph_aux->nodes[0] = node_red;
+            cgraph_aux->n_nodes = 1;
+
+            const int64_t add_start_us = ggml_time_us();
+            const ggml_status status =
+                ggml_backend_graph_compute_async(
+                    bcj_dst.backend, cgraph_aux);
+            reduce_add_us += ggml_time_us() - add_start_us;
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+
             if (pipeline_debug) {
                 const int layer = is_prefill_down_chunk ?
                     prefill_down_layer_0 : decode_layer_0;
                 const int chunk = is_prefill_down_chunk ?
                     prefill_down_chunk_0 : decode_chunk_0;
                 printf(
-                    "[TENSOR_PHONE_GENERIC_REDUCE] sg=%zu layer=%d chunk=%d mode=%s\n",
+                    "[TENSOR_PHONE_REDUCE] sg=%zu layer=%d chunk=%d "
+                    "mode=%s bytes=%zu copy_ms=%.3f\n",
                     i, layer, chunk,
-                    is_prefill_down_chunk ? "prefill" : "decode");
+                    is_prefill_down_chunk ? "prefill" : "decode",
+                    ggml_nbytes(node_src), copy_us / 1000.0);
             }
             return GGML_STATUS_SUCCESS;
         }
