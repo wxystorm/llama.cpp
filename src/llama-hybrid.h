@@ -377,7 +377,11 @@ struct llama_hybrid_plan {
     int phone_layers  = 0;
     int pc_layers     = 0;
 
-    float tensor_pc_ratio = 0.0f;
+    // false: PC-primary Tensor (legacy); true: Phone-primary Tensor.
+    // The FFN shard ratio keeps the same meaning in both modes: fraction
+    // resident/computed on the PC side.
+    bool  tensor_phone_primary = false;
+    float tensor_pc_ratio      = 0.0f;
 
     int gpu_pc_layers = 0;
 
