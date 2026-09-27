@@ -120,11 +120,11 @@ static void llama_hybrid_log_formal_prepare_prediction(
     const double total_median_ms =
         full_prediction.gpu_ms + prepare_ms + runtime_median_ms;
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_FORMAL_PREP] tokens=%u target_tensor_layers=%d prepare_ms=%.3f reuse=1\n",
         tokens, full_prediction.tensor_layers, prepare_ms);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[PRED_WAVE_II] mode=late_hold probe_layers=%d target_layers=%d "
         "prepare_ms=%.3f observed_intervals=%d observed_ii_sum_ms=%.3f "
         "remaining_intervals=%d late_ii_ms=%.3f ii_drift_ratio=%.4f "
@@ -712,7 +712,7 @@ void llama_context::sched_reserve() {
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
-    LLAMA_LOG_ERROR("[GRAPH_CAP] tokens=%u max_nodes=%zu\n", n_tokens, max_nodes);
+    LLAMA_LOG_DEBUG("[GRAPH_CAP] tokens=%u max_nodes=%zu\n", n_tokens, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -923,7 +923,7 @@ void llama_context::synchronize() {
             std::max<int64_t>(
                 0, total_us - timeline_accounted_us);
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[DECODE_RUNTIME] sample=%" PRId64
             " total_ms=%.3f prepare_ms=%.3f "
             "split_prepare_ms=%.3f split_submit_ms=%.3f "
@@ -962,7 +962,7 @@ void llama_context::synchronize() {
                 meta.graph_execute_us / 1000.0 -
                     simple_max_ms);
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[DECODE_META] sample=%" PRId64
             " graph_calls=%" PRId64
             " rebuilds=%" PRId64
@@ -1107,7 +1107,7 @@ void llama_context::synchronize() {
                 meta.graph_execute_us / 1000.0 -
                     layer_wall_us / 1000.0);
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[DECODE_META_LAYER] sample=%" PRId64
             " entries=%" PRId64
             " layers=%" PRId64
@@ -1892,7 +1892,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         const int64_t prepare_total_us = ggml_time_us() - prepare_total_begin_us;
 
         if (log_formal_prepare) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[FORMAL_PREPARE_BREAKDOWN] tokens=%u reused=%d total_ms=%.3f "
                 "apply_mctx_ms=%.3f graph_params_ms=%.3f build_graph_ms=%.3f "
                 "alloc_graph_ms=%.3f set_inputs_ms=%.3f unaccounted_ms=%.3f\n",
@@ -1916,7 +1916,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             const int64_t accounted_us =
                 apply_mctx_us + graph_params_us + reuse_check_us + reuse_sync_us +
                 graph_reset_us + graph_build_us + graph_alloc_us + set_inputs_us;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[STAGE_PREPARE_BREAKDOWN] stage=%s layers=[%d,%d) tokens=%u outputs=%d "
                 "reused=%d nodes=%d splits=%d total_ms=%.3f "
                 "apply_mctx_ms=%.3f graph_params_ms=%.3f reuse_check_ms=%.3f "
@@ -2246,7 +2246,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ubatch, token_begin, block_tokens, stage_input);
     n_outputs = block_outputs;
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[HYBRID_EXEC] ub=%d stage=%zu kind=%s layers=[%d,%d) block=%zu action=%s tokens=[%u,%u)\n",
         ubatch_id, stage_index, llama_hybrid_runtime_stage_name(stage.kind), stage.layer_begin, stage.layer_end,
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
@@ -2407,7 +2407,7 @@ bool llama_context::run_hybrid_wave_probe(
     bool apply_mctx = true;
     ggml_status status = GGML_STATUS_SUCCESS;
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PROBE_BEGIN] tokens=%u layers=[%d,%d) n_layers=%d XT=%d GA=%d XA=%d R=%.3f\n",
         probe_tokens, tensor_begin, tensor_end_probe, tensor_end_probe - tensor_begin,
         runtime_plan.tensor_chunk_tokens,
@@ -2550,7 +2550,7 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.compute_wall_ms > 0.0 ?
             calibration.meta_total_ms / calibration.compute_wall_ms : 0.0;
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PROBE_SUM] tokens=%u layers=%d XT=%d GA=%d XA=%d R=%.3f "
         "wall_ms=%.3f prepare_ms=%.3f compute_range_ms=%.3f sync_ms=%.3f "
         "post_sync_ms=%.3f unaccounted_ms=%.3f "
@@ -2583,7 +2583,7 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.lane_reuse_wait_ms,
         calibration.barrier_ms);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PROBE_CAL] layers=%d operator_compute_ms=%.3f compute_inflation=%.4f "
         "meta_inflation=%.4f attn_per_layer_ms=%.3f pc_ffn_per_layer_ms=%.3f "
         "meta_per_layer_ms=%.3f\n",
@@ -2595,7 +2595,7 @@ bool llama_context::run_hybrid_wave_probe(
         probe_layer_count > 0 ? calibration.pc_ffn_ms / probe_layer_count : 0.0,
         probe_layer_count > 0 ? calibration.meta_total_ms / probe_layer_count : 0.0);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PROBE_II] layer_starts=%d ii_count=%d fill_ms=%.3f "
         "ii_mean_ms=%.3f ii_median_ms=%.3f ii_min_ms=%.3f ii_max_ms=%.3f "
         "drain_ms=%.3f span_ms=%.3f outer_runtime_ms=%.3f\n",
@@ -2610,7 +2610,7 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.wave_span_ms,
         calibration.wave_outer_runtime_ms);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PROBE_DRIFT] early_ii_count=%d early_ii_mean_ms=%.3f early_ii_median_ms=%.3f "
         "late_ii_count=%d late_ii_mean_ms=%.3f late_ii_median_ms=%.3f ii_drift_ratio=%.4f "
         "early_layers=%d early_compute_per_layer_ms=%.3f early_barrier_per_layer_ms=%.3f "
@@ -2632,7 +2632,7 @@ bool llama_context::run_hybrid_wave_probe(
         calibration.wave_compute_drift_ratio,
         calibration.wave_barrier_drift_ratio);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[WAVE_PREPARE_MODEL] mode=formal_reuse pending=1 target_tensor_layers=%d\n",
         runtime_plan.tensor_layers);
 
@@ -2743,7 +2743,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.prepare_us +
                 stage_timing.compute_range_us +
                 stage_timing.sync_us;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[CPU_STAGE_TIMING] ub=%d tokens=%u layers=[%d,%d) "
                 "n_layers=%d XC=%d total_ms=%.3f prepare_ms=%.3f "
                 "compute_ms=%.3f sync_ms=%.3f unaccounted_ms=%.3f "
@@ -2839,7 +2839,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.prepare_us +
                 stage_timing.compute_range_us +
                 stage_timing.sync_us;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f "
                 "compute_range=%.3f sync=%.3f unaccounted=%.3f "
                 "meta_total=%.3f meta_rebuild=%.3f meta_execute=%.3f "
@@ -2860,7 +2860,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.graph_rebuild_count,
                 blocks.size());
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f "
                 "pc_ffn=%.3f h2d=%.3f phone=%.3f d2h=%.3f "
                 "reduce=%.3f wait=%.3f ms mode=SERIAL_ACCUMULATE\n",
@@ -2873,7 +2873,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.reduce_us / 1000.0,
                 profile.wait_us / 1000.0);
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64
                 " lane_reuse_ms=%.3f lane_reuse_max_ms=%.3f "
                 "lane0_count=%" PRId64 " lane0_ms=%.3f "
@@ -2910,7 +2910,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                         (double) overlap_est_us /
                             (double) profile.return_rpc_total_us :
                         0.0;
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[RETURN_CRITICAL_PATH] ub=%d returns=%" PRId64
                     " payload_mib=%.3f request_ms=%.3f ready_wait_ms=%.3f "
                     "recv_payload_ms=%.3f rpc_total_ms=%.3f "
@@ -2957,7 +2957,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     if (ubatch.n_tokens > 1) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[FORMAL_PREPARE] tokens=%u prepare_ms=%.3f\n",
             ubatch.n_tokens, prepare_us / 1000.0);
         llama_hybrid_log_formal_prepare_prediction(
@@ -3041,7 +3041,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             ggml_backend_dev_t split_dev =
                 split_backend != nullptr ?
                     ggml_backend_get_device(split_backend) : nullptr;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[DECODE_SPLIT_SUBMIT] sample=%" PRId64
                 " split=%d/%d backend=%s type=%d "
                 "prepare_ms=%.3f submit_ms=%.3f status=%d\n",
@@ -3066,7 +3066,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
             ggml_time_us() - compute_begin_us : 0;
 
     if (decode_profile_this_token) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[DECODE_DISPATCH] sample=%" PRId64
             " splits=%d prepare_graph_ms=%.3f "
             "split_prepare_ms=%.3f split_submit_ms=%.3f "
@@ -3080,7 +3080,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     }
 
     if (batched) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[FORMAL_UBATCH_TIMING] tokens=%u splits=%d prepare_ms=%.3f "
             "compute_ms=%.3f total_ms=%.3f\n",
             ubatch.n_tokens,
@@ -3601,7 +3601,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (return_wavefront_full_graph_override) {
             const int attn_group_chunks =
                 llama_hybrid_runtime_prefill_attn_group_chunks();
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_PIPE] return-wavefront full-graph override: "
                 "GPU->TENSOR stage queue disabled, batch=%u XG=%d XT=%d GA=%d XA=%d\n",
                 n_tokens_all, runtime_plan.gpu_chunk_tokens, runtime_plan.tensor_chunk_tokens,
@@ -3611,7 +3611,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             llama_hybrid_full_prefill_prediction full_prediction;
             if (llama_hybrid_runtime_predict_full_prefill(
                     (int) n_tokens_all, full_prediction)) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_WAVE_FULL] tokens=%d kv_tokens=%d T=%d XT=%d GA=%d XA=%d R=%.3f "
                     "gpu_ms=%.3f tensor_ms=%.3f total_ms=%.3f\n",
                     full_prediction.tokens,
@@ -3657,7 +3657,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     const double pred_tensor_per_layer =
                         tensor_prediction.tensor_total_ms / pred_layers;
 
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[PRED_WAVE_CAL_DIAG] probe_layers=%d "
                         "cal_attn_per_layer_ms=%.3f pred_attn_per_layer_ms=%.3f attn_ratio=%.4f "
                         "cal_pc_ffn_per_layer_ms=%.3f pred_pc_ffn_per_layer_ms=%.3f pc_ffn_ratio=%.4f "
@@ -3678,7 +3678,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         pred_tensor_per_layer,
                         pred_tensor_per_layer > 0.0 ? cal_meta_per_layer / pred_tensor_per_layer : 0.0);
 
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[PRED_WAVE_II_PENDING] probe_layers=%d target_layers=%d "
                         "probe_ii_median_ms=%.3f late_ii_median_ms=%.3f "
                         "ii_drift_ratio=%.4f waiting_for_formal_prepare=1\n",
@@ -3748,12 +3748,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (stage_queue_runtime_enabled) {
             runtime_ubatch = xg;
         }
-        LLAMA_LOG_ERROR("[STAGEQ] batch=%u XG=%u macros=%u XT=%d enabled=%d overlap=%d warmup=%d\n",
+        LLAMA_LOG_DEBUG("[STAGEQ] batch=%u XG=%u macros=%u XT=%d enabled=%d overlap=%d warmup=%d\n",
                         n_tokens_all, xg, n_macros, runtime_plan.tensor_chunk_tokens,
                         (int) stage_queue_runtime_enabled, (int) (n_macros >= 2), (int) cparams.warmup);
     } else if (generalized_stage_queue_runtime_enabled) {
         runtime_ubatch = std::min<uint32_t>(cparams.n_ubatch, runtime_stages.front().macro_tokens);
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PIPE] mode=GPU_DOWNSTREAM batch=%u ubatch=%u macros=%u stages=%zu\n",
             n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size());
     } else if (stage_serial_runtime_enabled) {
@@ -3777,7 +3777,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         runtime_ubatch =
             std::min<uint32_t>(cparams.n_ubatch, serial_macro);
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_EXEC] mode=serial batch=%u ubatch=%u "
             "front_macro=%d max_macro=%u stages=%zu\n",
             n_tokens_all, runtime_ubatch,
@@ -3903,16 +3903,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool pipeline_runtime_enabled = stage_queue_runtime_enabled || legacy_pipeline_runtime_enabled;
 
     const auto stage_queue_handoff = [&](llama_prefill_pipe_slot & slot) {
-        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d HANDOFF_BEGIN\n", slot.ubatch_id, slot.ubatch_id & 1);
+        LLAMA_LOG_DEBUG("[STAGEQ] ub=%d slot=%d HANDOFF_BEGIN\n", slot.ubatch_id, slot.ubatch_id & 1);
         const ggml_status status = pipe_prepare_post(slot);
         if (status == GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_READY\n", slot.ubatch_id, slot.ubatch_id & 1);
+            LLAMA_LOG_DEBUG("[STAGEQ] ub=%d slot=%d TENSOR_READY\n", slot.ubatch_id, slot.ubatch_id & 1);
         }
         return status;
     };
 
     const auto stage_queue_run_tensor = [&](llama_prefill_pipe_slot & slot) {
-        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_BEGIN tokens=%u XT=%d\n", slot.ubatch_id,
+        LLAMA_LOG_DEBUG("[STAGEQ] ub=%d slot=%d TENSOR_BEGIN tokens=%u XT=%d\n", slot.ubatch_id,
                         slot.ubatch_id & 1, slot.n_tokens, runtime_plan.tensor_chunk_tokens);
         ggml_status status = pipe_run_post_prepared(slot);
         if (status == GGML_STATUS_SUCCESS) {
@@ -3920,7 +3920,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             status = pipe_run_tail(slot);
         }
         if (status == GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d TENSOR_END\n", slot.ubatch_id, slot.ubatch_id & 1);
+            LLAMA_LOG_DEBUG("[STAGEQ] ub=%d slot=%d TENSOR_END\n", slot.ubatch_id, slot.ubatch_id & 1);
         }
         return status;
     };
@@ -3955,7 +3955,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto kind = runtime_stages[job.stage_index].kind;
         switch (kind) {
             case llama_hybrid_runtime_stage_kind::CPU:
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[HYBRID_PIPE] ub=%d -> CPU_QUEUE stage=%zu\n",
                     job.ubatch_id, job.stage_index);
                 hybrid_cpu_ready_q.push_back(std::move(job));
@@ -3964,7 +3964,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 {
                     const size_t tensor_bytes = job.hidden.capacity() * sizeof(float);
                     hybrid_tensor_ready_bytes += tensor_bytes;
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[HYBRID_PIPE] ub=%d -> TENSOR_QUEUE stage=%zu "
                         "job_mib=%.2f queue_mib=%.2f limit_mib=%.2f\n",
                         job.ubatch_id, job.stage_index, tensor_bytes / 1048576.0,
@@ -3977,7 +3977,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 {
                     const size_t phone_bytes = job.hidden.capacity() * sizeof(float);
                     hybrid_phone_ready_bytes += phone_bytes;
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[HYBRID_PIPE] ub=%d -> PHONE_QUEUE stage=%zu "
                         "job_mib=%.2f queue_mib=%.2f limit_mib=%.2f\n",
                         job.ubatch_id, job.stage_index, phone_bytes / 1048576.0,
@@ -3998,7 +3998,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto hybrid_gpu_harvest = [&](ggml_status & status) {
         GGML_ASSERT(hybrid_gpu_pending_active);
 
-        LLAMA_LOG_ERROR("[HYBRID_PIPE] ub=%d GPU_WAIT tokens=%u\n",
+        LLAMA_LOG_DEBUG("[HYBRID_PIPE] ub=%d GPU_WAIT tokens=%u\n",
                         hybrid_gpu_pending.ubatch_id, hybrid_gpu_pending.ubatch.n_tokens);
         if (!copy_hybrid_stage_output(
                 gf_res_prev.get(), sched.get(), hybrid_gpu_pending.hidden.data(),
@@ -4007,7 +4007,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return;
         }
 
-        LLAMA_LOG_ERROR("[HYBRID_PIPE] ub=%d GPU_READY next_stage=%zu\n",
+        LLAMA_LOG_DEBUG("[HYBRID_PIPE] ub=%d GPU_READY next_stage=%zu\n",
                         hybrid_gpu_pending.ubatch_id, hybrid_gpu_pending.stage_index);
         hybrid_enqueue_ready(std::move(hybrid_gpu_pending), status);
         hybrid_gpu_pending = {};
@@ -4035,7 +4035,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (result != nullptr && status == GGML_STATUS_SUCCESS) {
             hybrid_gpu_pending_active = true;
-            LLAMA_LOG_ERROR("[HYBRID_PIPE] ub=%d GPU_SUBMIT tokens=%u\n", ubatch_id, ubatch.n_tokens);
+            LLAMA_LOG_DEBUG("[HYBRID_PIPE] ub=%d GPU_SUBMIT tokens=%u\n", ubatch_id, ubatch.n_tokens);
         }
     };
 
@@ -4081,7 +4081,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_meta_tensor_profile_reset(ggml_backend_sched_get_backend(sched_pipe.get(), i));
             }
         }
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PIPE] ub=%d %s_PHASE_BEGIN stage=%zu blocks=%zu\n",
             job.ubatch_id, llama_hybrid_runtime_stage_name(stage.kind), stage_index, blocks.size());
 
@@ -4126,7 +4126,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 std::max<int64_t>(0, cpu_total_us - cpu_accounted_us);
             const int cpu_layers = stage.layer_end - stage.layer_begin;
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[CPU_STAGE_TIMING] ub=%d tokens=%u layers=[%d,%d) n_layers=%d XC=%d "
                 "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
                 "unaccounted_ms=%.3f blocks=%zu\n",
@@ -4164,7 +4164,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.profile_layer_saturated ? "SATURATED" :
                     "INTERPOLATE";
 
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_CPU_STAGE] ub=%d tokens=%d kv_tokens=%d layers=%d XC=%d "
                     "pred_total_ms=%.3f pred_per_layer_ms=%.3f "
                     "profile_mode=%s profile_range=[%d,%d] "
@@ -4187,7 +4187,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.profile_min_layers,
                     cpu_prediction.profile_max_layers);
 
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_CPU_ERROR] ub=%d actual_compute_ms=%.3f "
                     "actual_per_layer_ms=%.3f pred_compute_ms=%.3f "
                     "actual_over_pred=%.3f\n",
@@ -4260,7 +4260,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 tensor_stage_timing.sync_us;
             const int64_t tensor_stage_unaccounted_us =
                 std::max<int64_t>(0, tensor_total_us - tensor_stage_accounted_us);
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f compute_range=%.3f "
                 "sync=%.3f unaccounted=%.3f meta_total=%.3f meta_rebuild=%.3f "
                 "meta_execute=%.3f meta_other=%.3f meta_calls=%" PRId64
@@ -4278,7 +4278,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 profile.graph_compute_count,
                 profile.graph_rebuild_count,
                 blocks.size());
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f pc_ffn=%.3f h2d=%.3f "
                 "phone=%.3f d2h=%.3f reduce=%.3f wait=%.3f ms\n",
                 job.ubatch_id, tensor_total_us / 1000.0,
@@ -4289,7 +4289,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             llama_hybrid_tensor_compute_prediction tensor_prediction;
             if (llama_hybrid_runtime_predict_tensor_compute(
                     (int) job.ubatch.n_tokens, tensor_prediction)) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_TENSOR_COMPUTE] ub=%d tokens=%d kv_tokens=%d T=%d XT=%d GA=%d XA=%d R=%.3f "
                     "attn_misc_ms=%.3f pc_ffn_ms=%.3f pc_compute_ms=%.3f tensor_total_ms=%.3f\n",
                     job.ubatch_id,
@@ -4305,7 +4305,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     tensor_prediction.pc_compute_ms,
                     tensor_prediction.tensor_total_ms);
 
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_TENSOR_PIPE_DETAIL] ub=%d chunks=%d "
                     "h2d_sum_ms=%.3f pc_ffn_sum_ms=%.3f phone_sum_ms=%.3f d2h_sum_ms=%.3f "
                     "h2d_finish_ms=%.3f pc_finish_ms=%.3f phone_finish_ms=%.3f "
@@ -4328,7 +4328,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const auto actual_over_pred = [](double actual_ms, double pred_ms) {
                     return pred_ms > 0.0 ? actual_ms / pred_ms : 0.0;
                 };
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[PRED_TENSOR_ERROR] ub=%d actual_over_pred "
                     "compute=%.3f pc_ffn=%.3f h2d=%.3f phone=%.3f d2h=%.3f\n",
                     job.ubatch_id,
@@ -4348,7 +4348,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         profile.d2h_us / 1000.0,
                         tensor_prediction.pipeline_d2h_sum_ms));
             }
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[PREFILL_RETURN_STALL] lane_reuse_count=%" PRId64 " lane_reuse_ms=%.3f "
                 "lane_reuse_max_ms=%.3f lane0_count=%" PRId64 " lane0_ms=%.3f "
                 "lane1_count=%" PRId64 " lane1_ms=%.3f layer_barrier_count=%" PRId64 " "
@@ -4375,7 +4375,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         (double) overlap_est_us /
                             (double) profile.return_rpc_total_us :
                         0.0;
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[RETURN_CRITICAL_PATH] ub=%d returns=%" PRId64
                     " payload_mib=%.3f request_ms=%.3f ready_wait_ms=%.3f "
                     "recv_payload_ms=%.3f rpc_total_ms=%.3f "
@@ -4397,7 +4397,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     overlap_ratio);
             }
         }
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PIPE] ub=%d %s_PHASE_END stage=%zu\n",
             job.ubatch_id, llama_hybrid_runtime_stage_name(stage.kind), stage_index);
         return result;
@@ -4433,7 +4433,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         GGML_ASSERT(job.stage_index < runtime_stages.size());
         GGML_ASSERT(runtime_stages[job.stage_index].kind == llama_hybrid_runtime_stage_kind::TENSOR);
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PIPE] ub=%d TENSOR_DEQUEUE job_mib=%.2f queue_mib=%.2f\n",
             job.ubatch_id, tensor_bytes / 1048576.0, hybrid_tensor_ready_bytes / 1048576.0);
 
@@ -4462,7 +4462,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         GGML_ASSERT(job.stage_index < runtime_stages.size());
         GGML_ASSERT(runtime_stages[job.stage_index].kind == llama_hybrid_runtime_stage_kind::PHONE);
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PIPE] ub=%d PHONE_DEQUEUE job_mib=%.2f queue_mib=%.2f\n",
             job.ubatch_id, phone_bytes / 1048576.0, hybrid_phone_ready_bytes / 1048576.0);
 
@@ -4484,7 +4484,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool tensor_pressure = hybrid_tensor_ready_bytes >= hybrid_tensor_queue_limit_bytes;
 
         if (phone_pressure && !hybrid_phone_ready_q.empty()) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_SCHED] choose=PHONE reason=HWM cpu_q=%zu tensor_q=%zu phone_q=%zu phone_mib=%.2f\n",
                 hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(), hybrid_phone_ready_q.size(),
                 hybrid_phone_ready_bytes / 1048576.0);
@@ -4492,7 +4492,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         if (tensor_pressure && !hybrid_tensor_ready_q.empty()) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_SCHED] choose=TENSOR reason=HWM cpu_q=%zu tensor_q=%zu phone_q=%zu tensor_mib=%.2f\n",
                 hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(), hybrid_phone_ready_q.size(),
                 hybrid_tensor_ready_bytes / 1048576.0);
@@ -4500,7 +4500,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         if (!hybrid_cpu_ready_q.empty()) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_SCHED] choose=CPU reason=PRIORITY cpu_q=%zu tensor_q=%zu tensor_mib=%.2f\n",
                 hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(),
                 hybrid_tensor_ready_bytes / 1048576.0);
@@ -4736,7 +4736,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 if (status == GGML_STATUS_SUCCESS) {
                     status = pipe_run_gpu(cur);
                     if (status == GGML_STATUS_SUCCESS) {
-                        LLAMA_LOG_ERROR("[STAGEQ] ub=%d slot=%d GPU_SUBMIT tokens=%u\n", cur.ubatch_id,
+                        LLAMA_LOG_DEBUG("[STAGEQ] ub=%d slot=%d GPU_SUBMIT tokens=%u\n", cur.ubatch_id,
                                         slot_id, cur.n_tokens);
                         handoff_q.push_back(&cur);
                     }
@@ -4894,7 +4894,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     decode_runtime_profile.output_submit_us +=
                         ggml_time_us() -
                         output_submit_begin_us;
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[DECODE_OUTPUT_SUBMIT] sample=%" PRId64
                         " backend=%s bytes=%zu submit_ms=%.3f\n",
                         decode_runtime_profile.sample_index,
@@ -5105,7 +5105,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const double real_drain_ms     = real_profile.wave_drain_us / 1000.0;
             const double real_span_ms      = real_profile.wave_span_us / 1000.0;
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[WAVE_REAL_II] expected_layers=%d layer_starts=%" PRId64
                 " ii_count=%" PRId64 " fill_ms=%.3f ii_mean_ms=%.3f "
                 "ii_median_ms=%.3f ii_min_ms=%.3f ii_max_ms=%.3f "
@@ -5155,7 +5155,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     (real_profile.wave_late_barrier_us / 1000.0) /
                         real_profile.wave_late_layer_count : 0.0;
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[WAVE_REAL_DRIFT] early_ii_count=%" PRId64
                 " early_ii_mean_ms=%.3f early_ii_median_ms=%.3f "
                 "late_ii_count=%" PRId64
@@ -5190,7 +5190,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 calibration.tokens == (int) n_tokens_all &&
                 calibration.tensor_chunk_tokens == runtime_plan.tensor_chunk_tokens &&
                 std::abs(calibration.tensor_pc_ratio - runtime_plan.tensor_pc_ratio) < 1e-4f) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[WAVE_II_COMPARE] probe_layers=%d real_layers=%" PRId64
                     " probe_ii_median_ms=%.3f real_ii_median_ms=%.3f ii_ratio=%.4f "
                     "probe_ii_mean_ms=%.3f real_ii_mean_ms=%.3f mean_ratio=%.4f "
@@ -5210,7 +5210,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     calibration.wave_drain_ms > 0.0 ?
                         real_drain_ms / calibration.wave_drain_ms : 0.0);
 
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[WAVE_DRIFT_COMPARE] probe_ii_drift=%.4f real_ii_drift=%.4f "
                     "probe_compute_drift=%.4f real_compute_drift=%.4f "
                     "probe_barrier_drift=%.4f real_barrier_drift=%.4f "
@@ -5669,9 +5669,9 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    LLAMA_LOG_ERROR("[GRAPH_RESERVE_BEGIN] tokens=%u outputs=%u\n", n_tokens, n_outputs);
+    LLAMA_LOG_DEBUG("[GRAPH_RESERVE_BEGIN] tokens=%u outputs=%u\n", n_tokens, n_outputs);
     auto * gf = model.build_graph(gparams);
-    LLAMA_LOG_ERROR("[GRAPH_RESERVE_END] tokens=%u nodes=%d\n", n_tokens, ggml_graph_n_nodes(gf));
+    LLAMA_LOG_DEBUG("[GRAPH_RESERVE_END] tokens=%u nodes=%d\n", n_tokens, ggml_graph_n_nodes(gf));
 
     this->n_outputs = save_n_outputs;
 

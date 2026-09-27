@@ -607,7 +607,7 @@ bool llama_hybrid_profile_memory(llama_hybrid_profile & profile,
     }
 
     constexpr double mib = 1024.0 * 1024.0;
-    LLAMA_LOG_ERROR("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
+    LLAMA_LOG_DEBUG("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
                    ggml_backend_name(pc_backend), profile.pc_free_mem, profile.pc_total_mem, profile.pc_free_mem / mib,
                    profile.pc_total_mem / mib);
     LLAMA_LOG_INFO("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
@@ -692,7 +692,7 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
     LLAMA_LOG_INFO("[HYBRID_PROFILE] phone attn_ms=%.3f full_layer_ms=%.3f full_layer_compute_est_ms=%.3f\n",
                    profile.phone_attn_ms, profile.phone_full_layer_ms, profile.phone_full_layer_compute_est_ms);
     LLAMA_LOG_INFO("[HYBRID_PROFILE] gpu full_layer_ms=%.3f\n", profile.gpu_full_layer_ms);
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[HYBRID_PROFILE_DECODE_TAIL_SUMMARY] norm_ms=%.3f "
         "lm_head_ms=%.3f total_ms=%.3f\n",
         profile.decode_tail_norm_ms,
@@ -2519,7 +2519,7 @@ static bool llama_hybrid_profile_decode_tail(
             profile.decode_tail_ms -
                 profile.decode_tail_norm_ms);
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_DEBUG(
         "[HYBRID_PROFILE_DECODE_TAIL] placement=CPU_PRIMARY "
         "tokens=1 n_embd=%" PRId64 " n_vocab=%" PRId64
         " norm_type=%s output_type=%s tied=%d "
@@ -2808,7 +2808,7 @@ bool llama_hybrid_predict_decode_plan(
                 token1_sustained_per_layer_ms);
         if (have_one_layer && have_sustained) {
             const int deep_layers = profile.n_layer;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[DECODE_CPU_DEPTH] tokens=1 kv_tokens=%d "
                 "probe_layers=%d one_layer_base_ms=%.3f "
                 "sustained_per_layer_base_ms=%.3f sustained_over_one=%.3f "
@@ -5545,7 +5545,7 @@ bool llama_hybrid_profile_moe_ffn(
                 LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
                 phone_timing);
         if (!cpu_ok || !phone_ok) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
                 "status=SKIP cpu_ok=%d phone_ok=%d\n",
                 pc_ratio,
@@ -5563,7 +5563,7 @@ bool llama_hybrid_profile_moe_ffn(
             phone_timing.compute_est_ms,
         });
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
             "cpu_total_ms=%.3f cpu_per_layer_ms=%.3f "
             "phone_wall_total_ms=%.3f phone_wall_per_layer_ms=%.3f "
@@ -6406,7 +6406,7 @@ bool llama_hybrid_profile_moe_full_layer(
             total_ms,
             total_ms
         });
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
             "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
             "total_ms=%.3f per_layer_ms=%.3f\n",
