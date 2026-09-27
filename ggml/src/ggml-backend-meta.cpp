@@ -3801,15 +3801,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     auto subgraph_is_phone_only = [&](size_t sg) -> bool {
         return subgraph_is_phone_owned(sg);
     };
+    std::map<int, bool> layer_phone_primary_cache;
     auto layer_attention_phone_owned = [&](int layer) -> bool {
         if (n_backends != 2 || layer < 0) {
             return false;
         }
 
-        char expected[64];
-        std::snprintf(expected, sizeof(expected), "attn_out-%d", layer);
-        bool pc_seen = false;
-        bool phone_seen = false;
+        const auto cached = layer_phone_primary_cache.find(layer);
+        if (cached != layer_phone_primary_cache.end()) {
+            return cached->second;
+        }
+
+        char attn_name[64];
+        char residual_name[64];
+        std::snprintf(attn_name, sizeof(attn_name), "attn_out-%d", layer);
+        std::snprintf(residual_name, sizeof(residual_name), "ffn_inp-%d", layer);
+
+        bool marker_seen = false;
         bool pc_compute = false;
         bool phone_compute = false;
 
@@ -3822,26 +3830,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 for (int k = 0; k < graph->n_nodes; ++k) {
                     ggml_tensor * node = graph->nodes[k];
-                    if (std::strcmp(node->name, expected) != 0) {
+                    if (std::strcmp(node->name, attn_name) != 0 &&
+                        std::strcmp(node->name, residual_name) != 0) {
+                        continue;
+                    }
+
+                    marker_seen = true;
+                    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                         continue;
                     }
                     if (backend == 0) {
-                        pc_seen = true;
-                        pc_compute =
-                            pc_compute ||
-                            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                        pc_compute = true;
                     } else {
-                        phone_seen = true;
-                        phone_compute =
-                            phone_compute ||
-                            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                        phone_compute = true;
                     }
                 }
             }
         }
 
-        return pc_seen && phone_seen &&
-               !pc_compute && phone_compute;
+        const bool phone_primary =
+            marker_seen && !pc_compute && phone_compute;
+        layer_phone_primary_cache[layer] = phone_primary;
+        return phone_primary;
     };
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_attention_phone_owned(layer)) {
