@@ -1039,6 +1039,7 @@ void llama_context::synchronize() {
                         ++n_phone;
                         break;
                     case llama_hybrid_layer_mode::TENSOR_SPLIT:
+                    case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
                         ++n_tensor;
                         break;
                 }
@@ -3502,6 +3503,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+    const bool tensor_phone_primary_plan =
+        has_runtime_plan &&
+        runtime_plan.tensor_layers > 0 &&
+        runtime_plan.tensor_phone_primary;
 
     const bool gpu_tensor_topology =
         runtime_stages.size() == 2 &&
@@ -3512,7 +3517,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         std::all_of(runtime_stages.begin(), runtime_stages.end(),
                     [](const llama_hybrid_runtime_stage & stage) { return stage.macro_tokens > 0; });
     const bool stage_queue_plan_eligible =
-        stage_queue_requested && has_runtime_plan && gpu_tensor_topology && model.arch != LLM_ARCH_QWEN2;
+        stage_queue_requested && has_runtime_plan &&
+        !tensor_phone_primary_plan &&
+        gpu_tensor_topology && model.arch != LLM_ARCH_QWEN2;
     const bool gpu_cpu_tensor_topology =
         runtime_stages.size() == 3 &&
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
@@ -3548,16 +3555,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // full graph so the Tensor suffix can contain multiple XT chunks and
     // advance as (layer, chunk) wavefronts.
     const bool return_wavefront_full_graph_override =
-        return_wavefront_requested && gpu_tensor_topology && model.arch == LLM_ARCH_QWEN2;
+        return_wavefront_requested &&
+        !tensor_phone_primary_plan &&
+        gpu_tensor_topology && model.arch == LLM_ARCH_QWEN2;
     const bool generalized_stage_arch =
         model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3MOE;
     const bool generalized_stage_queue_plan_eligible =
-        stage_queue_requested && has_runtime_plan && valid_stage_macros && generalized_stage_arch &&
+        stage_queue_requested && has_runtime_plan &&
+        !tensor_phone_primary_plan &&
+        valid_stage_macros && generalized_stage_arch &&
         !return_wavefront_full_graph_override &&
         (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
-        stage_queue_requested && has_runtime_plan && !gpu_tensor_topology && runtime_stages.size() >= 2 &&
+        stage_queue_requested && has_runtime_plan &&
+        !tensor_phone_primary_plan &&
+        !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && generalized_stage_arch;
 
     // Formal return-wavefront profiling must be self-contained. Historically the
@@ -5732,10 +5745,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         const uint64_t n_chunks = chunks.size();
 
         if (n_chunks > 1) {
-            const uint64_t tensor_layers = std::count(
+            const uint64_t tensor_layers = std::count_if(
                     model.hybrid_layer_modes.begin(),
                     model.hybrid_layer_modes.end(),
-                    llama_hybrid_layer_mode::TENSOR_SPLIT);
+                    [](llama_hybrid_layer_mode mode) {
+                        return mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+                               mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+                    });
             const uint64_t n_layers = model.hparams.n_layer();
             const uint64_t base_nodes_per_layer = (base + n_layers - 1) / n_layers;
 
