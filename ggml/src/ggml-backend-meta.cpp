@@ -3969,6 +3969,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         };
 
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
+        if (layer_is_tensor_phone_primary(layer)) {
+            return false;
+        }
         if (layer_attention_phone_owned(layer)) {
             return true;
         }
@@ -4021,6 +4024,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return true;
     };
     auto decode_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
+        if (layer_is_tensor_phone_primary(layer)) {
+            return false;
+        }
         if (layer_attention_phone_owned(layer)) {
             return true;
         }
