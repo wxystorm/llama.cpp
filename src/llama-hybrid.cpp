@@ -127,13 +127,18 @@ bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan) {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
         g_llama_hybrid_runtime_plan = plan;
         g_llama_hybrid_runtime_wave_calibration.reset();
-        llama_hybrid_runtime_set_dual_return(plan.tensor_layers > 0);
+        llama_hybrid_runtime_set_dual_return(
+            plan.tensor_layers > 0 && !plan.tensor_phone_primary);
     }
 
     LLAMA_LOG_INFO(
-        "[HYBRID_RUNTIME] plan published T=%d P=%d C=%d R=%.3f G=%d XG=%d XC=%d XT=%d XP=%d\n",
-        plan.tensor_layers, plan.phone_layers, plan.pc_layers, plan.tensor_pc_ratio, plan.gpu_pc_layers,
-        plan.gpu_chunk_tokens, plan.cpu_chunk_tokens, plan.tensor_chunk_tokens, plan.phone_chunk_tokens);
+        "[HYBRID_RUNTIME] plan published T=%d primary=%s P=%d C=%d R=%.3f G=%d "
+        "XG=%d XC=%d XT=%d XP=%d\n",
+        plan.tensor_layers,
+        plan.tensor_phone_primary ? "PHONE" : "PC",
+        plan.phone_layers, plan.pc_layers, plan.tensor_pc_ratio,
+        plan.gpu_pc_layers, plan.gpu_chunk_tokens, plan.cpu_chunk_tokens,
+        plan.tensor_chunk_tokens, plan.phone_chunk_tokens);
     return true;
 }
 
