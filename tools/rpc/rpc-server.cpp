@@ -10,10 +10,12 @@
 #  define DIRECTORY_SEPARATOR '/'
 #  include <unistd.h>
 #  include <sys/stat.h>
+#  include <dlfcn.h>
 #endif
 #include <algorithm>
 #include <clocale>
 #include <codecvt>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <regex>
@@ -272,6 +274,159 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
     return true;
 }
 
+#ifndef _WIN32
+static void print_opencl_memory_info_if_selected(const std::vector<ggml_backend_dev_t> & devices) {
+    bool has_opencl_device = false;
+    for (ggml_backend_dev_t dev : devices) {
+        const char * name = ggml_backend_dev_name(dev);
+        if (name != nullptr && std::strstr(name, "OpenCL") != nullptr) {
+            has_opencl_device = true;
+            break;
+        }
+    }
+
+    if (!has_opencl_device) {
+        return;
+    }
+
+    // Keep this probe independent from the ICD loader used by clinfo.  On
+    // Android/Adreno, the vendor libOpenCL.so can work even when clinfo cannot
+    // enumerate a Khronos ICD platform.
+    void * opencl = nullptr;
+    const char * opencl_paths[] = {
+        "libOpenCL.so",
+        "/vendor/lib64/libOpenCL.so",
+        "/vendor/lib/libOpenCL.so",
+    };
+    for (const char * path : opencl_paths) {
+        opencl = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+        if (opencl != nullptr) {
+            printf("[OPENCL_MEMORY] library=%s\n", path);
+            break;
+        }
+    }
+
+    if (opencl == nullptr) {
+        const char * error = dlerror();
+        printf("[OPENCL_MEMORY] probe_failed=dlopen error=%s\n", error != nullptr ? error : "unknown");
+        return;
+    }
+
+    using cl_int         = int32_t;
+    using cl_uint        = uint32_t;
+    using cl_ulong       = uint64_t;
+    using cl_bool        = cl_uint;
+    using cl_bitfield    = cl_ulong;
+    using cl_device_type = cl_bitfield;
+    using cl_device_info = cl_uint;
+    using cl_platform_id = struct _cl_platform_id *;
+    using cl_device_id   = struct _cl_device_id *;
+
+    constexpr cl_int CL_SUCCESS = 0;
+    constexpr cl_device_type CL_DEVICE_TYPE_GPU = (cl_device_type) (1u << 2);
+    constexpr cl_device_info CL_DEVICE_ADDRESS_BITS        = 0x100D;
+    constexpr cl_device_info CL_DEVICE_MAX_MEM_ALLOC_SIZE  = 0x1010;
+    constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_SIZE     = 0x101F;
+    constexpr cl_device_info CL_DEVICE_NAME                = 0x102B;
+    constexpr cl_device_info CL_DEVICE_HOST_UNIFIED_MEMORY = 0x1035;
+
+    using clGetPlatformIDs_fn = cl_int (*)(cl_uint, cl_platform_id *, cl_uint *);
+    using clGetDeviceIDs_fn = cl_int (*)(cl_platform_id, cl_device_type, cl_uint, cl_device_id *, cl_uint *);
+    using clGetDeviceInfo_fn = cl_int (*)(cl_device_id, cl_device_info, size_t, void *, size_t *);
+
+    auto clGetPlatformIDs =
+        reinterpret_cast<clGetPlatformIDs_fn>(dlsym(opencl, "clGetPlatformIDs"));
+    auto clGetDeviceIDs =
+        reinterpret_cast<clGetDeviceIDs_fn>(dlsym(opencl, "clGetDeviceIDs"));
+    auto clGetDeviceInfo =
+        reinterpret_cast<clGetDeviceInfo_fn>(dlsym(opencl, "clGetDeviceInfo"));
+
+    if (clGetPlatformIDs == nullptr || clGetDeviceIDs == nullptr || clGetDeviceInfo == nullptr) {
+        printf("[OPENCL_MEMORY] probe_failed=missing_symbol\n");
+        dlclose(opencl);
+        return;
+    }
+
+    cl_uint platform_count = 0;
+    cl_int status = clGetPlatformIDs(0, nullptr, &platform_count);
+    if (status != CL_SUCCESS || platform_count == 0) {
+        printf("[OPENCL_MEMORY] probe_failed=platforms status=%d count=%u\n",
+               (int) status, platform_count);
+        dlclose(opencl);
+        return;
+    }
+
+    std::vector<cl_platform_id> platforms(platform_count);
+    status = clGetPlatformIDs(platform_count, platforms.data(), nullptr);
+    if (status != CL_SUCCESS) {
+        printf("[OPENCL_MEMORY] probe_failed=platform_list status=%d\n", (int) status);
+        dlclose(opencl);
+        return;
+    }
+
+    size_t printed = 0;
+    for (cl_platform_id platform : platforms) {
+        cl_uint device_count = 0;
+        status = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &device_count);
+        if (status != CL_SUCCESS || device_count == 0) {
+            continue;
+        }
+
+        std::vector<cl_device_id> cl_devices(device_count);
+        status = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, device_count, cl_devices.data(), nullptr);
+        if (status != CL_SUCCESS) {
+            continue;
+        }
+
+        for (cl_device_id device : cl_devices) {
+            char name[256] = {};
+            cl_ulong global_mem = 0;
+            cl_ulong max_alloc = 0;
+            cl_bool host_unified = 0;
+            cl_uint address_bits = 0;
+
+            const cl_int name_status =
+                clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+            const cl_int global_status =
+                clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, nullptr);
+            const cl_int alloc_status =
+                clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, nullptr);
+            const cl_int unified_status =
+                clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(host_unified), &host_unified, nullptr);
+            const cl_int bits_status =
+                clGetDeviceInfo(device, CL_DEVICE_ADDRESS_BITS, sizeof(address_bits), &address_bits, nullptr);
+
+            printf(
+                "[OPENCL_MEMORY] index=%zu device=%s "
+                "global_mem=%llu bytes (%.1f MiB) "
+                "max_alloc=%llu bytes (%.1f MiB) "
+                "host_unified=%u address_bits=%u "
+                "status={name:%d global:%d alloc:%d unified:%d bits:%d}\n",
+                printed,
+                name_status == CL_SUCCESS ? name : "<unknown>",
+                (unsigned long long) global_mem,
+                (double) global_mem / (1024.0 * 1024.0),
+                (unsigned long long) max_alloc,
+                (double) max_alloc / (1024.0 * 1024.0),
+                (unsigned) host_unified,
+                address_bits,
+                (int) name_status,
+                (int) global_status,
+                (int) alloc_status,
+                (int) unified_status,
+                (int) bits_status);
+            ++printed;
+        }
+    }
+
+    if (printed == 0) {
+        printf("[OPENCL_MEMORY] probe_failed=no_gpu_devices\n");
+    }
+
+    dlclose(opencl);
+}
+#endif
+
 static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & params) {
     std::vector<ggml_backend_dev_t> devices;
     if (!params.devices.empty()) {
@@ -412,6 +567,9 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
+#ifndef _WIN32
+    print_opencl_memory_info_if_selected(devices);
+#endif
     std::string endpoint = params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
