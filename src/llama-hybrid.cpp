@@ -35,14 +35,15 @@ static constexpr int LLAMA_HYBRID_COMPUTE_MEASURE_RUNS = 3;
 static constexpr int                  LLAMA_HYBRID_PROFILE_TOKENS          = 16;
 static constexpr int                  LLAMA_HYBRID_REFERENCE_TOKENS        = 128;
 static constexpr int                  LLAMA_HYBRID_PROFILE_BLOCK_LAYERS    = 5;
-static constexpr std::array<int, 9>   LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20, 24, 32, 48, 64 };
+static constexpr std::array<int, 13>  LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_REGION_CHUNK_CANDIDATES = { 8, 16, 32, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
-static constexpr std::array<int, 5>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64 };
+static constexpr std::array<int, 9>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS       = 4;
 static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS       = { 1, 64, 128, 256 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_LOW_TENSOR_ANCHORS          = { 1, 2, 4, 8 };
+static constexpr size_t               LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS         = 4;
 static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 4;
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
@@ -360,6 +361,15 @@ std::vector<int> llama_hybrid_probe_chunk_tokens(const llama_hybrid_profile & pr
         result.insert(result.end(), chunks.begin(), chunks.end());
     }
 
+    // The reference layout is intentionally small, but Tensor runtime can use
+    // much larger XT values at the real ubatch.  Probe those anchors directly
+    // instead of extrapolating 192/256-token GPU/RPC behavior from <=128.
+    for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
+        if (chunk_tokens > 0) {
+            result.push_back(chunk_tokens);
+        }
+    }
+
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -386,6 +396,15 @@ static std::vector<std::pair<int, int>> llama_hybrid_probe_dual_chunks(const lla
     for (const auto & chunks : layouts) {
         for (size_t i = 0; i + 1 < chunks.size(); i += 2) {
             pairs.emplace(chunks[i], chunks[i + 1]);
+        }
+    }
+
+    // Large XT layouts (notably 192/256 for ubatch 512) do not appear in the
+    // 128-token reference layout.  Measure their common paired return case so
+    // Tensor scoring does not fall back to a single-transfer approximation.
+    for (const int chunk_tokens : LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES) {
+        if (chunk_tokens > 0) {
+            pairs.emplace(chunk_tokens, chunk_tokens);
         }
     }
     return { pairs.begin(), pairs.end() };
@@ -3305,18 +3324,13 @@ static bool llama_hybrid_coarse_memory_possible(
 }
 
 static double llama_hybrid_tensor_depth_factor(int tensor_layers) {
-    if (tensor_layers <= 1) {
-        return 1.0;
-    }
+    (void) tensor_layers;
 
-    // Single-layer/chunk probes represent an optimistic overlap envelope.
-    // Real deep Tensor regions repeatedly cross the RPC return/reduce barrier,
-    // so retain a conservative depth-dependent correction. It rises quickly
-    // for the first few layers and saturates instead of growing without bound.
-    constexpr double max_penalty = 0.25;
-    constexpr double depth_scale = 8.0;
-    const double x = (double) (tensor_layers - 1) / depth_scale;
-    return 1.0 + max_penalty * (1.0 - std::exp(-x));
+    // Coarse search should only rank candidates well enough to decide which
+    // plans reach the full scorer.  The full pipeline simulator already models
+    // repeated Tensor layer barriers, so applying an additional empirical
+    // depth penalty here can prune good deep-T plans before they are simulated.
+    return 1.0;
 }
 
 static bool llama_hybrid_coarse_plan_score(
@@ -3442,6 +3456,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
 
     std::array<std::vector<llama_hybrid_coarse_candidate>, 16> family_top;
     std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_LOW_TENSOR_ANCHORS.size()> low_tensor_top;
+    std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS> tensor_depth_top;
     std::vector<llama_hybrid_coarse_candidate> global_top;
     std::vector<llama_hybrid_coarse_candidate> margin_pool;
 
@@ -3625,6 +3640,16 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                                 break;
                             }
                         }
+                        if (plan.tensor_layers > 0) {
+                            const size_t depth_bucket = std::min<size_t>(
+                                LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS - 1,
+                                (size_t) (plan.tensor_layers - 1) *
+                                    LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS /
+                                    (size_t) profile.n_layer);
+                            llama_hybrid_coarse_insert_top(
+                                tensor_depth_top[depth_bucket], candidate,
+                                LLAMA_HYBRID_COARSE_FAMILY_TOP_K);
+                        }
                         llama_hybrid_coarse_insert_top(
                             global_top, candidate,
                             LLAMA_HYBRID_COARSE_GLOBAL_TOP_K);
@@ -3665,6 +3690,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             keep_unique(candidate);
         }
     }
+    for (const auto & bucket : tensor_depth_top) {
+        for (const auto & candidate : bucket) {
+            keep_unique(candidate);
+        }
+    }
     for (const auto & candidate : global_top) {
         keep_unique(candidate);
     }
@@ -3681,7 +3711,8 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d max_tensor_chunks=%d pc_budget=%zu "
         "phone_budget=%zu gpu_budget=%zu gpu_runtime_reserve=%zu total=%zu coarse_scoreable=%zu kept=%zu "
         "reject_chunks=%zu reject_coarse_memory=%zu ratio_evals=%zu best_coarse_ms=%.3f "
-        "family_top_k=%zu low_tensor_anchors=1,2,4,8 global_top_k=%zu margin_pool=%zu margin=%.2f\n",
+        "family_top_k=%zu low_tensor_anchors=1,2,4,8 tensor_depth_buckets=%zu "
+        "global_top_k=%zu margin_pool=%zu margin=%.2f\n",
         constraints.target_ctx > 0 ? constraints.target_ctx : profile.n_ctx_train,
         constraints.target_ubatch_tokens > 0 ? constraints.target_ubatch_tokens : profile.probe_tokens,
         profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS,
@@ -3689,7 +3720,8 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         total_candidates, coarse_scoreable, result.size(), reject_chunks,
         reject_coarse_memory, ratio_evals,
         std::isfinite(best_coarse) ? best_coarse : 0.0,
-        LLAMA_HYBRID_COARSE_FAMILY_TOP_K, LLAMA_HYBRID_COARSE_GLOBAL_TOP_K,
+        LLAMA_HYBRID_COARSE_FAMILY_TOP_K, LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS,
+        LLAMA_HYBRID_COARSE_GLOBAL_TOP_K,
         LLAMA_HYBRID_COARSE_MARGIN_POOL, LLAMA_HYBRID_COARSE_MARGIN);
 
     return result;
