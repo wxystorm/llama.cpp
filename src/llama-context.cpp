@@ -3496,6 +3496,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_hybrid_plan runtime_plan;
     const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
+    int tensor_phone_first_layer = -1;
+    int tensor_phone_last_layer = -1;
+    if (has_runtime_plan && runtime_plan.tensor_phone_primary) {
+        for (int il = 0; il < (int) hparams.n_layer(); ++il) {
+            if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+                continue;
+            }
+            if (tensor_phone_first_layer < 0) {
+                tensor_phone_first_layer = il;
+            }
+            tensor_phone_last_layer = il + 1;
+        }
+        GGML_ASSERT(tensor_phone_last_layer - tensor_phone_first_layer == runtime_plan.tensor_layers);
+    }
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_backend_meta_set_tensor_phone_primary_layers(
+            backend, tensor_phone_first_layer, tensor_phone_last_layer);
+    }
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};

@@ -510,6 +510,8 @@ extern "C" {
     };
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
+    GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
+        ggml_backend_t backend, int first_layer, int last_layer);
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
