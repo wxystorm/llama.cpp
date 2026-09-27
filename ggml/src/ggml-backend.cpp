@@ -80,7 +80,7 @@ static void ggml_alloc_size_trace_log(
     const double remote_wall_pct =
         wall_us > 0 ? 100.0 * s.rpc_remote_us / wall_us : 0.0;
 
-    GGML_LOG_DEBUG(
+    GGML_LOG_ERROR(
         "[RPC_GET_ALLOC_SIZE_SUM] phase=%s wall_ms=%.3f calls=%" PRId64 " aggregate_ms=%.3f "
         "meta_calls=%" PRId64 " meta_ms=%.3f rpc_buft_calls=%" PRId64 " rpc_buft_ms=%.3f "
         "remote_calls=%" PRId64 " remote_ms=%.3f avg_remote_ms=%.3f remote_wall_pct=%.1f "
@@ -1733,7 +1733,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     const int64_t total_us = ggml_time_us() - total_begin_us;
     const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
     if (timing_debug || total_us >= 10000) {
-        GGML_LOG_DEBUG(
+        GGML_LOG_ERROR(
             "[SCHED_ALLOC_SPLITS] nodes=%d leafs=%d backends=%d backend_ids_changed=%d "
             "first_alloc_attempted=%d first_alloc_ok=%d need_realloc=%d reserve_ok=%d second_alloc_ok=%d "
             "total_ms=%.3f scan_ms=%.3f first_alloc_ms=%.3f sync_ms=%.3f reserve_ms=%.3f second_alloc_ms=%.3f\n",
@@ -1755,7 +1755,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         if (sync_us > 0) {
             for (int i = 0; i < sched->n_backends; ++i) {
-                GGML_LOG_DEBUG(
+                GGML_LOG_ERROR(
                     "[SCHED_ALLOC_SYNC] backend=%d name=%s sync_ms=%.3f\n",
                     i,
                     ggml_backend_name(sched->backends[i]),
@@ -2221,7 +2221,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
     if (timing_debug || total_us >= 10000) {
-        GGML_LOG_DEBUG(
+        GGML_LOG_ERROR(
             "[SCHED_ALLOC_BREAKDOWN] nodes=%d leafs=%d splits=%d backends=%d ok=%d "
             "total_ms=%.3f split_graph_ms=%.3f alloc_splits_ms=%.3f\n",
             graph->n_nodes,

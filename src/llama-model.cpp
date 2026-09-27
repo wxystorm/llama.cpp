@@ -1451,7 +1451,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
         if (has_runtime_plan) {
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) TENSOR=[%d,%d) PHONE=[%d,%d)\n",
                 runtime_plan.gpu_pc_layers,
                 runtime_plan.gpu_pc_layers, runtime_plan.pc_layers,
@@ -1626,7 +1626,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pc_layer_backends[il];
 
     if (pc_backend == llama_pc_layer_backend::CUDA) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CUDA device=%s\n",
             il, ggml_backend_dev_name(cuda_dev));
 
@@ -1640,7 +1640,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Place both its weights and graph directly on the CPU backend. Meta is
     // reserved for TENSOR_SPLIT / PHONE_ONLY layers that actually need the
     // secondary RPC backend.
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CPU_DIRECT device=%s\n",
         il, ggml_backend_dev_name(cpu_dev));
 
@@ -1945,11 +1945,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             } else {
                 const size_t ctx_used = ggml_used_mem(ctx);
                 const size_t ctx_size = ggml_get_mem_size(ctx);
-                LLAMA_LOG_DEBUG(
+                LLAMA_LOG_ERROR(
                     "[MODEL_ALLOC_CTX_BEGIN] buft=%s used=%zu size=%zu free=%zu\n",
                     ggml_backend_buft_name(buft), ctx_used, ctx_size, ctx_size - ctx_used);
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer   context很重要
-                LLAMA_LOG_DEBUG("[MODEL_ALLOC_CTX_END] buft=%s\n", ggml_backend_buft_name(buft));
+                LLAMA_LOG_ERROR("[MODEL_ALLOC_CTX_END] buft=%s\n", ggml_backend_buft_name(buft));
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

@@ -607,7 +607,7 @@ bool llama_hybrid_profile_memory(llama_hybrid_profile & profile,
     }
 
     constexpr double mib = 1024.0 * 1024.0;
-    LLAMA_LOG_DEBUG("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
+    LLAMA_LOG_ERROR("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
                    ggml_backend_name(pc_backend), profile.pc_free_mem, profile.pc_total_mem, profile.pc_free_mem / mib,
                    profile.pc_total_mem / mib);
     LLAMA_LOG_INFO("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
@@ -692,7 +692,7 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
     LLAMA_LOG_INFO("[HYBRID_PROFILE] phone attn_ms=%.3f full_layer_ms=%.3f full_layer_compute_est_ms=%.3f\n",
                    profile.phone_attn_ms, profile.phone_full_layer_ms, profile.phone_full_layer_compute_est_ms);
     LLAMA_LOG_INFO("[HYBRID_PROFILE] gpu full_layer_ms=%.3f\n", profile.gpu_full_layer_ms);
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[HYBRID_PROFILE_DECODE_TAIL_SUMMARY] norm_ms=%.3f "
         "lm_head_ms=%.3f total_ms=%.3f\n",
         profile.decode_tail_norm_ms,
@@ -742,7 +742,7 @@ void llama_hybrid_plan_print(const llama_hybrid_plan & plan) {
         plan.tensor_layers, plan.phone_layers, plan.pc_layers, plan.tensor_pc_ratio, plan.gpu_pc_layers,
         plan.gpu_chunk_tokens, plan.cpu_chunk_tokens, plan.tensor_chunk_tokens, plan.phone_chunk_tokens,
         plan.predicted_ms);
-    LLAMA_LOG_DEBUG("[HYBRID_PLAN_MEMORY] pc_required=%zu phone_required=%zu gpu_required=%zu\n", plan.pc_memory,
+    LLAMA_LOG_ERROR("[HYBRID_PLAN_MEMORY] pc_required=%zu phone_required=%zu gpu_required=%zu\n", plan.pc_memory,
                    plan.phone_memory, plan.gpu_memory);
     LLAMA_LOG_INFO(
         "[HYBRID_PLAN_COST] tensor=%.3f phone=%.3f pc_cpu=%.3f pc_gpu=%.3f handoff=%.3f "
@@ -2519,7 +2519,7 @@ static bool llama_hybrid_profile_decode_tail(
             profile.decode_tail_ms -
                 profile.decode_tail_norm_ms);
 
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[HYBRID_PROFILE_DECODE_TAIL] placement=CPU_PRIMARY "
         "tokens=1 n_embd=%" PRId64 " n_vocab=%" PRId64
         " norm_type=%s output_type=%s tied=%d "
@@ -2707,7 +2707,7 @@ void llama_hybrid_decode_plan_print(
         const llama_hybrid_decode_plan & plan) {
     const double tps =
         plan.predicted_ms > 0.0 ? 1000.0 / plan.predicted_ms : 0.0;
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[DECODE_PLAN] T=%d P=%d C=%d G=%d R=%.3f LLAMA_CHUNKS=%d "
         "kv_tokens=%d predicted_ms=%.3f predicted_tps=%.3f "
         "gpu_ms=%.3f cpu_ms=%.3f tensor_ms=%.3f phone_ms=%.3f "
@@ -2758,7 +2758,7 @@ bool llama_hybrid_predict_decode_plan(
     if (!llama_hybrid_decode_layer_cost(
             profile.phone_layer_blocks, profile.phone_attn,
             kv_tokens, true, phone_layer_ms)) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_PLAN] unavailable reason=missing_phone_decode_profile kv_tokens=%d\n",
             kv_tokens);
         return false;
@@ -2780,7 +2780,7 @@ bool llama_hybrid_predict_decode_plan(
                 layers,
                 false,
                 cpu_decode_region_ms[(size_t) layers])) {
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[DECODE_PLAN] unavailable reason=missing_cpu_depth_profile "
                 "layers=%d kv_tokens=%d\n",
                 layers, kv_tokens);
@@ -2808,7 +2808,7 @@ bool llama_hybrid_predict_decode_plan(
                 token1_sustained_per_layer_ms);
         if (have_one_layer && have_sustained) {
             const int deep_layers = profile.n_layer;
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[DECODE_CPU_DEPTH] tokens=1 kv_tokens=%d "
                 "probe_layers=%d one_layer_base_ms=%.3f "
                 "sustained_per_layer_base_ms=%.3f sustained_over_one=%.3f "
@@ -2830,7 +2830,7 @@ bool llama_hybrid_predict_decode_plan(
 
     const auto ratios = llama_hybrid_decode_ratio_candidates(profile);
     if (ratios.empty()) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_PLAN] unavailable reason=missing_token1_tensor_ratio_profile\n");
         return false;
     }
@@ -2844,7 +2844,7 @@ bool llama_hybrid_predict_decode_plan(
                 profile, kv_tokens, ratio, tensor_cost)) {
             continue;
         }
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_RATIO] R=%.5f layer_ms=%.3f base_ms=%.3f "
             "pc_ffn_ms=%.3f phone_ffn_ms=%.3f h2d_wall_ms=%.3f "
             "d2h_ms=%.3f reduce_ms=%.3f profile_layers=%d "
@@ -2869,7 +2869,7 @@ bool llama_hybrid_predict_decode_plan(
         return false;
     }
 
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[DECODE_RATIO_BEST] R=%.5f tensor_layer_ms=%.3f kv_tokens=%d\n",
         best_ratio, best_tensor_cost.total_ms, kv_tokens);
 
@@ -3010,7 +3010,7 @@ bool llama_hybrid_predict_decode_plan(
     }
 
     if (!found) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_PLAN] unavailable reason=no_memory_feasible_layout\n");
         return false;
     }
@@ -3026,7 +3026,7 @@ bool llama_hybrid_predict_decode_plan(
     }
     for (size_t i = 0; i < top.size(); ++i) {
         const auto & p = top[i].plan;
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_TOP] rank=%zu T=%d P=%d C=%d G=%d R=%.3f "
             "predicted_ms=%.3f predicted_tps=%.3f\n",
             i + 1,
@@ -3038,11 +3038,11 @@ bool llama_hybrid_predict_decode_plan(
 
     llama_hybrid_decode_plan_print(best_plan);
     if (profile.is_moe) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_CHUNK] selected=1 mode=FIXED "
             "reason=measured_fastest_correct_qwen3moe\n");
     } else {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[DECODE_CHUNK] selected=1 mode=BASELINE "
             "reason=decode_chunk_search_not_enabled\n");
     }
@@ -3665,7 +3665,7 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         }
     }
 
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[HYBRID_PLAN_ENUM] ctx=%d ubatch=%d reference_tokens=%d max_tensor_chunks=%d pc_budget=%zu "
         "phone_budget=%zu gpu_budget=%zu gpu_runtime_reserve=%zu total=%zu coarse_scoreable=%zu kept=%zu "
         "reject_chunks=%zu reject_coarse_memory=%zu ratio_evals=%zu best_coarse_ms=%.3f "
@@ -5545,7 +5545,7 @@ bool llama_hybrid_profile_moe_ffn(
                 LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS,
                 phone_timing);
         if (!cpu_ok || !phone_ok) {
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
                 "status=SKIP cpu_ok=%d phone_ok=%d\n",
                 pc_ratio,
@@ -5563,7 +5563,7 @@ bool llama_hybrid_profile_moe_ffn(
             phone_timing.compute_est_ms,
         });
 
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[HYBRID_PROFILE_DECODE_RATIO_BLOCK] R=%.5f layers=%d "
             "cpu_total_ms=%.3f cpu_per_layer_ms=%.3f "
             "phone_wall_total_ms=%.3f phone_wall_per_layer_ms=%.3f "
@@ -6406,7 +6406,7 @@ bool llama_hybrid_profile_moe_full_layer(
             total_ms,
             total_ms
         });
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_ERROR(
             "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
             "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
             "total_ms=%.3f per_layer_ms=%.3f\n",
@@ -7152,7 +7152,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
     }
 
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_ERROR(
         "[HYBRID_PLAN_MEMORY_FILTER] scored=%zu feasible=%zu estimate_failed=%zu "
         "reject_pc=%zu reject_phone=%zu reject_gpu=%zu pc_budget=%zu phone_budget=%zu gpu_budget=%zu\n",
         scored, memory_feasible, memory_estimate_failed, reject_pc, reject_phone, reject_gpu,
@@ -7207,7 +7207,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                         }
                         return result;
                     };
-                LLAMA_LOG_DEBUG(
+                LLAMA_LOG_ERROR(
                     "[HYBRID_TENSOR_LAYOUT] T=%d R=%.3f macro_tokens=%d "
                     "XT=%d raw=%s final=%s chunks=%zu->%zu "
                     "depth_factor=%.3f\n",
@@ -7228,7 +7228,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         llama_hybrid_decode_plan decode_plan;
         if (!llama_hybrid_predict_decode_plan(
                 profile, constraints, decode_plan)) {
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[DECODE_PLAN] prediction_failed applied=0\n");
         }
     }
@@ -7240,7 +7240,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             constraints.target_ubatch_tokens : reference_tokens;
         llama_hybrid_sim_result sim;
         if (llama_hybrid_simulate_prefill(profile, constraints, best_plan, work_tokens, true, sim)) {
-            LLAMA_LOG_DEBUG(
+            LLAMA_LOG_ERROR(
                 "[PRED_PIPE_LEGACY] plan=T%d,P%d,C%d,G%d,XG%d,XC%d,XT%d,XP%d sim_ms=%.3f "
                 "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f tensor_peak_mib=%.2f "
                 "phone_peak_mib=%.2f schedule=%s\n",

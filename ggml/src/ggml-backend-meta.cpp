@@ -2112,7 +2112,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     const int64_t total_us = ggml_time_us() - total_begin_us;
     const bool timing_debug = std::getenv("GGML_ALLOC_TIMING_DEBUG") != nullptr;
     if (timing_debug || total_us >= 10000) {
-        GGML_LOG_DEBUG(
+        GGML_LOG_ERROR(
             "[META_BUFFER_ALLOC] requested_mib=%.3f simple_backends=%zu total_ms=%.3f max_mib=%.3f\n",
             size / 1048576.0,
             n_simple_bufts,
@@ -2120,7 +2120,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
             max_size / 1048576.0);
         for (size_t i = 0; i < n_simple_bufts; ++i) {
             ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
-            GGML_LOG_DEBUG(
+            GGML_LOG_ERROR(
                 "[META_BUFFER_ALLOC_SIMPLE] index=%zu buft=%s requested_mib=%.3f actual_mib=%.3f alloc_ms=%.3f\n",
                 i,
                 ggml_backend_buft_name(simple_buft),
