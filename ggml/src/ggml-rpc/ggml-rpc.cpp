@@ -1131,7 +1131,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     if (rpc_opencl_extra_debug_enabled() &&
         rpc_is_k_quant_type(tensor->type)) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_CLIENT_SET_BEGIN] name=%s type=%d "
             "local_buffer=%p remote_buffer=0x%" PRIx64
             " data=0x%" PRIx64 " offset=%zu size=%zu\n",
@@ -1255,7 +1255,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     if (rpc_opencl_extra_debug_enabled() &&
         rpc_is_k_quant_type(tensor->type)) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_CLIENT_SET_DONE] name=%s type=%d "
             "remote_buffer=0x%" PRIx64 " data=0x%" PRIx64
             " offset=%zu size=%zu\n",
@@ -1508,7 +1508,7 @@ auto * dev_ctx =
 
     const bool timing_debug = std::getenv("GGML_ALLOC_TIMING_DEBUG") != nullptr;
     if (timing_debug || total_us >= 10000) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_ALLOC_BUFFER] device=%u requested_mib=%.3f returned_mib=%.3f status=%d "
             "total_ms=%.3f socket_ms=%.3f rpc_ms=%.3f\n",
             buft_ctx->device,
@@ -1858,7 +1858,7 @@ static void add_tensor(
 
         if (rpc_opencl_extra_debug_enabled() &&
             rpc_is_k_quant_type(tensor->type)) {
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_KQUANT_GRAPH_EXTERNAL] name=%s ptr=%p type=%d "
                 "local_buffer=%p remote_buffer=0x%" PRIx64
                 " data=0x%" PRIx64 " bytes=%zu view_src=%p\n",
@@ -2612,7 +2612,7 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
         }
 
         if (have_nearest) {
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
                 "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
                 "same_buffer_type=%zu nearest_data=0x%" PRIx64
@@ -2627,7 +2627,7 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
                 nearest_extra,
                 nearest_ambiguous ? 1 : 0);
         } else {
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
                 "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
                 "same_buffer_type=0\n",
@@ -2641,7 +2641,7 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
 
     if (storage_it->second.ambiguous ||
         storage_it->second.extra == nullptr) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_CONFLICT "
             "name=%s buffer=%p data=%p type=%d\n",
             tensor->name,
@@ -2680,7 +2680,7 @@ bool rpc_server::ensure_opencl_tensor_extra(
     // weights or OpenCL extra, and OpenCL skips empty nodes at execution.
     if (ggml_is_empty(tensor)) {
         if (rpc_opencl_extra_debug_enabled()) {
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_OPENCL_EXTRA] action=SKIP_EMPTY name=%s type=%d\n",
                 tensor->name, (int) tensor->type);
         }
@@ -2705,7 +2705,7 @@ bool rpc_server::ensure_opencl_tensor_extra(
          tensor->type == GGML_TYPE_Q6_K);
 
     if (!allow_quantized_weight_init && requires_k_quant_extra) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_K_QUANT_LEAF "
             "name=%s buffer=%p data=%p type=%d ne=[%" PRId64 ",%" PRId64
             ",%" PRId64 ",%" PRId64 "]\n",
@@ -2723,7 +2723,7 @@ bool rpc_server::ensure_opencl_tensor_extra(
     const ggml_status status =
         ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
     if (status != GGML_STATUS_SUCCESS || tensor->extra == nullptr) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_EXTRA] action=INIT_FAILED name=%s status=%d extra=%p\n",
             tensor->name, (int) status, tensor->extra);
         return false;
@@ -2787,7 +2787,7 @@ void rpc_server::remember_opencl_tensor_extra(ggml_tensor * tensor) {
     }
 
     if (storage_conflict) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_EXTRA] action=REMEMBER_STORAGE_CONFLICT "
             "name=%s buffer=%p data=%p type=%d extra=%p\n",
             tensor->name,
@@ -3064,7 +3064,7 @@ bool rpc_server::set_tensor_direct(
         rpc_is_k_quant_type(tensor->type);
 
     if (debug_k_quant) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_SET_BEGIN] name=%s type=%d "
             "buffer=%p data=%p offset=%" PRIu64 " size=%zu extra=%p\n",
             tensor->name,
@@ -3098,7 +3098,7 @@ bool rpc_server::set_tensor_direct(
     ggml_backend_tensor_set(tensor, data, offset, size);
 
     if (debug_k_quant) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_SET_AFTER_BACKEND] name=%s type=%d "
             "buffer=%p data=%p extra=%p\n",
             tensor->name,
@@ -3113,7 +3113,7 @@ bool rpc_server::set_tensor_direct(
     remember_opencl_tensor_extra(tensor);
 
     if (debug_k_quant) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_SET_REMEMBERED] name=%s type=%d "
             "buffer=%p data=%p extra=%p\n",
             tensor->name,
@@ -3307,7 +3307,7 @@ bool rpc_server::init_zero_tensor(
     }
 
     if (rpc_opencl_extra_debug_enabled()) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_PROFILE_INIT] name=%s type=%d buffer=%p "
             "data=%p bytes=%zu extra=%p\n",
             tensor->name,
@@ -3646,7 +3646,7 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
          rpc_is_k_quant_type(dst->type));
 
     if (debug_k_quant) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_COPY_BEGIN] "
             "src_name=%s src_type=%d src_buffer=%p src_data=%p "
             "dst_name=%s dst_type=%d dst_buffer=%p dst_data=%p\n",
@@ -3691,7 +3691,7 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
 
     if (debug_k_quant) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_COPY_DONE] result=%d "
             "src_name=%s src_extra=%p dst_name=%s dst_extra=%p\n",
             response.result ? 1 : 0,
@@ -4106,7 +4106,7 @@ bool rpc_server::set_tensor_from_local_file(
         tensor_nbytes % request.copy_size == 0 &&
         tensor_nbytes / request.copy_size == request.n_copies;
     if (opencl_quantized && !complete_destination) {
-        GGML_LOG_ERROR(
+        GGML_LOG_DEBUG(
             "[RPC_OPENCL_EXTRA] action=REJECT_PARTIAL_QUANT_SET "
             "name=%s type=%d dst_offset=%" PRIu64
             " copy_size=%" PRIu64 " n_copies=%" PRIu64
@@ -4307,7 +4307,7 @@ bool rpc_server::set_tensor_from_local_file(
             const auto mismatch = std::mismatch(staging.begin(), staging.end(), readback.begin());
             if (mismatch.first != staging.end()) {
                 const size_t pos = static_cast<size_t>(mismatch.first - staging.begin());
-                GGML_LOG_ERROR(
+                GGML_LOG_DEBUG(
                     "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_MISMATCH "
                     "name=%s type=%d offset=%zu expected=%u actual=%u bytes=%zu\n",
                     tensor->name, (int) tensor->type, pos,
@@ -4315,12 +4315,12 @@ bool rpc_server::set_tensor_from_local_file(
                 response.result = 2;
                 return true;
             }
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_OK name=%s type=%d bytes=%zu\n",
                 tensor->name, (int) tensor->type, staging.size());
         }
         if (rpc_opencl_extra_debug_enabled()) {
-            GGML_LOG_ERROR(
+            GGML_LOG_DEBUG(
                 "[RPC_OPENCL_EXTRA] action=SET_QUANT_FULL_STAGED "
                 "name=%s bytes=%zu n_copies=%" PRIu64 "\n",
                 tensor->name, staging.size(), request.n_copies);

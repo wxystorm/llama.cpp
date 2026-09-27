@@ -271,7 +271,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     if (return_wavefront_requested && stage_graph && n_tokens > 1) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d tokens=%" PRId64
             " layers=[%d,%d) equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
             "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
@@ -334,7 +334,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         GGML_ASSERT(
             coarse_chunk_begin == wave_chunk_sizes.size());
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_LAYOUT] layers=[%d,%d) tokens=%" PRId64
             " XT=%d attn_target=%d chunks=%s groups=%s "
             "first_attn=%" PRId64 "\n",
@@ -765,7 +765,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
                 const bool optimized = raw_chunk_sizes != chunk_sizes;
                 const int tail = raw_chunk_sizes.empty() ? 0 : raw_chunk_sizes.back();
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[TENSOR_CHUNK_PLAN] tokens=%" PRId64 " XT=%d raw=%s final=%s "
                     "action=%s tail=%d threshold=%d chunks=%zu->%zu\n",
                     cur->ne[1], planned_chunk_tokens,

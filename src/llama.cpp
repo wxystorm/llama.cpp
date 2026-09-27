@@ -323,7 +323,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 return {-1, nullptr};
             }
 
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_AUTO] selected T=%d P=%d C=%d R=%.3f G=%d XG=%d XC=%d XT=%d XP=%d "
                 "predicted=%.3f ms\n",
                 best.tensor_layers, best.phone_layers, best.pc_layers, best.tensor_pc_ratio, best.gpu_pc_layers,
