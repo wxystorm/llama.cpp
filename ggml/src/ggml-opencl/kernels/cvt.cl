@@ -998,6 +998,54 @@ kernel void kernel_restore_block_q5_1_trans4_ns(
     ((__global ushort8 *)(&(b->qs[0])))[0] = pre_block;
 }
 
+// Slow Q4_K MoE correctness reference. Used only when explicitly requested;
+// the production GEMV/GEMM kernels should agree with this straightforward dot.
+kernel void kernel_moe_q4_k_reference(
+    global const uint * quant, global const half * d, global const half * dm,
+    global const uchar * scales, global const float * activations,
+    global const int * ids, global float * dst,
+    ulong act_offset, ulong ids_offset, ulong dst_offset,
+    int k, int m, int n_used, int n_tokens, int act_columns, int router_stride
+) {
+    int row = get_global_id(0);
+    int used = get_global_id(1);
+    int token = get_global_id(2);
+    if (row >= m || used >= n_used || token >= n_tokens) return;
+
+    int expert = ids[ids_offset / 4 + token * router_stride + used];
+    int act_col = token * act_columns + (act_columns == 1 ? 0 : used);
+    global const float * act = activations + act_offset / 4 + act_col * k;
+    int blocks = k / 256;
+    float sum = 0.0f;
+    for (int sb = 0; sb < blocks; ++sb) {
+        int scale_idx = (expert * m + row) * blocks * 12 + sb * 12;
+        global const uchar * sc = scales + scale_idx;
+        int d_idx = (expert * blocks + sb) * m + row;
+        float base_d = (float) d[d_idx];
+        float base_min = (float) dm[d_idx];
+        int q_base = (expert * blocks + sb) * m * 32 + row;
+        for (int group = 0; group < 8; ++group) {
+            int scale, minv;
+            if (group < 4) {
+                scale = sc[group] & 63;
+                minv = sc[group + 4] & 63;
+            } else {
+                scale = (sc[group + 4] & 15) | ((sc[group - 4] & 0xc0) >> 2);
+                minv = (sc[group + 4] >> 4) | ((sc[group] & 0xc0) >> 2);
+            }
+            for (int word = 0; word < 4; ++word) {
+                uint packed = quant[q_base + (group * 4 + word) * m];
+                for (int nibble = 0; nibble < 8; ++nibble) {
+                    int x = (packed >> (4 * nibble)) & 15;
+                    int elem = sb * 256 + group * 32 + word * 8 + nibble;
+                    sum += (base_d * scale * x - base_min * minv) * act[elem];
+                }
+            }
+        }
+    }
+    dst[dst_offset / 4 + (token * n_used + used) * m + row] = sum;
+}
+
 kernel void kernel_convert_block_q4_k_trans4_ns(
     __global struct block_q4_K * src0,
     __global uint  * dst_q,

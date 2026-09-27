@@ -20576,6 +20576,36 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         case GGML_TYPE_Q4_K: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
             if (use_adreno_moe_kernels(backend_ctx, src0)) {
+                if (std::getenv("GGML_OPENCL_Q4_MOE_REFERENCE") != nullptr) {
+                    GGML_ASSERT(ne00 % 256 == 0 && (ne11 == 1 || ne11 == ne20));
+                    GGML_ASSERT(offset1 % 4 == 0 && offset2 % 4 == 0 && offsetd % 4 == 0);
+                    cl_int err;
+                    cl_kernel ref = clCreateKernel(backend_ctx->program_cvt, "kernel_moe_q4_k_reference", &err);
+                    CL_CHECK(err);
+                    cl_ulong act_off = offset1, ids_off = offset2, dst_off = offsetd;
+                    const int router_stride = nb21 / sizeof(int32_t);
+                    int arg = 0;
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra0_q4_K->q));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra0_q4_K->d));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra0_q4_K->dm));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra0_q4_K->s));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra1->data_device));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extra2->data_device));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_mem), &extrad->data_device));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_ulong), &act_off));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_ulong), &ids_off));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(cl_ulong), &dst_off));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &ne00));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &ne01));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &ne20));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &ne21));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &ne11));
+                    CL_CHECK(clSetKernelArg(ref, arg++, sizeof(int), &router_stride));
+                    size_t global[3] = {size_t(ne01), size_t(ne20), size_t(ne21)};
+                    backend_ctx->enqueue_ndrange_kernel(ref, 3, global, nullptr, dst);
+                    CL_CHECK(clReleaseKernel(ref));
+                    return;
+                }
                 cl_int status;
 
                 size_t local_size[3] = {64, 2, 1};
