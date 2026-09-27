@@ -7626,6 +7626,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_event evt;
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
+
             CL_CHECK(clReleaseMemObject(data_device));
 
             // Create image for Q
@@ -8467,6 +8468,44 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_event evt;
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
+            // Compare the first converted Q4_K block with the original bytes.
+            // Round-tripping through the restore kernel cannot detect a pair of
+            // conversion/restoration mistakes that cancel each other out.
+            if (std::getenv("GGML_OPENCL_VERIFY_Q4_MOE_LAYOUT") != nullptr &&
+                    offset == 0 && size == ggml_nbytes(tensor)) {
+                const uint8_t * raw = static_cast<const uint8_t *>(data);
+                uint8_t d[2], dm[2], scales[12];
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->d, CL_TRUE, 0, sizeof(d), d, 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->dm, CL_TRUE, 0, sizeof(dm), dm, 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->s, CL_TRUE, 0, sizeof(scales), scales, 0, NULL, NULL));
+                int first_bad_q = -1;
+                uint8_t expected_q = 0, actual_q = 0;
+                for (int p = 0; p < 32; ++p) {
+                    uint8_t packed[4];
+                    CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE,
+                        size_t(p) * ne01 * sizeof(uint32_t), sizeof(packed), packed, 0, NULL, NULL));
+                    for (int b = 0; b < 4; ++b) {
+                        const int pos = p * 4 + b;
+                        const int group = pos / 32;
+                        const int byte_in_group = pos % 16;
+                        const uint8_t x0 = raw[16 + group * 32 + byte_in_group * 2];
+                        const uint8_t x1 = raw[17 + group * 32 + byte_in_group * 2];
+                        const uint8_t want = (pos % 32 < 16) ?
+                            uint8_t((x0 & 0x0f) | ((x1 & 0x0f) << 4)) :
+                            uint8_t((x0 >> 4) | (x1 & 0xf0));
+                        if (first_bad_q < 0 && packed[b] != want) {
+                            first_bad_q = pos;
+                            expected_q = want;
+                            actual_q = packed[b];
+                        }
+                    }
+                }
+                GGML_LOG_INFO("[OPENCL_Q4_MOE_LAYOUT] name=%s d_ok=%d dm_ok=%d scales_ok=%d "
+                              "first_bad_q=%d expected_q=0x%02x actual_q=0x%02x\n",
+                    tensor->name, memcmp(d, raw, 2) == 0, memcmp(dm, raw + 2, 2) == 0,
+                    memcmp(scales, raw + 4, 12) == 0,
+                    first_bad_q, expected_q, actual_q);
+            }
             CL_CHECK(clReleaseMemObject(data_device));
 
             cl_image_format img_format_q = {CL_R, CL_UNSIGNED_INT32};
