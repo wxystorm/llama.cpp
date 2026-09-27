@@ -3867,51 +3867,41 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return cached->second;
         }
 
+        std::set<std::pair<bool, int>> pc_chunks;
+        std::set<std::pair<bool, int>> phone_chunks;
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            for (size_t backend = 0; backend < 2; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    ggml_tensor * node = graph->nodes[k];
+                    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    int chunk = -1;
+                    int parsed_layer = -1;
+                    const bool prefill = ggml_backend_meta_parse_prefill_down_chunk(
+                        node->name, chunk, parsed_layer);
+                    if (!prefill && !ggml_backend_meta_parse_decode_ffn_chunk(
+                            node->name, chunk, parsed_layer)) {
+                        continue;
+                    }
+                    if (parsed_layer == layer) {
+                        (backend == 0 ? pc_chunks : phone_chunks).insert({prefill, chunk});
+                    }
+                }
+            }
+        }
+
         bool split_ffn_seen = false;
-        for (size_t sg = 0;
-             sg < backend_ctx->n_subgraphs && !split_ffn_seen;
-             ++sg) {
-            ggml_cgraph * pc_graph =
-                backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
-            ggml_cgraph * phone_graph =
-                backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
-            if (pc_graph == nullptr || phone_graph == nullptr ||
-                pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
-                continue;
+        for (const auto & chunk : pc_chunks) {
+            if (phone_chunks.count(chunk) != 0) {
+                split_ffn_seen = true;
+                break;
             }
-
-            ggml_tensor * pc_last =
-                pc_graph->nodes[pc_graph->n_nodes - 1];
-            ggml_tensor * phone_last =
-                phone_graph->nodes[phone_graph->n_nodes - 1];
-
-            int pc_chunk = -1;
-            int pc_layer = -1;
-            int phone_chunk = -1;
-            int phone_layer = -1;
-
-            const bool prefill_match =
-                ggml_backend_meta_parse_prefill_down_chunk(
-                    pc_last->name, pc_chunk, pc_layer) &&
-                ggml_backend_meta_parse_prefill_down_chunk(
-                    phone_last->name, phone_chunk, phone_layer);
-            const bool decode_match =
-                !prefill_match &&
-                ggml_backend_meta_parse_decode_ffn_chunk(
-                    pc_last->name, pc_chunk, pc_layer) &&
-                ggml_backend_meta_parse_decode_ffn_chunk(
-                    phone_last->name, phone_chunk, phone_layer);
-
-            if (!(prefill_match || decode_match) ||
-                pc_layer != layer ||
-                phone_layer != layer ||
-                pc_chunk != phone_chunk) {
-                continue;
-            }
-
-            split_ffn_seen =
-                (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
-                (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
         }
 
         layer_tensor_phone_primary_cache[layer] = split_ffn_seen;
@@ -4634,6 +4624,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (external_backend_handoff && i + 1 < backend_ctx->n_subgraphs) {
                 ggml_tensor * disabled_l_out =
                     disable_layer_output_producers(0, i + 1, layer);
+                if (disabled_l_out == nullptr) {
+                    fprintf(stderr,
+                        "[META_HANDOFF_MISSING_PRODUCER] sg=%zu layer=%d node=%s dst=%s tp=%d forced=%d\n",
+                        i, layer, nodes[1]->name, dst_l_out->name,
+                        (int) layer_is_tensor_phone_primary(layer),
+                        (int) force_phone_block_exit);
+                }
                 GGML_ASSERT(disabled_l_out != nullptr);
                 GGML_ASSERT(disabled_l_out == dst_l_out);
 
