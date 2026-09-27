@@ -722,11 +722,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             model.hybrid_layer_mode(il);
         const int n_decode_chunks =
             std::min<int64_t>(qwen3moe_ffn_chunk_count(), n_embd);
+        const bool tensor_split_layer =
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
         const bool use_decode_chunked_moe =
             n_tokens == 1 &&
             n_decode_chunks > 1 &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            tensor_split_layer &&
             loras->empty() &&
             cvec->tensor_for(il) == nullptr;
         const bool use_prefill_chunked_moe =
@@ -734,7 +737,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cur->ne[1] > 1 &&
             planned_chunk_tokens > 0 &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            tensor_split_layer &&
             loras->empty() &&
             cvec->tensor_for(il) == nullptr;
 
@@ -749,8 +752,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
             const bool first_tensor_layer =
                 il == layer_begin ||
-                model.hybrid_layer_mode(il - 1) !=
-                    llama_hybrid_layer_mode::TENSOR_SPLIT;
+                model.hybrid_layer_mode(il - 1) != hybrid_mode;
             if (first_tensor_layer) {
                 auto chunk_list = [](const std::vector<int> & sizes) {
                     std::string result;
