@@ -3135,47 +3135,50 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
         profile.phone_full_layer_compute_est_ms : profile.phone_full_layer_ms;
     model.phone_cost = phone_base > 0.0 ? phone_base * token_scale : 1e12;
 
+    // Tensor cost is optional at the coarse-model level.  Some XT/R pairs
+    // cannot build a legal tensor chunk layout for the requested ubatch, but
+    // tensor-free topologies (T=0) must still remain scoreable.  Mark Tensor
+    // unavailable for this coarse model instead of rejecting every topology.
+    model.tensor_cost = std::numeric_limits<double>::infinity();
     double tensor_pipeline_ms = 0.0;
-    if (!llama_hybrid_tensor_ffn_cost(
+    if (llama_hybrid_tensor_ffn_cost(
             profile, pc_ratio, work_tokens, tensor_chunk_tokens,
             tensor_pipeline_ms, nullptr,
             constraints.max_tensor_chunks)) {
-        return false;
-    }
+        int tensor_kv_tokens = constraints.score_kv_tokens;
+        if (tensor_kv_tokens <= 0) {
+            tensor_kv_tokens = constraints.target_ctx > 0 ?
+                constraints.target_ctx : profile.n_ctx_train;
+        }
+        tensor_kv_tokens = std::max(tensor_kv_tokens, work_tokens);
+        if (profile.n_ctx_train > 0) {
+            tensor_kv_tokens =
+                std::min(tensor_kv_tokens, profile.n_ctx_train);
+        }
 
-    int tensor_kv_tokens = constraints.score_kv_tokens;
-    if (tensor_kv_tokens <= 0) {
-        tensor_kv_tokens = constraints.target_ctx > 0 ?
-            constraints.target_ctx : profile.n_ctx_train;
-    }
-    tensor_kv_tokens = std::max(tensor_kv_tokens, work_tokens);
-    if (profile.n_ctx_train > 0) {
-        tensor_kv_tokens =
-            std::min(tensor_kv_tokens, profile.n_ctx_train);
-    }
-
-    double cpu_layer_base = 0.0;
-    double cpu_attn_base  = 0.0;
-    double cpu_attn_kv    = 0.0;
-    if (llama_hybrid_layer_block_cost(
-            profile.cpu_layer_blocks, work_tokens, false,
-            cpu_layer_base) &&
-        llama_hybrid_attn_cost(
-            profile.cpu_attn, work_tokens, work_tokens,
-            cpu_attn_base) &&
-        llama_hybrid_attn_cost(
-            profile.cpu_attn, work_tokens, tensor_kv_tokens,
-            cpu_attn_kv)) {
-        model.tensor_cost =
-            cpu_attn_kv +
-            llama_hybrid_tensor_misc_cost(
-                profile, work_tokens,
-                cpu_layer_base, cpu_attn_base) +
-            tensor_pipeline_ms;
-    } else {
-        const double tensor_attn =
-            std::max(0.0, profile.cpu_attn_ms) * token_scale;
-        model.tensor_cost = tensor_attn + tensor_pipeline_ms;
+        double cpu_layer_base = 0.0;
+        double cpu_attn_base  = 0.0;
+        double cpu_attn_kv    = 0.0;
+        if (llama_hybrid_layer_block_cost(
+                profile.cpu_layer_blocks, work_tokens, false,
+                cpu_layer_base) &&
+            llama_hybrid_attn_cost(
+                profile.cpu_attn, work_tokens, work_tokens,
+                cpu_attn_base) &&
+            llama_hybrid_attn_cost(
+                profile.cpu_attn, work_tokens, tensor_kv_tokens,
+                cpu_attn_kv)) {
+            model.tensor_cost =
+                cpu_attn_kv +
+                llama_hybrid_tensor_misc_cost(
+                    profile, work_tokens,
+                    cpu_layer_base, cpu_attn_base) +
+                tensor_pipeline_ms;
+        } else {
+            const double tensor_attn =
+                std::max(0.0, profile.cpu_attn_ms) * token_scale;
+            model.tensor_cost = tensor_attn + tensor_pipeline_ms;
+        }
     }
 
     if (profile.layer_weight_bytes.size() != (size_t) profile.n_layer ||
@@ -3327,12 +3330,21 @@ static bool llama_hybrid_coarse_plan_score(
         return false;
     }
 
-    const double tensor_depth_factor =
-        llama_hybrid_tensor_depth_factor(plan.tensor_layers);
     double downstream_ms =
         cpu_layers * model.cpu_cost +
-        plan.tensor_layers * model.tensor_cost * tensor_depth_factor +
         plan.phone_layers * model.phone_cost;
+
+    // Do not evaluate Tensor terms for T=0.  In particular, 0 * infinity is
+    // NaN, which would incorrectly reject a valid tensor-free plan when this
+    // XT/R pair has no usable Tensor cost model.
+    if (plan.tensor_layers > 0) {
+        if (!std::isfinite(model.tensor_cost)) {
+            return false;
+        }
+        downstream_ms +=
+            plan.tensor_layers * model.tensor_cost *
+            llama_hybrid_tensor_depth_factor(plan.tensor_layers);
+    }
 
     if (plan.phone_layers > 0) {
         if (!std::isfinite(phone_boundary_ms)) {
