@@ -23,6 +23,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -4884,12 +4885,136 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const int64_t output_submit_begin_us =
                     decode_runtime_profile.pending ?
                         ggml_time_us() : 0;
+                const size_t logits_copy_bytes =
+                    (size_t) n_outputs * (size_t) n_vocab * sizeof(float);
                 ggml_backend_tensor_get_async(
                     backend_res,
                     t_logits,
                     logits_out,
                     0,
-                    n_outputs * n_vocab * sizeof(float));
+                    logits_copy_bytes);
+
+                // The server samples the first generated token from the raw
+                // logits produced by the prompt graph.  Keep an explicit
+                // backend fence on this prefill output copy while diagnosing
+                // the rare all-zero first-token logits.  llama_context::
+                // synchronize() eventually fences the scheduler too, but a
+                // direct fence here makes the output-copy dependency explicit
+                // and prevents a stale zero-filled host row from reaching the
+                // sampler.
+                if (ubatch.n_tokens > 1) {
+                    const int64_t logits_sync_begin_us = ggml_time_us();
+                    ggml_backend_synchronize(backend_res);
+                    const int64_t logits_sync_us =
+                        ggml_time_us() - logits_sync_begin_us;
+
+                    const size_t debug_row = (size_t) n_outputs - 1;
+                    const size_t debug_count = (size_t) n_vocab;
+                    const float * host_row =
+                        logits_out + debug_row * debug_count;
+
+                    auto collect_logits_stats = [](const float * data, size_t count,
+                                                   size_t & zero, size_t & nonfinite,
+                                                   float & min_value, float & max_value) {
+                        zero = 0;
+                        nonfinite = 0;
+                        min_value = std::numeric_limits<float>::infinity();
+                        max_value = -std::numeric_limits<float>::infinity();
+                        for (size_t i = 0; i < count; ++i) {
+                            const float value = data[i];
+                            zero += value == 0.0f;
+                            if (!std::isfinite(value)) {
+                                ++nonfinite;
+                                continue;
+                            }
+                            min_value = std::min(min_value, value);
+                            max_value = std::max(max_value, value);
+                        }
+                        if (!std::isfinite(min_value)) {
+                            min_value = 0.0f;
+                        }
+                        if (!std::isfinite(max_value)) {
+                            max_value = 0.0f;
+                        }
+                    };
+
+                    size_t host_zero = 0;
+                    size_t host_nonfinite = 0;
+                    float host_min = 0.0f;
+                    float host_max = 0.0f;
+                    collect_logits_stats(
+                        host_row, debug_count,
+                        host_zero, host_nonfinite,
+                        host_min, host_max);
+
+                    // Read the same output row directly from the source tensor
+                    // after the fence.  Comparing source vs host distinguishes
+                    // an upstream graph/output failure from a broken or late
+                    // backend->host copy.
+                    std::vector<float> source_row(debug_count);
+                    const size_t debug_offset =
+                        debug_row * debug_count * sizeof(float);
+                    ggml_backend_tensor_get(
+                        backend_res,
+                        t_logits,
+                        source_row.data(),
+                        debug_offset,
+                        debug_count * sizeof(float));
+
+                    size_t source_zero = 0;
+                    size_t source_nonfinite = 0;
+                    float source_min = 0.0f;
+                    float source_max = 0.0f;
+                    collect_logits_stats(
+                        source_row.data(), debug_count,
+                        source_zero, source_nonfinite,
+                        source_min, source_max);
+
+                    float max_abs_diff = 0.0f;
+                    size_t mismatch_count = 0;
+                    for (size_t i = 0; i < debug_count; ++i) {
+                        const float a = host_row[i];
+                        const float b = source_row[i];
+                        if (!std::isfinite(a) || !std::isfinite(b)) {
+                            if (!(std::isnan(a) && std::isnan(b)) && a != b) {
+                                ++mismatch_count;
+                            }
+                            continue;
+                        }
+                        const float diff = std::fabs(a - b);
+                        max_abs_diff = std::max(max_abs_diff, diff);
+                        mismatch_count += diff != 0.0f;
+                    }
+
+                    LLAMA_LOG_INFO(
+                        "[PREFILL_LOGITS_COPY_CHECK] tokens=%u outputs=%d row=%zu "
+                        "backend=%s count=%zu sync_ms=%.3f "
+                        "host_zero=%zu host_nonfinite=%zu host_min=%.9g host_max=%.9g "
+                        "source_zero=%zu source_nonfinite=%zu source_min=%.9g source_max=%.9g "
+                        "mismatch=%zu max_abs_diff=%.9g\n",
+                        ubatch.n_tokens, n_outputs, debug_row,
+                        ggml_backend_name(backend_res), debug_count,
+                        logits_sync_us / 1000.0,
+                        host_zero, host_nonfinite, host_min, host_max,
+                        source_zero, source_nonfinite, source_min, source_max,
+                        mismatch_count, max_abs_diff);
+
+                    if (host_zero == debug_count ||
+                        source_zero == debug_count ||
+                        host_nonfinite != 0 ||
+                        source_nonfinite != 0 ||
+                        mismatch_count != 0) {
+                        LLAMA_LOG_ERROR(
+                            "[PREFILL_LOGITS_COPY_SUSPECT] host_all_zero=%d source_all_zero=%d "
+                            "host_nonfinite=%zu source_nonfinite=%zu mismatch=%zu "
+                            "max_abs_diff=%.9g\n",
+                            host_zero == debug_count ? 1 : 0,
+                            source_zero == debug_count ? 1 : 0,
+                            host_nonfinite, source_nonfinite,
+                            mismatch_count, max_abs_diff);
+                    }
+                }
+
                 if (decode_runtime_profile.pending) {
                     decode_runtime_profile.output_submit_us +=
                         ggml_time_us() -
