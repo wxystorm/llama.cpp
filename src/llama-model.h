@@ -541,6 +541,7 @@ struct llama_meta_device_get_split_state_userdata {
 enum class llama_hybrid_layer_mode {
     PC_ONLY,
     TENSOR_SPLIT,
+    TENSOR_PHONE_PRIMARY,
     PHONE_ONLY,
 };
 
