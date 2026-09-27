@@ -3801,7 +3801,52 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     auto subgraph_is_phone_only = [&](size_t sg) -> bool {
         return subgraph_is_phone_owned(sg);
     };
+    auto layer_attention_phone_owned = [&](int layer) -> bool {
+        if (n_backends != 2 || layer < 0) {
+            return false;
+        }
+
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "attn_out-%d", layer);
+        bool pc_seen = false;
+        bool phone_seen = false;
+        bool pc_compute = false;
+        bool phone_compute = false;
+
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            for (size_t backend = 0; backend < 2; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    ggml_tensor * node = graph->nodes[k];
+                    if (std::strcmp(node->name, expected) != 0) {
+                        continue;
+                    }
+                    if (backend == 0) {
+                        pc_seen = true;
+                        pc_compute =
+                            pc_compute ||
+                            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                    } else {
+                        phone_seen = true;
+                        phone_compute =
+                            phone_compute ||
+                            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                    }
+                }
+            }
+        }
+
+        return pc_seen && phone_seen &&
+               !pc_compute && phone_compute;
+    };
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
+        if (layer_attention_phone_owned(layer)) {
+            return true;
+        }
         for (size_t next = sg + 1; next < backend_ctx->n_subgraphs; ++next) {
             ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
             if (graph == nullptr || graph->n_nodes == 0) {
@@ -3851,6 +3896,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return true;
     };
     auto decode_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
+        if (layer_attention_phone_owned(layer)) {
+            return true;
+        }
         for (size_t next = sg + 1; next < backend_ctx->n_subgraphs; ++next) {
             ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
             if (graph == nullptr || graph->n_nodes == 0) {
@@ -4619,6 +4667,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 nodes[1]->name, prefill_down_chunk_1, prefill_down_layer_1) &&
             prefill_down_chunk_0 == prefill_down_chunk_1 &&
             prefill_down_layer_0 == prefill_down_layer_1;
+
+        const bool phone_primary_tensor_down =
+            (is_prefill_down_chunk &&
+             layer_attention_phone_owned(prefill_down_layer_0)) ||
+            (is_ffn_down_chunk &&
+             layer_attention_phone_owned(decode_layer_0));
+        if (phone_primary_tensor_down) {
+            // Legacy specialized reduction assumes a PC-owned residual and
+            // folds that residual into the PC partial before handing the
+            // result to Phone. TP owns Attention/residual on Phone, so that
+            // assumption is invalid. Let the generic all-reduce materialize
+            // the complete FFN result on both devices; the normal Phone graph
+            // then applies the Phone-owned residual. This is correctness-first
+            // for both prefill and decode. A one-way reduce-to-Phone fast path
+            // can replace it later.
+            if (pipeline_debug) {
+                const int layer = is_prefill_down_chunk ?
+                    prefill_down_layer_0 : decode_layer_0;
+                const int chunk = is_prefill_down_chunk ?
+                    prefill_down_chunk_0 : decode_chunk_0;
+                printf(
+                    "[TENSOR_PHONE_GENERIC_REDUCE] sg=%zu layer=%d chunk=%d mode=%s\n",
+                    i, layer, chunk,
+                    is_prefill_down_chunk ? "prefill" : "decode");
+            }
+            return GGML_STATUS_SUCCESS;
+        }
 
         if (is_prefill_down_chunk) {
             GGML_ASSERT(pending_prefill_input_task == 0);
@@ -6091,7 +6166,8 @@ auto prefill_norm_sg_has_prework =
     }
 }
 
-    if (n_backends == 2 && is_prefill_down_sg) {
+    if (n_backends == 2 && is_prefill_down_sg &&
+            !layer_attention_phone_owned(prefill_down_layer)) {
         ggml_tensor * phone_prefill_down = get_prefill_down_boundary_node(1, i);
         ggml_tensor * pc_prefill_down = get_prefill_down_boundary_node(0, i);
         if (phone_prefill_down != nullptr && pc_prefill_down != nullptr &&
