@@ -6386,6 +6386,10 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // Graph reuse can overwrite router indices in the same cl_mem at the same
+    // offset. Rebuild the reordered table on its first use in each execution.
+    backend_ctx->toggle_reorder = true;
+
     // Keep node-level tracing opt-in because synchronizing after every OpenCL
     // op is intentionally expensive and changes timing. Reuse the RPC/OpenCL
     // extra debug switch as well so the current RPC debugging command line
@@ -22236,10 +22240,9 @@ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, co
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    const int ne21 = dst->ne[1];
-    if ((strstr(src0->name, "_moe") != NULL) && (ne21 != 1)) {
-        backend_ctx->toggle_reorder = true;
-    }
+    // Expert choices change even during single-token decode, where the
+    // destination buffer and tensor shape stay the same across iterations.
+    backend_ctx->toggle_reorder = true;
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 }
 
