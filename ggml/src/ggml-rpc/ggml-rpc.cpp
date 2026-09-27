@@ -3961,6 +3961,20 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     ggml_backend_dev_memory(dev, &free, &total);
     response.free_mem = free;
     response.total_mem = total;
+
+    const double mib = 1024.0 * 1024.0;
+    printf(
+        "[RPC_DEVICE_MEMORY] device=%u backend=%s description=%s "
+        "free=%" PRIu64 " total=%" PRIu64 " free_mib=%.1f total_mib=%.1f\n",
+        dev_id,
+        ggml_backend_dev_name(dev),
+        ggml_backend_dev_description(dev),
+        response.free_mem,
+        response.total_mem,
+        response.free_mem / mib,
+        response.total_mem / mib);
+    fflush(stdout);
+
     LOG_DBG("[%s] device: %u, free_mem: %" PRIu64 ", total_mem: %" PRIu64 "\n", __func__, dev_id, response.free_mem, response.total_mem);
     return true;
 }
