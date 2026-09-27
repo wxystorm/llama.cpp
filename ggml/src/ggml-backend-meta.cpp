@@ -5400,7 +5400,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         backend_ctx->backend_configs[1]
                             .cgraphs[i].cgraph_main->n_nodes - 1];
 
-    printf(
+    GGML_LOG_INFO(
         "[REDUCE_ACTIVE] sg=%zu "
         "name0=%s compute0=%d bytes0=%zu "
         "name1=%s compute1=%d bytes1=%zu\n",
