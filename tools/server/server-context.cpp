@@ -18,10 +18,12 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <numeric>
 #include <filesystem>
 #include <utility>
 #include <fstream>
@@ -3731,10 +3733,12 @@ private:
             */
            const int tok_idx = slot.i_batch - off;
 
-            // 只打印每个请求的第一个生成 token
+            // Inspect the first few generated tokens, including the decode path.
             if (slot.n_decoded == 0 || slot.n_decoded == 1 || slot.n_decoded == 2) {
-                const float * logits =
-                    llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                const float * sampled_logits = llama_get_sampled_logits_ith(slot.ctx_tgt, tok_idx);
+                const float * logits = sampled_logits ? sampled_logits : llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                const llama_token * candidate_ids = sampled_logits ?
+                    llama_get_sampled_candidates_ith(slot.ctx_tgt, tok_idx) : nullptr;
 
                 const llama_model * model =
                     llama_get_model(slot.ctx_tgt);
@@ -3744,30 +3748,45 @@ private:
 
                 const int32_t n_vocab =
                     llama_vocab_n_tokens(vocab);
+                const size_t n_logits = sampled_logits ?
+                    llama_get_sampled_logits_count_ith(slot.ctx_tgt, tok_idx) : (size_t) n_vocab;
 
-                std::vector<int32_t> ids(n_vocab);
+                size_t n_zero = 0;
+                size_t n_nonfinite = 0;
+                for (size_t i = 0; i < n_logits; ++i) {
+                    n_zero += logits[i] == 0.0f;
+                    n_nonfinite += !std::isfinite(logits[i]);
+                }
+
+                std::vector<int32_t> ids(n_logits);
                 std::iota(ids.begin(), ids.end(), 0);
 
-                std::partial_sort(
-                    ids.begin(),
-                    ids.begin() + 10,
-                    ids.end(),
+                const size_t n_top = std::min<size_t>(10, ids.size());
+                std::partial_sort(ids.begin(), ids.begin() + n_top, ids.end(),
                     [&](int32_t a, int32_t b) {
-                        return logits[a] > logits[b];
+                        const bool a_nan = std::isnan(logits[a]);
+                        const bool b_nan = std::isnan(logits[b]);
+                        if (a_nan != b_nan) {
+                            return !a_nan;
+                        }
+                        return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
                     });
 
                 fprintf(stderr,
-                    "\n========== FIRST TOKEN TOP 10 ==========\n");
+                    "\n========== TOKEN LOGITS TOP 10 ==========\n"
+                    "decoded=%d source=%s count=%zu zero=%zu nonfinite=%zu\n",
+                    slot.n_decoded, sampled_logits ? "backend_candidates" : "full_vocab",
+                    n_logits, n_zero, n_nonfinite);
 
-                for (int i = 0; i < 10; ++i) {
-                    const int32_t token = ids[i];
+                for (size_t i = 0; i < n_top; ++i) {
+                    const int32_t token = candidate_ids ? candidate_ids[ids[i]] : ids[i];
 
                     fprintf(
                         stderr,
-                        "top[%d]: token=%d logit=%.9f\n",
+                        "top[%zu]: token=%d logit=%.9f\n",
                         i,
                         token,
-                        logits[token]);
+                        logits[ids[i]]);
                 }
 
                 fprintf(stderr,

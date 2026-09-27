@@ -8732,11 +8732,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
-    // Qwen3-30B-A3B Adreno MoE: check both decode GEMV and prefill GEMM
-    // against the CPU reference. The matching shapes below also occur in
-    // make_test_cases_perf(), but perf mode does not compare results.
+    // Qwen3-30B-A3B Adreno MoE: include ragged prefill chunks emitted by
+    // the hybrid planner, as well as the decode and aligned prefill cases.
+    // Perf mode does not compare results against the CPU reference.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
-        for (int n : {1, 64}) {
+        for (int n : {1, 52, 64, 73}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
         }
     }
