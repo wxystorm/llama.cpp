@@ -4955,7 +4955,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     const size_t debug_offset =
                         debug_row * debug_count * sizeof(float);
                     ggml_backend_tensor_get(
-                        backend_res,
                         t_logits,
                         source_row.data(),
                         debug_offset,
