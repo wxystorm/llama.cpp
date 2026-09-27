@@ -6744,7 +6744,36 @@ auto prefill_norm_sg_has_prework =
         }
         return compute_status;
     }
-} else {
+
+    // Inspect the first failing decode attention block before its boundary
+    // tensor is copied to the other backend.  The regular TP input trace
+    // observes ffn_inp-31 only after that copy, when both copies are NaN.
+    if (std::getenv("GGML_META_TP_ATTN_TRACE") != nullptr && n_backends == 2) {
+        for (size_t backend = 0; backend < n_backends; ++backend) {
+            auto & bcj = backend_ctx->backend_configs[backend];
+            ggml_cgraph * graph = bcj.cgraphs[communication_sg].cgraph_main;
+            if (graph == nullptr || graph->n_nodes == 0 ||
+                    graph->nodes[0]->ne[1] != 1 ||
+                    std::strcmp(graph->nodes[0]->name, "l_out-30") != 0) {
+                continue;
+            }
+            printf("[TP_ATTN_TRACE] sg=%zu backend=%zu nodes=%d last=%s\n",
+                   communication_sg, backend, graph->n_nodes,
+                   graph->nodes[graph->n_nodes - 1]->name);
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                ggml_tensor * node = graph->nodes[k];
+                if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                        node->type != GGML_TYPE_F32 ||
+                        (std::strstr(node->name, "-31") == nullptr &&
+                         k != graph->n_nodes - 1)) {
+                    continue;
+                }
+                char tag[96];
+                std::snprintf(tag, sizeof(tag), "TP attn31 sg%zu backend%zu", communication_sg, backend);
+                meta_debug_tensor(bcj.backend, node, tag);
+            }
+        }
+    }} else {
     compute_complete = false;
 }
 
