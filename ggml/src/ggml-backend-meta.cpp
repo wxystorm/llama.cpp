@@ -4219,6 +4219,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
+    auto has_layer_output_producer = [&](size_t backend, size_t start_sg, int layer) -> bool {
+        if (backend >= n_backends || layer < 0) {
+            return false;
+        }
+        char expected[64];
+        std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
+        for (size_t sg = start_sg; sg < backend_ctx->n_subgraphs; ++sg) {
+            ggml_cgraph * graph = backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+            if (graph == nullptr) {
+                continue;
+            }
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                if (std::strcmp(graph->nodes[k]->name, expected) == 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
     auto subgraph_is_exact_l_out_bridge = [&](size_t sg, int layer) -> bool {
         if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
             return false;
@@ -4614,12 +4633,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(std::strcmp(dst_l_out->name, expected) == 0);
                 GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
             }
-            const bool external_backend_handoff =
+            const bool external_handoff_candidate =
                 !tp_layer_context &&
                 phone_owner_exit && !internal_pc_handoff &&
                 src_residual != nullptr && dst_l_out != nullptr &&
                 ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
                 ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+            const bool external_backend_handoff =
+                external_handoff_candidate &&
+                (i + 1 >= backend_ctx->n_subgraphs ||
+                 has_layer_output_producer(0, i + 1, layer));
+
+            if (external_handoff_candidate && !external_backend_handoff && pipeline_debug) {
+                printf("[META_HANDOFF_SKIP] sg=%zu layer=%d node=%s reason=no_pc_l_out_producer\n",
+                    i, layer, nodes[1]->name);
+            }
 
             if (external_backend_handoff && i + 1 < backend_ctx->n_subgraphs) {
                 ggml_tensor * disabled_l_out =
