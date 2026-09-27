@@ -4188,15 +4188,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             ggml_tensor * src0 = norm->src[0];
+            if (src0 == nullptr || src0->ne[1] != 1) {
+                continue;
+            }
             printf(
                 "[META_INPUT] layer=%d norm=%s src0=%s "
                 "src0_ptr=%p src0_buf=%p bytes=%zu\n",
                 layer, norm->name, src0 != nullptr ? src0->name : "(null)",
                 (void *) src0, src0 != nullptr ? (void *) src0->buffer : nullptr,
                 src0 != nullptr ? ggml_nbytes(src0) : 0);
-            meta_debug_tensor(
-                backend_ctx->backend_configs[backend].backend, src0,
-                "layer24 meta norm input");
+            char tag[80];
+            std::snprintf(tag, sizeof(tag), "TP layer%d norm input backend%zu", layer, backend);
+            meta_debug_tensor(backend_ctx->backend_configs[backend].backend, src0, tag);
             return;
         }
     };
@@ -6483,7 +6486,15 @@ auto prefill_norm_sg_has_prework =
     }
 
     for (size_t backend = 0; backend < n_backends; ++backend) {
-        debug_layer_input(backend, i, 24);
+        if (std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr &&
+            backend_ctx->tensor_phone_first_layer >= 0) {
+            for (int layer = backend_ctx->tensor_phone_first_layer;
+                 layer < backend_ctx->tensor_phone_last_layer; ++layer) {
+                debug_layer_input(backend, i, layer);
+            }
+        } else {
+            debug_layer_input(backend, i, 24);
+        }
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
