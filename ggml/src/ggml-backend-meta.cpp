@@ -6745,6 +6745,22 @@ auto prefill_norm_sg_has_prework =
         return compute_status;
     }
 
+    // Separate the synchronization effect from the tensor reads in the
+    // attention trace. This gate is diagnostic and leaves normal execution
+    // unchanged until the source of the decode corruption is confirmed.
+    if (std::getenv("GGML_META_TP_ATTN_FENCE") != nullptr &&
+            n_backends == 2 && is_phone_only_sg &&
+            !phone_block_fused) {
+        ggml_cgraph * phone_graph =
+            backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (phone_graph != nullptr && phone_graph->n_nodes > 0 &&
+                phone_graph->nodes[0]->ne[1] == 1 &&
+                std::strcmp(phone_graph->nodes[0]->name, "l_out-30") == 0) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[1].backend);
+            printf("[TP_ATTN_FENCE] sg=%zu phone_sync=1\n", i);
+        }
+    }
+
     // Inspect the first failing decode attention block before its boundary
     // tensor is copied to the other backend.  The regular TP input trace
     // observes ffn_inp-31 only after that copy, when both copies are NaN.
