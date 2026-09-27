@@ -3775,7 +3775,10 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         (profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS);
 
     bool allow_tensor_pc_primary = true;
-    bool allow_tensor_phone_primary = true;
+    // V1 Phone-primary Tensor runtime is being introduced for MoE first.
+    // Other architectures keep the legacy Tensor path until their graph
+    // ownership rules are validated explicitly.
+    bool allow_tensor_phone_primary = profile.is_moe;
     if (const char * primary = std::getenv("LLAMA_HYBRID_TENSOR_PRIMARY")) {
         if (std::strcmp(primary, "pc") == 0) {
             allow_tensor_phone_primary = false;
