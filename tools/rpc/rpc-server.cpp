@@ -10,7 +10,9 @@
 #  define DIRECTORY_SEPARATOR '/'
 #  include <unistd.h>
 #  include <sys/stat.h>
-#  include <dlfcn.h>
+#  if defined(__ANDROID__)
+#    include <dlfcn.h>
+#  endif
 #endif
 #include <algorithm>
 #include <clocale>
@@ -274,12 +276,12 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
     return true;
 }
 
-#ifndef _WIN32
+#if defined(__ANDROID__)
 static void print_opencl_memory_info_if_selected(const std::vector<ggml_backend_dev_t> & devices) {
     bool has_opencl_device = false;
     for (ggml_backend_dev_t dev : devices) {
         const char * name = ggml_backend_dev_name(dev);
-        if (name != nullptr && std::strstr(name, "OpenCL") != nullptr) {
+        if (name != nullptr && std::string(name).find("OpenCL") != std::string::npos) {
             has_opencl_device = true;
             break;
         }
@@ -567,7 +569,7 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-#ifndef _WIN32
+#if defined(__ANDROID__)
     print_opencl_memory_info_if_selected(devices);
 #endif
     std::string endpoint = params.host + ":" + std::to_string(params.port);
