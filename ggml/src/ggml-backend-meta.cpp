@@ -6773,7 +6773,8 @@ auto prefill_norm_sg_has_prework =
                 meta_debug_tensor(bcj.backend, node, tag);
             }
         }
-    }} else {
+    }
+} else {
     compute_complete = false;
 }
 
