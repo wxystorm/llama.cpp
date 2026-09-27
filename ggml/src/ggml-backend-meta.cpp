@@ -3853,6 +3853,121 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         layer_phone_primary_cache[layer] = phone_primary;
         return phone_primary;
     };
+
+    std::map<int, bool> layer_tensor_phone_primary_cache;
+    auto layer_is_tensor_phone_primary = [&](int layer) -> bool {
+        if (n_backends != 2 || layer < 0 ||
+            !layer_attention_phone_owned(layer)) {
+            return false;
+        }
+
+        const auto cached =
+            layer_tensor_phone_primary_cache.find(layer);
+        if (cached != layer_tensor_phone_primary_cache.end()) {
+            return cached->second;
+        }
+
+        bool split_ffn_seen = false;
+        for (size_t sg = 0;
+             sg < backend_ctx->n_subgraphs && !split_ffn_seen;
+             ++sg) {
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+            ggml_cgraph * phone_graph =
+                backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+            if (pc_graph == nullptr || phone_graph == nullptr ||
+                pc_graph->n_nodes == 0 || phone_graph->n_nodes == 0) {
+                continue;
+            }
+
+            ggml_tensor * pc_last =
+                pc_graph->nodes[pc_graph->n_nodes - 1];
+            ggml_tensor * phone_last =
+                phone_graph->nodes[phone_graph->n_nodes - 1];
+
+            int pc_chunk = -1;
+            int pc_layer = -1;
+            int phone_chunk = -1;
+            int phone_layer = -1;
+
+            const bool prefill_match =
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    pc_last->name, pc_chunk, pc_layer) &&
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    phone_last->name, phone_chunk, phone_layer);
+            const bool decode_match =
+                !prefill_match &&
+                ggml_backend_meta_parse_decode_ffn_chunk(
+                    pc_last->name, pc_chunk, pc_layer) &&
+                ggml_backend_meta_parse_decode_ffn_chunk(
+                    phone_last->name, phone_chunk, phone_layer);
+
+            if (!(prefill_match || decode_match) ||
+                pc_layer != layer ||
+                phone_layer != layer ||
+                pc_chunk != phone_chunk) {
+                continue;
+            }
+
+            split_ffn_seen =
+                (pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                (phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        }
+
+        layer_tensor_phone_primary_cache[layer] = split_ffn_seen;
+        return split_ffn_seen;
+    };
+
+    auto subgraph_tensor_phone_primary_layer =
+        [&](size_t sg, int & layer) -> bool {
+            layer = -1;
+            if (sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            for (size_t backend = 0;
+                 backend < n_backends;
+                 ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    ggml_tensor * node = graph->nodes[k];
+                    int parsed_layer = -1;
+                    int chunk = -1;
+
+                    const bool parsed =
+                        std::sscanf(
+                            node->name, "attn_out-%d",
+                            &parsed_layer) == 1 ||
+                        std::sscanf(
+                            node->name, "ffn_inp-%d",
+                            &parsed_layer) == 1 ||
+                        std::sscanf(
+                            node->name, "ffn_norm-%d",
+                            &parsed_layer) == 1 ||
+                        ggml_backend_meta_parse_prefill_norm_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_decode_ffn_chunk(
+                            node->name, chunk, parsed_layer);
+
+                    if (parsed &&
+                        layer_is_tensor_phone_primary(parsed_layer)) {
+                        layer = parsed_layer;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        };
+
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_attention_phone_owned(layer)) {
             return true;
@@ -4317,11 +4432,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
+        int phone_primary_tensor_layer = -1;
+        const bool phone_primary_tensor_sg =
+            active_count == 1 &&
+            active_backend == 1 &&
+            subgraph_tensor_phone_primary_layer(
+                i, phone_primary_tensor_layer);
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
+            !phone_primary_tensor_sg &&
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
+
+        if (pipeline_debug && phone_primary_tensor_sg) {
+            printf(
+                "[TENSOR_PHONE_KEEP_OWNER] sg=%zu layer=%d node=%s "
+                "next_pc=%d next_phone=%d\n",
+                i, phone_primary_tensor_layer,
+                nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                i + 1 < backend_ctx->n_subgraphs ?
+                    (int) subgraph_will_execute_pc(i + 1) : -1,
+                i + 1 < backend_ctx->n_subgraphs ?
+                    (int) subgraph_will_execute_phone(i + 1) : -1);
+        }
 
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             const bool pc_needed_next =
@@ -5813,6 +5948,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const bool is_ffn =
             std::sscanf(g1->nodes[0]->name, "ffn_inp-%d", &ffn_layer) == 1;
         if (!is_attn || !is_ffn || attn_layer != ffn_layer) {
+            return false;
+        }
+
+        // A Phone-primary Tensor layer also has Phone-owned Attention and
+        // ffn_inp, but its FFN is split across PC+Phone. It must not enter
+        // the pure PHONE_ONLY block-fusion / block-exit path.
+        if (layer_is_tensor_phone_primary(attn_layer)) {
             return false;
         }
 
