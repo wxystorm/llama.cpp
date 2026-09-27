@@ -4439,19 +4439,52 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             subgraph_tensor_phone_primary_layer(
                 i, phone_primary_tensor_layer);
 
+        int inferred_phone_layer = -1;
+        ggml_tensor * inferred_phone_residual = nullptr;
+        bool inferred_phone_primary_tensor = false;
+        if (active_count == 1 && active_backend == 1) {
+            inferred_phone_residual =
+                find_recent_ffn_inp_layer(
+                    1, i, inferred_phone_layer);
+            inferred_phone_primary_tensor =
+                inferred_phone_residual != nullptr &&
+                layer_is_tensor_phone_primary(
+                    inferred_phone_layer);
+        }
+
+        const bool forced_phone_primary_tensor =
+            force_phone_block_exit &&
+            force_phone_block_layer >= 0 &&
+            layer_is_tensor_phone_primary(
+                force_phone_block_layer);
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
+            !inferred_phone_primary_tensor &&
+            !forced_phone_primary_tensor &&
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
 
-        if (pipeline_debug && phone_primary_tensor_sg) {
+        if (pipeline_debug &&
+            (phone_primary_tensor_sg ||
+             inferred_phone_primary_tensor ||
+             forced_phone_primary_tensor)) {
+            const int kept_layer =
+                phone_primary_tensor_sg ?
+                    phone_primary_tensor_layer :
+                (inferred_phone_primary_tensor ?
+                    inferred_phone_layer :
+                    force_phone_block_layer);
             printf(
                 "[TENSOR_PHONE_KEEP_OWNER] sg=%zu layer=%d node=%s "
-                "next_pc=%d next_phone=%d\n",
-                i, phone_primary_tensor_layer,
+                "source=%s next_pc=%d next_phone=%d\n",
+                i, kept_layer,
                 nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                phone_primary_tensor_sg ? "subgraph" :
+                    (inferred_phone_primary_tensor ?
+                        "recent_ffn_inp" : "forced_block"),
                 i + 1 < backend_ctx->n_subgraphs ?
                     (int) subgraph_will_execute_pc(i + 1) : -1,
                 i + 1 < backend_ctx->n_subgraphs ?
@@ -4476,7 +4509,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             auto & bcj_src = backend_ctx->backend_configs[active_backend];
             const bool defer_to_terminal_l_out =
                 active_backend == 1 && force_phone_block_exit &&
-                subgraph_is_exact_l_out_bridge(i + 1, force_phone_block_layer);
+                !forced_phone_primary_tensor &&
+                !layer_is_tensor_phone_primary(force_phone_block_layer) &&
+                subgraph_is_exact_l_out_bridge(
+                    i + 1, force_phone_block_layer);
             if (defer_to_terminal_l_out) {
                 ggml_tensor * disabled_l_out = disable_layer_output_producers(
                     0, i + 1, force_phone_block_layer);
@@ -4554,8 +4590,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
 
+            const bool tp_layer_context =
+                phone_primary_tensor_sg ||
+                inferred_phone_primary_tensor ||
+                forced_phone_primary_tensor;
             const bool internal_pc_handoff =
                 n_backends == 2 && active_backend == 1 &&
+                !tp_layer_context &&
                 i + 1 < backend_ctx->n_subgraphs &&
                 (subgraph_is_prefill_pc_only(i + 1) ||
                  subgraph_is_decode_pc_only_norm(i + 1));
@@ -4578,6 +4619,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
             }
             const bool external_backend_handoff =
+                !tp_layer_context &&
                 phone_owner_exit && !internal_pc_handoff &&
                 src_residual != nullptr && dst_l_out != nullptr &&
                 ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
@@ -6661,11 +6703,17 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
+        int terminal_tp_layer = -1;
         const bool terminal_phone_exit =
             communication_sg + 1 >= backend_ctx->n_subgraphs &&
-            subgraph_is_phone_only(communication_sg);
+            subgraph_is_phone_only(communication_sg) &&
+            !subgraph_tensor_phone_primary_layer(
+                communication_sg, terminal_tp_layer);
         const bool force_phone_block_exit =
-            phone_block_fused && phone_block_last_layer >= 0;
+            phone_block_fused &&
+            phone_block_last_layer >= 0 &&
+            !layer_is_tensor_phone_primary(
+                phone_block_last_layer);
         if (n_backends > 1 &&
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
