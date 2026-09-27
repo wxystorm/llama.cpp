@@ -6756,8 +6756,16 @@ auto prefill_norm_sg_has_prework =
         if (phone_graph != nullptr && phone_graph->n_nodes > 0 &&
                 phone_graph->nodes[0]->ne[1] == 1 &&
                 std::strcmp(phone_graph->nodes[0]->name, "l_out-30") == 0) {
-            ggml_backend_synchronize(backend_ctx->backend_configs[1].backend);
-            printf("[TP_ATTN_FENCE] sg=%zu phone_sync=1\n", i);
+            ggml_backend_t phone_backend = backend_ctx->backend_configs[1].backend;
+            const ggml_backend_rpc_fence_t rpc_fence =
+                ggml_backend_meta_get_rpc_fence(phone_backend);
+            if (rpc_fence != nullptr) {
+                rpc_fence(phone_backend);
+            } else {
+                ggml_backend_synchronize(phone_backend);
+            }
+            printf("[TP_ATTN_FENCE] sg=%zu rpc_fence=%d\n", i,
+                   (int) (rpc_fence != nullptr));
         }
     }
 
