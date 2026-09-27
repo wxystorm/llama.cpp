@@ -421,16 +421,20 @@ static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
 }
 
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
-        int n_layer, int pc_layers, int tensor_layers, int phone_layers) {
+        int n_layer, int pc_layers, int tensor_layers, int phone_layers,
+        bool tensor_phone_primary) {
     GGML_ASSERT(pc_layers + tensor_layers + phone_layers == n_layer);
 
     std::vector<llama_hybrid_layer_mode> policy(n_layer, llama_hybrid_layer_mode::TENSOR_SPLIT);
 
     const int pc_end     = pc_layers;
     const int tensor_end = pc_end + tensor_layers;
+    const llama_hybrid_layer_mode tensor_mode = tensor_phone_primary ?
+        llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY :
+        llama_hybrid_layer_mode::TENSOR_SPLIT;
 
     std::fill(policy.begin(), policy.begin() + pc_end, llama_hybrid_layer_mode::PC_ONLY);
-    std::fill(policy.begin() + pc_end, policy.begin() + tensor_end, llama_hybrid_layer_mode::TENSOR_SPLIT);
+    std::fill(policy.begin() + pc_end, policy.begin() + tensor_end, tensor_mode);
     std::fill(policy.begin() + tensor_end, policy.end(), llama_hybrid_layer_mode::PHONE_ONLY);
 
     return policy;
@@ -825,13 +829,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         ud->model->arch == LLM_ARCH_QWEN3MOE;
     const llama_hybrid_layer_mode mode = hybrid_arch ?
         ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
+    const bool tensor_phone_primary =
+        mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
     const bool force_primary =
-        (is_attention_tensor && mode != llama_hybrid_layer_mode::PHONE_ONLY) ||
+        (is_attention_tensor &&
+         mode != llama_hybrid_layer_mode::PHONE_ONLY &&
+         !tensor_phone_primary) ||
         (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY) ||
         is_output_tensor;
     const bool force_phone =
-        mode == llama_hybrid_layer_mode::PHONE_ONLY &&
-        (is_attention_tensor || is_ffn_split_tensor);
+        (mode == llama_hybrid_layer_mode::PHONE_ONLY &&
+         (is_attention_tensor || is_ffn_split_tensor)) ||
+        (tensor_phone_primary && is_attention_tensor);
 
     auto force_to_device = [&](size_t device) {
         GGML_ASSERT(device < ud->n_devices);
@@ -1447,14 +1456,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         hybrid_layer_modes = has_runtime_plan ?
             llama_build_hybrid_plan_policy(
-                n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers, runtime_plan.phone_layers) :
+                n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
+                runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
             llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
         if (has_runtime_plan) {
             LLAMA_LOG_ERROR(
-                "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) TENSOR=[%d,%d) PHONE=[%d,%d)\n",
+                "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) %s=[%d,%d) PHONE=[%d,%d)\n",
                 runtime_plan.gpu_pc_layers,
                 runtime_plan.gpu_pc_layers, runtime_plan.pc_layers,
+                runtime_plan.tensor_phone_primary ? "TENSOR_PHONE" : "TENSOR",
                 runtime_plan.pc_layers, runtime_plan.pc_layers + runtime_plan.tensor_layers,
                 runtime_plan.pc_layers + runtime_plan.tensor_layers, n_layer);
         }
@@ -1506,10 +1517,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 tensor_pc_ratio = params.tensor_split[0] / split_sum;
             }
         }
-        LLAMA_LOG_INFO("[HYBRID_SPLIT] source=%s pc_pct=%g layout=%s n_layer=%d tensor_split=%d phone_only=%d "
-                       "pc_only=%d gpu_pc=%d R=%.3f phone_layers=[%s] pc_layers=[%s]\n",
+        LLAMA_LOG_INFO("[HYBRID_SPLIT] source=%s pc_pct=%g layout=%s n_layer=%d tensor_split=%d "
+                       "tensor_primary=%s phone_only=%d pc_only=%d gpu_pc=%d R=%.3f "
+                       "phone_layers=[%s] pc_layers=[%s]\n",
             has_runtime_plan ? "planner" : "environment", pc_pct, pc_layout.c_str(), n_layer,
-            n_layer - phone_layers - pc_layers, phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
+            n_layer - phone_layers - pc_layers,
+            has_runtime_plan && runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
+            phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
             phone_layer_list.c_str(), pc_layer_list.c_str());
     }
 
