@@ -8468,43 +8468,51 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             cl_event evt;
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
             CL_CHECK(clWaitForEvents(1, &evt));
-            // Compare the first converted Q4_K block with the original bytes.
-            // Round-tripping through the restore kernel cannot detect a pair of
-            // conversion/restoration mistakes that cancel each other out.
+            // Verify the entire converted tensor when debugging Q4_K MoE. An
+            // inverse restore could hide a symmetric conversion mistake.
             if (std::getenv("GGML_OPENCL_VERIFY_Q4_MOE_LAYOUT") != nullptr &&
                     offset == 0 && size == ggml_nbytes(tensor)) {
+                std::vector<uint8_t> quant(size_q), d(size_d), dm(size_dm), scales(size_s);
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE, 0, size_q, quant.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->d, CL_TRUE, 0, size_d, d.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->dm, CL_TRUE, 0, size_dm, dm.data(), 0, NULL, NULL));
+                CL_CHECK(clEnqueueReadBuffer(queue, extra->s, CL_TRUE, 0, size_s, scales.data(), 0, NULL, NULL));
                 const uint8_t * raw = static_cast<const uint8_t *>(data);
-                uint8_t d[2], dm[2], scales[12];
-                CL_CHECK(clEnqueueReadBuffer(queue, extra->d, CL_TRUE, 0, sizeof(d), d, 0, NULL, NULL));
-                CL_CHECK(clEnqueueReadBuffer(queue, extra->dm, CL_TRUE, 0, sizeof(dm), dm, 0, NULL, NULL));
-                CL_CHECK(clEnqueueReadBuffer(queue, extra->s, CL_TRUE, 0, sizeof(scales), scales, 0, NULL, NULL));
-                int first_bad_q = -1;
-                uint8_t expected_q = 0, actual_q = 0;
-                for (int p = 0; p < 32; ++p) {
-                    uint8_t packed[4];
-                    CL_CHECK(clEnqueueReadBuffer(queue, extra->q, CL_TRUE,
-                        size_t(p) * ne01 * sizeof(uint32_t), sizeof(packed), packed, 0, NULL, NULL));
-                    for (int b = 0; b < 4; ++b) {
-                        const int pos = p * 4 + b;
-                        const int group = pos / 32;
-                        const int byte_in_group = pos % 16;
-                        const uint8_t x0 = raw[16 + group * 32 + byte_in_group * 2];
-                        const uint8_t x1 = raw[17 + group * 32 + byte_in_group * 2];
-                        const uint8_t want = (pos % 32 < 16) ?
-                            uint8_t((x0 & 0x0f) | ((x1 & 0x0f) << 4)) :
-                            uint8_t((x0 >> 4) | (x1 & 0xf0));
-                        if (first_bad_q < 0 && packed[b] != want) {
-                            first_bad_q = pos;
-                            expected_q = want;
-                            actual_q = packed[b];
+                const int blocks_per_row = ne00 / 256;
+                int bad_expert = -1, bad_row = -1, bad_block = -1, bad_quant = -1;
+                const char * bad_field = "none";
+                for (int expert = 0; expert < ne02 && bad_expert < 0; ++expert) {
+                    for (int row = 0; row < ne01 && bad_expert < 0; ++row) {
+                        for (int block = 0; block < blocks_per_row && bad_expert < 0; ++block) {
+                            const size_t src_block = (size_t(expert) * ne01 + row) * blocks_per_row + block;
+                            const uint8_t * orig = raw + src_block * 144;
+                            const size_t scale_block = ((size_t(expert) * ne01 + row) * blocks_per_row + block) * 12;
+                            const size_t dst_block = (size_t(expert) * blocks_per_row + block) * ne01 + row;
+                            if (memcmp(d.data() + dst_block * 2, orig, 2) != 0) bad_field = "d";
+                            else if (memcmp(dm.data() + dst_block * 2, orig + 2, 2) != 0) bad_field = "dm";
+                            else if (memcmp(scales.data() + scale_block, orig + 4, 12) != 0) bad_field = "scales";
+                            for (int pos = 0; pos < 128 && strcmp(bad_field, "none") == 0; ++pos) {
+                                const int group = pos / 32;
+                                const int j = pos % 16;
+                                const uint8_t x0 = orig[16 + group * 32 + 2 * j];
+                                const uint8_t x1 = orig[17 + group * 32 + 2 * j];
+                                const uint8_t want = (pos % 32 < 16) ?
+                                    uint8_t((x0 & 15) | ((x1 & 15) << 4)) :
+                                    uint8_t((x0 >> 4) | (x1 & 0xf0));
+                                const size_t q_off = ((size_t(expert) * blocks_per_row + block) * ne01 * 32 +
+                                                      (pos / 4) * ne01 + row) * 4 + pos % 4;
+                                if (quant[q_off] != want) { bad_field = "quant"; bad_quant = pos; }
+                            }
+                            if (strcmp(bad_field, "none") != 0) {
+                                bad_expert = expert; bad_row = row; bad_block = block;
+                            }
                         }
                     }
                 }
-                GGML_LOG_INFO("[OPENCL_Q4_MOE_LAYOUT] name=%s d_ok=%d dm_ok=%d scales_ok=%d "
-                              "first_bad_q=%d expected_q=0x%02x actual_q=0x%02x\n",
-                    tensor->name, memcmp(d, raw, 2) == 0, memcmp(dm, raw + 2, 2) == 0,
-                    memcmp(scales, raw + 4, 12) == 0,
-                    first_bad_q, expected_q, actual_q);
+                GGML_LOG_INFO("[OPENCL_Q4_MOE_LAYOUT] name=%s checked_blocks=%zu field=%s "
+                              "expert=%d row=%d block=%d quant_pos=%d\n",
+                    tensor->name, size_t(ne02) * ne01 * blocks_per_row,
+                    bad_field, bad_expert, bad_row, bad_block, bad_quant);
             }
             CL_CHECK(clReleaseMemObject(data_device));
 
