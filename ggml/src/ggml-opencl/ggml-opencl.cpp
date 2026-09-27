@@ -10187,13 +10187,23 @@ static const char * ggml_backend_opencl_device_get_description(ggml_backend_dev_
 static void ggml_backend_opencl_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) dev->context;
 
-    static const size_t opencl_extra_margin = 1024ull*1024ull*1024ull;
+    size_t opencl_extra_margin = 1024ull * 1024ull * 1024ull;
+    if (const char * value = std::getenv("GGML_OPENCL_MEMORY_MARGIN_MIB")) {
+        char * end = nullptr;
+        const unsigned long long margin_mib = std::strtoull(value, &end, 10);
+        if (end != value && *end == '\0' &&
+            margin_mib <= SIZE_MAX / (1024ull * 1024ull)) {
+            opencl_extra_margin =
+                (size_t) margin_mib * 1024ull * 1024ull;
+        }
+    }
 
     // OpenCL does not provide reliable currently-free device memory.
-    // Use total/global memory as a best-effort upper bound.
-    // Improved safety: Reduce by a 1GiB extra margin for common --fit
+    // Use total/global memory as a best-effort upper bound and reserve a
+    // configurable safety margin. The default remains 1 GiB.
     *total = dev_ctx->global_mem_size;
-    *free  = *total > opencl_extra_margin ? *total - opencl_extra_margin : 0;
+    *free  = *total > opencl_extra_margin ?
+        *total - opencl_extra_margin : 0;
 }
 
 static enum ggml_backend_dev_type ggml_backend_opencl_device_get_type(ggml_backend_dev_t dev) {
