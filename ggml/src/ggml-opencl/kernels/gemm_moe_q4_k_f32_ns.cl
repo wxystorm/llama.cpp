@@ -232,8 +232,14 @@ kernel void kernel_gemm_moe_q4_k_f32_ns(
 
         // Load sub-block scale and min
         global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        int sv, mn;
+        if (j < 4) {
+            sv = sc[j] & 63;
+            mn = sc[j + 4] & 63;
+        } else {
+            sv = (sc[j + 4] & 15) | ((sc[j - 4] & 0xc0) >> 2);
+            mn = (sc[j + 4] >> 4) | ((sc[j] & 0xc0) >> 2);
+        }
 
         float scale = (float)d_val * (float)sv;
         float minv = (float)dm_val * (float)mn;
