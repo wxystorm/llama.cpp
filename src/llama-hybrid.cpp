@@ -62,10 +62,11 @@ static double llama_hybrid_phone_memory_fraction() {
 
     char * end = nullptr;
     const double parsed = std::strtod(value, &end);
-    if (end == value || !std::isfinite(parsed)) {
+    if (end == value || *end != '\0' ||
+        !std::isfinite(parsed) || parsed <= 0.0) {
         return LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT;
     }
-    return std::clamp(parsed, 0.0, 1.0);
+    return std::min(parsed, 1.0);
 }
 
 // HYBRID_AUTO uses a two-level search.  The cheap pass ranks complete
