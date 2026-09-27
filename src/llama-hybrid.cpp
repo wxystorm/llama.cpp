@@ -632,6 +632,18 @@ bool llama_hybrid_profile_memory(llama_hybrid_profile & profile,
     LLAMA_LOG_INFO("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
                    ggml_backend_name(phone_backend), profile.phone_free_mem, profile.phone_total_mem,
                    profile.phone_free_mem / mib, profile.phone_total_mem / mib);
+
+    const size_t phone_default_budget =
+        (size_t) ((long double) profile.phone_free_mem * LLAMA_HYBRID_PHONE_MEMORY_FRACTION);
+    LLAMA_LOG_ERROR(
+        "[HYBRID_PHONE_MEMORY] source=backend_device_report backend=%s "
+        "free_mib=%.1f total_mib=%.1f fraction=%.2f default_budget_mib=%.1f\n",
+        ggml_backend_name(phone_backend),
+        profile.phone_free_mem / mib,
+        profile.phone_total_mem / mib,
+        LLAMA_HYBRID_PHONE_MEMORY_FRACTION,
+        phone_default_budget / mib);
+
     if (gpu_backend != nullptr) {
         LLAMA_LOG_INFO("[HYBRID_PROFILE_MEMORY] backend=%s free=%zu total=%zu free_mib=%.1f total_mib=%.1f\n",
                        ggml_backend_name(gpu_backend), profile.gpu_free_mem, profile.gpu_total_mem,
