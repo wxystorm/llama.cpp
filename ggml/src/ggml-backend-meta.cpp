@@ -1561,6 +1561,32 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ne_sum += split_state_src.ne[s*n_simple_bufs + j] * split_state_src.nr[s];
             }
             if (ne_sum == 0) {
+                if (std::getenv("GGML_META_TP_FFN_FLAG_TRACE") != nullptr &&
+                        (std::strstr(tensor->name, "ffn_moe") != nullptr ||
+                         std::strstr(tensor->name, "ffn_down") != nullptr)) {
+                    int64_t src_ne_0 = 0;
+                    int64_t src_ne_1 = 0;
+                    for (size_t s = 0; s < split_state_src.n_segments; ++s) {
+                        if (n_simple_bufs > 0) {
+                            src_ne_0 += split_state_src.ne[s*n_simple_bufs + 0] *
+                                        split_state_src.nr[s];
+                        }
+                        if (n_simple_bufs > 1) {
+                            src_ne_1 += split_state_src.ne[s*n_simple_bufs + 1] *
+                                        split_state_src.nr[s];
+                        }
+                    }
+                    printf(
+                        "[TP_FFN_FLAG_DISABLE] tensor=%s op=%s backend=%zu "
+                        "src=%s src_axis=%s src_ne={%" PRId64 ",%" PRId64 "}\n",
+                        tensor->name,
+                        ggml_op_name(tensor->op),
+                        j,
+                        tensor->src[i]->name,
+                        ggml_backend_meta_split_axis_name(split_state_src.axis),
+                        src_ne_0,
+                        src_ne_1);
+                }
                 simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
             }
         }
@@ -5239,6 +5265,48 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 nodes[0]->name, decode_chunk_0, decode_layer_0) &&
             ggml_backend_meta_parse_decode_ffn_chunk(
                 nodes[1]->name, decode_chunk_1, decode_layer_1);
+
+        if (std::getenv("GGML_META_TP_FFN_FLAG_TRACE") != nullptr &&
+                n_backends == 2) {
+            int trace_layer_0 = -1;
+            int trace_layer_1 = -1;
+            int trace_parsed_0 = 0;
+            int trace_parsed_1 = 0;
+            const bool trace_moe_0 =
+                std::sscanf(nodes[0]->name, "ffn_moe_out-%d%n",
+                            &trace_layer_0, &trace_parsed_0) == 1 &&
+                nodes[0]->name[trace_parsed_0] == '\0';
+            const bool trace_moe_1 =
+                std::sscanf(nodes[1]->name, "ffn_moe_out-%d%n",
+                            &trace_layer_1, &trace_parsed_1) == 1 &&
+                nodes[1]->name[trace_parsed_1] == '\0';
+            int trace_chunk_0 = -1;
+            int trace_prefill_layer_0 = -1;
+            int trace_chunk_1 = -1;
+            int trace_prefill_layer_1 = -1;
+            const bool trace_prefill_0 =
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    nodes[0]->name, trace_chunk_0, trace_prefill_layer_0);
+            const bool trace_prefill_1 =
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    nodes[1]->name, trace_chunk_1, trace_prefill_layer_1);
+            if (trace_moe_0 || trace_moe_1 || trace_prefill_0 || trace_prefill_1) {
+                printf(
+                    "[TP_FFN_BOUNDARY] sg=%zu active=%zu "
+                    "pc={name=%s op=%s compute=%d ne=[%" PRId64 ",%" PRId64 "]} "
+                    "phone={name=%s op=%s compute=%d ne=[%" PRId64 ",%" PRId64 "]}\n",
+                    i,
+                    active_count,
+                    nodes[0]->name,
+                    ggml_op_name(nodes[0]->op),
+                    !!(nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE),
+                    nodes[0]->ne[0], nodes[0]->ne[1],
+                    nodes[1]->name,
+                    ggml_op_name(nodes[1]->op),
+                    !!(nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE),
+                    nodes[1]->ne[0], nodes[1]->ne[1]);
+            }
+        }
 
         // Qwen3-MoE with LLAMA_CHUNKS=1 does not create
         // ffn_down_chunk_0-* boundaries. Its split expert result terminates at
