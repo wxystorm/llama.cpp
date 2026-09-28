@@ -920,6 +920,11 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+struct llm_graph_moe_routing {
+    ggml_tensor * selected_experts = nullptr; // [n_expert_used, n_tokens]
+    ggml_tensor * weights          = nullptr; // [1, n_expert_used, n_tokens]
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1035,6 +1040,20 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    llm_graph_moe_routing build_moe_routing(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_inp_b,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1057,7 +1076,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
                      int   down_chunks = 1,
- std::vector<ggml_tensor *> * down_chunk_outputs = nullptr) const;
+ std::vector<ggml_tensor *> * down_chunk_outputs = nullptr,
+             ggml_tensor * expert_weights_in = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1085,7 +1105,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
                      int   down_chunks = 1,
- std::vector<ggml_tensor *> * down_chunk_outputs = nullptr) const;
+ std::vector<ggml_tensor *> * down_chunk_outputs = nullptr,
+             ggml_tensor * expert_weights_in = nullptr) const;
 
     //
     // inputs
