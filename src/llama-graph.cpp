@@ -1822,84 +1822,20 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_moe_ffn(
-         ggml_tensor * cur,
-         ggml_tensor * gate_inp,
-         ggml_tensor * up_exps,
-         ggml_tensor * gate_exps,
-         ggml_tensor * down_exps,
-         ggml_tensor * exp_probs_b,
-             int64_t   n_expert,
-             int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
-                bool   norm_w,
-               float   w_scale,
-         llama_expert_gating_func_type gating_op,
-                 int   il,
-         ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-                 int   down_chunks,
- std::vector<ggml_tensor *> * down_chunk_outputs) const {
-    return build_moe_ffn(
-        cur,
-        gate_inp,  /* gate_inp_b  */ nullptr,
-        up_exps,   /* up_exps_b   */ nullptr,
-        gate_exps, /* gate_exps_b */ nullptr,
-        down_exps, /* down_exps_b */ nullptr,
-        exp_probs_b,
-        n_expert,
-        n_expert_used,
-        type_op,
-        norm_w,
-        w_scale,
-        gating_op,
-        il,
-        probs_in,
-        gate_up_exps,
-        /* gate_up_exps_b */ nullptr,
-        up_exps_s,
-        gate_exps_s,
-        down_exps_s,
-        selected_experts_in,
-        down_chunks,
-        down_chunk_outputs
-    );
-}
-
-ggml_tensor * llm_graph_context::build_moe_ffn(
+llm_graph_moe_routing llm_graph_context::build_moe_routing(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
          ggml_tensor * gate_inp_b,
-         ggml_tensor * up_exps,
-         ggml_tensor * up_exps_b,
-         ggml_tensor * gate_exps,
-         ggml_tensor * gate_exps_b,
-         ggml_tensor * down_exps,
-         ggml_tensor * down_exps_b,
          ggml_tensor * exp_probs_b,
              int64_t   n_expert,
              int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
                 bool   norm_w,
                float   w_scale,
         llama_expert_gating_func_type gating_op,
                  int   il,
          ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * gate_up_exps_b,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in,
-                 int   down_chunks,
- std::vector<ggml_tensor *> * down_chunk_outputs) const {
-    const int64_t n_embd   = cur->ne[0];
+         ggml_tensor * selected_experts_in) const {
     const int64_t n_tokens = cur->ne[1];
-    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
 
@@ -2033,7 +1969,116 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    //call early so that topk-moe can be used
+
+    return { selected_experts, weights };
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+               float   w_scale,
+         llama_expert_gating_func_type gating_op,
+                 int   il,
+         ggml_tensor * probs_in,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+                 int   down_chunks,
+ std::vector<ggml_tensor *> * down_chunk_outputs,
+         ggml_tensor * expert_weights_in) const {
+    return build_moe_ffn(
+        cur,
+        gate_inp,  /* gate_inp_b  */ nullptr,
+        up_exps,   /* up_exps_b   */ nullptr,
+        gate_exps, /* gate_exps_b */ nullptr,
+        down_exps, /* down_exps_b */ nullptr,
+        exp_probs_b,
+        n_expert,
+        n_expert_used,
+        type_op,
+        norm_w,
+        w_scale,
+        gating_op,
+        il,
+        probs_in,
+        gate_up_exps,
+        /* gate_up_exps_b */ nullptr,
+        up_exps_s,
+        gate_exps_s,
+        down_exps_s,
+        selected_experts_in,
+        down_chunks,
+        down_chunk_outputs,
+        expert_weights_in
+    );
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * gate_inp_b,
+         ggml_tensor * up_exps,
+         ggml_tensor * up_exps_b,
+         ggml_tensor * gate_exps,
+         ggml_tensor * gate_exps_b,
+         ggml_tensor * down_exps,
+         ggml_tensor * down_exps_b,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il,
+         ggml_tensor * probs_in,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * gate_up_exps_b,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in,
+                 int   down_chunks,
+ std::vector<ggml_tensor *> * down_chunk_outputs,
+         ggml_tensor * expert_weights_in) const {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    ggml_tensor * selected_experts = selected_experts_in;
+    ggml_tensor * weights = expert_weights_in;
+
+    if (weights == nullptr) {
+        const llm_graph_moe_routing routing = build_moe_routing(
+            cur,
+            gate_inp,
+            gate_inp_b,
+            exp_probs_b,
+            n_expert,
+            n_expert_used,
+            norm_w,
+            w_scale,
+            gating_op,
+            il,
+            probs_in,
+            selected_experts_in);
+        selected_experts = routing.selected_experts;
+        weights = routing.weights;
+    } else {
+        GGML_ASSERT(selected_experts != nullptr);
+    }
+
+    // call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
