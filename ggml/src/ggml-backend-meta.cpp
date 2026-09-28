@@ -5240,6 +5240,34 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_backend_meta_parse_decode_ffn_chunk(
                 nodes[1]->name, decode_chunk_1, decode_layer_1);
 
+        // Qwen3-MoE with LLAMA_CHUNKS=1 does not create
+        // ffn_down_chunk_0-* boundaries. Its split expert result terminates at
+        // ffn_moe_out-*. For Phone-primary Tensor layers that tensor is still a
+        // PARTIAL result and must be reduced into the Phone owner exactly like
+        // the chunked decode boundary. Falling through to the generic
+        // all-reduce needlessly mirrors the result back to PC and bypasses the
+        // Phone-primary ownership path.
+        int decode_single_layer_0 = -1;
+        int decode_single_layer_1 = -1;
+        int decode_single_parsed_0 = 0;
+        int decode_single_parsed_1 = 0;
+        const bool is_single_decode_moe_out =
+            n_backends == 2 &&
+            active_count == 2 &&
+            nodes[0]->ne[1] == 1 &&
+            nodes[1]->ne[1] == 1 &&
+            std::sscanf(
+                nodes[0]->name, "ffn_moe_out-%d%n",
+                &decode_single_layer_0,
+                &decode_single_parsed_0) == 1 &&
+            nodes[0]->name[decode_single_parsed_0] == '\0' &&
+            std::sscanf(
+                nodes[1]->name, "ffn_moe_out-%d%n",
+                &decode_single_layer_1,
+                &decode_single_parsed_1) == 1 &&
+            nodes[1]->name[decode_single_parsed_1] == '\0' &&
+            decode_single_layer_0 == decode_single_layer_1;
+
         int prefill_down_chunk_0 = -1;
         int prefill_down_layer_0 = -1;
         int prefill_down_chunk_1 = -1;
@@ -5254,11 +5282,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             prefill_down_chunk_0 == prefill_down_chunk_1 &&
             prefill_down_layer_0 == prefill_down_layer_1;
 
+        const int phone_primary_decode_layer =
+            is_ffn_down_chunk ? decode_layer_0 :
+            (is_single_decode_moe_out ? decode_single_layer_0 : -1);
         const bool phone_primary_tensor_down =
             (is_prefill_down_chunk &&
              layer_attention_phone_owned(prefill_down_layer_0)) ||
-            (is_ffn_down_chunk &&
-             layer_attention_phone_owned(decode_layer_0));
+            ((is_ffn_down_chunk || is_single_decode_moe_out) &&
+             layer_attention_phone_owned(phone_primary_decode_layer));
         if (phone_primary_tensor_down) {
             // TP owns Attention/residual on Phone. Reduce only the PC FFN
             // partial into the Phone partial; do not fold residual here.
@@ -5313,14 +5344,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug) {
                 const int layer = is_prefill_down_chunk ?
-                    prefill_down_layer_0 : decode_layer_0;
+                    prefill_down_layer_0 : phone_primary_decode_layer;
                 const int chunk = is_prefill_down_chunk ?
-                    prefill_down_chunk_0 : decode_chunk_0;
+                    prefill_down_chunk_0 :
+                    (is_ffn_down_chunk ? decode_chunk_0 : 0);
+                const char * mode = is_prefill_down_chunk ?
+                    "prefill" :
+                    (is_single_decode_moe_out ? "decode-single" : "decode");
                 printf(
                     "[TENSOR_PHONE_REDUCE] sg=%zu layer=%d chunk=%d "
                     "mode=%s bytes=%zu copy_ms=%.3f\n",
-                    i, layer, chunk,
-                    is_prefill_down_chunk ? "prefill" : "decode",
+                    i, layer, chunk, mode,
                     ggml_nbytes(node_src), copy_us / 1000.0);
             }
             return GGML_STATUS_SUCCESS;
