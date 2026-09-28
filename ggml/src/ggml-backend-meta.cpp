@@ -4786,7 +4786,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 residual_name, sizeof(residual_name),
                 "ffn_inp-%d", phone_route_layer);
             const bool internal_single_owner =
-                phone_primary_internal_single_owner &&
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
                 phone_route_layer + 1 < backend_ctx->tensor_phone_last_layer;
             const bool copy_residual =
                 phone_route_chunk <= 0 && !internal_single_owner;
