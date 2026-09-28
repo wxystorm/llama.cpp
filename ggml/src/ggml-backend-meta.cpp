@@ -4739,12 +4739,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
         int phone_route_chunk = -1;
         int phone_route_layer = -1;
+        bool phone_route_boundary = false;
+        if (n_backends == 2) {
+            phone_route_boundary =
+                ggml_backend_meta_parse_phone_route_weights(
+                    nodes[1]->name, phone_route_chunk, phone_route_layer);
+            if (!phone_route_boundary) {
+                phone_route_boundary =
+                    ggml_backend_meta_parse_phone_route_weights(
+                        nodes[0]->name, phone_route_chunk, phone_route_layer);
+            }
+        }
+
         const bool phone_router_handoff =
-            n_backends == 2 &&
-            active_count == 1 &&
-            active_backend == 1 &&
-            ggml_backend_meta_parse_phone_route_weights(
-                nodes[1]->name, phone_route_chunk, phone_route_layer);
+            phone_route_boundary &&
+            layer_is_tensor_phone_primary(phone_route_layer);
 
         if (phone_router_handoff) {
             handled = true;
@@ -4775,8 +4784,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * dst_hidden = find_exact_named_tensor(0, hidden_name);
             ggml_tensor * src_topk = find_exact_named_tensor(1, topk_name);
             ggml_tensor * dst_topk = find_exact_named_tensor(0, topk_name);
-            ggml_tensor * src_weights = nodes[1];
-            ggml_tensor * dst_weights = nodes[0];
+            ggml_tensor * src_weights = find_exact_named_tensor(
+                1, nodes[1]->name);
+            ggml_tensor * dst_weights = find_exact_named_tensor(
+                0, nodes[0]->name);
 
             // v2 mirrors the residual state once per layer.  PC needs this
             // exact Phone-owned ffn_inp only after the FFN all-reduce, when it
@@ -4871,14 +4882,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug) {
                 printf(
-                    "%s layer=%d chunk=%d "
+                    "%s layer=%d chunk=%d active=%zu "
                     "residual=%s residual_bytes=%zu hidden=%s hidden_bytes=%zu "
                     "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
-                    "copy_ms=%.3f\n",
+                    "copy_ms=%.3f action=PHONE_TO_PC_NO_REDUCE\n",
                     internal_single_owner ?
                         "[TENSOR_PHONE_V21_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
-                    phone_route_layer, phone_route_chunk,
+                    phone_route_layer, phone_route_chunk, active_count,
                     copy_residual ? src_residual->name : "(already-copied)",
                     copy_residual ? ggml_nbytes(src_residual) : 0,
                     src_hidden->name, ggml_nbytes(src_hidden),
