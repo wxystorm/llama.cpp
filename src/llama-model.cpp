@@ -1484,7 +1484,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 runtime_plan.pc_layers, runtime_plan.pc_layers + runtime_plan.tensor_layers,
                 runtime_plan.pc_layers + runtime_plan.tensor_layers, n_layer,
                 runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
-                phone_primary_exec ? "PHONE_PRIMARY_V21_SINGLE_OWNER" : "LEGACY_TENSOR_SPLIT");
+                phone_primary_exec ?
+                    (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr ?
+                        "PHONE_PRIMARY_V21_INTERNAL_SINGLE_OWNER" :
+                        "PHONE_PRIMARY_V2") :
+                    "LEGACY_TENSOR_SPLIT");
         }
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
@@ -1544,7 +1548,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             has_runtime_plan ? "planner" : "environment", pc_pct, pc_layout.c_str(), n_layer,
             n_layer - phone_layers - pc_layers,
             has_runtime_plan && runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
-            phone_primary_exec ? "PHONE_PRIMARY_V21_SINGLE_OWNER" : "LEGACY_TENSOR_SPLIT",
+            phone_primary_exec ?
+                    (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr ?
+                        "PHONE_PRIMARY_V21_INTERNAL_SINGLE_OWNER" :
+                        "PHONE_PRIMARY_V2") :
+                    "LEGACY_TENSOR_SPLIT",
             phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
             phone_layer_list.c_str(), pc_layer_list.c_str());
     }
