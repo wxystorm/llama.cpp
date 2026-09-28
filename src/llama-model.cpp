@@ -781,6 +781,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+
+        // FFN sharding uses a global PC/Phone ratio. Rotation only changes which
+        // physical backend receives the first contiguous slice; it must not
+        // reinterpret the first rotated fraction as the PC ratio. Otherwise,
+        // with two backends and rotation=1, the Phone fraction is passed to
+        // llama_hybrid_ffn_shard_size(..., backend_index=0), which can round the
+        // Phone shard down to zero (e.g. 768 * 0.333 -> 255 -> 0 at granularity
+        // 256). This is what caused every other MoE layer to lose the Phone FFN
+        // shard.
+        float ffn_pc_ratio = 0.5f;
+        if (is_ffn_split_tensor && ud->n_devices == 2 && tensor_split != nullptr) {
+            const float split_sum = tensor_split[0] + tensor_split[1];
+            if (split_sum > 0.0f) {
+                ffn_pc_ratio = tensor_split[0] / split_sum;
+            }
+        }
+
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
@@ -788,21 +805,40 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
+                const size_t split_device = (j + tc.rotation) % ud->n_devices;
                 int64_t high = tensor_split_scan.back() == 0.0f ?
                     ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                const float split_ratio = tensor_split_scan.back() == 0.0f ?
-                    (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
-                if (is_ffn_split_tensor && ud->n_devices == 2 && split_ratio > 0.0f && split_ratio < 1.0f) {
-                    high = llama_hybrid_ffn_shard_size(ne_s, tc.tensor_axis_0->type, split_ratio, 0);
+
+                if (is_ffn_split_tensor && ud->n_devices == 2) {
+                    high = llama_hybrid_ffn_shard_size(
+                        ne_s,
+                        tc.tensor_axis_0->type,
+                        ffn_pc_ratio,
+                        (int) split_device);
                 }
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                split_state.ne[is*ud->n_devices + split_device] = high - low;
                 low = high;
             }
             split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
+        }
+
+        if (std::getenv("GGML_META_TP_FFN_FLAG_TRACE") != nullptr &&
+                is_ffn_split_tensor && ud->n_devices == 2) {
+            int64_t ne_pc = 0;
+            int64_t ne_phone = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                ne_pc += split_state.ne[is*ud->n_devices + 0] * split_state.nr[is];
+                ne_phone += split_state.ne[is*ud->n_devices + 1] * split_state.nr[is];
+            }
+            GGML_LOG_INFO(
+                "[TP_FFN_WEIGHT_SPLIT] tensor=%s layer=%u rotation=%zu "
+                "pc_ratio=%.6f ne={%" PRId64 ",%" PRId64 "}\n",
+                tensor_name.c_str(), tc.il, tc.rotation,
+                ffn_pc_ratio, ne_pc, ne_phone);
         }
         split_state.n_segments = segments.size();
     } else {
