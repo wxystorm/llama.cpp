@@ -3498,21 +3498,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
     int tensor_phone_first_layer = -1;
     int tensor_phone_last_layer = -1;
-    if (has_runtime_plan && runtime_plan.tensor_phone_primary) {
-        for (int il = 0; il < (int) hparams.n_layer(); ++il) {
-            if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
-                continue;
-            }
-            if (tensor_phone_first_layer < 0) {
-                tensor_phone_first_layer = il;
-            }
-            tensor_phone_last_layer = il + 1;
+
+    // The model policy is the execution source of truth.  Do not gate this on
+    // runtime_plan.tensor_phone_primary: test overrides can intentionally turn
+    // a planner-selected PC-primary Tensor region into TENSOR_PHONE_PRIMARY
+    // after the plan was published.  Meta must receive the range that the
+    // model will actually execute, otherwise its Phone-primary owner/handoff
+    // paths remain disabled and complete control tensors can fall through to
+    // generic all-reduce.
+    for (int il = 0; il < (int) hparams.n_layer(); ++il) {
+        if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+            continue;
         }
-        if (tensor_phone_first_layer >= 0) {
-            GGML_ASSERT(
-                tensor_phone_last_layer - tensor_phone_first_layer ==
-                runtime_plan.tensor_layers);
+        if (tensor_phone_first_layer < 0) {
+            tensor_phone_first_layer = il;
         }
+        tensor_phone_last_layer = il + 1;
+    }
+    if (tensor_phone_first_layer >= 0 && has_runtime_plan) {
+        GGML_ASSERT(
+            tensor_phone_last_layer - tensor_phone_first_layer ==
+            runtime_plan.tensor_layers);
     }
     for (ggml_backend_t backend : backend_ptrs) {
         ggml_backend_meta_set_tensor_phone_primary_layers(
