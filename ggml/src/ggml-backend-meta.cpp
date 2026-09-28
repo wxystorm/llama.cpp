@@ -139,6 +139,46 @@ static bool ggml_backend_meta_parse_prefill_down_chunk(
     return name[n] == '\0';
 }
 
+static bool ggml_backend_meta_parse_phone_route_weights(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "phone_prefill_route_weights_chunk_%d-%d%n",
+                    &chunk, &layer, &n) == 2 && name[n] == '\0') {
+        return true;
+    }
+
+    chunk = -1;
+    n = 0;
+    return std::sscanf(name, "phone_moe_route_weights-%d%n",
+                       &layer, &n) == 1 && name[n] == '\0';
+}
+
+static bool ggml_backend_meta_parse_phone_route_topk(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "phone_prefill_route_topk_chunk_%d-%d%n",
+                    &chunk, &layer, &n) == 2 && name[n] == '\0') {
+        return true;
+    }
+
+    chunk = -1;
+    n = 0;
+    return std::sscanf(name, "phone_moe_route_topk-%d%n",
+                       &layer, &n) == 1 && name[n] == '\0';
+}
+
 static bool ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
         const char * name,
         int & chunk,
@@ -2856,6 +2896,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        if (n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0) {
+            bool in_phone_router = false;
+            int phone_router_layer = -1;
+
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * node = cgraph->nodes[i];
+
+                int parsed_layer = -1;
+                int parsed_chars = 0;
+                const bool router_begin =
+                    std::sscanf(node->name, "ffn_moe_logits-%d%n",
+                                &parsed_layer, &parsed_chars) == 1 &&
+                    node->name[parsed_chars] == '\0' &&
+                    parsed_layer >= backend_ctx->tensor_phone_first_layer &&
+                    parsed_layer < backend_ctx->tensor_phone_last_layer;
+
+                if (router_begin) {
+                    in_phone_router = true;
+                    phone_router_layer = parsed_layer;
+                }
+
+                if (in_phone_router) {
+                    backend_ctx->backend_configs[0].nodes[i]->flags &=
+                        ~GGML_TENSOR_FLAG_COMPUTE;
+                    backend_ctx->backend_configs[1].nodes[i]->flags |=
+                        GGML_TENSOR_FLAG_COMPUTE;
+                }
+
+                int route_chunk = -1;
+                int route_layer = -1;
+                if (in_phone_router &&
+                        ggml_backend_meta_parse_phone_route_weights(
+                            node->name, route_chunk, route_layer) &&
+                        route_layer == phone_router_layer) {
+                    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                        printf(
+                            "[TENSOR_PHONE_ROUTER_OWNER] layer=%d chunk=%d "
+                            "begin=ffn_moe_logits end=%s owner=PHONE\n",
+                            route_layer, route_chunk, node->name);
+                    }
+                    in_phone_router = false;
+                    phone_router_layer = -1;
+                }
+            }
+        }
+
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_tensor * node = cgraph->nodes[i];
             const bool is_decode_result_norm =
@@ -3187,12 +3274,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_ffn_input_layer <
                         backend_ctx->tensor_phone_last_layer;
 
+                int phone_route_chunk = -1;
+                int phone_route_layer = -1;
+                const bool is_phone_route_boundary =
+                    ggml_backend_meta_parse_phone_route_weights(
+                        node->name, phone_route_chunk, phone_route_layer);
+
                 const bool new_subgraph =
                     i == last_meta_node ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
-                    is_phone_primary_ffn_input;
+                    is_phone_primary_ffn_input ||
+                    is_phone_route_boundary;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -4537,6 +4631,83 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
             // Fall through.  The generic single-owner handoff below performs
             // a synchronous PC->Phone copy before the next phone computation.
+        }
+
+        int phone_route_chunk = -1;
+        int phone_route_layer = -1;
+        const bool phone_router_handoff =
+            n_backends == 2 &&
+            active_count == 1 &&
+            active_backend == 1 &&
+            ggml_backend_meta_parse_phone_route_weights(
+                nodes[1]->name, phone_route_chunk, phone_route_layer);
+
+        if (phone_router_handoff) {
+            handled = true;
+
+            char topk_name[96];
+            if (phone_route_chunk >= 0) {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "phone_prefill_route_topk_chunk_%d-%d",
+                    phone_route_chunk, phone_route_layer);
+            } else {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "phone_moe_route_topk-%d",
+                    phone_route_layer);
+            }
+
+            ggml_tensor * src_topk = find_exact_named_tensor(1, topk_name);
+            ggml_tensor * dst_topk = find_exact_named_tensor(0, topk_name);
+            ggml_tensor * src_weights = nodes[1];
+            ggml_tensor * dst_weights = nodes[0];
+
+            GGML_ASSERT(src_topk != nullptr);
+            GGML_ASSERT(dst_topk != nullptr);
+            GGML_ASSERT(src_weights != nullptr);
+            GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
+            GGML_ASSERT(ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
+
+            auto & bcj_src = backend_ctx->backend_configs[1];
+            auto & bcj_dst = backend_ctx->backend_configs[0];
+            const ggml_backend_rpc_fence_t rpc_fence =
+                ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+            if (rpc_fence != nullptr) {
+                rpc_fence(bcj_src.backend);
+            } else {
+                ggml_backend_synchronize(bcj_src.backend);
+            }
+
+            const int64_t topk_copy_begin = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                bcj_src.backend, bcj_dst.backend, src_topk, dst_topk);
+            const int64_t topk_copy_us = ggml_time_us() - topk_copy_begin;
+            record_copy_wait(topk_copy_us);
+            record_meta_copy(i, 1, 0, src_topk, topk_copy_us);
+
+            const int64_t weights_copy_begin = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                bcj_src.backend, bcj_dst.backend, src_weights, dst_weights);
+            const int64_t weights_copy_us = ggml_time_us() - weights_copy_begin;
+            record_copy_wait(weights_copy_us);
+            record_meta_copy(i, 1, 0, src_weights, weights_copy_us);
+            ggml_backend_synchronize(bcj_dst.backend);
+            record_direct_copy();
+
+            if (pipeline_debug) {
+                printf(
+                    "[TENSOR_PHONE_ROUTER_HANDOFF] layer=%d chunk=%d "
+                    "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
+                    "copy_ms=%.3f\n",
+                    phone_route_layer, phone_route_chunk,
+                    src_topk->name, ggml_nbytes(src_topk),
+                    src_weights->name, ggml_nbytes(src_weights),
+                    (topk_copy_us + weights_copy_us) / 1000.0);
+            }
+
+            return GGML_STATUS_SUCCESS;
         }
 
         if (active_count == 1 && n_backends == 2 && active_backend == 0) {
