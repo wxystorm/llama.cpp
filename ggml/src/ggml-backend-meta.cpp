@@ -4168,7 +4168,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
-    auto debug_layer_input = [&](size_t backend, size_t sg, int layer) {
+    auto debug_layer_input = [&](size_t backend, size_t sg, int layer, bool after_compute) {
         if (!pipeline_debug || backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
             return;
         }
@@ -4191,14 +4191,54 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (src0 == nullptr || src0->ne[1] != 1) {
                 continue;
             }
+
+            int producer_idx = -1;
+            for (int p = 0; p < graph->n_nodes; ++p) {
+                if (graph->nodes[p] == src0) {
+                    producer_idx = p;
+                    break;
+                }
+            }
+            const bool producer_in_sg =
+                producer_idx >= 0 &&
+                (src0->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
             printf(
-                "[META_INPUT] layer=%d norm=%s src0=%s "
-                "src0_ptr=%p src0_buf=%p bytes=%zu\n",
-                layer, norm->name, src0 != nullptr ? src0->name : "(null)",
-                (void *) src0, src0 != nullptr ? (void *) src0->buffer : nullptr,
-                src0 != nullptr ? ggml_nbytes(src0) : 0);
-            char tag[80];
-            std::snprintf(tag, sizeof(tag), "TP layer%d norm input backend%zu", layer, backend);
+                "[META_INPUT%s] layer=%d norm=%s src0=%s "
+                "src0_ptr=%p src0_buf=%p bytes=%zu op=%s "
+                "producer_in_sg=%d producer_idx=%d\n",
+                after_compute ? "_POST" : "",
+                layer, norm->name, src0->name,
+                (void *) src0, (void *) src0->buffer, ggml_nbytes(src0),
+                ggml_op_name(src0->op), (int) producer_in_sg, producer_idx);
+
+            // A source produced inside this same subgraph has not run yet when
+            // the PRE trace executes. Reading it here reports stale/zero arena
+            // contents and can also perturb OpenCL/RPC timing. Defer only those
+            // sources until immediately after this subgraph completes.
+            if (!after_compute && producer_in_sg) {
+                printf(
+                    "[NUMDBG_DEFER] layer=%d backend=%zu tensor=%s "
+                    "reason=producer_in_current_sg producer_idx=%d\n",
+                    layer, backend, src0->name, producer_idx);
+                return;
+            }
+            if (after_compute != producer_in_sg) {
+                return;
+            }
+
+            char tag[96];
+            if (after_compute) {
+                std::snprintf(
+                    tag, sizeof(tag),
+                    "TP layer%d norm input POST backend%zu",
+                    layer, backend);
+            } else {
+                std::snprintf(
+                    tag, sizeof(tag),
+                    "TP layer%d norm input backend%zu",
+                    layer, backend);
+            }
             meta_debug_tensor(backend_ctx->backend_configs[backend].backend, src0, tag);
             return;
         }
@@ -6490,10 +6530,10 @@ auto prefill_norm_sg_has_prework =
             backend_ctx->tensor_phone_first_layer >= 0) {
             for (int layer = backend_ctx->tensor_phone_first_layer;
                  layer < backend_ctx->tensor_phone_last_layer; ++layer) {
-                debug_layer_input(backend, i, layer);
+                debug_layer_input(backend, i, layer, false);
             }
         } else {
-            debug_layer_input(backend, i, 24);
+            debug_layer_input(backend, i, 24, false);
         }
     }
 
@@ -6743,6 +6783,19 @@ auto prefill_norm_sg_has_prework =
             wait_all_prefill_reduces(nullptr);
         }
         return compute_status;
+    }
+
+    // Complete deferred TP input traces only for sources that are produced by
+    // this subgraph itself. This distinguishes a real zero from a PRE trace
+    // that simply inspected the destination before its ADD/other producer ran.
+    if (std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr &&
+            backend_ctx->tensor_phone_first_layer >= 0) {
+        for (size_t backend = 0; backend < n_backends; ++backend) {
+            for (int layer = backend_ctx->tensor_phone_first_layer;
+                 layer < backend_ctx->tensor_phone_last_layer; ++layer) {
+                debug_layer_input(backend, communication_sg, layer, true);
+            }
+        }
     }
 
     // Separate the synchronization effect from the tensor reads in the
