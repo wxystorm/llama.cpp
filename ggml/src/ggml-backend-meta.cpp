@@ -2956,12 +2956,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // In TENSOR_PHONE_PRIMARY layers, Attention and the residual stream are
-        // Phone-owned.  ffn_inp = attn_out + residual must therefore also be
-        // materialized on Phone before the FFN split.  If PC recomputes this ADD
-        // from its mirrored residual, it can consume a stale l_out and the two
-        // backends immediately diverge.  Keep ffn_inp Phone-only; the subgraph
-        // boundary below copies this complete FFN input to PC exactly once.
+        // TENSOR_PHONE_PRIMARY keeps the activation/control path on Phone:
+        // Attention -> residual (ffn_inp) -> FFN norm -> Router.  PC joins only
+        // after routing is complete, where it receives the normalized hidden
+        // state plus the tiny top-k/weight tensors used by the expert FFN.
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (n_backends != 2 ||
                     backend_ctx->tensor_phone_first_layer < 0) {
@@ -2971,9 +2969,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int layer = -1;
             int parsed = 0;
             const char * name = cgraph->nodes[i]->name;
-            if (std::sscanf(name, "ffn_inp-%d%n", &layer, &parsed) != 1 ||
-                    name[parsed] != '\0' ||
-                    layer < backend_ctx->tensor_phone_first_layer ||
+            const bool is_ffn_inp =
+                std::sscanf(name, "ffn_inp-%d%n", &layer, &parsed) == 1 &&
+                name[parsed] == '\0';
+
+            if (!is_ffn_inp) {
+                layer = -1;
+                parsed = 0;
+                const bool is_ffn_norm =
+                    std::sscanf(name, "ffn_norm-%d%n", &layer, &parsed) == 1 &&
+                    name[parsed] == '\0';
+                if (!is_ffn_norm) {
+                    continue;
+                }
+            }
+
+            if (layer < backend_ctx->tensor_phone_first_layer ||
                     layer >= backend_ctx->tensor_phone_last_layer) {
                 continue;
             }
@@ -2985,7 +2996,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
                 printf(
-                    "[TENSOR_PHONE_FFN_INPUT_OWNER] layer=%d node=%s owner=PHONE\n",
+                    "[TENSOR_PHONE_CONTROL_OWNER] layer=%d node=%s owner=PHONE\n",
                     layer, name);
             }
         }
@@ -3017,11 +3028,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             int chunk = -1;
             int layer = -1;
-            if (!ggml_backend_meta_parse_prefill_norm_chunk(cgraph->nodes[i]->name, chunk, layer)) {
+            if (!ggml_backend_meta_parse_prefill_norm_chunk(
+                    cgraph->nodes[i]->name, chunk, layer)) {
                 continue;
             }
-            for (size_t j = 1; j < n_backends; ++j) {
-                backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+
+            const bool phone_primary_norm =
+                n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0 &&
+                layer >= backend_ctx->tensor_phone_first_layer &&
+                layer < backend_ctx->tensor_phone_last_layer;
+
+            if (phone_primary_norm) {
+                backend_ctx->backend_configs[0].nodes[i]->flags &=
+                    ~GGML_TENSOR_FLAG_COMPUTE;
+                backend_ctx->backend_configs[1].nodes[i]->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+            } else {
+                for (size_t j = 1; j < n_backends; ++j) {
+                    backend_ctx->backend_configs[j].nodes[i]->flags &=
+                        ~GGML_TENSOR_FLAG_COMPUTE;
+                }
             }
         }
 
@@ -3259,21 +3286,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_prefill_norm_chunk(
                         node->name, prefill_chunk, prefill_layer);
 
-                int phone_ffn_input_layer = -1;
-                int phone_ffn_input_parsed = 0;
-                const bool is_phone_primary_ffn_input =
-                    n_backends == 2 &&
-                    backend_ctx->tensor_phone_first_layer >= 0 &&
-                    std::sscanf(
-                        node->name, "ffn_inp-%d%n",
-                        &phone_ffn_input_layer,
-                        &phone_ffn_input_parsed) == 1 &&
-                    node->name[phone_ffn_input_parsed] == '\0' &&
-                    phone_ffn_input_layer >=
-                        backend_ctx->tensor_phone_first_layer &&
-                    phone_ffn_input_layer <
-                        backend_ctx->tensor_phone_last_layer;
-
                 int phone_route_chunk = -1;
                 int phone_route_layer = -1;
                 const bool is_phone_route_boundary =
@@ -3285,7 +3297,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
-                    is_phone_primary_ffn_input ||
                     is_phone_route_boundary;
                 if (!new_subgraph) {
                     continue;
@@ -4645,30 +4656,51 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (phone_router_handoff) {
             handled = true;
 
+            char hidden_name[96];
             char topk_name[96];
             if (phone_route_chunk >= 0) {
+                std::snprintf(
+                    hidden_name, sizeof(hidden_name),
+                    "prefill_ffn_norm_chunk_%d-%d",
+                    phone_route_chunk, phone_route_layer);
                 std::snprintf(
                     topk_name, sizeof(topk_name),
                     "phone_prefill_route_topk_chunk_%d-%d",
                     phone_route_chunk, phone_route_layer);
             } else {
                 std::snprintf(
+                    hidden_name, sizeof(hidden_name),
+                    "ffn_norm-%d",
+                    phone_route_layer);
+                std::snprintf(
                     topk_name, sizeof(topk_name),
                     "phone_moe_route_topk-%d",
                     phone_route_layer);
             }
 
+            ggml_tensor * src_hidden = find_exact_named_tensor(1, hidden_name);
+            ggml_tensor * dst_hidden = find_exact_named_tensor(0, hidden_name);
             ggml_tensor * src_topk = find_exact_named_tensor(1, topk_name);
             ggml_tensor * dst_topk = find_exact_named_tensor(0, topk_name);
             ggml_tensor * src_weights = nodes[1];
             ggml_tensor * dst_weights = nodes[0];
 
+            GGML_ASSERT(src_hidden != nullptr);
+            GGML_ASSERT(dst_hidden != nullptr);
             GGML_ASSERT(src_topk != nullptr);
             GGML_ASSERT(dst_topk != nullptr);
             GGML_ASSERT(src_weights != nullptr);
             GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(ggml_nbytes(src_hidden) == ggml_nbytes(dst_hidden));
             GGML_ASSERT(ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
             GGML_ASSERT(ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
+
+            int parsed_topk_chunk = -1;
+            int parsed_topk_layer = -1;
+            GGML_ASSERT(ggml_backend_meta_parse_phone_route_topk(
+                src_topk->name, parsed_topk_chunk, parsed_topk_layer));
+            GGML_ASSERT(parsed_topk_chunk == phone_route_chunk);
+            GGML_ASSERT(parsed_topk_layer == phone_route_layer);
 
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
@@ -4679,6 +4711,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             } else {
                 ggml_backend_synchronize(bcj_src.backend);
             }
+
+            const int64_t hidden_copy_begin = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                bcj_src.backend, bcj_dst.backend, src_hidden, dst_hidden);
+            const int64_t hidden_copy_us = ggml_time_us() - hidden_copy_begin;
+            record_copy_wait(hidden_copy_us);
+            record_meta_copy(i, 1, 0, src_hidden, hidden_copy_us);
 
             const int64_t topk_copy_begin = ggml_time_us();
             ggml_backend_tensor_copy_async(
@@ -4699,12 +4738,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (pipeline_debug) {
                 printf(
                     "[TENSOR_PHONE_ROUTER_HANDOFF] layer=%d chunk=%d "
-                    "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
-                    "copy_ms=%.3f\n",
+                    "hidden=%s hidden_bytes=%zu topk=%s topk_bytes=%zu "
+                    "weights=%s weights_bytes=%zu copy_ms=%.3f\n",
                     phone_route_layer, phone_route_chunk,
+                    src_hidden->name, ggml_nbytes(src_hidden),
                     src_topk->name, ggml_nbytes(src_topk),
                     src_weights->name, ggml_nbytes(src_weights),
-                    (topk_copy_us + weights_copy_us) / 1000.0);
+                    (hidden_copy_us + topk_copy_us + weights_copy_us) / 1000.0);
             }
 
             return GGML_STATUS_SUCCESS;
