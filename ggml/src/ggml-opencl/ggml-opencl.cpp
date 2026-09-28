@@ -6401,11 +6401,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         std::getenv("GGML_OPENCL_NODE_DEBUG") != nullptr ||
         std::getenv("GGML_RPC_OPENCL_EXTRA_DEBUG") != nullptr;
 
-    bool decode_attention_graph = false;
+    bool decode_tensor_graph = false;
     if (numeric_debug && cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] == 1) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) {
-                decode_attention_graph = true;
+            if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT ||
+                    strncmp(cgraph->nodes[i]->name, "ffn_inp-", 8) == 0) {
+                decode_tensor_graph = true;
                 break;
             }
         }
@@ -6470,7 +6471,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // became visible.
         ggml_backend_synchronize(backend);
 
-        if (decode_attention_graph && strcmp(mode, "DIRECT") == 0 &&
+        if (decode_tensor_graph && strcmp(mode, "DIRECT") == 0 &&
                 node->type == GGML_TYPE_F32 && node->buffer != nullptr &&
                 node->extra != nullptr && ggml_is_contiguous(node) &&
                 ggml_nelements(node) <= 4096) {
@@ -6491,8 +6492,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 }
             }
             GGML_LOG_ERROR(
-                "[OPENCL_NUMERIC] idx=%d op=%s name=%s n=%zu nonfinite=%zu first_bad=%zu max=%.6g\n",
-                index, ggml_op_name(node->op), node->name, n, nonfinite,
+                "[OPENCL_NUMERIC] uid=%" PRIu64 " idx=%d op=%s name=%s n=%zu nonfinite=%zu first_bad=%zu max=%.6g\n",
+                cgraph->uid, index, ggml_op_name(node->op), node->name, n, nonfinite,
                 first_bad, max_abs);
             fflush(stderr);
         }
