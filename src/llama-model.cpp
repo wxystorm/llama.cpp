@@ -837,9 +837,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             GGML_LOG_INFO(
                 "[TP_FFN_WEIGHT_SPLIT] tensor=%s layer=%u rotation=%zu "
-                "pc_ratio=%.6f ne={%" PRId64 ",%" PRId64 "}\n",
+                "pc_ratio=%.6f ne={%lld,%lld}\n",
                 tensor_name.c_str(), tc.il, tc.rotation,
-                ffn_pc_ratio, ne_pc, ne_phone);
+                ffn_pc_ratio,
+                (long long) ne_pc,
+                (long long) ne_phone);
         }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
