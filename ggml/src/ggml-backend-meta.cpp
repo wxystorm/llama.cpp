@@ -5461,26 +5461,107 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ((is_ffn_down_chunk || is_single_decode_moe_out) &&
              layer_attention_phone_owned(phone_primary_decode_layer));
         if (phone_primary_tensor_down) {
-            // Phone-primary v2 deliberately uses the ordinary Meta all-reduce
-            // here.  The expert FFN tensors are partial on PC and Phone; after
-            // this boundary both backends must hold the identical complete FFN
-            // result before either evaluates l_out.
-            //
-            // Leave 'handled' false so the caller falls through to the generic
-            // all-reduce implementation.
+            const int layer = is_prefill_down_chunk ?
+                prefill_down_layer_0 : phone_primary_decode_layer;
+            const int chunk = is_prefill_down_chunk ?
+                prefill_down_chunk_0 :
+                (is_ffn_down_chunk ? decode_chunk_0 : 0);
+            const char * mode = is_prefill_down_chunk ?
+                "prefill" :
+                (is_single_decode_moe_out ? "decode-single" : "decode");
+
+            // Correctness-first v2.2 experiment:
+            // - residual mirroring remains exactly as in the proven v2/v2.1 path;
+            // - internal Tensor layers already keep l_out Phone-owned;
+            // - only those internal layers may reduce PC FFN partial -> Phone;
+            // - the terminal Tensor layer retains generic all-reduce because PC
+            //   still computes the mirrored terminal l_out used at block exit.
+            const bool internal_phone_l_out_owner =
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
+                layer + 1 < backend_ctx->tensor_phone_last_layer;
+            const bool one_way_reduce =
+                internal_phone_l_out_owner &&
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
+
+            if (one_way_reduce) {
+                handled = true;
+
+                constexpr size_t j_src = 0; // PC FFN partial
+                constexpr size_t j_dst = 1; // Phone FFN partial / owner
+                auto & bcj_src = backend_ctx->backend_configs[j_src];
+                auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+                ggml_tensor * node_src = nodes[j_src];
+                ggml_tensor * node_dst = nodes[j_dst];
+
+                GGML_ASSERT(ggml_is_contiguous(node_src));
+                GGML_ASSERT(ggml_is_contiguous(node_dst));
+                GGML_ASSERT(ggml_nbytes(node_src) == ggml_nbytes(node_dst));
+
+                ggml_tensor * node_tmp = get_node_aux(node_dst);
+                set_tmp_data(node_tmp, j_dst, 0);
+
+                const int64_t copy_start_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_src.backend, bcj_dst.backend,
+                    node_src, node_tmp);
+                const int64_t copy_us = ggml_time_us() - copy_start_us;
+                record_copy_wait(copy_us);
+                record_meta_copy(i, j_src, j_dst, node_src, copy_us);
+
+                ggml_tensor * node_red = get_node_aux(node_dst);
+                node_red->view_src =
+                    node_dst->view_src == nullptr ?
+                        node_dst : node_dst->view_src;
+                node_red->view_offs = node_dst->view_offs;
+                node_red->op = GGML_OP_ADD;
+                node_red->src[0] = node_dst;
+                node_red->src[1] = node_tmp;
+                node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(node_red);
+
+                ggml_cgraph * cgraph_aux = get_cgraph_aux();
+                cgraph_aux->nodes[0] = node_red;
+                cgraph_aux->n_nodes = 1;
+
+                const int64_t add_start_us = ggml_time_us();
+                const ggml_status status =
+                    ggml_backend_graph_compute_async(
+                        bcj_dst.backend, cgraph_aux);
+                reduce_add_us += ggml_time_us() - add_start_us;
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+
+                // Make this diagnostic path dependency-explicit.  The next
+                // Phone-owned l_out must not observe the pre-reduce FFN value.
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(bcj_dst.backend);
+                if (rpc_fence != nullptr) {
+                    rpc_fence(bcj_dst.backend);
+                } else {
+                    ggml_backend_synchronize(bcj_dst.backend);
+                }
+
+                if (pipeline_debug) {
+                    printf(
+                        "[TENSOR_PHONE_V22_FFN_ONEWAY] sg=%zu layer=%d "
+                        "chunk=%d mode=%s bytes=%zu copy_ms=%.3f "
+                        "action=PC_TO_PHONE\n",
+                        i, layer, chunk, mode,
+                        ggml_nbytes(node_src), copy_us / 1000.0);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
+            // Proven v2/v2.1 path.  Keep generic all-reduce for the terminal
+            // Tensor layer and whenever the v2.2 experiment is disabled.
             if (pipeline_debug) {
-                const int layer = is_prefill_down_chunk ?
-                    prefill_down_layer_0 : phone_primary_decode_layer;
-                const int chunk = is_prefill_down_chunk ?
-                    prefill_down_chunk_0 :
-                    (is_ffn_down_chunk ? decode_chunk_0 : 0);
-                const char * mode = is_prefill_down_chunk ?
-                    "prefill" :
-                    (is_single_decode_moe_out ? "decode-single" : "decode");
                 printf(
                     "[TENSOR_PHONE_V2_FFN_ALLREDUCE] sg=%zu layer=%d "
-                    "chunk=%d mode=%s action=GENERIC_ALLREDUCE\n",
-                    i, layer, chunk, mode);
+                    "chunk=%d mode=%s action=GENERIC_ALLREDUCE reason=%s\n",
+                    i, layer, chunk, mode,
+                    internal_phone_l_out_owner ?
+                        "oneway-disabled" : "terminal-or-baseline");
             }
             return GGML_STATUS_SUCCESS;
         }
