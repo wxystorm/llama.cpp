@@ -4788,8 +4788,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool internal_single_owner =
                 std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
                 phone_route_layer + 1 < backend_ctx->tensor_phone_last_layer;
+            // Diagnostic split: keep the proven v2 residual mirror even
+            // when l_out is Phone-only.  This isolates whether correctness
+            // depends on the residual copy itself or on mirrored l_out /
+            // two-backend boundary semantics.
             const bool copy_residual =
-                phone_route_chunk <= 0 && !internal_single_owner;
+                phone_route_chunk <= 0;
             ggml_tensor * src_residual = copy_residual ?
                 find_exact_named_tensor(1, residual_name) : nullptr;
             ggml_tensor * dst_residual = copy_residual ?
@@ -4875,8 +4879,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "[TENSOR_PHONE_V21_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
                     phone_route_layer, phone_route_chunk,
-                    copy_residual ? src_residual->name :
-                        (internal_single_owner ? "(not-needed)" : "(already-copied)"),
+                    copy_residual ? src_residual->name : "(already-copied)",
                     copy_residual ? ggml_nbytes(src_residual) : 0,
                     src_hidden->name, ggml_nbytes(src_hidden),
                     src_topk->name, ggml_nbytes(src_topk),
