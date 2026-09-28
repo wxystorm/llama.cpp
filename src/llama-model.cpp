@@ -1486,7 +1486,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
                 phone_primary_exec ?
                     (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr ?
-                        "PHONE_PRIMARY_V21_L_OUT_SINGLE_OWNER" :
+                        (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr ?
+                            "PHONE_PRIMARY_V22_ONEWAY_INTERNAL" :
+                            "PHONE_PRIMARY_V21_L_OUT_SINGLE_OWNER") :
                         "PHONE_PRIMARY_V2") :
                     "LEGACY_TENSOR_SPLIT");
         }
@@ -1550,7 +1552,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             has_runtime_plan && runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
             phone_primary_exec ?
                     (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr ?
-                        "PHONE_PRIMARY_V21_L_OUT_SINGLE_OWNER" :
+                        (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr ?
+                            "PHONE_PRIMARY_V22_ONEWAY_INTERNAL" :
+                            "PHONE_PRIMARY_V21_L_OUT_SINGLE_OWNER") :
                         "PHONE_PRIMARY_V2") :
                     "LEGACY_TENSOR_SPLIT",
             phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
