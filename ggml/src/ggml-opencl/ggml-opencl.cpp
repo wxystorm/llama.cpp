@@ -14682,6 +14682,84 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),    &blk_buffer));
     }
 
+    const char * fa_input_debug = getenv("GGML_OPENCL_FA_INPUT_DEBUG");
+    if (fa_input_debug != NULL && fa_input_debug[0] != '0' &&
+        n_q == 1 && is_mixed && d_head_q == 128 && d_head_v == 128) {
+        char kernel_name[128] = {};
+        CL_CHECK(clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, NULL));
+
+        int first_visible = -1;
+        int last_visible = -1;
+        int mask_nonfinite = 0;
+        float mask_first = 0.0f;
+        float mask_last = 0.0f;
+        if (mask_buffer != NULL) {
+            std::vector<ggml_fp16_t> mask_values(n_kv);
+            CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, mask_buffer, CL_TRUE,
+                                        offset_mask, mask_values.size() * sizeof(ggml_fp16_t),
+                                        mask_values.data(), 0, NULL, NULL));
+            for (int i = 0; i < n_kv; ++i) {
+                const float value = ggml_fp16_to_fp32(mask_values[i]);
+                if (!std::isfinite(value)) {
+                    ++mask_nonfinite;
+                }
+                if (value > -1.0e4f) {
+                    if (first_visible < 0) {
+                        first_visible = i;
+                    }
+                    last_visible = i;
+                }
+            }
+            if (n_kv > 0) {
+                mask_first = ggml_fp16_to_fp32(mask_values[0]);
+                mask_last = ggml_fp16_to_fp32(mask_values[n_kv - 1]);
+            }
+        } else if (n_kv > 0) {
+            first_visible = 0;
+            last_visible = n_kv - 1;
+        }
+
+        auto log_f16_row = [&](const char * label, cl_mem buffer, cl_ulong offset,
+                               cl_ulong nb1, int row) {
+            if (row < 0) {
+                return;
+            }
+            ggml_fp16_t values[128];
+            CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, buffer, CL_TRUE,
+                                        offset + (cl_ulong) row * nb1, sizeof(values),
+                                        values, 0, NULL, NULL));
+            int nonfinite = 0;
+            float max_abs = 0.0f;
+            for (ggml_fp16_t value : values) {
+                const float f = ggml_fp16_to_fp32(value);
+                if (!std::isfinite(f)) {
+                    ++nonfinite;
+                } else {
+                    max_abs = std::max(max_abs, std::abs(f));
+                }
+            }
+            GGML_LOG_ERROR("[OPENCL_FA_INPUT] name=%s %s row=%d offset=%llu nonfinite=%d max=%.6g v0=%.6g v1=%.6g\n",
+                           dst->name, label, row, (unsigned long long) (offset + (cl_ulong) row * nb1),
+                           nonfinite, max_abs, ggml_fp16_to_fp32(values[0]), ggml_fp16_to_fp32(values[1]));
+        };
+
+        GGML_LOG_ERROR("[OPENCL_FA_INPUT] name=%s kernel=%s n_kv=%d mask=%d visible=[%d,%d] "
+                       "mask_nonfinite=%d mask_first=%.6g mask_last=%.6g "
+                       "k_offset=%llu k_nb=[%llu,%llu,%llu] v_offset=%llu v_nb=[%llu,%llu,%llu]\n",
+                       dst->name, kernel_name, n_kv, mask_buffer != NULL, first_visible, last_visible,
+                       mask_nonfinite, mask_first, mask_last,
+                       (unsigned long long) offset_k, (unsigned long long) k_nb1,
+                       (unsigned long long) k_nb2, (unsigned long long) k_nb3,
+                       (unsigned long long) offset_v, (unsigned long long) v_nb1,
+                       (unsigned long long) v_nb2, (unsigned long long) v_nb3);
+        log_f16_row("K", k_data_device, offset_k, k_nb1, first_visible);
+        log_f16_row("V", v_data_device, offset_v, v_nb1, first_visible);
+        if (last_visible != first_visible) {
+            log_f16_row("K", k_data_device, offset_k, k_nb1, last_visible);
+            log_f16_row("V", v_data_device, offset_v, v_nb1, last_visible);
+        }
+    }
+
     if (n_q == 1) {
         if (use_local_tile) {
             const size_t lt_wg = 128;
