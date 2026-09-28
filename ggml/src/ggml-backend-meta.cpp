@@ -3001,6 +3001,42 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // The residual add for a Phone-primary tensor layer is normally
+        // consumed at the beginning of the following Phone Attention graph.
+        // The terminal tensor layer has no following Attention graph, so flush
+        // its final l_out on Phone before handing the activation to the output
+        // head (or to a non-Phone placement region).
+        if (n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0 &&
+                backend_ctx->tensor_phone_last_layer >
+                    backend_ctx->tensor_phone_first_layer) {
+            const int terminal_phone_tensor_layer =
+                backend_ctx->tensor_phone_last_layer - 1;
+
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                int layer = -1;
+                int parsed = 0;
+                const char * name = cgraph->nodes[i]->name;
+                if (std::sscanf(name, "l_out-%d%n", &layer, &parsed) != 1 ||
+                        name[parsed] != '\0' ||
+                        layer != terminal_phone_tensor_layer) {
+                    continue;
+                }
+
+                backend_ctx->backend_configs[0].nodes[i]->flags &=
+                    ~GGML_TENSOR_FLAG_COMPUTE;
+                backend_ctx->backend_configs[1].nodes[i]->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+
+                if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                    printf(
+                        "[TENSOR_PHONE_TERMINAL_OWNER] layer=%d node=%s "
+                        "owner=PHONE\n",
+                        layer, name);
+                }
+            }
+        }
+
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_tensor * node = cgraph->nodes[i];
             const bool is_decode_result_output =
@@ -3292,12 +3328,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
+                int terminal_phone_l_out_layer = -1;
+                int terminal_phone_l_out_parsed = 0;
+                const bool is_terminal_phone_l_out =
+                    n_backends == 2 &&
+                    backend_ctx->tensor_phone_first_layer >= 0 &&
+                    backend_ctx->tensor_phone_last_layer >
+                        backend_ctx->tensor_phone_first_layer &&
+                    std::sscanf(
+                        node->name, "l_out-%d%n",
+                        &terminal_phone_l_out_layer,
+                        &terminal_phone_l_out_parsed) == 1 &&
+                    node->name[terminal_phone_l_out_parsed] == '\0' &&
+                    terminal_phone_l_out_layer ==
+                        backend_ctx->tensor_phone_last_layer - 1;
+
                 const bool new_subgraph =
                     i == last_meta_node ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
-                    is_phone_route_boundary;
+                    is_phone_route_boundary ||
+                    is_terminal_phone_l_out;
                 if (!new_subgraph) {
                     continue;
                 }
