@@ -705,7 +705,20 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        const llama_hybrid_layer_mode hybrid_mode =
+            model.hybrid_layer_mode(il);
+        const bool defer_last_output_rows =
+            il == n_layer - 1 &&
+            inp_out_ids != nullptr &&
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+
+        // Normally the last layer is pruned to only the requested output rows
+        // before the FFN.  TENSOR_PHONE_PRIMARY needs the same full-token
+        // Attention -> residual -> FFN topology as the preceding tensor layers:
+        // pruning here gives the two Meta backend copies a different final-layer
+        // graph shape and can leave ffn_inp unsynchronized.  Defer the row
+        // selection until after the complete last-layer residual is materialized.
+        if (il == n_layer - 1 && inp_out_ids && !defer_last_output_rows) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -718,8 +731,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        const llama_hybrid_layer_mode hybrid_mode =
-            model.hybrid_layer_mode(il);
         const int n_decode_chunks =
             std::min<int64_t>(qwen3moe_ffn_chunk_count(), n_embd);
         const bool tensor_split_layer =
@@ -885,6 +896,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        if (defer_last_output_rows) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
 
         // input for next layer
         inpL = cur;
