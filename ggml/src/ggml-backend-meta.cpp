@@ -3027,37 +3027,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // The residual add for a Phone-primary tensor layer is normally
-        // consumed at the beginning of the following Phone Attention graph.
-        // The terminal tensor layer has no following Attention graph, so flush
-        // its final l_out on Phone before handing the activation to the output
-        // head (or to a non-Phone placement region).
+        // Phone-primary v2 keeps the control path on Phone through Router,
+        // but re-materializes the complete layer state on both backends after
+        // the FFN all-reduce.  Both sides therefore execute the residual l_out
+        // ADD from identical complete FFN output + identical ffn_inp.
+        //
+        // This deliberately trades an extra mirrored residual state for simple
+        // correctness: every tensor layer ends with PC and Phone synchronized,
+        // so the next Phone-owned Attention does not depend on hidden
+        // keep-owner/terminal-flush state.
         if (n_backends == 2 &&
-                backend_ctx->tensor_phone_first_layer >= 0 &&
-                backend_ctx->tensor_phone_last_layer >
-                    backend_ctx->tensor_phone_first_layer) {
-            const int terminal_phone_tensor_layer =
-                backend_ctx->tensor_phone_last_layer - 1;
-
+                backend_ctx->tensor_phone_first_layer >= 0) {
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 int layer = -1;
                 int parsed = 0;
                 const char * name = cgraph->nodes[i]->name;
                 if (std::sscanf(name, "l_out-%d%n", &layer, &parsed) != 1 ||
                         name[parsed] != '\0' ||
-                        layer != terminal_phone_tensor_layer) {
+                        layer < backend_ctx->tensor_phone_first_layer ||
+                        layer >= backend_ctx->tensor_phone_last_layer) {
                     continue;
                 }
 
-                backend_ctx->backend_configs[0].nodes[i]->flags &=
-                    ~GGML_TENSOR_FLAG_COMPUTE;
+                backend_ctx->backend_configs[0].nodes[i]->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
                 backend_ctx->backend_configs[1].nodes[i]->flags |=
                     GGML_TENSOR_FLAG_COMPUTE;
 
                 if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
                     printf(
-                        "[TENSOR_PHONE_TERMINAL_OWNER] layer=%d node=%s "
-                        "owner=PHONE\n",
+                        "[TENSOR_PHONE_V2_L_OUT_MIRROR] layer=%d node=%s "
+                        "compute={PC,PHONE}\n",
                         layer, name);
                 }
             }
@@ -3354,20 +3354,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
-                int terminal_phone_l_out_layer = -1;
-                int terminal_phone_l_out_parsed = 0;
-                const bool is_terminal_phone_l_out =
+                int phone_primary_l_out_layer = -1;
+                int phone_primary_l_out_parsed = 0;
+                const bool is_phone_primary_l_out =
                     n_backends == 2 &&
                     backend_ctx->tensor_phone_first_layer >= 0 &&
-                    backend_ctx->tensor_phone_last_layer >
-                        backend_ctx->tensor_phone_first_layer &&
                     std::sscanf(
                         node->name, "l_out-%d%n",
-                        &terminal_phone_l_out_layer,
-                        &terminal_phone_l_out_parsed) == 1 &&
-                    node->name[terminal_phone_l_out_parsed] == '\0' &&
-                    terminal_phone_l_out_layer ==
-                        backend_ctx->tensor_phone_last_layer - 1;
+                        &phone_primary_l_out_layer,
+                        &phone_primary_l_out_parsed) == 1 &&
+                    node->name[phone_primary_l_out_parsed] == '\0' &&
+                    phone_primary_l_out_layer >=
+                        backend_ctx->tensor_phone_first_layer &&
+                    phone_primary_l_out_layer <
+                        backend_ctx->tensor_phone_last_layer;
 
                 const bool new_subgraph =
                     i == last_meta_node ||
@@ -3375,7 +3375,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
-                    is_terminal_phone_l_out;
+                    is_phone_primary_l_out;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -4763,6 +4763,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * src_weights = nodes[1];
             ggml_tensor * dst_weights = nodes[0];
 
+            // v2 mirrors the residual state once per layer.  PC needs this
+            // exact Phone-owned ffn_inp only after the FFN all-reduce, when it
+            // independently evaluates the same l_out residual ADD.
+            char residual_name[64];
+            std::snprintf(
+                residual_name, sizeof(residual_name),
+                "ffn_inp-%d", phone_route_layer);
+            const bool copy_residual =
+                phone_route_chunk <= 0; // decode=-1, prefill first chunk=0
+            ggml_tensor * src_residual = copy_residual ?
+                find_exact_named_tensor(1, residual_name) : nullptr;
+            ggml_tensor * dst_residual = copy_residual ?
+                find_exact_named_tensor(0, residual_name) : nullptr;
+
             GGML_ASSERT(src_hidden != nullptr);
             GGML_ASSERT(dst_hidden != nullptr);
             GGML_ASSERT(src_topk != nullptr);
@@ -4772,6 +4786,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(ggml_nbytes(src_hidden) == ggml_nbytes(dst_hidden));
             GGML_ASSERT(ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
             GGML_ASSERT(ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
+            if (copy_residual) {
+                GGML_ASSERT(src_residual != nullptr);
+                GGML_ASSERT(dst_residual != nullptr);
+                GGML_ASSERT(
+                    ggml_nbytes(src_residual) ==
+                    ggml_nbytes(dst_residual));
+            }
 
             int parsed_topk_chunk = -1;
             int parsed_topk_layer = -1;
@@ -4788,6 +4809,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 rpc_fence(bcj_src.backend);
             } else {
                 ggml_backend_synchronize(bcj_src.backend);
+            }
+
+            int64_t residual_copy_us = 0;
+            if (copy_residual) {
+                const int64_t residual_copy_begin = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_src.backend, bcj_dst.backend,
+                    src_residual, dst_residual);
+                residual_copy_us =
+                    ggml_time_us() - residual_copy_begin;
+                record_copy_wait(residual_copy_us);
+                record_meta_copy(
+                    i, 1, 0, src_residual, residual_copy_us);
             }
 
             const int64_t hidden_copy_begin = ggml_time_us();
@@ -4815,16 +4849,59 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug) {
                 printf(
-                    "[TENSOR_PHONE_ROUTER_HANDOFF] layer=%d chunk=%d "
-                    "hidden=%s hidden_bytes=%zu topk=%s topk_bytes=%zu "
-                    "weights=%s weights_bytes=%zu copy_ms=%.3f\n",
+                    "[TENSOR_PHONE_V2_ROUTER_HANDOFF] layer=%d chunk=%d "
+                    "residual=%s residual_bytes=%zu hidden=%s hidden_bytes=%zu "
+                    "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
+                    "copy_ms=%.3f\n",
                     phone_route_layer, phone_route_chunk,
+                    copy_residual ? src_residual->name : "(already-copied)",
+                    copy_residual ? ggml_nbytes(src_residual) : 0,
                     src_hidden->name, ggml_nbytes(src_hidden),
                     src_topk->name, ggml_nbytes(src_topk),
                     src_weights->name, ggml_nbytes(src_weights),
-                    (hidden_copy_us + topk_copy_us + weights_copy_us) / 1000.0);
+                    (residual_copy_us + hidden_copy_us +
+                     topk_copy_us + weights_copy_us) / 1000.0);
             }
 
+            return GGML_STATUS_SUCCESS;
+        }
+
+        int phone_v2_l_out_layer_0 = -1;
+        int phone_v2_l_out_layer_1 = -1;
+        int phone_v2_l_out_parsed_0 = 0;
+        int phone_v2_l_out_parsed_1 = 0;
+        const bool phone_v2_l_out_boundary =
+            n_backends == 2 &&
+            active_count == 2 &&
+            backend_ctx->tensor_phone_first_layer >= 0 &&
+            std::sscanf(
+                nodes[0]->name, "l_out-%d%n",
+                &phone_v2_l_out_layer_0,
+                &phone_v2_l_out_parsed_0) == 1 &&
+            nodes[0]->name[phone_v2_l_out_parsed_0] == '\0' &&
+            std::sscanf(
+                nodes[1]->name, "l_out-%d%n",
+                &phone_v2_l_out_layer_1,
+                &phone_v2_l_out_parsed_1) == 1 &&
+            nodes[1]->name[phone_v2_l_out_parsed_1] == '\0' &&
+            phone_v2_l_out_layer_0 == phone_v2_l_out_layer_1 &&
+            phone_v2_l_out_layer_0 >=
+                backend_ctx->tensor_phone_first_layer &&
+            phone_v2_l_out_layer_0 <
+                backend_ctx->tensor_phone_last_layer;
+
+        if (phone_v2_l_out_boundary) {
+            // Both backends already hold the same complete FFN result after
+            // the preceding all-reduce and the same residual ffn_inp after the
+            // Router handoff.  Therefore both l_out ADDs are complete values,
+            // not partials: do NOT all-reduce them again.
+            handled = true;
+            if (pipeline_debug) {
+                printf(
+                    "[TENSOR_PHONE_V2_L_OUT_SYNC] sg=%zu layer=%d "
+                    "action=NO_REDUCE\n",
+                    i, phone_v2_l_out_layer_0);
+            }
             return GGML_STATUS_SUCCESS;
         }
 
@@ -5359,57 +5436,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ((is_ffn_down_chunk || is_single_decode_moe_out) &&
              layer_attention_phone_owned(phone_primary_decode_layer));
         if (phone_primary_tensor_down) {
-            // TP owns Attention/residual on Phone. Reduce only the PC FFN
-            // partial into the Phone partial; do not fold residual here.
-            // The following Phone-owned graph applies residual normally.
-            handled = true;
-
-            constexpr size_t j_src = 0; // PC partial
-            constexpr size_t j_dst = 1; // Phone partial / owner
-            auto & bcj_src = backend_ctx->backend_configs[j_src];
-            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
-            ggml_tensor * node_src = nodes[j_src];
-            ggml_tensor * node_dst = nodes[j_dst];
-
-            GGML_ASSERT(ggml_is_contiguous(node_src));
-            GGML_ASSERT(ggml_is_contiguous(node_dst));
-            GGML_ASSERT(ggml_nbytes(node_src) == ggml_nbytes(node_dst));
-
-            ggml_tensor * node_tmp = get_node_aux(node_dst);
-            set_tmp_data(node_tmp, j_dst, 0);
-
-            const int64_t copy_start_us = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                bcj_src.backend, bcj_dst.backend,
-                node_src, node_tmp);
-            const int64_t copy_us = ggml_time_us() - copy_start_us;
-            record_copy_wait(copy_us);
-            record_meta_copy(i, j_src, j_dst, node_src, copy_us);
-
-            ggml_tensor * node_red = get_node_aux(node_dst);
-            node_red->view_src =
-                node_dst->view_src == nullptr ?
-                    node_dst : node_dst->view_src;
-            node_red->view_offs = node_dst->view_offs;
-            node_red->op = GGML_OP_ADD;
-            node_red->src[0] = node_dst;
-            node_red->src[1] = node_tmp;
-            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            ggml_backend_view_init(node_red);
-
-            ggml_cgraph * cgraph_aux = get_cgraph_aux();
-            cgraph_aux->nodes[0] = node_red;
-            cgraph_aux->n_nodes = 1;
-
-            const int64_t add_start_us = ggml_time_us();
-            const ggml_status status =
-                ggml_backend_graph_compute_async(
-                    bcj_dst.backend, cgraph_aux);
-            reduce_add_us += ggml_time_us() - add_start_us;
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-
+            // Phone-primary v2 deliberately uses the ordinary Meta all-reduce
+            // here.  The expert FFN tensors are partial on PC and Phone; after
+            // this boundary both backends must hold the identical complete FFN
+            // result before either evaluates l_out.
+            //
+            // Leave 'handled' false so the caller falls through to the generic
+            // all-reduce implementation.
             if (pipeline_debug) {
                 const int layer = is_prefill_down_chunk ?
                     prefill_down_layer_0 : phone_primary_decode_layer;
@@ -5420,10 +5453,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "prefill" :
                     (is_single_decode_moe_out ? "decode-single" : "decode");
                 printf(
-                    "[TENSOR_PHONE_REDUCE] sg=%zu layer=%d chunk=%d "
-                    "mode=%s bytes=%zu copy_ms=%.3f\n",
-                    i, layer, chunk, mode,
-                    ggml_nbytes(node_src), copy_us / 1000.0);
+                    "[TENSOR_PHONE_V2_FFN_ALLREDUCE] sg=%zu layer=%d "
+                    "chunk=%d mode=%s action=GENERIC_ALLREDUCE\n",
+                    i, layer, chunk, mode);
             }
             return GGML_STATUS_SUCCESS;
         }
