@@ -425,6 +425,11 @@ static bool llama_tensor_phone_primary_execution_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool llama_hybrid_force_phone_primary_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_FORCE_PHONE_PRIMARY");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
         int n_layer, int pc_layers, int tensor_layers, int phone_layers,
         bool tensor_phone_primary) {
@@ -1442,6 +1447,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_plan runtime_plan;
         const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
+        const bool force_phone_primary =
+            has_runtime_plan &&
+            llama_hybrid_force_phone_primary_enabled() &&
+            runtime_plan.tensor_layers > 0;
+        if (force_phone_primary) {
+            runtime_plan.tensor_phone_primary = true;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PRIMARY_OVERRIDE] requested=PHONE tensor_layers=%d "
+                "R=%.3f source=LLAMA_HYBRID_FORCE_PHONE_PRIMARY\n",
+                runtime_plan.tensor_layers,
+                runtime_plan.tensor_pc_ratio);
+        }
 
         if (has_runtime_plan &&
             runtime_plan.tensor_layers + runtime_plan.phone_layers + runtime_plan.pc_layers != n_layer) {
