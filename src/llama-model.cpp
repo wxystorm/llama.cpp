@@ -825,6 +825,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
+        split_state.n_segments = segments.size();
 
         if (std::getenv("GGML_META_TP_FFN_FLAG_TRACE") != nullptr &&
                 is_ffn_split_tensor && ud->n_devices == 2) {
@@ -840,7 +841,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 tensor_name.c_str(), tc.il, tc.rotation,
                 ffn_pc_ratio, ne_pc, ne_phone);
         }
-        split_state.n_segments = segments.size();
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
