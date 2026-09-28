@@ -37,6 +37,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -6395,9 +6396,20 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     // op is intentionally expensive and changes timing. Reuse the RPC/OpenCL
     // extra debug switch as well so the current RPC debugging command line
     // automatically gets deterministic per-node fault localization.
-    const bool node_debug =
+    const bool numeric_debug = std::getenv("GGML_OPENCL_NUMERIC_DEBUG") != nullptr;
+    const bool node_debug = numeric_debug ||
         std::getenv("GGML_OPENCL_NODE_DEBUG") != nullptr ||
         std::getenv("GGML_RPC_OPENCL_EXTRA_DEBUG") != nullptr;
+
+    bool decode_attention_graph = false;
+    if (numeric_debug && cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] == 1) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) {
+                decode_attention_graph = true;
+                break;
+            }
+        }
+    }
 
     auto log_node_begin = [&](int index, const ggml_tensor * node, const char * mode) {
         if (!node_debug) {
@@ -6457,6 +6469,33 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         // instead of a later node that happened to run before the driver fault
         // became visible.
         ggml_backend_synchronize(backend);
+
+        if (decode_attention_graph && strcmp(mode, "DIRECT") == 0 &&
+                node->type == GGML_TYPE_F32 && node->buffer != nullptr &&
+                node->extra != nullptr && ggml_is_contiguous(node) &&
+                ggml_nelements(node) <= 4096) {
+            const size_t n = (size_t) ggml_nelements(node);
+            std::vector<float> values(n);
+            ggml_backend_tensor_get(node, values.data(), 0, n * sizeof(float));
+            size_t nonfinite = 0;
+            size_t first_bad = n;
+            double max_abs = 0.0;
+            for (size_t j = 0; j < n; ++j) {
+                if (!std::isfinite(values[j])) {
+                    if (first_bad == n) {
+                        first_bad = j;
+                    }
+                    ++nonfinite;
+                } else {
+                    max_abs = std::max(max_abs, std::abs((double) values[j]));
+                }
+            }
+            GGML_LOG_ERROR(
+                "[OPENCL_NUMERIC] idx=%d op=%s name=%s n=%zu nonfinite=%zu first_bad=%zu max=%.6g\n",
+                index, ggml_op_name(node->op), node->name, n, nonfinite,
+                first_bad, max_abs);
+            fflush(stderr);
+        }
 
         GGML_LOG_ERROR(
             "[OPENCL_NODE_DONE] uid=%" PRIu64 " idx=%d op=%s mode=%s\n",
