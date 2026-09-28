@@ -420,6 +420,11 @@ static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_policy(
     return policy;
 }
 
+static bool llama_tensor_phone_primary_execution_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_EXEC");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
         int n_layer, int pc_layers, int tensor_layers, int phone_layers,
         bool tensor_phone_primary) {
@@ -429,7 +434,13 @@ static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
 
     const int pc_end     = pc_layers;
     const int tensor_end = pc_end + tensor_layers;
-    const llama_hybrid_layer_mode tensor_mode = tensor_phone_primary ?
+
+    // Correctness fallback: keep the planner's PHONE-primary decision, but
+    // execute the tensor region with the proven legacy TENSOR_SPLIT semantics
+    // unless explicitly re-enabled for A/B testing.
+    const bool execute_tensor_phone_primary =
+        tensor_phone_primary && llama_tensor_phone_primary_execution_enabled();
+    const llama_hybrid_layer_mode tensor_mode = execute_tensor_phone_primary ?
         llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY :
         llama_hybrid_layer_mode::TENSOR_SPLIT;
 
@@ -781,23 +792,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
-
-        // FFN sharding uses a global PC/Phone ratio. Rotation only changes which
-        // physical backend receives the first contiguous slice; it must not
-        // reinterpret the first rotated fraction as the PC ratio. Otherwise,
-        // with two backends and rotation=1, the Phone fraction is passed to
-        // llama_hybrid_ffn_shard_size(..., backend_index=0), which can round the
-        // Phone shard down to zero (e.g. 768 * 0.333 -> 255 -> 0 at granularity
-        // 256). This is what caused every other MoE layer to lose the Phone FFN
-        // shard.
-        float ffn_pc_ratio = 0.5f;
-        if (is_ffn_split_tensor && ud->n_devices == 2 && tensor_split != nullptr) {
-            const float split_sum = tensor_split[0] + tensor_split[1];
-            if (split_sum > 0.0f) {
-                ffn_pc_ratio = tensor_split[0] / split_sum;
-            }
-        }
-
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
@@ -805,44 +799,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
-                const size_t split_device = (j + tc.rotation) % ud->n_devices;
                 int64_t high = tensor_split_scan.back() == 0.0f ?
                     ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-
-                if (is_ffn_split_tensor && ud->n_devices == 2) {
-                    high = llama_hybrid_ffn_shard_size(
-                        ne_s,
-                        tc.tensor_axis_0->type,
-                        ffn_pc_ratio,
-                        (int) split_device);
+                const float split_ratio = tensor_split_scan.back() == 0.0f ?
+                    (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
+                if (is_ffn_split_tensor && ud->n_devices == 2 && split_ratio > 0.0f && split_ratio < 1.0f) {
+                    high = llama_hybrid_ffn_shard_size(ne_s, tc.tensor_axis_0->type, split_ratio, 0);
                 }
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + split_device] = high - low;
+                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
                 low = high;
             }
             split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
-
-        if (std::getenv("GGML_META_TP_FFN_FLAG_TRACE") != nullptr &&
-                is_ffn_split_tensor && ud->n_devices == 2) {
-            int64_t ne_pc = 0;
-            int64_t ne_phone = 0;
-            for (size_t is = 0; is < split_state.n_segments; ++is) {
-                ne_pc += split_state.ne[is*ud->n_devices + 0] * split_state.nr[is];
-                ne_phone += split_state.ne[is*ud->n_devices + 1] * split_state.nr[is];
-            }
-            GGML_LOG_INFO(
-                "[TP_FFN_WEIGHT_SPLIT] tensor=%s layer=%u rotation=%zu "
-                "pc_ratio=%.6f ne={%lld,%lld}\n",
-                tensor_name.c_str(), tc.il, tc.rotation,
-                ffn_pc_ratio,
-                (long long) ne_pc,
-                (long long) ne_phone);
-        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
@@ -1499,13 +1472,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
         if (has_runtime_plan) {
+            const bool phone_primary_exec =
+                runtime_plan.tensor_phone_primary &&
+                llama_tensor_phone_primary_execution_enabled();
             LLAMA_LOG_ERROR(
-                "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) %s=[%d,%d) PHONE=[%d,%d)\n",
+                "[HYBRID_LAYOUT] GPU=[0,%d) CPU=[%d,%d) %s=[%d,%d) PHONE=[%d,%d) "
+                "planned_primary=%s execution=%s\n",
                 runtime_plan.gpu_pc_layers,
                 runtime_plan.gpu_pc_layers, runtime_plan.pc_layers,
-                runtime_plan.tensor_phone_primary ? "TENSOR_PHONE" : "TENSOR",
+                runtime_plan.tensor_phone_primary ? "TENSOR_PHONE_PLAN" : "TENSOR",
                 runtime_plan.pc_layers, runtime_plan.pc_layers + runtime_plan.tensor_layers,
-                runtime_plan.pc_layers + runtime_plan.tensor_layers, n_layer);
+                runtime_plan.pc_layers + runtime_plan.tensor_layers, n_layer,
+                runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
+                phone_primary_exec ? "PHONE_PRIMARY" : "LEGACY_TENSOR_SPLIT");
         }
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
@@ -1555,12 +1534,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 tensor_pc_ratio = params.tensor_split[0] / split_sum;
             }
         }
+        const bool phone_primary_exec =
+            has_runtime_plan &&
+            runtime_plan.tensor_phone_primary &&
+            llama_tensor_phone_primary_execution_enabled();
         LLAMA_LOG_INFO("[HYBRID_SPLIT] source=%s pc_pct=%g layout=%s n_layer=%d tensor_split=%d "
-                       "tensor_primary=%s phone_only=%d pc_only=%d gpu_pc=%d R=%.3f "
+                       "tensor_primary=%s tensor_exec=%s phone_only=%d pc_only=%d gpu_pc=%d R=%.3f "
                        "phone_layers=[%s] pc_layers=[%s]\n",
             has_runtime_plan ? "planner" : "environment", pc_pct, pc_layout.c_str(), n_layer,
             n_layer - phone_layers - pc_layers,
             has_runtime_plan && runtime_plan.tensor_phone_primary ? "PHONE" : "PC",
+            phone_primary_exec ? "PHONE_PRIMARY" : "LEGACY_TENSOR_SPLIT",
             phone_layers, pc_layers, n_gpu_pc, tensor_pc_ratio,
             phone_layer_list.c_str(), pc_layer_list.c_str());
     }
