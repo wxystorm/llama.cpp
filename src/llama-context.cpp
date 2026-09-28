@@ -3508,7 +3508,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
             tensor_phone_last_layer = il + 1;
         }
-        GGML_ASSERT(tensor_phone_last_layer - tensor_phone_first_layer == runtime_plan.tensor_layers);
+        if (tensor_phone_first_layer >= 0) {
+            GGML_ASSERT(
+                tensor_phone_last_layer - tensor_phone_first_layer ==
+                runtime_plan.tensor_layers);
+        }
     }
     for (ggml_backend_t backend : backend_ptrs) {
         ggml_backend_meta_set_tensor_phone_primary_layers(
@@ -3521,10 +3525,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
-    const bool tensor_phone_primary_plan =
-        has_runtime_plan &&
-        runtime_plan.tensor_layers > 0 &&
-        runtime_plan.tensor_phone_primary;
+    // Execution follows the model policy, not merely the planner flag.
+    // A PHONE-primary plan may intentionally run with legacy TENSOR_SPLIT
+    // semantics for correctness A/B testing.
+    const bool tensor_phone_primary_exec =
+        tensor_phone_first_layer >= 0 &&
+        tensor_phone_last_layer > tensor_phone_first_layer;
 
     const bool gpu_tensor_topology =
         runtime_stages.size() == 2 &&
@@ -3536,7 +3542,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     [](const llama_hybrid_runtime_stage & stage) { return stage.macro_tokens > 0; });
     const bool stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
-        !tensor_phone_primary_plan &&
+        !tensor_phone_primary_exec &&
         gpu_tensor_topology && model.arch != LLM_ARCH_QWEN2;
     const bool gpu_cpu_tensor_topology =
         runtime_stages.size() == 3 &&
@@ -3574,20 +3580,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // advance as (layer, chunk) wavefronts.
     const bool return_wavefront_full_graph_override =
         return_wavefront_requested &&
-        !tensor_phone_primary_plan &&
+        !tensor_phone_primary_exec &&
         gpu_tensor_topology && model.arch == LLM_ARCH_QWEN2;
     const bool generalized_stage_arch =
         model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3MOE;
     const bool generalized_stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
-        !tensor_phone_primary_plan &&
+        !tensor_phone_primary_exec &&
         valid_stage_macros && generalized_stage_arch &&
         !return_wavefront_full_graph_override &&
         (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
-        !tensor_phone_primary_plan &&
+        !tensor_phone_primary_exec &&
         !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && generalized_stage_arch;
 
