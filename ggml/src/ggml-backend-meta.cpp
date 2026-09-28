@@ -2869,6 +2869,40 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // In TENSOR_PHONE_PRIMARY layers, Attention and the residual stream are
+        // Phone-owned.  ffn_inp = attn_out + residual must therefore also be
+        // materialized on Phone before the FFN split.  If PC recomputes this ADD
+        // from its mirrored residual, it can consume a stale l_out and the two
+        // backends immediately diverge.  Keep ffn_inp Phone-only; the subgraph
+        // boundary below copies this complete FFN input to PC exactly once.
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (n_backends != 2 ||
+                    backend_ctx->tensor_phone_first_layer < 0) {
+                break;
+            }
+
+            int layer = -1;
+            int parsed = 0;
+            const char * name = cgraph->nodes[i]->name;
+            if (std::sscanf(name, "ffn_inp-%d%n", &layer, &parsed) != 1 ||
+                    name[parsed] != '\0' ||
+                    layer < backend_ctx->tensor_phone_first_layer ||
+                    layer >= backend_ctx->tensor_phone_last_layer) {
+                continue;
+            }
+
+            backend_ctx->backend_configs[0].nodes[i]->flags &=
+                ~GGML_TENSOR_FLAG_COMPUTE;
+            backend_ctx->backend_configs[1].nodes[i]->flags |=
+                GGML_TENSOR_FLAG_COMPUTE;
+
+            if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                printf(
+                    "[TENSOR_PHONE_FFN_INPUT_OWNER] layer=%d node=%s owner=PHONE\n",
+                    layer, name);
+            }
+        }
+
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_tensor * node = cgraph->nodes[i];
             const bool is_decode_result_output =
@@ -3138,11 +3172,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_prefill_norm_chunk(
                         node->name, prefill_chunk, prefill_layer);
 
+                int phone_ffn_input_layer = -1;
+                int phone_ffn_input_parsed = 0;
+                const bool is_phone_primary_ffn_input =
+                    n_backends == 2 &&
+                    backend_ctx->tensor_phone_first_layer >= 0 &&
+                    std::sscanf(
+                        node->name, "ffn_inp-%d%n",
+                        &phone_ffn_input_layer,
+                        &phone_ffn_input_parsed) == 1 &&
+                    node->name[phone_ffn_input_parsed] == '\0' &&
+                    phone_ffn_input_layer >=
+                        backend_ctx->tensor_phone_first_layer &&
+                    phone_ffn_input_layer <
+                        backend_ctx->tensor_phone_last_layer;
+
                 const bool new_subgraph =
                     i == last_meta_node ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
-                    is_prefill_norm_chunk;
+                    is_prefill_norm_chunk ||
+                    is_phone_primary_ffn_input;
                 if (!new_subgraph) {
                     continue;
                 }
