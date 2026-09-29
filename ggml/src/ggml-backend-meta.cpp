@@ -6488,6 +6488,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
+        auto reduce_fence_backend = [&](ggml_backend_t backend) {
+            const ggml_backend_rpc_fence_t rpc_fence =
+                ggml_backend_meta_get_rpc_fence(backend);
+            if (rpc_fence != nullptr) {
+                rpc_fence(backend);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+        };
+
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
@@ -6501,11 +6511,38 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
+            // Correctness-first ordering for heterogeneous all-reduce.
+            //
+            // ggml_backend_tensor_copy_async() falls back to
+            // ggml_backend_synchronize() when the destination has no async
+            // copy hook.  RPC's ordinary synchronize hook is intentionally a
+            // no-op in this fork, so that fallback does NOT guarantee that a
+            // remote producer has finished before another transfer socket
+            // reads its tensor.  Make both dependencies explicit here:
+            //   producer complete -> copy complete/visible on destination -> ADD.
+            const int64_t src_fence_start_us = ggml_time_us();
+            reduce_fence_backend(bcj_src.backend);
+            const int64_t src_fence_us = ggml_time_us() - src_fence_start_us;
+
             const int64_t copy_start_us = ggml_time_us();
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
             const int64_t copy_us = ggml_time_us() - copy_start_us;
             record_copy_wait(copy_us);
             record_meta_copy(i, j_src, j_dst, node_src, copy_us);
+
+            const int64_t dst_fence_start_us = ggml_time_us();
+            reduce_fence_backend(bcj_dst.backend);
+            const int64_t dst_fence_us = ggml_time_us() - dst_fence_start_us;
+
+            if (pipeline_debug) {
+                printf(
+                    "[META_ALLREDUCE_FENCE] sg=%zu %zu->%zu tensor=%s "
+                    "src_fence_ms=%.3f copy_ms=%.3f dst_fence_ms=%.3f\n",
+                    i, j_src, j_dst, node_src->name,
+                    src_fence_us / 1000.0,
+                    copy_us / 1000.0,
+                    dst_fence_us / 1000.0);
+            }
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
