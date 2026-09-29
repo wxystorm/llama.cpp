@@ -2578,7 +2578,8 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
     const auto exact_it = opencl_tensor_extras.find(exact_key);
     if (exact_it != opencl_tensor_extras.end()) {
         tensor->extra = exact_it->second;
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=RESTORE_EXACT name=%s buffer=%p data=%p extra=%p\n",
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_EXACT name=%s buffer=%p data=%p extra=%p\n",
             tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
         return true;
     }
@@ -2618,7 +2619,8 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
         }
 
         if (have_nearest) {
-            RPC_OPENCL_EXTRA_DBG(\n                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
+            RPC_OPENCL_EXTRA_DBG(
+                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
                 "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
                 "same_buffer_type=%zu nearest_data=0x%" PRIx64
                 " delta=%" PRIu64 " nearest_extra=%p ambiguous=%d\n",
@@ -2632,7 +2634,8 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
                 nearest_extra,
                 nearest_ambiguous ? 1 : 0);
         } else {
-            RPC_OPENCL_EXTRA_DBG(\n                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
+            RPC_OPENCL_EXTRA_DBG(
+                "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_MISS "
                 "name=%s buffer=%p data=0x%" PRIx64 " type=%d "
                 "same_buffer_type=0\n",
                 tensor->name,
@@ -2645,7 +2648,8 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
 
     if (storage_it->second.ambiguous ||
         storage_it->second.extra == nullptr) {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_CONFLICT "
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE_CONFLICT "
             "name=%s buffer=%p data=%p type=%d\n",
             tensor->name,
             (void *) tensor->buffer,
@@ -2660,7 +2664,8 @@ bool rpc_server::restore_opencl_tensor_extra(ggml_tensor * tensor) {
     // reconstructions then take the strict path without another fallback.
     opencl_tensor_extras.emplace(exact_key, tensor->extra);
 
-    RPC_OPENCL_EXTRA_DBG(\n        "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE name=%s "
+    RPC_OPENCL_EXTRA_DBG(
+        "[RPC_OPENCL_EXTRA] action=RESTORE_STORAGE name=%s "
         "buffer=%p data=%p type=%d extra=%p\n",
         tensor->name,
         (void *) tensor->buffer,
@@ -2682,7 +2687,8 @@ bool rpc_server::ensure_opencl_tensor_extra(
     // weights or OpenCL extra, and OpenCL skips empty nodes at execution.
     if (ggml_is_empty(tensor)) {
         if (rpc_opencl_extra_debug_enabled()) {
-            RPC_OPENCL_EXTRA_DBG(\n                "[RPC_OPENCL_EXTRA] action=SKIP_EMPTY name=%s type=%d\n",
+            RPC_OPENCL_EXTRA_DBG(
+                "[RPC_OPENCL_EXTRA] action=SKIP_EMPTY name=%s type=%d\n",
                 tensor->name, (int) tensor->type);
         }
         return true;
@@ -2706,7 +2712,8 @@ bool rpc_server::ensure_opencl_tensor_extra(
          tensor->type == GGML_TYPE_Q6_K);
 
     if (!allow_quantized_weight_init && requires_k_quant_extra) {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_K_QUANT_LEAF "
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=RESTORE_MISS_K_QUANT_LEAF "
             "name=%s buffer=%p data=%p type=%d ne=[%" PRId64 ",%" PRId64
             ",%" PRId64 ",%" PRId64 "]\n",
             tensor->name,
@@ -2723,12 +2730,14 @@ bool rpc_server::ensure_opencl_tensor_extra(
     const ggml_status status =
         ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
     if (status != GGML_STATUS_SUCCESS || tensor->extra == nullptr) {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=INIT_FAILED name=%s status=%d extra=%p\n",
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=INIT_FAILED name=%s status=%d extra=%p\n",
             tensor->name, (int) status, tensor->extra);
         return false;
     }
 
-    RPC_OPENCL_EXTRA_DBG(\n        "[RPC_OPENCL_EXTRA] action=INIT name=%s buffer=%p data=%p extra=%p\n",
+    RPC_OPENCL_EXTRA_DBG(
+        "[RPC_OPENCL_EXTRA] action=INIT name=%s buffer=%p data=%p extra=%p\n",
         tensor->name, (void *) tensor->buffer, tensor->data, tensor->extra);
     return true;
 }
@@ -2785,7 +2794,8 @@ void rpc_server::remember_opencl_tensor_extra(ggml_tensor * tensor) {
     }
 
     if (storage_conflict) {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=REMEMBER_STORAGE_CONFLICT "
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=REMEMBER_STORAGE_CONFLICT "
             "name=%s buffer=%p data=%p type=%d extra=%p\n",
             tensor->name,
             (void *) tensor->buffer,
@@ -2793,7 +2803,8 @@ void rpc_server::remember_opencl_tensor_extra(ggml_tensor * tensor) {
             (int) tensor->type,
             tensor->extra);
     } else {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=REMEMBER name=%s "
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=REMEMBER name=%s "
             "buffer=%p data=%p type=%d extra=%p\n",
             tensor->name,
             (void *) tensor->buffer,
@@ -4116,7 +4127,8 @@ bool rpc_server::set_tensor_from_local_file(
         tensor_nbytes % request.copy_size == 0 &&
         tensor_nbytes / request.copy_size == request.n_copies;
     if (opencl_quantized && !complete_destination) {
-        RPC_OPENCL_EXTRA_DBG(\n            "[RPC_OPENCL_EXTRA] action=REJECT_PARTIAL_QUANT_SET "
+        RPC_OPENCL_EXTRA_DBG(
+            "[RPC_OPENCL_EXTRA] action=REJECT_PARTIAL_QUANT_SET "
             "name=%s type=%d dst_offset=%" PRIu64
             " copy_size=%" PRIu64 " n_copies=%" PRIu64
             " tensor_size=%" PRIu64 "\n",
@@ -4316,18 +4328,21 @@ bool rpc_server::set_tensor_from_local_file(
             const auto mismatch = std::mismatch(staging.begin(), staging.end(), readback.begin());
             if (mismatch.first != staging.end()) {
                 const size_t pos = static_cast<size_t>(mismatch.first - staging.begin());
-                RPC_OPENCL_EXTRA_DBG(\n                    "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_MISMATCH "
+                GGML_LOG_DEBUG(
+                    "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_MISMATCH "
                     "name=%s type=%d offset=%zu expected=%u actual=%u bytes=%zu\n",
                     tensor->name, (int) tensor->type, pos,
                     (unsigned) staging[pos], (unsigned) readback[pos], staging.size());
                 response.result = 2;
                 return true;
             }
-            RPC_OPENCL_EXTRA_DBG(\n                "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_OK name=%s type=%d bytes=%zu\n",
+            GGML_LOG_DEBUG(
+                "[RPC_OPENCL_EXTRA] action=VERIFY_QUANT_OK name=%s type=%d bytes=%zu\n",
                 tensor->name, (int) tensor->type, staging.size());
         }
         if (rpc_opencl_extra_debug_enabled()) {
-            RPC_OPENCL_EXTRA_DBG(\n                "[RPC_OPENCL_EXTRA] action=SET_QUANT_FULL_STAGED "
+            RPC_OPENCL_EXTRA_DBG(
+                "[RPC_OPENCL_EXTRA] action=SET_QUANT_FULL_STAGED "
                 "name=%s bytes=%zu n_copies=%" PRIu64 "\n",
                 tensor->name, staging.size(), request.n_copies);
         }
