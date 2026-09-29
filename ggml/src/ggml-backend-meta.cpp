@@ -7786,6 +7786,155 @@ auto prefill_norm_sg_has_prework =
         }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
+
+        // Diagnostic-only shadow execution for the first Phone-primary Tensor
+        // layer's Attention subgraph.  The real path still consumes the Phone
+        // result.  We run the PC counterpart after Phone completes, compare
+        // the final Attention tensor, then restore the original COMPUTE flags
+        // before communication/ownership logic continues.
+        if (compute_status == GGML_STATUS_SUCCESS &&
+                std::getenv("GGML_META_TP_ATTN_SHADOW_PC") != nullptr &&
+                !phone_block_fused &&
+                n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0 &&
+                phone_graph != nullptr &&
+                phone_graph->n_nodes > 0) {
+            int shadow_layer = -1;
+            int shadow_parsed = 0;
+            const char * first_name = phone_graph->nodes[0]->name;
+            const bool is_first_tp_attn =
+                std::sscanf(
+                    first_name, "norm-%d%n",
+                    &shadow_layer, &shadow_parsed) == 1 &&
+                first_name[shadow_parsed] == '\0' &&
+                shadow_layer == backend_ctx->tensor_phone_first_layer;
+
+            if (is_first_tp_attn) {
+                ggml_cgraph * pc_graph =
+                    backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+
+                if (pc_graph != nullptr &&
+                        pc_graph->n_nodes == phone_graph->n_nodes) {
+                    std::vector<enum ggml_tensor_flag> saved_flags;
+                    saved_flags.reserve((size_t) pc_graph->n_nodes);
+                    for (int k = 0; k < pc_graph->n_nodes; ++k) {
+                        saved_flags.push_back(pc_graph->nodes[k]->flags);
+                        pc_graph->nodes[k]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    }
+
+                    compute_workers.start_graph(0, pc_graph);
+                    const ggml_status shadow_status = compute_workers.wait(0);
+
+                    for (int k = 0; k < pc_graph->n_nodes; ++k) {
+                        pc_graph->nodes[k]->flags = saved_flags[(size_t) k];
+                    }
+
+                    ggml_tensor * pc_last =
+                        pc_graph->nodes[pc_graph->n_nodes - 1];
+                    ggml_tensor * phone_last =
+                        phone_graph->nodes[phone_graph->n_nodes - 1];
+
+                    auto shadow_fence = [&](ggml_backend_t backend) {
+                        const ggml_backend_rpc_fence_t rpc_fence =
+                            ggml_backend_meta_get_rpc_fence(backend);
+                        if (rpc_fence != nullptr) {
+                            rpc_fence(backend);
+                        } else {
+                            ggml_backend_synchronize(backend);
+                        }
+                    };
+
+                    if (shadow_status == GGML_STATUS_SUCCESS &&
+                            pc_last != nullptr &&
+                            phone_last != nullptr &&
+                            pc_last->type == GGML_TYPE_F32 &&
+                            phone_last->type == GGML_TYPE_F32 &&
+                            ggml_nelements(pc_last) ==
+                                ggml_nelements(phone_last)) {
+                        shadow_fence(
+                            backend_ctx->backend_configs[0].backend);
+                        shadow_fence(
+                            backend_ctx->backend_configs[1].backend);
+
+                        const size_t n = ggml_nelements(pc_last);
+                        std::vector<float> pc_values(n);
+                        std::vector<float> phone_values(n);
+                        ggml_backend_tensor_get(
+                            pc_last, pc_values.data(), 0,
+                            n * sizeof(float));
+                        ggml_backend_tensor_get(
+                            phone_last, phone_values.data(), 0,
+                            n * sizeof(float));
+
+                        double pc_sum = 0.0;
+                        double phone_sum = 0.0;
+                        double pc_l2 = 0.0;
+                        double phone_l2 = 0.0;
+                        double diff_l2 = 0.0;
+                        double max_abs_diff = 0.0;
+                        size_t max_diff_index = 0;
+                        for (size_t q = 0; q < n; ++q) {
+                            const double a = pc_values[q];
+                            const double b = phone_values[q];
+                            const double d = a - b;
+                            pc_sum += a;
+                            phone_sum += b;
+                            pc_l2 += a * a;
+                            phone_l2 += b * b;
+                            diff_l2 += d * d;
+                            if (std::abs(d) > max_abs_diff) {
+                                max_abs_diff = std::abs(d);
+                                max_diff_index = q;
+                            }
+                        }
+
+                        printf(
+                            "[TP_ATTN_SHADOW] layer=%d sg=%zu "
+                            "pc_last=%s phone_last=%s n=%zu "
+                            "pc_sum=%.9f phone_sum=%.9f "
+                            "pc_l2=%.9f phone_l2=%.9f "
+                            "max_abs_diff=%.9g rms_diff=%.9g "
+                            "max_diff_index=%zu "
+                            "pc_v0=%.9f phone_v0=%.9f "
+                            "pc_v1=%.9f phone_v1=%.9f\n",
+                            shadow_layer, i,
+                            pc_last->name, phone_last->name, n,
+                            pc_sum, phone_sum,
+                            std::sqrt(pc_l2), std::sqrt(phone_l2),
+                            max_abs_diff,
+                            n > 0 ?
+                                std::sqrt(diff_l2 / (double) n) :
+                                0.0,
+                            max_diff_index,
+                            n > 0 ? pc_values[0] : 0.0f,
+                            n > 0 ? phone_values[0] : 0.0f,
+                            n > 1 ? pc_values[1] : 0.0f,
+                            n > 1 ? phone_values[1] : 0.0f);
+                    } else {
+                        printf(
+                            "[TP_ATTN_SHADOW] layer=%d sg=%zu status=SKIP "
+                            "shadow_status=%d pc_last=%s phone_last=%s "
+                            "pc_type=%d phone_type=%d pc_n=%" PRId64
+                            " phone_n=%" PRId64 "\n",
+                            shadow_layer, i, (int) shadow_status,
+                            pc_last != nullptr ? pc_last->name : "(null)",
+                            phone_last != nullptr ? phone_last->name : "(null)",
+                            pc_last != nullptr ? (int) pc_last->type : -1,
+                            phone_last != nullptr ? (int) phone_last->type : -1,
+                            pc_last != nullptr ? ggml_nelements(pc_last) : 0,
+                            phone_last != nullptr ? ggml_nelements(phone_last) : 0);
+                    }
+                } else {
+                    printf(
+                        "[TP_ATTN_SHADOW] layer=%d sg=%zu status=SKIP "
+                        "reason=graph-shape pc_nodes=%d phone_nodes=%d\n",
+                        shadow_layer, i,
+                        pc_graph != nullptr ? pc_graph->n_nodes : -1,
+                        phone_graph->n_nodes);
+                }
+            }
+        }
+
         const int64_t phone_submit_end_us = ggml_time_us();
         if (pipeline_debug && phone_block_fused) {
             printf("[PHONE_BLOCK_SUBMIT_END] layers=%d..%d t=%" PRId64 " dur=%.3f ms\n", first_fused_layer,
