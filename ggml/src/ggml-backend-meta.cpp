@@ -7583,7 +7583,8 @@ auto prefill_norm_sg_has_prework =
     }
 
     for (size_t backend = 0; backend < n_backends; ++backend) {
-        if (std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr &&
+        if ((std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr ||
+             std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr) &&
             backend_ctx->tensor_phone_first_layer >= 0) {
             for (int layer = backend_ctx->tensor_phone_first_layer;
                  layer < backend_ctx->tensor_phone_last_layer; ++layer) {
@@ -7845,7 +7846,8 @@ auto prefill_norm_sg_has_prework =
     // Complete deferred TP input traces only for sources that are produced by
     // this subgraph itself. This distinguishes a real zero from a PRE trace
     // that simply inspected the destination before its ADD/other producer ran.
-    if (std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr &&
+    if ((std::getenv("GGML_META_TP_INPUT_TRACE") != nullptr ||
+         std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr) &&
             backend_ctx->tensor_phone_first_layer >= 0) {
         for (size_t backend = 0; backend < n_backends; ++backend) {
             for (int layer = backend_ctx->tensor_phone_first_layer;
