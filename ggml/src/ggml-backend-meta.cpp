@@ -6498,6 +6498,109 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         };
 
+        // Numeric proof for the first Phone-primary Tensor layer.  This is
+        // deliberately diagnostic-only: it does not change graph ownership or
+        // reduction semantics.  Capture the two FFN partials before reduction
+        // so we can prove whether each backend later contains their exact sum.
+        bool tp_numeric_trace = false;
+        int tp_numeric_layer = -1;
+        int tp_numeric_chunk = -1;
+        const char * tp_numeric_mode = nullptr;
+        std::vector<float> tp_numeric_pre_pc;
+        std::vector<float> tp_numeric_pre_phone;
+
+        if (std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr &&
+                n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0) {
+            ggml_tensor * trace_node =
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
+                    backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+
+            int parsed = 0;
+            int layer = -1;
+            int chunk = -1;
+            int chunk_layer = -1;
+            if (trace_node->ne[1] == 1 &&
+                    std::sscanf(
+                        trace_node->name, "ffn_moe_out-%d%n",
+                        &layer, &parsed) == 1 &&
+                    trace_node->name[parsed] == '\0') {
+                tp_numeric_layer = layer;
+                tp_numeric_chunk = 0;
+                tp_numeric_mode = "decode-single";
+            } else if (ggml_backend_meta_parse_decode_ffn_chunk(
+                           trace_node->name, chunk, chunk_layer)) {
+                tp_numeric_layer = chunk_layer;
+                tp_numeric_chunk = chunk;
+                tp_numeric_mode = "decode";
+            } else if (ggml_backend_meta_parse_prefill_down_chunk(
+                           trace_node->name, chunk, chunk_layer)) {
+                tp_numeric_layer = chunk_layer;
+                tp_numeric_chunk = chunk;
+                tp_numeric_mode = "prefill";
+            }
+
+            tp_numeric_trace =
+                tp_numeric_layer == backend_ctx->tensor_phone_first_layer &&
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main
+                    ->nodes[backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1]->type == GGML_TYPE_F32 &&
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main
+                    ->nodes[backend_ctx->backend_configs[1].cgraphs[i].cgraph_main->n_nodes - 1]->type == GGML_TYPE_F32;
+
+            if (tp_numeric_trace) {
+                auto & pc_cfg = backend_ctx->backend_configs[0];
+                auto & ph_cfg = backend_ctx->backend_configs[1];
+                ggml_tensor * pc_node =
+                    pc_cfg.cgraphs[i].cgraph_main->nodes[
+                        pc_cfg.cgraphs[i].cgraph_main->n_nodes - 1];
+                ggml_tensor * ph_node =
+                    ph_cfg.cgraphs[i].cgraph_main->nodes[
+                        ph_cfg.cgraphs[i].cgraph_main->n_nodes - 1];
+
+                if (ggml_nelements(pc_node) != ggml_nelements(ph_node)) {
+                    tp_numeric_trace = false;
+                } else {
+                    reduce_fence_backend(pc_cfg.backend);
+                    reduce_fence_backend(ph_cfg.backend);
+
+                    const size_t n = ggml_nelements(pc_node);
+                    tp_numeric_pre_pc.resize(n);
+                    tp_numeric_pre_phone.resize(n);
+                    ggml_backend_tensor_get(
+                        pc_node, tp_numeric_pre_pc.data(), 0,
+                        n * sizeof(float));
+                    ggml_backend_tensor_get(
+                        ph_node, tp_numeric_pre_phone.data(), 0,
+                        n * sizeof(float));
+
+                    auto print_pre = [&](const char * side,
+                                         const std::vector<float> & values) {
+                        double sum = 0.0;
+                        double l2 = 0.0;
+                        double max_abs = 0.0;
+                        for (float x : values) {
+                            sum += x;
+                            l2 += (double) x * x;
+                            max_abs = std::max(max_abs, std::abs((double) x));
+                        }
+                        printf(
+                            "[TP_ALLREDUCE_NUMERIC] phase=PRE layer=%d chunk=%d "
+                            "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
+                            "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                            tp_numeric_layer, tp_numeric_chunk,
+                            tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                            side, values.size(), sum, std::sqrt(l2), max_abs,
+                            values.size() > 0 ? values[0] : 0.0f,
+                            values.size() > 1 ? values[1] : 0.0f,
+                            values.size() > 2 ? values[2] : 0.0f,
+                            values.size() > 3 ? values[3] : 0.0f);
+                    };
+                    print_pre("PC", tp_numeric_pre_pc);
+                    print_pre("PHONE", tp_numeric_pre_phone);
+                }
+            }
+        }
+
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
@@ -6624,6 +6727,88 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i_buf++;
         }
         assert(i_buf == backend_ctx->n_reduce_steps);
+
+        if (tp_numeric_trace) {
+            auto & pc_cfg = backend_ctx->backend_configs[0];
+            auto & ph_cfg = backend_ctx->backend_configs[1];
+            ggml_tensor * pc_node =
+                pc_cfg.cgraphs[i].cgraph_main->nodes[
+                    pc_cfg.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * ph_node =
+                ph_cfg.cgraphs[i].cgraph_main->nodes[
+                    ph_cfg.cgraphs[i].cgraph_main->n_nodes - 1];
+
+            reduce_fence_backend(pc_cfg.backend);
+            reduce_fence_backend(ph_cfg.backend);
+
+            const size_t n = tp_numeric_pre_pc.size();
+            std::vector<float> post_pc(n);
+            std::vector<float> post_phone(n);
+            ggml_backend_tensor_get(
+                pc_node, post_pc.data(), 0, n * sizeof(float));
+            ggml_backend_tensor_get(
+                ph_node, post_phone.data(), 0, n * sizeof(float));
+
+            auto print_post = [&](const char * side,
+                                  const std::vector<float> & values) {
+                double sum = 0.0;
+                double l2 = 0.0;
+                double max_abs = 0.0;
+                double diff_l2 = 0.0;
+                double max_abs_diff = 0.0;
+                size_t max_diff_index = 0;
+                for (size_t k = 0; k < n; ++k) {
+                    const double x = values[k];
+                    const double expected =
+                        (double) tp_numeric_pre_pc[k] +
+                        (double) tp_numeric_pre_phone[k];
+                    const double diff = x - expected;
+                    sum += x;
+                    l2 += x * x;
+                    max_abs = std::max(max_abs, std::abs(x));
+                    diff_l2 += diff * diff;
+                    if (std::abs(diff) > max_abs_diff) {
+                        max_abs_diff = std::abs(diff);
+                        max_diff_index = k;
+                    }
+                }
+                const double rms_diff =
+                    n > 0 ? std::sqrt(diff_l2 / (double) n) : 0.0;
+                printf(
+                    "[TP_ALLREDUCE_NUMERIC] phase=POST layer=%d chunk=%d "
+                    "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
+                    "max_abs_diff=%.9g rms_diff=%.9g max_diff_index=%zu "
+                    "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                    tp_numeric_layer, tp_numeric_chunk,
+                    tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                    side, values.size(), sum, std::sqrt(l2), max_abs,
+                    max_abs_diff, rms_diff, max_diff_index,
+                    values.size() > 0 ? values[0] : 0.0f,
+                    values.size() > 1 ? values[1] : 0.0f,
+                    values.size() > 2 ? values[2] : 0.0f,
+                    values.size() > 3 ? values[3] : 0.0f);
+            };
+
+            print_post("PC", post_pc);
+            print_post("PHONE", post_phone);
+
+            double cross_l2 = 0.0;
+            double cross_max = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                const double diff =
+                    (double) post_pc[k] - (double) post_phone[k];
+                cross_l2 += diff * diff;
+                cross_max = std::max(cross_max, std::abs(diff));
+            }
+            printf(
+                "[TP_ALLREDUCE_NUMERIC] phase=CROSS layer=%d chunk=%d "
+                "mode=%s pc_phone_max_abs_diff=%.9g "
+                "pc_phone_rms_diff=%.9g\n",
+                tp_numeric_layer, tp_numeric_chunk,
+                tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                cross_max,
+                n > 0 ? std::sqrt(cross_l2 / (double) n) : 0.0);
+        }
 
         if (pipeline_debug && i == 1 && n_backends == 2) {
             auto & bcj = backend_ctx->backend_configs[0];
