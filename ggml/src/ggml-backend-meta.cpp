@@ -2608,6 +2608,21 @@ static ggml_backend_rpc_fence_t ggml_backend_meta_get_rpc_fence(ggml_backend_t b
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_FENCE_PROC));
 }
 
+static ggml_backend_rpc_get_tensor_batch3_t ggml_backend_meta_get_tensor_batch3(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_get_tensor_batch3_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_GET_TENSOR_BATCH3_PROC));
+}
+
 static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -5070,26 +5085,64 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     i, 1, 0, src_residual, residual_copy_us);
             }
 
-            const int64_t hidden_copy_begin = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                bcj_src.backend, bcj_dst.backend, src_hidden, dst_hidden);
-            const int64_t hidden_copy_us = ggml_time_us() - hidden_copy_begin;
-            record_copy_wait(hidden_copy_us);
-            record_meta_copy(i, 1, 0, src_hidden, hidden_copy_us);
+            int64_t hidden_copy_us = 0;
+            int64_t topk_copy_us = 0;
+            int64_t weights_copy_us = 0;
+            int64_t route_batch_us = 0;
+            bool route_batch_used = false;
 
-            const int64_t topk_copy_begin = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                bcj_src.backend, bcj_dst.backend, src_topk, dst_topk);
-            const int64_t topk_copy_us = ggml_time_us() - topk_copy_begin;
-            record_copy_wait(topk_copy_us);
-            record_meta_copy(i, 1, 0, src_topk, topk_copy_us);
+            const ggml_backend_rpc_get_tensor_batch3_t get_tensor_batch3 =
+                ggml_backend_meta_get_tensor_batch3(bcj_src.backend);
+            const bool allow_route_batch =
+                phone_single_owner &&
+                !strict_phone_primary_fence &&
+                !copy_residual &&
+                get_tensor_batch3 != nullptr &&
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_DISABLE_ROUTE_BATCH") == nullptr;
 
-            const int64_t weights_copy_begin = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                bcj_src.backend, bcj_dst.backend, src_weights, dst_weights);
-            const int64_t weights_copy_us = ggml_time_us() - weights_copy_begin;
-            record_copy_wait(weights_copy_us);
-            record_meta_copy(i, 1, 0, src_weights, weights_copy_us);
+            if (allow_route_batch) {
+                const int64_t route_batch_begin = ggml_time_us();
+                route_batch_used = get_tensor_batch3(
+                    bcj_src.backend,
+                    bcj_dst.backend,
+                    src_hidden, dst_hidden,
+                    src_topk, dst_topk,
+                    src_weights, dst_weights);
+                route_batch_us = ggml_time_us() - route_batch_begin;
+
+                if (route_batch_used) {
+                    // Account wall time once while still keeping the tensor byte
+                    // counters intact for the three logical Router payloads.
+                    hidden_copy_us = route_batch_us;
+                    record_copy_wait(route_batch_us);
+                    record_meta_copy(i, 1, 0, src_hidden, route_batch_us);
+                    record_meta_copy(i, 1, 0, src_topk, 0);
+                    record_meta_copy(i, 1, 0, src_weights, 0);
+                }
+            }
+
+            if (!route_batch_used) {
+                const int64_t hidden_copy_begin = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_src.backend, bcj_dst.backend, src_hidden, dst_hidden);
+                hidden_copy_us = ggml_time_us() - hidden_copy_begin;
+                record_copy_wait(hidden_copy_us);
+                record_meta_copy(i, 1, 0, src_hidden, hidden_copy_us);
+
+                const int64_t topk_copy_begin = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_src.backend, bcj_dst.backend, src_topk, dst_topk);
+                topk_copy_us = ggml_time_us() - topk_copy_begin;
+                record_copy_wait(topk_copy_us);
+                record_meta_copy(i, 1, 0, src_topk, topk_copy_us);
+
+                const int64_t weights_copy_begin = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_src.backend, bcj_dst.backend, src_weights, dst_weights);
+                weights_copy_us = ggml_time_us() - weights_copy_begin;
+                record_copy_wait(weights_copy_us);
+                record_meta_copy(i, 1, 0, src_weights, weights_copy_us);
+            }
 
             // The following PC graph is submitted on the destination backend
             // after these copies.  Preserve the old explicit destination wait
@@ -5186,8 +5239,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "%s layer=%d chunk=%d active=%zu "
                     "residual=%s residual_bytes=%zu hidden=%s hidden_bytes=%zu "
                     "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
-                    "strict_fence=%d route_fence_ms=%.3f dst_sync_ms=%.3f "
-                    "copy_ms=%.3f action=PHONE_TO_PC_ORDERED_GET\n",
+                    "strict_fence=%d batch=%d route_fence_ms=%.3f dst_sync_ms=%.3f "
+                    "copy_ms=%.3f batch_ms=%.3f action=%s\n",
                     phone_single_owner ?
                         "[TENSOR_PHONE_V23_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
@@ -5198,10 +5251,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     src_topk->name, ggml_nbytes(src_topk),
                     src_weights->name, ggml_nbytes(src_weights),
                     strict_phone_primary_fence ? 1 : 0,
+                    route_batch_used ? 1 : 0,
                     route_fence_us / 1000.0,
                     route_dst_sync_us / 1000.0,
                     (residual_copy_us + hidden_copy_us +
-                     topk_copy_us + weights_copy_us) / 1000.0);
+                     topk_copy_us + weights_copy_us) / 1000.0,
+                    route_batch_us / 1000.0,
+                    route_batch_used ?
+                        "PHONE_TO_PC_BATCH3" :
+                        "PHONE_TO_PC_ORDERED_GET");
             }
 
             return GGML_STATUS_SUCCESS;

@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    4
+#define RPC_PROTO_PATCH_VERSION    5
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -72,12 +72,25 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_INIT_ZERO_TENSOR_PROC \
     "ggml_backend_rpc_init_zero_tensor"
 
+#define GGML_BACKEND_RPC_GET_TENSOR_BATCH3_PROC \
+    "ggml_backend_rpc_get_tensor_batch3"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
 typedef bool (*ggml_backend_rpc_prepare_fused_ffn_input_t)(
     ggml_backend_t backend,
     const ggml_tensor * tensor);
+
+using ggml_backend_rpc_get_tensor_batch3_t = bool (*)(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src0,
+        ggml_tensor * dst0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst1,
+        const ggml_tensor * src2,
+        ggml_tensor * dst2);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,

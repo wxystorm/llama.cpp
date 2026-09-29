@@ -82,6 +82,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
     RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
     RPC_CMD_INIT_ZERO_TENSOR,
+    RPC_CMD_GET_TENSOR_BATCH3,
     RPC_CMD_COUNT,
 };
 
@@ -93,6 +94,7 @@ static_assert(RPC_CMD_GET_SNAPSHOT == 20, "RPC_CMD_GET_SNAPSHOT must be before R
 static_assert(RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT == 21, "RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT == 22,"RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INIT_ZERO_TENSOR == 23, "RPC_CMD_INIT_ZERO_TENSOR must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GET_TENSOR_BATCH3 == 24, "RPC_CMD_GET_TENSOR_BATCH3 must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -191,6 +193,10 @@ struct rpc_msg_get_tensor_req {
     rpc_tensor tensor;
     uint64_t offset;
     uint64_t size;
+};
+
+struct rpc_msg_get_tensor_batch3_req {
+    rpc_msg_get_tensor_req items[3];
 };
 
 struct rpc_msg_copy_tensor_req {
@@ -1735,6 +1741,98 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
 RPC_STATUS_ASSERT(status);
 }
 
+static bool ggml_backend_rpc_get_tensor_batch3(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src0,
+        ggml_tensor * dst0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst1,
+        const ggml_tensor * src2,
+        ggml_tensor * dst2) {
+    if (backend_src == nullptr || backend_dst == nullptr) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_src->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * srcs[3] = { src0, src1, src2 };
+    ggml_tensor * dsts[3] = { dst0, dst1, dst2 };
+    rpc_msg_get_tensor_batch3_req request {};
+    size_t sizes[3] = {};
+    size_t total_size = 0;
+
+    for (size_t i = 0; i < 3; ++i) {
+        if (srcs[i] == nullptr || dsts[i] == nullptr ||
+                srcs[i]->buffer == nullptr ||
+                !ggml_backend_buffer_is_rpc(srcs[i]->buffer) ||
+                !ggml_are_same_layout(srcs[i], dsts[i])) {
+            return false;
+        }
+
+        auto * buffer_ctx =
+            static_cast<ggml_backend_rpc_buffer_context *>(
+                srcs[i]->buffer->context);
+        if (buffer_ctx == nullptr ||
+                buffer_ctx->endpoint != rpc_ctx->endpoint ||
+                buffer_ctx->device != rpc_ctx->device) {
+            return false;
+        }
+
+        sizes[i] = ggml_nbytes(srcs[i]);
+        if (sizes[i] > SIZE_MAX - total_size) {
+            return false;
+        }
+
+        request.items[i].tensor = serialize_tensor(srcs[i]);
+        request.items[i].offset = 0;
+        request.items[i].size = sizes[i];
+        total_size += sizes[i];
+    }
+
+    // Match the generic copy fallback's destination-safety contract, but do it
+    // once for the whole Router packet instead of once per tensor.
+    ggml_backend_synchronize(backend_dst);
+
+    std::vector<uint8_t> response(total_size);
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    const int64_t t0 = ggml_time_us();
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_GET_TENSOR_BATCH3,
+        &request,
+        sizeof(request),
+        response.data(),
+        response.size());
+    RPC_STATUS_ASSERT(status);
+
+    size_t response_offset = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        ggml_backend_tensor_set(
+            dsts[i],
+            response.data() + response_offset,
+            0,
+            sizes[i]);
+        response_offset += sizes[i];
+    }
+    GGML_ASSERT(response_offset == response.size());
+
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_GET_BATCH3_CLIENT] bytes=%zu total=%.3f ms\n",
+            total_size,
+            (ggml_time_us() - t0) / 1000.0);
+    }
+
+    return true;
+}
+
 static bool ggml_backend_rpc_snapshot_arm(
         ggml_backend_t backend,
         const ggml_tensor * tensor,
@@ -2452,7 +2550,9 @@ public:
     bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
     bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+    bool get_tensor_batch3(const rpc_msg_get_tensor_batch3_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -3376,7 +3476,9 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     return true;
 }
 
-bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+bool rpc_server::get_tensor_into(
+        const rpc_msg_get_tensor_req & request,
+        void * response_data) {
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -3413,25 +3515,62 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
         }
     }
 
-    response.resize(request.size, 0);
     const int64_t t0 = ggml_time_us();
+    ggml_backend_tensor_get(
+        tensor,
+        response_data,
+        request.offset,
+        request.size);
+    const int64_t get_us = ggml_time_us() - t0;
 
-ggml_backend_tensor_get(
-    tensor,
-    response.data(),
-    request.offset,
-    request.size);
-
-const int64_t get_us = ggml_time_us() - t0;
-
-if (RPC_DEBUG) {
-    GGML_LOG_INFO(
-        "[RPC_SERVER_GET] tensor=%s bytes=%" PRIu64
-        " tensor_get=%.3f ms\n",
-        tensor->name,
-        request.size,
-        get_us / 1000.0);
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_SERVER_GET] tensor=%s bytes=%" PRIu64
+            " tensor_get=%.3f ms\n",
+            tensor->name,
+            request.size,
+            get_us / 1000.0);
+    }
+    return true;
 }
+
+bool rpc_server::get_tensor(
+        const rpc_msg_get_tensor_req & request,
+        std::vector<uint8_t> & response) {
+    response.resize(request.size, 0);
+    return get_tensor_into(request, response.data());
+}
+
+bool rpc_server::get_tensor_batch3(
+        const rpc_msg_get_tensor_batch3_req & request,
+        std::vector<uint8_t> & response) {
+    size_t total_size = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        if (request.items[i].size > SIZE_MAX - total_size) {
+            return false;
+        }
+        total_size += static_cast<size_t>(request.items[i].size);
+    }
+
+    response.resize(total_size);
+    size_t response_offset = 0;
+    const int64_t t0 = ggml_time_us();
+    for (size_t i = 0; i < 3; ++i) {
+        if (!get_tensor_into(
+                request.items[i],
+                response.data() + response_offset)) {
+            return false;
+        }
+        response_offset += static_cast<size_t>(request.items[i].size);
+    }
+    GGML_ASSERT(response_offset == response.size());
+
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_SERVER_GET_BATCH3] bytes=%zu total=%.3f ms\n",
+            total_size,
+            (ggml_time_us() - t0) / 1000.0);
+    }
     return true;
 }
 
@@ -4847,6 +4986,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_GET_TENSOR_BATCH3: {
+                rpc_msg_get_tensor_batch3_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.get_tensor_batch3(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -5336,6 +5489,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_INIT_ZERO_TENSOR_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_init_zero_tensor);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_TENSOR_BATCH3_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_get_tensor_batch3);
     }
     GGML_UNUSED(reg);
 
