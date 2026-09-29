@@ -8296,37 +8296,64 @@ auto prefill_norm_sg_has_prework =
                    (chunk_submit_end_us - chunk_submit_begin_us) / 1000.0);
         }
         compute_status = pc_status != GGML_STATUS_SUCCESS ? pc_status : phone_status;
-    } else if (is_prefill_norm_sg ||
-           subgraph_is_prefill_pc_only(i)) {
+    } else if (is_prefill_norm_sg) {
+        // Phone-primary prefill owns the residual -> FFN norm -> Router
+        // control path.  Do not reuse the legacy PC-only prefill-norm
+        // execution rule here: the terminal prefill_ffn_norm_chunk_* is a
+        // VIEW of ffn_norm, so executing only backend 0 leaves the Phone view
+        // pointing at stale allocator contents even though its logical owner
+        // is backend 1.
+        const bool phone_primary_prefill_norm =
+            n_backends == 2 &&
+            layer_is_tensor_phone_primary(prefill_norm_layer);
 
-    compute_workers.start(0, i);
-    compute_status = compute_workers.wait(0);
+        const size_t norm_backend = phone_primary_prefill_norm ? 1 : 0;
+        compute_workers.start(norm_backend, i);
+        compute_status = compute_workers.wait(norm_backend);
 
-    if (pipeline_debug) {
-        ggml_cgraph * graph =
-            backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
-        if (graph != nullptr && graph->n_nodes > 0 &&
-                std::strcmp(graph->nodes[0]->name, "l_out-24") == 0) {
-            meta_debug_tensor(
-                backend_ctx->backend_configs[0].backend,
-                graph->nodes[0], "CPU L24 IMMEDIATE");
+        if (pipeline_debug) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[norm_backend]
+                    .cgraphs[i].cgraph_main;
+            if (graph != nullptr && graph->n_nodes > 0) {
+                printf(
+                    "[PREFILL_NORM_EXEC] sg=%zu layer=%d chunk=%d "
+                    "backend=%zu primary=%s first=%s last=%s nodes=%d\n",
+                    i, prefill_norm_layer, prefill_norm_chunk,
+                    norm_backend,
+                    phone_primary_prefill_norm ? "PHONE" : "PC",
+                    graph->nodes[0]->name,
+                    graph->nodes[graph->n_nodes - 1]->name,
+                    graph->n_nodes);
+            }
         }
-    }
 
-    if (pipeline_debug &&
-            subgraph_is_prefill_pc_only(i)) {
-        auto * g =
-            backend_ctx->backend_configs[0]
-                .cgraphs[i].cgraph_main;
+    } else if (subgraph_is_prefill_pc_only(i)) {
 
-        printf(
-            "[PREFILL_PC_ONLY_SG] sg=%zu "
-            "first=%s last=%s nodes=%d\n",
-            i,
-            g->nodes[0]->name,
-            g->nodes[g->n_nodes - 1]->name,
-            g->n_nodes);
-    }
+        compute_workers.start(0, i);
+        compute_status = compute_workers.wait(0);
+
+        if (pipeline_debug) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            if (graph != nullptr && graph->n_nodes > 0 &&
+                    std::strcmp(graph->nodes[0]->name, "l_out-24") == 0) {
+                meta_debug_tensor(
+                    backend_ctx->backend_configs[0].backend,
+                    graph->nodes[0], "CPU L24 IMMEDIATE");
+            }
+
+            auto * g =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            printf(
+                "[PREFILL_PC_ONLY_SG] sg=%zu "
+                "first=%s last=%s nodes=%d\n",
+                i,
+                g->nodes[0]->name,
+                g->nodes[g->n_nodes - 1]->name,
+                g->n_nodes);
+        }
 
     } else if (is_decode_pc_only_norm_sg(i) ||
                subgraph_is_decode_pc_only_ffn(i)) {
