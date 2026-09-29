@@ -4927,6 +4927,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
+            // Keep this fence even in the relaxed Phone-primary path.
+            // Router tensors may be fetched through the dedicated staged
+            // transfer socket, while Phone graph submissions use the control
+            // socket.  Drain the control lane before allowing a cross-socket
+            // GET_TENSOR to observe the Router outputs.
             const ggml_backend_rpc_fence_t rpc_fence =
                 ggml_backend_meta_get_rpc_fence(bcj_src.backend);
             if (rpc_fence != nullptr) {
@@ -5759,26 +5764,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         subgraph_will_execute_phone(i + 1);
                 }
 
-                const int64_t source_fence_start_us = ggml_time_us();
-                if (pc_full_ffn_to_phone) {
+                const bool strict_phone_primary_fence =
+                    std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+
+                // ggml_backend_tensor_copy_async() falls back to a blocking
+                // copy for RPC because the RPC backend has no cpy_tensor_async
+                // hook.  That fallback already synchronizes the PC producer,
+                // and the RPC SET_TENSOR is ordered before the following Phone
+                // graph on the same control socket.  Keep the old explicit
+                // fences only as a correctness/debug fallback.
+                int64_t source_fence_us = 0;
+                if (pc_full_ffn_to_phone && strict_phone_primary_fence) {
+                    const int64_t source_fence_start_us = ggml_time_us();
                     ggml_backend_synchronize(bcj_src.backend);
+                    source_fence_us = ggml_time_us() - source_fence_start_us;
                 }
-                const int64_t source_fence_us =
-                    pc_full_ffn_to_phone ?
-                        ggml_time_us() - source_fence_start_us : 0;
 
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
 
-                // A single-active PC FFN boundary means PC already owns the
-                // complete FFN result.  Phone-primary execution consumes that
-                // result immediately in the following Phone-owned l_out.
-                // The generic direct-copy path is asynchronous, so returning
-                // here without a destination fence lets l_out race the RPC
-                // transfer.  This is the single-active counterpart of the
-                // fenced v2.3 partial-reduce path.
-                if (pc_full_ffn_to_phone) {
+                if (pc_full_ffn_to_phone && strict_phone_primary_fence) {
                     const ggml_backend_rpc_fence_t rpc_fence =
                         ggml_backend_meta_get_rpc_fence(bcj_dst.backend);
                     if (rpc_fence != nullptr) {
@@ -5796,12 +5802,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     printf(
                         "[TENSOR_PHONE_V24_FFN_DIRECT] sg=%zu layer=%d "
                         "chunk=%d mode=%s tensor=%s bytes=%zu "
-                        "source_fence_ms=%.3f copy_fence_ms=%.3f "
-                        "action=PC_FULL_TO_PHONE_SOURCE_FENCED\n",
+                        "strict_fence=%d source_fence_ms=%.3f copy_ms=%.3f "
+                        "action=PC_FULL_TO_PHONE_ORDERED_COPY\n",
                         i, phone_ffn_layer, phone_ffn_chunk,
                         phone_ffn_mode != nullptr ? phone_ffn_mode : "unknown",
                         nodes[active_backend]->name,
                         ggml_nbytes(nodes[active_backend]),
+                        strict_phone_primary_fence ? 1 : 0,
                         source_fence_us / 1000.0,
                         copy_us / 1000.0);
                 }
@@ -5960,10 +5967,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_tensor * node_tmp = get_node_aux(node_dst);
                 set_tmp_data(node_tmp, j_dst, 0);
 
-                // Match the proven generic all-reduce ordering:
-                // producer complete -> copy visible on Phone -> ADD -> next Phone SG.
-                // This matters for RPC because the ordinary RPC synchronize hook is
-                // intentionally a no-op in this fork.
+                // Relaxed Phone-primary ordering:
+                // - RPC has no cpy_tensor_async hook, so the generic async-copy
+                //   API already falls back to source sync + blocking copy.
+                // - PC->Phone SET_TENSOR and the following ADD graph are sent
+                //   on the same RPC control socket, preserving command order.
+                // - later cross-socket Phone->PC Router reads retain their
+                //   explicit RPC fence before GET_TENSOR.
+                //
+                // LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE restores the old
+                // fence-before/fence-after behavior for A/B correctness tests.
+                const bool strict_phone_primary_fence =
+                    std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
                 const auto fence_backend = [&](ggml_backend_t backend) {
                     const ggml_backend_rpc_fence_t rpc_fence =
                         ggml_backend_meta_get_rpc_fence(backend);
@@ -5974,10 +5989,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 };
 
-                const int64_t src_fence_start_us = ggml_time_us();
-                fence_backend(bcj_src.backend);
-                const int64_t src_fence_us =
-                    ggml_time_us() - src_fence_start_us;
+                int64_t src_fence_us = 0;
+                if (strict_phone_primary_fence) {
+                    const int64_t src_fence_start_us = ggml_time_us();
+                    fence_backend(bcj_src.backend);
+                    src_fence_us = ggml_time_us() - src_fence_start_us;
+                }
 
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
@@ -5987,10 +6004,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 record_copy_wait(copy_us);
                 record_meta_copy(i, j_src, j_dst, node_src, copy_us);
 
-                const int64_t dst_fence_start_us = ggml_time_us();
-                fence_backend(bcj_dst.backend);
-                const int64_t dst_fence_us =
-                    ggml_time_us() - dst_fence_start_us;
+                int64_t dst_fence_us = 0;
+                if (strict_phone_primary_fence) {
+                    const int64_t dst_fence_start_us = ggml_time_us();
+                    fence_backend(bcj_dst.backend);
+                    dst_fence_us = ggml_time_us() - dst_fence_start_us;
+                }
 
                 ggml_tensor * node_red = get_node_aux(node_dst);
                 node_red->view_src =
@@ -6016,20 +6035,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return status;
                 }
 
-                // The next Phone-owned l_out must observe the reduced FFN.
-                const int64_t add_fence_start_us = ggml_time_us();
-                fence_backend(bcj_dst.backend);
-                const int64_t add_fence_us =
-                    ggml_time_us() - add_fence_start_us;
+                // ADD and the following Phone-owned graph are submitted on the
+                // same RPC control socket / OpenCL queue.  Do not round-trip a
+                // fence here in the relaxed path; queue ordering carries the
+                // dependency forward.  A later cross-socket read fences at the
+                // Router handoff boundary.
+                int64_t add_fence_us = 0;
+                if (strict_phone_primary_fence) {
+                    const int64_t add_fence_start_us = ggml_time_us();
+                    fence_backend(bcj_dst.backend);
+                    add_fence_us = ggml_time_us() - add_fence_start_us;
+                }
 
                 if (pipeline_debug) {
                     printf(
                         "[TENSOR_PHONE_V22_FFN_ONEWAY] sg=%zu layer=%d "
-                        "chunk=%d mode=%s bytes=%zu src_fence_ms=%.3f "
-                        "copy_ms=%.3f dst_fence_ms=%.3f add_fence_ms=%.3f "
-                        "action=PC_TO_PHONE\n",
+                        "chunk=%d mode=%s bytes=%zu strict_fence=%d "
+                        "src_fence_ms=%.3f copy_ms=%.3f "
+                        "dst_fence_ms=%.3f add_fence_ms=%.3f "
+                        "action=PC_TO_PHONE_ORDERED\n",
                         i, layer, chunk, mode,
                         ggml_nbytes(node_src),
+                        strict_phone_primary_fence ? 1 : 0,
                         src_fence_us / 1000.0,
                         copy_us / 1000.0,
                         dst_fence_us / 1000.0,
