@@ -726,10 +726,29 @@ static bool send_rpc_cmd_staged(
 
 // RPC client-side implementation
 
+static std::mutex rpc_remote_version_mutex;
+static std::unordered_map<std::string, uint8_t> rpc_remote_patch_by_socket_key;
+
+static void rpc_record_remote_patch(
+        const std::string & socket_key,
+        uint8_t patch) {
+    std::lock_guard<std::mutex> lock(rpc_remote_version_mutex);
+    rpc_remote_patch_by_socket_key[socket_key] = patch;
+}
+
+static uint8_t rpc_get_remote_patch(
+        const std::string & socket_key) {
+    std::lock_guard<std::mutex> lock(rpc_remote_version_mutex);
+    auto it = rpc_remote_patch_by_socket_key.find(socket_key);
+    return it == rpc_remote_patch_by_socket_key.end() ? 0 : it->second;
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(
+        const std::shared_ptr<socket_t> & sock,
+        uint8_t * remote_patch) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -742,6 +761,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
         return false;
+    }
+
+    if (remote_patch != nullptr) {
+        *remote_patch = response.patch;
     }
 
     sock->update_caps(response.conn_caps);
@@ -794,10 +817,15 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    uint8_t remote_patch = 0;
+    if (!negotiate_hello(sock, &remote_patch)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    rpc_record_remote_patch(key, remote_patch);
+    LOG_DBG(
+        "[%s] connected to %s remote_rpc=%d.%d.%d\n",
+        __func__, endpoint.c_str(),
+        RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, remote_patch);
     sockets[key] = sock;
     return sock;
 }
@@ -1794,13 +1822,30 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         total_size += sizes[i];
     }
 
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    // Batch3 was added in RPC protocol patch 5.  Older servers intentionally
+    // remain connectable at the same major/minor version, so never send the new
+    // command unless the HELLO response explicitly proves support.  Returning
+    // false lets Meta fall back to the already-correct three-GET path.
+    constexpr uint8_t RPC_BATCH3_MIN_PATCH = 5;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_BATCH3_MIN_PATCH) {
+        LOG_DBG(
+            "[RPC_GET_BATCH3_FALLBACK] endpoint=%s remote_patch=%u required=%u\n",
+            rpc_ctx->endpoint.c_str(),
+            (unsigned) remote_patch,
+            (unsigned) RPC_BATCH3_MIN_PATCH);
+        return false;
+    }
+
     // Match the generic copy fallback's destination-safety contract, but do it
     // once for the whole Router packet instead of once per tensor.
     ggml_backend_synchronize(backend_dst);
 
     std::vector<uint8_t> response(total_size);
-    auto sock = get_socket(rpc_ctx->endpoint);
-    RPC_STATUS_ASSERT(sock != nullptr);
 
     const int64_t t0 = ggml_time_us();
     const bool status = send_rpc_cmd(
