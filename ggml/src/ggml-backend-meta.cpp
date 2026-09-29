@@ -3027,13 +3027,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // Phone-primary v2 is the correctness baseline: mirror l_out on both
-        // backends after the complete FFN all-reduce.  The optional v2.1
-        // experiment only makes INTERNAL Tensor layers Phone-owned; the final
-        // Tensor layer stays mirrored so the following PC/output region still
-        // has a valid terminal l_out without relying on the old terminal-owner
-        // handoff machinery.
-        const bool phone_primary_internal_single_owner =
+        // Phone-primary single-owner mode keeps every Tensor-layer l_out on
+        // Phone, including the terminal Tensor layer.  If the following region
+        // also runs on Phone, the activation stays local.  If the following
+        // region needs PC, the ordinary single-active-backend boundary copy
+        // below transfers the completed terminal l_out exactly once.
+        const bool phone_primary_single_owner =
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr;
         if (n_backends == 2 &&
                 backend_ctx->tensor_phone_first_layer >= 0) {
@@ -3048,11 +3047,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
 
-                const bool internal_single_owner =
-                    phone_primary_internal_single_owner &&
-                    layer + 1 < backend_ctx->tensor_phone_last_layer;
-
-                if (internal_single_owner) {
+                if (phone_primary_single_owner) {
                     backend_ctx->backend_configs[0].nodes[i]->flags &=
                         ~GGML_TENSOR_FLAG_COMPUTE;
                 } else {
@@ -3063,15 +3058,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     GGML_TENSOR_FLAG_COMPUTE;
 
                 if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
-                    if (internal_single_owner) {
+                    if (phone_primary_single_owner) {
                         printf(
-                            "[TENSOR_PHONE_V21_L_OUT_OWNER] layer=%d node=%s "
-                            "owner=PHONE scope=INTERNAL\n",
+                            "[TENSOR_PHONE_V23_L_OUT_OWNER] layer=%d node=%s "
+                            "owner=PHONE scope=ALL\n",
                             layer, name);
                     } else {
                         printf(
                             "[TENSOR_PHONE_V2_L_OUT_MIRROR] layer=%d node=%s "
-                            "compute={PC,PHONE} scope=TERMINAL_OR_BASELINE\n",
+                            "compute={PC,PHONE} scope=BASELINE\n",
                             layer, name);
                     }
                 }
@@ -5937,17 +5932,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 "prefill" :
                 (is_single_decode_moe_out ? "decode-single" : "decode");
 
-            // Correctness-first v2.2 experiment:
-            // - residual mirroring remains exactly as in the proven v2/v2.1 path;
-            // - internal Tensor layers already keep l_out Phone-owned;
-            // - only those internal layers may reduce PC FFN partial -> Phone;
-            // - the terminal Tensor layer retains generic all-reduce because PC
-            //   still computes the mirrored terminal l_out used at block exit.
-            const bool internal_phone_l_out_owner =
-                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
-                layer + 1 < backend_ctx->tensor_phone_last_layer;
+            // Phone-primary v2.3:
+            // - every Tensor-layer l_out is Phone-owned in single-owner mode;
+            // - therefore every Tensor FFN can reduce only PC partial -> Phone;
+            // - if the terminal Tensor activation is later needed on PC, the
+            //   completed l_out crosses once at the ordinary backend boundary.
+            const bool phone_l_out_owner =
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr;
             const bool one_way_reduce =
-                internal_phone_l_out_owner &&
+                phone_l_out_owner &&
                 std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
 
             if (one_way_reduce) {
@@ -6045,15 +6038,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return GGML_STATUS_SUCCESS;
             }
 
-            // Proven v2/v2.1 path.  Keep generic all-reduce for the terminal
-            // Tensor layer and whenever the v2.2 experiment is disabled.
+            // Proven generic fallback when single-owner / one-way mode is
+            // disabled.
             if (pipeline_debug) {
                 printf(
                     "[TENSOR_PHONE_V2_FFN_ALLREDUCE] sg=%zu layer=%d "
                     "chunk=%d mode=%s action=GENERIC_ALLREDUCE reason=%s\n",
                     i, layer, chunk, mode,
-                    internal_phone_l_out_owner ?
-                        "oneway-disabled" : "terminal-or-baseline");
+                    phone_l_out_owner ?
+                        "oneway-disabled" : "single-owner-disabled");
             }
             return GGML_STATUS_SUCCESS;
         }
