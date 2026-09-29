@@ -4880,22 +4880,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * dst_weights = find_exact_named_tensor(
                 0, nodes[0]->name);
 
-            // v2 mirrors the residual state once per layer.  PC needs this
-            // exact Phone-owned ffn_inp only after the FFN all-reduce, when it
-            // independently evaluates the same l_out residual ADD.
-            char residual_name[64];
-            std::snprintf(
-                residual_name, sizeof(residual_name),
-                "ffn_inp-%d", phone_route_layer);
-            const bool internal_single_owner =
-                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
-                phone_route_layer + 1 < backend_ctx->tensor_phone_last_layer;
-            // Diagnostic split: keep the proven v2 residual mirror even
-            // when l_out is Phone-only.  This isolates whether correctness
-            // depends on the residual copy itself or on mirrored l_out /
-            // two-backend boundary semantics.
+            // The legacy mirrored-l_out fallback needs the Phone-owned
+            // residual on PC so PC can evaluate the same l_out ADD.  In the
+            // v2.3 single-owner path every Tensor-layer l_out is completed on
+            // Phone, so PC consumes only normalized hidden/top-k/weights for
+            // its expert FFN shard and must not receive ffn_inp at all.
+            const bool phone_single_owner =
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr;
             const bool copy_residual =
-                phone_route_chunk <= 0;
+                !phone_single_owner && phone_route_chunk <= 0;
+
+            char residual_name[64] = {};
+            if (copy_residual) {
+                std::snprintf(
+                    residual_name, sizeof(residual_name),
+                    "ffn_inp-%d", phone_route_layer);
+            }
             ggml_tensor * src_residual = copy_residual ?
                 find_exact_named_tensor(1, residual_name) : nullptr;
             ggml_tensor * dst_residual = copy_residual ?
@@ -5162,8 +5162,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "residual=%s residual_bytes=%zu hidden=%s hidden_bytes=%zu "
                     "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
                     "copy_ms=%.3f action=PHONE_TO_PC_NO_REDUCE\n",
-                    internal_single_owner ?
-                        "[TENSOR_PHONE_V21_ROUTER_HANDOFF]" :
+                    phone_single_owner ?
+                        "[TENSOR_PHONE_V23_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
                     phone_route_layer, phone_route_chunk, active_count,
                     copy_residual ? src_residual->name : "(already-copied)",
