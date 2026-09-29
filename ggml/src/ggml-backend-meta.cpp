@@ -5166,7 +5166,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "[TENSOR_PHONE_V23_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
                     phone_route_layer, phone_route_chunk, active_count,
-                    copy_residual ? src_residual->name : "(already-copied)",
+                    copy_residual ? src_residual->name : "(not-needed)",
                     copy_residual ? ggml_nbytes(src_residual) : 0,
                     src_hidden->name, ggml_nbytes(src_hidden),
                     src_topk->name, ggml_nbytes(src_topk),
