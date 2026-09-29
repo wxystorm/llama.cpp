@@ -7815,7 +7815,7 @@ auto prefill_norm_sg_has_prework =
 
                 if (pc_graph != nullptr &&
                         pc_graph->n_nodes == phone_graph->n_nodes) {
-                    std::vector<enum ggml_tensor_flag> saved_flags;
+                    std::vector<int32_t> saved_flags;
                     saved_flags.reserve((size_t) pc_graph->n_nodes);
                     for (int k = 0; k < pc_graph->n_nodes; ++k) {
                         saved_flags.push_back(pc_graph->nodes[k]->flags);
