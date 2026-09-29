@@ -4940,6 +4940,113 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_synchronize(bcj_src.backend);
             }
 
+            bool live_route_trace = false;
+            if (const char * value =
+                    std::getenv("GGML_META_TP_CONTROL_TRACE_LAYER")) {
+                char * end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                live_route_trace =
+                    end != value && *end == '\0' &&
+                    parsed == phone_route_layer &&
+                    phone_route_chunk <= 0;
+            }
+
+            std::vector<float> live_src_hidden;
+            std::vector<int32_t> live_src_topk;
+            std::vector<float> live_src_weights;
+
+            auto capture_live_f32 =
+                [&](ggml_tensor * tensor,
+                    std::vector<float> & out,
+                    const char * logical,
+                    const char * side) {
+                    if (!live_route_trace ||
+                            tensor == nullptr ||
+                            tensor->type != GGML_TYPE_F32) {
+                        return;
+                    }
+                    const size_t n = ggml_nelements(tensor);
+                    out.resize(n);
+                    ggml_backend_tensor_get(
+                        tensor, out.data(), 0, n * sizeof(float));
+
+                    double sum = 0.0;
+                    double l2 = 0.0;
+                    double max_abs = 0.0;
+                    for (float x : out) {
+                        const double xd = x;
+                        sum += xd;
+                        l2 += xd * xd;
+                        max_abs = std::max(max_abs, std::abs(xd));
+                    }
+                    printf(
+                        "[TP_ROUTE_LIVE_F32] layer=%d chunk=%d side=%s "
+                        "logical=%s tensor=%s n=%zu sum=%.9f l2=%.9f "
+                        "max=%.9f v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                        phone_route_layer, phone_route_chunk,
+                        side, logical, tensor->name, n,
+                        sum, std::sqrt(l2), max_abs,
+                        n > 0 ? out[0] : 0.0f,
+                        n > 1 ? out[1] : 0.0f,
+                        n > 2 ? out[2] : 0.0f,
+                        n > 3 ? out[3] : 0.0f);
+                };
+
+            auto capture_live_i32 =
+                [&](ggml_tensor * tensor,
+                    std::vector<int32_t> & out,
+                    const char * logical,
+                    const char * side) {
+                    if (!live_route_trace ||
+                            tensor == nullptr ||
+                            tensor->type != GGML_TYPE_I32) {
+                        return;
+                    }
+                    const size_t n = ggml_nelements(tensor);
+                    out.resize(n);
+                    ggml_backend_tensor_get(
+                        tensor, out.data(), 0, n * sizeof(int32_t));
+
+                    int64_t sum = 0;
+                    int32_t min_v = n > 0 ? out[0] : 0;
+                    int32_t max_v = n > 0 ? out[0] : 0;
+                    uint64_t hash = UINT64_C(1469598103934665603);
+                    for (int32_t x : out) {
+                        sum += x;
+                        min_v = std::min(min_v, x);
+                        max_v = std::max(max_v, x);
+                        const uint32_t bits = (uint32_t) x;
+                        for (int b = 0; b < 4; ++b) {
+                            hash ^= (bits >> (b * 8)) & UINT64_C(0xff);
+                            hash *= UINT64_C(1099511628211);
+                        }
+                    }
+                    printf(
+                        "[TP_ROUTE_LIVE_I32] layer=%d chunk=%d side=%s "
+                        "logical=%s tensor=%s n=%zu sum=%" PRId64
+                        " min=%d max=%d hash=%" PRIu64
+                        " v0=%d v1=%d v2=%d v3=%d "
+                        "v4=%d v5=%d v6=%d v7=%d\n",
+                        phone_route_layer, phone_route_chunk,
+                        side, logical, tensor->name, n,
+                        sum, min_v, max_v, hash,
+                        n > 0 ? out[0] : 0,
+                        n > 1 ? out[1] : 0,
+                        n > 2 ? out[2] : 0,
+                        n > 3 ? out[3] : 0,
+                        n > 4 ? out[4] : 0,
+                        n > 5 ? out[5] : 0,
+                        n > 6 ? out[6] : 0,
+                        n > 7 ? out[7] : 0);
+                };
+
+            capture_live_f32(
+                src_hidden, live_src_hidden, "hidden", "PHONE_PRE_COPY");
+            capture_live_i32(
+                src_topk, live_src_topk, "topk", "PHONE_PRE_COPY");
+            capture_live_f32(
+                src_weights, live_src_weights, "weights", "PHONE_PRE_COPY");
+
             int64_t residual_copy_us = 0;
             if (copy_residual) {
                 const int64_t residual_copy_begin = ggml_time_us();
@@ -4975,6 +5082,84 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             record_meta_copy(i, 1, 0, src_weights, weights_copy_us);
             ggml_backend_synchronize(bcj_dst.backend);
             record_direct_copy();
+
+            if (live_route_trace) {
+                std::vector<float> live_dst_hidden;
+                std::vector<int32_t> live_dst_topk;
+                std::vector<float> live_dst_weights;
+
+                capture_live_f32(
+                    dst_hidden, live_dst_hidden, "hidden", "PC_POST_COPY");
+                capture_live_i32(
+                    dst_topk, live_dst_topk, "topk", "PC_POST_COPY");
+                capture_live_f32(
+                    dst_weights, live_dst_weights, "weights", "PC_POST_COPY");
+
+                auto compare_live_f32 =
+                    [&](const char * logical,
+                        const std::vector<float> & src,
+                        const std::vector<float> & dst) {
+                        if (src.size() != dst.size() || src.empty()) {
+                            printf(
+                                "[TP_ROUTE_LIVE_DIFF] layer=%d chunk=%d "
+                                "logical=%s status=SIZE src=%zu dst=%zu\n",
+                                phone_route_layer, phone_route_chunk,
+                                logical, src.size(), dst.size());
+                            return;
+                        }
+                        double diff_l2 = 0.0;
+                        double max_abs_diff = 0.0;
+                        size_t max_index = 0;
+                        for (size_t q = 0; q < src.size(); ++q) {
+                            const double d =
+                                (double) src[q] - (double) dst[q];
+                            diff_l2 += d * d;
+                            if (std::abs(d) > max_abs_diff) {
+                                max_abs_diff = std::abs(d);
+                                max_index = q;
+                            }
+                        }
+                        printf(
+                            "[TP_ROUTE_LIVE_DIFF] layer=%d chunk=%d "
+                            "logical=%s max_abs_diff=%.9g "
+                            "rms_diff=%.9g max_index=%zu\n",
+                            phone_route_layer, phone_route_chunk,
+                            logical, max_abs_diff,
+                            std::sqrt(
+                                diff_l2 / (double) src.size()),
+                            max_index);
+                    };
+
+                compare_live_f32(
+                    "hidden", live_src_hidden, live_dst_hidden);
+                compare_live_f32(
+                    "weights", live_src_weights, live_dst_weights);
+
+                if (live_src_topk.size() == live_dst_topk.size() &&
+                        !live_src_topk.empty()) {
+                    size_t mismatch = 0;
+                    size_t first_mismatch = 0;
+                    for (size_t q = 0; q < live_src_topk.size(); ++q) {
+                        if (live_src_topk[q] != live_dst_topk[q]) {
+                            if (mismatch == 0) {
+                                first_mismatch = q;
+                            }
+                            ++mismatch;
+                        }
+                    }
+                    printf(
+                        "[TP_ROUTE_LIVE_DIFF] layer=%d chunk=%d "
+                        "logical=topk mismatches=%zu first_mismatch=%zu\n",
+                        phone_route_layer, phone_route_chunk,
+                        mismatch, first_mismatch);
+                } else {
+                    printf(
+                        "[TP_ROUTE_LIVE_DIFF] layer=%d chunk=%d "
+                        "logical=topk status=SIZE src=%zu dst=%zu\n",
+                        phone_route_layer, phone_route_chunk,
+                        live_src_topk.size(), live_dst_topk.size());
+                }
+            }
 
             if (pipeline_debug) {
                 printf(
