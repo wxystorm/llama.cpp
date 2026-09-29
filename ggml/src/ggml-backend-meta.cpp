@@ -5348,12 +5348,104 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
+                int phone_ffn_layer = -1;
+                int phone_ffn_chunk = -1;
+                const char * phone_ffn_mode = nullptr;
+                bool pc_full_ffn_to_phone = false;
+                if (n_backends == 2 &&
+                        active_backend == 0 &&
+                        j_dst == 1) {
+                    int parsed = 0;
+                    int decode_layer = -1;
+                    const bool decode_single =
+                        nodes[active_backend]->ne[1] == 1 &&
+                        std::sscanf(
+                            nodes[active_backend]->name,
+                            "ffn_moe_out-%d%n",
+                            &decode_layer, &parsed) == 1 &&
+                        nodes[active_backend]->name[parsed] == '\0';
+
+                    int decode_chunk = -1;
+                    int decode_chunk_layer = -1;
+                    const bool decode_chunked =
+                        ggml_backend_meta_parse_decode_ffn_chunk(
+                            nodes[active_backend]->name,
+                            decode_chunk, decode_chunk_layer);
+
+                    int prefill_chunk = -1;
+                    int prefill_layer = -1;
+                    const bool prefill_chunked =
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            nodes[active_backend]->name,
+                            prefill_chunk, prefill_layer);
+
+                    if (decode_single) {
+                        phone_ffn_layer = decode_layer;
+                        phone_ffn_chunk = 0;
+                        phone_ffn_mode = "decode-single";
+                    } else if (decode_chunked) {
+                        phone_ffn_layer = decode_chunk_layer;
+                        phone_ffn_chunk = decode_chunk;
+                        phone_ffn_mode = "decode";
+                    } else if (prefill_chunked) {
+                        phone_ffn_layer = prefill_layer;
+                        phone_ffn_chunk = prefill_chunk;
+                        phone_ffn_mode = "prefill";
+                    }
+
+                    pc_full_ffn_to_phone =
+                        phone_ffn_layer >= 0 &&
+                        layer_is_tensor_phone_primary(phone_ffn_layer) &&
+                        i + 1 < backend_ctx->n_subgraphs &&
+                        subgraph_will_execute_phone(i + 1);
+                }
+
+                const int64_t source_fence_start_us = ggml_time_us();
+                if (pc_full_ffn_to_phone) {
+                    ggml_backend_synchronize(bcj_src.backend);
+                }
+                const int64_t source_fence_us =
+                    pc_full_ffn_to_phone ?
+                        ggml_time_us() - source_fence_start_us : 0;
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
+
+                // A single-active PC FFN boundary means PC already owns the
+                // complete FFN result.  Phone-primary execution consumes that
+                // result immediately in the following Phone-owned l_out.
+                // The generic direct-copy path is asynchronous, so returning
+                // here without a destination fence lets l_out race the RPC
+                // transfer.  This is the single-active counterpart of the
+                // fenced v2.3 partial-reduce path.
+                if (pc_full_ffn_to_phone) {
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(bcj_dst.backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(bcj_dst.backend);
+                    } else {
+                        ggml_backend_synchronize(bcj_dst.backend);
+                    }
+                }
+
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
                 record_copy_wait(copy_us);
                 record_meta_copy(i, active_backend, j_dst, nodes[active_backend], copy_us);
+
+                if (pc_full_ffn_to_phone && pipeline_debug) {
+                    printf(
+                        "[TENSOR_PHONE_V24_FFN_DIRECT] sg=%zu layer=%d "
+                        "chunk=%d mode=%s tensor=%s bytes=%zu "
+                        "source_fence_ms=%.3f copy_fence_ms=%.3f "
+                        "action=PC_FULL_TO_PHONE_SOURCE_FENCED\n",
+                        i, phone_ffn_layer, phone_ffn_chunk,
+                        phone_ffn_mode != nullptr ? phone_ffn_mode : "unknown",
+                        nodes[active_backend]->name,
+                        ggml_nbytes(nodes[active_backend]),
+                        source_fence_us / 1000.0,
+                        copy_us / 1000.0);
+                }
             }
             record_direct_copy();
             return GGML_STATUS_SUCCESS;
