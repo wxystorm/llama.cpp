@@ -4927,17 +4927,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
-            // Keep this fence even in the relaxed Phone-primary path.
-            // Router tensors may be fetched through the dedicated staged
-            // transfer socket, while Phone graph submissions use the control
-            // socket.  Drain the control lane before allowing a cross-socket
-            // GET_TENSOR to observe the Router outputs.
-            const ggml_backend_rpc_fence_t rpc_fence =
-                ggml_backend_meta_get_rpc_fence(bcj_src.backend);
-            if (rpc_fence != nullptr) {
-                rpc_fence(bcj_src.backend);
-            } else {
-                ggml_backend_synchronize(bcj_src.backend);
+            // Router handoff runs on the graph thread.  RPC's staged transfer
+            // callback is thread_local and is only installed by the transfer
+            // workers, so these GET_TENSOR calls use the same control socket as
+            // the preceding Phone graph submissions.  The server processes that
+            // socket serially and OpenCL GET_TENSOR is a blocking CL_TRUE read,
+            // which already establishes producer completion.  Keep the old
+            // explicit fence only for legacy mirrored mode or strict A/B tests.
+            const bool strict_phone_primary_fence =
+                !phone_single_owner ||
+                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+            int64_t route_fence_us = 0;
+            if (strict_phone_primary_fence) {
+                const int64_t route_fence_begin = ggml_time_us();
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                if (rpc_fence != nullptr) {
+                    rpc_fence(bcj_src.backend);
+                } else {
+                    ggml_backend_synchronize(bcj_src.backend);
+                }
+                route_fence_us = ggml_time_us() - route_fence_begin;
             }
 
             bool live_route_trace = false;
@@ -5080,7 +5090,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const int64_t weights_copy_us = ggml_time_us() - weights_copy_begin;
             record_copy_wait(weights_copy_us);
             record_meta_copy(i, 1, 0, src_weights, weights_copy_us);
-            ggml_backend_synchronize(bcj_dst.backend);
+
+            // The following PC graph is submitted on the destination backend
+            // after these copies.  Preserve the old explicit destination wait
+            // only in strict/legacy mode; normal backend queue ordering carries
+            // the dependency.
+            int64_t route_dst_sync_us = 0;
+            if (strict_phone_primary_fence) {
+                const int64_t route_dst_sync_begin = ggml_time_us();
+                ggml_backend_synchronize(bcj_dst.backend);
+                route_dst_sync_us = ggml_time_us() - route_dst_sync_begin;
+            }
             record_direct_copy();
 
             if (live_route_trace) {
@@ -5166,7 +5186,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "%s layer=%d chunk=%d active=%zu "
                     "residual=%s residual_bytes=%zu hidden=%s hidden_bytes=%zu "
                     "topk=%s topk_bytes=%zu weights=%s weights_bytes=%zu "
-                    "copy_ms=%.3f action=PHONE_TO_PC_NO_REDUCE\n",
+                    "strict_fence=%d route_fence_ms=%.3f dst_sync_ms=%.3f "
+                    "copy_ms=%.3f action=PHONE_TO_PC_ORDERED_GET\n",
                     phone_single_owner ?
                         "[TENSOR_PHONE_V23_ROUTER_HANDOFF]" :
                         "[TENSOR_PHONE_V2_ROUTER_HANDOFF]",
@@ -5176,6 +5197,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     src_hidden->name, ggml_nbytes(src_hidden),
                     src_topk->name, ggml_nbytes(src_topk),
                     src_weights->name, ggml_nbytes(src_weights),
+                    strict_phone_primary_fence ? 1 : 0,
+                    route_fence_us / 1000.0,
+                    route_dst_sync_us / 1000.0,
                     (residual_copy_us + hidden_copy_us +
                      topk_copy_us + weights_copy_us) / 1000.0);
             }
@@ -5972,8 +5996,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 //   API already falls back to source sync + blocking copy.
                 // - PC->Phone SET_TENSOR and the following ADD graph are sent
                 //   on the same RPC control socket, preserving command order.
-                // - later cross-socket Phone->PC Router reads retain their
-                //   explicit RPC fence before GET_TENSOR.
+                // - the next Phone->PC Router handoff also uses the graph
+                //   thread's control socket; its blocking GET_TENSOR observes
+                //   all prior Phone queue work in order.
                 //
                 // LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE restores the old
                 // fence-before/fence-after behavior for A/B correctness tests.
