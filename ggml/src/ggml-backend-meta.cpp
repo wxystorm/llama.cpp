@@ -5967,6 +5967,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_tensor * node_tmp = get_node_aux(node_dst);
                 set_tmp_data(node_tmp, j_dst, 0);
 
+                // Match the proven generic all-reduce ordering:
+                // producer complete -> copy visible on Phone -> ADD -> next Phone SG.
+                // This matters for RPC because the ordinary RPC synchronize hook is
+                // intentionally a no-op in this fork.
+                const auto fence_backend = [&](ggml_backend_t backend) {
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(backend);
+                    } else {
+                        ggml_backend_synchronize(backend);
+                    }
+                };
+
+                const int64_t src_fence_start_us = ggml_time_us();
+                fence_backend(bcj_src.backend);
+                const int64_t src_fence_us =
+                    ggml_time_us() - src_fence_start_us;
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                     bcj_src.backend, bcj_dst.backend,
@@ -5974,6 +5993,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
                 record_copy_wait(copy_us);
                 record_meta_copy(i, j_src, j_dst, node_src, copy_us);
+
+                const int64_t dst_fence_start_us = ggml_time_us();
+                fence_backend(bcj_dst.backend);
+                const int64_t dst_fence_us =
+                    ggml_time_us() - dst_fence_start_us;
 
                 ggml_tensor * node_red = get_node_aux(node_dst);
                 node_red->view_src =
@@ -5999,23 +6023,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return status;
                 }
 
-                // Make this diagnostic path dependency-explicit.  The next
-                // Phone-owned l_out must not observe the pre-reduce FFN value.
-                const ggml_backend_rpc_fence_t rpc_fence =
-                    ggml_backend_meta_get_rpc_fence(bcj_dst.backend);
-                if (rpc_fence != nullptr) {
-                    rpc_fence(bcj_dst.backend);
-                } else {
-                    ggml_backend_synchronize(bcj_dst.backend);
-                }
+                // The next Phone-owned l_out must observe the reduced FFN.
+                const int64_t add_fence_start_us = ggml_time_us();
+                fence_backend(bcj_dst.backend);
+                const int64_t add_fence_us =
+                    ggml_time_us() - add_fence_start_us;
 
                 if (pipeline_debug) {
                     printf(
                         "[TENSOR_PHONE_V22_FFN_ONEWAY] sg=%zu layer=%d "
-                        "chunk=%d mode=%s bytes=%zu copy_ms=%.3f "
+                        "chunk=%d mode=%s bytes=%zu src_fence_ms=%.3f "
+                        "copy_ms=%.3f dst_fence_ms=%.3f add_fence_ms=%.3f "
                         "action=PC_TO_PHONE\n",
                         i, layer, chunk, mode,
-                        ggml_nbytes(node_src), copy_us / 1000.0);
+                        ggml_nbytes(node_src),
+                        src_fence_us / 1000.0,
+                        copy_us / 1000.0,
+                        dst_fence_us / 1000.0,
+                        add_fence_us / 1000.0);
                 }
                 return GGML_STATUS_SUCCESS;
             }
