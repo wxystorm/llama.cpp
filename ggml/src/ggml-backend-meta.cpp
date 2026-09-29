@@ -4436,7 +4436,103 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             ggml_tensor * src0 = norm->src[0];
-            if (src0 == nullptr || src0->ne[1] != 1) {
+            if (src0 == nullptr) {
+                continue;
+            }
+
+            // At the first Phone-primary Tensor layer, prove that the tensor
+            // consumed by Phone is exactly the preceding PC layer output.
+            // Unlike the ordinary per-token input trace, this also runs for
+            // prefill matrices (ne[1] > 1).
+            const bool trace_tp_entry =
+                std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr &&
+                !after_compute &&
+                backend == 1 &&
+                layer == backend_ctx->tensor_phone_first_layer &&
+                src0->type == GGML_TYPE_F32;
+            if (trace_tp_entry) {
+                char prev_name[64];
+                std::snprintf(
+                    prev_name, sizeof(prev_name),
+                    "l_out-%d", layer - 1);
+                ggml_tensor * pc_prev =
+                    find_exact_named_tensor(0, prev_name);
+
+                if (pc_prev != nullptr &&
+                        pc_prev->type == GGML_TYPE_F32 &&
+                        ggml_nelements(pc_prev) == ggml_nelements(src0)) {
+                    auto fence_for_trace = [&](ggml_backend_t b) {
+                        const ggml_backend_rpc_fence_t rpc_fence =
+                            ggml_backend_meta_get_rpc_fence(b);
+                        if (rpc_fence != nullptr) {
+                            rpc_fence(b);
+                        } else {
+                            ggml_backend_synchronize(b);
+                        }
+                    };
+
+                    auto & pc_cfg = backend_ctx->backend_configs[0];
+                    auto & ph_cfg = backend_ctx->backend_configs[1];
+                    fence_for_trace(pc_cfg.backend);
+                    fence_for_trace(ph_cfg.backend);
+
+                    const size_t n = ggml_nelements(src0);
+                    std::vector<float> pc_values(n);
+                    std::vector<float> phone_values(n);
+                    ggml_backend_tensor_get(
+                        pc_prev, pc_values.data(), 0, n * sizeof(float));
+                    ggml_backend_tensor_get(
+                        src0, phone_values.data(), 0, n * sizeof(float));
+
+                    double pc_sum = 0.0;
+                    double phone_sum = 0.0;
+                    double pc_l2 = 0.0;
+                    double phone_l2 = 0.0;
+                    double diff_l2 = 0.0;
+                    double max_abs_diff = 0.0;
+                    size_t max_diff_index = 0;
+                    for (size_t q = 0; q < n; ++q) {
+                        const double a = pc_values[q];
+                        const double b = phone_values[q];
+                        const double d = a - b;
+                        pc_sum += a;
+                        phone_sum += b;
+                        pc_l2 += a * a;
+                        phone_l2 += b * b;
+                        diff_l2 += d * d;
+                        if (std::abs(d) > max_abs_diff) {
+                            max_abs_diff = std::abs(d);
+                            max_diff_index = q;
+                        }
+                    }
+
+                    printf(
+                        "[TP_ENTRY_NUMERIC] layer=%d pc=%s phone=%s n=%zu "
+                        "pc_sum=%.9f phone_sum=%.9f pc_l2=%.9f phone_l2=%.9f "
+                        "max_abs_diff=%.9g rms_diff=%.9g max_diff_index=%zu "
+                        "pc_v0=%.9f phone_v0=%.9f "
+                        "pc_v1=%.9f phone_v1=%.9f\n",
+                        layer, pc_prev->name, src0->name, n,
+                        pc_sum, phone_sum,
+                        std::sqrt(pc_l2), std::sqrt(phone_l2),
+                        max_abs_diff,
+                        n > 0 ? std::sqrt(diff_l2 / (double) n) : 0.0,
+                        max_diff_index,
+                        n > 0 ? pc_values[0] : 0.0f,
+                        n > 0 ? phone_values[0] : 0.0f,
+                        n > 1 ? pc_values[1] : 0.0f,
+                        n > 1 ? phone_values[1] : 0.0f);
+                } else {
+                    printf(
+                        "[TP_ENTRY_NUMERIC] layer=%d status=SKIP "
+                        "pc_prev=%s phone_src=%s\n",
+                        layer,
+                        pc_prev != nullptr ? pc_prev->name : "(null)",
+                        src0->name);
+                }
+            }
+
+            if (src0->ne[1] != 1) {
                 continue;
             }
 
@@ -5011,6 +5107,89 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     (int) subgraph_will_execute_pc(i + 1) : -1,
                 i + 1 < backend_ctx->n_subgraphs ?
                     (int) subgraph_will_execute_phone(i + 1) : -1);
+        }
+
+        if (active_count == 1 && n_backends == 2 && active_backend == 1 &&
+                std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr &&
+                backend_ctx->tensor_phone_first_layer >= 0) {
+            int trace_lout_layer = -1;
+            int trace_lout_parsed = 0;
+            ggml_tensor * trace_lout = nodes[1];
+            const bool is_first_tp_lout =
+                trace_lout != nullptr &&
+                std::sscanf(
+                    trace_lout->name, "l_out-%d%n",
+                    &trace_lout_layer, &trace_lout_parsed) == 1 &&
+                trace_lout->name[trace_lout_parsed] == '\0' &&
+                trace_lout_layer == backend_ctx->tensor_phone_first_layer;
+
+            if (is_first_tp_lout &&
+                    trace_lout->type == GGML_TYPE_F32 &&
+                    trace_lout->src[0] != nullptr &&
+                    trace_lout->src[1] != nullptr &&
+                    trace_lout->src[0]->type == GGML_TYPE_F32 &&
+                    trace_lout->src[1]->type == GGML_TYPE_F32 &&
+                    ggml_nelements(trace_lout) ==
+                        ggml_nelements(trace_lout->src[0]) &&
+                    ggml_nelements(trace_lout) ==
+                        ggml_nelements(trace_lout->src[1])) {
+                auto & ph_cfg = backend_ctx->backend_configs[1];
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(ph_cfg.backend);
+                if (rpc_fence != nullptr) {
+                    rpc_fence(ph_cfg.backend);
+                } else {
+                    ggml_backend_synchronize(ph_cfg.backend);
+                }
+
+                const size_t n = ggml_nelements(trace_lout);
+                std::vector<float> out(n);
+                std::vector<float> src_a(n);
+                std::vector<float> src_b(n);
+                ggml_backend_tensor_get(
+                    trace_lout, out.data(), 0, n * sizeof(float));
+                ggml_backend_tensor_get(
+                    trace_lout->src[0], src_a.data(), 0, n * sizeof(float));
+                ggml_backend_tensor_get(
+                    trace_lout->src[1], src_b.data(), 0, n * sizeof(float));
+
+                double out_sum = 0.0;
+                double out_l2 = 0.0;
+                double diff_l2 = 0.0;
+                double max_abs_diff = 0.0;
+                size_t max_diff_index = 0;
+                for (size_t q = 0; q < n; ++q) {
+                    const double x = out[q];
+                    const double expected =
+                        (double) src_a[q] + (double) src_b[q];
+                    const double d = x - expected;
+                    out_sum += x;
+                    out_l2 += x * x;
+                    diff_l2 += d * d;
+                    if (std::abs(d) > max_abs_diff) {
+                        max_abs_diff = std::abs(d);
+                        max_diff_index = q;
+                    }
+                }
+
+                printf(
+                    "[TP_LOUT_NUMERIC] layer=%d out=%s src0=%s src1=%s n=%zu "
+                    "sum=%.9f l2=%.9f max_abs_diff=%.9g rms_diff=%.9g "
+                    "max_diff_index=%zu out_v0=%.9f expected_v0=%.9f "
+                    "out_v1=%.9f expected_v1=%.9f\n",
+                    trace_lout_layer,
+                    trace_lout->name,
+                    trace_lout->src[0]->name,
+                    trace_lout->src[1]->name,
+                    n, out_sum, std::sqrt(out_l2),
+                    max_abs_diff,
+                    n > 0 ? std::sqrt(diff_l2 / (double) n) : 0.0,
+                    max_diff_index,
+                    n > 0 ? out[0] : 0.0f,
+                    n > 0 ? src_a[0] + src_b[0] : 0.0f,
+                    n > 1 ? out[1] : 0.0f,
+                    n > 1 ? src_a[1] + src_b[1] : 0.0f);
+            }
         }
 
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
