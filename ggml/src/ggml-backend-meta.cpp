@@ -6677,6 +6677,403 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         };
 
+        // Cross-primary control-path trace.  This is deliberately read-only and
+        // runs at the first FFN reduction for the requested layer, after
+        // Attention / residual / FFN norm / Router have already executed but
+        // before the FFN partials are reduced.  It therefore works for both
+        // legacy PC-primary Tensor and TENSOR_PHONE_PRIMARY without executing a
+        // shadow graph or changing ownership.
+        if (n_backends == 2) {
+            const char * trace_layer_env =
+                std::getenv("GGML_META_TP_CONTROL_TRACE_LAYER");
+            if (trace_layer_env != nullptr) {
+                char * trace_end = nullptr;
+                const long trace_layer_long =
+                    std::strtol(trace_layer_env, &trace_end, 10);
+
+                if (trace_end != trace_layer_env &&
+                        *trace_end == '\0' &&
+                        trace_layer_long >= 0) {
+                    const int trace_layer = (int) trace_layer_long;
+
+                    ggml_tensor * reduce_node =
+                        backend_ctx->backend_configs[0]
+                            .cgraphs[i].cgraph_main->nodes[
+                                backend_ctx->backend_configs[0]
+                                    .cgraphs[i].cgraph_main->n_nodes - 1];
+
+                    int current_layer = -1;
+                    int current_chunk = -1;
+                    int parsed_chars = 0;
+                    const char * current_mode = nullptr;
+
+                    if (reduce_node->ne[1] == 1 &&
+                            std::sscanf(
+                                reduce_node->name,
+                                "ffn_moe_out-%d%n",
+                                &current_layer,
+                                &parsed_chars) == 1 &&
+                            reduce_node->name[parsed_chars] == '\0') {
+                        current_chunk = 0;
+                        current_mode = "decode-single";
+                    } else {
+                        int parsed_chunk = -1;
+                        int parsed_layer = -1;
+                        if (ggml_backend_meta_parse_decode_ffn_chunk(
+                                reduce_node->name,
+                                parsed_chunk,
+                                parsed_layer)) {
+                            current_layer = parsed_layer;
+                            current_chunk = parsed_chunk;
+                            current_mode = "decode";
+                        } else if (ggml_backend_meta_parse_prefill_down_chunk(
+                                       reduce_node->name,
+                                       parsed_chunk,
+                                       parsed_layer)) {
+                            current_layer = parsed_layer;
+                            current_chunk = parsed_chunk;
+                            current_mode = "prefill";
+                        }
+                    }
+
+                    // Chunk zero is sufficient to compare both paths while
+                    // keeping the trace small.  Decode-single also maps here.
+                    if (current_layer == trace_layer &&
+                            current_chunk == 0) {
+                        const bool phone_primary_owner =
+                            backend_ctx->tensor_phone_first_layer >= 0 &&
+                            trace_layer >=
+                                backend_ctx->tensor_phone_first_layer &&
+                            trace_layer <
+                                backend_ctx->tensor_phone_last_layer;
+                        const size_t owner =
+                            phone_primary_owner ? 1 : 0;
+                        auto & owner_cfg =
+                            backend_ctx->backend_configs[owner];
+
+                        reduce_fence_backend(owner_cfg.backend);
+
+                        auto trace_f32 =
+                            [&](const char * logical,
+                                const char * tensor_name) {
+                                ggml_tensor * tensor =
+                                    find_exact_named_tensor(
+                                        owner, tensor_name);
+                                if (tensor == nullptr) {
+                                    printf(
+                                        "[TP_CONTROL_TRACE] layer=%d "
+                                        "chunk=%d mode=%s primary=%s "
+                                        "owner=%zu logical=%s "
+                                        "tensor=%s status=MISSING\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        current_mode != nullptr ?
+                                            current_mode : "unknown",
+                                        phone_primary_owner ?
+                                            "PHONE" : "PC",
+                                        owner,
+                                        logical,
+                                        tensor_name);
+                                    return;
+                                }
+                                if (tensor->type != GGML_TYPE_F32) {
+                                    printf(
+                                        "[TP_CONTROL_TRACE] layer=%d "
+                                        "chunk=%d mode=%s primary=%s "
+                                        "owner=%zu logical=%s "
+                                        "tensor=%s status=TYPE type=%d\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        current_mode != nullptr ?
+                                            current_mode : "unknown",
+                                        phone_primary_owner ?
+                                            "PHONE" : "PC",
+                                        owner,
+                                        logical,
+                                        tensor->name,
+                                        (int) tensor->type);
+                                    return;
+                                }
+
+                                const size_t n =
+                                    ggml_nelements(tensor);
+                                std::vector<float> data(n);
+                                ggml_backend_tensor_get(
+                                    tensor,
+                                    data.data(),
+                                    0,
+                                    n * sizeof(float));
+
+                                double sum = 0.0;
+                                double l2 = 0.0;
+                                double max_abs = 0.0;
+                                for (float x : data) {
+                                    const double xd = x;
+                                    sum += xd;
+                                    l2 += xd * xd;
+                                    max_abs =
+                                        std::max(
+                                            max_abs,
+                                            std::abs(xd));
+                                }
+
+                                printf(
+                                    "[TP_CONTROL_F32] layer=%d chunk=%d "
+                                    "mode=%s primary=%s owner=%zu "
+                                    "logical=%s tensor=%s "
+                                    "ne=[%" PRId64 ",%" PRId64
+                                    ",%" PRId64 ",%" PRId64 "] "
+                                    "n=%zu sum=%.9f l2=%.9f "
+                                    "max=%.9f "
+                                    "v0=%.9f v1=%.9f v2=%.9f "
+                                    "v3=%.9f v4=%.9f v5=%.9f "
+                                    "v6=%.9f v7=%.9f\n",
+                                    trace_layer,
+                                    current_chunk,
+                                    current_mode != nullptr ?
+                                        current_mode : "unknown",
+                                    phone_primary_owner ?
+                                        "PHONE" : "PC",
+                                    owner,
+                                    logical,
+                                    tensor->name,
+                                    tensor->ne[0],
+                                    tensor->ne[1],
+                                    tensor->ne[2],
+                                    tensor->ne[3],
+                                    n,
+                                    sum,
+                                    std::sqrt(l2),
+                                    max_abs,
+                                    n > 0 ? data[0] : 0.0f,
+                                    n > 1 ? data[1] : 0.0f,
+                                    n > 2 ? data[2] : 0.0f,
+                                    n > 3 ? data[3] : 0.0f,
+                                    n > 4 ? data[4] : 0.0f,
+                                    n > 5 ? data[5] : 0.0f,
+                                    n > 6 ? data[6] : 0.0f,
+                                    n > 7 ? data[7] : 0.0f);
+                            };
+
+                        auto trace_i32 =
+                            [&](const char * logical,
+                                const char * tensor_name) {
+                                ggml_tensor * tensor =
+                                    find_exact_named_tensor(
+                                        owner, tensor_name);
+                                if (tensor == nullptr) {
+                                    return;
+                                }
+                                if (tensor->type != GGML_TYPE_I32) {
+                                    printf(
+                                        "[TP_CONTROL_TRACE] layer=%d "
+                                        "chunk=%d mode=%s primary=%s "
+                                        "owner=%zu logical=%s tensor=%s "
+                                        "status=TYPE type=%d\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        current_mode != nullptr ?
+                                            current_mode : "unknown",
+                                        phone_primary_owner ?
+                                            "PHONE" : "PC",
+                                        owner,
+                                        logical,
+                                        tensor->name,
+                                        (int) tensor->type);
+                                    return;
+                                }
+
+                                const size_t n =
+                                    ggml_nelements(tensor);
+                                std::vector<int32_t> data(n);
+                                ggml_backend_tensor_get(
+                                    tensor,
+                                    data.data(),
+                                    0,
+                                    n * sizeof(int32_t));
+
+                                int64_t sum = 0;
+                                int32_t min_v =
+                                    n > 0 ? data[0] : 0;
+                                int32_t max_v =
+                                    n > 0 ? data[0] : 0;
+                                uint64_t hash =
+                                    UINT64_C(1469598103934665603);
+                                for (int32_t x : data) {
+                                    sum += x;
+                                    min_v = std::min(min_v, x);
+                                    max_v = std::max(max_v, x);
+                                    const uint32_t bits =
+                                        (uint32_t) x;
+                                    for (int b = 0; b < 4; ++b) {
+                                        hash ^=
+                                            (bits >> (b * 8)) &
+                                            UINT64_C(0xff);
+                                        hash *=
+                                            UINT64_C(1099511628211);
+                                    }
+                                }
+
+                                printf(
+                                    "[TP_CONTROL_I32] layer=%d chunk=%d "
+                                    "mode=%s primary=%s owner=%zu "
+                                    "logical=%s tensor=%s "
+                                    "ne=[%" PRId64 ",%" PRId64
+                                    ",%" PRId64 ",%" PRId64 "] "
+                                    "n=%zu sum=%" PRId64
+                                    " min=%d max=%d hash=%" PRIu64
+                                    " v0=%d v1=%d v2=%d v3=%d "
+                                    "v4=%d v5=%d v6=%d v7=%d\n",
+                                    trace_layer,
+                                    current_chunk,
+                                    current_mode != nullptr ?
+                                        current_mode : "unknown",
+                                    phone_primary_owner ?
+                                        "PHONE" : "PC",
+                                    owner,
+                                    logical,
+                                    tensor->name,
+                                    tensor->ne[0],
+                                    tensor->ne[1],
+                                    tensor->ne[2],
+                                    tensor->ne[3],
+                                    n,
+                                    sum,
+                                    min_v,
+                                    max_v,
+                                    hash,
+                                    n > 0 ? data[0] : 0,
+                                    n > 1 ? data[1] : 0,
+                                    n > 2 ? data[2] : 0,
+                                    n > 3 ? data[3] : 0,
+                                    n > 4 ? data[4] : 0,
+                                    n > 5 ? data[5] : 0,
+                                    n > 6 ? data[6] : 0,
+                                    n > 7 ? data[7] : 0);
+                            };
+
+                        char residual_name[64];
+                        char hidden_name[96];
+                        char logits_name[64];
+                        char topk_name[96];
+                        char weights_name[96];
+
+                        std::snprintf(
+                            residual_name,
+                            sizeof(residual_name),
+                            "ffn_inp-%d",
+                            trace_layer);
+                        std::snprintf(
+                            logits_name,
+                            sizeof(logits_name),
+                            "ffn_moe_logits-%d",
+                            trace_layer);
+
+                        if (current_mode != nullptr &&
+                                std::strcmp(
+                                    current_mode,
+                                    "prefill") == 0) {
+                            std::snprintf(
+                                hidden_name,
+                                sizeof(hidden_name),
+                                "prefill_ffn_norm_chunk_%d-%d",
+                                current_chunk,
+                                trace_layer);
+                            if (phone_primary_owner) {
+                                std::snprintf(
+                                    topk_name,
+                                    sizeof(topk_name),
+                                    "phone_prefill_route_topk_chunk_%d-%d",
+                                    current_chunk,
+                                    trace_layer);
+                                std::snprintf(
+                                    weights_name,
+                                    sizeof(weights_name),
+                                    "phone_prefill_route_weights_chunk_%d-%d",
+                                    current_chunk,
+                                    trace_layer);
+                            } else {
+                                std::snprintf(
+                                    topk_name,
+                                    sizeof(topk_name),
+                                    "ffn_moe_topk-%d",
+                                    trace_layer);
+                                std::snprintf(
+                                    weights_name,
+                                    sizeof(weights_name),
+                                    "ffn_moe_weights-%d",
+                                    trace_layer);
+                            }
+                        } else {
+                            std::snprintf(
+                                hidden_name,
+                                sizeof(hidden_name),
+                                "ffn_norm-%d",
+                                trace_layer);
+                            if (phone_primary_owner) {
+                                std::snprintf(
+                                    topk_name,
+                                    sizeof(topk_name),
+                                    "phone_moe_route_topk-%d",
+                                    trace_layer);
+                                std::snprintf(
+                                    weights_name,
+                                    sizeof(weights_name),
+                                    "phone_moe_route_weights-%d",
+                                    trace_layer);
+                            } else {
+                                std::snprintf(
+                                    topk_name,
+                                    sizeof(topk_name),
+                                    "ffn_moe_topk-%d",
+                                    trace_layer);
+                                std::snprintf(
+                                    weights_name,
+                                    sizeof(weights_name),
+                                    "ffn_moe_weights-%d",
+                                    trace_layer);
+                            }
+                        }
+
+                        trace_f32("ffn_inp", residual_name);
+                        trace_f32("ffn_norm", hidden_name);
+                        trace_f32("router_logits", logits_name);
+                        trace_i32("router_topk", topk_name);
+                        trace_f32("router_weights", weights_name);
+
+                        if (!phone_primary_owner) {
+                            // Different model variants may rename the final
+                            // post-softmax router weights.  Print these if
+                            // present so the A/B trace still captures the
+                            // actual control tensor used by expert dispatch.
+                            const char * suffixes[] = {
+                                "ffn_moe_weights_softmax",
+                                "ffn_moe_weights_norm",
+                                "ffn_moe_weights_scaled",
+                            };
+                            for (const char * suffix : suffixes) {
+                                char alt_name[96];
+                                std::snprintf(
+                                    alt_name,
+                                    sizeof(alt_name),
+                                    "%s-%d",
+                                    suffix,
+                                    trace_layer);
+                                ggml_tensor * alt =
+                                    find_exact_named_tensor(
+                                        owner, alt_name);
+                                if (alt != nullptr) {
+                                    trace_f32(
+                                        suffix,
+                                        alt_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Numeric proof for the first Phone-primary Tensor layer.  This is
         // deliberately diagnostic-only: it does not change graph ownership or
         // reduction semantics.  Capture the two FFN partials before reduction
