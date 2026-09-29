@@ -7589,6 +7589,30 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 parsed);
         }
     }
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_PC_LAYERS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 0 &&
+            parsed <= profile.n_layer) {
+            constraints.fixed_pc_layers = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] pc_layers=%ld source=environment\n",
+                parsed);
+        }
+    }
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_PHONE_LAYERS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 0 &&
+            parsed <= profile.n_layer) {
+            constraints.fixed_phone_layers = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] phone_layers=%ld source=environment\n",
+                parsed);
+        }
+    }
     // No fixed topology here: CPU_DIRECT is now part of the runtime model, so
     // HYBRID_AUTO must search placement and chunking jointly instead of being
     // constrained to the earlier T1/P0/C47/G11 validation layout.
