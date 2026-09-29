@@ -83,6 +83,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT,
     RPC_CMD_INIT_ZERO_TENSOR,
     RPC_CMD_GET_TENSOR_BATCH3,
+    RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
     RPC_CMD_COUNT,
 };
 
@@ -95,6 +96,7 @@ static_assert(RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT == 21, "RPC_CMD_GRAPH_RECOMPUTE_S
 static_assert(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT == 22,"RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INIT_ZERO_TENSOR == 23, "RPC_CMD_INIT_ZERO_TENSOR must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_TENSOR_BATCH3 == 24, "RPC_CMD_GET_TENSOR_BATCH3 must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SET_TENSOR_GRAPH_COMPUTE == 25, "RPC_CMD_SET_TENSOR_GRAPH_COMPUTE must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -197,6 +199,13 @@ struct rpc_msg_get_tensor_req {
 
 struct rpc_msg_get_tensor_batch3_req {
     rpc_msg_get_tensor_req items[3];
+};
+
+struct rpc_msg_set_tensor_graph_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t graph_size;
 };
 
 struct rpc_msg_copy_tensor_req {
@@ -403,6 +412,13 @@ struct ggml_backend_rpc_buffer_context {
     ggml_backend_rpc_device_context * device_ctx = nullptr;
     std::array<std::shared_ptr<socket_t>, 2> snapshot_transfer_socks {};
 };
+
+static bool ggml_backend_rpc_set_tensor_graph(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        const ggml_cgraph * graph);
 
 static bool ggml_backend_rpc_prepare_fused_ffn_input(
         ggml_backend_t backend,
@@ -2110,6 +2126,105 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     }
 }
 
+static bool ggml_backend_rpc_set_tensor_graph(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst,
+        const ggml_cgraph * graph) {
+    if (backend_src == nullptr || backend_dst == nullptr ||
+            src == nullptr || dst == nullptr || graph == nullptr ||
+            graph->n_nodes <= 0 || src->buffer == nullptr ||
+            dst->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(dst->buffer) ||
+            !ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_dst->context);
+    auto * dst_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(dst->buffer->context);
+    if (rpc_ctx == nullptr || dst_buffer_ctx == nullptr ||
+            dst_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            dst_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    constexpr uint8_t RPC_SET_TENSOR_GRAPH_MIN_PATCH = 6;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_SET_TENSOR_GRAPH_MIN_PATCH) {
+        LOG_DBG(
+            "[RPC_SET_GRAPH_FALLBACK] endpoint=%s remote_patch=%u required=%u\n",
+            rpc_ctx->endpoint.c_str(),
+            (unsigned) remote_patch,
+            (unsigned) RPC_SET_TENSOR_GRAPH_MIN_PATCH);
+        return false;
+    }
+
+    // Preserve the generic async-copy fallback's producer ordering before
+    // reading the PC partial into the combined RPC packet.
+    ggml_backend_synchronize(backend_src);
+    ggml_backend_synchronize(backend_dst);
+
+    const size_t data_size = ggml_nbytes(src);
+    std::vector<uint8_t> data(data_size);
+    ggml_backend_tensor_get(src, data.data(), 0, data_size);
+
+    const uint64_t graph_uid = rpc_graph_effective_uid(graph);
+    std::vector<uint8_t> graph_data;
+    serialize_graph(rpc_ctx->device, graph_uid, graph, graph_data);
+
+    rpc_msg_set_tensor_graph_req request {};
+    request.tensor = serialize_tensor(dst);
+    request.offset = 0;
+    request.size = data_size;
+    request.graph_size = graph_data.size();
+
+    if (data_size > SIZE_MAX - sizeof(request) ||
+            graph_data.size() > SIZE_MAX - sizeof(request) - data_size) {
+        return false;
+    }
+
+    std::vector<uint8_t> input(
+        sizeof(request) + data_size + graph_data.size());
+    size_t cursor = 0;
+    memcpy(input.data() + cursor, &request, sizeof(request));
+    cursor += sizeof(request);
+    if (data_size > 0) {
+        memcpy(input.data() + cursor, data.data(), data_size);
+        cursor += data_size;
+    }
+    if (!graph_data.empty()) {
+        memcpy(input.data() + cursor, graph_data.data(), graph_data.size());
+        cursor += graph_data.size();
+    }
+    GGML_ASSERT(cursor == input.size());
+
+    const int64_t t0 = ggml_time_us();
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
+        input.data(),
+        input.size());
+
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_SET_GRAPH_CLIENT] tensor=%s bytes=%zu graph_bytes=%zu "
+            "total=%.3f ms\n",
+            dst->name,
+            data_size,
+            graph_data.size(),
+            (ggml_time_us() - t0) / 1000.0);
+    }
+
+    return status;
+}
+
 static int rpc_find_graph_node(
         const ggml_cgraph * graph,
         const ggml_tensor * target) {
@@ -2598,6 +2713,7 @@ public:
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_batch3(const rpc_msg_get_tensor_batch3_req & request, std::vector<uint8_t> & response);
+    bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -3960,6 +4076,55 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     return result;
 }
 
+bool rpc_server::set_tensor_graph_compute(
+        const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_msg_set_tensor_graph_req)) {
+        return false;
+    }
+
+    rpc_msg_set_tensor_graph_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+
+    const size_t data_size = static_cast<size_t>(request.size);
+    const size_t graph_size = static_cast<size_t>(request.graph_size);
+    if (data_size > SIZE_MAX - sizeof(request) ||
+            graph_size > SIZE_MAX - sizeof(request) - data_size ||
+            input.size() != sizeof(request) + data_size + graph_size) {
+        return false;
+    }
+
+    const uint8_t * data = input.data() + sizeof(request);
+    if (!set_tensor_direct(
+            request.tensor,
+            request.offset,
+            data,
+            data_size)) {
+        return false;
+    }
+
+    std::vector<uint8_t> graph_input(graph_size);
+    if (graph_size > 0) {
+        memcpy(
+            graph_input.data(),
+            data + data_size,
+            graph_size);
+    }
+
+    const int64_t t0 = ggml_time_us();
+    const bool ok = graph_compute(graph_input);
+    if (RPC_DEBUG) {
+        GGML_LOG_INFO(
+            "[RPC_SET_GRAPH_SERVER] tensor=%s bytes=%zu graph_bytes=%zu "
+            "total=%.3f ms status=%d\n",
+            request.tensor.name,
+            data_size,
+            graph_size,
+            (ggml_time_us() - t0) / 1000.0,
+            ok ? 1 : 0);
+    }
+    return ok;
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -5045,6 +5210,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_GRAPH_COMPUTE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_graph_compute(input)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -5539,6 +5714,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_GET_TENSOR_BATCH3_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_get_tensor_batch3);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_set_tensor_graph);
     }
     GGML_UNUSED(reg);
 

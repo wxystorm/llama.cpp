@@ -2623,6 +2623,21 @@ static ggml_backend_rpc_get_tensor_batch3_t ggml_backend_meta_get_tensor_batch3(
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_GET_TENSOR_BATCH3_PROC));
 }
 
+static ggml_backend_rpc_set_tensor_graph_t ggml_backend_meta_get_set_tensor_graph(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_set_tensor_graph_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC));
+}
+
 static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -6079,21 +6094,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     src_fence_us = ggml_time_us() - src_fence_start_us;
                 }
 
-                const int64_t copy_start_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    bcj_src.backend, bcj_dst.backend,
-                    node_src, node_tmp);
-                const int64_t copy_us = ggml_time_us() - copy_start_us;
-                record_copy_wait(copy_us);
-                record_meta_copy(i, j_src, j_dst, node_src, copy_us);
-
-                int64_t dst_fence_us = 0;
-                if (strict_phone_primary_fence) {
-                    const int64_t dst_fence_start_us = ggml_time_us();
-                    fence_backend(bcj_dst.backend);
-                    dst_fence_us = ggml_time_us() - dst_fence_start_us;
-                }
-
                 ggml_tensor * node_red = get_node_aux(node_dst);
                 node_red->view_src =
                     node_dst->view_src == nullptr ?
@@ -6109,20 +6109,67 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 cgraph_aux->nodes[0] = node_red;
                 cgraph_aux->n_nodes = 1;
 
-                const int64_t add_start_us = ggml_time_us();
-                const ggml_status status =
-                    ggml_backend_graph_compute_async(
-                        bcj_dst.backend, cgraph_aux);
-                reduce_add_us += ggml_time_us() - add_start_us;
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
+                const ggml_backend_rpc_set_tensor_graph_t set_tensor_graph =
+                    ggml_backend_meta_get_set_tensor_graph(bcj_dst.backend);
+                const bool allow_fused_set_add =
+                    !strict_phone_primary_fence &&
+                    set_tensor_graph != nullptr &&
+                    std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_DISABLE_FUSED_SET_ADD") == nullptr;
+
+                bool fused_set_add_used = false;
+                int64_t fused_set_add_us = 0;
+                int64_t copy_us = 0;
+                int64_t dst_fence_us = 0;
+                int64_t add_submit_us = 0;
+
+                if (allow_fused_set_add) {
+                    const int64_t fused_begin_us = ggml_time_us();
+                    fused_set_add_used = set_tensor_graph(
+                        bcj_src.backend,
+                        bcj_dst.backend,
+                        node_src,
+                        node_tmp,
+                        cgraph_aux);
+                    fused_set_add_us = ggml_time_us() - fused_begin_us;
+                    if (fused_set_add_used) {
+                        copy_us = fused_set_add_us;
+                        record_copy_wait(fused_set_add_us);
+                        record_meta_copy(
+                            i, j_src, j_dst, node_src, fused_set_add_us);
+                    }
                 }
 
-                // ADD and the following Phone-owned graph are submitted on the
-                // same RPC control socket / OpenCL queue.  Do not round-trip a
-                // fence here in the relaxed path; queue ordering carries the
-                // dependency forward.  A later cross-socket read fences at the
-                // Router handoff boundary.
+                if (!fused_set_add_used) {
+                    const int64_t copy_start_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_src.backend, bcj_dst.backend,
+                        node_src, node_tmp);
+                    copy_us = ggml_time_us() - copy_start_us;
+                    record_copy_wait(copy_us);
+                    record_meta_copy(i, j_src, j_dst, node_src, copy_us);
+
+                    if (strict_phone_primary_fence) {
+                        const int64_t dst_fence_start_us = ggml_time_us();
+                        fence_backend(bcj_dst.backend);
+                        dst_fence_us = ggml_time_us() - dst_fence_start_us;
+                    }
+
+                    const int64_t add_start_us = ggml_time_us();
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(
+                            bcj_dst.backend, cgraph_aux);
+                    add_submit_us = ggml_time_us() - add_start_us;
+                    reduce_add_us += add_submit_us;
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+
+                // Fused mode sends the PC partial and the one-node Phone ADD
+                // graph in one RPC command.  Fallback mode preserves the
+                // already-validated ordered SET_TENSOR -> GRAPH_COMPUTE path.
+                // The following Phone-owned graph remains ordered on the same
+                // control socket / OpenCL queue.
                 int64_t add_fence_us = 0;
                 if (strict_phone_primary_fence) {
                     const int64_t add_fence_start_us = ggml_time_us();
@@ -6133,17 +6180,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf(
                         "[TENSOR_PHONE_V22_FFN_ONEWAY] sg=%zu layer=%d "
-                        "chunk=%d mode=%s bytes=%zu strict_fence=%d "
-                        "src_fence_ms=%.3f copy_ms=%.3f "
-                        "dst_fence_ms=%.3f add_fence_ms=%.3f "
-                        "action=PC_TO_PHONE_ORDERED\n",
+                        "chunk=%d mode=%s bytes=%zu strict_fence=%d fused=%d "
+                        "src_fence_ms=%.3f copy_ms=%.3f fused_ms=%.3f "
+                        "add_submit_ms=%.3f dst_fence_ms=%.3f "
+                        "add_fence_ms=%.3f action=%s\n",
                         i, layer, chunk, mode,
                         ggml_nbytes(node_src),
                         strict_phone_primary_fence ? 1 : 0,
+                        fused_set_add_used ? 1 : 0,
                         src_fence_us / 1000.0,
                         copy_us / 1000.0,
+                        fused_set_add_us / 1000.0,
+                        add_submit_us / 1000.0,
                         dst_fence_us / 1000.0,
-                        add_fence_us / 1000.0);
+                        add_fence_us / 1000.0,
+                        fused_set_add_used ?
+                            "PC_TO_PHONE_FUSED_SET_ADD" :
+                            "PC_TO_PHONE_ORDERED");
                 }
                 return GGML_STATUS_SUCCESS;
             }
