@@ -2088,7 +2088,8 @@ static bool ggml_backend_rpc_get_tensor_batch3(
             rpc_us / 1000.0);
     }
     if (stage_profile) {
-        GGML_LOG_INFO(
+        std::fprintf(
+            stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=router_batch "
             "bytes=%zu dst_sync_ms=%.3f rpc_roundtrip_ms=%.3f "
             "dst_set_ms=%.3f total_ms=%.3f\n",
@@ -2097,6 +2098,7 @@ static bool ggml_backend_rpc_get_tensor_batch3(
             rpc_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
     }
 
     return true;
@@ -2525,7 +2527,8 @@ static bool ggml_backend_rpc_set_tensor_graph(
             send_us / 1000.0);
     }
     if (stage_profile) {
-        GGML_LOG_INFO(
+        std::fprintf(
+            stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_set_add "
             "bytes=%zu graph_uid=%" PRIu64 " cache=%d graph_bytes=%zu "
             "src_sync_ms=%.3f dst_sync_ms=%.3f src_get_ms=%.3f "
@@ -2541,6 +2544,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
             pack_us / 1000.0,
             send_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
     }
 
     return status;
