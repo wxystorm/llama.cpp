@@ -25,6 +25,10 @@
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
+static bool rpc_tensor_phone_stage_profile_enabled() {
+    return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
+}
+
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
@@ -1872,13 +1876,22 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         return false;
     }
 
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t client_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
     // Match the generic copy fallback's destination-safety contract, but do it
     // once for the whole Router packet instead of once per tensor.
+    const int64_t dst_sync_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     ggml_backend_synchronize(backend_dst);
+    const int64_t dst_sync_us =
+        stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
     std::vector<uint8_t> response(total_size);
 
-    const int64_t t0 = ggml_time_us();
+    const int64_t rpc_begin_us = ggml_time_us();
     const bool status = send_rpc_cmd(
         sock,
         RPC_CMD_GET_TENSOR_BATCH3,
@@ -1886,8 +1899,11 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         sizeof(request),
         response.data(),
         response.size());
+    const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
     RPC_STATUS_ASSERT(status);
 
+    const int64_t dst_set_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     size_t response_offset = 0;
     for (size_t i = 0; i < 3; ++i) {
         ggml_backend_tensor_set(
@@ -1898,12 +1914,25 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         response_offset += sizes[i];
     }
     GGML_ASSERT(response_offset == response.size());
+    const int64_t dst_set_us =
+        stage_profile ? ggml_time_us() - dst_set_begin_us : 0;
 
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_GET_BATCH3_CLIENT] bytes=%zu total=%.3f ms\n",
             total_size,
-            (ggml_time_us() - t0) / 1000.0);
+            rpc_us / 1000.0);
+    }
+    if (stage_profile) {
+        GGML_LOG_INFO(
+            "[TENSOR_PHONE_RPC_STAGE] side=pc stage=router_batch "
+            "bytes=%zu dst_sync_ms=%.3f rpc_roundtrip_ms=%.3f "
+            "dst_set_ms=%.3f total_ms=%.3f\n",
+            total_size,
+            dst_sync_us / 1000.0,
+            rpc_us / 1000.0,
+            dst_set_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
     }
 
     return true;
@@ -2186,13 +2215,31 @@ static bool ggml_backend_rpc_set_tensor_graph(
         return false;
     }
 
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t client_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
     // Preserve producer completion before materializing the PC partial on host.
+    const int64_t src_sync_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     ggml_backend_synchronize(backend_src);
+    const int64_t src_sync_us =
+        stage_profile ? ggml_time_us() - src_sync_begin_us : 0;
+
+    const int64_t dst_sync_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     ggml_backend_synchronize(backend_dst);
+    const int64_t dst_sync_us =
+        stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
     const size_t data_size = ggml_nbytes(src);
     std::vector<uint8_t> data(data_size);
+    const int64_t src_get_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     ggml_backend_tensor_get(src, data.data(), 0, data_size);
+    const int64_t src_get_us =
+        stage_profile ? ggml_time_us() - src_get_begin_us : 0;
 
     const uint64_t graph_uid = rpc_graph_effective_uid(graph);
     const bool cache_supported =
@@ -2215,6 +2262,8 @@ static bool ggml_backend_rpc_set_tensor_graph(
     }
 
     std::vector<uint8_t> graph_data;
+    const int64_t serialize_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     if (!cache_hit) {
         serialize_graph(
             rpc_ctx->device,
@@ -2222,7 +2271,11 @@ static bool ggml_backend_rpc_set_tensor_graph(
             graph,
             graph_data);
     }
+    const int64_t serialize_us =
+        stage_profile ? ggml_time_us() - serialize_begin_us : 0;
 
+    const int64_t pack_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     std::vector<uint8_t> input;
     if (cache_supported) {
         rpc_msg_set_tensor_graph_req request {};
@@ -2279,12 +2332,15 @@ static bool ggml_backend_rpc_set_tensor_graph(
         GGML_ASSERT(cursor == input.size());
     }
 
-    const int64_t t0 = ggml_time_us();
+    const int64_t pack_us =
+        stage_profile ? ggml_time_us() - pack_begin_us : 0;
+    const int64_t send_begin_us = ggml_time_us();
     const bool status = send_rpc_cmd(
         sock,
         RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
         input.data(),
         input.size());
+    const int64_t send_us = ggml_time_us() - send_begin_us;
 
     if (status && cache_supported && !cache_hit) {
         // Same control socket is strictly ordered: once the full graph command
@@ -2302,7 +2358,25 @@ static bool ggml_backend_rpc_set_tensor_graph(
             graph_uid,
             cache_hit ? 1 : 0,
             graph_data.size(),
-            (ggml_time_us() - t0) / 1000.0);
+            send_us / 1000.0);
+    }
+    if (stage_profile) {
+        GGML_LOG_INFO(
+            "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_set_add "
+            "bytes=%zu graph_uid=%" PRIu64 " cache=%d graph_bytes=%zu "
+            "src_sync_ms=%.3f dst_sync_ms=%.3f src_get_ms=%.3f "
+            "serialize_ms=%.3f pack_ms=%.3f send_ms=%.3f total_ms=%.3f\n",
+            data_size,
+            graph_uid,
+            cache_hit ? 1 : 0,
+            graph_data.size(),
+            src_sync_us / 1000.0,
+            dst_sync_us / 1000.0,
+            src_get_us / 1000.0,
+            serialize_us / 1000.0,
+            pack_us / 1000.0,
+            send_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
     }
 
     return status;
@@ -3852,6 +3926,11 @@ bool rpc_server::get_tensor(
 bool rpc_server::get_tensor_batch3(
         const rpc_msg_get_tensor_batch3_req & request,
         std::vector<uint8_t> & response) {
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t server_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
     size_t sizes[3] = {};
     size_t response_offsets[3] = {};
     size_t total_size = 0;
@@ -3865,7 +3944,9 @@ bool rpc_server::get_tensor_batch3(
     }
 
     response.resize(total_size);
-    const int64_t t0 = ggml_time_us();
+    const int64_t read_begin_us = ggml_time_us();
+    const int64_t prepare_us =
+        stage_profile ? read_begin_us - server_begin_us : 0;
 
     bool opencl_batch_used = false;
     if (std::getenv("GGML_RPC_DISABLE_OPENCL_BATCH3_READ") == nullptr) {
@@ -3938,12 +4019,24 @@ bool rpc_server::get_tensor_batch3(
         }
     }
 
+    const int64_t read_us = ggml_time_us() - read_begin_us;
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_SERVER_GET_BATCH3] bytes=%zu opencl_wait1=%d total=%.3f ms\n",
             total_size,
             opencl_batch_used ? 1 : 0,
-            (ggml_time_us() - t0) / 1000.0);
+            read_us / 1000.0);
+    }
+    if (stage_profile) {
+        GGML_LOG_INFO(
+            "[TENSOR_PHONE_RPC_STAGE] side=phone stage=router_batch "
+            "bytes=%zu opencl_wait1=%d prepare_ms=%.3f "
+            "device_read_ms=%.3f total_ms=%.3f\n",
+            total_size,
+            opencl_batch_used ? 1 : 0,
+            prepare_us / 1000.0,
+            read_us / 1000.0,
+            (ggml_time_us() - server_begin_us) / 1000.0);
     }
     return true;
 }
@@ -4291,6 +4384,11 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 
 bool rpc_server::set_tensor_graph_compute(
         const std::vector<uint8_t> & input) {
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t server_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
     if (input.size() < sizeof(rpc_msg_set_tensor_graph_req_v6)) {
         return false;
     }
@@ -4341,6 +4439,9 @@ bool rpc_server::set_tensor_graph_compute(
     }
 
     const uint8_t * data = input.data() + header_size;
+    const int64_t write_begin_us = ggml_time_us();
+    const int64_t parse_us =
+        stage_profile ? write_begin_us - server_begin_us : 0;
     bool async_write_used = false;
     if (std::getenv("GGML_RPC_DISABLE_OPENCL_ASYNC_SET_ADD") == nullptr) {
         async_write_used = set_tensor_direct_opencl_async(
@@ -4358,8 +4459,9 @@ bool rpc_server::set_tensor_graph_compute(
                 data_size)) {
         return false;
     }
+    const int64_t write_us = ggml_time_us() - write_begin_us;
 
-    const int64_t t0 = ggml_time_us();
+    const int64_t graph_begin_us = ggml_time_us();
     bool ok = false;
 
     if (cached_graph_request) {
@@ -4378,6 +4480,7 @@ bool rpc_server::set_tensor_graph_compute(
         ok = graph_compute(graph_input);
     }
 
+    const int64_t graph_us = ggml_time_us() - graph_begin_us;
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_SET_GRAPH_SERVER] tensor=%s bytes=%zu graph_uid=%" PRIu64
@@ -4388,7 +4491,24 @@ bool rpc_server::set_tensor_graph_compute(
             cached_graph_request ? 1 : 0,
             graph_size,
             async_write_used ? 1 : 0,
-            (ggml_time_us() - t0) / 1000.0,
+            graph_us / 1000.0,
+            ok ? 1 : 0);
+    }
+    if (stage_profile) {
+        GGML_LOG_INFO(
+            "[TENSOR_PHONE_RPC_STAGE] side=phone stage=return_set_add "
+            "bytes=%zu graph_uid=%" PRIu64 " cache=%d graph_bytes=%zu "
+            "async_write=%d parse_ms=%.3f write_ms=%.3f "
+            "graph_ms=%.3f total_ms=%.3f status=%d\n",
+            data_size,
+            graph_uid,
+            cached_graph_request ? 1 : 0,
+            graph_size,
+            async_write_used ? 1 : 0,
+            parse_us / 1000.0,
+            write_us / 1000.0,
+            graph_us / 1000.0,
+            (ggml_time_us() - server_begin_us) / 1000.0,
             ok ? 1 : 0);
     }
     return ok;
