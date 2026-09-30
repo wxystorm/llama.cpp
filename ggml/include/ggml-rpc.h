@@ -48,6 +48,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_STAGE_READY_PROC \
     "ggml_backend_rpc_set_stage_ready_callback"
 
+#define GGML_BACKEND_RPC_SET_ROUTE_TRANSFER_LANE_PROC \
+    "ggml_backend_rpc_set_route_transfer_lane"
+
 #define GGML_BACKEND_RPC_FENCE_PROC \
     "ggml_backend_rpc_fence"
 
@@ -122,6 +125,9 @@ using ggml_backend_rpc_stage_ready_callback_t = void (*)(void * user_data);
 using ggml_backend_rpc_set_stage_ready_t = void (*)(
         ggml_backend_rpc_stage_ready_callback_t callback,
         void * user_data);
+
+using ggml_backend_rpc_set_route_transfer_lane_t = void (*)(
+        int lane);
 
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
 

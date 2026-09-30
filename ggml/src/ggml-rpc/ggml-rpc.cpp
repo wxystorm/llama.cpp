@@ -534,6 +534,7 @@ struct ggml_backend_rpc_device_context {
     rpc_pending_fused_ffn_input fused_ffn;
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
+    std::array<std::shared_ptr<socket_t>, 2> route_transfer_socks {};
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -782,6 +783,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 static thread_local ggml_backend_rpc_stage_ready_callback_t rpc_stage_ready_callback = nullptr;
 static thread_local void * rpc_stage_ready_user_data = nullptr;
+static thread_local int rpc_route_transfer_lane = -1;
 
 struct rpc_snapshot_read_context {
     bool active = false;
@@ -796,6 +798,11 @@ static void ggml_backend_rpc_set_stage_ready_callback(
         void * user_data) {
     rpc_stage_ready_callback = callback;
     rpc_stage_ready_user_data = user_data;
+}
+
+static void ggml_backend_rpc_set_route_transfer_lane(int lane) {
+    GGML_ASSERT(lane >= -1 && lane < 2);
+    rpc_route_transfer_lane = lane;
 }
 
 static void ggml_backend_rpc_set_snapshot_read(bool enabled, uint32_t slot, uint64_t seq) {
@@ -974,6 +981,8 @@ enum class rpc_socket_role {
     TRANSFER,
     SNAPSHOT_TRANSFER_0,
     SNAPSHOT_TRANSFER_1,
+    ROUTE_TRANSFER_0,
+    ROUTE_TRANSFER_1,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -993,6 +1002,12 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::SNAPSHOT_TRANSFER_1:
             suffix = "_snapshot_transfer_1";
+            break;
+        case rpc_socket_role::ROUTE_TRANSFER_0:
+            suffix = "_route_transfer_0";
+            break;
+        case rpc_socket_role::ROUTE_TRANSFER_1:
+            suffix = "_route_transfer_1";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1041,6 +1056,12 @@ static std::shared_ptr<socket_t> get_snapshot_transfer_socket(const std::string 
     GGML_ASSERT(lane < 2);
     return get_socket_role(endpoint, lane == 0 ? rpc_socket_role::SNAPSHOT_TRANSFER_0
                                                : rpc_socket_role::SNAPSHOT_TRANSFER_1);
+}
+
+static std::shared_ptr<socket_t> get_route_transfer_socket(const std::string & endpoint, size_t lane) {
+    GGML_ASSERT(lane < 2);
+    return get_socket_role(endpoint, lane == 0 ? rpc_socket_role::ROUTE_TRANSFER_0
+                                               : rpc_socket_role::ROUTE_TRANSFER_1);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -2021,7 +2042,29 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         total_size += sizes[i];
     }
 
-    auto sock = get_socket(rpc_ctx->endpoint);
+    const bool staged_route =
+        rpc_stage_ready_callback != nullptr &&
+        rpc_route_transfer_lane >= 0;
+    std::shared_ptr<socket_t> sock;
+    if (staged_route) {
+        auto * rpc_dev_ctx =
+            static_cast<ggml_backend_rpc_device_context *>(
+                ggml_backend_get_device(backend_src)->context);
+        RPC_STATUS_ASSERT(rpc_dev_ctx != nullptr);
+        const size_t route_lane =
+            static_cast<size_t>(rpc_route_transfer_lane);
+        auto & route_sock =
+            rpc_dev_ctx->route_transfer_socks[route_lane];
+        if (route_sock == nullptr) {
+            route_sock =
+                get_route_transfer_socket(
+                    rpc_ctx->endpoint,
+                    route_lane);
+        }
+        sock = route_sock;
+    } else {
+        sock = get_socket(rpc_ctx->endpoint);
+    }
     RPC_STATUS_ASSERT(sock != nullptr);
 
     // Batch3 was added in RPC protocol patch 5.  Older servers intentionally
@@ -2049,20 +2092,30 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     // once for the whole Router packet instead of once per tensor.
     const int64_t dst_sync_begin_us =
         stage_profile ? ggml_time_us() : 0;
-    ggml_backend_synchronize(backend_dst);
+    if (!staged_route) {
+        ggml_backend_synchronize(backend_dst);
+    }
     const int64_t dst_sync_us =
         stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
     std::vector<uint8_t> response(total_size);
 
     const int64_t rpc_begin_us = ggml_time_us();
-    const bool status = send_rpc_cmd(
-        sock,
-        RPC_CMD_GET_TENSOR_BATCH3,
-        &request,
-        sizeof(request),
-        response.data(),
-        response.size());
+    const bool status = staged_route ?
+        send_rpc_cmd_staged(
+            sock,
+            RPC_CMD_GET_TENSOR_BATCH3,
+            &request,
+            sizeof(request),
+            response.data(),
+            response.size()) :
+        send_rpc_cmd(
+            sock,
+            RPC_CMD_GET_TENSOR_BATCH3,
+            &request,
+            sizeof(request),
+            response.data(),
+            response.size());
     const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
     RPC_STATUS_ASSERT(status);
 
@@ -2091,9 +2144,11 @@ static bool ggml_backend_rpc_get_tensor_batch3(
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=router_batch "
-            "bytes=%zu dst_sync_ms=%.3f rpc_roundtrip_ms=%.3f "
-            "dst_set_ms=%.3f total_ms=%.3f\n",
+            "bytes=%zu staged=%d lane=%d dst_sync_ms=%.3f "
+            "rpc_roundtrip_ms=%.3f dst_set_ms=%.3f total_ms=%.3f\n",
             total_size,
+            staged_route ? 1 : 0,
+            staged_route ? rpc_route_transfer_lane : -1,
             dst_sync_us / 1000.0,
             rpc_us / 1000.0,
             dst_set_us / 1000.0,
@@ -6247,6 +6302,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_STAGE_READY_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_stage_ready_callback);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_ROUTE_TRANSFER_LANE_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_route_transfer_lane);
     }
     if (std::strcmp(
             name,
