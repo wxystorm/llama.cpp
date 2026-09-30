@@ -29,6 +29,170 @@ static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
 }
 
+struct rpc_tensor_phone_graph_stage {
+    const char * stage = "graph_compute";
+    const char * mode = "unknown";
+    int layer = -1;
+    int chunk = -1;
+};
+
+static rpc_tensor_phone_graph_stage rpc_tensor_phone_graph_stage_identity(
+        const ggml_cgraph * graph) {
+    rpc_tensor_phone_graph_stage result;
+    if (graph == nullptr) {
+        return result;
+    }
+
+    // Prefer the FFN output boundary when a graph contains more than one
+    // recognizable Tensor-Phone marker.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        const char * name = node != nullptr ? node->name : nullptr;
+        if (name == nullptr) {
+            continue;
+        }
+
+        int chunk = -1;
+        int layer = -1;
+        int parsed = 0;
+        if (std::sscanf(
+                name,
+                "prefill_ffn_down_chunk_%d-%d%n",
+                &chunk,
+                &layer,
+                &parsed) == 2 &&
+                name[parsed] == '\0') {
+            result.stage = "ffn_device_compute";
+            result.mode = "prefill";
+            result.layer = layer;
+            result.chunk = chunk;
+            return result;
+        }
+
+        parsed = 0;
+        if (std::sscanf(
+                name,
+                "ffn_down_chunk_%d-%d%n",
+                &chunk,
+                &layer,
+                &parsed) == 2 &&
+                name[parsed] == '\0') {
+            result.stage = "ffn_device_compute";
+            result.mode = "decode";
+            result.layer = layer;
+            result.chunk = chunk;
+            return result;
+        }
+
+        parsed = 0;
+        if (std::sscanf(name, "ffn_moe_out-%d%n", &layer, &parsed) == 1 &&
+                name[parsed] == '\0') {
+            result.stage = "ffn_device_compute";
+            result.mode = "decode";
+            result.layer = layer;
+            result.chunk = 0;
+            return result;
+        }
+    }
+
+    // Route/norm graphs are useful too, but are secondary to the FFN marker.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        const char * name = node != nullptr ? node->name : nullptr;
+        if (name == nullptr) {
+            continue;
+        }
+
+        int chunk = -1;
+        int layer = -1;
+        int parsed = 0;
+        if ((std::sscanf(
+                 name,
+                 "phone_prefill_route_weights_chunk_%d-%d%n",
+                 &chunk,
+                 &layer,
+                 &parsed) == 2 ||
+             std::sscanf(
+                 name,
+                 "phone_prefill_route_topk_chunk_%d-%d%n",
+                 &chunk,
+                 &layer,
+                 &parsed) == 2 ||
+             std::sscanf(
+                 name,
+                 "prefill_ffn_norm_chunk_%d-%d%n",
+                 &chunk,
+                 &layer,
+                 &parsed) == 2) &&
+                name[parsed] == '\0') {
+            result.stage = "pre_route_device_compute";
+            result.mode = "prefill";
+            result.layer = layer;
+            result.chunk = chunk;
+            return result;
+        }
+
+        parsed = 0;
+        if ((std::sscanf(
+                 name,
+                 "phone_moe_route_weights-%d%n",
+                 &layer,
+                 &parsed) == 1 ||
+             std::sscanf(
+                 name,
+                 "phone_moe_route_topk-%d%n",
+                 &layer,
+                 &parsed) == 1) &&
+                name[parsed] == '\0') {
+            result.stage = "pre_route_device_compute";
+            result.mode = "decode";
+            result.layer = layer;
+            result.chunk = 0;
+            return result;
+        }
+    }
+
+    return result;
+}
+
+static void rpc_tensor_phone_log_graph_compute(
+        const char * kind,
+        uint64_t graph_uid,
+        const ggml_cgraph * graph,
+        int64_t compute_us,
+        int64_t post_compute_us) {
+    if (!rpc_tensor_phone_stage_profile_enabled()) {
+        return;
+    }
+
+    const rpc_tensor_phone_graph_stage stage =
+        rpc_tensor_phone_graph_stage_identity(graph);
+    const char * first =
+        graph != nullptr && graph->n_nodes > 0 && graph->nodes[0] != nullptr ?
+            graph->nodes[0]->name : "(none)";
+    const char * last =
+        graph != nullptr && graph->n_nodes > 0 &&
+                graph->nodes[graph->n_nodes - 1] != nullptr ?
+            graph->nodes[graph->n_nodes - 1]->name : "(none)";
+
+    GGML_LOG_INFO(
+        "[TENSOR_PHONE_RPC_STAGE] side=phone stage=%s kind=%s "
+        "mode=%s layer=%d chunk=%d graph_uid=%" PRIu64
+        " nodes=%d first=%s last=%s compute_sync_ms=%.3f "
+        "post_compute_ms=%.3f\n",
+        stage.stage,
+        kind,
+        stage.mode,
+        stage.layer,
+        stage.chunk,
+        graph_uid,
+        graph != nullptr ? graph->n_nodes : 0,
+        first,
+        last,
+        compute_us / 1000.0,
+        post_compute_us / 1000.0);
+}
+
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
@@ -4591,6 +4755,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     const int64_t t1 = ggml_time_us();
 
+    rpc_tensor_phone_log_graph_compute(
+        "compute",
+        graph_uid,
+        graph,
+        t1 - t0,
+        0);
+
     if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
             "[RPC_GRAPH_SERVER] uid=%" PRIu64
@@ -4624,6 +4795,13 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
             graph);
 
     const int64_t t1 = ggml_time_us();
+
+    rpc_tensor_phone_log_graph_compute(
+        "recompute",
+        request.graph_uid,
+        graph,
+        t1 - t0,
+        0);
 
     if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
@@ -4670,6 +4848,13 @@ bool rpc_server::graph_recompute_snapshot(
         request.offset,
         request.size);
     const int64_t t2 = ggml_time_us();
+
+    rpc_tensor_phone_log_graph_compute(
+        "recompute_snapshot",
+        request.graph_uid,
+        graph,
+        t1 - t0,
+        t2 - t1);
 
     if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
