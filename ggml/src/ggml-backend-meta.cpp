@@ -4753,6 +4753,49 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     std::map<int, int64_t> return_wave_layer_compute_wall_us;
     std::map<int, int64_t> return_wave_layer_barrier_us;
 
+    // Pure-observation Phone-primary stage profiler.  This intentionally does
+    // not add synchronization, graph submissions, tensor reads, or ownership
+    // changes.  It only consumes timing values that the normal path already
+    // produces, plus ggml_time_us() wall-clock stamps around existing calls.
+    const bool tensor_phone_stage_profile =
+        std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
+
+    struct tensor_phone_stage_timing {
+        bool mode_set = false;
+        bool decode = false;
+
+        int64_t pre_route_wall_us = 0;
+        int64_t pre_route_pc_worker_us = 0;
+        int64_t pre_route_phone_worker_us = 0;
+
+        int64_t route_handoff_us = 0;
+
+        int64_t ffn_wall_us = 0;
+        int64_t pc_ffn_worker_us = 0;
+        int64_t phone_ffn_worker_us = 0;
+
+        int64_t return_client_wall_us = 0;
+
+        int route_compute_count = 0;
+        int route_handoff_count = 0;
+        int ffn_compute_count = 0;
+        int return_count = 0;
+    };
+
+    std::map<std::pair<int, int>, tensor_phone_stage_timing>
+        tensor_phone_stage_timings;
+
+    auto tensor_phone_stage_entry =
+        [&](int layer, int chunk, bool decode)
+            -> tensor_phone_stage_timing & {
+            const int chunk_key = chunk >= 0 ? chunk : 0;
+            auto & timing =
+                tensor_phone_stage_timings[{ layer, chunk_key }];
+            timing.mode_set = true;
+            timing.decode = decode;
+            return timing;
+        };
+
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
                                          int force_phone_block_layer) -> ggml_status {
@@ -4878,6 +4921,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
         if (phone_router_handoff) {
             handled = true;
+            const int64_t tensor_phone_route_handoff_begin_us =
+                tensor_phone_stage_profile ? ggml_time_us() : 0;
 
             char hidden_name[96];
             char topk_name[96];
@@ -5247,6 +5292,30 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         phone_route_layer, phone_route_chunk,
                         live_src_topk.size(), live_dst_topk.size());
                 }
+            }
+
+            if (tensor_phone_stage_profile) {
+                const int64_t route_handoff_wall_us =
+                    ggml_time_us() - tensor_phone_route_handoff_begin_us;
+                auto & stage = tensor_phone_stage_entry(
+                    phone_route_layer,
+                    phone_route_chunk,
+                    phone_route_chunk < 0);
+                stage.route_handoff_us += route_handoff_wall_us;
+                stage.route_handoff_count += 1;
+                printf(
+                    "[TENSOR_PHONE_STAGE_COMM] stage=route_handoff "
+                    "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
+                    "batch=%d batch_ms=%.3f copy_ms=%.3f\n",
+                    phone_route_chunk < 0 ? "decode" : "prefill",
+                    phone_route_layer,
+                    phone_route_chunk < 0 ? 0 : phone_route_chunk,
+                    i,
+                    route_handoff_wall_us / 1000.0,
+                    route_batch_used ? 1 : 0,
+                    route_batch_us / 1000.0,
+                    (residual_copy_us + hidden_copy_us +
+                     topk_copy_us + weights_copy_us) / 1000.0);
             }
 
             if (pipeline_debug) {
@@ -6049,6 +6118,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (one_way_reduce) {
                 handled = true;
+                const int64_t tensor_phone_return_begin_us =
+                    tensor_phone_stage_profile ? ggml_time_us() : 0;
 
                 constexpr size_t j_src = 0; // PC FFN partial
                 constexpr size_t j_dst = 1; // Phone FFN partial / owner
@@ -6175,6 +6246,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const int64_t add_fence_start_us = ggml_time_us();
                     fence_backend(bcj_dst.backend);
                     add_fence_us = ggml_time_us() - add_fence_start_us;
+                }
+
+                if (tensor_phone_stage_profile) {
+                    const int64_t return_client_wall_us =
+                        ggml_time_us() - tensor_phone_return_begin_us;
+                    auto & stage = tensor_phone_stage_entry(
+                        layer, chunk, !is_prefill_down_chunk);
+                    stage.return_client_wall_us += return_client_wall_us;
+                    stage.return_count += 1;
+                    printf(
+                        "[TENSOR_PHONE_STAGE_COMM] stage=return_set_add "
+                        "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
+                        "fused=%d fused_ms=%.3f copy_ms=%.3f "
+                        "add_submit_ms=%.3f\n",
+                        mode,
+                        layer,
+                        chunk,
+                        i,
+                        return_client_wall_us / 1000.0,
+                        fused_set_add_used ? 1 : 0,
+                        fused_set_add_us / 1000.0,
+                        copy_us / 1000.0,
+                        add_submit_us / 1000.0);
                 }
 
                 if (pipeline_debug) {
@@ -7990,6 +8084,85 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return -1;
     };
 
+    auto tensor_phone_stage_route_identity =
+        [&](size_t sg, int & layer, int & chunk) -> bool {
+            layer = -1;
+            chunk = -1;
+            if (sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+            for (size_t backend = 0; backend < n_backends; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr || graph->n_nodes <= 0) {
+                    continue;
+                }
+                const char * name =
+                    graph->nodes[graph->n_nodes - 1]->name;
+                if (ggml_backend_meta_parse_phone_route_weights(
+                        name, chunk, layer) &&
+                        layer_is_tensor_phone_primary(layer)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+    auto tensor_phone_stage_ffn_identity =
+        [&](size_t sg, int & layer, int & chunk, bool & decode)
+            -> bool {
+            layer = -1;
+            chunk = -1;
+            decode = false;
+            if (sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            for (size_t backend = 0; backend < n_backends; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr || graph->n_nodes <= 0) {
+                    continue;
+                }
+
+                const char * name =
+                    graph->nodes[graph->n_nodes - 1]->name;
+                int parsed_layer = -1;
+                int parsed_chunk = -1;
+                if (ggml_backend_meta_parse_prefill_down_chunk(
+                        name, parsed_chunk, parsed_layer) &&
+                        layer_is_tensor_phone_primary(parsed_layer)) {
+                    layer = parsed_layer;
+                    chunk = parsed_chunk;
+                    decode = false;
+                    return true;
+                }
+                if (ggml_backend_meta_parse_decode_ffn_chunk(
+                        name, parsed_chunk, parsed_layer) &&
+                        layer_is_tensor_phone_primary(parsed_layer)) {
+                    layer = parsed_layer;
+                    chunk = parsed_chunk;
+                    decode = true;
+                    return true;
+                }
+
+                int parsed = 0;
+                if (std::sscanf(
+                        name, "ffn_moe_out-%d%n",
+                        &parsed_layer, &parsed) == 1 &&
+                        name[parsed] == '\0' &&
+                        layer_is_tensor_phone_primary(parsed_layer)) {
+                    layer = parsed_layer;
+                    chunk = 0;
+                    decode = true;
+                    return true;
+                }
+            }
+            return false;
+        };
+
     auto backend_times_snapshot = [&]() {
         std::lock_guard<std::mutex> lock(compute_workers.mutex);
         return compute_workers.backend_time_us;
@@ -8935,6 +9108,64 @@ auto prefill_norm_sg_has_prework =
             tensor_backend_times_after[0] - backend_times_before[0] : 0;
         const int64_t phone_compute_us = tensor_backend_times_after.size() > 1 ?
             tensor_backend_times_after[1] - backend_times_before[1] : 0;
+
+        if (tensor_phone_stage_profile) {
+            int stage_layer = -1;
+            int stage_chunk = -1;
+            bool stage_decode = false;
+            const bool stage_is_route =
+                tensor_phone_stage_route_identity(
+                    communication_sg, stage_layer, stage_chunk);
+            const bool stage_is_ffn =
+                !stage_is_route &&
+                tensor_phone_stage_ffn_identity(
+                    communication_sg,
+                    stage_layer,
+                    stage_chunk,
+                    stage_decode);
+
+            if (stage_is_route) {
+                stage_decode = stage_chunk < 0;
+                auto & stage = tensor_phone_stage_entry(
+                    stage_layer, stage_chunk, stage_decode);
+                stage.pre_route_wall_us += subgraph_compute_wall_us;
+                stage.pre_route_pc_worker_us += pc_compute_us;
+                stage.pre_route_phone_worker_us += phone_compute_us;
+                stage.route_compute_count += 1;
+
+                printf(
+                    "[TENSOR_PHONE_STAGE_SG] stage=pre_route_compute "
+                    "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
+                    "pc_worker_ms=%.3f phone_worker_ms=%.3f\n",
+                    stage_decode ? "decode" : "prefill",
+                    stage_layer,
+                    stage_chunk < 0 ? 0 : stage_chunk,
+                    communication_sg,
+                    subgraph_compute_wall_us / 1000.0,
+                    pc_compute_us / 1000.0,
+                    phone_compute_us / 1000.0);
+            } else if (stage_is_ffn) {
+                auto & stage = tensor_phone_stage_entry(
+                    stage_layer, stage_chunk, stage_decode);
+                stage.ffn_wall_us += subgraph_compute_wall_us;
+                stage.pc_ffn_worker_us += pc_compute_us;
+                stage.phone_ffn_worker_us += phone_compute_us;
+                stage.ffn_compute_count += 1;
+
+                printf(
+                    "[TENSOR_PHONE_STAGE_SG] stage=ffn_parallel_compute "
+                    "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
+                    "pc_worker_ms=%.3f phone_worker_ms=%.3f\n",
+                    stage_decode ? "decode" : "prefill",
+                    stage_layer,
+                    stage_chunk < 0 ? 0 : stage_chunk,
+                    communication_sg,
+                    subgraph_compute_wall_us / 1000.0,
+                    pc_compute_us / 1000.0,
+                    phone_compute_us / 1000.0);
+            }
+        }
+
         if (is_prefill_down_sg) {
             tensor_pc_ffn_us += pc_compute_us;
             tensor_phone_us  += phone_compute_us;
@@ -9188,6 +9419,55 @@ auto prefill_norm_sg_has_prework =
             meta_total_us / 1000.0,
             other_main_us / 1000.0);
     }
+    if (tensor_phone_stage_profile) {
+        for (const auto & item : tensor_phone_stage_timings) {
+            const int layer = item.first.first;
+            const int chunk = item.first.second;
+            const tensor_phone_stage_timing & stage = item.second;
+
+            const int64_t worker_parallel_est_us =
+                std::max(
+                    stage.pc_ffn_worker_us,
+                    stage.phone_ffn_worker_us);
+            const int64_t ffn_overhead_est_us =
+                std::max<int64_t>(
+                    0,
+                    stage.ffn_wall_us - worker_parallel_est_us);
+            const int64_t client_path_est_us =
+                stage.pre_route_wall_us +
+                stage.route_handoff_us +
+                stage.ffn_wall_us +
+                stage.return_client_wall_us;
+
+            printf(
+                "[TENSOR_PHONE_STAGE] mode=%s layer=%d chunk=%d "
+                "pre_route_wall_ms=%.3f pre_route_pc_worker_ms=%.3f "
+                "pre_route_phone_worker_ms=%.3f route_handoff_ms=%.3f "
+                "ffn_wall_ms=%.3f pc_ffn_worker_ms=%.3f "
+                "phone_ffn_worker_ms=%.3f worker_parallel_est_ms=%.3f "
+                "ffn_overhead_est_ms=%.3f return_client_wall_ms=%.3f "
+                "client_path_est_ms=%.3f counts=%d/%d/%d/%d\n",
+                stage.decode ? "decode" : "prefill",
+                layer,
+                chunk,
+                stage.pre_route_wall_us / 1000.0,
+                stage.pre_route_pc_worker_us / 1000.0,
+                stage.pre_route_phone_worker_us / 1000.0,
+                stage.route_handoff_us / 1000.0,
+                stage.ffn_wall_us / 1000.0,
+                stage.pc_ffn_worker_us / 1000.0,
+                stage.phone_ffn_worker_us / 1000.0,
+                worker_parallel_est_us / 1000.0,
+                ffn_overhead_est_us / 1000.0,
+                stage.return_client_wall_us / 1000.0,
+                client_path_est_us / 1000.0,
+                stage.route_compute_count,
+                stage.route_handoff_count,
+                stage.ffn_compute_count,
+                stage.return_count);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(backend_ctx->tensor_profile_mutex);
         backend_ctx->tensor_profile.attn_us   += tensor_attn_us;
