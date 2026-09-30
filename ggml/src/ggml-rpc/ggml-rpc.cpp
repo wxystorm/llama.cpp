@@ -202,11 +202,20 @@ struct rpc_msg_get_tensor_batch3_req {
     rpc_msg_get_tensor_req items[3];
 };
 
+struct rpc_msg_set_tensor_graph_req_v6 {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t graph_size;
+};
+
 struct rpc_msg_set_tensor_graph_req {
     rpc_tensor tensor;
     uint64_t offset;
     uint64_t size;
     uint64_t graph_size;
+    uint64_t graph_uid;
+    uint32_t device;
 };
 
 struct rpc_msg_copy_tensor_req {
@@ -349,6 +358,11 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
+
+    std::mutex fused_set_graph_cache_mutex;
+    std::unordered_set<uint64_t> fused_set_graph_uids;
+    const socket_t * fused_set_graph_cache_socket = nullptr;
+
     rpc_pending_fused_ffn_input fused_ffn;
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
@@ -2146,7 +2160,11 @@ static bool ggml_backend_rpc_set_tensor_graph(
         static_cast<ggml_backend_rpc_context *>(backend_dst->context);
     auto * dst_buffer_ctx =
         static_cast<ggml_backend_rpc_buffer_context *>(dst->buffer->context);
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_dst)->context);
     if (rpc_ctx == nullptr || dst_buffer_ctx == nullptr ||
+            rpc_dev_ctx == nullptr ||
             dst_buffer_ctx->endpoint != rpc_ctx->endpoint ||
             dst_buffer_ctx->device != rpc_ctx->device) {
         return false;
@@ -2156,6 +2174,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
     RPC_STATUS_ASSERT(sock != nullptr);
 
     constexpr uint8_t RPC_SET_TENSOR_GRAPH_MIN_PATCH = 6;
+    constexpr uint8_t RPC_SET_TENSOR_GRAPH_CACHE_MIN_PATCH = 7;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
     if (remote_patch < RPC_SET_TENSOR_GRAPH_MIN_PATCH) {
@@ -2167,8 +2186,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
         return false;
     }
 
-    // Preserve the generic async-copy fallback's producer ordering before
-    // reading the PC partial into the combined RPC packet.
+    // Preserve producer completion before materializing the PC partial on host.
     ggml_backend_synchronize(backend_src);
     ggml_backend_synchronize(backend_dst);
 
@@ -2177,34 +2195,89 @@ static bool ggml_backend_rpc_set_tensor_graph(
     ggml_backend_tensor_get(src, data.data(), 0, data_size);
 
     const uint64_t graph_uid = rpc_graph_effective_uid(graph);
+    const bool cache_supported =
+        remote_patch >= RPC_SET_TENSOR_GRAPH_CACHE_MIN_PATCH &&
+        std::getenv("GGML_RPC_DISABLE_FUSED_ADD_GRAPH_CACHE") == nullptr;
+
+    bool cache_hit = false;
+    std::unique_lock<std::mutex> cache_lock(
+        rpc_dev_ctx->fused_set_graph_cache_mutex,
+        std::defer_lock);
+    if (cache_supported) {
+        cache_lock.lock();
+        if (rpc_dev_ctx->fused_set_graph_cache_socket != sock.get()) {
+            rpc_dev_ctx->fused_set_graph_uids.clear();
+            rpc_dev_ctx->fused_set_graph_cache_socket = sock.get();
+        }
+        cache_hit =
+            rpc_dev_ctx->fused_set_graph_uids.find(graph_uid) !=
+            rpc_dev_ctx->fused_set_graph_uids.end();
+    }
+
     std::vector<uint8_t> graph_data;
-    serialize_graph(rpc_ctx->device, graph_uid, graph, graph_data);
-
-    rpc_msg_set_tensor_graph_req request {};
-    request.tensor = serialize_tensor(dst);
-    request.offset = 0;
-    request.size = data_size;
-    request.graph_size = graph_data.size();
-
-    if (data_size > SIZE_MAX - sizeof(request) ||
-            graph_data.size() > SIZE_MAX - sizeof(request) - data_size) {
-        return false;
+    if (!cache_hit) {
+        serialize_graph(
+            rpc_ctx->device,
+            graph_uid,
+            graph,
+            graph_data);
     }
 
-    std::vector<uint8_t> input(
-        sizeof(request) + data_size + graph_data.size());
-    size_t cursor = 0;
-    memcpy(input.data() + cursor, &request, sizeof(request));
-    cursor += sizeof(request);
-    if (data_size > 0) {
-        memcpy(input.data() + cursor, data.data(), data_size);
-        cursor += data_size;
+    std::vector<uint8_t> input;
+    if (cache_supported) {
+        rpc_msg_set_tensor_graph_req request {};
+        request.tensor = serialize_tensor(dst);
+        request.offset = 0;
+        request.size = data_size;
+        request.graph_size = graph_data.size();
+        request.graph_uid = graph_uid;
+        request.device = rpc_ctx->device;
+
+        if (data_size > SIZE_MAX - sizeof(request) ||
+                graph_data.size() > SIZE_MAX - sizeof(request) - data_size) {
+            return false;
+        }
+
+        input.resize(sizeof(request) + data_size + graph_data.size());
+        size_t cursor = 0;
+        memcpy(input.data() + cursor, &request, sizeof(request));
+        cursor += sizeof(request);
+        if (data_size > 0) {
+            memcpy(input.data() + cursor, data.data(), data_size);
+            cursor += data_size;
+        }
+        if (!graph_data.empty()) {
+            memcpy(input.data() + cursor, graph_data.data(), graph_data.size());
+            cursor += graph_data.size();
+        }
+        GGML_ASSERT(cursor == input.size());
+    } else {
+        // Patch-6 server compatibility: preserve the original header exactly.
+        rpc_msg_set_tensor_graph_req_v6 request {};
+        request.tensor = serialize_tensor(dst);
+        request.offset = 0;
+        request.size = data_size;
+        request.graph_size = graph_data.size();
+
+        if (data_size > SIZE_MAX - sizeof(request) ||
+                graph_data.size() > SIZE_MAX - sizeof(request) - data_size) {
+            return false;
+        }
+
+        input.resize(sizeof(request) + data_size + graph_data.size());
+        size_t cursor = 0;
+        memcpy(input.data() + cursor, &request, sizeof(request));
+        cursor += sizeof(request);
+        if (data_size > 0) {
+            memcpy(input.data() + cursor, data.data(), data_size);
+            cursor += data_size;
+        }
+        if (!graph_data.empty()) {
+            memcpy(input.data() + cursor, graph_data.data(), graph_data.size());
+            cursor += graph_data.size();
+        }
+        GGML_ASSERT(cursor == input.size());
     }
-    if (!graph_data.empty()) {
-        memcpy(input.data() + cursor, graph_data.data(), graph_data.size());
-        cursor += graph_data.size();
-    }
-    GGML_ASSERT(cursor == input.size());
 
     const int64_t t0 = ggml_time_us();
     const bool status = send_rpc_cmd(
@@ -2213,12 +2286,21 @@ static bool ggml_backend_rpc_set_tensor_graph(
         input.data(),
         input.size());
 
+    if (status && cache_supported && !cache_hit) {
+        // Same control socket is strictly ordered: once the full graph command
+        // has been sent, a later cached command cannot overtake its server-side
+        // reconstruction.  Socket replacement clears this cache above.
+        rpc_dev_ctx->fused_set_graph_uids.insert(graph_uid);
+    }
+
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
-            "[RPC_SET_GRAPH_CLIENT] tensor=%s bytes=%zu graph_bytes=%zu "
-            "total=%.3f ms\n",
+            "[RPC_SET_GRAPH_CLIENT] tensor=%s bytes=%zu graph_uid=%" PRIu64
+            " cache=%d graph_bytes=%zu total=%.3f ms\n",
             dst->name,
             data_size,
+            graph_uid,
+            cache_hit ? 1 : 0,
             graph_data.size(),
             (ggml_time_us() - t0) / 1000.0);
     }
@@ -4209,56 +4291,101 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 
 bool rpc_server::set_tensor_graph_compute(
         const std::vector<uint8_t> & input) {
-    if (input.size() < sizeof(rpc_msg_set_tensor_graph_req)) {
+    if (input.size() < sizeof(rpc_msg_set_tensor_graph_req_v6)) {
         return false;
     }
 
-    rpc_msg_set_tensor_graph_req request {};
-    memcpy(&request, input.data(), sizeof(request));
+    rpc_msg_set_tensor_graph_req_v6 request_v6 {};
+    memcpy(&request_v6, input.data(), sizeof(request_v6));
 
-    const size_t data_size = static_cast<size_t>(request.size);
-    const size_t graph_size = static_cast<size_t>(request.graph_size);
-    if (data_size > SIZE_MAX - sizeof(request) ||
-            graph_size > SIZE_MAX - sizeof(request) - data_size ||
-            input.size() != sizeof(request) + data_size + graph_size) {
-        return false;
+    const size_t data_size = static_cast<size_t>(request_v6.size);
+    const size_t graph_size = static_cast<size_t>(request_v6.graph_size);
+
+    size_t header_size = sizeof(request_v6);
+    bool cached_graph_request = false;
+    uint64_t graph_uid = 0;
+    uint32_t device = 0;
+
+    const bool v6_size_ok =
+        data_size <= SIZE_MAX - sizeof(request_v6) &&
+        graph_size <= SIZE_MAX - sizeof(request_v6) - data_size &&
+        input.size() == sizeof(request_v6) + data_size + graph_size;
+
+    if (!v6_size_ok) {
+        if (input.size() < sizeof(rpc_msg_set_tensor_graph_req)) {
+            return false;
+        }
+
+        rpc_msg_set_tensor_graph_req request {};
+        memcpy(&request, input.data(), sizeof(request));
+        if (request.size != request_v6.size ||
+                request.graph_size != request_v6.graph_size) {
+            return false;
+        }
+
+        header_size = sizeof(request);
+        graph_uid = request.graph_uid;
+        device = request.device;
+
+        if (data_size > SIZE_MAX - header_size ||
+                graph_size > SIZE_MAX - header_size - data_size ||
+                input.size() != header_size + data_size + graph_size) {
+            return false;
+        }
+
+        cached_graph_request = graph_size == 0;
+        if (cached_graph_request &&
+                (graph_uid == 0 || device >= backends.size())) {
+            return false;
+        }
     }
 
-    const uint8_t * data = input.data() + sizeof(request);
+    const uint8_t * data = input.data() + header_size;
     bool async_write_used = false;
     if (std::getenv("GGML_RPC_DISABLE_OPENCL_ASYNC_SET_ADD") == nullptr) {
         async_write_used = set_tensor_direct_opencl_async(
-            request.tensor,
-            request.offset,
+            request_v6.tensor,
+            request_v6.offset,
             data,
             data_size);
     }
 
     if (!async_write_used &&
             !set_tensor_direct(
-                request.tensor,
-                request.offset,
+                request_v6.tensor,
+                request_v6.offset,
                 data,
                 data_size)) {
         return false;
     }
 
-    std::vector<uint8_t> graph_input(graph_size);
-    if (graph_size > 0) {
-        memcpy(
-            graph_input.data(),
-            data + data_size,
-            graph_size);
+    const int64_t t0 = ggml_time_us();
+    bool ok = false;
+
+    if (cached_graph_request) {
+        rpc_msg_graph_recompute_req recompute {};
+        recompute.device = device;
+        recompute.graph_uid = graph_uid;
+        ok = graph_recompute(recompute);
+    } else {
+        std::vector<uint8_t> graph_input(graph_size);
+        if (graph_size > 0) {
+            memcpy(
+                graph_input.data(),
+                data + data_size,
+                graph_size);
+        }
+        ok = graph_compute(graph_input);
     }
 
-    const int64_t t0 = ggml_time_us();
-    const bool ok = graph_compute(graph_input);
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
-            "[RPC_SET_GRAPH_SERVER] tensor=%s bytes=%zu graph_bytes=%zu "
-            "async_write=%d total=%.3f ms status=%d\n",
-            request.tensor.name,
+            "[RPC_SET_GRAPH_SERVER] tensor=%s bytes=%zu graph_uid=%" PRIu64
+            " cache=%d graph_bytes=%zu async_write=%d total=%.3f ms status=%d\n",
+            request_v6.tensor.name,
             data_size,
+            graph_uid,
+            cached_graph_request ? 1 : 0,
             graph_size,
             async_write_used ? 1 : 0,
             (ggml_time_us() - t0) / 1000.0,
