@@ -2560,6 +2560,11 @@ struct ggml_backend_meta_transfer_worker {
         return status;
     }
 
+    bool is_completed(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completed >= id;
+    }
+
     void mark_stage_ready(uint64_t id) {
         std::lock_guard<std::mutex> lock(mutex);
         stage_ready = std::max(stage_ready, id);
@@ -5028,6 +5033,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return GGML_STATUS_SUCCESS;
             }
 
+            const int64_t tail_begin_us = ggml_time_us();
+            size_t layer_chunk_count = 0;
+            size_t pc_ready_at_entry = 0;
+            for (const auto & branch : pending_phone_prefill_pc_branches) {
+                if (branch.layer != layer) {
+                    continue;
+                }
+                ++layer_chunk_count;
+                if (backend_ctx->prefill_pc_worker->is_completed(
+                        branch.pc_task)) {
+                    ++pc_ready_at_entry;
+                }
+            }
+
             // All local Phone FFNs were submitted fire-and-forget on the
             // compute socket.  Before any PC partial is returned and added
             // into Phone state, fence once at the layer barrier so the final
@@ -5044,6 +5063,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const int64_t phone_fence_us =
                 ggml_time_us() - phone_fence_begin_us;
 
+            size_t pc_ready_after_phone_fence = 0;
+            for (const auto & branch : pending_phone_prefill_pc_branches) {
+                if (branch.layer == layer &&
+                        backend_ctx->prefill_pc_worker->is_completed(
+                            branch.pc_task)) {
+                    ++pc_ready_after_phone_fence;
+                }
+            }
+
             if (pipeline_debug || tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_PREFILL_LAYER_FENCE] "
@@ -5051,6 +5079,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     layer,
                     phone_fence_us / 1000.0);
             }
+
+            int64_t pc_wait_total_us = 0;
+            int64_t return_total_us = 0;
+            size_t drained_chunks = 0;
 
             for (auto it = pending_phone_prefill_pc_branches.begin();
                  it != pending_phone_prefill_pc_branches.end();) {
@@ -5063,13 +5095,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const ggml_status pc_status =
                     backend_ctx->prefill_pc_worker->wait(it->pc_task);
                 const int64_t wait_us = ggml_time_us() - wait_begin_us;
+                pc_wait_total_us += wait_us;
                 if (pc_status != GGML_STATUS_SUCCESS) {
                     return pc_status;
                 }
 
+                const int64_t return_begin_us = ggml_time_us();
                 const ggml_status return_status =
                     perform_phone_prefill_oneway_return(
                         it->sg, it->layer, it->chunk);
+                const int64_t return_us =
+                    ggml_time_us() - return_begin_us;
+                return_total_us += return_us;
                 if (return_status != GGML_STATUS_SUCCESS) {
                     return return_status;
                 }
@@ -5077,18 +5114,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf(
                         "[PHONE_PREFILL_PIPE_DRAIN] layer=%d chunk=%d sg=%zu "
-                        "pc_wait_ms=%.3f\n",
+                        "pc_wait_ms=%.3f return_ms=%.3f\n",
                         it->layer,
                         it->chunk,
                         it->sg,
-                        wait_us / 1000.0);
+                        wait_us / 1000.0,
+                        return_us / 1000.0);
                 }
 
+                ++drained_chunks;
                 pending_phone_prefill_routes.erase({ it->layer, it->chunk });
                 deferred_phone_prefill_return_sgs.erase(it->sg);
                 it = pending_phone_prefill_pc_branches.erase(it);
             }
 
+            if (pipeline_debug || tensor_phone_stage_profile) {
+                const int64_t tail_wall_us =
+                    ggml_time_us() - tail_begin_us;
+                printf(
+                    "[PHONE_PREFILL_PC_DRAIN] "
+                    "layer=%d chunks=%zu ready_at_entry=%zu "
+                    "ready_after_phone_fence=%zu phone_fence_ms=%.3f "
+                    "pc_wait_ms=%.3f return_ms=%.3f tail_ms=%.3f\n",
+                    layer,
+                    drained_chunks,
+                    pc_ready_at_entry,
+                    pc_ready_after_phone_fence,
+                    phone_fence_us / 1000.0,
+                    pc_wait_total_us / 1000.0,
+                    return_total_us / 1000.0,
+                    tail_wall_us / 1000.0);
+            }
+
+            GGML_ASSERT(drained_chunks == layer_chunk_count);
             return GGML_STATUS_SUCCESS;
         };
 
