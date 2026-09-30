@@ -20,6 +20,15 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
 #define GGML_BACKEND_OPENCL_GET_TENSOR_BATCH3_PROC \
     "ggml_backend_opencl_get_tensor_batch3"
 
+#define GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC \
+    "ggml_backend_opencl_set_tensor_async"
+
+typedef bool (*ggml_backend_opencl_set_tensor_async_t)(
+        struct ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size);
+
 typedef bool (*ggml_backend_opencl_get_tensor_batch3_t)(
         const struct ggml_tensor * tensor0,
         void * data0,

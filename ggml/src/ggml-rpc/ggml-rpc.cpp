@@ -2709,6 +2709,11 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
+    bool set_tensor_direct_opencl_async(
+        const rpc_tensor & in_tensor,
+        uint64_t offset,
+        const void * data,
+        size_t size);
     bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
@@ -3391,6 +3396,65 @@ bool rpc_server::set_tensor_direct(
             tensor->data,
             tensor->extra);
     }
+    return true;
+}
+
+bool rpc_server::set_tensor_direct_opencl_async(
+        const rpc_tensor & in_tensor,
+        uint64_t offset,
+        const void * data,
+        size_t size) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+
+    ggml_tensor * tensor =
+        deserialize_tensor(ctx_ptr.get(), &in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+            !is_opencl_tensor(tensor)) {
+        return false;
+    }
+
+    const size_t p0 =
+        (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const size_t p1 =
+        p0 + ggml_backend_buffer_get_size(tensor->buffer);
+    if (in_tensor.data + offset < p0 ||
+            in_tensor.data + offset >= p1 ||
+            size > (p1 - in_tensor.data - offset)) {
+        return false;
+    }
+
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev =
+        ggml_backend_buft_get_device(tensor->buffer->buft);
+    ggml_backend_reg_t reg =
+        dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const ggml_backend_opencl_set_tensor_async_t set_async =
+        reg != nullptr ?
+            reinterpret_cast<ggml_backend_opencl_set_tensor_async_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg,
+                    GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC)) :
+            nullptr;
+
+    if (set_async == nullptr ||
+            !set_async(
+                tensor,
+                data,
+                static_cast<size_t>(offset),
+                size)) {
+        return false;
+    }
+
+    remember_opencl_tensor_extra(tensor);
     return true;
 }
 
@@ -4161,11 +4225,21 @@ bool rpc_server::set_tensor_graph_compute(
     }
 
     const uint8_t * data = input.data() + sizeof(request);
-    if (!set_tensor_direct(
+    bool async_write_used = false;
+    if (std::getenv("GGML_RPC_DISABLE_OPENCL_ASYNC_SET_ADD") == nullptr) {
+        async_write_used = set_tensor_direct_opencl_async(
             request.tensor,
             request.offset,
             data,
-            data_size)) {
+            data_size);
+    }
+
+    if (!async_write_used &&
+            !set_tensor_direct(
+                request.tensor,
+                request.offset,
+                data,
+                data_size)) {
         return false;
     }
 
@@ -4182,10 +4256,11 @@ bool rpc_server::set_tensor_graph_compute(
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_SET_GRAPH_SERVER] tensor=%s bytes=%zu graph_bytes=%zu "
-            "total=%.3f ms status=%d\n",
+            "async_write=%d total=%.3f ms status=%d\n",
             request.tensor.name,
             data_size,
             graph_size,
+            async_write_used ? 1 : 0,
             (ggml_time_us() - t0) / 1000.0,
             ok ? 1 : 0);
     }

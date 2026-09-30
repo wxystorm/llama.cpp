@@ -10097,6 +10097,55 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     GGML_UNUSED(buffer);
 }
 
+static bool ggml_backend_opencl_set_tensor_async(
+        ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size) {
+    if (tensor == nullptr || data == nullptr ||
+            tensor->buffer == nullptr || tensor->buffer->buft == nullptr ||
+            tensor->extra == nullptr ||
+            tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (offset > nbytes || size > nbytes - offset) {
+        return false;
+    }
+
+    auto * dev_ctx =
+        static_cast<ggml_backend_opencl_device_context *>(
+            tensor->buffer->buft->device->context);
+    if (dev_ctx == nullptr || dev_ctx->backend_ctx == nullptr) {
+        return false;
+    }
+
+    auto * backend_ctx = dev_ctx->backend_ctx;
+    auto * extra =
+        static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+    if (extra->data_device == nullptr) {
+        return false;
+    }
+
+    // The Qualcomm/OpenCL compute queue is in-order.  The fused RPC keeps the
+    // host packet alive until its ADD graph completes synchronously, so the
+    // write may remain nonblocking on the host while queue ordering guarantees
+    // that ADD observes the new PC partial.
+    sync_with_other_backends(backend_ctx);
+    CL_CHECK(clEnqueueWriteBuffer(
+        backend_ctx->queue,
+        extra->data_device,
+        CL_FALSE,
+        extra->offset + tensor->view_offs + offset,
+        size,
+        data,
+        0,
+        nullptr,
+        nullptr));
+    return true;
+}
+
 static bool ggml_backend_opencl_get_tensor_batch3(
         const ggml_tensor * tensor0,
         void * data0,
@@ -10473,6 +10522,12 @@ static void * ggml_backend_opencl_reg_get_proc_address(
             GGML_BACKEND_OPENCL_GET_TENSOR_BATCH3_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_opencl_get_tensor_batch3);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_opencl_set_tensor_async);
     }
     return nullptr;
 }
