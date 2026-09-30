@@ -10097,7 +10097,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     GGML_UNUSED(buffer);
 }
 
-static bool ggml_backend_opencl_set_tensor_async(
+static bool ggml_backend_opencl_set_tensor_rpc_async_write(
         ggml_tensor * tensor,
         const void * data,
         size_t offset,
@@ -10527,7 +10527,7 @@ static void * ggml_backend_opencl_reg_get_proc_address(
             name,
             GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC) == 0) {
         return reinterpret_cast<void *>(
-            ggml_backend_opencl_set_tensor_async);
+            ggml_backend_opencl_set_tensor_rpc_async_write);
     }
     return nullptr;
 }
