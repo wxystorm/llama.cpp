@@ -8416,6 +8416,7 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
+        int64_t subgraph_compute_wall_us = 0;
         if (!compute_complete) {
     if (n_backends == 2) {
     ggml_tensor * phone_wdown =
@@ -8923,7 +8924,7 @@ auto prefill_norm_sg_has_prework =
         compute_status = compute_workers.compute(i);
     }
 
-    const int64_t subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
+    subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
     compute_wall_us += subgraph_compute_wall_us;
 
     if (return_wavefront_graph) {
