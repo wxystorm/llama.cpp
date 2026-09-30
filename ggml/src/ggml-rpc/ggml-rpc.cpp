@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-opencl.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -3705,31 +3706,97 @@ bool rpc_server::get_tensor(
 bool rpc_server::get_tensor_batch3(
         const rpc_msg_get_tensor_batch3_req & request,
         std::vector<uint8_t> & response) {
+    size_t sizes[3] = {};
+    size_t response_offsets[3] = {};
     size_t total_size = 0;
     for (size_t i = 0; i < 3; ++i) {
         if (request.items[i].size > SIZE_MAX - total_size) {
             return false;
         }
-        total_size += static_cast<size_t>(request.items[i].size);
+        response_offsets[i] = total_size;
+        sizes[i] = static_cast<size_t>(request.items[i].size);
+        total_size += sizes[i];
     }
 
     response.resize(total_size);
-    size_t response_offset = 0;
     const int64_t t0 = ggml_time_us();
-    for (size_t i = 0; i < 3; ++i) {
-        if (!get_tensor_into(
-                request.items[i],
-                response.data() + response_offset)) {
-            return false;
+
+    bool opencl_batch_used = false;
+    if (std::getenv("GGML_RPC_DISABLE_OPENCL_BATCH3_READ") == nullptr) {
+        struct ggml_init_params params {
+            /*.mem_size   =*/ 3 * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+
+        ggml_tensor * tensors[3] = {};
+        bool valid = true;
+        for (size_t i = 0; i < 3; ++i) {
+            tensors[i] =
+                deserialize_tensor(ctx_ptr.get(), &request.items[i].tensor);
+            if (tensors[i] == nullptr || tensors[i]->buffer == nullptr ||
+                    !is_opencl_tensor(tensors[i]) ||
+                    !ensure_opencl_tensor_extra(tensors[i])) {
+                valid = false;
+                break;
+            }
         }
-        response_offset += static_cast<size_t>(request.items[i].size);
+
+        if (valid) {
+            ggml_backend_dev_t dev =
+                ggml_backend_buft_get_device(tensors[0]->buffer->buft);
+            for (size_t i = 1; i < 3 && valid; ++i) {
+                valid =
+                    ggml_backend_buft_get_device(tensors[i]->buffer->buft) ==
+                    dev;
+            }
+
+            ggml_backend_reg_t reg =
+                valid && dev != nullptr ?
+                    ggml_backend_dev_backend_reg(dev) : nullptr;
+            const ggml_backend_opencl_get_tensor_batch3_t opencl_batch =
+                reg != nullptr ?
+                    reinterpret_cast<ggml_backend_opencl_get_tensor_batch3_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg,
+                            GGML_BACKEND_OPENCL_GET_TENSOR_BATCH3_PROC)) :
+                    nullptr;
+
+            if (opencl_batch != nullptr) {
+                opencl_batch_used = opencl_batch(
+                    tensors[0],
+                    response.data() + response_offsets[0],
+                    static_cast<size_t>(request.items[0].offset),
+                    sizes[0],
+                    tensors[1],
+                    response.data() + response_offsets[1],
+                    static_cast<size_t>(request.items[1].offset),
+                    sizes[1],
+                    tensors[2],
+                    response.data() + response_offsets[2],
+                    static_cast<size_t>(request.items[2].offset),
+                    sizes[2]);
+            }
+        }
     }
-    GGML_ASSERT(response_offset == response.size());
+
+    if (!opencl_batch_used) {
+        for (size_t i = 0; i < 3; ++i) {
+            if (!get_tensor_into(
+                    request.items[i],
+                    response.data() + response_offsets[i])) {
+                return false;
+            }
+        }
+    }
 
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
-            "[RPC_SERVER_GET_BATCH3] bytes=%zu total=%.3f ms\n",
+            "[RPC_SERVER_GET_BATCH3] bytes=%zu opencl_wait1=%d total=%.3f ms\n",
             total_size,
+            opencl_batch_used ? 1 : 0,
             (ggml_time_us() - t0) / 1000.0);
     }
     return true;

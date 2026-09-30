@@ -10097,6 +10097,103 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     GGML_UNUSED(buffer);
 }
 
+static bool ggml_backend_opencl_get_tensor_batch3(
+        const ggml_tensor * tensor0,
+        void * data0,
+        size_t offset0,
+        size_t size0,
+        const ggml_tensor * tensor1,
+        void * data1,
+        size_t offset1,
+        size_t size1,
+        const ggml_tensor * tensor2,
+        void * data2,
+        size_t offset2,
+        size_t size2) {
+    const ggml_tensor * tensors[3] = { tensor0, tensor1, tensor2 };
+    void * datas[3] = { data0, data1, data2 };
+    const size_t offsets[3] = { offset0, offset1, offset2 };
+    const size_t sizes[3] = { size0, size1, size2 };
+
+    ggml_backend_opencl_context * backend_ctx = nullptr;
+    cl_command_queue queue = nullptr;
+    ggml_tensor_extra_cl * extras[3] = {};
+
+    // Router batch fast path is intentionally narrow: the current Phone
+    // handoff is F32 hidden + I32 topk + F32 weights, all backed by the generic
+    // OpenCL tensor storage.  Validate everything before enqueueing so a false
+    // return is always safe for the RPC fallback.
+    for (size_t i = 0; i < 3; ++i) {
+        const ggml_tensor * tensor = tensors[i];
+        if (tensor == nullptr || datas[i] == nullptr ||
+                tensor->buffer == nullptr || tensor->buffer->buft == nullptr ||
+                tensor->extra == nullptr ||
+                (tensor->type != GGML_TYPE_F32 &&
+                 tensor->type != GGML_TYPE_I32)) {
+            return false;
+        }
+
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (offsets[i] > nbytes || sizes[i] > nbytes - offsets[i]) {
+            return false;
+        }
+
+        auto * dev_ctx =
+            static_cast<ggml_backend_opencl_device_context *>(
+                tensor->buffer->buft->device->context);
+        if (dev_ctx == nullptr || dev_ctx->backend_ctx == nullptr) {
+            return false;
+        }
+
+        if (backend_ctx == nullptr) {
+            backend_ctx = dev_ctx->backend_ctx;
+            queue = backend_ctx->queue;
+        } else if (backend_ctx != dev_ctx->backend_ctx) {
+            return false;
+        }
+
+        extras[i] =
+            static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+        if (extras[i]->data_device == nullptr) {
+            return false;
+        }
+    }
+
+    sync_with_other_backends(backend_ctx);
+
+    // The OpenCL queue is created in-order (command_queue_props == 0).  Enqueue
+    // all three reads without blocking and wait only for the final read event;
+    // completion of that event implies both earlier reads have completed too.
+    for (size_t i = 0; i < 2; ++i) {
+        CL_CHECK(clEnqueueReadBuffer(
+            queue,
+            extras[i]->data_device,
+            CL_FALSE,
+            extras[i]->offset + tensors[i]->view_offs + offsets[i],
+            sizes[i],
+            datas[i],
+            0,
+            nullptr,
+            nullptr));
+    }
+
+    cl_event final_event = nullptr;
+    CL_CHECK(clEnqueueReadBuffer(
+        queue,
+        extras[2]->data_device,
+        CL_FALSE,
+        extras[2]->offset + tensors[2]->view_offs + offsets[2],
+        sizes[2],
+        datas[2],
+        0,
+        nullptr,
+        &final_event));
+    CL_CHECK(clWaitForEvents(1, &final_event));
+    CL_CHECK(clReleaseEvent(final_event));
+
+    return true;
+}
+
 static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
@@ -10367,11 +10464,24 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+static void * ggml_backend_opencl_reg_get_proc_address(
+        ggml_backend_reg_t reg,
+        const char * name) {
+    GGML_UNUSED(reg);
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_OPENCL_GET_TENSOR_BATCH3_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_opencl_get_tensor_batch3);
+    }
+    return nullptr;
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {
