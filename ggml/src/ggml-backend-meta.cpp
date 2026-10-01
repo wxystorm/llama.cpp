@@ -2332,6 +2332,8 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_return_worker = nullptr;
+    std::vector<std::shared_ptr<std::vector<uint8_t>>>
+        prefill_pc_return_host_payloads;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES> prefill_reduce_workers { nullptr,
                                                                                                   nullptr };
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES> prefill_route_workers { nullptr,
@@ -10231,9 +10233,20 @@ auto prefill_norm_sg_has_prework =
                 phone_return_stage->data =
                     ggml_backend_buffer_get_base(return_buf.get());
 
-                return_payload =
-                    std::make_shared<std::vector<uint8_t>>(
-                        return_bytes);
+                auto & host_payloads =
+                    backend_ctx->prefill_pc_return_host_payloads;
+                if (host_payloads.size() <= return_slot) {
+                    host_payloads.resize(return_slot + 1);
+                }
+                auto & host_payload =
+                    host_payloads[return_slot];
+                if (host_payload == nullptr ||
+                        host_payload->size() != return_bytes) {
+                    host_payload =
+                        std::make_shared<std::vector<uint8_t>>(
+                            return_bytes);
+                }
+                return_payload = host_payload;
 
                 if (pipeline_debug) {
                     printf(
