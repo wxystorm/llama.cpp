@@ -2636,7 +2636,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
         memcpy(input.data() + cursor, &request, sizeof(request));
         cursor += sizeof(request);
         if (data_size > 0) {
-            memcpy(input.data() + cursor, data.data(), data_size);
+            memcpy(input.data() + cursor, data, data_size);
             cursor += data_size;
         }
         if (!graph_data.empty()) {
