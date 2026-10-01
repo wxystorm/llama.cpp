@@ -2013,7 +2013,7 @@ RPC_STATUS_ASSERT(status);
 static bool ggml_backend_rpc_route_mark_ready(
         ggml_backend_t backend,
         uint64_t seq) {
-    if (backend == nullptr || seq == 0) {
+    if (backend == nullptr) {
         return false;
     }
 
@@ -2027,6 +2027,10 @@ static bool ggml_backend_rpc_route_mark_ready(
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     if (rpc_get_remote_patch(compute_key) < RPC_ROUTE_SEQ_MIN_PATCH) {
         return false;
+    }
+    if (seq == 0) {
+        // Capability query used by Meta before it rebinds producer storage.
+        return true;
     }
 
     rpc_msg_route_mark_ready_req request {};
