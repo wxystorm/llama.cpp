@@ -5549,6 +5549,44 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
+        n_tokens_all > 1 && has_runtime_plan && runtime_plan.tensor_layers > 0) {
+        llama_hybrid_tensor_compute_prediction validate_prediction;
+        if (llama_hybrid_runtime_predict_tensor_compute(
+                (int) n_tokens_all, validate_prediction)) {
+            LLAMA_LOG_ERROR(
+                "[TENSOR_PREDICT_VALIDATE] mode=DECODE_SUMMARY "
+                "primary=%s tokens=%d T=%d R=%.3f XT=%d chunks=%d "
+                "planner_ref_pred_ms=%.3f tensor_pred_ms=%.3f "
+                "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
+                "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
+                "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
+                "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
+                "pipeline_done_pred_ms=%.3f overlap_saved_pred_ms=%.3f\n",
+                tensor_phone_primary_exec ? "PHONE" : "PC",
+                validate_prediction.tokens,
+                validate_prediction.tensor_layers,
+                validate_prediction.tensor_pc_ratio,
+                validate_prediction.tensor_chunk_tokens,
+                validate_prediction.tensor_chunks,
+                runtime_plan.predicted_ms,
+                validate_prediction.tensor_total_ms,
+                validate_prediction.attn_misc_ms,
+                validate_prediction.pipeline_h2d_sum_ms,
+                validate_prediction.pipeline_pc_ffn_sum_ms,
+                validate_prediction.pipeline_phone_sum_ms,
+                validate_prediction.pipeline_d2h_sum_ms,
+                validate_prediction.pipeline_h2d_finish_ms,
+                validate_prediction.pipeline_pc_finish_ms,
+                validate_prediction.pipeline_phone_finish_ms,
+                validate_prediction.pipeline_return_finish_ms,
+                validate_prediction.pipeline_reduce_tail_ms,
+                validate_prediction.pipeline_done_ms,
+                validate_prediction.pipeline_overlap_saved_ms);
+        }
+    }
+
     return 0;
 }
 
