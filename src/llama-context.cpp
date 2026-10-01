@@ -2841,7 +2841,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.prepare_us +
                 stage_timing.compute_range_us +
                 stage_timing.sync_us;
-            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr) {
+            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
+                    ubatch.n_tokens > 16) {
                 llama_hybrid_tensor_compute_prediction validate_prediction;
                 if (llama_hybrid_runtime_predict_tensor_compute(
                         (int) ubatch.n_tokens, validate_prediction)) {
@@ -2857,7 +2858,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
                         "prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
                         "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
                         "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
-                        "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                        "phone_start_pred_ms=%.3f return_sum_pred_ms=%.3f "
+                        "h2d_finish_pred_ms=%.3f "
                         "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
                         "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
                         "pipeline_done_pred_ms=%.3f\n",
@@ -2878,6 +2880,7 @@ llm_graph_result * llama_context::process_ubatch_staged(
                         validate_prediction.pipeline_h2d_sum_ms,
                         validate_prediction.pipeline_pc_ffn_sum_ms,
                         validate_prediction.pipeline_phone_sum_ms,
+                        validate_prediction.pipeline_phone_start_ms,
                         validate_prediction.pipeline_d2h_sum_ms,
                         validate_prediction.pipeline_h2d_finish_ms,
                         validate_prediction.pipeline_pc_finish_ms,
@@ -4350,7 +4353,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 tensor_stage_timing.sync_us;
             const int64_t tensor_stage_unaccounted_us =
                 std::max<int64_t>(0, tensor_total_us - tensor_stage_accounted_us);
-            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr) {
+            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
+                    job.ubatch.n_tokens > 16) {
                 llama_hybrid_tensor_compute_prediction validate_prediction;
                 if (llama_hybrid_runtime_predict_tensor_compute(
                         (int) job.ubatch.n_tokens, validate_prediction)) {
@@ -4366,7 +4370,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         "prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
                         "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
                         "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
-                        "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                        "phone_start_pred_ms=%.3f return_sum_pred_ms=%.3f "
+                        "h2d_finish_pred_ms=%.3f "
                         "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
                         "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
                         "pipeline_done_pred_ms=%.3f\n",
@@ -4387,6 +4392,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         validate_prediction.pipeline_h2d_sum_ms,
                         validate_prediction.pipeline_pc_ffn_sum_ms,
                         validate_prediction.pipeline_phone_sum_ms,
+                        validate_prediction.pipeline_phone_start_ms,
                         validate_prediction.pipeline_d2h_sum_ms,
                         validate_prediction.pipeline_h2d_finish_ms,
                         validate_prediction.pipeline_pc_finish_ms,
@@ -5550,7 +5556,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
-        n_tokens_all > 1 && has_runtime_plan && runtime_plan.tensor_layers > 0) {
+        n_tokens_all > 16 && has_runtime_plan && runtime_plan.tensor_layers > 0) {
         llama_hybrid_tensor_compute_prediction validate_prediction;
         if (llama_hybrid_runtime_predict_tensor_compute(
                 (int) n_tokens_all, validate_prediction)) {
@@ -5560,7 +5566,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "planner_ref_pred_ms=%.3f tensor_pred_ms=%.3f "
                 "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
                 "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
-                "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                "phone_start_pred_ms=%.3f return_sum_pred_ms=%.3f "
+                "h2d_finish_pred_ms=%.3f "
                 "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
                 "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
                 "pipeline_done_pred_ms=%.3f overlap_saved_pred_ms=%.3f\n",
@@ -5576,6 +5583,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 validate_prediction.pipeline_h2d_sum_ms,
                 validate_prediction.pipeline_pc_ffn_sum_ms,
                 validate_prediction.pipeline_phone_sum_ms,
+                validate_prediction.pipeline_phone_start_ms,
                 validate_prediction.pipeline_d2h_sum_ms,
                 validate_prediction.pipeline_h2d_finish_ms,
                 validate_prediction.pipeline_pc_finish_ms,
