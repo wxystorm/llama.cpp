@@ -4904,8 +4904,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::map<int, std::vector<phone_prefill_binding_backup>>
         phone_prefill_direct_bindings;
-    std::map<int, std::vector<ggml_tensor *>>
-        phone_prefill_direct_views;
     std::map<std::pair<int, int>, uint64_t>
         phone_prefill_route_producer_seq;
 
@@ -4925,16 +4923,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             });
         };
 
-    auto remember_phone_prefill_view =
+    auto rebind_phone_prefill_view =
         [&](int layer, ggml_tensor * view) {
-            if (view == nullptr || view->view_src == nullptr) {
-                return;
-            }
-            auto & views = phone_prefill_direct_views[layer];
-            if (std::find(views.begin(), views.end(), view) ==
-                    views.end()) {
-                views.push_back(view);
-            }
+            GGML_ASSERT(view != nullptr);
+            GGML_ASSERT(view->view_src != nullptr);
+            GGML_ASSERT(view->view_src->buffer != nullptr);
+            GGML_ASSERT(view->view_src->data != nullptr);
+
+            // This view is already initialized by the scheduler.  Calling
+            // ggml_backend_view_init() again would assert because buffer/data
+            // are non-null.  Preserve its original binding and rewrite only
+            // the descriptor used for RPC serialization.
+            backup_phone_prefill_binding(layer, view);
+            view->buffer = view->view_src->buffer;
+            view->data =
+                static_cast<char *>(view->view_src->data) +
+                view->view_offs;
         };
 
     auto bind_phone_prefill_storage =
@@ -4962,8 +4966,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             storage->data = ggml_backend_buffer_get_base(buf.get());
 
             if (tensor->view_src != nullptr) {
-                ggml_backend_view_init(tensor);
-                remember_phone_prefill_view(layer, tensor);
+                rebind_phone_prefill_view(layer, tensor);
             }
         };
 
@@ -4982,15 +4985,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 it->tensor->data = it->data;
             }
 
-            auto views_it = phone_prefill_direct_views.find(layer);
-            if (views_it != phone_prefill_direct_views.end()) {
-                for (ggml_tensor * view : views_it->second) {
-                    if (view != nullptr && view->view_src != nullptr) {
-                        ggml_backend_view_init(view);
-                    }
-                }
-                phone_prefill_direct_views.erase(views_it);
-            }
             phone_prefill_direct_bindings.erase(binding_it);
         };
 
@@ -5082,8 +5076,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     continue;
                 }
                 if (hidden->view_src == hidden_storage) {
-                    ggml_backend_view_init(hidden);
-                    remember_phone_prefill_view(layer, hidden);
+                    rebind_phone_prefill_view(layer, hidden);
                 }
             }
 
