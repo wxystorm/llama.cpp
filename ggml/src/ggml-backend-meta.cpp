@@ -4818,8 +4818,84 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // produces, plus ggml_time_us() wall-clock stamps around existing calls.
     const bool tensor_phone_stage_profile =
         std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
+    const bool tensor_expert_load_profile =
+        std::getenv("GGML_META_TENSOR_EXPERT_LOAD_PROFILE") != nullptr;
     const bool phone_prefill_chunk_pipeline =
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_PIPELINE") != nullptr;
+
+    struct tensor_expert_load_accum {
+        uint64_t assignments = 0;
+        int64_t read_us = 0;
+        std::vector<uint64_t> counts;
+    };
+
+    std::mutex tensor_expert_load_mutex;
+    std::map<int, tensor_expert_load_accum> tensor_expert_load_by_layer;
+    std::map<int, std::pair<int64_t, int64_t>> tensor_expert_shard_by_layer;
+
+    auto tensor_expert_top_string =
+        [](const std::vector<uint64_t> & counts, size_t limit) {
+            std::vector<std::pair<uint64_t, size_t>> ranked;
+            ranked.reserve(counts.size());
+            for (size_t expert = 0; expert < counts.size(); ++expert) {
+                if (counts[expert] != 0) {
+                    ranked.push_back({ counts[expert], expert });
+                }
+            }
+            std::sort(
+                ranked.begin(), ranked.end(),
+                [](const auto & a, const auto & b) {
+                    if (a.first != b.first) {
+                        return a.first > b.first;
+                    }
+                    return a.second < b.second;
+                });
+            if (ranked.size() > limit) {
+                ranked.resize(limit);
+            }
+
+            std::string out;
+            for (size_t i = 0; i < ranked.size(); ++i) {
+                if (i != 0) {
+                    out += ",";
+                }
+                out += std::to_string(ranked[i].second);
+                out += ":";
+                out += std::to_string(ranked[i].first);
+            }
+            return out;
+        };
+
+    auto tensor_moe_ffn_shard_width =
+        [](const ggml_cgraph * graph) -> int64_t {
+            if (graph == nullptr) {
+                return -1;
+            }
+            for (int node_index = 0;
+                 node_index < graph->n_nodes;
+                 ++node_index) {
+                const ggml_tensor * node = graph->nodes[node_index];
+                if (node == nullptr ||
+                        node->op != GGML_OP_MUL_MAT_ID ||
+                        node->src[0] == nullptr) {
+                    continue;
+                }
+
+                const ggml_tensor * weight = node->src[0];
+                const char * name = weight->name;
+                if (name == nullptr) {
+                    continue;
+                }
+                if (std::strstr(name, "ffn_gate_exps.weight") != nullptr ||
+                        std::strstr(name, "ffn_up_exps.weight") != nullptr) {
+                    return weight->ne[1];
+                }
+                if (std::strstr(name, "ffn_down_exps.weight") != nullptr) {
+                    return weight->ne[0];
+                }
+            }
+            return -1;
+        };
 
     struct tensor_phone_stage_timing {
         bool mode_set = false;
@@ -5144,6 +5220,66 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     pc_wait_total_us / 1000.0,
                     return_total_us / 1000.0,
                     tail_wall_us / 1000.0);
+            }
+
+            if (tensor_expert_load_profile) {
+                tensor_expert_load_accum layer_load;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        tensor_expert_load_mutex);
+                    const auto load_it =
+                        tensor_expert_load_by_layer.find(layer);
+                    if (load_it !=
+                            tensor_expert_load_by_layer.end()) {
+                        layer_load = load_it->second;
+                        tensor_expert_load_by_layer.erase(load_it);
+                    }
+                }
+
+                size_t unique_experts = 0;
+                for (uint64_t count : layer_load.counts) {
+                    unique_experts += count != 0 ? 1 : 0;
+                }
+                const std::string top =
+                    tensor_expert_top_string(
+                        layer_load.counts, 12);
+
+                int64_t pc_ff = -1;
+                int64_t phone_ff = -1;
+                const auto shard_it =
+                    tensor_expert_shard_by_layer.find(layer);
+                if (shard_it !=
+                        tensor_expert_shard_by_layer.end()) {
+                    pc_ff = shard_it->second.first;
+                    phone_ff = shard_it->second.second;
+                    tensor_expert_shard_by_layer.erase(shard_it);
+                }
+                const int64_t total_ff =
+                    pc_ff >= 0 && phone_ff >= 0 ?
+                        pc_ff + phone_ff : -1;
+
+                printf(
+                    "[TENSOR_EXPERT_LOAD_LAYER] "
+                    "layer=%d parity=%s chunks=%zu "
+                    "assignments=%" PRIu64 " unique=%zu "
+                    "top=%s read_ms=%.3f "
+                    "pc_ff=%" PRId64 " phone_ff=%" PRId64
+                    " pc_pct=%.3f phone_pct=%.3f\n",
+                    layer,
+                    (layer & 1) != 0 ? "odd" : "even",
+                    drained_chunks,
+                    layer_load.assignments,
+                    unique_experts,
+                    top.c_str(),
+                    layer_load.read_us / 1000.0,
+                    pc_ff,
+                    phone_ff,
+                    total_ff > 0 ?
+                        100.0 * (double) pc_ff /
+                            (double) total_ff : 0.0,
+                    total_ff > 0 ?
+                        100.0 * (double) phone_ff /
+                            (double) total_ff : 0.0);
             }
 
             GGML_ASSERT(drained_chunks == layer_chunk_count);
@@ -9272,9 +9408,42 @@ auto prefill_norm_sg_has_prework =
 
             ggml_cgraph * pc_graph =
                 backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            ggml_cgraph * phone_graph =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
             ggml_backend_t pc_backend =
                 backend_ctx->backend_configs[0].backend;
             GGML_ASSERT(pc_graph != nullptr);
+            GGML_ASSERT(phone_graph != nullptr);
+
+            if (tensor_expert_load_profile &&
+                    prefill_down_chunk == 0) {
+                const int64_t pc_ff =
+                    tensor_moe_ffn_shard_width(pc_graph);
+                const int64_t phone_ff =
+                    tensor_moe_ffn_shard_width(phone_graph);
+                tensor_expert_shard_by_layer[prefill_down_layer] = {
+                    pc_ff,
+                    phone_ff,
+                };
+
+                const int64_t total_ff =
+                    pc_ff >= 0 && phone_ff >= 0 ?
+                        pc_ff + phone_ff : -1;
+                printf(
+                    "[TENSOR_EXPERT_SHARD] "
+                    "layer=%d parity=%s pc_ff=%" PRId64
+                    " phone_ff=%" PRId64 " total_ff=%" PRId64
+                    " pc_pct=%.3f phone_pct=%.3f\n",
+                    prefill_down_layer,
+                    (prefill_down_layer & 1) != 0 ? "odd" : "even",
+                    pc_ff,
+                    phone_ff,
+                    total_ff,
+                    total_ff > 0 ?
+                        100.0 * (double) pc_ff / (double) total_ff : 0.0,
+                    total_ff > 0 ?
+                        100.0 * (double) phone_ff / (double) total_ff : 0.0);
+            }
 
             const uint64_t pc_task =
                 backend_ctx->prefill_pc_worker->enqueue(
@@ -9310,6 +9479,90 @@ auto prefill_norm_sg_has_prework =
                         ggml_backend_synchronize(pc_backend);
                         const int64_t stage_copy_us =
                             ggml_time_us() - stage_copy_begin_us;
+
+                        if (tensor_expert_load_profile &&
+                                route.dst_topk != nullptr) {
+                            const int64_t expert_read_begin_us =
+                                ggml_time_us();
+
+                            const size_t n_topk =
+                                ggml_nelements(route.dst_topk);
+                            std::vector<int32_t> selected;
+                            if (route.dst_topk->type == GGML_TYPE_I32) {
+                                selected.resize(n_topk);
+                                ggml_backend_tensor_get(
+                                    route.dst_topk,
+                                    selected.data(),
+                                    0,
+                                    n_topk * sizeof(int32_t));
+                            }
+
+                            const int64_t expert_read_us =
+                                ggml_time_us() -
+                                expert_read_begin_us;
+
+                            std::vector<uint64_t> chunk_counts;
+                            uint64_t valid_assignments = 0;
+                            for (int32_t expert : selected) {
+                                if (expert < 0) {
+                                    continue;
+                                }
+                                const size_t expert_index =
+                                    static_cast<size_t>(expert);
+                                if (chunk_counts.size() <= expert_index) {
+                                    chunk_counts.resize(
+                                        expert_index + 1, 0);
+                                }
+                                ++chunk_counts[expert_index];
+                                ++valid_assignments;
+                            }
+
+                            size_t unique_experts = 0;
+                            for (uint64_t count : chunk_counts) {
+                                unique_experts += count != 0 ? 1 : 0;
+                            }
+                            const std::string top =
+                                tensor_expert_top_string(
+                                    chunk_counts, 8);
+
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    tensor_expert_load_mutex);
+                                auto & layer_load =
+                                    tensor_expert_load_by_layer[
+                                        prefill_down_layer];
+                                layer_load.assignments +=
+                                    valid_assignments;
+                                layer_load.read_us +=
+                                    expert_read_us;
+                                if (layer_load.counts.size() <
+                                        chunk_counts.size()) {
+                                    layer_load.counts.resize(
+                                        chunk_counts.size(), 0);
+                                }
+                                for (size_t expert = 0;
+                                     expert < chunk_counts.size();
+                                     ++expert) {
+                                    layer_load.counts[expert] +=
+                                        chunk_counts[expert];
+                                }
+                            }
+
+                            printf(
+                                "[TENSOR_EXPERT_LOAD_CHUNK] "
+                                "layer=%d chunk=%d tokens=%" PRId64
+                                " topk=%" PRId64
+                                " assignments=%" PRIu64
+                                " unique=%zu top=%s read_ms=%.3f\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                route.dst_topk->ne[1],
+                                route.dst_topk->ne[0],
+                                valid_assignments,
+                                unique_experts,
+                                top.c_str(),
+                                expert_read_us / 1000.0);
+                        }
 
                         const int64_t pc_begin_us = ggml_time_us();
                         const ggml_status status =
