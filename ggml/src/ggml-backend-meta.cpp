@@ -2287,8 +2287,10 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
         std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES> prefill_reduce_bufs;
         std::vector<std::array<ggml_backend_buffer_ptr, 3>> prefill_route_stage_bufs;
-        // Private Phone-side copies of Router outputs used when the local FFN
-        // is deferred so later chunk Router work can be submitted first.
+        // Private Phone-side storage used by Router-first deferred FFN.
+        // The full normalized hidden is produced directly into one layer-local
+        // buffer, while top-k/weights use per-chunk buffers.
+        ggml_backend_buffer_ptr prefill_phone_hidden_stage_buf;
         std::vector<std::array<ggml_backend_buffer_ptr, 3>> prefill_phone_ffn_stage_bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
@@ -2309,6 +2311,7 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
     uint64_t                    next_snapshot_seq = 1;
+    uint64_t                    next_phone_prefill_route_seq = 1;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
 
@@ -2622,6 +2625,42 @@ ggml_backend_meta_get_route_transfer_lane_setter(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(
             reg,
             GGML_BACKEND_RPC_SET_ROUTE_TRANSFER_LANE_PROC));
+}
+
+static ggml_backend_rpc_set_route_wait_seq_t
+ggml_backend_meta_get_route_wait_seq_setter(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_set_route_wait_seq_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_SET_ROUTE_WAIT_SEQ_PROC));
+}
+
+static ggml_backend_rpc_route_mark_ready_t
+ggml_backend_meta_get_route_mark_ready(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_route_mark_ready_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC));
 }
 
 static ggml_backend_rpc_fence_t ggml_backend_meta_get_rpc_fence(ggml_backend_t backend) {
@@ -3816,6 +3855,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     struct phone_prefill_route_task {
         size_t lane = 0;
         uint64_t task = 0;
+        uint64_t producer_seq = 0;
         ggml_backend_meta_transfer_worker * worker = nullptr;
 
         // Original Phone graph inputs.
@@ -4857,6 +4897,245 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool phone_prefill_defer_phone_ffn =
         std::getenv("GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN") != nullptr;
 
+    struct phone_prefill_binding_backup {
+        ggml_tensor * tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+    };
+    std::map<int, std::vector<phone_prefill_binding_backup>>
+        phone_prefill_direct_bindings;
+    std::map<int, std::vector<ggml_tensor *>>
+        phone_prefill_direct_views;
+    std::map<std::pair<int, int>, uint64_t>
+        phone_prefill_route_producer_seq;
+
+    auto backup_phone_prefill_binding =
+        [&](int layer, ggml_tensor * tensor) {
+            GGML_ASSERT(tensor != nullptr);
+            auto & bindings = phone_prefill_direct_bindings[layer];
+            for (const auto & binding : bindings) {
+                if (binding.tensor == tensor) {
+                    return;
+                }
+            }
+            bindings.push_back({
+                tensor,
+                tensor->buffer,
+                tensor->data,
+            });
+        };
+
+    auto remember_phone_prefill_view =
+        [&](int layer, ggml_tensor * view) {
+            if (view == nullptr || view->view_src == nullptr) {
+                return;
+            }
+            auto & views = phone_prefill_direct_views[layer];
+            if (std::find(views.begin(), views.end(), view) ==
+                    views.end()) {
+                views.push_back(view);
+            }
+        };
+
+    auto bind_phone_prefill_storage =
+        [&](int layer,
+            ggml_tensor * tensor,
+            ggml_backend_buffer_ptr & buf) {
+            GGML_ASSERT(tensor != nullptr);
+            ggml_tensor * storage =
+                tensor->view_src != nullptr ?
+                    tensor->view_src : tensor;
+
+            backup_phone_prefill_binding(layer, storage);
+
+            const size_t need = ggml_nbytes(storage);
+            if (!buf ||
+                    ggml_backend_buffer_get_size(buf.get()) < need) {
+                buf.reset(
+                    ggml_backend_alloc_buffer(
+                        backend_ctx->backend_configs[1].backend,
+                        need));
+            }
+            GGML_ASSERT(buf != nullptr);
+
+            storage->buffer = buf.get();
+            storage->data = ggml_backend_buffer_get_base(buf.get());
+
+            if (tensor->view_src != nullptr) {
+                ggml_backend_view_init(tensor);
+                remember_phone_prefill_view(layer, tensor);
+            }
+        };
+
+    auto restore_phone_prefill_direct_bindings =
+        [&](int layer) {
+            auto binding_it =
+                phone_prefill_direct_bindings.find(layer);
+            if (binding_it == phone_prefill_direct_bindings.end()) {
+                return;
+            }
+
+            for (auto it = binding_it->second.rbegin();
+                 it != binding_it->second.rend();
+                 ++it) {
+                it->tensor->buffer = it->buffer;
+                it->tensor->data = it->data;
+            }
+
+            auto views_it = phone_prefill_direct_views.find(layer);
+            if (views_it != phone_prefill_direct_views.end()) {
+                for (ggml_tensor * view : views_it->second) {
+                    if (view != nullptr && view->view_src != nullptr) {
+                        ggml_backend_view_init(view);
+                    }
+                }
+                phone_prefill_direct_views.erase(views_it);
+            }
+            phone_prefill_direct_bindings.erase(binding_it);
+        };
+
+    auto phone_prefill_direct_defer_eligible =
+        [&](int layer) {
+            if (!phone_prefill_chunk_pipeline ||
+                    !phone_prefill_defer_phone_ffn ||
+                    n_backends != 2 ||
+                    !layer_is_tensor_phone_primary(layer) ||
+                    std::getenv(
+                        "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") ==
+                        nullptr ||
+                    std::getenv(
+                        "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") ==
+                        nullptr ||
+                    std::getenv(
+                        "LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") !=
+                        nullptr ||
+                    std::getenv(
+                        "GGML_META_TP_CONTROL_TRACE_LAYER") !=
+                        nullptr) {
+                return false;
+            }
+
+            if (find_down_chunk(0, true, layer, 1) == nullptr ||
+                    find_down_chunk(1, true, layer, 1) == nullptr) {
+                return false;
+            }
+
+            ggml_backend_t phone_backend =
+                backend_ctx->backend_configs[1].backend;
+            return
+                ggml_backend_meta_get_tensor_batch3(phone_backend) !=
+                    nullptr &&
+                ggml_backend_meta_get_stage_ready_setter(
+                    phone_backend) != nullptr &&
+                ggml_backend_meta_get_route_transfer_lane_setter(
+                    phone_backend) != nullptr &&
+                ggml_backend_meta_get_route_wait_seq_setter(
+                    phone_backend) != nullptr &&
+                ggml_backend_meta_get_route_mark_ready(
+                    phone_backend) != nullptr;
+        };
+
+    auto bind_phone_prefill_hidden_direct =
+        [&](int layer) -> bool {
+            if (!phone_prefill_direct_defer_eligible(layer)) {
+                return false;
+            }
+
+            char hidden_name[96];
+            std::snprintf(
+                hidden_name,
+                sizeof(hidden_name),
+                "prefill_ffn_norm_chunk_0-%d",
+                layer);
+            ggml_tensor * hidden0 =
+                find_exact_named_tensor(1, hidden_name);
+            if (hidden0 == nullptr) {
+                return false;
+            }
+
+            auto & hidden_buf =
+                backend_ctx->backend_configs[1].
+                    prefill_phone_hidden_stage_buf;
+            bind_phone_prefill_storage(
+                layer,
+                hidden0,
+                hidden_buf);
+
+            ggml_tensor * hidden_storage =
+                hidden0->view_src != nullptr ?
+                    hidden0->view_src : hidden0;
+            for (int chunk = 0; chunk < 64; ++chunk) {
+                std::snprintf(
+                    hidden_name,
+                    sizeof(hidden_name),
+                    "prefill_ffn_norm_chunk_%d-%d",
+                    chunk,
+                    layer);
+                ggml_tensor * hidden =
+                    find_exact_named_tensor(1, hidden_name);
+                if (hidden == nullptr) {
+                    if (chunk > 0) {
+                        break;
+                    }
+                    continue;
+                }
+                if (hidden->view_src == hidden_storage) {
+                    ggml_backend_view_init(hidden);
+                    remember_phone_prefill_view(layer, hidden);
+                }
+            }
+
+            return true;
+        };
+
+    auto bind_phone_prefill_route_outputs_direct =
+        [&](int layer, int chunk) -> bool {
+            if (!phone_prefill_direct_defer_eligible(layer) ||
+                    chunk < 0) {
+                return false;
+            }
+
+            char topk_name[96];
+            char weights_name[96];
+            std::snprintf(
+                topk_name,
+                sizeof(topk_name),
+                "phone_prefill_route_topk_chunk_%d-%d",
+                chunk,
+                layer);
+            std::snprintf(
+                weights_name,
+                sizeof(weights_name),
+                "phone_prefill_route_weights_chunk_%d-%d",
+                chunk,
+                layer);
+
+            ggml_tensor * topk =
+                find_exact_named_tensor(1, topk_name);
+            ggml_tensor * weights =
+                find_exact_named_tensor(1, weights_name);
+            if (topk == nullptr || weights == nullptr) {
+                return false;
+            }
+
+            auto & slots =
+                backend_ctx->backend_configs[1].
+                    prefill_phone_ffn_stage_bufs;
+            if (slots.size() <= static_cast<size_t>(chunk)) {
+                slots.resize(static_cast<size_t>(chunk) + 1);
+            }
+
+            bind_phone_prefill_storage(
+                layer,
+                topk,
+                slots[static_cast<size_t>(chunk)][1]);
+            bind_phone_prefill_storage(
+                layer,
+                weights,
+                slots[static_cast<size_t>(chunk)][2]);
+            return true;
+        };
+
     struct tensor_expert_load_accum {
         uint64_t assignments = 0;
         int64_t read_us = 0;
@@ -5190,47 +5469,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         cgraphs[it->sg].cgraph_main;
                 GGML_ASSERT(phone_graph != nullptr);
 
-                struct tensor_binding_backup {
-                    ggml_tensor * tensor = nullptr;
-                    ggml_backend_buffer_t buffer = nullptr;
-                    void * data = nullptr;
-                };
-                tensor_binding_backup bindings[3] = {
-                    { it->src_hidden,
-                      it->src_hidden->buffer,
-                      it->src_hidden->data },
-                    { it->src_topk,
-                      it->src_topk->buffer,
-                      it->src_topk->data },
-                    { it->src_weights,
-                      it->src_weights->buffer,
-                      it->src_weights->data },
-                };
-                ggml_tensor * stages[3] = {
-                    it->stage_hidden,
-                    it->stage_topk,
-                    it->stage_weights,
-                };
-
+                // Inputs are already directly bound to their private
+                // producer buffers.  Force serialization so the remote graph
+                // records those bindings; no local rebind or restore is
+                // needed around this submission.
                 const int64_t bind_begin_us = ggml_time_us();
-                for (size_t k = 0; k < 3; ++k) {
-                    GGML_ASSERT(bindings[k].tensor != nullptr);
-                    GGML_ASSERT(stages[k] != nullptr);
-                    GGML_ASSERT(
-                        ggml_are_same_layout(
-                            bindings[k].tensor,
-                            stages[k]));
-                    bindings[k].tensor->buffer = stages[k]->buffer;
-                    bindings[k].tensor->data = stages[k]->data;
-                }
-
-                // A cached RPC graph would retain the old remote buffer/data
-                // bindings from its first serialization.  Force this deferred
-                // submission to serialize the graph while the three external
-                // inputs are rebound to private staging.  The worker wait is
-                // only a client-side submission wait, but it is sufficient:
-                // serialization and send have finished before we restore the
-                // local tensor metadata.
                 const uint64_t saved_uid = phone_graph->uid;
                 phone_graph->uid = 0;
                 const int64_t bind_us = ggml_time_us() - bind_begin_us;
@@ -5246,10 +5489,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_ffn_submit_us += submit_us;
 
                 phone_graph->uid = saved_uid;
-                for (size_t k = 0; k < 3; ++k) {
-                    bindings[k].tensor->buffer = bindings[k].buffer;
-                    bindings[k].tensor->data = bindings[k].data;
-                }
 
                 if (phone_status != GGML_STATUS_SUCCESS) {
                     return phone_status;
@@ -5434,6 +5673,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             GGML_ASSERT(drained_chunks == layer_chunk_count);
+
+            restore_phone_prefill_direct_bindings(layer);
+            for (auto it = phone_prefill_route_producer_seq.begin();
+                 it != phone_prefill_route_producer_seq.end();) {
+                if (it->first.first == layer) {
+                    it = phone_prefill_route_producer_seq.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             return GGML_STATUS_SUCCESS;
         };
 
@@ -5841,6 +6091,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
             const ggml_backend_rpc_set_route_transfer_lane_t route_set_lane =
                 ggml_backend_meta_get_route_transfer_lane_setter(bcj_src.backend);
+            const ggml_backend_rpc_set_route_wait_seq_t route_set_wait_seq =
+                ggml_backend_meta_get_route_wait_seq_setter(bcj_src.backend);
+            const ggml_backend_rpc_route_mark_ready_t route_mark_ready =
+                ggml_backend_meta_get_route_mark_ready(bcj_src.backend);
             const ggml_backend_rpc_fence_t route_rpc_fence =
                 ggml_backend_meta_get_rpc_fence(bcj_src.backend);
             const bool phone_oneway_reduce =
@@ -5870,7 +6124,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 route_get_batch3 != nullptr &&
                 route_set_stage_ready != nullptr &&
                 route_set_lane != nullptr &&
-                route_rpc_fence != nullptr;
+                route_rpc_fence != nullptr &&
+                (!phone_prefill_defer_phone_ffn ||
+                 (route_set_wait_seq != nullptr &&
+                  route_mark_ready != nullptr));
 
             if (allow_prefill_route_pipeline) {
                 const size_t lane =
@@ -5937,98 +6194,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_tensor * phone_stage_topk = nullptr;
                 ggml_tensor * phone_stage_weights = nullptr;
 
-                int64_t phone_stage_copy_us = 0;
-                int64_t phone_stage_fence_us = 0;
+                uint64_t producer_seq = 0;
                 if (phone_prefill_defer_phone_ffn) {
-                    auto & phone_stage_slots =
-                        backend_ctx->backend_configs[1].
-                            prefill_phone_ffn_stage_bufs;
-                    if (phone_stage_slots.size() <=
-                            static_cast<size_t>(phone_route_chunk)) {
-                        phone_stage_slots.resize(
-                            static_cast<size_t>(phone_route_chunk) + 1);
-                    }
+                    // Direct-producer mode: hidden/top-k/weights were rebound
+                    // to private Phone buffers before their producer graphs
+                    // were submitted.  No Phone->Phone copy occurs here.
+                    phone_stage_hidden = src_hidden;
+                    phone_stage_topk = src_topk;
+                    phone_stage_weights = src_weights;
 
-                    phone_stage_hidden = get_node_aux(src_hidden);
-                    phone_stage_topk = get_node_aux(src_topk);
-                    phone_stage_weights = get_node_aux(src_weights);
-
-                    ggml_tensor * phone_stage_tensors[3] = {
-                        phone_stage_hidden,
-                        phone_stage_topk,
-                        phone_stage_weights,
-                    };
-                    ggml_tensor * phone_src_tensors[3] = {
-                        src_hidden,
-                        src_topk,
-                        src_weights,
-                    };
-
-                    auto & phone_stage_bufs =
-                        phone_stage_slots[
-                            static_cast<size_t>(phone_route_chunk)];
-                    for (size_t stage_index = 0;
-                         stage_index < 3;
-                         ++stage_index) {
-                        const size_t need =
-                            ggml_nbytes(phone_src_tensors[stage_index]);
-                        auto & buf = phone_stage_bufs[stage_index];
-                        if (!buf ||
-                                ggml_backend_buffer_get_size(buf.get()) <
-                                    need) {
-                            buf.reset(
-                                ggml_backend_alloc_buffer(
-                                    route_src_backend,
-                                    need));
-                        }
-                        GGML_ASSERT(buf != nullptr);
-                        phone_stage_tensors[stage_index]->buffer =
-                            buf.get();
-                        phone_stage_tensors[stage_index]->data =
-                            ggml_backend_buffer_get_base(buf.get());
-                    }
-
-                    const int64_t stage_copy_begin_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        route_src_backend,
-                        route_src_backend,
-                        src_hidden,
-                        phone_stage_hidden);
-                    ggml_backend_tensor_copy_async(
-                        route_src_backend,
-                        route_src_backend,
-                        src_topk,
-                        phone_stage_topk);
-                    ggml_backend_tensor_copy_async(
-                        route_src_backend,
-                        route_src_backend,
-                        src_weights,
-                        phone_stage_weights);
-                    phone_stage_copy_us =
-                        ggml_time_us() - stage_copy_begin_us;
-
-                    // RPC has no backend cpy_tensor_async hook, so these
-                    // same-server copies use blocking RPC_COPY_TENSOR on the
-                    // COMPUTE socket.  They are ordered after the Router graph
-                    // and have completed before this call returns.  The route
-                    // socket can therefore read the private staging buffers
-                    // without a whole-backend fence.
-                    phone_stage_fence_us = 0;
-
-                    route_src_hidden = phone_stage_hidden;
-                    route_src_topk = phone_stage_topk;
-                    route_src_weights = phone_stage_weights;
+                    auto seq_it =
+                        phone_prefill_route_producer_seq.find(
+                            { phone_route_layer, phone_route_chunk });
+                    GGML_ASSERT(
+                        seq_it != phone_prefill_route_producer_seq.end());
+                    producer_seq = seq_it->second;
 
                     if (pipeline_debug) {
                         printf(
-                            "[PHONE_PREFILL_PHONE_DEFER_STAGE] "
-                            "layer=%d chunk=%d lane=%zu "
-                            "copy_submit_ms=%.3f fence_ms=%.3f bytes=%zu\n",
+                            "[PHONE_PREFILL_PHONE_DIRECT_STAGE] "
+                            "layer=%d chunk=%d lane=%zu seq=%" PRIu64
+                            " bytes=%zu copy_ms=0.000\n",
                             phone_route_layer,
                             phone_route_chunk,
                             lane,
-                            phone_stage_copy_us / 1000.0,
-                            phone_stage_fence_us / 1000.0,
+                            producer_seq,
                             ggml_nbytes(src_hidden) +
                                 ggml_nbytes(src_topk) +
                                 ggml_nbytes(src_weights));
@@ -6081,6 +6271,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     route_worker->enqueue(
                         [&, route_worker, route_get_batch3,
                             route_set_stage_ready, route_set_lane,
+                            route_set_wait_seq,
                             route_src_hidden, stage_hidden,
                             route_src_topk, stage_topk,
                             route_src_weights, stage_weights,
@@ -6094,6 +6285,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             };
 
                             route_set_lane(static_cast<int>(lane));
+                            if (route_set_wait_seq != nullptr) {
+                                route_set_wait_seq(producer_seq);
+                            }
                             route_set_stage_ready(
                                 ggml_backend_meta_stage_ready,
                                 &stage_context);
@@ -6109,6 +6303,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 ggml_time_us() - route_begin_us;
 
                             route_set_stage_ready(nullptr, nullptr);
+                            if (route_set_wait_seq != nullptr) {
+                                route_set_wait_seq(0);
+                            }
                             route_set_lane(-1);
 
                             if (!used) {
@@ -6144,6 +6341,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     { phone_route_layer, phone_route_chunk }] = {
                         lane,
                         route_task,
+                        producer_seq,
                         route_worker,
                         src_hidden,
                         src_topk,
@@ -9993,8 +10191,39 @@ auto prefill_norm_sg_has_prework =
             layer_is_tensor_phone_primary(prefill_norm_layer);
 
         const size_t norm_backend = phone_primary_prefill_norm ? 1 : 0;
+
+        ggml_cgraph * norm_graph =
+            backend_ctx->backend_configs[norm_backend].
+                cgraphs[i].cgraph_main;
+        const bool direct_hidden_bound =
+            phone_primary_prefill_norm &&
+            prefill_norm_chunk == 0 &&
+            bind_phone_prefill_hidden_direct(
+                prefill_norm_layer);
+        uint64_t saved_norm_uid = 0;
+        if (direct_hidden_bound && norm_graph != nullptr) {
+            saved_norm_uid = norm_graph->uid;
+            norm_graph->uid = 0;
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_PREFILL_DIRECT_HIDDEN] "
+                    "layer=%d sg=%zu bytes=%zu\n",
+                    prefill_norm_layer,
+                    i,
+                    ggml_nbytes(
+                        find_exact_named_tensor(
+                            1,
+                            norm_graph->nodes[
+                                norm_graph->n_nodes - 1]->name)));
+            }
+        }
+
         compute_workers.start(norm_backend, i);
         compute_status = compute_workers.wait(norm_backend);
+
+        if (direct_hidden_bound && norm_graph != nullptr) {
+            norm_graph->uid = saved_norm_uid;
+        }
 
         if (pipeline_debug) {
             ggml_cgraph * graph =
@@ -10073,6 +10302,26 @@ auto prefill_norm_sg_has_prework =
             backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
         communication_sg = phone_block_fused ? phone_block_end : i;
 
+        int direct_route_chunk = -1;
+        int direct_route_layer = -1;
+        bool direct_route_bound = false;
+        uint64_t saved_phone_graph_uid = 0;
+        if (!phone_block_fused &&
+                phone_graph != nullptr &&
+                phone_graph->n_nodes > 0 &&
+                ggml_backend_meta_parse_phone_route_weights(
+                    phone_graph->nodes[
+                        phone_graph->n_nodes - 1]->name,
+                    direct_route_chunk,
+                    direct_route_layer) &&
+                bind_phone_prefill_route_outputs_direct(
+                    direct_route_layer,
+                    direct_route_chunk)) {
+            direct_route_bound = true;
+            saved_phone_graph_uid = phone_graph->uid;
+            phone_graph->uid = 0;
+        }
+
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (pipeline_debug && phone_block_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
@@ -10080,6 +10329,31 @@ auto prefill_norm_sg_has_prework =
         }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
+
+        if (direct_route_bound) {
+            phone_graph->uid = saved_phone_graph_uid;
+            const ggml_backend_rpc_route_mark_ready_t mark_ready =
+                ggml_backend_meta_get_route_mark_ready(
+                    backend_ctx->backend_configs[1].backend);
+            GGML_ASSERT(mark_ready != nullptr);
+            const uint64_t seq =
+                backend_ctx->next_phone_prefill_route_seq++;
+            const bool marked = mark_ready(
+                backend_ctx->backend_configs[1].backend,
+                seq);
+            GGML_ASSERT(marked);
+            phone_prefill_route_producer_seq[
+                { direct_route_layer, direct_route_chunk }] = seq;
+
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_PREFILL_ROUTE_PRODUCER_SEQ] "
+                    "layer=%d chunk=%d seq=%" PRIu64 "\n",
+                    direct_route_layer,
+                    direct_route_chunk,
+                    seq);
+            }
+        }
 
         // Diagnostic-only shadow execution for the first Phone-primary Tensor
         // layer's Attention subgraph.  The real path still consumes the Phone

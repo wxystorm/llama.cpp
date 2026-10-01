@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    7
+#define RPC_PROTO_PATCH_VERSION    8
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -50,6 +50,12 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_SET_ROUTE_TRANSFER_LANE_PROC \
     "ggml_backend_rpc_set_route_transfer_lane"
+
+#define GGML_BACKEND_RPC_SET_ROUTE_WAIT_SEQ_PROC \
+    "ggml_backend_rpc_set_route_wait_seq"
+
+#define GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC \
+    "ggml_backend_rpc_route_mark_ready"
 
 #define GGML_BACKEND_RPC_FENCE_PROC \
     "ggml_backend_rpc_fence"
@@ -128,6 +134,13 @@ using ggml_backend_rpc_set_stage_ready_t = void (*)(
 
 using ggml_backend_rpc_set_route_transfer_lane_t = void (*)(
         int lane);
+
+using ggml_backend_rpc_set_route_wait_seq_t = void (*)(
+        uint64_t seq);
+
+using ggml_backend_rpc_route_mark_ready_t = bool (*)(
+        ggml_backend_t backend,
+        uint64_t seq);
 
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
 

@@ -253,6 +253,7 @@ enum rpc_cmd {
     RPC_CMD_INIT_ZERO_TENSOR,
     RPC_CMD_GET_TENSOR_BATCH3,
     RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
+    RPC_CMD_ROUTE_MARK_READY,
     RPC_CMD_COUNT,
 };
 
@@ -266,6 +267,7 @@ static_assert(RPC_CMD_SET_TENSOR_RECOMPUTE_SNAPSHOT == 22,"RPC_CMD_SET_TENSOR_RE
 static_assert(RPC_CMD_INIT_ZERO_TENSOR == 23, "RPC_CMD_INIT_ZERO_TENSOR must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_TENSOR_BATCH3 == 24, "RPC_CMD_GET_TENSOR_BATCH3 must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_GRAPH_COMPUTE == 25, "RPC_CMD_SET_TENSOR_GRAPH_COMPUTE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_ROUTE_MARK_READY == 26, "RPC_CMD_ROUTE_MARK_READY must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -367,7 +369,15 @@ struct rpc_msg_get_tensor_req {
 };
 
 struct rpc_msg_get_tensor_batch3_req {
+    uint32_t device;
+    uint32_t reserved;
+    uint64_t wait_seq;
     rpc_msg_get_tensor_req items[3];
+};
+
+struct rpc_msg_route_mark_ready_req {
+    uint32_t device;
+    uint64_t seq;
 };
 
 struct rpc_msg_set_tensor_graph_req_v6 {
@@ -784,6 +794,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 static thread_local ggml_backend_rpc_stage_ready_callback_t rpc_stage_ready_callback = nullptr;
 static thread_local void * rpc_stage_ready_user_data = nullptr;
 static thread_local int rpc_route_transfer_lane = -1;
+static thread_local uint64_t rpc_route_wait_seq = 0;
 
 struct rpc_snapshot_read_context {
     bool active = false;
@@ -803,6 +814,10 @@ static void ggml_backend_rpc_set_stage_ready_callback(
 static void ggml_backend_rpc_set_route_transfer_lane(int lane) {
     GGML_ASSERT(lane >= -1 && lane < 2);
     rpc_route_transfer_lane = lane;
+}
+
+static void ggml_backend_rpc_set_route_wait_seq(uint64_t seq) {
+    rpc_route_wait_seq = seq;
 }
 
 static void ggml_backend_rpc_set_snapshot_read(bool enabled, uint32_t slot, uint64_t seq) {
@@ -1989,6 +2004,37 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
 RPC_STATUS_ASSERT(status);
 }
 
+static bool ggml_backend_rpc_route_mark_ready(
+        ggml_backend_t backend,
+        uint64_t seq) {
+    if (backend == nullptr || seq == 0) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_ROUTE_SEQ_MIN_PATCH = 8;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) < RPC_ROUTE_SEQ_MIN_PATCH) {
+        return false;
+    }
+
+    rpc_msg_route_mark_ready_req request {};
+    request.device = rpc_ctx->device;
+    request.seq = seq;
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+    return send_rpc_cmd_compact_small(
+        sock,
+        RPC_CMD_ROUTE_MARK_READY,
+        request);
+}
+
 static bool ggml_backend_rpc_get_tensor_batch3(
         ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
@@ -2011,6 +2057,8 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     const ggml_tensor * srcs[3] = { src0, src1, src2 };
     ggml_tensor * dsts[3] = { dst0, dst1, dst2 };
     rpc_msg_get_tensor_batch3_req request {};
+    request.device = rpc_ctx->device;
+    request.wait_seq = rpc_route_wait_seq;
     size_t sizes[3] = {};
     size_t total_size = 0;
 
@@ -2072,9 +2120,12 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     // command unless the HELLO response explicitly proves support.  Returning
     // false lets Meta fall back to the already-correct three-GET path.
     constexpr uint8_t RPC_BATCH3_MIN_PATCH = 5;
+    constexpr uint8_t RPC_ROUTE_SEQ_MIN_PATCH = 8;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
-    if (remote_patch < RPC_BATCH3_MIN_PATCH) {
+    if (remote_patch < RPC_BATCH3_MIN_PATCH ||
+            (request.wait_seq != 0 &&
+             remote_patch < RPC_ROUTE_SEQ_MIN_PATCH)) {
         LOG_DBG(
             "[RPC_GET_BATCH3_FALLBACK] endpoint=%s remote_patch=%u required=%u\n",
             rpc_ctx->endpoint.c_str(),
@@ -3098,6 +3149,7 @@ public:
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_batch3(const rpc_msg_get_tensor_batch3_req & request, std::vector<uint8_t> & response);
+    bool route_mark_ready(const rpc_msg_route_mark_ready_req & request);
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -3163,6 +3215,11 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+
+    std::mutex route_ready_mutex;
+    std::condition_variable route_ready_cv;
+    std::unordered_map<uint32_t, uint64_t> route_ready_seq;
+
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
     std::mutex snapshot_breakdown_mutex;
@@ -4146,9 +4203,31 @@ bool rpc_server::get_tensor(
     return get_tensor_into(request, response.data());
 }
 
+bool rpc_server::route_mark_ready(
+        const rpc_msg_route_mark_ready_req & request) {
+    {
+        std::lock_guard<std::mutex> lock(route_ready_mutex);
+        uint64_t & ready = route_ready_seq[request.device];
+        ready = std::max(ready, request.seq);
+    }
+    route_ready_cv.notify_all();
+    return true;
+}
+
 bool rpc_server::get_tensor_batch3(
         const rpc_msg_get_tensor_batch3_req & request,
         std::vector<uint8_t> & response) {
+    if (request.wait_seq != 0) {
+        std::unique_lock<std::mutex> lock(route_ready_mutex);
+        route_ready_cv.wait(
+            lock,
+            [&]() {
+                auto it = route_ready_seq.find(request.device);
+                return it != route_ready_seq.end() &&
+                       it->second >= request.wait_seq;
+            });
+    }
+
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t server_begin_us =
@@ -5843,6 +5922,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_ROUTE_MARK_READY: {
+                rpc_msg_route_mark_ready_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.route_mark_ready(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -6308,6 +6397,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_ROUTE_TRANSFER_LANE_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_route_transfer_lane);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_ROUTE_WAIT_SEQ_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_route_wait_seq);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_route_mark_ready);
     }
     if (std::strcmp(
             name,
