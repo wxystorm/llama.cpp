@@ -115,10 +115,10 @@ using ggml_backend_rpc_set_tensor_graph_t = bool (*)(
         const struct ggml_cgraph * graph);
 
 using ggml_backend_rpc_set_tensor_async_return_t = bool (*)(
-        ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
-        const ggml_tensor * src,
-        ggml_tensor * dst);
+        ggml_tensor * dst,
+        const void * data,
+        size_t size);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
