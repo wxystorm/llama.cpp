@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    8
+#define RPC_PROTO_PATCH_VERSION    9
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -87,6 +87,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC \
     "ggml_backend_rpc_set_tensor_graph"
 
+#define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC \
+    "ggml_backend_rpc_set_tensor_async_return"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -110,6 +113,12 @@ using ggml_backend_rpc_set_tensor_graph_t = bool (*)(
         const ggml_tensor * src,
         ggml_tensor * dst,
         const struct ggml_cgraph * graph);
+
+using ggml_backend_rpc_set_tensor_async_return_t = bool (*)(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
