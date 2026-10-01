@@ -6271,7 +6271,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     route_worker->enqueue(
                         [&, route_worker, route_get_batch3,
                             route_set_stage_ready, route_set_lane,
-                            route_set_wait_seq,
+                            route_set_wait_seq, producer_seq,
                             route_src_hidden, stage_hidden,
                             route_src_topk, stage_topk,
                             route_src_weights, stage_weights,
