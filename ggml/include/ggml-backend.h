@@ -488,6 +488,10 @@ extern "C" {
         int64_t wave_late_compute_wall_us;
         int64_t wave_late_barrier_us;
 
+        int64_t route_stage_wait_count;
+        int64_t route_stage_wait_us;
+        int64_t route_stage_wait_max_us;
+
         int64_t lane_reuse_wait_count;
         int64_t lane_reuse_wait_us;
         int64_t lane_reuse_wait_max_us;
