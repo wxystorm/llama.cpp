@@ -10485,7 +10485,9 @@ auto prefill_norm_sg_has_prework =
                      return_payload,
                      prefill_down_layer,
                      prefill_down_chunk,
-                     i]
+                     i,
+                     pipeline_debug,
+                     tensor_phone_stage_profile]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t wait_begin_us =
                             ggml_time_us();
