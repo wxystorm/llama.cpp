@@ -254,6 +254,7 @@ enum rpc_cmd {
     RPC_CMD_GET_TENSOR_BATCH3,
     RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
     RPC_CMD_ROUTE_MARK_READY,
+    RPC_CMD_GET_TENSOR_BATCH3_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -268,6 +269,7 @@ static_assert(RPC_CMD_INIT_ZERO_TENSOR == 23, "RPC_CMD_INIT_ZERO_TENSOR must be 
 static_assert(RPC_CMD_GET_TENSOR_BATCH3 == 24, "RPC_CMD_GET_TENSOR_BATCH3 must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_GRAPH_COMPUTE == 25, "RPC_CMD_SET_TENSOR_GRAPH_COMPUTE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_MARK_READY == 26, "RPC_CMD_ROUTE_MARK_READY must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GET_TENSOR_BATCH3_WAIT == 27, "RPC_CMD_GET_TENSOR_BATCH3_WAIT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -369,10 +371,14 @@ struct rpc_msg_get_tensor_req {
 };
 
 struct rpc_msg_get_tensor_batch3_req {
+    rpc_msg_get_tensor_req items[3];
+};
+
+struct rpc_msg_get_tensor_batch3_wait_req {
     uint32_t device;
     uint32_t reserved;
     uint64_t wait_seq;
-    rpc_msg_get_tensor_req items[3];
+    rpc_msg_get_tensor_batch3_req batch;
 };
 
 struct rpc_msg_route_mark_ready_req {
@@ -2057,8 +2063,6 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     const ggml_tensor * srcs[3] = { src0, src1, src2 };
     ggml_tensor * dsts[3] = { dst0, dst1, dst2 };
     rpc_msg_get_tensor_batch3_req request {};
-    request.device = rpc_ctx->device;
-    request.wait_seq = rpc_route_wait_seq;
     size_t sizes[3] = {};
     size_t total_size = 0;
 
@@ -2124,7 +2128,7 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
     if (remote_patch < RPC_BATCH3_MIN_PATCH ||
-            (request.wait_seq != 0 &&
+            (rpc_route_wait_seq != 0 &&
              remote_patch < RPC_ROUTE_SEQ_MIN_PATCH)) {
         LOG_DBG(
             "[RPC_GET_BATCH3_FALLBACK] endpoint=%s remote_patch=%u required=%u\n",
@@ -2152,21 +2156,44 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     std::vector<uint8_t> response(total_size);
 
     const int64_t rpc_begin_us = ggml_time_us();
-    const bool status = staged_route ?
-        send_rpc_cmd_staged(
-            sock,
-            RPC_CMD_GET_TENSOR_BATCH3,
-            &request,
-            sizeof(request),
-            response.data(),
-            response.size()) :
-        send_rpc_cmd(
-            sock,
-            RPC_CMD_GET_TENSOR_BATCH3,
-            &request,
-            sizeof(request),
-            response.data(),
-            response.size());
+    bool status = false;
+    if (rpc_route_wait_seq != 0) {
+        rpc_msg_get_tensor_batch3_wait_req wait_request {};
+        wait_request.device = rpc_ctx->device;
+        wait_request.wait_seq = rpc_route_wait_seq;
+        wait_request.batch = request;
+        status = staged_route ?
+            send_rpc_cmd_staged(
+                sock,
+                RPC_CMD_GET_TENSOR_BATCH3_WAIT,
+                &wait_request,
+                sizeof(wait_request),
+                response.data(),
+                response.size()) :
+            send_rpc_cmd(
+                sock,
+                RPC_CMD_GET_TENSOR_BATCH3_WAIT,
+                &wait_request,
+                sizeof(wait_request),
+                response.data(),
+                response.size());
+    } else {
+        status = staged_route ?
+            send_rpc_cmd_staged(
+                sock,
+                RPC_CMD_GET_TENSOR_BATCH3,
+                &request,
+                sizeof(request),
+                response.data(),
+                response.size()) :
+            send_rpc_cmd(
+                sock,
+                RPC_CMD_GET_TENSOR_BATCH3,
+                &request,
+                sizeof(request),
+                response.data(),
+                response.size());
+    }
     const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
     RPC_STATUS_ASSERT(status);
 
@@ -3149,6 +3176,7 @@ public:
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_batch3(const rpc_msg_get_tensor_batch3_req & request, std::vector<uint8_t> & response);
+    bool get_tensor_batch3_wait(const rpc_msg_get_tensor_batch3_wait_req & request, std::vector<uint8_t> & response);
     bool route_mark_ready(const rpc_msg_route_mark_ready_req & request);
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -4214,8 +4242,8 @@ bool rpc_server::route_mark_ready(
     return true;
 }
 
-bool rpc_server::get_tensor_batch3(
-        const rpc_msg_get_tensor_batch3_req & request,
+bool rpc_server::get_tensor_batch3_wait(
+        const rpc_msg_get_tensor_batch3_wait_req & request,
         std::vector<uint8_t> & response) {
     if (request.wait_seq != 0) {
         std::unique_lock<std::mutex> lock(route_ready_mutex);
@@ -4227,7 +4255,12 @@ bool rpc_server::get_tensor_batch3(
                        it->second >= request.wait_seq;
             });
     }
+    return get_tensor_batch3(request.batch, response);
+}
 
+bool rpc_server::get_tensor_batch3(
+        const rpc_msg_get_tensor_batch3_req & request,
+        std::vector<uint8_t> & response) {
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t server_begin_us =
@@ -5928,6 +5961,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 if (!server.route_mark_ready(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_TENSOR_BATCH3_WAIT: {
+                rpc_msg_get_tensor_batch3_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.get_tensor_batch3_wait(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
