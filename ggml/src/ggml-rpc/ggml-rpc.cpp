@@ -255,6 +255,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_GRAPH_COMPUTE,
     RPC_CMD_ROUTE_MARK_READY,
     RPC_CMD_GET_TENSOR_BATCH3_WAIT,
+    RPC_CMD_SET_TENSOR_ASYNC_RETURN,
     RPC_CMD_COUNT,
 };
 
@@ -270,6 +271,7 @@ static_assert(RPC_CMD_GET_TENSOR_BATCH3 == 24, "RPC_CMD_GET_TENSOR_BATCH3 must b
 static_assert(RPC_CMD_SET_TENSOR_GRAPH_COMPUTE == 25, "RPC_CMD_SET_TENSOR_GRAPH_COMPUTE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_MARK_READY == 26, "RPC_CMD_ROUTE_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_TENSOR_BATCH3_WAIT == 27, "RPC_CMD_GET_TENSOR_BATCH3_WAIT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN == 28, "RPC_CMD_SET_TENSOR_ASYNC_RETURN must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -551,6 +553,7 @@ struct ggml_backend_rpc_device_context {
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
     std::array<std::shared_ptr<socket_t>, 2> route_transfer_socks {};
+    std::shared_ptr<socket_t> return_transfer_sock;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -1004,6 +1007,7 @@ enum class rpc_socket_role {
     SNAPSHOT_TRANSFER_1,
     ROUTE_TRANSFER_0,
     ROUTE_TRANSFER_1,
+    RETURN_TRANSFER,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1029,6 +1033,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::ROUTE_TRANSFER_1:
             suffix = "_route_transfer_1";
+            break;
+        case rpc_socket_role::RETURN_TRANSFER:
+            suffix = "_return_transfer";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1083,6 +1090,10 @@ static std::shared_ptr<socket_t> get_route_transfer_socket(const std::string & e
     GGML_ASSERT(lane < 2);
     return get_socket_role(endpoint, lane == 0 ? rpc_socket_role::ROUTE_TRANSFER_0
                                                : rpc_socket_role::ROUTE_TRANSFER_1);
+}
+
+static std::shared_ptr<socket_t> get_return_transfer_socket(const std::string & endpoint) {
+    return get_socket_role(endpoint, rpc_socket_role::RETURN_TRANSFER);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -2687,6 +2698,127 @@ static bool ggml_backend_rpc_set_tensor_graph(
     return status;
 }
 
+static bool ggml_backend_rpc_set_tensor_async_return(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    GGML_UNUSED(backend_src);
+
+    if (backend_dst == nullptr || !ggml_backend_is_rpc(backend_dst)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_dst->context);
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_dst)->context);
+    if (rpc_ctx == nullptr || rpc_dev_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_ASYNC_RETURN_MIN_PATCH = 9;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_ASYNC_RETURN_MIN_PATCH) {
+        return false;
+    }
+
+    // Null tensors are a cheap capability query used by Meta.
+    if (src == nullptr && dst == nullptr) {
+        return true;
+    }
+    if (src == nullptr || dst == nullptr ||
+            dst->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(dst->buffer) ||
+            !ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+
+    auto * dst_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            dst->buffer->context);
+    if (dst_buffer_ctx == nullptr ||
+            dst_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            dst_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    if (rpc_dev_ctx->return_transfer_sock == nullptr) {
+        rpc_dev_ctx->return_transfer_sock =
+            get_return_transfer_socket(rpc_ctx->endpoint);
+    }
+    auto sock = rpc_dev_ctx->return_transfer_sock;
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t client_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    const size_t data_size = ggml_nbytes(src);
+    std::vector<uint8_t> data(data_size);
+    const int64_t src_get_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    if (data_size > 0) {
+        // Caller guarantees the PC producer task has completed.  Do not issue
+        // a backend-wide synchronize here: the PC worker is intentionally
+        // allowed to compute the next chunk while this transfer runs.
+        ggml_backend_tensor_get(src, data.data(), 0, data_size);
+    }
+    const int64_t src_get_us =
+        stage_profile ? ggml_time_us() - src_get_begin_us : 0;
+
+    const int64_t pack_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    const rpc_tensor serialized_tensor = serialize_tensor(dst);
+    const uint64_t wire_offset = 0;
+    const size_t input_size =
+        sizeof(serialized_tensor) + sizeof(wire_offset) + data_size;
+    std::vector<uint8_t> input(input_size);
+    size_t cursor = 0;
+    memcpy(input.data() + cursor, &serialized_tensor, sizeof(serialized_tensor));
+    cursor += sizeof(serialized_tensor);
+    memcpy(input.data() + cursor, &wire_offset, sizeof(wire_offset));
+    cursor += sizeof(wire_offset);
+    if (data_size > 0) {
+        memcpy(input.data() + cursor, data.data(), data_size);
+        cursor += data_size;
+    }
+    GGML_ASSERT(cursor == input.size());
+    const int64_t pack_us =
+        stage_profile ? ggml_time_us() - pack_begin_us : 0;
+
+    const int64_t send_begin_us = ggml_time_us();
+    // Wait only for the server to enqueue the asynchronous OpenCL write.  The
+    // layer-tail RPC fence later guarantees device completion before ADD.
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_SET_TENSOR_ASYNC_RETURN,
+        input.data(),
+        input.size(),
+        nullptr,
+        0);
+    const int64_t send_us = ggml_time_us() - send_begin_us;
+
+    if (stage_profile) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_stage_send "
+            "bytes=%zu src_get_ms=%.3f pack_ms=%.3f "
+            "send_ms=%.3f total_ms=%.3f\n",
+            data_size,
+            src_get_us / 1000.0,
+            pack_us / 1000.0,
+            send_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+
+    return status;
+}
+
 static int rpc_find_graph_node(
         const ggml_cgraph * graph,
         const ggml_tensor * target) {
@@ -3176,6 +3308,7 @@ public:
         const void * data,
         size_t size);
     bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
+    bool set_tensor_async_return(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -3924,6 +4057,57 @@ bool rpc_server::set_tensor_direct_opencl_async(
 
     remember_opencl_tensor_extra(tensor);
     return true;
+}
+
+bool rpc_server::set_tensor_async_return(
+        const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+        return false;
+    }
+
+    rpc_tensor in_tensor {};
+    memcpy(&in_tensor, input.data(), sizeof(in_tensor));
+    uint64_t offset = 0;
+    memcpy(
+        &offset,
+        input.data() + sizeof(in_tensor),
+        sizeof(offset));
+    const size_t data_size =
+        input.size() - sizeof(in_tensor) - sizeof(offset);
+    const void * data =
+        input.data() + sizeof(in_tensor) + sizeof(offset);
+
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    const int64_t write_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    bool async_write = set_tensor_direct_opencl_async(
+        in_tensor, offset, data, data_size);
+    bool status = async_write;
+    if (!status) {
+        status = set_tensor_direct(
+            in_tensor, offset, data, data_size);
+    }
+
+    const int64_t write_us =
+        stage_profile ? ggml_time_us() - write_begin_us : 0;
+    if (stage_profile) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone stage=return_stage_write "
+            "bytes=%zu async_write=%d write_ms=%.3f total_ms=%.3f status=%d\n",
+            data_size,
+            async_write ? 1 : 0,
+            write_us / 1000.0,
+            (ggml_time_us() - begin_us) / 1000.0,
+            status ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    return status;
 }
 
 bool rpc_server::set_tensor_recompute_snapshot(const std::vector<uint8_t> & input) {
@@ -5983,6 +6167,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_ASYNC_RETURN: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_async_return(input)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -6510,6 +6707,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_set_tensor_graph);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_tensor_async_return);
     }
     GGML_UNUSED(reg);
 
