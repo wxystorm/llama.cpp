@@ -4924,10 +4924,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_PIPELINE") != nullptr;
     const bool phone_prefill_defer_phone_ffn =
         std::getenv("GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN") != nullptr;
-    const bool phone_prefill_eager_down =
-        std::getenv("GGML_META_PHONE_PREFILL_EAGER_DOWN") != nullptr;
-    const bool phone_prefill_pc_direct_stage =
-        std::getenv("GGML_META_PHONE_PREFILL_PC_DIRECT_STAGE") != nullptr;
     const bool phone_prefill_async_return =
         std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr;
     const ggml_backend_rpc_set_tensor_async_return_t
@@ -10149,31 +10145,13 @@ auto prefill_norm_sg_has_prework =
             GGML_ASSERT(route.worker != nullptr);
             GGML_ASSERT(route.task != 0);
 
-            const bool eager_down_active =
-                phone_prefill_eager_down &&
-                phone_prefill_defer_phone_ffn &&
-                route.phone_stage_hidden != nullptr &&
-                route.phone_stage_topk != nullptr &&
-                route.phone_stage_weights != nullptr;
-
-            int64_t stage_wait_us = 0;
-            if (!eager_down_active) {
-                const int64_t stage_wait_begin_us = ggml_time_us();
-                const ggml_status route_stage_status =
-                    route.worker->wait_stage_ready(route.task);
-                stage_wait_us =
-                    ggml_time_us() - stage_wait_begin_us;
-                if (route_stage_status != GGML_STATUS_SUCCESS) {
-                    return route_stage_status;
-                }
-            } else if (pipeline_debug) {
-                printf(
-                    "[PHONE_PREFILL_EAGER_DOWN] "
-                    "layer=%d chunk=%d sg=%zu route_task=%" PRIu64 "\n",
-                    prefill_down_layer,
-                    prefill_down_chunk,
-                    i,
-                    route.task);
+            const int64_t stage_wait_begin_us = ggml_time_us();
+            const ggml_status route_stage_status =
+                route.worker->wait_stage_ready(route.task);
+            const int64_t stage_wait_us =
+                ggml_time_us() - stage_wait_begin_us;
+            if (route_stage_status != GGML_STATUS_SUCCESS) {
+                return route_stage_status;
             }
 
             if (backend_ctx->prefill_pc_worker == nullptr) {
@@ -10316,8 +10294,7 @@ auto prefill_norm_sg_has_prework =
                 backend_ctx->prefill_pc_worker->enqueue(
                     [&, route, pc_graph, pc_backend,
                         pc_return_src, return_payload,
-                        prefill_down_layer, prefill_down_chunk, i,
-                        phone_prefill_pc_direct_stage]
+                        prefill_down_layer, prefill_down_chunk, i]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t route_wait_begin_us = ggml_time_us();
                         const ggml_status route_status =
@@ -10328,74 +10305,24 @@ auto prefill_norm_sg_has_prework =
                             return route_status;
                         }
 
-                        struct direct_binding_backup {
-                            ggml_tensor * tensor = nullptr;
-                            ggml_backend_buffer_t buffer = nullptr;
-                            void * data = nullptr;
-                        };
-                        std::array<direct_binding_backup, 3>
-                            direct_backups {};
-
-                        const bool pc_direct_stage_active =
-                            phone_prefill_pc_direct_stage &&
-                            route.stage_hidden != nullptr &&
-                            route.stage_topk != nullptr &&
-                            route.stage_weights != nullptr &&
-                            route.dst_hidden != nullptr &&
-                            route.dst_topk != nullptr &&
-                            route.dst_weights != nullptr &&
-                            ggml_are_same_layout(
-                                route.stage_hidden,
-                                route.dst_hidden) &&
-                            ggml_are_same_layout(
-                                route.stage_topk,
-                                route.dst_topk) &&
-                            ggml_are_same_layout(
-                                route.stage_weights,
-                                route.dst_weights);
-
                         const int64_t stage_copy_begin_us =
                             ggml_time_us();
-                        if (pc_direct_stage_active) {
-                            ggml_tensor * stages[3] = {
-                                route.stage_hidden,
-                                route.stage_topk,
-                                route.stage_weights,
-                            };
-                            ggml_tensor * dsts[3] = {
-                                route.dst_hidden,
-                                route.dst_topk,
-                                route.dst_weights,
-                            };
-                            for (size_t k = 0; k < 3; ++k) {
-                                GGML_ASSERT(stages[k]->buffer != nullptr);
-                                GGML_ASSERT(stages[k]->data != nullptr);
-                                direct_backups[k] = {
-                                    dsts[k],
-                                    dsts[k]->buffer,
-                                    dsts[k]->data,
-                                };
-                                dsts[k]->buffer = stages[k]->buffer;
-                                dsts[k]->data = stages[k]->data;
-                            }
-                        } else {
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_hidden,
-                                route.dst_hidden);
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_topk,
-                                route.dst_topk);
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_weights,
-                                route.dst_weights);
-                            ggml_backend_synchronize(pc_backend);
-                        }
+                        ggml_backend_tensor_copy_async(
+                            pc_backend,
+                            pc_backend,
+                            route.stage_hidden,
+                            route.dst_hidden);
+                        ggml_backend_tensor_copy_async(
+                            pc_backend,
+                            pc_backend,
+                            route.stage_topk,
+                            route.dst_topk);
+                        ggml_backend_tensor_copy_async(
+                            pc_backend,
+                            pc_backend,
+                            route.stage_weights,
+                            route.dst_weights);
+                        ggml_backend_synchronize(pc_backend);
                         const int64_t stage_copy_us =
                             ggml_time_us() - stage_copy_begin_us;
 
@@ -10491,16 +10418,6 @@ auto prefill_norm_sg_has_prework =
                         const int64_t pc_compute_us =
                             ggml_time_us() - pc_begin_us;
 
-                        if (pc_direct_stage_active) {
-                            for (auto it = direct_backups.rbegin();
-                                 it != direct_backups.rend();
-                                 ++it) {
-                                GGML_ASSERT(it->tensor != nullptr);
-                                it->tensor->buffer = it->buffer;
-                                it->tensor->data = it->data;
-                            }
-                        }
-
                         int64_t return_stage_us = 0;
                         if (status == GGML_STATUS_SUCCESS &&
                                 return_payload != nullptr) {
@@ -10527,7 +10444,7 @@ auto prefill_norm_sg_has_prework =
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " route_wait_ms=%.3f stage_copy_ms=%.3f "
                                 "pc_compute_ms=%.3f return_stage_ms=%.3f "
-                                "direct_stage=%d status=%d\n",
+                                "status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
@@ -10536,7 +10453,6 @@ auto prefill_norm_sg_has_prework =
                                 stage_copy_us / 1000.0,
                                 pc_compute_us / 1000.0,
                                 return_stage_us / 1000.0,
-                                pc_direct_stage_active ? 1 : 0,
                                 (int) status);
                         }
 
@@ -10673,16 +10589,14 @@ auto prefill_norm_sg_has_prework =
                 printf(
                     "[PHONE_PREFILL_PHONE_BRANCH] "
                     "layer=%d chunk=%d sg=%zu route_stage_wait_ms=%.3f "
-                    "phone_wall_ms=%.3f pc_task=%" PRIu64
-                    " deferred=%d eager_down=%d\n",
+                    "phone_wall_ms=%.3f pc_task=%" PRIu64 " deferred=%d\n",
                     prefill_down_layer,
                     prefill_down_chunk,
                     i,
                     stage_wait_us / 1000.0,
                     phone_wall_us / 1000.0,
                     pc_task,
-                    defer_local_phone_ffn ? 1 : 0,
-                    eager_down_active ? 1 : 0);
+                    defer_local_phone_ffn ? 1 : 0);
             }
 
             compute_status = phone_status;
