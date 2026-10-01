@@ -241,6 +241,7 @@ struct llama_hybrid_tensor_compute_prediction {
     int   attn_group_chunks    = 1;
     int   attn_chunk_tokens    = 0;
     float tensor_pc_ratio      = 0.0f;
+    bool  tensor_phone_primary = false;
 
     double attn_misc_ms    = 0.0;
     double pc_ffn_ms       = 0.0;
