@@ -5358,6 +5358,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             const uint64_t producer_seq =
                 backend_ctx->next_phone_prefill_route_seq++;
+            ggml_backend_t route_src_backend = bcj_src.backend;
+            ggml_backend_t route_dst_backend = bcj_dst.backend;
 
             const uint64_t route_task =
                 route_worker->enqueue(
@@ -5368,6 +5370,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         src_topk, stage_topk,
                         src_weights, stage_weights,
                         dst_hidden, dst_topk, dst_weights,
+                        route_src_backend, route_dst_backend,
                         lane, layer, chunk, sg]
                     (uint64_t task_id) -> ggml_status {
                         ggml_backend_meta_stage_ready_context
@@ -5386,8 +5389,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         const int64_t route_begin_us =
                             ggml_time_us();
                         const bool used = route_get_batch3(
-                            bcj_src.backend,
-                            bcj_dst.backend,
+                            route_src_backend,
+                            route_dst_backend,
                             src_hidden,
                             stage_hidden,
                             src_topk,
@@ -6532,6 +6535,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 src_topk->name, parsed_topk_chunk, parsed_topk_layer));
             GGML_ASSERT(parsed_topk_chunk == phone_route_chunk);
             GGML_ASSERT(parsed_topk_layer == phone_route_layer);
+
+            const auto producer_route_it =
+                pending_phone_prefill_routes.find(
+                    { phone_route_layer, phone_route_chunk });
+            if (phone_prefill_producer_route &&
+                    producer_route_it !=
+                        pending_phone_prefill_routes.end() &&
+                    producer_route_it->second.producer_seq != 0) {
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_PREFILL_ROUTE_MAILBOX_HANDOFF] "
+                        "layer=%d chunk=%d lane=%zu "
+                        "seq=%" PRIu64 " task=%" PRIu64
+                        " action=ALREADY_POSTED\n",
+                        phone_route_layer,
+                        phone_route_chunk,
+                        producer_route_it->second.lane,
+                        producer_route_it->second.producer_seq,
+                        producer_route_it->second.task);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
 
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
@@ -11095,6 +11121,15 @@ auto prefill_norm_sg_has_prework =
             phone_graph->uid = 0;
         }
 
+        bool producer_route_prearmed = false;
+        if (direct_route_bound) {
+            producer_route_prearmed =
+                prearm_phone_prefill_route(
+                    i,
+                    direct_route_layer,
+                    direct_route_chunk);
+        }
+
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (pipeline_debug && phone_block_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
@@ -11109,22 +11144,41 @@ auto prefill_norm_sg_has_prework =
                 ggml_backend_meta_get_route_mark_ready(
                     backend_ctx->backend_configs[1].backend);
             GGML_ASSERT(mark_ready != nullptr);
-            const uint64_t seq =
-                backend_ctx->next_phone_prefill_route_seq++;
+
+            uint64_t seq = 0;
+            if (producer_route_prearmed) {
+                const auto route_it =
+                    pending_phone_prefill_routes.find(
+                        { direct_route_layer,
+                          direct_route_chunk });
+                GGML_ASSERT(
+                    route_it !=
+                    pending_phone_prefill_routes.end());
+                seq = route_it->second.producer_seq;
+                GGML_ASSERT(seq != 0);
+            } else {
+                seq =
+                    backend_ctx->next_phone_prefill_route_seq++;
+                phone_prefill_route_producer_seq[
+                    { direct_route_layer,
+                      direct_route_chunk }] = seq;
+            }
+
             const bool marked = mark_ready(
                 backend_ctx->backend_configs[1].backend,
                 seq);
             GGML_ASSERT(marked);
-            phone_prefill_route_producer_seq[
-                { direct_route_layer, direct_route_chunk }] = seq;
 
-            if (pipeline_debug) {
+            if (pipeline_debug ||
+                    tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_PREFILL_ROUTE_PRODUCER_SEQ] "
-                    "layer=%d chunk=%d seq=%" PRIu64 "\n",
+                    "layer=%d chunk=%d seq=%" PRIu64
+                    " mailbox=%d\n",
                     direct_route_layer,
                     direct_route_chunk,
-                    seq);
+                    seq,
+                    producer_route_prearmed ? 1 : 0);
             }
         }
 
