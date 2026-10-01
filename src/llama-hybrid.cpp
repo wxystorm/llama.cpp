@@ -5382,8 +5382,25 @@ int64_t llama_hybrid_ffn_shard_size(int64_t n_ff, ggml_type down_type, float pc_
     }
 
     const int64_t granularity = std::lcm<int64_t>(ggml_blck_size(down_type), 128);
-    int64_t       pc_size     = (int64_t) (n_ff * (double) pc_ratio);
+
+    // Ratios are stored as float, while valid shard boundaries are integral
+    // multiples of granularity.  Recover values that are only microscopically
+    // below an integer boundary because of float representation (for example
+    // 768 * float(1/3) -> 255.99999...) before applying the historical
+    // round-down policy.
+    double raw_pc_size = n_ff * (double) pc_ratio;
+    const double nearest = std::round(raw_pc_size);
+    const double integer_tol =
+        std::max(1e-6,
+                 2.0 * std::numeric_limits<float>::epsilon() *
+                     (double) n_ff);
+    if (std::fabs(raw_pc_size - nearest) <= integer_tol) {
+        raw_pc_size = nearest;
+    }
+
+    int64_t pc_size = (int64_t) std::floor(raw_pc_size);
     pc_size -= pc_size % granularity;
+    pc_size = std::clamp<int64_t>(pc_size, 0, n_ff);
     return backend_index == 0 ? pc_size : n_ff - pc_size;
 }
 

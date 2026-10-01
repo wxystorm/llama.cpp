@@ -783,6 +783,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+
+    const bool hybrid_arch =
+        ud->model->arch == LLM_ARCH_LLAMA ||
+        ud->model->arch == LLM_ARCH_QWEN2 ||
+        ud->model->arch == LLM_ARCH_QWEN3 ||
+        ud->model->arch == LLM_ARCH_QWEN3MOE;
+    const llama_hybrid_layer_mode mode = hybrid_arch ?
+        ud->model->hybrid_layer_mode(tc.il) :
+        llama_hybrid_layer_mode::TENSOR_SPLIT;
+    const bool tensor_phone_primary =
+        mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+
+    // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
+    // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
+    // Generic split rotation is useful for equivalent devices, but rotating
+    // these two heterogeneous roles changes the meaning of R and can collapse
+    // the smaller shard after quantized alignment.
+    const size_t split_rotation =
+        tensor_phone_primary && is_ffn_split_tensor && ud->n_devices == 2 ?
+            0 : tc.rotation;
+
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
@@ -790,7 +811,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + split_rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -814,10 +835,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                split_state.ne[is*ud->n_devices + (j + split_rotation) % ud->n_devices] = high - low;
                 low = high;
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            split_state.ne[is*ud->n_devices + (j + split_rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -838,15 +859,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_attn_sinks) ||
         std::regex_match(tensor_name, pattern_attn_out_weight) ||
         std::regex_match(tensor_name, pattern_attn_gate_weight);
-    const bool hybrid_arch =
-        ud->model->arch == LLM_ARCH_LLAMA ||
-        ud->model->arch == LLM_ARCH_QWEN2 ||
-        ud->model->arch == LLM_ARCH_QWEN3 ||
-        ud->model->arch == LLM_ARCH_QWEN3MOE;
-    const llama_hybrid_layer_mode mode = hybrid_arch ?
-        ud->model->hybrid_layer_mode(tc.il) : llama_hybrid_layer_mode::TENSOR_SPLIT;
-    const bool tensor_phone_primary =
-        mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
     const bool force_primary =
         (is_attention_tensor &&
          mode != llama_hybrid_layer_mode::PHONE_ONLY &&
