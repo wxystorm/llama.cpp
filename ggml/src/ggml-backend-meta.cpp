@@ -4924,6 +4924,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN") != nullptr;
     const bool phone_prefill_async_return =
         std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr;
+    const ggml_backend_rpc_set_tensor_async_return_t
+        phone_prefill_async_return_set =
+            n_backends > 1 ?
+            ggml_backend_meta_get_set_tensor_async_return(
+                backend_ctx->backend_configs[1].backend) :
+            nullptr;
+    const bool phone_prefill_async_return_active =
+        phone_prefill_async_return &&
+        phone_prefill_async_return_set != nullptr &&
+        phone_prefill_async_return_set(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0);
+
+    if (pipeline_debug && phone_prefill_async_return) {
+        printf(
+            "[PHONE_PREFILL_ASYNC_RETURN_CAP] requested=1 active=%d\n",
+            phone_prefill_async_return_active ? 1 : 0);
+    }
 
     struct phone_prefill_binding_backup {
         ggml_tensor * tensor = nullptr;
@@ -5437,6 +5457,76 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             return GGML_STATUS_SUCCESS;
+        };
+
+    auto submit_phone_prefill_staged_add =
+        [&](size_t sg,
+            int layer,
+            int chunk,
+            ggml_tensor * return_stage) -> ggml_status {
+            constexpr size_t j_dst = 1;
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+            ggml_cgraph * phone_graph =
+                bcj_dst.cgraphs[sg].cgraph_main;
+            GGML_ASSERT(phone_graph != nullptr);
+            GGML_ASSERT(phone_graph->n_nodes > 0);
+            GGML_ASSERT(return_stage != nullptr);
+
+            ggml_tensor * node_dst =
+                phone_graph->nodes[phone_graph->n_nodes - 1];
+            int phone_chunk = -1;
+            int phone_layer = -1;
+            GGML_ASSERT(ggml_backend_meta_parse_prefill_down_chunk(
+                node_dst->name, phone_chunk, phone_layer));
+            GGML_ASSERT(phone_chunk == chunk);
+            GGML_ASSERT(phone_layer == layer);
+            GGML_ASSERT(ggml_are_same_layout(node_dst, return_stage));
+
+            ggml_tensor * node_red = get_node_aux(node_dst);
+            node_red->view_src =
+                node_dst->view_src == nullptr ?
+                    node_dst : node_dst->view_src;
+            node_red->view_offs = node_dst->view_offs;
+            node_red->op = GGML_OP_ADD;
+            node_red->src[0] = node_dst;
+            node_red->src[1] = return_stage;
+            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red);
+
+            ggml_cgraph * add_graph = get_cgraph_aux();
+            add_graph->nodes[0] = node_red;
+            add_graph->n_nodes = 1;
+
+            const int64_t submit_begin_us = ggml_time_us();
+            const ggml_status status =
+                ggml_backend_graph_compute_async(
+                    bcj_dst.backend,
+                    add_graph);
+            const int64_t submit_us =
+                ggml_time_us() - submit_begin_us;
+            record_reduce_add(submit_us, true);
+
+            if (tensor_phone_stage_profile) {
+                auto & stage =
+                    tensor_phone_stage_entry(layer, chunk, false);
+                stage.return_client_wall_us += submit_us;
+                stage.return_count += 1;
+            }
+
+            if (pipeline_debug || tensor_phone_stage_profile) {
+                printf(
+                    "[PHONE_PREFILL_ASYNC_ADD_SUBMIT] "
+                    "layer=%d chunk=%d sg=%zu bytes=%zu submit_ms=%.3f "
+                    "status=%d\n",
+                    layer,
+                    chunk,
+                    sg,
+                    ggml_nbytes(return_stage),
+                    submit_us / 1000.0,
+                    (int) status);
+            }
+
+            return status;
         };
 
     auto drain_phone_prefill_pc_layer =
