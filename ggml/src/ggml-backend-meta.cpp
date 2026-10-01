@@ -5022,6 +5022,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             ggml_backend_t phone_backend =
                 backend_ctx->backend_configs[1].backend;
+            const ggml_backend_rpc_route_mark_ready_t mark_ready =
+                ggml_backend_meta_get_route_mark_ready(phone_backend);
             return
                 ggml_backend_meta_get_tensor_batch3(phone_backend) !=
                     nullptr &&
@@ -5031,8 +5033,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_backend) != nullptr &&
                 ggml_backend_meta_get_route_wait_seq_setter(
                     phone_backend) != nullptr &&
-                ggml_backend_meta_get_route_mark_ready(
-                    phone_backend) != nullptr;
+                mark_ready != nullptr &&
+                mark_ready(phone_backend, 0);
         };
 
     auto bind_phone_prefill_hidden_direct =
@@ -6112,6 +6114,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_route_layer,
                     1) != nullptr;
 
+            const bool route_seq_supported =
+                route_mark_ready != nullptr &&
+                route_mark_ready(bcj_src.backend, 0);
+
             const bool allow_prefill_route_pipeline =
                 phone_prefill_chunk_pipeline &&
                 phone_route_chunk >= 0 &&
@@ -6127,7 +6133,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 route_rpc_fence != nullptr &&
                 (!phone_prefill_defer_phone_ffn ||
                  (route_set_wait_seq != nullptr &&
-                  route_mark_ready != nullptr));
+                  route_seq_supported));
 
             if (allow_prefill_route_pipeline) {
                 const size_t lane =
