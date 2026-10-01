@@ -2841,6 +2841,52 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.prepare_us +
                 stage_timing.compute_range_us +
                 stage_timing.sync_us;
+            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr) {
+                llama_hybrid_tensor_compute_prediction validate_prediction;
+                if (llama_hybrid_runtime_predict_tensor_compute(
+                        (int) ubatch.n_tokens, validate_prediction)) {
+                    const double actual_ms = stage_total_us / 1000.0;
+                    const double actual_over_pred =
+                        validate_prediction.tensor_total_ms > 0.0 ?
+                            actual_ms / validate_prediction.tensor_total_ms :
+                            0.0;
+                    LLAMA_LOG_ERROR(
+                        "[TENSOR_PREDICT_VALIDATE] ub=%d mode=SERIAL_ACCUMULATE "
+                        "primary=%s tokens=%d T=%d R=%.3f XT=%d chunks=%d "
+                        "actual_ms=%.3f pred_ms=%.3f actual_over_pred=%.3f "
+                        "prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
+                        "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
+                        "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
+                        "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                        "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
+                        "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
+                        "pipeline_done_pred_ms=%.3f\n",
+                        ubatch_id,
+                        validate_prediction.tensor_phone_primary ? "PHONE" : "PC",
+                        validate_prediction.tokens,
+                        validate_prediction.tensor_layers,
+                        validate_prediction.tensor_pc_ratio,
+                        validate_prediction.tensor_chunk_tokens,
+                        validate_prediction.tensor_chunks,
+                        actual_ms,
+                        validate_prediction.tensor_total_ms,
+                        actual_over_pred,
+                        stage_timing.prepare_us / 1000.0,
+                        stage_timing.compute_range_us / 1000.0,
+                        stage_timing.sync_us / 1000.0,
+                        validate_prediction.attn_misc_ms,
+                        validate_prediction.pipeline_h2d_sum_ms,
+                        validate_prediction.pipeline_pc_ffn_sum_ms,
+                        validate_prediction.pipeline_phone_sum_ms,
+                        validate_prediction.pipeline_d2h_sum_ms,
+                        validate_prediction.pipeline_h2d_finish_ms,
+                        validate_prediction.pipeline_pc_finish_ms,
+                        validate_prediction.pipeline_phone_finish_ms,
+                        validate_prediction.pipeline_return_finish_ms,
+                        validate_prediction.pipeline_reduce_tail_ms,
+                        validate_prediction.pipeline_done_ms);
+                }
+            }
             LLAMA_LOG_DEBUG(
                 "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f "
                 "compute_range=%.3f sync=%.3f unaccounted=%.3f "
@@ -4304,6 +4350,52 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 tensor_stage_timing.sync_us;
             const int64_t tensor_stage_unaccounted_us =
                 std::max<int64_t>(0, tensor_total_us - tensor_stage_accounted_us);
+            if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr) {
+                llama_hybrid_tensor_compute_prediction validate_prediction;
+                if (llama_hybrid_runtime_predict_tensor_compute(
+                        (int) job.ubatch.n_tokens, validate_prediction)) {
+                    const double actual_ms = tensor_total_us / 1000.0;
+                    const double actual_over_pred =
+                        validate_prediction.tensor_total_ms > 0.0 ?
+                            actual_ms / validate_prediction.tensor_total_ms :
+                            0.0;
+                    LLAMA_LOG_ERROR(
+                        "[TENSOR_PREDICT_VALIDATE] ub=%d mode=STAGE_QUEUE "
+                        "primary=%s tokens=%d T=%d R=%.3f XT=%d chunks=%d "
+                        "actual_ms=%.3f pred_ms=%.3f actual_over_pred=%.3f "
+                        "prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f "
+                        "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
+                        "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
+                        "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
+                        "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
+                        "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
+                        "pipeline_done_pred_ms=%.3f\n",
+                        job.ubatch_id,
+                        validate_prediction.tensor_phone_primary ? "PHONE" : "PC",
+                        validate_prediction.tokens,
+                        validate_prediction.tensor_layers,
+                        validate_prediction.tensor_pc_ratio,
+                        validate_prediction.tensor_chunk_tokens,
+                        validate_prediction.tensor_chunks,
+                        actual_ms,
+                        validate_prediction.tensor_total_ms,
+                        actual_over_pred,
+                        tensor_stage_timing.prepare_us / 1000.0,
+                        tensor_stage_timing.compute_range_us / 1000.0,
+                        tensor_stage_timing.sync_us / 1000.0,
+                        validate_prediction.attn_misc_ms,
+                        validate_prediction.pipeline_h2d_sum_ms,
+                        validate_prediction.pipeline_pc_ffn_sum_ms,
+                        validate_prediction.pipeline_phone_sum_ms,
+                        validate_prediction.pipeline_d2h_sum_ms,
+                        validate_prediction.pipeline_h2d_finish_ms,
+                        validate_prediction.pipeline_pc_finish_ms,
+                        validate_prediction.pipeline_phone_finish_ms,
+                        validate_prediction.pipeline_return_finish_ms,
+                        validate_prediction.pipeline_reduce_tail_ms,
+                        validate_prediction.pipeline_done_ms);
+                }
+            }
             LLAMA_LOG_DEBUG(
                 "[TENSOR_STAGE_TIMING] ub=%d total=%.3f prepare=%.3f compute_range=%.3f "
                 "sync=%.3f unaccounted=%.3f meta_total=%.3f meta_rebuild=%.3f "
