@@ -2610,7 +2610,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
         memcpy(input.data() + cursor, &request, sizeof(request));
         cursor += sizeof(request);
         if (data_size > 0) {
-            memcpy(input.data() + cursor, data.data(), data_size);
+            memcpy(input.data() + cursor, data, data_size);
             cursor += data_size;
         }
         if (!graph_data.empty()) {
@@ -2699,12 +2699,10 @@ static bool ggml_backend_rpc_set_tensor_graph(
 }
 
 static bool ggml_backend_rpc_set_tensor_async_return(
-        ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
-        const ggml_tensor * src,
-        ggml_tensor * dst) {
-    GGML_UNUSED(backend_src);
-
+        ggml_tensor * dst,
+        const void * data,
+        size_t data_size) {
     if (backend_dst == nullptr || !ggml_backend_is_rpc(backend_dst)) {
         return false;
     }
@@ -2725,14 +2723,14 @@ static bool ggml_backend_rpc_set_tensor_async_return(
         return false;
     }
 
-    // Null tensors are a cheap capability query used by Meta.
-    if (src == nullptr && dst == nullptr) {
+    // Null destination/data is a cheap capability query used by Meta.
+    if (dst == nullptr && data == nullptr && data_size == 0) {
         return true;
     }
-    if (src == nullptr || dst == nullptr ||
+    if (dst == nullptr || data == nullptr ||
             dst->buffer == nullptr ||
             !ggml_backend_buffer_is_rpc(dst->buffer) ||
-            !ggml_are_same_layout(src, dst)) {
+            data_size != ggml_nbytes(dst)) {
         return false;
     }
 
@@ -2756,19 +2754,6 @@ static bool ggml_backend_rpc_set_tensor_async_return(
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t client_begin_us =
         stage_profile ? ggml_time_us() : 0;
-
-    const size_t data_size = ggml_nbytes(src);
-    std::vector<uint8_t> data(data_size);
-    const int64_t src_get_begin_us =
-        stage_profile ? ggml_time_us() : 0;
-    if (data_size > 0) {
-        // Caller guarantees the PC producer task has completed.  Do not issue
-        // a backend-wide synchronize here: the PC worker is intentionally
-        // allowed to compute the next chunk while this transfer runs.
-        ggml_backend_tensor_get(src, data.data(), 0, data_size);
-    }
-    const int64_t src_get_us =
-        stage_profile ? ggml_time_us() - src_get_begin_us : 0;
 
     const int64_t pack_begin_us =
         stage_profile ? ggml_time_us() : 0;
@@ -2806,10 +2791,8 @@ static bool ggml_backend_rpc_set_tensor_async_return(
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_stage_send "
-            "bytes=%zu src_get_ms=%.3f pack_ms=%.3f "
-            "send_ms=%.3f total_ms=%.3f\n",
+            "bytes=%zu pack_ms=%.3f send_ms=%.3f total_ms=%.3f\n",
             data_size,
-            src_get_us / 1000.0,
             pack_us / 1000.0,
             send_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
