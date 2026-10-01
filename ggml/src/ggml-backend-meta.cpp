@@ -2292,6 +2292,10 @@ struct ggml_backend_meta_context {
         // buffer, while top-k/weights use per-chunk buffers.
         ggml_backend_buffer_ptr prefill_phone_hidden_stage_buf;
         std::vector<std::array<ggml_backend_buffer_ptr, 3>> prefill_phone_ffn_stage_bufs;
+        // Private Phone-side PC-partial staging. One buffer per Tensor chunk
+        // lets network return overlap the PC worker without overwriting an
+        // earlier partial before the layer-tail ADD.
+        std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
@@ -2327,6 +2331,7 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
+    ggml_backend_meta_transfer_worker * prefill_return_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES> prefill_reduce_workers { nullptr,
                                                                                                   nullptr };
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES> prefill_route_workers { nullptr,
@@ -2708,6 +2713,24 @@ static ggml_backend_rpc_set_tensor_graph_t ggml_backend_meta_get_set_tensor_grap
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC));
 }
 
+static ggml_backend_rpc_set_tensor_async_return_t
+ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_set_tensor_async_return_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC));
+}
+
 static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -2805,6 +2828,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
+    delete prefill_return_worker;
     for (auto * worker : prefill_reduce_workers) {
         delete worker;
     }
@@ -3888,6 +3912,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int chunk = -1;
         size_t sg = 0;
         uint64_t pc_task = 0;
+        uint64_t return_task = 0;
+        ggml_tensor * return_stage = nullptr;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
@@ -4896,6 +4922,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_PIPELINE") != nullptr;
     const bool phone_prefill_defer_phone_ffn =
         std::getenv("GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN") != nullptr;
+    const bool phone_prefill_async_return =
+        std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr;
 
     struct phone_prefill_binding_backup {
         ggml_tensor * tensor = nullptr;
