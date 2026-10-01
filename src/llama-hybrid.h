@@ -254,6 +254,7 @@ struct llama_hybrid_tensor_compute_prediction {
     double pipeline_h2d_sum_ms       = 0.0;
     double pipeline_pc_ffn_sum_ms    = 0.0;
     double pipeline_phone_sum_ms     = 0.0;
+    double pipeline_phone_start_ms   = 0.0;
     double pipeline_d2h_sum_ms       = 0.0;
     double pipeline_h2d_finish_ms    = 0.0;
     double pipeline_pc_finish_ms     = 0.0;
