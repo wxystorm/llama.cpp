@@ -9991,8 +9991,89 @@ auto prefill_norm_sg_has_prework =
                 backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
             ggml_backend_t pc_backend =
                 backend_ctx->backend_configs[0].backend;
+            ggml_backend_t phone_backend =
+                backend_ctx->backend_configs[1].backend;
             GGML_ASSERT(pc_graph != nullptr);
             GGML_ASSERT(phone_graph != nullptr);
+
+            ggml_tensor * pc_return_src = nullptr;
+            ggml_tensor * phone_return_dst = nullptr;
+            ggml_tensor * phone_return_stage = nullptr;
+            std::shared_ptr<std::vector<uint8_t>> return_payload;
+            if (phone_prefill_async_return_active) {
+                GGML_ASSERT(pc_graph->n_nodes > 0);
+                GGML_ASSERT(phone_graph->n_nodes > 0);
+                pc_return_src =
+                    pc_graph->nodes[pc_graph->n_nodes - 1];
+                phone_return_dst =
+                    phone_graph->nodes[phone_graph->n_nodes - 1];
+
+                int pc_return_chunk = -1;
+                int pc_return_layer = -1;
+                int phone_return_chunk = -1;
+                int phone_return_layer = -1;
+                GGML_ASSERT(
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        pc_return_src->name,
+                        pc_return_chunk,
+                        pc_return_layer));
+                GGML_ASSERT(
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        phone_return_dst->name,
+                        phone_return_chunk,
+                        phone_return_layer));
+                GGML_ASSERT(pc_return_chunk == prefill_down_chunk);
+                GGML_ASSERT(phone_return_chunk == prefill_down_chunk);
+                GGML_ASSERT(pc_return_layer == prefill_down_layer);
+                GGML_ASSERT(phone_return_layer == prefill_down_layer);
+                GGML_ASSERT(
+                    ggml_are_same_layout(
+                        pc_return_src,
+                        phone_return_dst));
+
+                const size_t return_bytes =
+                    ggml_nbytes(phone_return_dst);
+                auto & return_bufs =
+                    backend_ctx->backend_configs[1].
+                        prefill_phone_return_stage_bufs;
+                const size_t return_slot =
+                    static_cast<size_t>(prefill_down_chunk);
+                if (return_bufs.size() <= return_slot) {
+                    return_bufs.resize(return_slot + 1);
+                }
+                auto & return_buf = return_bufs[return_slot];
+                if (!return_buf ||
+                        ggml_backend_buffer_get_size(return_buf.get()) <
+                            return_bytes) {
+                    return_buf.reset(
+                        ggml_backend_alloc_buffer(
+                            phone_backend,
+                            return_bytes));
+                    GGML_ASSERT(return_buf != nullptr);
+                }
+
+                phone_return_stage =
+                    get_node_aux(phone_return_dst);
+                phone_return_stage->buffer =
+                    return_buf.get();
+                phone_return_stage->data =
+                    ggml_backend_buffer_get_base(return_buf.get());
+
+                return_payload =
+                    std::make_shared<std::vector<uint8_t>>(
+                        return_bytes);
+
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_PREFILL_RETURN_STAGE_PREP] "
+                        "layer=%d chunk=%d sg=%zu bytes=%zu stage=%p\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        return_bytes,
+                        (void *) phone_return_stage);
+                }
+            }
 
             if (tensor_expert_load_profile &&
                     prefill_down_chunk == 0) {
@@ -10027,6 +10108,7 @@ auto prefill_norm_sg_has_prework =
             const uint64_t pc_task =
                 backend_ctx->prefill_pc_worker->enqueue(
                     [&, route, pc_graph, pc_backend,
+                        pc_return_src, return_payload,
                         prefill_down_layer, prefill_down_chunk, i]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t route_wait_begin_us = ggml_time_us();
@@ -10151,13 +10233,33 @@ auto prefill_norm_sg_has_prework =
                         const int64_t pc_compute_us =
                             ggml_time_us() - pc_begin_us;
 
+                        int64_t return_stage_us = 0;
+                        if (status == GGML_STATUS_SUCCESS &&
+                                return_payload != nullptr) {
+                            GGML_ASSERT(pc_return_src != nullptr);
+                            GGML_ASSERT(
+                                return_payload->size() ==
+                                ggml_nbytes(pc_return_src));
+                            const int64_t return_stage_begin_us =
+                                ggml_time_us();
+                            ggml_backend_tensor_get(
+                                pc_return_src,
+                                return_payload->data(),
+                                0,
+                                return_payload->size());
+                            return_stage_us =
+                                ggml_time_us() -
+                                return_stage_begin_us;
+                        }
+
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
                             printf(
                                 "[PHONE_PREFILL_PC_BRANCH] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " route_wait_ms=%.3f stage_copy_ms=%.3f "
-                                "pc_compute_ms=%.3f status=%d\n",
+                                "pc_compute_ms=%.3f return_stage_ms=%.3f "
+                                "status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
@@ -10165,11 +10267,84 @@ auto prefill_norm_sg_has_prework =
                                 route_wait_us / 1000.0,
                                 stage_copy_us / 1000.0,
                                 pc_compute_us / 1000.0,
+                                return_stage_us / 1000.0,
                                 (int) status);
                         }
 
                         return status;
                     });
+
+            uint64_t return_task = 0;
+            if (phone_prefill_async_return_active) {
+                GGML_ASSERT(return_payload != nullptr);
+                GGML_ASSERT(phone_return_stage != nullptr);
+                if (backend_ctx->prefill_return_worker == nullptr) {
+                    backend_ctx->prefill_return_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+
+                ggml_backend_meta_transfer_worker * pc_worker =
+                    backend_ctx->prefill_pc_worker;
+                ggml_backend_meta_transfer_worker * return_worker =
+                    backend_ctx->prefill_return_worker;
+                const ggml_backend_rpc_set_tensor_async_return_t
+                    async_return_set =
+                        phone_prefill_async_return_set;
+
+                return_task = return_worker->enqueue(
+                    [pc_worker,
+                     pc_task,
+                     async_return_set,
+                     phone_backend,
+                     phone_return_stage,
+                     return_payload,
+                     prefill_down_layer,
+                     prefill_down_chunk,
+                     i]
+                    (uint64_t task_id) -> ggml_status {
+                        const int64_t wait_begin_us =
+                            ggml_time_us();
+                        const ggml_status pc_status =
+                            pc_worker->wait(pc_task);
+                        const int64_t pc_wait_us =
+                            ggml_time_us() - wait_begin_us;
+                        if (pc_status != GGML_STATUS_SUCCESS) {
+                            return pc_status;
+                        }
+
+                        const int64_t send_begin_us =
+                            ggml_time_us();
+                        const bool sent =
+                            async_return_set(
+                                phone_backend,
+                                phone_return_stage,
+                                return_payload->data(),
+                                return_payload->size());
+                        const int64_t send_us =
+                            ggml_time_us() - send_begin_us;
+
+                        if (pipeline_debug ||
+                                tensor_phone_stage_profile) {
+                            printf(
+                                "[PHONE_PREFILL_RETURN_ASYNC] "
+                                "layer=%d chunk=%d sg=%zu task=%" PRIu64
+                                " pc_wait_ms=%.3f send_ms=%.3f "
+                                "bytes=%zu status=%d\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                i,
+                                task_id,
+                                pc_wait_us / 1000.0,
+                                send_us / 1000.0,
+                                return_payload->size(),
+                                sent ? 1 : 0);
+                        }
+
+                        return sent ?
+                            GGML_STATUS_SUCCESS :
+                            GGML_STATUS_FAILED;
+                    });
+            }
 
             const bool defer_local_phone_ffn =
                 phone_prefill_defer_phone_ffn &&
@@ -10216,6 +10391,8 @@ auto prefill_norm_sg_has_prework =
                 prefill_down_chunk,
                 i,
                 pc_task,
+                return_task,
+                phone_return_stage,
             });
             deferred_phone_prefill_return_sgs[i] =
                 prefill_down_layer;
