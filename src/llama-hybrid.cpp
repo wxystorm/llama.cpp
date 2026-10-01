@@ -49,6 +49,7 @@ static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
+static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES = 2;
 
 static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION            = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT = 0.90;
@@ -1868,6 +1869,7 @@ struct llama_hybrid_tensor_ffn_detail {
     double h2d_sum_ms        = 0.0;
     double pc_ffn_sum_ms     = 0.0;
     double phone_sum_ms      = 0.0;
+    double phone_start_ms    = 0.0;
     double d2h_sum_ms        = 0.0;
     double h2d_finish_ms     = 0.0;
     double pc_finish_ms      = 0.0;
@@ -1888,20 +1890,25 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
         return false;
     }
 
-    std::vector<double> phone_ready(chunks.size(), 0.0);
+    std::vector<double> route_ready(chunks.size(), 0.0);
     std::vector<double> pc_ready(chunks.size(), 0.0);
     std::vector<double> return_ready(chunks.size(), 0.0);
 
-    double phone_available  = 0.0;
-    double input_available  = 0.0;
-    double pc_available     = 0.0;
-    double return_available = 0.0;
+    // The Phone-primary prefill implementation has two independent route
+    // workers/sockets and assigns chunks round-robin by chunk index.  Model
+    // those lanes explicitly instead of serializing every Phone->PC handoff.
+    std::array<double, LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES>
+        route_lane_available {};
+
+    double phone_defer_start = 0.0;
+    double phone_available   = 0.0;
+    double pc_available      = 0.0;
+    double return_available  = 0.0;
 
     double input_sum_ms  = 0.0;
     double pc_sum_ms     = 0.0;
     double phone_sum_ms  = 0.0;
     double return_sum_ms = 0.0;
-    double done_ms       = 0.0;
 
     for (size_t i = 0; i < chunks.size(); ++i) {
         const int tokens = chunks[i];
@@ -1929,25 +1936,49 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
         phone_sum_ms  += phone_ms;
         return_sum_ms += pc_to_phone_ms;
 
-        // Phone owns the layer state. Local Phone FFN and the remote-PC lane
-        // can overlap after the normalized hidden chunk is ready.
-        phone_available += phone_ms;
-        phone_ready[i] = phone_available;
+        const size_t lane =
+            i % LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES;
+        route_lane_available[lane] += phone_to_pc_ms;
+        route_ready[i] = route_lane_available[lane];
 
-        input_available += phone_to_pc_ms;
-        pc_available = std::max(pc_available, input_available);
+        // The PC branch is one serial worker.  Each queued chunk may start
+        // only after both the previous PC chunk and this chunk's route lane
+        // have completed.
+        pc_available = std::max(pc_available, route_ready[i]);
         pc_available += pc_ms;
         pc_ready[i] = pc_available;
 
+        // Async returns use one serial return worker, but overlap with later
+        // PC chunks and with the deferred local Phone FFN wave.
         return_available = std::max(return_available, pc_ready[i]);
         return_available += pc_to_phone_ms;
         return_ready[i] = return_available;
 
-        done_ms = std::max(
-            done_ms,
-            std::max(phone_ready[i], return_ready[i]) +
-                profile.reduce_ms);
+        // Before chunk i can reuse a private route lane, Meta waits for the
+        // previous task on that lane (i - route_lanes).  The layer-tail Phone
+        // FFN wave begins only after all chunks have been issued, so its
+        // earliest start includes exactly the lane-reuse waits exposed while
+        // reaching the tail.  The final one/two route tasks may still be in
+        // flight and are intentionally not included here.
+        if (i >= LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES) {
+            phone_defer_start = std::max(
+                phone_defer_start,
+                route_ready[
+                    i - LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES]);
+        }
     }
+
+    // Local Phone FFNs are deferred until the layer tail, then submitted in
+    // chunk order on the Phone compute socket and completed by one fence.
+    phone_available = phone_defer_start + phone_sum_ms;
+
+    const double route_finish =
+        *std::max_element(
+            route_lane_available.begin(),
+            route_lane_available.end());
+    const double done_ms =
+        std::max(phone_available, return_available) +
+        profile.reduce_ms;
 
     result_ms = done_ms;
 
@@ -1956,8 +1987,9 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
         detail->h2d_sum_ms        = input_sum_ms;
         detail->pc_ffn_sum_ms     = pc_sum_ms;
         detail->phone_sum_ms      = phone_sum_ms;
+        detail->phone_start_ms    = phone_defer_start;
         detail->d2h_sum_ms        = return_sum_ms;
-        detail->h2d_finish_ms     = input_available;
+        detail->h2d_finish_ms     = route_finish;
         detail->pc_finish_ms      = pc_available;
         detail->phone_finish_ms   = phone_available;
         detail->return_finish_ms  = return_available;
@@ -2498,6 +2530,7 @@ bool llama_hybrid_runtime_predict_tensor_compute(
     prediction.pipeline_h2d_sum_ms       = tensor_layers * pipeline_detail.h2d_sum_ms;
     prediction.pipeline_pc_ffn_sum_ms    = tensor_layers * pipeline_detail.pc_ffn_sum_ms;
     prediction.pipeline_phone_sum_ms     = tensor_layers * pipeline_detail.phone_sum_ms;
+    prediction.pipeline_phone_start_ms   = tensor_layers * pipeline_detail.phone_start_ms;
     prediction.pipeline_d2h_sum_ms       = tensor_layers * pipeline_detail.d2h_sum_ms;
     prediction.pipeline_h2d_finish_ms    = tensor_layers * pipeline_detail.h2d_finish_ms;
     prediction.pipeline_pc_finish_ms     = tensor_layers * pipeline_detail.pc_finish_ms;
