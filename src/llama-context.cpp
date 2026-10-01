@@ -3573,6 +3573,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_backend_meta_set_tensor_phone_primary_layers(
             backend, tensor_phone_first_layer, tensor_phone_last_layer);
     }
+    const bool hybrid_predict_validate =
+        std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
+        n_tokens_all > 16;
+    if (hybrid_predict_validate) {
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_meta_tensor_profile_reset(backend);
+        }
+    }
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
@@ -5555,8 +5563,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    if (std::getenv("LLAMA_HYBRID_PREDICT_VALIDATE") != nullptr &&
-        n_tokens_all > 16 && has_runtime_plan && runtime_plan.tensor_layers > 0) {
+    if (hybrid_predict_validate &&
+        has_runtime_plan && runtime_plan.tensor_layers > 0) {
+        ggml_backend_meta_tensor_profile actual_profile {};
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_meta_tensor_profile backend_profile {};
+            if (!ggml_backend_meta_tensor_profile_get(
+                    backend, &backend_profile)) {
+                continue;
+            }
+            actual_profile.route_stage_wait_count +=
+                backend_profile.route_stage_wait_count;
+            actual_profile.route_stage_wait_us +=
+                backend_profile.route_stage_wait_us;
+            actual_profile.route_stage_wait_max_us =
+                std::max(
+                    actual_profile.route_stage_wait_max_us,
+                    backend_profile.route_stage_wait_max_us);
+        }
+
         llama_hybrid_tensor_compute_prediction validate_prediction;
         if (llama_hybrid_runtime_predict_tensor_compute(
                 (int) n_tokens_all, validate_prediction)) {
@@ -5566,8 +5591,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "planner_ref_pred_ms=%.3f tensor_pred_ms=%.3f "
                 "attn_misc_pred_ms=%.3f h2d_sum_pred_ms=%.3f "
                 "pc_ffn_sum_pred_ms=%.3f phone_sum_pred_ms=%.3f "
-                "phone_start_pred_ms=%.3f return_sum_pred_ms=%.3f "
-                "h2d_finish_pred_ms=%.3f "
+                "phone_start_pred_ms=%.3f route_stage_wait_actual_ms=%.3f "
+                "route_stage_wait_count=%" PRId64 " route_stage_wait_max_ms=%.3f "
+                "return_sum_pred_ms=%.3f h2d_finish_pred_ms=%.3f "
                 "pc_finish_pred_ms=%.3f phone_finish_pred_ms=%.3f "
                 "return_finish_pred_ms=%.3f tail_pred_ms=%.3f "
                 "pipeline_done_pred_ms=%.3f overlap_saved_pred_ms=%.3f\n",
@@ -5584,6 +5610,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 validate_prediction.pipeline_pc_ffn_sum_ms,
                 validate_prediction.pipeline_phone_sum_ms,
                 validate_prediction.pipeline_phone_start_ms,
+                actual_profile.route_stage_wait_us / 1000.0,
+                actual_profile.route_stage_wait_count,
+                actual_profile.route_stage_wait_max_us / 1000.0,
                 validate_prediction.pipeline_d2h_sum_ms,
                 validate_prediction.pipeline_h2d_finish_ms,
                 validate_prediction.pipeline_pc_finish_ms,
