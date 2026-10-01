@@ -4926,6 +4926,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN") != nullptr;
     const bool phone_prefill_async_return =
         std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr;
+
+    // Fine-grained Phone-primary correctness fences for A/B isolation.
+    // The legacy STRICT_FENCE remains an umbrella and preserves its older
+    // conservative behavior. The split switches only add their own fence.
+    const bool phone_primary_strict_all =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+    const bool phone_primary_strict_route =
+        phone_primary_strict_all ||
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_ROUTE") != nullptr;
+    const bool phone_primary_strict_ffn_handoff =
+        phone_primary_strict_all ||
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FFN_HANDOFF") != nullptr;
+    const bool phone_primary_strict_reduce =
+        phone_primary_strict_all ||
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_REDUCE") != nullptr;
     const ggml_backend_rpc_set_tensor_async_return_t
         phone_prefill_async_return_set =
             n_backends > 1 ?
@@ -5050,9 +5065,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     std::getenv(
                         "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") ==
                         nullptr ||
-                    std::getenv(
-                        "LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") !=
-                        nullptr ||
+                    phone_primary_strict_all ||
                     std::getenv(
                         "GGML_META_TP_CONTROL_TRACE_LAYER") !=
                         nullptr) {
@@ -5341,7 +5354,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             cgraph_aux->n_nodes = 1;
 
             const bool strict_phone_primary_fence =
-                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+                phone_primary_strict_reduce;
             const auto fence_backend = [&](ggml_backend_t backend) {
                 const ggml_backend_rpc_fence_t rpc_fence =
                     ggml_backend_meta_get_rpc_fence(backend);
@@ -6250,8 +6263,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             // which already establishes producer completion.  Keep the old
             // explicit fence only for legacy mirrored mode or strict A/B tests.
             const bool strict_phone_primary_fence =
-                !phone_single_owner ||
-                std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+                !phone_single_owner || phone_primary_strict_route;
             int64_t route_fence_us = 0;
             if (strict_phone_primary_fence) {
                 const int64_t route_fence_begin = ggml_time_us();
@@ -7467,7 +7479,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 const bool strict_phone_primary_fence =
-                    std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+                    phone_primary_strict_ffn_handoff;
 
                 // ggml_backend_tensor_copy_async() falls back to a blocking
                 // copy for RPC because the RPC backend has no cpy_tensor_async
@@ -7680,10 +7692,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 //   thread's control socket; its blocking GET_TENSOR observes
                 //   all prior Phone queue work in order.
                 //
-                // LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE restores the old
-                // fence-before/fence-after behavior for A/B correctness tests.
+                // STRICT_REDUCE restores fence-before/fence-after behavior
+                // for the one-way partial-return + ADD reduction path.
                 const bool strict_phone_primary_fence =
-                    std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE") != nullptr;
+                    phone_primary_strict_reduce;
                 const auto fence_backend = [&](ggml_backend_t backend) {
                     const ggml_backend_rpc_fence_t rpc_fence =
                         ggml_backend_meta_get_rpc_fence(backend);
