@@ -3720,6 +3720,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t tensor_pc_ffn_us       = 0;
     int64_t tensor_phone_us        = 0;
     int64_t tensor_wait_us         = 0;
+    int64_t route_stage_wait_count = 0;
+    int64_t route_stage_wait_us    = 0;
+    int64_t route_stage_wait_max_us = 0;
     int64_t lane_reuse_wait_count  = 0;
     int64_t lane_reuse_wait_us     = 0;
     int64_t lane_reuse_wait_max_us = 0;
@@ -10150,6 +10153,10 @@ auto prefill_norm_sg_has_prework =
                 route.worker->wait_stage_ready(route.task);
             const int64_t stage_wait_us =
                 ggml_time_us() - stage_wait_begin_us;
+            ++route_stage_wait_count;
+            route_stage_wait_us += stage_wait_us;
+            route_stage_wait_max_us =
+                std::max(route_stage_wait_max_us, stage_wait_us);
             if (route_stage_status != GGML_STATUS_SUCCESS) {
                 return route_stage_status;
             }
@@ -11590,6 +11597,14 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.d2h_us    += d2h_us;
         backend_ctx->tensor_profile.reduce_us += tensor_reduce_us;
         backend_ctx->tensor_profile.wait_us   += tensor_wait_us;
+        backend_ctx->tensor_profile.route_stage_wait_count +=
+            route_stage_wait_count;
+        backend_ctx->tensor_profile.route_stage_wait_us +=
+            route_stage_wait_us;
+        backend_ctx->tensor_profile.route_stage_wait_max_us =
+            std::max(
+                backend_ctx->tensor_profile.route_stage_wait_max_us,
+                route_stage_wait_max_us);
         backend_ctx->tensor_profile.return_transfer_count +=
             return_transfer_count;
         backend_ctx->tensor_profile.return_payload_bytes +=
