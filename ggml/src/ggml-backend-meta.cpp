@@ -5162,10 +5162,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             // Optional Router-first scheduling.  Each deferred local Phone FFN
             // has private copies of hidden/topk/weights, so allocator reuse by
-            // later chunks cannot corrupt its inputs.  Restore those inputs
-            // and submit all local FFNs only after every Router in the layer
-            // has already been launched.  The copies and graph submissions
-            // use the same RPC compute socket, preserving device queue order.
+            // later chunks cannot corrupt its inputs.  Do not restore those
+            // bytes into allocator-managed tensors at the layer tail: their
+            // storage may already have been reused.  Instead, temporarily
+            // rebind the graph's three external tensor descriptors to private
+            // staging while RPC serializes each Phone FFN graph.
             size_t phone_deferred_submitted = 0;
             int64_t phone_restore_submit_us = 0;
             int64_t phone_ffn_submit_us = 0;
@@ -5184,27 +5185,72 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(it->stage_topk != nullptr);
                 GGML_ASSERT(it->stage_weights != nullptr);
 
-                const int64_t restore_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    phone_backend, phone_backend,
-                    it->stage_hidden, it->src_hidden);
-                ggml_backend_tensor_copy_async(
-                    phone_backend, phone_backend,
-                    it->stage_topk, it->src_topk);
-                ggml_backend_tensor_copy_async(
-                    phone_backend, phone_backend,
-                    it->stage_weights, it->src_weights);
-                const int64_t restore_us =
-                    ggml_time_us() - restore_begin_us;
-                phone_restore_submit_us += restore_us;
+                ggml_cgraph * phone_graph =
+                    backend_ctx->backend_configs[1].
+                        cgraphs[it->sg].cgraph_main;
+                GGML_ASSERT(phone_graph != nullptr);
+
+                struct tensor_binding_backup {
+                    ggml_tensor * tensor = nullptr;
+                    ggml_backend_buffer_t buffer = nullptr;
+                    void * data = nullptr;
+                };
+                tensor_binding_backup bindings[3] = {
+                    { it->src_hidden,
+                      it->src_hidden->buffer,
+                      it->src_hidden->data },
+                    { it->src_topk,
+                      it->src_topk->buffer,
+                      it->src_topk->data },
+                    { it->src_weights,
+                      it->src_weights->buffer,
+                      it->src_weights->data },
+                };
+                ggml_tensor * stages[3] = {
+                    it->stage_hidden,
+                    it->stage_topk,
+                    it->stage_weights,
+                };
+
+                const int64_t bind_begin_us = ggml_time_us();
+                for (size_t k = 0; k < 3; ++k) {
+                    GGML_ASSERT(bindings[k].tensor != nullptr);
+                    GGML_ASSERT(stages[k] != nullptr);
+                    GGML_ASSERT(
+                        ggml_are_same_layout(
+                            bindings[k].tensor,
+                            stages[k]));
+                    bindings[k].tensor->buffer = stages[k]->buffer;
+                    bindings[k].tensor->data = stages[k]->data;
+                }
+
+                // A cached RPC graph would retain the old remote buffer/data
+                // bindings from its first serialization.  Force this deferred
+                // submission to serialize the graph while the three external
+                // inputs are rebound to private staging.  The worker wait is
+                // only a client-side submission wait, but it is sufficient:
+                // serialization and send have finished before we restore the
+                // local tensor metadata.
+                const uint64_t saved_uid = phone_graph->uid;
+                phone_graph->uid = 0;
+                const int64_t bind_us = ggml_time_us() - bind_begin_us;
+                phone_restore_submit_us += bind_us;
 
                 const int64_t submit_begin_us = ggml_time_us();
-                backend_ctx->compute_workers->start(1, it->sg);
+                backend_ctx->compute_workers->start_graph(
+                    1, phone_graph);
                 const ggml_status phone_status =
                     backend_ctx->compute_workers->wait(1);
                 const int64_t submit_us =
                     ggml_time_us() - submit_begin_us;
                 phone_ffn_submit_us += submit_us;
+
+                phone_graph->uid = saved_uid;
+                for (size_t k = 0; k < 3; ++k) {
+                    bindings[k].tensor->buffer = bindings[k].buffer;
+                    bindings[k].tensor->data = bindings[k].data;
+                }
+
                 if (phone_status != GGML_STATUS_SUCCESS) {
                     return phone_status;
                 }
@@ -5213,11 +5259,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     printf(
                         "[PHONE_PREFILL_PHONE_DEFER_SUBMIT] "
                         "layer=%d chunk=%d sg=%zu "
-                        "restore_submit_ms=%.3f ffn_submit_ms=%.3f\n",
+                        "bind_ms=%.3f ffn_submit_ms=%.3f\n",
                         it->layer,
                         it->chunk,
                         it->sg,
-                        restore_us / 1000.0,
+                        bind_us / 1000.0,
                         submit_us / 1000.0);
                 }
 
@@ -5311,7 +5357,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "[PHONE_PREFILL_PC_DRAIN] "
                     "layer=%d chunks=%zu ready_at_entry=%zu "
                     "ready_after_phone_fence=%zu phone_deferred=%zu "
-                    "restore_submit_ms=%.3f phone_ffn_submit_ms=%.3f "
+                    "bind_ms=%.3f phone_ffn_submit_ms=%.3f "
                     "phone_fence_ms=%.3f pc_wait_ms=%.3f "
                     "return_ms=%.3f tail_ms=%.3f\n",
                     layer,
@@ -5865,7 +5911,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 // this point (previous local FFN + current pre-route graph)
                 // has completed on the Phone backend.
                 const int64_t producer_fence_begin_us = ggml_time_us();
-                route_rpc_fence(bcj_src.backend);
+                if (!phone_prefill_defer_phone_ffn) {
+                    route_rpc_fence(bcj_src.backend);
+                }
                 const int64_t producer_fence_us =
                     ggml_time_us() - producer_fence_begin_us;
 
@@ -5959,14 +6007,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_stage_copy_us =
                         ggml_time_us() - stage_copy_begin_us;
 
-                    // The route transfer uses a different RPC socket.  Fence
-                    // only the just-enqueued local staging copies before that
-                    // socket reads them.  No Phone FFN has been submitted yet,
-                    // so this does not reintroduce the old FFN serialization.
-                    const int64_t stage_fence_begin_us = ggml_time_us();
-                    route_rpc_fence(route_src_backend);
-                    phone_stage_fence_us =
-                        ggml_time_us() - stage_fence_begin_us;
+                    // RPC has no backend cpy_tensor_async hook, so these
+                    // same-server copies use blocking RPC_COPY_TENSOR on the
+                    // COMPUTE socket.  They are ordered after the Router graph
+                    // and have completed before this call returns.  The route
+                    // socket can therefore read the private staging buffers
+                    // without a whole-backend fence.
+                    phone_stage_fence_us = 0;
 
                     route_src_hidden = phone_stage_hidden;
                     route_src_topk = phone_stage_topk;
