@@ -5654,52 +5654,214 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_fence_us / 1000.0);
             }
 
+            size_t async_return_chunks = 0;
+            size_t return_ready_after_phone_fence = 0;
+            for (const auto & branch : pending_phone_prefill_pc_branches) {
+                if (branch.layer != layer || branch.return_task == 0) {
+                    continue;
+                }
+                ++async_return_chunks;
+                GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
+                if (backend_ctx->prefill_return_worker->is_completed(
+                        branch.return_task)) {
+                    ++return_ready_after_phone_fence;
+                }
+            }
+            GGML_ASSERT(
+                async_return_chunks == 0 ||
+                async_return_chunks == layer_chunk_count);
+            const bool use_async_return =
+                async_return_chunks != 0;
+
             int64_t pc_wait_total_us = 0;
+            int64_t return_wait_total_us = 0;
+            int64_t return_fence_us = 0;
+            int64_t add_submit_total_us = 0;
+            int64_t add_fence_us = 0;
             int64_t return_total_us = 0;
             size_t drained_chunks = 0;
 
-            for (auto it = pending_phone_prefill_pc_branches.begin();
-                 it != pending_phone_prefill_pc_branches.end();) {
-                if (it->layer != layer) {
-                    ++it;
-                    continue;
+            if (use_async_return) {
+                GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
+
+                // Network transfer has already been running concurrently with
+                // the PC worker and local Phone FFNs.  At the tail, wait only
+                // for any residual PC/return work that failed to hide.
+                for (auto & branch : pending_phone_prefill_pc_branches) {
+                    if (branch.layer != layer) {
+                        continue;
+                    }
+                    GGML_ASSERT(branch.return_task != 0);
+                    GGML_ASSERT(branch.return_stage != nullptr);
+
+                    const int64_t pc_wait_begin_us = ggml_time_us();
+                    const ggml_status pc_status =
+                        backend_ctx->prefill_pc_worker->wait(
+                            branch.pc_task);
+                    const int64_t pc_wait_us =
+                        ggml_time_us() - pc_wait_begin_us;
+                    pc_wait_total_us += pc_wait_us;
+                    if (pc_status != GGML_STATUS_SUCCESS) {
+                        return pc_status;
+                    }
+
+                    const int64_t return_wait_begin_us =
+                        ggml_time_us();
+                    const ggml_status return_status =
+                        backend_ctx->prefill_return_worker->wait(
+                            branch.return_task);
+                    const int64_t return_wait_us =
+                        ggml_time_us() - return_wait_begin_us;
+                    return_wait_total_us += return_wait_us;
+                    if (return_status != GGML_STATUS_SUCCESS) {
+                        return return_status;
+                    }
+
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile) {
+                        printf(
+                            "[PHONE_PREFILL_ASYNC_DRAIN] "
+                            "layer=%d chunk=%d sg=%zu "
+                            "pc_wait_ms=%.3f return_wait_ms=%.3f\n",
+                            branch.layer,
+                            branch.chunk,
+                            branch.sg,
+                            pc_wait_us / 1000.0,
+                            return_wait_us / 1000.0);
+                    }
                 }
 
-                const int64_t wait_begin_us = ggml_time_us();
-                const ggml_status pc_status =
-                    backend_ctx->prefill_pc_worker->wait(it->pc_task);
-                const int64_t wait_us = ggml_time_us() - wait_begin_us;
-                pc_wait_total_us += wait_us;
-                if (pc_status != GGML_STATUS_SUCCESS) {
-                    return pc_status;
+                // Return ACK means the server has enqueued the async OpenCL
+                // staging write.  One fence guarantees all private staging
+                // buffers are device-complete before any ADD reads them.
+                const int64_t return_fence_begin_us =
+                    ggml_time_us();
+                phone_fence(phone_backend);
+                return_fence_us =
+                    ggml_time_us() - return_fence_begin_us;
+
+                // All staging buffers are now stable. Queue every ADD on the
+                // Phone compute socket, then pay a single completion fence.
+                for (auto & branch : pending_phone_prefill_pc_branches) {
+                    if (branch.layer != layer) {
+                        continue;
+                    }
+                    const int64_t add_begin_us = ggml_time_us();
+                    const ggml_status add_status =
+                        submit_phone_prefill_staged_add(
+                            branch.sg,
+                            branch.layer,
+                            branch.chunk,
+                            branch.return_stage);
+                    add_submit_total_us +=
+                        ggml_time_us() - add_begin_us;
+                    if (add_status != GGML_STATUS_SUCCESS) {
+                        return add_status;
+                    }
                 }
 
-                const int64_t return_begin_us = ggml_time_us();
-                const ggml_status return_status =
-                    perform_phone_prefill_oneway_return(
-                        it->sg, it->layer, it->chunk);
-                const int64_t return_us =
-                    ggml_time_us() - return_begin_us;
-                return_total_us += return_us;
-                if (return_status != GGML_STATUS_SUCCESS) {
-                    return return_status;
-                }
+                const int64_t add_fence_begin_us =
+                    ggml_time_us();
+                phone_fence(phone_backend);
+                add_fence_us =
+                    ggml_time_us() - add_fence_begin_us;
 
-                if (pipeline_debug) {
+                return_total_us =
+                    return_wait_total_us +
+                    return_fence_us +
+                    add_submit_total_us +
+                    add_fence_us;
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
                     printf(
-                        "[PHONE_PREFILL_PIPE_DRAIN] layer=%d chunk=%d sg=%zu "
-                        "pc_wait_ms=%.3f return_ms=%.3f\n",
-                        it->layer,
-                        it->chunk,
-                        it->sg,
-                        wait_us / 1000.0,
-                        return_us / 1000.0);
+                        "[PHONE_PREFILL_RETURN_OVERLAP] "
+                        "layer=%d chunks=%zu ready_after_phone_fence=%zu "
+                        "return_wait_ms=%.3f return_fence_ms=%.3f "
+                        "add_submit_ms=%.3f add_fence_ms=%.3f "
+                        "residual_ms=%.3f\n",
+                        layer,
+                        async_return_chunks,
+                        return_ready_after_phone_fence,
+                        return_wait_total_us / 1000.0,
+                        return_fence_us / 1000.0,
+                        add_submit_total_us / 1000.0,
+                        add_fence_us / 1000.0,
+                        return_total_us / 1000.0);
                 }
 
-                ++drained_chunks;
-                pending_phone_prefill_routes.erase({ it->layer, it->chunk });
-                deferred_phone_prefill_return_sgs.erase(it->sg);
-                it = pending_phone_prefill_pc_branches.erase(it);
+                for (auto it =
+                         pending_phone_prefill_pc_branches.begin();
+                     it != pending_phone_prefill_pc_branches.end();) {
+                    if (it->layer != layer) {
+                        ++it;
+                        continue;
+                    }
+                    ++drained_chunks;
+                    pending_phone_prefill_routes.erase(
+                        { it->layer, it->chunk });
+                    deferred_phone_prefill_return_sgs.erase(
+                        it->sg);
+                    it =
+                        pending_phone_prefill_pc_branches.erase(it);
+                }
+            } else {
+                // Patch-8 / feature-off fallback: preserve the previous
+                // correct fused SET+ADD tail path unchanged.
+                for (auto it =
+                         pending_phone_prefill_pc_branches.begin();
+                     it != pending_phone_prefill_pc_branches.end();) {
+                    if (it->layer != layer) {
+                        ++it;
+                        continue;
+                    }
+
+                    const int64_t wait_begin_us =
+                        ggml_time_us();
+                    const ggml_status pc_status =
+                        backend_ctx->prefill_pc_worker->wait(
+                            it->pc_task);
+                    const int64_t wait_us =
+                        ggml_time_us() - wait_begin_us;
+                    pc_wait_total_us += wait_us;
+                    if (pc_status != GGML_STATUS_SUCCESS) {
+                        return pc_status;
+                    }
+
+                    const int64_t return_begin_us =
+                        ggml_time_us();
+                    const ggml_status return_status =
+                        perform_phone_prefill_oneway_return(
+                            it->sg,
+                            it->layer,
+                            it->chunk);
+                    const int64_t return_us =
+                        ggml_time_us() - return_begin_us;
+                    return_total_us += return_us;
+                    if (return_status != GGML_STATUS_SUCCESS) {
+                        return return_status;
+                    }
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_PREFILL_PIPE_DRAIN] "
+                            "layer=%d chunk=%d sg=%zu "
+                            "pc_wait_ms=%.3f return_ms=%.3f\n",
+                            it->layer,
+                            it->chunk,
+                            it->sg,
+                            wait_us / 1000.0,
+                            return_us / 1000.0);
+                    }
+
+                    ++drained_chunks;
+                    pending_phone_prefill_routes.erase(
+                        { it->layer, it->chunk });
+                    deferred_phone_prefill_return_sgs.erase(
+                        it->sg);
+                    it =
+                        pending_phone_prefill_pc_branches.erase(it);
+                }
             }
 
             if (pipeline_debug || tensor_phone_stage_profile) {
@@ -5708,19 +5870,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 printf(
                     "[PHONE_PREFILL_PC_DRAIN] "
                     "layer=%d chunks=%zu ready_at_entry=%zu "
-                    "ready_after_phone_fence=%zu phone_deferred=%zu "
+                    "ready_after_phone_fence=%zu "
+                    "return_ready_after_phone_fence=%zu "
+                    "phone_deferred=%zu async_return=%d "
                     "bind_ms=%.3f phone_ffn_submit_ms=%.3f "
                     "phone_fence_ms=%.3f pc_wait_ms=%.3f "
+                    "return_wait_ms=%.3f return_fence_ms=%.3f "
+                    "add_submit_ms=%.3f add_fence_ms=%.3f "
                     "return_ms=%.3f tail_ms=%.3f\n",
                     layer,
                     drained_chunks,
                     pc_ready_at_entry,
                     pc_ready_after_phone_fence,
+                    return_ready_after_phone_fence,
                     phone_deferred_submitted,
+                    use_async_return ? 1 : 0,
                     phone_restore_submit_us / 1000.0,
                     phone_ffn_submit_us / 1000.0,
                     phone_fence_us / 1000.0,
                     pc_wait_total_us / 1000.0,
+                    return_wait_total_us / 1000.0,
+                    return_fence_us / 1000.0,
+                    add_submit_total_us / 1000.0,
+                    add_fence_us / 1000.0,
                     return_total_us / 1000.0,
                     tail_wall_us / 1000.0);
             }
