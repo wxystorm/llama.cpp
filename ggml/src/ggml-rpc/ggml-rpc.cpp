@@ -3619,6 +3619,13 @@ private:
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
         route_snapshot_devices;
+
+    std::mutex async_return_payload_mutex;
+    std::unordered_map<
+        ggml_backend_dev_t,
+        std::vector<std::shared_ptr<std::vector<uint8_t>>>>
+        async_return_payloads;
+
     std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
     std::mutex snapshot_breakdown_mutex;
     //新加的
@@ -4317,12 +4324,53 @@ bool rpc_server::set_tensor_async_return(
     const int64_t write_begin_us =
         stage_profile ? ggml_time_us() : 0;
 
-    bool async_write = set_tensor_direct_opencl_async(
-        in_tensor, offset, data, data_size);
-    bool status = async_write;
+    // CL_FALSE writes require the host source pointer to remain valid until
+    // the write completes. The old path pointed directly into this RPC
+    // request vector, which is destroyed when the handler returns. Keep an
+    // owned copy alive on the server until a synchronize on this device proves
+    // every previously-enqueued write has completed.
+    bool async_write = false;
+    bool status = false;
+    std::shared_ptr<std::vector<uint8_t>> owned_payload;
+    ggml_backend_dev_t payload_dev = nullptr;
+
+    ggml_backend_buffer_t payload_buffer =
+        reinterpret_cast<ggml_backend_buffer_t>(in_tensor.buffer);
+    if (payload_buffer != nullptr &&
+            buffers.find(payload_buffer) != buffers.end() &&
+            payload_buffer->buft != nullptr) {
+        payload_dev =
+            ggml_backend_buft_get_device(payload_buffer->buft);
+    }
+
+    if (payload_dev != nullptr) {
+        owned_payload =
+            std::make_shared<std::vector<uint8_t>>(data_size);
+        if (data_size > 0) {
+            memcpy(
+                owned_payload->data(),
+                data,
+                data_size);
+        }
+
+        std::lock_guard<std::mutex> lock(
+            async_return_payload_mutex);
+        async_write = set_tensor_direct_opencl_async(
+            in_tensor,
+            offset,
+            owned_payload->data(),
+            data_size);
+        if (async_write) {
+            async_return_payloads[payload_dev].
+                push_back(owned_payload);
+            status = true;
+        }
+    }
+
     if (!status) {
         status = set_tensor_direct(
             in_tensor, offset, data, data_size);
+        owned_payload.reset();
     }
 
     const int64_t write_us =
@@ -5643,7 +5691,36 @@ bool rpc_server::synchronize(uint32_t device) {
         return false;
     }
 
-    ggml_backend_synchronize(backends[device]);
+    ggml_backend_t backend = backends[device];
+    ggml_backend_dev_t dev =
+        ggml_backend_get_device(backend);
+
+    size_t released_payloads = 0;
+    {
+        std::lock_guard<std::mutex> lock(
+            async_return_payload_mutex);
+        ggml_backend_synchronize(backend);
+
+        if (dev != nullptr) {
+            auto it = async_return_payloads.find(dev);
+            if (it != async_return_payloads.end()) {
+                released_payloads = it->second.size();
+                async_return_payloads.erase(it);
+            }
+        }
+    }
+
+    if (released_payloads != 0 &&
+            rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=async_return_payload_release "
+            "device=%u count=%zu\n",
+            device,
+            released_payloads);
+        std::fflush(stderr);
+    }
     return true;
 }
 
