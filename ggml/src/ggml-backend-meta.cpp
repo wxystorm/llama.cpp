@@ -3994,36 +3994,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
-    struct phone_prefill_route_wave_gate {
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool open = false;
-        bool cancelled = false;
-    };
-    std::map<int, std::shared_ptr<phone_prefill_route_wave_gate>>
-        phone_prefill_route_wave_gates;
-
-    struct phone_prefill_route_wave_gate_guard {
-        std::map<int, std::shared_ptr<phone_prefill_route_wave_gate>> & gates;
-
-        ~phone_prefill_route_wave_gate_guard() {
-            for (auto & entry : gates) {
-                const auto & gate = entry.second;
-                if (gate == nullptr) {
-                    continue;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(gate->mutex);
-                    gate->cancelled = true;
-                    gate->open = true;
-                }
-                gate->cv.notify_all();
-            }
-        }
-    } phone_prefill_route_wave_gate_guard_instance {
-        phone_prefill_route_wave_gates
-    };
-
     struct phone_prefill_deferred_phone_branch {
         int layer = -1;
         int chunk = -1;
@@ -5101,13 +5071,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             0,
             0);
 
-    // Route-priority wavefront: keep PC/Phone compute overlapped, but do not
-    // let PC->Phone return payloads compete with the same layer's outstanding
-    // Phone->PC route snapshots. The layer tail releases the return gate only
-    // after every route snapshot for that layer has completed.
-    const bool phone_prefill_route_priority_active =
-        phone_prefill_chunk_join_active;
-
     if (pipeline_debug && phone_prefill_async_return) {
         printf(
             "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
@@ -5975,60 +5938,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return status;
         };
 
-    auto release_phone_prefill_route_wave =
-        [&](int layer) -> ggml_status {
-            if (!phone_prefill_route_priority_active) {
-                return GGML_STATUS_SUCCESS;
-            }
-
-            auto gate_it =
-                phone_prefill_route_wave_gates.find(layer);
-            if (gate_it == phone_prefill_route_wave_gates.end() ||
-                    gate_it->second == nullptr) {
-                return GGML_STATUS_FAILED;
-            }
-
-            size_t route_count = 0;
-            const int64_t wait_begin_us = ggml_time_us();
-            for (const auto & entry : pending_phone_prefill_routes) {
-                if (entry.first.first != layer) {
-                    continue;
-                }
-
-                const auto & route = entry.second;
-                GGML_ASSERT(route.worker != nullptr);
-                GGML_ASSERT(route.task != 0);
-                ++route_count;
-
-                const ggml_status route_status =
-                    route.worker->wait(route.task);
-                if (route_status != GGML_STATUS_SUCCESS) {
-                    return route_status;
-                }
-            }
-            const int64_t route_wait_us =
-                ggml_time_us() - wait_begin_us;
-
-            {
-                std::lock_guard<std::mutex> lock(
-                    gate_it->second->mutex);
-                gate_it->second->open = true;
-            }
-            gate_it->second->cv.notify_all();
-
-            if (pipeline_debug ||
-                    tensor_phone_stage_profile) {
-                printf(
-                    "[PHONE_PREFILL_ROUTE_WAVE_READY] "
-                    "layer=%d routes=%zu wait_ms=%.3f\n",
-                    layer,
-                    route_count,
-                    route_wait_us / 1000.0);
-            }
-
-            return GGML_STATUS_SUCCESS;
-        };
-
     auto join_phone_prefill_pc_chunk =
         [&](int layer, int chunk, bool wait_for_return) -> ggml_status {
             if (!phone_prefill_chunk_join_active) {
@@ -6711,16 +6620,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
-                if (last_chunk &&
-                        phone_prefill_route_priority_active) {
-                    const ggml_status route_wave_status =
-                        release_phone_prefill_route_wave(
-                            deferred_layer_0);
-                    if (route_wave_status != GGML_STATUS_SUCCESS) {
-                        return route_wave_status;
-                    }
-                }
-
                 const int64_t reap_begin_us = ggml_time_us();
                 const ggml_status join_status =
                     reap_phone_prefill_pc_layer(
@@ -6757,8 +6656,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (last_chunk) {
                     GGML_ASSERT(pending_after == 0);
-                    phone_prefill_route_wave_gates.erase(
-                        deferred_layer_0);
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
@@ -11237,27 +11134,12 @@ auto prefill_norm_sg_has_prework =
                 const bool use_chunk_join_return =
                     phone_prefill_chunk_join_active;
 
-                std::shared_ptr<phone_prefill_route_wave_gate>
-                    route_wave_gate;
-                if (phone_prefill_route_priority_active) {
-                    auto & gate =
-                        phone_prefill_route_wave_gates[
-                            prefill_down_layer];
-                    if (gate == nullptr) {
-                        gate =
-                            std::make_shared<
-                                phone_prefill_route_wave_gate>();
-                    }
-                    route_wave_gate = gate;
-                }
-
                 return_task = return_worker->enqueue(
                     [pc_worker,
                      pc_task,
                      async_return_set,
                      async_return_wait,
                      use_chunk_join_return,
-                     route_wave_gate,
                      phone_ffn_seq,
                      phone_backend,
                      phone_return_stage,
@@ -11276,26 +11158,6 @@ auto prefill_norm_sg_has_prework =
                             ggml_time_us() - wait_begin_us;
                         if (pc_status != GGML_STATUS_SUCCESS) {
                             return pc_status;
-                        }
-
-                        int64_t route_gate_wait_us = 0;
-                        if (route_wave_gate != nullptr) {
-                            const int64_t route_gate_wait_begin_us =
-                                ggml_time_us();
-                            std::unique_lock<std::mutex> gate_lock(
-                                route_wave_gate->mutex);
-                            route_wave_gate->cv.wait(
-                                gate_lock,
-                                [&]() {
-                                    return route_wave_gate->open ||
-                                        route_wave_gate->cancelled;
-                                });
-                            route_gate_wait_us =
-                                ggml_time_us() -
-                                route_gate_wait_begin_us;
-                            if (route_wave_gate->cancelled) {
-                                return GGML_STATUS_FAILED;
-                            }
                         }
 
                         const int64_t send_begin_us =
@@ -11321,15 +11183,14 @@ auto prefill_norm_sg_has_prework =
                             printf(
                                 "[PHONE_PREFILL_RETURN_ASYNC] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " pc_wait_ms=%.3f route_gate_wait_ms=%.3f "
-                                "send_ms=%.3f bytes=%zu ffn_seq=%" PRIu64
+                                " pc_wait_ms=%.3f send_ms=%.3f "
+                                "bytes=%zu ffn_seq=%" PRIu64
                                 " chunk_join=%d status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
                                 pc_wait_us / 1000.0,
-                                route_gate_wait_us / 1000.0,
                                 send_us / 1000.0,
                                 return_payload->size(),
                                 phone_ffn_seq,
