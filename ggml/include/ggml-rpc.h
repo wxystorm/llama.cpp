@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    9
+#define RPC_PROTO_PATCH_VERSION    10
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -56,6 +56,12 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC \
     "ggml_backend_rpc_route_mark_ready"
+
+#define GGML_BACKEND_RPC_ROUTE_SNAPSHOT_READY_PROC \
+    "ggml_backend_rpc_route_snapshot_ready"
+
+#define GGML_BACKEND_RPC_GET_ROUTE_SNAPSHOT_PROC \
+    "ggml_backend_rpc_get_route_snapshot"
 
 #define GGML_BACKEND_RPC_FENCE_PROC \
     "ggml_backend_rpc_fence"
@@ -150,6 +156,23 @@ using ggml_backend_rpc_set_route_wait_seq_t = void (*)(
 using ggml_backend_rpc_route_mark_ready_t = bool (*)(
         ggml_backend_t backend,
         uint64_t seq);
+
+using ggml_backend_rpc_route_snapshot_ready_t = bool (*)(
+        ggml_backend_t backend,
+        uint64_t seq,
+        uint32_t lane,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * src2);
+
+using ggml_backend_rpc_get_route_snapshot_t = bool (*)(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        uint64_t seq,
+        uint32_t lane,
+        ggml_tensor * dst0,
+        ggml_tensor * dst1,
+        ggml_tensor * dst2);
 
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
 
