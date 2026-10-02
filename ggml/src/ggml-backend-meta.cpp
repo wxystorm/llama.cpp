@@ -2271,7 +2271,7 @@ struct ggml_backend_meta_transfer_worker;
 
 struct ggml_backend_meta_context {
     static constexpr size_t PREFILL_RETURN_LANES = 2;
-    static constexpr size_t PREFILL_ROUTE_LANES = 2;
+    static constexpr size_t PREFILL_ROUTE_LANES = 4;
 
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
