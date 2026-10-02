@@ -26,6 +26,7 @@
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
+static constexpr size_t RPC_RETURN_TRANSFER_LANES = 2;
 
 static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
@@ -594,7 +595,7 @@ struct ggml_backend_rpc_device_context {
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
-    std::shared_ptr<socket_t> return_transfer_sock;
+    std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -1050,7 +1051,8 @@ enum class rpc_socket_role {
     ROUTE_TRANSFER_1,
     ROUTE_TRANSFER_2,
     ROUTE_TRANSFER_3,
-    RETURN_TRANSFER,
+    RETURN_TRANSFER_0,
+    RETURN_TRANSFER_1,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1083,8 +1085,11 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
         case rpc_socket_role::ROUTE_TRANSFER_3:
             suffix = "_route_transfer_3";
             break;
-        case rpc_socket_role::RETURN_TRANSFER:
-            suffix = "_return_transfer";
+        case rpc_socket_role::RETURN_TRANSFER_0:
+            suffix = "_return_transfer_0";
+            break;
+        case rpc_socket_role::RETURN_TRANSFER_1:
+            suffix = "_return_transfer_1";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1151,8 +1156,15 @@ static std::shared_ptr<socket_t> get_route_transfer_socket(const std::string & e
     }
 }
 
-static std::shared_ptr<socket_t> get_return_transfer_socket(const std::string & endpoint) {
-    return get_socket_role(endpoint, rpc_socket_role::RETURN_TRANSFER);
+static std::shared_ptr<socket_t> get_return_transfer_socket(
+        const std::string & endpoint,
+        size_t lane) {
+    GGML_ASSERT(lane < RPC_RETURN_TRANSFER_LANES);
+    return get_socket_role(
+        endpoint,
+        lane == 0 ?
+            rpc_socket_role::RETURN_TRANSFER_0 :
+            rpc_socket_role::RETURN_TRANSFER_1);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -3049,11 +3061,18 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         return false;
     }
 
-    if (rpc_dev_ctx->return_transfer_sock == nullptr) {
-        rpc_dev_ctx->return_transfer_sock =
-            get_return_transfer_socket(rpc_ctx->endpoint);
+    const size_t return_lane =
+        static_cast<size_t>(phone_ffn_seq) %
+        RPC_RETURN_TRANSFER_LANES;
+    auto & return_sock =
+        rpc_dev_ctx->return_transfer_socks[return_lane];
+    if (return_sock == nullptr) {
+        return_sock =
+            get_return_transfer_socket(
+                rpc_ctx->endpoint,
+                return_lane);
     }
-    auto sock = rpc_dev_ctx->return_transfer_sock;
+    auto sock = return_sock;
     RPC_STATUS_ASSERT(sock != nullptr);
 
     rpc_msg_set_tensor_async_return_wait_req request {};
@@ -3087,8 +3106,9 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=return_chunk_join seq=%" PRIu64
-            " bytes=%zu total_ms=%.3f status=%d\n",
+            " lane=%zu bytes=%zu total_ms=%.3f status=%d\n",
             phone_ffn_seq,
+            return_lane,
             data_size,
             (ggml_time_us() - begin_us) / 1000.0,
             status ? 1 : 0);
@@ -3143,11 +3163,15 @@ static bool ggml_backend_rpc_set_tensor_async_return(
         return false;
     }
 
-    if (rpc_dev_ctx->return_transfer_sock == nullptr) {
-        rpc_dev_ctx->return_transfer_sock =
-            get_return_transfer_socket(rpc_ctx->endpoint);
+    auto & return_sock =
+        rpc_dev_ctx->return_transfer_socks[0];
+    if (return_sock == nullptr) {
+        return_sock =
+            get_return_transfer_socket(
+                rpc_ctx->endpoint,
+                0);
     }
-    auto sock = rpc_dev_ctx->return_transfer_sock;
+    auto sock = return_sock;
     RPC_STATUS_ASSERT(sock != nullptr);
 
     const bool stage_profile =
