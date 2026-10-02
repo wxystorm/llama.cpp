@@ -258,6 +258,8 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_ASYNC_RETURN,
     RPC_CMD_ROUTE_SNAPSHOT_READY,
     RPC_CMD_GET_ROUTE_SNAPSHOT,
+    RPC_CMD_PHONE_FFN_MARK_READY,
+    RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -276,6 +278,8 @@ static_assert(RPC_CMD_GET_TENSOR_BATCH3_WAIT == 27, "RPC_CMD_GET_TENSOR_BATCH3_W
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN == 28, "RPC_CMD_SET_TENSOR_ASYNC_RETURN must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY == 29, "RPC_CMD_ROUTE_SNAPSHOT_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -390,6 +394,18 @@ struct rpc_msg_get_tensor_batch3_wait_req {
 struct rpc_msg_route_mark_ready_req {
     uint32_t device;
     uint64_t seq;
+};
+
+struct rpc_msg_phone_ffn_mark_ready_req {
+    uint32_t device;
+    uint64_t seq;
+};
+
+struct rpc_msg_set_tensor_async_return_wait_req {
+    uint32_t device;
+    uint64_t phone_ffn_seq;
+    rpc_tensor tensor;
+    uint64_t offset;
 };
 
 struct rpc_msg_route_snapshot_ready_req {
@@ -2924,6 +2940,144 @@ static bool ggml_backend_rpc_set_tensor_graph(
     return status;
 }
 
+static bool ggml_backend_rpc_phone_ffn_mark_ready(
+        ggml_backend_t backend,
+        uint64_t seq) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_PHONE_FFN_JOIN_MIN_PATCH = 11;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_PHONE_FFN_JOIN_MIN_PATCH) {
+        return false;
+    }
+
+    if (seq == 0) {
+        return true;
+    }
+
+    rpc_msg_phone_ffn_mark_ready_req request {};
+    request.device = rpc_ctx->device;
+    request.seq = seq;
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    // This command intentionally has no response. It is sent on the compute
+    // socket immediately after the Phone FFN graph command. The server cannot
+    // process this marker until the preceding graph_compute has completed on
+    // that socket, making seq a per-chunk Phone-FFN completion dependency.
+    return send_rpc_cmd_compact_small(
+        sock,
+        RPC_CMD_PHONE_FFN_MARK_READY,
+        request);
+}
+
+static bool ggml_backend_rpc_set_tensor_async_return_wait(
+        ggml_backend_t backend_dst,
+        ggml_tensor * dst,
+        const void * data,
+        size_t data_size,
+        uint64_t phone_ffn_seq) {
+    if (backend_dst == nullptr || !ggml_backend_is_rpc(backend_dst)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_dst->context);
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_dst)->context);
+    if (rpc_ctx == nullptr || rpc_dev_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_PHONE_FFN_JOIN_MIN_PATCH = 11;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_PHONE_FFN_JOIN_MIN_PATCH) {
+        return false;
+    }
+
+    if (dst == nullptr && data == nullptr &&
+            data_size == 0 && phone_ffn_seq == 0) {
+        return true;
+    }
+
+    if (dst == nullptr || data == nullptr ||
+            phone_ffn_seq == 0 ||
+            dst->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(dst->buffer) ||
+            data_size != ggml_nbytes(dst)) {
+        return false;
+    }
+
+    auto * dst_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            dst->buffer->context);
+    if (dst_buffer_ctx == nullptr ||
+            dst_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            dst_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    if (rpc_dev_ctx->return_transfer_sock == nullptr) {
+        rpc_dev_ctx->return_transfer_sock =
+            get_return_transfer_socket(rpc_ctx->endpoint);
+    }
+    auto sock = rpc_dev_ctx->return_transfer_sock;
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    rpc_msg_set_tensor_async_return_wait_req request {};
+    request.device = rpc_ctx->device;
+    request.phone_ffn_seq = phone_ffn_seq;
+    request.tensor = serialize_tensor(dst);
+    request.offset = 0;
+
+    const size_t input_size = sizeof(request) + data_size;
+    std::vector<uint8_t> input(input_size);
+    memcpy(input.data(), &request, sizeof(request));
+    if (data_size > 0) {
+        memcpy(input.data() + sizeof(request), data, data_size);
+    }
+
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
+        input.data(),
+        input.size(),
+        nullptr,
+        0);
+
+    if (stage_profile) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=pc "
+            "stage=return_chunk_join seq=%" PRIu64
+            " bytes=%zu total_ms=%.3f status=%d\n",
+            phone_ffn_seq,
+            data_size,
+            (ggml_time_us() - begin_us) / 1000.0,
+            status ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    return status;
+}
+
 static bool ggml_backend_rpc_set_tensor_async_return(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -3534,6 +3688,8 @@ public:
         size_t size);
     bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
     bool set_tensor_async_return(const std::vector<uint8_t> & input);
+    bool set_tensor_async_return_wait(const std::vector<uint8_t> & input);
+    bool phone_ffn_mark_ready(const rpc_msg_phone_ffn_mark_ready_req & request);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor_into(const rpc_msg_get_tensor_req & request, void * response_data);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -3615,6 +3771,10 @@ private:
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
     std::unordered_map<uint32_t, uint64_t> route_ready_seq;
+
+    std::mutex phone_ffn_ready_mutex;
+    std::condition_variable phone_ffn_ready_cv;
+    std::unordered_map<uint32_t, uint64_t> phone_ffn_ready_seq;
 
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
@@ -4384,6 +4544,101 @@ bool rpc_server::set_tensor_async_return(
             async_write ? 1 : 0,
             write_us / 1000.0,
             (ggml_time_us() - begin_us) / 1000.0,
+            status ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    return status;
+}
+
+bool rpc_server::phone_ffn_mark_ready(
+        const rpc_msg_phone_ffn_mark_ready_req & request) {
+    if (request.device >= backends.size() || request.seq == 0) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
+        uint64_t & ready = phone_ffn_ready_seq[request.device];
+        ready = std::max(ready, request.seq);
+    }
+    phone_ffn_ready_cv.notify_all();
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=phone_ffn_chunk_ready device=%u seq=%" PRIu64 "\n",
+            request.device,
+            request.seq);
+        std::fflush(stderr);
+    }
+    return true;
+}
+
+bool rpc_server::set_tensor_async_return_wait(
+        const std::vector<uint8_t> & input) {
+    if (input.size() <
+            sizeof(rpc_msg_set_tensor_async_return_wait_req)) {
+        return false;
+    }
+
+    rpc_msg_set_tensor_async_return_wait_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+
+    if (request.device >= backends.size() ||
+            request.phone_ffn_seq == 0) {
+        return false;
+    }
+
+    const int64_t wait_begin_us = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lock(phone_ffn_ready_mutex);
+        phone_ffn_ready_cv.wait(
+            lock,
+            [&]() {
+                auto it = phone_ffn_ready_seq.find(request.device);
+                return it != phone_ffn_ready_seq.end() &&
+                    it->second >= request.phone_ffn_seq;
+            });
+    }
+    const int64_t wait_us = ggml_time_us() - wait_begin_us;
+
+    const size_t data_size = input.size() - sizeof(request);
+    std::vector<uint8_t> legacy_input(
+        sizeof(rpc_tensor) + sizeof(uint64_t) + data_size);
+    size_t cursor = 0;
+    memcpy(
+        legacy_input.data() + cursor,
+        &request.tensor,
+        sizeof(request.tensor));
+    cursor += sizeof(request.tensor);
+    memcpy(
+        legacy_input.data() + cursor,
+        &request.offset,
+        sizeof(request.offset));
+    cursor += sizeof(request.offset);
+    if (data_size > 0) {
+        memcpy(
+            legacy_input.data() + cursor,
+            input.data() + sizeof(request),
+            data_size);
+        cursor += data_size;
+    }
+    GGML_ASSERT(cursor == legacy_input.size());
+
+    const bool status = set_tensor_async_return(legacy_input);
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=return_chunk_join device=%u seq=%" PRIu64
+            " ffn_wait_ms=%.3f bytes=%zu status=%d\n",
+            request.device,
+            request.phone_ffn_seq,
+            wait_us / 1000.0,
+            data_size,
             status ? 1 : 0);
         std::fflush(stderr);
     }
@@ -6637,6 +6892,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_PHONE_FFN_MARK_READY: {
+                rpc_msg_phone_ffn_mark_ready_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.phone_ffn_mark_ready(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR_BATCH3_WAIT: {
                 rpc_msg_get_tensor_batch3_wait_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -6681,6 +6946,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         sock,
                         response.data(),
                         response.size())) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_async_return_wait(input)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
@@ -7243,6 +7521,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_FFN_MARK_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_ffn_mark_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_tensor_async_return_wait);
     }
     GGML_UNUSED(reg);
 
