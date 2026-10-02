@@ -5105,6 +5105,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             nullptr,
             nullptr,
             0,
+            0,
             0);
 
     if (pipeline_debug && phone_prefill_async_return) {
@@ -11257,7 +11258,7 @@ auto prefill_norm_sg_has_prework =
                     phone_prefill_chunk_join_active;
                 return_lane =
                     use_chunk_join_return ?
-                        static_cast<size_t>(phone_ffn_seq - 1) %
+                        static_cast<size_t>(prefill_down_chunk) %
                             ggml_backend_meta_context::PREFILL_RETURN_LANES :
                         0;
                 auto & return_worker_slot =
@@ -11349,7 +11350,8 @@ auto prefill_norm_sg_has_prework =
                                     phone_return_stage,
                                     return_payload->data(),
                                     return_payload->size(),
-                                    phone_ffn_seq) :
+                                    phone_ffn_seq,
+                                    return_lane) :
                                 async_return_set(
                                     phone_backend,
                                     phone_return_stage,
