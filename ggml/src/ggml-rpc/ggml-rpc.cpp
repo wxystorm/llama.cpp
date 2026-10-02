@@ -23,7 +23,9 @@
 #include <functional>
 #include <algorithm>
 
-static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");\n\nstatic constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
+static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+
+static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 
 static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
