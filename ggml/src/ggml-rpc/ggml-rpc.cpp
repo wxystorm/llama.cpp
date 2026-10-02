@@ -256,6 +256,8 @@ enum rpc_cmd {
     RPC_CMD_ROUTE_MARK_READY,
     RPC_CMD_GET_TENSOR_BATCH3_WAIT,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN,
+    RPC_CMD_ROUTE_SNAPSHOT_READY,
+    RPC_CMD_GET_ROUTE_SNAPSHOT,
     RPC_CMD_COUNT,
 };
 
@@ -272,6 +274,8 @@ static_assert(RPC_CMD_SET_TENSOR_GRAPH_COMPUTE == 25, "RPC_CMD_SET_TENSOR_GRAPH_
 static_assert(RPC_CMD_ROUTE_MARK_READY == 26, "RPC_CMD_ROUTE_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_TENSOR_BATCH3_WAIT == 27, "RPC_CMD_GET_TENSOR_BATCH3_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN == 28, "RPC_CMD_SET_TENSOR_ASYNC_RETURN must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY == 29, "RPC_CMD_ROUTE_SNAPSHOT_READY must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -386,6 +390,25 @@ struct rpc_msg_get_tensor_batch3_wait_req {
 struct rpc_msg_route_mark_ready_req {
     uint32_t device;
     uint64_t seq;
+};
+
+struct rpc_msg_route_snapshot_ready_req {
+    uint32_t device;
+    uint32_t lane;
+    uint64_t seq;
+    rpc_tensor tensors[3];
+    uint64_t sizes[3];
+};
+
+struct rpc_msg_route_snapshot_ready_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_get_route_snapshot_req {
+    uint32_t device;
+    uint32_t lane;
+    uint64_t seq;
+    uint64_t sizes[3];
 };
 
 struct rpc_msg_set_tensor_graph_req_v6 {
@@ -2056,6 +2079,209 @@ static bool ggml_backend_rpc_route_mark_ready(
         request);
 }
 
+static bool ggml_backend_rpc_route_snapshot_ready(
+        ggml_backend_t backend,
+        uint64_t seq,
+        uint32_t lane,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * src2) {
+    if (backend == nullptr || lane >= 2) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 10;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
+        return false;
+    }
+
+    if (seq == 0) {
+        // Capability query used by Meta before enabling producer snapshots.
+        return true;
+    }
+
+    const ggml_tensor * srcs[3] = { src0, src1, src2 };
+    rpc_msg_route_snapshot_ready_req request {};
+    request.device = rpc_ctx->device;
+    request.lane = lane;
+    request.seq = seq;
+
+    for (size_t i = 0; i < 3; ++i) {
+        if (srcs[i] == nullptr ||
+                srcs[i]->buffer == nullptr ||
+                !ggml_backend_buffer_is_rpc(srcs[i]->buffer)) {
+            return false;
+        }
+
+        auto * buffer_ctx =
+            static_cast<ggml_backend_rpc_buffer_context *>(
+                srcs[i]->buffer->context);
+        if (buffer_ctx == nullptr ||
+                buffer_ctx->endpoint != rpc_ctx->endpoint ||
+                buffer_ctx->device != rpc_ctx->device) {
+            return false;
+        }
+
+        request.tensors[i] = serialize_tensor(srcs[i]);
+        request.sizes[i] = ggml_nbytes(srcs[i]);
+    }
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    rpc_msg_route_snapshot_ready_rsp response {};
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_ROUTE_SNAPSHOT_READY,
+        &request,
+        sizeof(request),
+        &response,
+        sizeof(response));
+    return status && response.result != 0;
+}
+
+static bool ggml_backend_rpc_get_route_snapshot(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        uint64_t seq,
+        uint32_t lane,
+        ggml_tensor * dst0,
+        ggml_tensor * dst1,
+        ggml_tensor * dst2) {
+    if (backend_src == nullptr ||
+            backend_dst == nullptr ||
+            seq == 0 ||
+            lane >= 2) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_src->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 10;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
+        return false;
+    }
+
+    ggml_tensor * dsts[3] = { dst0, dst1, dst2 };
+    rpc_msg_get_route_snapshot_req request {};
+    request.device = rpc_ctx->device;
+    request.lane = lane;
+    request.seq = seq;
+
+    size_t total_size = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        if (dsts[i] == nullptr) {
+            return false;
+        }
+        const size_t size = ggml_nbytes(dsts[i]);
+        if (size > SIZE_MAX - total_size) {
+            return false;
+        }
+        request.sizes[i] = size;
+        total_size += size;
+    }
+
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_src)->context);
+    if (rpc_dev_ctx == nullptr) {
+        return false;
+    }
+
+    auto & route_sock =
+        rpc_dev_ctx->route_transfer_socks[lane];
+    if (route_sock == nullptr) {
+        route_sock =
+            get_route_transfer_socket(
+                rpc_ctx->endpoint,
+                lane);
+    }
+    RPC_STATUS_ASSERT(route_sock != nullptr);
+
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t client_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    // Destination staging is private per chunk/lane. Keep the generic
+    // destination-safety contract explicit for correctness.
+    const int64_t dst_sync_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    ggml_backend_synchronize(backend_dst);
+    const int64_t dst_sync_us =
+        stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
+
+    std::vector<uint8_t> response(total_size);
+    const int64_t rpc_begin_us = ggml_time_us();
+    const bool status =
+        rpc_stage_ready_callback != nullptr ?
+            send_rpc_cmd_staged(
+                route_sock,
+                RPC_CMD_GET_ROUTE_SNAPSHOT,
+                &request,
+                sizeof(request),
+                response.data(),
+                response.size()) :
+            send_rpc_cmd(
+                route_sock,
+                RPC_CMD_GET_ROUTE_SNAPSHOT,
+                &request,
+                sizeof(request),
+                response.data(),
+                response.size());
+    const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
+    RPC_STATUS_ASSERT(status);
+
+    const int64_t dst_set_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    size_t offset = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t size = static_cast<size_t>(request.sizes[i]);
+        ggml_backend_tensor_set(
+            dsts[i],
+            response.data() + offset,
+            0,
+            size);
+        offset += size;
+    }
+    GGML_ASSERT(offset == response.size());
+    const int64_t dst_set_us =
+        stage_profile ? ggml_time_us() - dst_set_begin_us : 0;
+
+    if (stage_profile) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=pc "
+            "stage=route_snapshot bytes=%zu lane=%u "
+            "seq=%" PRIu64 " dst_sync_ms=%.3f "
+            "rpc_roundtrip_ms=%.3f dst_set_ms=%.3f total_ms=%.3f\n",
+            total_size,
+            lane,
+            seq,
+            dst_sync_us / 1000.0,
+            rpc_us / 1000.0,
+            dst_set_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+
+    return true;
+}
+
 static bool ggml_backend_rpc_get_tensor_batch3(
         ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
@@ -3180,6 +3406,19 @@ struct rpc_snapshot_device {
     std::array<rpc_snapshot_slot, 2> slots;
 };
 
+struct rpc_route_snapshot_slot {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<uint8_t> data;
+    std::array<uint64_t, 3> sizes {};
+    uint64_t seq = 0;
+    rpc_snapshot_state state = rpc_snapshot_state::FREE;
+};
+
+struct rpc_route_snapshot_device {
+    std::array<rpc_route_snapshot_slot, 2> slots;
+};
+
 struct rpc_snapshot_breakdown {
     uint64_t requests      = 0;
     uint64_t bytes         = 0;
@@ -3267,8 +3506,11 @@ public:
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
         snapshot_devices.reserve(backends.size());
+        route_snapshot_devices.reserve(backends.size());
         for (size_t i = 0; i < backends.size(); ++i) {
             snapshot_devices.emplace_back(std::make_unique<rpc_snapshot_device>());
+            route_snapshot_devices.emplace_back(
+                std::make_unique<rpc_route_snapshot_device>());
         }
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
@@ -3298,6 +3540,12 @@ public:
     bool get_tensor_batch3(const rpc_msg_get_tensor_batch3_req & request, std::vector<uint8_t> & response);
     bool get_tensor_batch3_wait(const rpc_msg_get_tensor_batch3_wait_req & request, std::vector<uint8_t> & response);
     bool route_mark_ready(const rpc_msg_route_mark_ready_req & request);
+    bool route_snapshot_ready(
+        const rpc_msg_route_snapshot_ready_req & request,
+        rpc_msg_route_snapshot_ready_rsp & response);
+    bool get_route_snapshot(
+        const rpc_msg_get_route_snapshot_req & request,
+        std::vector<uint8_t> & response);
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -3369,6 +3617,8 @@ private:
     std::unordered_map<uint32_t, uint64_t> route_ready_seq;
 
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
+    std::vector<std::unique_ptr<rpc_route_snapshot_device>>
+        route_snapshot_devices;
     std::array<rpc_snapshot_breakdown, 2> snapshot_breakdown {};
     std::mutex snapshot_breakdown_mutex;
     //新加的
@@ -4400,6 +4650,180 @@ bool rpc_server::get_tensor(
         std::vector<uint8_t> & response) {
     response.resize(request.size, 0);
     return get_tensor_into(request, response.data());
+}
+
+bool rpc_server::route_snapshot_ready(
+        const rpc_msg_route_snapshot_ready_req & request,
+        rpc_msg_route_snapshot_ready_rsp & response) {
+    response.result = 0;
+    if (request.device >= backends.size() ||
+            request.lane >= 2 ||
+            request.seq == 0) {
+        return true;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ 3 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+
+    ggml_tensor * tensors[3] = {};
+    size_t total_size = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        tensors[i] =
+            deserialize_tensor(
+                ctx_ptr.get(),
+                &request.tensors[i]);
+        if (tensors[i] == nullptr ||
+                tensors[i]->buffer == nullptr ||
+                request.sizes[i] != ggml_nbytes(tensors[i])) {
+            return true;
+        }
+        if (!ensure_opencl_tensor_extra(tensors[i])) {
+            return true;
+        }
+        if (request.sizes[i] > SIZE_MAX - total_size) {
+            return true;
+        }
+        total_size +=
+            static_cast<size_t>(request.sizes[i]);
+    }
+
+    rpc_route_snapshot_slot & slot =
+        route_snapshot_devices[request.device]->
+            slots[request.lane];
+
+    {
+        std::unique_lock<std::mutex> lock(slot.mutex);
+        slot.cv.wait(
+            lock,
+            [&]() {
+                return slot.state ==
+                    rpc_snapshot_state::FREE;
+            });
+        slot.state = rpc_snapshot_state::FILLING;
+        slot.seq = request.seq;
+        slot.sizes = {
+            request.sizes[0],
+            request.sizes[1],
+            request.sizes[2],
+        };
+        slot.data.resize(total_size);
+    }
+
+    const int64_t fill_begin_us = ggml_time_us();
+    size_t offset = 0;
+    bool ok = true;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t size =
+            static_cast<size_t>(request.sizes[i]);
+        ggml_backend_tensor_get(
+            tensors[i],
+            slot.data.data() + offset,
+            0,
+            size);
+        offset += size;
+    }
+    GGML_ASSERT(offset == total_size);
+    const int64_t fill_us =
+        ggml_time_us() - fill_begin_us;
+
+    {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (ok) {
+            slot.state = rpc_snapshot_state::READY;
+        } else {
+            slot.state = rpc_snapshot_state::FREE;
+            slot.data.clear();
+            slot.seq = 0;
+        }
+    }
+    slot.cv.notify_all();
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=route_snapshot_fill lane=%u "
+            "seq=%" PRIu64 " bytes=%zu fill_ms=%.3f status=%d\n",
+            request.lane,
+            request.seq,
+            total_size,
+            fill_us / 1000.0,
+            ok ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    response.result = ok ? 1 : 0;
+    return true;
+}
+
+bool rpc_server::get_route_snapshot(
+        const rpc_msg_get_route_snapshot_req & request,
+        std::vector<uint8_t> & response) {
+    if (request.device >= backends.size() ||
+            request.lane >= 2 ||
+            request.seq == 0) {
+        return false;
+    }
+
+    rpc_route_snapshot_slot & slot =
+        route_snapshot_devices[request.device]->
+            slots[request.lane];
+
+    const int64_t wait_begin_us = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lock(slot.mutex);
+        slot.cv.wait(
+            lock,
+            [&]() {
+                return slot.state ==
+                        rpc_snapshot_state::READY &&
+                    slot.seq == request.seq;
+            });
+
+        for (size_t i = 0; i < 3; ++i) {
+            if (slot.sizes[i] != request.sizes[i]) {
+                GGML_LOG_ERROR(
+                    "[RPC_ROUTE_SNAPSHOT_MISMATCH] "
+                    "lane=%u seq=%" PRIu64
+                    " item=%zu expected=%" PRIu64
+                    " actual=%" PRIu64 "\n",
+                    request.lane,
+                    request.seq,
+                    i,
+                    request.sizes[i],
+                    slot.sizes[i]);
+                return false;
+            }
+        }
+
+        slot.state = rpc_snapshot_state::SENDING;
+        response = slot.data;
+        slot.data.clear();
+        slot.seq = 0;
+        slot.sizes = {};
+        slot.state = rpc_snapshot_state::FREE;
+    }
+    slot.cv.notify_all();
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=route_snapshot_send lane=%u "
+            "seq=%" PRIu64 " bytes=%zu ready_wait_ms=%.3f\n",
+            request.lane,
+            request.seq,
+            response.size(),
+            (ggml_time_us() - wait_begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+
+    return true;
 }
 
 bool rpc_server::route_mark_ready(
@@ -6150,6 +6574,40 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_ROUTE_SNAPSHOT_READY: {
+                rpc_msg_route_snapshot_ready_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_route_snapshot_ready_rsp response {};
+                if (!server.route_snapshot_ready(request, response)) {
+                    return;
+                }
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GET_ROUTE_SNAPSHOT: {
+                rpc_msg_get_route_snapshot_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.get_route_snapshot(request, response)) {
+                    return;
+                }
+                if (!send_msg(
+                        sock,
+                        response.data(),
+                        response.size())) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_ASYNC_RETURN: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -6640,6 +7098,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_route_mark_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_ROUTE_SNAPSHOT_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_route_snapshot_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_ROUTE_SNAPSHOT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_get_route_snapshot);
     }
     if (std::strcmp(
             name,
