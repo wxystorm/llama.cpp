@@ -5095,6 +5095,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         [&](int layer) {
             if (!phone_prefill_chunk_pipeline ||
                     !phone_prefill_defer_phone_ffn ||
+                    phone_prefill_producer_route ||
                     n_backends != 2 ||
                     !layer_is_tensor_phone_primary(layer) ||
                     std::getenv(
@@ -5244,7 +5245,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         [&](size_t sg, int layer, int chunk) -> bool {
             if (!phone_prefill_producer_route ||
                     !phone_prefill_chunk_pipeline ||
-                    !phone_prefill_defer_phone_ffn ||
                     phone_primary_strict_route ||
                     chunk < 0 ||
                     n_backends != 2 ||
@@ -5478,9 +5478,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     src_hidden,
                     src_topk,
                     src_weights,
-                    src_hidden,
-                    src_topk,
-                    src_weights,
+                    nullptr,
+                    nullptr,
+                    nullptr,
                     stage_hidden,
                     stage_topk,
                     stage_weights,
@@ -10883,6 +10883,7 @@ auto prefill_norm_sg_has_prework =
             }
 
             const bool defer_local_phone_ffn =
+                !phone_prefill_producer_route &&
                 phone_prefill_defer_phone_ffn &&
                 route.phone_stage_hidden != nullptr &&
                 route.phone_stage_topk != nullptr &&
@@ -11135,6 +11136,7 @@ auto prefill_norm_sg_has_prework =
         int direct_route_chunk = -1;
         int direct_route_layer = -1;
         bool direct_route_bound = false;
+        bool direct_route_rebound = false;
         uint64_t saved_phone_graph_uid = 0;
         if (!phone_block_fused &&
                 phone_graph != nullptr &&
@@ -11143,13 +11145,21 @@ auto prefill_norm_sg_has_prework =
                     phone_graph->nodes[
                         phone_graph->n_nodes - 1]->name,
                     direct_route_chunk,
-                    direct_route_layer) &&
-                bind_phone_prefill_route_outputs_direct(
+                    direct_route_layer)) {
+            // Producer-route snapshots the ordinary producer tensors
+            // immediately after this graph completes.  It must therefore
+            // detect the boundary without rebinding those tensors into the
+            // legacy deferred-Phone-FFN staging storage.
+            if (phone_prefill_producer_route) {
+                direct_route_bound = true;
+            } else if (bind_phone_prefill_route_outputs_direct(
                     direct_route_layer,
                     direct_route_chunk)) {
-            direct_route_bound = true;
-            saved_phone_graph_uid = phone_graph->uid;
-            phone_graph->uid = 0;
+                direct_route_bound = true;
+                direct_route_rebound = true;
+                saved_phone_graph_uid = phone_graph->uid;
+                phone_graph->uid = 0;
+            }
         }
 
         bool producer_route_prearmed = false;
@@ -11170,7 +11180,9 @@ auto prefill_norm_sg_has_prework =
         compute_status = compute_workers.wait(1);
 
         if (direct_route_bound) {
-            phone_graph->uid = saved_phone_graph_uid;
+            if (direct_route_rebound) {
+                phone_graph->uid = saved_phone_graph_uid;
+            }
             ggml_backend_t phone_backend =
                 backend_ctx->backend_configs[1].backend;
 
