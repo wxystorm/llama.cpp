@@ -2670,6 +2670,42 @@ ggml_backend_meta_get_route_mark_ready(ggml_backend_t backend) {
             GGML_BACKEND_RPC_ROUTE_MARK_READY_PROC));
 }
 
+static ggml_backend_rpc_route_snapshot_ready_t
+ggml_backend_meta_get_route_snapshot_ready(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_route_snapshot_ready_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_ROUTE_SNAPSHOT_READY_PROC));
+}
+
+static ggml_backend_rpc_get_route_snapshot_t
+ggml_backend_meta_get_route_snapshot(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_get_route_snapshot_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_GET_ROUTE_SNAPSHOT_PROC));
+}
+
 static ggml_backend_rpc_fence_t ggml_backend_meta_get_rpc_fence(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -5199,13 +5235,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     // Producer-driven Phone->PC route path.
     //
-    // The PC route worker posts GET_BATCH3_WAIT(seq) before the Phone Router
-    // producer graph runs. The dedicated route socket therefore waits at the
-    // server for the producer sequence instead of issuing a live GET after
-    // production. When the Phone graph completes, mark_ready(seq) releases
-    // the already-posted transfer. This mirrors the snapshot/credit style used
-    // by the PC-primary pipeline and removes route polling from the graph
-    // thread without adding a host fence.
+    // The PC route worker posts GET_ROUTE_SNAPSHOT(seq,lane) before the Phone
+    // Router producer graph runs. The dedicated route socket waits on an
+    // immutable server-side lane slot. When the Phone graph completes, Meta
+    // synchronously captures hidden/top-k/weights into that slot and only then
+    // publishes READY. The consumer never reads a live producer tensor.
     auto prearm_phone_prefill_route =
         [&](size_t sg, int layer, int chunk) -> bool {
             if (!phone_prefill_producer_route ||
@@ -5232,24 +5266,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
 
-            const ggml_backend_rpc_get_tensor_batch3_t route_get_batch3 =
-                ggml_backend_meta_get_tensor_batch3(bcj_src.backend);
+            const ggml_backend_rpc_get_route_snapshot_t
+                route_get_snapshot =
+                    ggml_backend_meta_get_route_snapshot(
+                        bcj_src.backend);
+            const ggml_backend_rpc_route_snapshot_ready_t
+                route_snapshot_ready =
+                    ggml_backend_meta_get_route_snapshot_ready(
+                        bcj_src.backend);
             const ggml_backend_rpc_set_stage_ready_t route_set_stage_ready =
-                ggml_backend_meta_get_stage_ready_setter(bcj_src.backend);
-            const ggml_backend_rpc_set_route_transfer_lane_t route_set_lane =
-                ggml_backend_meta_get_route_transfer_lane_setter(
+                ggml_backend_meta_get_stage_ready_setter(
                     bcj_src.backend);
-            const ggml_backend_rpc_set_route_wait_seq_t route_set_wait_seq =
-                ggml_backend_meta_get_route_wait_seq_setter(bcj_src.backend);
-            const ggml_backend_rpc_route_mark_ready_t route_mark_ready =
-                ggml_backend_meta_get_route_mark_ready(bcj_src.backend);
 
-            if (route_get_batch3 == nullptr ||
+            if (route_get_snapshot == nullptr ||
+                    route_snapshot_ready == nullptr ||
                     route_set_stage_ready == nullptr ||
-                    route_set_lane == nullptr ||
-                    route_set_wait_seq == nullptr ||
-                    route_mark_ready == nullptr ||
-                    !route_mark_ready(bcj_src.backend, 0)) {
+                    !route_snapshot_ready(
+                        bcj_src.backend,
+                        0,
+                        0,
+                        nullptr,
+                        nullptr,
+                        nullptr)) {
                 return false;
             }
 
@@ -5363,9 +5401,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             const uint64_t route_task =
                 route_worker->enqueue(
-                    [&, route_worker, route_get_batch3,
-                        route_set_stage_ready, route_set_lane,
-                        route_set_wait_seq, producer_seq,
+                    [&, route_worker, route_get_snapshot,
+                        route_set_stage_ready, producer_seq,
                         src_hidden, stage_hidden,
                         src_topk, stage_topk,
                         src_weights, stage_weights,
@@ -5379,31 +5416,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 task_id,
                             };
 
-                        route_set_lane(
-                            static_cast<int>(lane));
-                        route_set_wait_seq(producer_seq);
                         route_set_stage_ready(
                             ggml_backend_meta_stage_ready,
                             &stage_context);
 
                         const int64_t route_begin_us =
                             ggml_time_us();
-                        const bool used = route_get_batch3(
+                        const bool used = route_get_snapshot(
                             route_src_backend,
                             route_dst_backend,
-                            src_hidden,
+                            producer_seq,
+                            static_cast<uint32_t>(lane),
                             stage_hidden,
-                            src_topk,
                             stage_topk,
-                            src_weights,
                             stage_weights);
                         const int64_t route_us =
                             ggml_time_us() -
                             route_begin_us;
 
                         route_set_stage_ready(nullptr, nullptr);
-                        route_set_wait_seq(0);
-                        route_set_lane(-1);
 
                         if (!used) {
                             return GGML_STATUS_FAILED;
@@ -11140,12 +11171,12 @@ auto prefill_norm_sg_has_prework =
 
         if (direct_route_bound) {
             phone_graph->uid = saved_phone_graph_uid;
-            const ggml_backend_rpc_route_mark_ready_t mark_ready =
-                ggml_backend_meta_get_route_mark_ready(
-                    backend_ctx->backend_configs[1].backend);
-            GGML_ASSERT(mark_ready != nullptr);
+            ggml_backend_t phone_backend =
+                backend_ctx->backend_configs[1].backend;
 
             uint64_t seq = 0;
+            bool published = false;
+            int64_t snapshot_us = 0;
             if (producer_route_prearmed) {
                 const auto route_it =
                     pending_phone_prefill_routes.find(
@@ -11154,31 +11185,54 @@ auto prefill_norm_sg_has_prework =
                 GGML_ASSERT(
                     route_it !=
                     pending_phone_prefill_routes.end());
-                seq = route_it->second.producer_seq;
+                const phone_prefill_route_task & route =
+                    route_it->second;
+                seq = route.producer_seq;
                 GGML_ASSERT(seq != 0);
+
+                const ggml_backend_rpc_route_snapshot_ready_t
+                    snapshot_ready =
+                        ggml_backend_meta_get_route_snapshot_ready(
+                            phone_backend);
+                GGML_ASSERT(snapshot_ready != nullptr);
+
+                const int64_t snapshot_begin_us =
+                    ggml_time_us();
+                published = snapshot_ready(
+                    phone_backend,
+                    seq,
+                    static_cast<uint32_t>(route.lane),
+                    route.src_hidden,
+                    route.src_topk,
+                    route.src_weights);
+                snapshot_us =
+                    ggml_time_us() - snapshot_begin_us;
             } else {
+                const ggml_backend_rpc_route_mark_ready_t mark_ready =
+                    ggml_backend_meta_get_route_mark_ready(
+                        phone_backend);
+                GGML_ASSERT(mark_ready != nullptr);
+
                 seq =
                     backend_ctx->next_phone_prefill_route_seq++;
                 phone_prefill_route_producer_seq[
                     { direct_route_layer,
                       direct_route_chunk }] = seq;
+                published = mark_ready(phone_backend, seq);
             }
-
-            const bool marked = mark_ready(
-                backend_ctx->backend_configs[1].backend,
-                seq);
-            GGML_ASSERT(marked);
+            GGML_ASSERT(published);
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_PREFILL_ROUTE_PRODUCER_SEQ] "
                     "layer=%d chunk=%d seq=%" PRIu64
-                    " mailbox=%d\n",
+                    " mailbox=%d snapshot_ms=%.3f\n",
                     direct_route_layer,
                     direct_route_chunk,
                     seq,
-                    producer_route_prearmed ? 1 : 0);
+                    producer_route_prearmed ? 1 : 0,
+                    snapshot_us / 1000.0);
             }
         }
 
