@@ -615,6 +615,7 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_hybrid_layer_mode> hybrid_layer_modes;
+    std::vector<float>                   hybrid_tensor_pc_ratios;
     std::vector<llama_pc_layer_backend>  pc_layer_backends;
 
     std::vector<llama_layer> layers;
@@ -662,6 +663,7 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     llama_hybrid_layer_mode hybrid_layer_mode(int il) const;
+    float hybrid_tensor_pc_ratio(int il) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
