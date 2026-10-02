@@ -11148,14 +11148,15 @@ auto prefill_norm_sg_has_prework =
                     });
 
             uint64_t return_task = 0;
+            size_t return_lane = 0;
             if (phone_prefill_async_return_active) {
                 GGML_ASSERT(return_payload != nullptr);
                 GGML_ASSERT(phone_return_stage != nullptr);
                 const bool use_chunk_join_return =
                     phone_prefill_chunk_join_active;
-                const size_t return_lane =
+                return_lane =
                     use_chunk_join_return ?
-                        static_cast<size_t>(prefill_down_chunk) %
+                        static_cast<size_t>(phone_ffn_seq - 1) %
                             ggml_backend_meta_context::PREFILL_RETURN_LANES :
                         0;
                 auto & return_worker_slot =
