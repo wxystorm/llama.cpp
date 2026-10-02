@@ -4964,6 +4964,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr;
     const bool phone_prefill_producer_route =
         std::getenv("GGML_META_PHONE_PREFILL_PRODUCER_ROUTE") != nullptr;
+    const bool phone_prefill_ordered_return =
+        std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr;
 
     // Fine-grained Phone-primary correctness fences for A/B isolation.
     // The legacy STRICT_FENCE remains an umbrella and preserves its older
@@ -4994,10 +4996,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             nullptr,
             0);
 
+    const bool phone_prefill_ordered_return_active =
+        phone_prefill_ordered_return &&
+        phone_prefill_async_return_active &&
+        !phone_primary_strict_reduce;
+
     if (pipeline_debug && phone_prefill_async_return) {
         printf(
-            "[PHONE_PREFILL_ASYNC_RETURN_CAP] requested=1 active=%d\n",
-            phone_prefill_async_return_active ? 1 : 0);
+            "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
+            "requested=1 active=%d ordered=%d\n",
+            phone_prefill_async_return_active ? 1 : 0,
+            phone_prefill_ordered_return_active ? 1 : 0);
     }
 
     struct phone_prefill_binding_backup {
@@ -6060,17 +6069,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
-                // Return ACK means the server has enqueued the async OpenCL
-                // staging write.  One fence guarantees all private staging
-                // buffers are device-complete before any ADD reads them.
-                const int64_t return_fence_begin_us =
-                    ggml_time_us();
-                phone_fence(phone_backend);
-                return_fence_us =
-                    ggml_time_us() - return_fence_begin_us;
+                // Return ACK means the server has already enqueued the
+                // OpenCL write. In ordered-return mode the server owns the
+                // CL_FALSE source payload until a later device synchronize,
+                // so ADD can rely on in-order queue sequencing instead of a
+                // host-side return fence.
+                if (!phone_prefill_ordered_return_active) {
+                    const int64_t return_fence_begin_us =
+                        ggml_time_us();
+                    phone_fence(phone_backend);
+                    return_fence_us =
+                        ggml_time_us() - return_fence_begin_us;
+                }
 
-                // All staging buffers are now stable. Queue every ADD on the
-                // Phone compute socket, then pay a single completion fence.
+                // Queue every ADD on the Phone compute socket. Later Phone
+                // graph commands use the same ordered RPC compute socket and
+                // OpenCL queue, so ordered-return mode does not need a host
+                // completion fence after the ADD submissions either.
                 for (auto & branch : pending_phone_prefill_pc_branches) {
                     if (branch.layer != layer) {
                         continue;
@@ -6089,11 +6104,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
-                const int64_t add_fence_begin_us =
-                    ggml_time_us();
-                phone_fence(phone_backend);
-                add_fence_us =
-                    ggml_time_us() - add_fence_begin_us;
+                if (!phone_prefill_ordered_return_active) {
+                    const int64_t add_fence_begin_us =
+                        ggml_time_us();
+                    phone_fence(phone_backend);
+                    add_fence_us =
+                        ggml_time_us() - add_fence_begin_us;
+                }
 
                 return_total_us =
                     return_wait_total_us +
@@ -6201,7 +6218,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "layer=%d chunks=%zu ready_at_entry=%zu "
                     "ready_after_phone_fence=%zu "
                     "return_ready_after_phone_fence=%zu "
-                    "phone_deferred=%zu async_return=%d "
+                    "phone_deferred=%zu async_return=%d ordered_return=%d "
                     "bind_ms=%.3f phone_ffn_submit_ms=%.3f "
                     "phone_fence_ms=%.3f pc_wait_ms=%.3f "
                     "return_wait_ms=%.3f return_fence_ms=%.3f "
@@ -6214,6 +6231,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return_ready_after_phone_fence,
                     phone_deferred_submitted,
                     use_async_return ? 1 : 0,
+                    phone_prefill_ordered_return_active ? 1 : 0,
                     phone_restore_submit_us / 1000.0,
                     phone_ffn_submit_us / 1000.0,
                     phone_fence_us / 1000.0,
