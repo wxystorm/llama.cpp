@@ -3018,7 +3018,8 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         ggml_tensor * dst,
         const void * data,
         size_t data_size,
-        uint64_t phone_ffn_seq) {
+        uint64_t phone_ffn_seq,
+        size_t return_lane) {
     if (backend_dst == nullptr || !ggml_backend_is_rpc(backend_dst)) {
         return false;
     }
@@ -3041,7 +3042,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     if (dst == nullptr && data == nullptr &&
             data_size == 0 && phone_ffn_seq == 0) {
-        return true;
+        return return_lane < RPC_RETURN_TRANSFER_LANES;
     }
 
     if (dst == nullptr || data == nullptr ||
@@ -3061,9 +3062,10 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         return false;
     }
 
-    const size_t return_lane =
-        static_cast<size_t>(phone_ffn_seq - 1) %
-        RPC_RETURN_TRANSFER_LANES;
+    if (return_lane >= RPC_RETURN_TRANSFER_LANES) {
+        return false;
+    }
+
     auto & return_sock =
         rpc_dev_ctx->return_transfer_socks[return_lane];
     if (return_sock == nullptr) {
