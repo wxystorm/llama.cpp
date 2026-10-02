@@ -3986,6 +3986,38 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
 
+    struct phone_prefill_lane1_return_gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool open = false;
+        bool cancelled = false;
+    };
+    std::map<int, std::shared_ptr<phone_prefill_lane1_return_gate>>
+        phone_prefill_lane1_return_gates;
+
+    // If graph execution exits early while a lane-1 return is waiting for the
+    // last route handoff, wake it so worker destruction cannot deadlock.
+    struct phone_prefill_lane1_return_gate_guard {
+        std::map<int, std::shared_ptr<phone_prefill_lane1_return_gate>> & gates;
+
+        ~phone_prefill_lane1_return_gate_guard() {
+            for (auto & entry : gates) {
+                const auto & gate = entry.second;
+                if (gate == nullptr) {
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(gate->mutex);
+                    gate->cancelled = true;
+                    gate->open = true;
+                }
+                gate->cv.notify_all();
+            }
+        }
+    } phone_prefill_lane1_return_gate_guard_instance {
+        phone_prefill_lane1_return_gates
+    };
+
     struct phone_prefill_pc_branch {
         int layer = -1;
         int chunk = -1;
@@ -6591,6 +6623,50 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return GGML_STATUS_SUCCESS;
         };
 
+    auto open_phone_prefill_lane1_return_gate =
+        [&](int layer, int chunk) {
+            if (!phone_prefill_chunk_join_active ||
+                    !phone_prefill_producer_route ||
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES < 2) {
+                return;
+            }
+
+            const bool has_next_chunk =
+                find_down_chunk(0, true, layer, chunk + 1) != nullptr ||
+                find_down_chunk(1, true, layer, chunk + 1) != nullptr;
+            if (has_next_chunk) {
+                return;
+            }
+
+            auto & gate =
+                phone_prefill_lane1_return_gates[layer];
+            if (gate == nullptr) {
+                gate =
+                    std::make_shared<
+                        phone_prefill_lane1_return_gate>();
+            }
+
+            bool opened_now = false;
+            {
+                std::lock_guard<std::mutex> lock(gate->mutex);
+                if (!gate->open) {
+                    gate->open = true;
+                    opened_now = true;
+                }
+            }
+            gate->cv.notify_all();
+
+            if (opened_now &&
+                    (pipeline_debug ||
+                     tensor_phone_stage_profile)) {
+                printf(
+                    "[PHONE_PREFILL_RETURN_LANE1_GATE_OPEN] "
+                    "layer=%d chunk=%d reason=LAST_ROUTE_HANDOFF\n",
+                    layer,
+                    chunk);
+            }
+        };
+
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
                                          int force_phone_block_layer) -> ggml_status {
@@ -6701,6 +6777,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (last_chunk) {
                     GGML_ASSERT(pending_after == 0);
+                    phone_prefill_lane1_return_gates.erase(
+                        deferred_layer_0);
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
@@ -6932,6 +7010,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         producer_route_it->second.producer_seq,
                         producer_route_it->second.task);
                 }
+
+                // Soft dual-return policy: lane 0 stays fully eager.  Lane 1
+                // is released as soon as the final route for this layer has
+                // been posted, not when the route transfer or FFN completes.
+                open_phone_prefill_lane1_return_gate(
+                    phone_route_layer,
+                    phone_route_chunk);
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -11176,6 +11261,21 @@ auto prefill_norm_sg_has_prework =
                         new ggml_backend_meta_transfer_worker();
                 }
 
+                std::shared_ptr<phone_prefill_lane1_return_gate>
+                    lane1_return_gate;
+                if (use_chunk_join_return &&
+                        return_lane == 1) {
+                    auto & gate =
+                        phone_prefill_lane1_return_gates[
+                            prefill_down_layer];
+                    if (gate == nullptr) {
+                        gate =
+                            std::make_shared<
+                                phone_prefill_lane1_return_gate>();
+                    }
+                    lane1_return_gate = gate;
+                }
+
                 ggml_backend_meta_transfer_worker * pc_worker =
                     backend_ctx->prefill_pc_worker;
                 ggml_backend_meta_transfer_worker * return_worker =
@@ -11193,6 +11293,7 @@ auto prefill_norm_sg_has_prework =
                      async_return_wait,
                      use_chunk_join_return,
                      return_lane,
+                     lane1_return_gate,
                      phone_ffn_seq,
                      phone_backend,
                      phone_return_stage,
@@ -11211,6 +11312,26 @@ auto prefill_norm_sg_has_prework =
                             ggml_time_us() - wait_begin_us;
                         if (pc_status != GGML_STATUS_SUCCESS) {
                             return pc_status;
+                        }
+
+                        int64_t lane_gate_wait_us = 0;
+                        if (lane1_return_gate != nullptr) {
+                            const int64_t gate_wait_begin_us =
+                                ggml_time_us();
+                            std::unique_lock<std::mutex> gate_lock(
+                                lane1_return_gate->mutex);
+                            lane1_return_gate->cv.wait(
+                                gate_lock,
+                                [&]() {
+                                    return lane1_return_gate->open ||
+                                        lane1_return_gate->cancelled;
+                                });
+                            lane_gate_wait_us =
+                                ggml_time_us() -
+                                gate_wait_begin_us;
+                            if (lane1_return_gate->cancelled) {
+                                return GGML_STATUS_FAILED;
+                            }
                         }
 
                         const int64_t send_begin_us =
@@ -11236,14 +11357,16 @@ auto prefill_norm_sg_has_prework =
                             printf(
                                 "[PHONE_PREFILL_RETURN_ASYNC] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " pc_wait_ms=%.3f send_ms=%.3f "
-                                "return_lane=%zu bytes=%zu ffn_seq=%" PRIu64
+                                " pc_wait_ms=%.3f lane_gate_wait_ms=%.3f "
+                                "send_ms=%.3f return_lane=%zu bytes=%zu "
+                                "ffn_seq=%" PRIu64
                                 " chunk_join=%d status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
                                 pc_wait_us / 1000.0,
+                                lane_gate_wait_us / 1000.0,
                                 send_us / 1000.0,
                                 return_lane,
                                 return_payload->size(),
