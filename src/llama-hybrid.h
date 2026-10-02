@@ -383,7 +383,12 @@ struct llama_hybrid_plan {
     // The FFN shard ratio keeps the same meaning in both modes: fraction
     // resident/computed on the PC side.
     bool  tensor_phone_primary = false;
+    // Effective/target PC share used by the planner.  Phone-primary MoE may
+    // realize this by mixing the adjacent physical ratios across layers.
     float tensor_pc_ratio      = 0.0f;
+    float tensor_pc_ratio_low  = 0.0f;
+    float tensor_pc_ratio_high = 0.0f;
+    int   tensor_pc_ratio_high_layers = 0;
 
     int gpu_pc_layers = 0;
 
