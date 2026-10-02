@@ -49,7 +49,8 @@ static constexpr int                  LLAMA_HYBRID_DECODE_RATIO_BLOCK_LAYERS  = 
 static constexpr std::array<float, 8> LLAMA_HYBRID_FFN_RATIO_PROBES        = { 0.05f, 0.20f, 0.35f, 0.50f, 0.65f, 0.80f, 0.95f, 1.00f };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_PREFILL_KV_ANCHORS     = { 128, 256, 1024, 4096 };
 static constexpr std::array<int, 2>   LLAMA_HYBRID_PHONE_BLOCK_CANDIDATES = { 1, LLAMA_HYBRID_PROFILE_BLOCK_LAYERS };
-static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES = 2;
+static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES  = 4;
+static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES = 2;
 
 static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION            = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT = 0.90;
@@ -1890,39 +1891,54 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
         return false;
     }
 
-    std::vector<double> route_ready(chunks.size(), 0.0);
-    std::vector<double> pc_ready(chunks.size(), 0.0);
-    std::vector<double> return_ready(chunks.size(), 0.0);
+    const size_t n = chunks.size();
+    std::vector<double> route_issue(n, 0.0);
+    std::vector<double> route_ready(n, 0.0);
+    std::vector<double> pc_ready(n, 0.0);
+    std::vector<double> phone_ready(n, 0.0);
+    std::vector<double> return_single(n, 0.0);
+    std::vector<double> return_ready(n, 0.0);
 
-    // The Phone-primary prefill implementation has two independent route
-    // workers/sockets and assigns chunks round-robin by chunk index.  Model
-    // those lanes explicitly instead of serializing every Phone->PC handoff.
+    // Match the current Phone-primary runtime:
+    //   - four route snapshot workers/sockets, chunk-index round robin;
+    //   - local Phone FFN executes inline for each chunk after its route
+    //     handoff is posted;
+    //   - one serial PC FFN worker;
+    //   - two return workers/sockets, also chunk-index round robin;
+    //   - return lane 0 is fully eager;
+    //   - return lane 1 is released when the final route of the layer has
+    //     been handed off (soft gate), not when that route finishes.
     std::array<double, LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES>
         route_lane_available {};
+    std::array<double, LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES>
+        return_lane_available {};
 
-    double phone_defer_start = 0.0;
-    double phone_available   = 0.0;
-    double pc_available      = 0.0;
-    double return_available  = 0.0;
+    double phone_available = 0.0;
+    double pc_available    = 0.0;
 
-    double input_sum_ms  = 0.0;
+    double route_sum_ms  = 0.0;
     double pc_sum_ms     = 0.0;
     double phone_sum_ms  = 0.0;
     double return_sum_ms = 0.0;
 
-    for (size_t i = 0; i < chunks.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const int tokens = chunks[i];
         const size_t bytes =
-            (size_t) profile.n_embd * (size_t) tokens * sizeof(float);
+            (size_t) profile.n_embd *
+            (size_t) tokens *
+            sizeof(float);
 
-        double phone_to_pc_ms = 0.0;
-        double pc_ms          = 0.0;
-        double phone_ms       = 0.0;
-        double pc_to_phone_ms = 0.0;
+        double route_ms  = 0.0;
+        double pc_ms     = 0.0;
+        double phone_ms  = 0.0;
+        double return_ms = 0.0;
+
+        // Route snapshots use the snapshot RPC path.  The return partial uses
+        // the normal PC->Phone transfer profile.
         if (!llama_hybrid_transfer_cost(
-                profile.phone_to_pc, bytes, phone_to_pc_ms) ||
+                profile.snapshot_phone_to_pc, bytes, route_ms) ||
             !llama_hybrid_transfer_cost(
-                profile.pc_to_phone, bytes, pc_to_phone_ms) ||
+                profile.pc_to_phone, bytes, return_ms) ||
             !llama_hybrid_ffn_cost(
                 profile.cpu_ffn, tokens, pc_ratio, pc_ms) ||
             !llama_hybrid_ffn_cost(
@@ -1931,74 +1947,99 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
             return false;
         }
 
-        input_sum_ms  += phone_to_pc_ms;
+        route_sum_ms  += route_ms;
         pc_sum_ms     += pc_ms;
         phone_sum_ms  += phone_ms;
-        return_sum_ms += pc_to_phone_ms;
+        return_sum_ms += return_ms;
+        return_single[i] = return_ms;
 
-        const size_t lane =
+        const size_t route_lane =
             i % LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES;
-        route_lane_available[lane] += phone_to_pc_ms;
-        route_ready[i] = route_lane_available[lane];
 
-        // The PC branch is one serial worker.  Each queued chunk may start
-        // only after both the previous PC chunk and this chunk's route lane
-        // have completed.
+        // The Meta thread can post the next route after the previous chunk's
+        // local Phone FFN has been issued/completed.  If a layer has more
+        // chunks than route lanes, reusing a lane also waits for its previous
+        // snapshot task to finish.
+        const double issue =
+            std::max(
+                phone_available,
+                route_lane_available[route_lane]);
+        route_issue[i] = issue;
+
+        route_ready[i] = issue + route_ms;
+        route_lane_available[route_lane] = route_ready[i];
+
+        // Phone FFN is no longer deferred to a layer-tail wave.  It runs
+        // inline after this chunk's route handoff has been posted.
+        phone_available = issue + phone_ms;
+        phone_ready[i] = phone_available;
+
+        // The PC branch remains one serial worker.
         pc_available = std::max(pc_available, route_ready[i]);
         pc_available += pc_ms;
         pc_ready[i] = pc_available;
-
-        // Async returns use one serial return worker, but overlap with later
-        // PC chunks and with the deferred local Phone FFN wave.
-        return_available = std::max(return_available, pc_ready[i]);
-        return_available += pc_to_phone_ms;
-        return_ready[i] = return_available;
-
-        // Before chunk i can reuse a private route lane, Meta waits for the
-        // previous task on that lane (i - route_lanes).  The layer-tail Phone
-        // FFN wave begins only after all chunks have been issued, so its
-        // earliest start includes exactly the lane-reuse waits exposed while
-        // reaching the tail.  The final one/two route tasks may still be in
-        // flight and are intentionally not included here.
-        if (i >= LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES) {
-            phone_defer_start = std::max(
-                phone_defer_start,
-                route_ready[
-                    i - LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES]);
-        }
     }
 
-    // Local Phone FFNs are deferred until the layer tail, then submitted in
-    // chunk order on the Phone compute socket and completed by one fence.
-    phone_available = phone_defer_start + phone_sum_ms;
+    // Soft gate opens at the handoff/post time of the final route, not at the
+    // route completion time.
+    const double lane1_gate_open = route_issue.back();
+
+    for (size_t i = 0; i < n; ++i) {
+        const size_t return_lane =
+            i % LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES;
+
+        double start =
+            std::max(
+                return_lane_available[return_lane],
+                pc_ready[i]);
+
+        if (return_lane == 1) {
+            start = std::max(start, lane1_gate_open);
+        }
+
+        const double end = start + return_single[i];
+        return_ready[i] = end;
+        return_lane_available[return_lane] = end;
+    }
 
     const double route_finish =
         *std::max_element(
             route_lane_available.begin(),
             route_lane_available.end());
+    const double return_finish =
+        *std::max_element(
+            return_lane_available.begin(),
+            return_lane_available.end());
+
+    // Per-chunk ADDs are cheap and are represented by the existing reduce
+    // tail.  Layer completion still requires both the inline Phone path and
+    // both return lanes to be drained.
     const double done_ms =
-        std::max(phone_available, return_available) +
+        std::max(phone_available, return_finish) +
         profile.reduce_ms;
 
     result_ms = done_ms;
 
     if (detail != nullptr) {
-        detail->chunks            = (int) chunks.size();
-        detail->h2d_sum_ms        = input_sum_ms;
+        detail->chunks            = (int) n;
+        detail->h2d_sum_ms        = route_sum_ms;
         detail->pc_ffn_sum_ms     = pc_sum_ms;
         detail->phone_sum_ms      = phone_sum_ms;
-        detail->phone_start_ms    = phone_defer_start;
+        detail->phone_start_ms    = route_issue.front();
         detail->d2h_sum_ms        = return_sum_ms;
         detail->h2d_finish_ms     = route_finish;
         detail->pc_finish_ms      = pc_available;
         detail->phone_finish_ms   = phone_available;
-        detail->return_finish_ms  = return_available;
+        detail->return_finish_ms  = return_finish;
         detail->reduce_tail_ms    = profile.reduce_ms;
         detail->done_ms           = done_ms;
 
         const double serial_ms =
-            input_sum_ms + pc_sum_ms + phone_sum_ms +
-            return_sum_ms + profile.reduce_ms;
+            route_sum_ms +
+            pc_sum_ms +
+            phone_sum_ms +
+            return_sum_ms +
+            profile.reduce_ms;
         detail->overlap_saved_ms =
             std::max(0.0, serial_ms - done_ms);
     }
@@ -2646,18 +2687,19 @@ static bool llama_hybrid_tensor_balance_diff(const llama_hybrid_profile & profil
 
     double pc_ms    = 0.0;
     double phone_ms = 0.0;
-    double return_ms = 0.0;
-    const size_t bytes = (size_t) profile.n_embd * (size_t) chunk_tokens * sizeof(float);
-    if (!llama_hybrid_ffn_cost(profile.cpu_ffn, chunk_tokens, pc_ratio, pc_ms) ||
-        !llama_hybrid_ffn_cost(profile.phone_ffn, chunk_tokens, 1.0f - pc_ratio, phone_ms) ||
-        !llama_hybrid_transfer_cost(profile.snapshot_phone_to_pc, bytes, return_ms)) {
+    if (!llama_hybrid_ffn_cost(
+            profile.cpu_ffn, chunk_tokens, pc_ratio, pc_ms) ||
+        !llama_hybrid_ffn_cost(
+            profile.phone_ffn, chunk_tokens, 1.0f - pc_ratio,
+            phone_ms)) {
         return false;
     }
 
-    // PC->Phone is intentionally not included in the steady-state balance equation: the
-    // transfer worker can prefetch the next chunk while the phone computes the current one.
-    // The full tensor pipeline simulator still accounts for the actual H2D timeline.
-    diff_ms = pc_ms - (phone_ms + return_ms);
+    // Route and return payload sizes do not depend on R.  They belong in the
+    // full pipeline simulator, not in the ratio-center equation; charging the
+    // route to the Phone branch biases candidate generation toward an
+    // unnecessarily large PC shard.
+    diff_ms = pc_ms - phone_ms;
     return true;
 }
 
