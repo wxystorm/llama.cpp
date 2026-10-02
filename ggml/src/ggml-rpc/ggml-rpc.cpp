@@ -3062,7 +3062,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     }
 
     const size_t return_lane =
-        static_cast<size_t>(phone_ffn_seq) %
+        static_cast<size_t>(phone_ffn_seq - 1) %
         RPC_RETURN_TRANSFER_LANES;
     auto & return_sock =
         rpc_dev_ctx->return_transfer_socks[return_lane];
