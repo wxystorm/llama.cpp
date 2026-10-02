@@ -1048,6 +1048,8 @@ enum class rpc_socket_role {
     SNAPSHOT_TRANSFER_1,
     ROUTE_TRANSFER_0,
     ROUTE_TRANSFER_1,
+    ROUTE_TRANSFER_2,
+    ROUTE_TRANSFER_3,
     RETURN_TRANSFER,
 };
 
@@ -1074,6 +1076,12 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::ROUTE_TRANSFER_1:
             suffix = "_route_transfer_1";
+            break;
+        case rpc_socket_role::ROUTE_TRANSFER_2:
+            suffix = "_route_transfer_2";
+            break;
+        case rpc_socket_role::ROUTE_TRANSFER_3:
+            suffix = "_route_transfer_3";
             break;
         case rpc_socket_role::RETURN_TRANSFER:
             suffix = "_return_transfer";
@@ -1128,9 +1136,19 @@ static std::shared_ptr<socket_t> get_snapshot_transfer_socket(const std::string 
 }
 
 static std::shared_ptr<socket_t> get_route_transfer_socket(const std::string & endpoint, size_t lane) {
-    GGML_ASSERT(lane < 2);
-    return get_socket_role(endpoint, lane == 0 ? rpc_socket_role::ROUTE_TRANSFER_0
-                                               : rpc_socket_role::ROUTE_TRANSFER_1);
+    GGML_ASSERT(lane < RPC_ROUTE_TRANSFER_LANES);
+    switch (lane) {
+        case 0:
+            return get_socket_role(endpoint, rpc_socket_role::ROUTE_TRANSFER_0);
+        case 1:
+            return get_socket_role(endpoint, rpc_socket_role::ROUTE_TRANSFER_1);
+        case 2:
+            return get_socket_role(endpoint, rpc_socket_role::ROUTE_TRANSFER_2);
+        case 3:
+            return get_socket_role(endpoint, rpc_socket_role::ROUTE_TRANSFER_3);
+        default:
+            GGML_ABORT("invalid route transfer lane");
+    }
 }
 
 static std::shared_ptr<socket_t> get_return_transfer_socket(const std::string & endpoint) {
