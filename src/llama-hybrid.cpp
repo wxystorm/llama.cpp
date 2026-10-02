@@ -2434,6 +2434,51 @@ static bool llama_hybrid_tensor_phone_ffn_cost(
         profile, pc_ratio, chunks, result_ms, detail);
 }
 
+static bool llama_hybrid_tensor_phone_mixed_ffn_total_cost(
+        const llama_hybrid_profile & profile,
+        float                        target_pc_ratio,
+        int                          tensor_layers,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        double &                     total_ms,
+        int                          max_chunks = 0) {
+    if (tensor_layers <= 0) {
+        return false;
+    }
+
+    std::vector<int> chunks;
+    if (!llama_hybrid_select_tensor_phone_chunks(
+            profile, target_pc_ratio, total_tokens,
+            chunk_tokens, max_chunks, chunks)) {
+        return false;
+    }
+
+    llama_hybrid_mixed_ratio_layout layout;
+    if (!llama_hybrid_mixed_ratio_layout_for_profile(
+            profile, target_pc_ratio, tensor_layers, layout)) {
+        return false;
+    }
+
+    double low_ms = 0.0;
+    if (!llama_hybrid_tensor_phone_ffn_cost_for_chunks(
+            profile, layout.low_ratio, chunks, low_ms)) {
+        return false;
+    }
+
+    double high_ms = low_ms;
+    if (layout.high_layers > 0 &&
+        std::fabs(layout.high_ratio - layout.low_ratio) >= 1e-6f &&
+        !llama_hybrid_tensor_phone_ffn_cost_for_chunks(
+            profile, layout.high_ratio, chunks, high_ms)) {
+        return false;
+    }
+
+    total_ms =
+        layout.low_layers * low_ms +
+        layout.high_layers * high_ms;
+    return std::isfinite(total_ms);
+}
+
 std::vector<int> llama_hybrid_runtime_tensor_chunks(
         int tokens, int chunk_tokens) {
     if (tokens <= 0 || chunk_tokens <= 0) {
@@ -5050,27 +5095,21 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
             return false;
         }
 
+        double tensor_total_ms = 0.0;
         double tensor_layer_ms = 0.0;
         for (const int macro_tokens : macro_chunks) {
-            double tensor_ffn_ms = 0.0;
-            const bool ffn_ok = candidate.tensor_phone_primary ?
-                llama_hybrid_tensor_phone_ffn_cost(
-                    profile, candidate.tensor_pc_ratio, macro_tokens,
-                    candidate.tensor_chunk_tokens, tensor_ffn_ms,
-                    nullptr, constraints.max_tensor_chunks) :
-                llama_hybrid_tensor_ffn_cost(
-                    profile, candidate.tensor_pc_ratio, macro_tokens,
-                    candidate.tensor_chunk_tokens, tensor_ffn_ms,
-                    nullptr, constraints.max_tensor_chunks);
-            if (!ffn_ok) {
-                return false;
-            }
-
             if (candidate.tensor_phone_primary) {
+                double tensor_ffn_total_ms = 0.0;
                 double phone_layer_base = 0.0;
                 double phone_attn_base  = 0.0;
                 double phone_attn_kv    = 0.0;
-                if (!llama_hybrid_layer_block_cost(
+                if (!llama_hybrid_tensor_phone_mixed_ffn_total_cost(
+                        profile, candidate.tensor_pc_ratio,
+                        candidate.tensor_layers, macro_tokens,
+                        candidate.tensor_chunk_tokens,
+                        tensor_ffn_total_ms,
+                        constraints.max_tensor_chunks) ||
+                    !llama_hybrid_layer_block_cost(
                         profile.phone_layer_blocks, macro_tokens, true,
                         phone_layer_base) ||
                     !llama_hybrid_attn_cost(
@@ -5082,17 +5121,24 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
                     return false;
                 }
 
-                tensor_layer_ms +=
+                const double common_layer_ms =
                     phone_attn_kv +
                     llama_hybrid_tensor_phone_misc_cost(
                         profile, macro_tokens,
-                        phone_layer_base, phone_attn_base) +
-                    tensor_ffn_ms;
+                        phone_layer_base, phone_attn_base);
+                tensor_total_ms +=
+                    candidate.tensor_layers * common_layer_ms +
+                    tensor_ffn_total_ms;
             } else {
+                double tensor_ffn_ms = 0.0;
                 double cpu_layer_base = 0.0;
                 double cpu_attn_base  = 0.0;
                 double cpu_attn_kv    = 0.0;
-                if (!llama_hybrid_layer_block_cost(
+                if (!llama_hybrid_tensor_ffn_cost(
+                        profile, candidate.tensor_pc_ratio, macro_tokens,
+                        candidate.tensor_chunk_tokens, tensor_ffn_ms,
+                        nullptr, constraints.max_tensor_chunks) ||
+                    !llama_hybrid_layer_block_cost(
                         profile.cpu_layer_blocks, macro_tokens, false,
                         cpu_layer_base) ||
                     !llama_hybrid_attn_cost(
@@ -5114,7 +5160,9 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         }
 
         candidate.predicted_tensor_ms =
-            candidate.tensor_layers * tensor_layer_ms;
+            candidate.tensor_phone_primary ?
+                tensor_total_ms :
+                candidate.tensor_layers * tensor_layer_ms;
         return true;
     };
 
