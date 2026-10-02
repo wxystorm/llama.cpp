@@ -1253,7 +1253,15 @@ static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     p
                 return false;
             }
         } else if (il < tensor_end) {
-            const size_t pc_ffn    = llama_hybrid_ratio_bytes(ffn, pc_ratio);
+            const int tensor_layer_index = il - cpu_end;
+            const float layer_pc_ratio =
+                plan.tensor_phone_primary ?
+                    llama_hybrid_mixed_profile_ratio_for_layer(
+                        profile, pc_ratio,
+                        tensor_layer_index, tensor_layers) :
+                    pc_ratio;
+            const size_t pc_ffn =
+                llama_hybrid_ratio_bytes(ffn, layer_pc_ratio);
             const size_t phone_ffn = ffn - pc_ffn;
             if (plan.tensor_phone_primary) {
                 if (!llama_hybrid_add_bytes(pc_memory, pc_ffn) ||
@@ -2814,7 +2822,10 @@ static bool llama_hybrid_tensor_balance_diff(const llama_hybrid_profile & profil
     return true;
 }
 
-static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_profile & profile, int chunk_tokens) {
+static std::vector<float> llama_hybrid_plan_ratio_candidates(
+        const llama_hybrid_profile & profile,
+        int                          chunk_tokens,
+        bool                         allow_mixed_phone_ratio) {
     std::vector<float> anchors;
     for (const auto & point : profile.cpu_ffn) {
         if (point.local_ratio > 0.0f && point.local_ratio < 1.0f) {
@@ -2866,7 +2877,11 @@ static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_
         }
 
         const double t = std::clamp(-d0 / (d1 - d0), 0.0, 1.0);
-        center = llama_hybrid_align_pc_ratio(profile, (float) (q0 + t * (q1 - q0)));
+        const float crossing =
+            (float) (q0 + t * (q1 - q0));
+        center = allow_mixed_phone_ratio ?
+            crossing :
+            llama_hybrid_align_pc_ratio(profile, crossing);
         found_crossing = true;
         break;
     }
@@ -2875,7 +2890,11 @@ static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_
     const float ratio_step = profile.n_ff > 0 && profile.ffn_shard_granularity > 0 ?
         (float) ((double) profile.ffn_shard_granularity / (double) profile.n_ff) : 0.0f;
     const auto add = [&](float q) {
-        q = llama_hybrid_align_pc_ratio(profile, q);
+        if (allow_mixed_phone_ratio) {
+            q = std::clamp(q, anchors.front(), anchors.back());
+        } else {
+            q = llama_hybrid_align_pc_ratio(profile, q);
+        }
         if (q > 0.0f && q < 1.0f) {
             result.push_back(q);
         }
@@ -2887,14 +2906,24 @@ static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_
         add(center + ratio_step);
     }
     if (profile.is_moe) {
-        // Phone-primary Tensor often balances at a substantially smaller PC
-        // share than the legacy PC-primary lane. Preserve a few broad anchors
-        // so the coarse search can discover that regime.
-        add(0.20f);
-        add(0.35f);
-        add(0.50f);
-        add(0.65f);
-        add(0.80f);
+        // Phone-primary mixed-R can realize continuous effective ratios by
+        // distributing adjacent legal quantized shards across Tensor layers.
+        // Keep a denser set around the interesting 1/3..2/3 interval.
+        if (allow_mixed_phone_ratio) {
+            add(0.35f);
+            add(0.40f);
+            add(0.45f);
+            add(0.50f);
+            add(0.55f);
+            add(0.60f);
+            add(0.65f);
+        } else {
+            add(0.20f);
+            add(0.35f);
+            add(0.50f);
+            add(0.65f);
+            add(0.80f);
+        }
     }
 
     auto upper = std::lower_bound(anchors.begin(), anchors.end(), center);
@@ -2910,11 +2939,12 @@ static std::vector<float> llama_hybrid_plan_ratio_candidates(const llama_hybrid_
         return std::fabs(a - b) < 1e-4f;
     }), result.end());
 
-    if (!found_crossing && result.size() > 5) {
+    if (!found_crossing &&
+        result.size() > (allow_mixed_phone_ratio ? 9u : 5u)) {
         std::stable_sort(result.begin(), result.end(), [center](float a, float b) {
             return std::fabs(a - center) < std::fabs(b - center);
         });
-        result.resize(5);
+        result.resize(allow_mixed_phone_ratio ? 9u : 5u);
         std::sort(result.begin(), result.end());
     }
     return result;
@@ -4052,9 +4082,14 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             if (ratio <= 0.0f || ratio >= 1.0f) {
                 continue;
             }
-            ratios.push_back(llama_hybrid_align_pc_ratio(profile, ratio));
+            ratios.push_back(
+                allow_tensor_phone_primary ?
+                    ratio :
+                    llama_hybrid_align_pc_ratio(profile, ratio));
         } else {
-            ratios = llama_hybrid_plan_ratio_candidates(profile, chunk_tokens);
+            ratios = llama_hybrid_plan_ratio_candidates(
+                profile, chunk_tokens,
+                allow_tensor_phone_primary);
             if (ratios.empty()) {
                 continue;
             }
@@ -4167,6 +4202,18 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                                  (tensor_phone_primary &&
                                   !allow_tensor_phone_primary))) {
                                 continue;
+                            }
+
+                            if (tensor_layers > 0 &&
+                                !tensor_phone_primary) {
+                                const float physical_ratio =
+                                    llama_hybrid_align_pc_ratio(
+                                        profile, ratio);
+                                if (std::fabs(
+                                        physical_ratio - ratio) >
+                                    1e-4f) {
+                                    continue;
+                                }
                             }
 
                             ++total_candidates;
