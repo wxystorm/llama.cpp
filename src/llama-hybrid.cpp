@@ -5714,6 +5714,76 @@ int64_t llama_hybrid_ffn_shard_size(int64_t n_ff, ggml_type down_type, float pc_
     return backend_index == 0 ? pc_size : n_ff - pc_size;
 }
 
+float llama_hybrid_mixed_pc_ratio_for_layer(
+        int64_t n_ff,
+        ggml_type down_type,
+        float target_pc_ratio,
+        int tensor_layer_index,
+        int tensor_layers) {
+    if (n_ff <= 0 ||
+        down_type < 0 || down_type >= GGML_TYPE_COUNT ||
+        target_pc_ratio <= 0.0f || target_pc_ratio >= 1.0f ||
+        tensor_layers <= 0 ||
+        tensor_layer_index < 0 ||
+        tensor_layer_index >= tensor_layers) {
+        return target_pc_ratio;
+    }
+
+    const int64_t granularity =
+        std::lcm<int64_t>(
+            ggml_blck_size(down_type), 128);
+    const int64_t max_width =
+        std::max<int64_t>(
+            granularity,
+            (n_ff / granularity - 1) * granularity);
+    if (max_width < granularity) {
+        return target_pc_ratio;
+    }
+
+    const double raw_width = std::clamp(
+        (double) n_ff * target_pc_ratio,
+        (double) granularity,
+        (double) max_width);
+    int64_t low_width =
+        (int64_t) std::floor(
+            raw_width / granularity) *
+        granularity;
+    int64_t high_width =
+        (int64_t) std::ceil(
+            raw_width / granularity) *
+        granularity;
+    low_width = std::clamp<int64_t>(
+        low_width, granularity, max_width);
+    high_width = std::clamp<int64_t>(
+        high_width, granularity, max_width);
+
+    if (low_width == high_width) {
+        return (float) (
+            (double) low_width / (double) n_ff);
+    }
+
+    const double high_fraction = std::clamp(
+        (raw_width - low_width) /
+            (double) (high_width - low_width),
+        0.0, 1.0);
+    const int high_layers = std::clamp(
+        (int) std::llround(
+            high_fraction * tensor_layers),
+        0, tensor_layers);
+
+    const int high_before =
+        (tensor_layer_index * high_layers) /
+        tensor_layers;
+    const int high_after =
+        ((tensor_layer_index + 1) * high_layers) /
+        tensor_layers;
+    const int64_t width =
+        high_after > high_before ?
+            high_width : low_width;
+    return (float) (
+        (double) width / (double) n_ff);
+}
+
 static bool llama_hybrid_profile_ffn_point(const llama_hybrid_ffn_desc & desc,
                                            ggml_backend_t                backend,
                                            int                           backend_index,
@@ -8031,6 +8101,25 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
 
         if (best_plan.tensor_layers > 0) {
+            if (best_plan.tensor_phone_primary) {
+                llama_hybrid_mixed_ratio_layout mixed_layout;
+                if (llama_hybrid_mixed_ratio_layout_for_profile(
+                        profile, best_plan.tensor_pc_ratio,
+                        best_plan.tensor_layers, mixed_layout)) {
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_MIXED_R] target=%.5f effective=%.5f "
+                        "low=%.5f high=%.5f low_layers=%d high_layers=%d "
+                        "tensor_layers=%d\n",
+                        best_plan.tensor_pc_ratio,
+                        mixed_layout.effective_ratio,
+                        mixed_layout.low_ratio,
+                        mixed_layout.high_ratio,
+                        mixed_layout.low_layers,
+                        mixed_layout.high_layers,
+                        best_plan.tensor_layers);
+                }
+            }
+
             const int work_tokens =
                 constraints.target_ubatch_tokens > 0 ?
                     constraints.target_ubatch_tokens :
