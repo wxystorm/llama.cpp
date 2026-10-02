@@ -6067,13 +6067,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return GGML_STATUS_SUCCESS;
             }
 
-            // Two return lanes run independently. At ordinary chunk
-            // boundaries reap any completed branch from either lane without
-            // blocking. At the layer boundary, wait/drain all residual
-            // branches. This preserves exact per-chunk join semantics while
-            // chunk0/2 and chunk1/3 returns overlap.
+            // Two return lanes run independently. Reap whichever branch has
+            // completed first. At the layer boundary, only block when neither
+            // lane has a completed branch; this avoids delaying a ready ADD
+            // behind an unrelated return on the other lane.
             while (true) {
                 auto branch_it =
+                    pending_phone_prefill_pc_branches.end();
+                auto wait_candidate =
                     pending_phone_prefill_pc_branches.end();
 
                 for (auto it =
@@ -6084,6 +6085,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         continue;
                     }
 
+                    if (wait_candidate ==
+                            pending_phone_prefill_pc_branches.end()) {
+                        wait_candidate = it;
+                    }
+
                     GGML_ASSERT(
                         it->return_lane <
                         ggml_backend_meta_context::PREFILL_RETURN_LANES);
@@ -6092,9 +6098,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             it->return_lane];
                     GGML_ASSERT(return_worker != nullptr);
 
-                    if (wait_for_all ||
-                            return_worker->is_completed(
-                                it->return_task)) {
+                    if (return_worker->is_completed(
+                            it->return_task)) {
                         branch_it = it;
                         break;
                     }
@@ -6102,7 +6107,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (branch_it ==
                         pending_phone_prefill_pc_branches.end()) {
-                    return GGML_STATUS_SUCCESS;
+                    if (!wait_for_all ||
+                            wait_candidate ==
+                                pending_phone_prefill_pc_branches.end()) {
+                        return GGML_STATUS_SUCCESS;
+                    }
+                    branch_it = wait_candidate;
                 }
 
                 const int chunk = branch_it->chunk;
