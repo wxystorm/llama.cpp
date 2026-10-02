@@ -8060,6 +8060,17 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 parsed);
         }
     }
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_CPU_CHUNK_TOKENS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0) {
+            constraints.fixed_cpu_chunk_tokens = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] cpu_chunk_tokens=%ld source=environment\n",
+                parsed);
+        }
+    }
     // No fixed topology here: CPU_DIRECT is now part of the runtime model, so
     // HYBRID_AUTO must search placement and chunking jointly instead of being
     // constrained to the earlier T1/P0/C47/G11 validation layout.
