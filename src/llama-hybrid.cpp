@@ -1085,6 +1085,117 @@ static bool llama_hybrid_attn_runtime_bytes(const std::vector<llama_hybrid_attn_
     return true;
 }
 
+struct llama_hybrid_mixed_ratio_layout {
+    float low_ratio      = 0.0f;
+    float high_ratio     = 0.0f;
+    float effective_ratio = 0.0f;
+    int   low_layers     = 0;
+    int   high_layers    = 0;
+};
+
+static bool llama_hybrid_mixed_ratio_layout_for_profile(
+        const llama_hybrid_profile & profile,
+        float                        target_pc_ratio,
+        int                          tensor_layers,
+        llama_hybrid_mixed_ratio_layout & layout) {
+    if (profile.n_ff <= 0 ||
+        profile.ffn_shard_granularity <= 0 ||
+        tensor_layers <= 0 ||
+        target_pc_ratio <= 0.0f ||
+        target_pc_ratio >= 1.0f) {
+        return false;
+    }
+
+    const int64_t granularity = profile.ffn_shard_granularity;
+    const int64_t n_ff        = profile.n_ff;
+    const int64_t max_width =
+        std::max<int64_t>(
+            granularity,
+            (n_ff / granularity - 1) * granularity);
+    if (max_width < granularity) {
+        return false;
+    }
+
+    const double raw_width = std::clamp(
+        (double) n_ff * target_pc_ratio,
+        (double) granularity,
+        (double) max_width);
+
+    int64_t low_width =
+        (int64_t) std::floor(raw_width / granularity) *
+        granularity;
+    int64_t high_width =
+        (int64_t) std::ceil(raw_width / granularity) *
+        granularity;
+    low_width = std::clamp<int64_t>(
+        low_width, granularity, max_width);
+    high_width = std::clamp<int64_t>(
+        high_width, granularity, max_width);
+
+    layout.low_ratio =
+        (float) ((double) low_width / (double) n_ff);
+    layout.high_ratio =
+        (float) ((double) high_width / (double) n_ff);
+
+    if (low_width == high_width) {
+        layout.low_layers = tensor_layers;
+        layout.high_layers = 0;
+        layout.effective_ratio = layout.low_ratio;
+        return true;
+    }
+
+    const double high_fraction = std::clamp(
+        (raw_width - low_width) /
+            (double) (high_width - low_width),
+        0.0, 1.0);
+    layout.high_layers = std::clamp(
+        (int) std::llround(
+            high_fraction * tensor_layers),
+        0, tensor_layers);
+    layout.low_layers =
+        tensor_layers - layout.high_layers;
+    layout.effective_ratio =
+        (float) (
+            ((double) layout.low_layers * layout.low_ratio +
+             (double) layout.high_layers * layout.high_ratio) /
+            tensor_layers);
+    return true;
+}
+
+static float llama_hybrid_mixed_profile_ratio_for_layer(
+        const llama_hybrid_profile & profile,
+        float                        target_pc_ratio,
+        int                          tensor_layer_index,
+        int                          tensor_layers) {
+    llama_hybrid_mixed_ratio_layout layout;
+    if (!llama_hybrid_mixed_ratio_layout_for_profile(
+            profile, target_pc_ratio, tensor_layers, layout) ||
+        tensor_layer_index < 0 ||
+        tensor_layer_index >= tensor_layers) {
+        return target_pc_ratio;
+    }
+
+    if (layout.high_layers <= 0 ||
+        std::fabs(layout.high_ratio - layout.low_ratio) < 1e-6f) {
+        return layout.low_ratio;
+    }
+    if (layout.low_layers <= 0) {
+        return layout.high_ratio;
+    }
+
+    // Evenly distribute the high-ratio layers using a Bresenham-style
+    // cumulative count.  This avoids long Phone-heavy/PC-heavy runs while
+    // realizing exactly high_layers of the requested physical shard.
+    const int high_before =
+        (tensor_layer_index * layout.high_layers) /
+        tensor_layers;
+    const int high_after =
+        ((tensor_layer_index + 1) * layout.high_layers) /
+        tensor_layers;
+    return high_after > high_before ?
+        layout.high_ratio : layout.low_ratio;
+}
+
 static bool llama_hybrid_estimate_plan_memory(const llama_hybrid_profile &     profile,
                                               const llama_hybrid_constraints & constraints,
                                               llama_hybrid_plan &              plan) {
