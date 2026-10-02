@@ -135,11 +135,15 @@ bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan) {
     }
 
     LLAMA_LOG_INFO(
-        "[HYBRID_RUNTIME] plan published T=%d primary=%s P=%d C=%d R=%.3f G=%d "
+        "[HYBRID_RUNTIME] plan published T=%d primary=%s P=%d C=%d "
+        "R=%.3f Rlow=%.3f Rhigh=%.3f Rhigh_layers=%d G=%d "
         "XG=%d XC=%d XT=%d XP=%d\n",
         plan.tensor_layers,
         plan.tensor_phone_primary ? "PHONE" : "PC",
         plan.phone_layers, plan.pc_layers, plan.tensor_pc_ratio,
+        plan.tensor_pc_ratio_low,
+        plan.tensor_pc_ratio_high,
+        plan.tensor_pc_ratio_high_layers,
         plan.gpu_pc_layers, plan.gpu_chunk_tokens, plan.cpu_chunk_tokens,
         plan.tensor_chunk_tokens, plan.phone_chunk_tokens);
     return true;
