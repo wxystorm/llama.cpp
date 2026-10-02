@@ -3774,7 +3774,10 @@ private:
 
     std::mutex phone_ffn_ready_mutex;
     std::condition_variable phone_ffn_ready_cv;
-    std::unordered_map<uint32_t, uint64_t> phone_ffn_ready_seq;
+    std::unordered_map<
+        uint32_t,
+        std::unordered_set<uint64_t>>
+        phone_ffn_ready_seqs;
 
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
@@ -4559,8 +4562,7 @@ bool rpc_server::phone_ffn_mark_ready(
 
     {
         std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
-        uint64_t & ready = phone_ffn_ready_seq[request.device];
-        ready = std::max(ready, request.seq);
+        phone_ffn_ready_seqs[request.device].insert(request.seq);
     }
     phone_ffn_ready_cv.notify_all();
 
@@ -4597,10 +4599,20 @@ bool rpc_server::set_tensor_async_return_wait(
         phone_ffn_ready_cv.wait(
             lock,
             [&]() {
-                auto it = phone_ffn_ready_seq.find(request.device);
-                return it != phone_ffn_ready_seq.end() &&
-                    it->second >= request.phone_ffn_seq;
+                auto it = phone_ffn_ready_seqs.find(request.device);
+                return it != phone_ffn_ready_seqs.end() &&
+                    it->second.find(request.phone_ffn_seq) !=
+                        it->second.end();
             });
+
+        auto it = phone_ffn_ready_seqs.find(request.device);
+        GGML_ASSERT(it != phone_ffn_ready_seqs.end());
+        const size_t erased =
+            it->second.erase(request.phone_ffn_seq);
+        GGML_ASSERT(erased == 1);
+        if (it->second.empty()) {
+            phone_ffn_ready_seqs.erase(it);
+        }
     }
     const int64_t wait_us = ggml_time_us() - wait_begin_us;
 
