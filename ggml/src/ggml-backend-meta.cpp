@@ -7444,6 +7444,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             ggml_nbytes(src_weights));
                 }
 
+                open_phone_prefill_lane1_return_gate(
+                    phone_route_layer,
+                    phone_route_chunk);
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -7661,6 +7664,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "PHONE_TO_PC_ORDERED_GET");
             }
 
+            open_phone_prefill_lane1_return_gate(
+                phone_route_layer,
+                phone_route_chunk);
             return GGML_STATUS_SUCCESS;
         }
 
