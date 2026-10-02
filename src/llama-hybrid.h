@@ -532,6 +532,17 @@ LLAMA_API bool llama_hybrid_predict_decode_plan(
     const llama_hybrid_constraints & constraints,
     llama_hybrid_decode_plan & best_plan);
 
+// Return the physical per-layer PC FFN ratio used to realize a continuous
+// Phone-primary target ratio with quantization-compatible shards.  The result
+// is one of the adjacent legal shard ratios and is distributed uniformly
+// across the Tensor region.
+LLAMA_API float llama_hybrid_mixed_pc_ratio_for_layer(
+    int64_t n_ff,
+    ggml_type down_type,
+    float target_pc_ratio,
+    int tensor_layer_index,
+    int tensor_layers);
+
 LLAMA_API bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan);
 LLAMA_API bool llama_hybrid_runtime_plan_get(llama_hybrid_plan & plan);
 LLAMA_API void llama_hybrid_runtime_wave_calibration_set(const llama_hybrid_wave_calibration & calibration);
