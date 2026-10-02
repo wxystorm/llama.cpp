@@ -2316,6 +2316,7 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
     uint64_t                    next_snapshot_seq = 1;
     uint64_t                    next_phone_prefill_route_seq = 1;
+    uint64_t                    next_phone_prefill_ffn_seq = 1;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
 
@@ -2767,6 +2768,43 @@ ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(
             reg,
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC));
+}
+
+static ggml_backend_rpc_phone_ffn_mark_ready_t
+ggml_backend_meta_get_phone_ffn_mark_ready(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_phone_ffn_mark_ready_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_PHONE_FFN_MARK_READY_PROC));
+}
+
+static ggml_backend_rpc_set_tensor_async_return_wait_t
+ggml_backend_meta_get_set_tensor_async_return_wait(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_set_tensor_async_return_wait_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC));
 }
 
 static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
@@ -3951,6 +3989,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         size_t sg = 0;
         uint64_t pc_task = 0;
         uint64_t return_task = 0;
+        uint64_t phone_ffn_seq = 0;
         ggml_tensor * return_stage = nullptr;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
@@ -4966,6 +5005,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_PRODUCER_ROUTE") != nullptr;
     const bool phone_prefill_ordered_return =
         std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr;
+    const bool phone_prefill_chunk_join =
+        std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
 
     // Fine-grained Phone-primary correctness fences for A/B isolation.
     // The legacy STRICT_FENCE remains an umbrella and preserves its older
@@ -5001,12 +5042,42 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_async_return_active &&
         !phone_primary_strict_reduce;
 
+    const ggml_backend_rpc_phone_ffn_mark_ready_t
+        phone_prefill_ffn_mark_ready =
+            n_backends > 1 ?
+            ggml_backend_meta_get_phone_ffn_mark_ready(
+                backend_ctx->backend_configs[1].backend) :
+            nullptr;
+    const ggml_backend_rpc_set_tensor_async_return_wait_t
+        phone_prefill_async_return_wait =
+            n_backends > 1 ?
+            ggml_backend_meta_get_set_tensor_async_return_wait(
+                backend_ctx->backend_configs[1].backend) :
+            nullptr;
+
+    const bool phone_prefill_chunk_join_active =
+        phone_prefill_chunk_join &&
+        phone_prefill_producer_route &&
+        phone_prefill_ordered_return_active &&
+        phone_prefill_ffn_mark_ready != nullptr &&
+        phone_prefill_async_return_wait != nullptr &&
+        phone_prefill_ffn_mark_ready(
+            backend_ctx->backend_configs[1].backend,
+            0) &&
+        phone_prefill_async_return_wait(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            0);
+
     if (pipeline_debug && phone_prefill_async_return) {
         printf(
             "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
-            "requested=1 active=%d ordered=%d\n",
+            "requested=1 active=%d ordered=%d chunk_join=%d\n",
             phone_prefill_async_return_active ? 1 : 0,
-            phone_prefill_ordered_return_active ? 1 : 0);
+            phone_prefill_ordered_return_active ? 1 : 0,
+            phone_prefill_chunk_join_active ? 1 : 0);
     }
 
     struct phone_prefill_binding_backup {
