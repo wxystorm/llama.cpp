@@ -795,27 +795,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool tensor_phone_primary =
         mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
 
-    int mixed_tensor_layer_index = -1;
-    int mixed_tensor_layers = 0;
-    if (tensor_phone_primary &&
-        is_ffn_split_tensor &&
-        ud->n_devices == 2) {
-        const int n_layer =
-            ud->model->hparams.n_layer();
-        int ordinal = 0;
-        for (int il = 0; il < n_layer; ++il) {
-            if (ud->model->hybrid_layer_mode(il) !=
-                    llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
-                continue;
-            }
-            if (il == tc.il) {
-                mixed_tensor_layer_index = ordinal;
-            }
-            ++ordinal;
-        }
-        mixed_tensor_layers = ordinal;
-    }
-
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
     // Generic split rotation is useful for equivalent devices, but rotating
@@ -854,16 +833,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (tensor_phone_primary &&
                     is_ffn_split_tensor &&
                     ud->n_devices == 2 &&
-                    j == 0 &&
-                    mixed_tensor_layer_index >= 0 &&
-                    mixed_tensor_layers > 0) {
-                    split_ratio =
-                        llama_hybrid_mixed_pc_ratio_for_layer(
-                            ne_s,
-                            tc.tensor_axis_0->type,
-                            split_ratio,
-                            mixed_tensor_layer_index,
-                            mixed_tensor_layers);
+                    j == 0) {
+                    const float layer_ratio =
+                        ud->model->hybrid_tensor_pc_ratio(tc.il);
+                    if (layer_ratio > 0.0f &&
+                        layer_ratio < 1.0f) {
+                        split_ratio = layer_ratio;
+                    }
                 }
 
                 if (is_ffn_split_tensor && ud->n_devices == 2 && split_ratio > 0.0f && split_ratio < 1.0f) {
@@ -1537,6 +1513,46 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
             llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
+        hybrid_tensor_pc_ratios.assign(
+            n_layer,
+            has_runtime_plan ?
+                runtime_plan.tensor_pc_ratio :
+                0.0f);
+        if (has_runtime_plan &&
+            runtime_plan.tensor_phone_primary &&
+            runtime_plan.tensor_layers > 0) {
+            const float low_ratio =
+                runtime_plan.tensor_pc_ratio_low > 0.0f ?
+                    runtime_plan.tensor_pc_ratio_low :
+                    runtime_plan.tensor_pc_ratio;
+            const float high_ratio =
+                runtime_plan.tensor_pc_ratio_high > 0.0f ?
+                    runtime_plan.tensor_pc_ratio_high :
+                    low_ratio;
+            const int high_layers = std::clamp(
+                runtime_plan.tensor_pc_ratio_high_layers,
+                0, runtime_plan.tensor_layers);
+
+            int ordinal = 0;
+            for (int il = 0; il < n_layer; ++il) {
+                if (hybrid_layer_modes[il] !=
+                        llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+                    continue;
+                }
+
+                const int high_before =
+                    (ordinal * high_layers) /
+                    runtime_plan.tensor_layers;
+                const int high_after =
+                    ((ordinal + 1) * high_layers) /
+                    runtime_plan.tensor_layers;
+                hybrid_tensor_pc_ratios[il] =
+                    high_after > high_before ?
+                        high_ratio : low_ratio;
+                ++ordinal;
+            }
+        }
+
         if (has_runtime_plan) {
             const bool phone_primary_exec =
                 runtime_plan.tensor_phone_primary &&
@@ -2188,6 +2204,21 @@ llama_hybrid_layer_mode llama_model::hybrid_layer_mode(int il) const {
         return llama_hybrid_layer_mode::TENSOR_SPLIT;
     }
     return hybrid_layer_modes[il];
+}
+
+float llama_model::hybrid_tensor_pc_ratio(int il) const {
+    if (il >= 0 &&
+        il < (int) hybrid_tensor_pc_ratios.size() &&
+        hybrid_tensor_pc_ratios[il] > 0.0f) {
+        return hybrid_tensor_pc_ratios[il];
+    }
+
+    const float * split = tensor_split();
+    if (split == nullptr) {
+        return 0.0f;
+    }
+    const float sum = split[0] + split[1];
+    return sum > 0.0f ? split[0] / sum : 0.0f;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
