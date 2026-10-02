@@ -5939,7 +5939,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         };
 
     auto join_phone_prefill_pc_chunk =
-        [&](int layer, int chunk) -> ggml_status {
+        [&](int layer, int chunk, bool wait_for_return) -> ggml_status {
             if (!phone_prefill_chunk_join_active) {
                 return GGML_STATUS_SUCCESS;
             }
@@ -5967,6 +5967,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 backend_ctx->prefill_pc_worker != nullptr &&
                 backend_ctx->prefill_pc_worker->is_completed(
                     branch_it->pc_task);
+            const bool return_ready_before =
+                backend_ctx->prefill_return_worker->is_completed(
+                    branch_it->return_task);
+
+            // Normal chunk boundaries are opportunistic only.  If the return
+            // has not completed, leave this branch pending and let the next
+            // Phone chunk run instead of turning the per-chunk dependency into
+            // a host-side barrier.  The last chunk of the layer calls this
+            // helper with wait_for_return=true and drains every residual
+            // branch before the next layer is allowed to start.
+            if (!wait_for_return && !return_ready_before) {
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_PREFILL_CHUNK_JOIN_DEFER] "
+                        "layer=%d chunk=%d sg=%zu seq=%" PRIu64
+                        " pc_ready=%d return_ready=0\n",
+                        branch_it->layer,
+                        branch_it->chunk,
+                        branch_it->sg,
+                        branch_it->phone_ffn_seq,
+                        pc_ready_before ? 1 : 0);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
 
             const int64_t join_wait_begin_us = ggml_time_us();
             const ggml_status return_status =
@@ -6001,13 +6026,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 printf(
                     "[PHONE_PREFILL_CHUNK_JOIN] "
                     "layer=%d chunk=%d sg=%zu seq=%" PRIu64
-                    " pc_ready_before=%d wait_ms=%.3f "
+                    " mode=%s pc_ready_before=%d "
+                    "return_ready_before=%d wait_ms=%.3f "
                     "add_submit_ms=%.3f\n",
                     branch_it->layer,
                     branch_it->chunk,
                     branch_it->sg,
                     branch_it->phone_ffn_seq,
+                    wait_for_return ?
+                        "LAYER_BARRIER" : "EAGER",
                     pc_ready_before ? 1 : 0,
+                    return_ready_before ? 1 : 0,
                     join_wait_us / 1000.0,
                     add_us / 1000.0);
             }
@@ -6019,6 +6048,50 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pending_phone_prefill_pc_branches.erase(branch_it);
 
             return GGML_STATUS_SUCCESS;
+        };
+
+    auto reap_phone_prefill_pc_layer =
+        [&](int layer, bool wait_for_all) -> ggml_status {
+            if (!phone_prefill_chunk_join_active) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
+
+            // Return tasks share one FIFO worker.  Therefore, if the earliest
+            // pending branch for this layer is not complete, no later branch
+            // from the same layer can be complete either.  At ordinary chunk
+            // boundaries stop immediately instead of blocking; at the layer
+            // boundary wait and drain in submission order.
+            while (true) {
+                auto branch_it =
+                    std::find_if(
+                        pending_phone_prefill_pc_branches.begin(),
+                        pending_phone_prefill_pc_branches.end(),
+                        [&](const phone_prefill_pc_branch & branch) {
+                            return branch.layer == layer;
+                        });
+                if (branch_it ==
+                        pending_phone_prefill_pc_branches.end()) {
+                    return GGML_STATUS_SUCCESS;
+                }
+
+                if (!wait_for_all &&
+                        !backend_ctx->prefill_return_worker->is_completed(
+                            branch_it->return_task)) {
+                    return GGML_STATUS_SUCCESS;
+                }
+
+                const int chunk = branch_it->chunk;
+                const ggml_status status =
+                    join_phone_prefill_pc_chunk(
+                        layer,
+                        chunk,
+                        wait_for_all);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
         };
 
     auto drain_phone_prefill_pc_layer =
@@ -6539,24 +6612,50 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (phone_prefill_chunk_join_active) {
+                size_t pending_before = 0;
+                for (const auto & branch :
+                        pending_phone_prefill_pc_branches) {
+                    if (branch.layer == deferred_layer_0) {
+                        ++pending_before;
+                    }
+                }
+
+                const int64_t reap_begin_us = ggml_time_us();
                 const ggml_status join_status =
-                    join_phone_prefill_pc_chunk(
+                    reap_phone_prefill_pc_layer(
                         deferred_layer_0,
-                        deferred_chunk_0);
+                        last_chunk);
+                const int64_t reap_us =
+                    ggml_time_us() - reap_begin_us;
                 if (join_status != GGML_STATUS_SUCCESS) {
                     return join_status;
                 }
 
+                size_t pending_after = 0;
+                for (const auto & branch :
+                        pending_phone_prefill_pc_branches) {
+                    if (branch.layer == deferred_layer_0) {
+                        ++pending_after;
+                    }
+                }
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_PREFILL_CHUNK_REAP] "
+                        "layer=%d boundary_chunk=%d last=%d "
+                        "pending_before=%zu pending_after=%zu "
+                        "wall_ms=%.3f\n",
+                        deferred_layer_0,
+                        deferred_chunk_0,
+                        last_chunk ? 1 : 0,
+                        pending_before,
+                        pending_after,
+                        reap_us / 1000.0);
+                }
+
                 if (last_chunk) {
-                    const bool layer_pending =
-                        std::any_of(
-                            pending_phone_prefill_pc_branches.begin(),
-                            pending_phone_prefill_pc_branches.end(),
-                            [&](const phone_prefill_pc_branch & branch) {
-                                return branch.layer ==
-                                    deferred_layer_0;
-                            });
-                    GGML_ASSERT(!layer_pending);
+                    GGML_ASSERT(pending_after == 0);
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
