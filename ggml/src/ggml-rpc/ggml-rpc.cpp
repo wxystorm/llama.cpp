@@ -23,7 +23,7 @@
 #include <functional>
 #include <algorithm>
 
-static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");\n\nstatic constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 
 static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
@@ -591,7 +591,7 @@ struct ggml_backend_rpc_device_context {
     rpc_pending_fused_ffn_input fused_ffn;
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
-    std::array<std::shared_ptr<socket_t>, 2> route_transfer_socks {};
+    std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::shared_ptr<socket_t> return_transfer_sock;
 };
 
@@ -860,7 +860,7 @@ static void ggml_backend_rpc_set_stage_ready_callback(
 }
 
 static void ggml_backend_rpc_set_route_transfer_lane(int lane) {
-    GGML_ASSERT(lane >= -1 && lane < 2);
+    GGML_ASSERT(lane >= -1 && lane < static_cast<int>(RPC_ROUTE_TRANSFER_LANES));
     rpc_route_transfer_lane = lane;
 }
 
@@ -2102,7 +2102,7 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         const ggml_tensor * src2) {
-    if (backend == nullptr || lane >= 2) {
+    if (backend == nullptr || lane >= RPC_ROUTE_TRANSFER_LANES) {
         return false;
     }
 
@@ -2112,7 +2112,7 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         return false;
     }
 
-    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 10;
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     if (rpc_get_remote_patch(compute_key) <
             RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
@@ -2175,7 +2175,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     if (backend_src == nullptr ||
             backend_dst == nullptr ||
             seq == 0 ||
-            lane >= 2) {
+            lane >= RPC_ROUTE_TRANSFER_LANES) {
         return false;
     }
 
@@ -2185,7 +2185,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         return false;
     }
 
-    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 10;
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     if (rpc_get_remote_patch(compute_key) <
             RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
@@ -3570,7 +3570,7 @@ struct rpc_route_snapshot_slot {
 };
 
 struct rpc_route_snapshot_device {
-    std::array<rpc_route_snapshot_slot, 2> slots;
+    std::array<rpc_route_snapshot_slot, RPC_ROUTE_TRANSFER_LANES> slots;
 };
 
 struct rpc_snapshot_breakdown {
@@ -4972,7 +4972,7 @@ bool rpc_server::route_snapshot_ready(
         rpc_msg_route_snapshot_ready_rsp & response) {
     response.result = 0;
     if (request.device >= backends.size() ||
-            request.lane >= 2 ||
+            request.lane >= RPC_ROUTE_TRANSFER_LANES ||
             request.seq == 0) {
         return true;
     }
@@ -5080,7 +5080,7 @@ bool rpc_server::get_route_snapshot(
         const rpc_msg_get_route_snapshot_req & request,
         std::vector<uint8_t> & response) {
     if (request.device >= backends.size() ||
-            request.lane >= 2 ||
+            request.lane >= RPC_ROUTE_TRANSFER_LANES ||
             request.seq == 0) {
         return false;
     }
