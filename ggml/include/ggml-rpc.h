@@ -141,7 +141,8 @@ using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         ggml_tensor * dst,
         const void * data,
         size_t size,
-        uint64_t phone_ffn_seq);
+        uint64_t phone_ffn_seq,
+        size_t return_lane);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
