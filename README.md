@@ -157,68 +157,140 @@ cmake --build build-cuda --config Release -j 8
 
 ---
 
-# 6. 当前 phone-primary Tensor 流水需要开启的变量
+# 6. 当前 Hybrid / Phone-primary 环境变量
 
 这些变量在 **PC 端 PowerShell** 设置。
 
+## 6.1 默认：让 Hybrid Planner 全自动搜索
+
+正常跑 `--hybrid-auto` 时，建议先清掉旧的固定 plan override：
+
+```powershell
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_PC_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_PHONE_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_PC_RATIO -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_CHUNK_TOKENS -ErrorAction SilentlyContinue
+```
+
+这样 planner 会自己搜索：
+
+```text
+T  = Tensor layers
+P  = Phone-only layers
+C  = PC layers
+G  = PC GPU layers
+R  = Tensor PC ratio
+XT = Tensor chunk tokens
+XG / XC / XP = 各阶段 chunk / macro 参数
+```
+
+其中当前代码没有 `LLAMA_HYBRID_FIXED_GPU_LAYERS`、`FIXED_XG/XC/XP` 这类环境变量；`G/XG/XC/XP` 由 planner / score model 自动选择。
+
+如果也希望 planner 自己决定 Tensor primary，不要设置：
+
+```powershell
+Remove-Item Env:LLAMA_HYBRID_TENSOR_PRIMARY -ErrorAction SilentlyContinue
+```
+
+只有在专门测试 Phone-primary 时才使用：
+
 ```powershell
 $env:LLAMA_HYBRID_TENSOR_PRIMARY="phone"
+```
 
+## 6.2 当前 Phone-primary prefill chunk pipeline
+
+Phone-primary 路径仍需要：
+
+```powershell
 $env:LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER="1"
 $env:LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE="1"
 
 $env:GGML_META_PHONE_PREFILL_CHUNK_PIPELINE="1"
-$env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN="1"
+$env:GGML_META_PHONE_PREFILL_PRODUCER_ROUTE="1"
 $env:GGML_META_PHONE_PREFILL_ASYNC_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_ORDERED_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_CHUNK_JOIN="1"
+
+Remove-Item Env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN -ErrorAction SilentlyContinue
+
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_ROUTE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_REDUCE -ErrorAction SilentlyContinue
+$env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FFN_HANDOFF="1"
 ```
 
-它们分别对应：
-
-### `LLAMA_HYBRID_TENSOR_PRIMARY=phone`
-
-让 Hybrid Planner 只考虑 **Phone-primary Tensor** 方案。
-
-如果不设置，MoE planner 可以同时搜索 PC-primary 和 Phone-primary。
-
-也可以设置成pc，这样再切分的时候，PC 将作为 Tensor 层 activation 的主要持有者。
+含义：
 
 ### `LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER=1`
 
-Tensor 区域中完整的 `l_out` 由 Phone 持有。
-
-也就是 Phone 作为 Tensor 层 activation 的 owner。
+Tensor 区域完整 activation / `l_out` 由 Phone 持有。
 
 ### `LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE=1`
 
-FFN Tensor Parallel 归约改为单向：
+FFN Tensor Parallel 使用单向归约：
 
 ```text
-PC partial
-    |
-    v
-Phone ADD
-    |
-    v
-Phone owns full l_out
+Phone route / local FFN
+        |
+        +--------------------+
+        |                    |
+        v                    v
+   Phone FFN             PC FFN
+                             |
+                             v
+                       PC partial
+                             |
+                             v
+                          Phone
+                             |
+                             v
+                            ADD
+                             |
+                             v
+                    Phone owns full l_out
 ```
 
-不再每一层把完整结果重新 mirror 回 PC。
+PC 不再要求拥有内部 Tensor 层的完整 `l_out`。
 
 ### `GGML_META_PHONE_PREFILL_CHUNK_PIPELINE=1`
 
-启用目前的 prefill chunk pipeline。
+启用 Phone-primary prefill chunk pipeline。
 
-### `GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN=1`
+### `GGML_META_PHONE_PREFILL_PRODUCER_ROUTE=1`
 
-允许 Phone FFN 延后执行，从而与 PC 侧计算 / Router handoff 等阶段形成流水重叠。
+Phone 作为 Router / Top-K 结果 producer。每个 chunk 的 route snapshot 通过独立 route lane 发送给 PC；当前 RPC route lane 数为 4。
 
 ### `GGML_META_PHONE_PREFILL_ASYNC_RETURN=1`
 
-启用当前实现的异步 Phone → PC return path。
+启用 PC partial -> Phone 的异步 return path。
 
+### `GGML_META_PHONE_PREFILL_ORDERED_RETURN=1`
 
+让 return 使用独立、有序的 RPC return 通道，避免把 return 和普通 compute socket 的控制流混在一起。
 
-因此 **PC 和手机两边都需要使用最新代码重新编译**，否则 PC 即使打开 `ASYNC_RETURN`，旧 RPC server 也不一定支持对应接口。
+### `GGML_META_PHONE_PREFILL_CHUNK_JOIN=1`
+
+启用当前 per-chunk join：
+
+```text
+Phone FFN_i ---------+
+                     +--> ADD_i
+PC FFN_i -> return --+
+```
+
+chunk 之间允许 overlap；但同一层所有 chunk 必须完成 join 后，才能进入下一层。
+
+### `GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN`
+
+**当前标准路径不要开启。** 之前 README 中要求设置它已经过时。
+
+### `LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FFN_HANDOFF=1`
+
+当前仍保留 FFN handoff 的 correctness fence。其它 `STRICT_FENCE / STRICT_ROUTE / STRICT_REDUCE` 默认关闭，避免重新引入不必要的全局同步。
+
+RPC protocol 当前为 **v4.0.12**。如果 PC / Phone 一侧还停留在旧 RPC build，应两边更新并重新编译；尤其是 4-lane route snapshot 需要 patch 12。
 
 ---
 
@@ -285,16 +357,25 @@ Remove-Item Env:GGML_META_TP_ATTN_TRACE -ErrorAction SilentlyContinue
 Remove-Item Env:GGML_META_TP_FFN_NUMERIC_TRACE -ErrorAction SilentlyContinue
 ```
 
-但是下面这些功能变量要保留：
+但是当前 Phone-primary 功能变量要保留：
 
 ```powershell
-$env:LLAMA_HYBRID_TENSOR_PRIMARY="phone"
 $env:LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER="1"
 $env:LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE="1"
 $env:GGML_META_PHONE_PREFILL_CHUNK_PIPELINE="1"
-$env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN="1"
+$env:GGML_META_PHONE_PREFILL_PRODUCER_ROUTE="1"
 $env:GGML_META_PHONE_PREFILL_ASYNC_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_ORDERED_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_CHUNK_JOIN="1"
+
+Remove-Item Env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_ROUTE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_REDUCE -ErrorAction SilentlyContinue
+$env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FFN_HANDOFF="1"
 ```
+
+如果是在测完整 autoplan，不要固定 `LLAMA_HYBRID_TENSOR_PRIMARY`；只有专门做 Phone-primary A/B 时再设置为 `phone`。
 
 然后使用：
 
@@ -490,15 +571,41 @@ git pull --ff-only origin planner-moe-stage
 cmake --build build-cuda --config Release -j 8
 ```
 
-开启当前 Phone-primary pipeline：
+清掉旧的固定 planner override：
 
 ```powershell
-$env:LLAMA_HYBRID_TENSOR_PRIMARY="phone" （还是建议设置成pc，因为这个更快）
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_PC_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_PHONE_LAYERS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_PC_RATIO -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_FIXED_TENSOR_CHUNK_TOKENS -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_TENSOR_PRIMARY -ErrorAction SilentlyContinue
+```
+
+开启当前 Phone-primary pipeline 能力（当 planner 选择 Phone-primary 时生效）：
+
+```powershell
 $env:LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER="1"
 $env:LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE="1"
+
 $env:GGML_META_PHONE_PREFILL_CHUNK_PIPELINE="1"
-$env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN="1"
+$env:GGML_META_PHONE_PREFILL_PRODUCER_ROUTE="1"
 $env:GGML_META_PHONE_PREFILL_ASYNC_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_ORDERED_RETURN="1"
+$env:GGML_META_PHONE_PREFILL_CHUNK_JOIN="1"
+
+Remove-Item Env:GGML_META_PHONE_PREFILL_DEFER_PHONE_FFN -ErrorAction SilentlyContinue
+
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FENCE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_ROUTE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_REDUCE -ErrorAction SilentlyContinue
+$env:LLAMA_HYBRID_PHONE_PRIMARY_STRICT_FFN_HANDOFF="1"
+```
+
+如果要专门复现 Phone-primary 性能，再额外设置：
+
+```powershell
+$env:LLAMA_HYBRID_TENSOR_PRIMARY="phone"
 ```
 
 关闭性能无关日志：
