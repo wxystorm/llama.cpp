@@ -795,6 +795,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool tensor_phone_primary =
         mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
 
+    int mixed_tensor_layer_index = -1;
+    int mixed_tensor_layers = 0;
+    if (tensor_phone_primary &&
+        is_ffn_split_tensor &&
+        ud->n_devices == 2) {
+        const int n_layer =
+            ud->model->hparams.n_layer();
+        int ordinal = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            if (ud->model->hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+                continue;
+            }
+            if (il == tc.il) {
+                mixed_tensor_layer_index = ordinal;
+            }
+            ++ordinal;
+        }
+        mixed_tensor_layers = ordinal;
+    }
+
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
     // Generic split rotation is useful for equivalent devices, but rotating
@@ -827,8 +848,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             for (; j < ud->n_devices - 1; j++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
                     ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                const float split_ratio = tensor_split_scan.back() == 0.0f ?
+                float split_ratio = tensor_split_scan.back() == 0.0f ?
                     (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
+
+                if (tensor_phone_primary &&
+                    is_ffn_split_tensor &&
+                    ud->n_devices == 2 &&
+                    j == 0 &&
+                    mixed_tensor_layer_index >= 0 &&
+                    mixed_tensor_layers > 0) {
+                    split_ratio =
+                        llama_hybrid_mixed_pc_ratio_for_layer(
+                            ne_s,
+                            tc.tensor_axis_0->type,
+                            split_ratio,
+                            mixed_tensor_layer_index,
+                            mixed_tensor_layers);
+                }
+
                 if (is_ffn_split_tensor && ud->n_devices == 2 && split_ratio > 0.0f && split_ratio < 1.0f) {
                     high = llama_hybrid_ffn_shard_size(ne_s, tc.tensor_axis_0->type, split_ratio, 0);
                 }
