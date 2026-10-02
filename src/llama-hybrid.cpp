@@ -7882,13 +7882,4 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
     return found;
 }
-/*constraints.fixed_tensor_layers      = 37;
-    constraints.fixed_phone_layers       = 0;
-    constraints.fixed_pc_layers          = 27;
-    constraints.fixed_tensor_pc_ratio     = 0.713f;
-    constraints.fixed_gpu_pc_layers      = 14;
-    constraints.fixed_gpu_chunk_tokens    = 192;
-    constraints.fixed_cpu_chunk_tokens    = 192;
-    constraints.fixed_tensor_chunk_tokens = 48;
-    constraints.fixed_phone_chunk_tokens  = 4;
-    */
+
