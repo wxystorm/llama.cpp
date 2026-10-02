@@ -2332,7 +2332,8 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
-    ggml_backend_meta_transfer_worker * prefill_return_worker = nullptr;
+    std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
+        prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
         prefill_pc_return_host_payloads;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES> prefill_reduce_workers { nullptr,
@@ -2904,7 +2905,9 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
-    delete prefill_return_worker;
+    for (auto * worker : prefill_return_workers) {
+        delete worker;
+    }
     for (auto * worker : prefill_reduce_workers) {
         delete worker;
     }
@@ -3989,6 +3992,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         size_t sg = 0;
         uint64_t pc_task = 0;
         uint64_t return_task = 0;
+        size_t return_lane = 0;
         uint64_t phone_ffn_seq = 0;
         ggml_tensor * return_stage = nullptr;
     };
@@ -5961,14 +5965,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(branch_it->return_task != 0);
             GGML_ASSERT(branch_it->phone_ffn_seq != 0);
             GGML_ASSERT(branch_it->return_stage != nullptr);
-            GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
+            GGML_ASSERT(
+                branch_it->return_lane <
+                ggml_backend_meta_context::PREFILL_RETURN_LANES);
+            ggml_backend_meta_transfer_worker * return_worker =
+                backend_ctx->prefill_return_workers[
+                    branch_it->return_lane];
+            GGML_ASSERT(return_worker != nullptr);
 
             const bool pc_ready_before =
                 backend_ctx->prefill_pc_worker != nullptr &&
                 backend_ctx->prefill_pc_worker->is_completed(
                     branch_it->pc_task);
             const bool return_ready_before =
-                backend_ctx->prefill_return_worker->is_completed(
+                return_worker->is_completed(
                     branch_it->return_task);
 
             // Normal chunk boundaries are opportunistic only.  If the return
@@ -5995,7 +6005,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             const int64_t join_wait_begin_us = ggml_time_us();
             const ggml_status return_status =
-                backend_ctx->prefill_return_worker->wait(
+                return_worker->wait(
                     branch_it->return_task);
             const int64_t join_wait_us =
                 ggml_time_us() - join_wait_begin_us;
@@ -6026,7 +6036,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 printf(
                     "[PHONE_PREFILL_CHUNK_JOIN] "
                     "layer=%d chunk=%d sg=%zu seq=%" PRIu64
-                    " mode=%s pc_ready_before=%d "
+                    " mode=%s return_lane=%zu pc_ready_before=%d "
                     "return_ready_before=%d wait_ms=%.3f "
                     "add_submit_ms=%.3f\n",
                     branch_it->layer,
@@ -6035,6 +6045,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     branch_it->phone_ffn_seq,
                     wait_for_return ?
                         "LAYER_BARRIER" : "EAGER",
+                    branch_it->return_lane,
                     pc_ready_before ? 1 : 0,
                     return_ready_before ? 1 : 0,
                     join_wait_us / 1000.0,
@@ -6056,29 +6067,41 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return GGML_STATUS_SUCCESS;
             }
 
-            GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
-
-            // Return tasks share one FIFO worker.  Therefore, if the earliest
-            // pending branch for this layer is not complete, no later branch
-            // from the same layer can be complete either.  At ordinary chunk
-            // boundaries stop immediately instead of blocking; at the layer
-            // boundary wait and drain in submission order.
+            // Two return lanes run independently. At ordinary chunk
+            // boundaries reap any completed branch from either lane without
+            // blocking. At the layer boundary, wait/drain all residual
+            // branches. This preserves exact per-chunk join semantics while
+            // chunk0/2 and chunk1/3 returns overlap.
             while (true) {
                 auto branch_it =
-                    std::find_if(
-                        pending_phone_prefill_pc_branches.begin(),
-                        pending_phone_prefill_pc_branches.end(),
-                        [&](const phone_prefill_pc_branch & branch) {
-                            return branch.layer == layer;
-                        });
-                if (branch_it ==
-                        pending_phone_prefill_pc_branches.end()) {
-                    return GGML_STATUS_SUCCESS;
+                    pending_phone_prefill_pc_branches.end();
+
+                for (auto it =
+                         pending_phone_prefill_pc_branches.begin();
+                     it != pending_phone_prefill_pc_branches.end();
+                     ++it) {
+                    if (it->layer != layer) {
+                        continue;
+                    }
+
+                    GGML_ASSERT(
+                        it->return_lane <
+                        ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                    ggml_backend_meta_transfer_worker * return_worker =
+                        backend_ctx->prefill_return_workers[
+                            it->return_lane];
+                    GGML_ASSERT(return_worker != nullptr);
+
+                    if (wait_for_all ||
+                            return_worker->is_completed(
+                                it->return_task)) {
+                        branch_it = it;
+                        break;
+                    }
                 }
 
-                if (!wait_for_all &&
-                        !backend_ctx->prefill_return_worker->is_completed(
-                            branch_it->return_task)) {
+                if (branch_it ==
+                        pending_phone_prefill_pc_branches.end()) {
                     return GGML_STATUS_SUCCESS;
                 }
 
@@ -6226,8 +6249,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     continue;
                 }
                 ++async_return_chunks;
-                GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
-                if (backend_ctx->prefill_return_worker->is_completed(
+                GGML_ASSERT(
+                    branch.return_lane <
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                ggml_backend_meta_transfer_worker * return_worker =
+                    backend_ctx->prefill_return_workers[
+                        branch.return_lane];
+                GGML_ASSERT(return_worker != nullptr);
+                if (return_worker->is_completed(
                         branch.return_task)) {
                     ++return_ready_after_phone_fence;
                 }
@@ -6247,8 +6276,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             size_t drained_chunks = 0;
 
             if (use_async_return) {
-                GGML_ASSERT(backend_ctx->prefill_return_worker != nullptr);
-
                 // Network transfer has already been running concurrently with
                 // the PC worker and local Phone FFNs.  At the tail, wait only
                 // for any residual PC/return work that failed to hide.
@@ -6270,10 +6297,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         return pc_status;
                     }
 
+                    GGML_ASSERT(
+                        branch.return_lane <
+                        ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                    ggml_backend_meta_transfer_worker * return_worker =
+                        backend_ctx->prefill_return_workers[
+                            branch.return_lane];
+                    GGML_ASSERT(return_worker != nullptr);
+
                     const int64_t return_wait_begin_us =
                         ggml_time_us();
                     const ggml_status return_status =
-                        backend_ctx->prefill_return_worker->wait(
+                        return_worker->wait(
                             branch.return_task);
                     const int64_t return_wait_us =
                         ggml_time_us() - return_wait_begin_us;
@@ -11116,30 +11151,37 @@ auto prefill_norm_sg_has_prework =
             if (phone_prefill_async_return_active) {
                 GGML_ASSERT(return_payload != nullptr);
                 GGML_ASSERT(phone_return_stage != nullptr);
-                if (backend_ctx->prefill_return_worker == nullptr) {
-                    backend_ctx->prefill_return_worker =
+                const bool use_chunk_join_return =
+                    phone_prefill_chunk_join_active;
+                const size_t return_lane =
+                    use_chunk_join_return ?
+                        static_cast<size_t>(prefill_down_chunk) %
+                            ggml_backend_meta_context::PREFILL_RETURN_LANES :
+                        0;
+                auto & return_worker_slot =
+                    backend_ctx->prefill_return_workers[return_lane];
+                if (return_worker_slot == nullptr) {
+                    return_worker_slot =
                         new ggml_backend_meta_transfer_worker();
                 }
 
                 ggml_backend_meta_transfer_worker * pc_worker =
                     backend_ctx->prefill_pc_worker;
                 ggml_backend_meta_transfer_worker * return_worker =
-                    backend_ctx->prefill_return_worker;
+                    return_worker_slot;
                 const ggml_backend_rpc_set_tensor_async_return_t
                     async_return_set =
                         phone_prefill_async_return_set;
                 const ggml_backend_rpc_set_tensor_async_return_wait_t
                     async_return_wait =
                         phone_prefill_async_return_wait;
-                const bool use_chunk_join_return =
-                    phone_prefill_chunk_join_active;
-
                 return_task = return_worker->enqueue(
                     [pc_worker,
                      pc_task,
                      async_return_set,
                      async_return_wait,
                      use_chunk_join_return,
+                     return_lane,
                      phone_ffn_seq,
                      phone_backend,
                      phone_return_stage,
@@ -11184,7 +11226,7 @@ auto prefill_norm_sg_has_prework =
                                 "[PHONE_PREFILL_RETURN_ASYNC] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " pc_wait_ms=%.3f send_ms=%.3f "
-                                "bytes=%zu ffn_seq=%" PRIu64
+                                "return_lane=%zu bytes=%zu ffn_seq=%" PRIu64
                                 " chunk_join=%d status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
@@ -11192,6 +11234,7 @@ auto prefill_norm_sg_has_prework =
                                 task_id,
                                 pc_wait_us / 1000.0,
                                 send_us / 1000.0,
+                                return_lane,
                                 return_payload->size(),
                                 phone_ffn_seq,
                                 use_chunk_join_return ? 1 : 0,
@@ -11272,6 +11315,7 @@ auto prefill_norm_sg_has_prework =
                 i,
                 pc_task,
                 return_task,
+                return_lane,
                 phone_ffn_seq,
                 phone_return_stage,
             });
