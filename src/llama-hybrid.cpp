@@ -4082,6 +4082,8 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
             allow_tensor_pc_primary = false;
         }
     }
+    const bool allow_mixed_phone_ratio =
+        allow_tensor_phone_primary && profile.is_moe;
 
     std::array<std::vector<llama_hybrid_coarse_candidate>, 32> family_top;
     std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_LOW_TENSOR_ANCHORS.size()> low_tensor_top;
@@ -4128,13 +4130,13 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                 continue;
             }
             ratios.push_back(
-                allow_tensor_phone_primary ?
+                allow_mixed_phone_ratio ?
                     ratio :
                     llama_hybrid_align_pc_ratio(profile, ratio));
         } else {
             ratios = llama_hybrid_plan_ratio_candidates(
                 profile, chunk_tokens,
-                allow_tensor_phone_primary);
+                allow_mixed_phone_ratio);
             if (ratios.empty()) {
                 continue;
             }
@@ -4269,6 +4271,27 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                             plan.tensor_phone_primary   = tensor_phone_primary;
                             plan.tensor_pc_ratio        =
                                 tensor_layers > 0 ? ratio : 0.50f;
+                            plan.tensor_pc_ratio_low    =
+                                plan.tensor_pc_ratio;
+                            plan.tensor_pc_ratio_high   =
+                                plan.tensor_pc_ratio;
+                            plan.tensor_pc_ratio_high_layers = 0;
+                            if (tensor_layers > 0 &&
+                                tensor_phone_primary &&
+                                allow_mixed_phone_ratio) {
+                                llama_hybrid_mixed_ratio_layout mixed_layout;
+                                if (!llama_hybrid_mixed_ratio_layout_for_profile(
+                                        profile, ratio, tensor_layers,
+                                        mixed_layout)) {
+                                    continue;
+                                }
+                                plan.tensor_pc_ratio_low =
+                                    mixed_layout.low_ratio;
+                                plan.tensor_pc_ratio_high =
+                                    mixed_layout.high_ratio;
+                                plan.tensor_pc_ratio_high_layers =
+                                    mixed_layout.high_layers;
+                            }
                             plan.gpu_pc_layers          = gpu_layers;
                             plan.tensor_chunk_tokens    = chunk_tokens;
 
