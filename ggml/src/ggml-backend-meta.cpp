@@ -825,6 +825,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
+                if (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr) {
+                    std::string lhs_ne;
+                    std::string rhs_ne;
+                    for (size_t j = 0; j < n_bufs; ++j) {
+                        if (j > 0) {
+                            lhs_ne += ",";
+                            rhs_ne += ",";
+                        }
+                        lhs_ne += std::to_string(ret.ne[j]);
+                        rhs_ne += std::to_string(src_ss[i].ne[j]);
+                    }
+                    GGML_LOG_ERROR(
+                        "[HYBRID_META_SPLIT_MISMATCH] tensor=%s op=%s src_index=%zu "
+                        "lhs_axis=%s lhs_ne={%s} lhs_nr=%u lhs_segments=%zu "
+                        "rhs=%s rhs_axis=%s rhs_ne={%s} rhs_nr=%u rhs_segments=%zu\n",
+                        tensor->name,
+                        ggml_op_name(tensor->op),
+                        i,
+                        ggml_backend_meta_split_axis_name(ret.axis),
+                        lhs_ne.c_str(),
+                        ret.nr[0],
+                        ret.n_segments,
+                        tensor->src[i] != nullptr ? tensor->src[i]->name : "(null)",
+                        ggml_backend_meta_split_axis_name(src_ss[i].axis),
+                        rhs_ne.c_str(),
+                        src_ss[i].nr[0],
+                        src_ss[i].n_segments);
+                }
                 ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 break;
             }
