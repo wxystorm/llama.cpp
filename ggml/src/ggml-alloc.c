@@ -969,7 +969,7 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
     const bool hybrid_view_trace =
-        getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL &&
+        getenv("GGML_META_GALLOC_TRACE") != NULL &&
         tensor->view_src != NULL &&
         strstr(tensor->name, "ffn_moe_weights-") != NULL;
 
@@ -1040,7 +1040,7 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
             const bool hybrid_meta_alloc_trace =
-                getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL &&
+                getenv("GGML_META_ALLOC_TRACE") != NULL &&
                 strstr(ggml_backend_buft_name(galloc->bufts[buffer_id]), "Meta(") != NULL;
             if (hybrid_meta_alloc_trace) {
                 GGML_LOG_ERROR(
@@ -1164,7 +1164,7 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
     // nodes
     const bool hybrid_galloc_node_trace =
-        getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL;
+        getenv("GGML_META_GALLOC_TRACE") != NULL;
     const int hybrid_galloc_trace_begin =
         graph->n_nodes > 600 ? graph->n_nodes - 600 : 0;
 
