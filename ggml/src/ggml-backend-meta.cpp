@@ -1446,12 +1446,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        // Tensor storage can be reused across rebuilt graphs. Invalidate only
-        // this stale entry: every cached tensor carries its own byte snapshot
-        // and will be validated on lookup. Clearing the entire cache here
-        // destroys valid ancestor states and can force a very deep recursive
-        // recomputation during staged Meta allocation.
-        buf_ctx->split_state_cache.erase(it);
+        buf_ctx->split_state_cache.clear();
         it = buf_ctx->split_state_cache.end();
     }
 
