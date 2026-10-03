@@ -2168,7 +2168,20 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         const int64_t simple_begin_us = ggml_time_us();
         bufs.push_back(ggml_backend_buft_alloc_buffer(simple_buft, size));
         simple_alloc_us[i] = ggml_time_us() - simple_begin_us;
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (bufs.back() == nullptr) {
+            GGML_LOG_ERROR(
+                "[META_BUFFER_ALLOC_FAIL] index=%zu buft=%s requested_mib=%.3f "
+                "alloc_ms=%.3f simple_backends=%zu\n",
+                i,
+                ggml_backend_buft_name(simple_buft),
+                size / 1048576.0,
+                simple_alloc_us[i] / 1000.0,
+                n_simple_bufts);
+            for (size_t j = 0; j + 1 < bufs.size(); ++j) {
+                ggml_backend_buffer_free(bufs[j]);
+            }
+            return nullptr;
+        }
         simple_alloc_size[i] = ggml_backend_buffer_get_size(bufs.back());
         max_size = std::max(max_size, simple_alloc_size[i]);
     }
