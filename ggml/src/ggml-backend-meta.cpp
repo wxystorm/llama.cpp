@@ -1446,7 +1446,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
+        // Compute tensor storage is reused across staged graph generations.
+        // The whole cache is invalidated once when the STC generation switches
+        // in ggml_backend_meta_buffer_init_tensor(). Do not clear the entire
+        // cache from inside recursive split-state evaluation: doing so destroys
+        // memoized ancestor states and can turn a linear walk into unbounded
+        // recomputation deep enough to overflow the host stack.
+        //
+        // A mismatch inside one generation should be local in normal operation.
+        // Drop this stale entry and recompute it while preserving unrelated
+        // split states. If this starts firing repeatedly, GGML_META_STC_DEBUG
+        // can be used to diagnose an unexpected in-generation tensor mutation.
+        buf_ctx->split_state_cache.erase(it);
         it = buf_ctx->split_state_cache.end();
     }
 
@@ -1462,7 +1473,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!srcs_info.empty()) {
                     srcs_info += ", ";
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor->src[0], true);
+                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor->src[i], true);
                 GGML_ASSERT(split_state.n_segments == 1);
                 const char * axis_name = ggml_backend_meta_split_axis_name(split_state.axis);
                 std::string ne_info;
@@ -1750,7 +1761,26 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
-    buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
+
+    if (buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
+        if (std::getenv("GGML_META_STC_DEBUG") != nullptr) {
+            GGML_LOG_DEBUG(
+                "[META_SPLIT_CACHE_ROTATE] cur=%d next=%d entries=%zu tensor=%s\n",
+                buf_ctx->stc_compute_index,
+                buf_ctx->stc_compute_index_next,
+                buf_ctx->split_state_cache.size(),
+                tensor->name);
+        }
+
+        // The allocator reuses ggml_tensor addresses across staged graphs.
+        // Invalidate split states once at the generation boundary, before any
+        // tensor from the new STC is initialized. Keeping this out of recursive
+        // split-state lookup preserves memoization for the entire graph and
+        // prevents stale-address recovery from recursively clearing the cache.
+        buf_ctx->split_state_cache.clear();
+        buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
+    }
+
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
