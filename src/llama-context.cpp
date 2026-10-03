@@ -3863,16 +3863,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         phone_primary_cpu_chunk_stages.push_back({
             llama_hybrid_runtime_stage_kind::TENSOR,
             runtime_stages[2].layer_begin,
-            (int) hparams.n_layer(),
+            runtime_stages[2].layer_end,
             suffix_macro_tokens,
             runtime_plan.tensor_chunk_tokens,
         });
 
+        if (runtime_stages[2].layer_end < (int) hparams.n_layer()) {
+            phone_primary_cpu_chunk_stages.push_back({
+                llama_hybrid_runtime_stage_kind::PHONE,
+                runtime_stages[2].layer_end,
+                (int) hparams.n_layer(),
+                suffix_macro_tokens,
+                0,
+            });
+        }
+
         LLAMA_LOG_ERROR(
             "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
             "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
-            "SUFFIX=[%d,%d) suffix_macro=%d XT=%d "
-            "mode=PREFIX_STAGED_SUFFIX_FULL\n",
+            "TENSOR=[%d,%d) tensor_macro=%d XT=%d "
+            "PHONE=[%d,%d) phone_macro=%d "
+            "mode=PREFIX_STAGED_TENSOR_PHONE_SPLIT\n",
             phone_primary_cpu_chunk_stages[0].layer_begin,
             phone_primary_cpu_chunk_stages[0].layer_end,
             phone_primary_cpu_chunk_stages[0].macro_tokens,
@@ -3882,7 +3893,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
             phone_primary_cpu_chunk_stages[2].layer_begin,
             phone_primary_cpu_chunk_stages[2].layer_end,
             phone_primary_cpu_chunk_stages[2].macro_tokens,
-            phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+            phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
+            phone_primary_cpu_chunk_stages.size() > 3 ?
+                phone_primary_cpu_chunk_stages[3].layer_begin :
+                phone_primary_cpu_chunk_stages[2].layer_end,
+            phone_primary_cpu_chunk_stages.size() > 3 ?
+                phone_primary_cpu_chunk_stages[3].layer_end :
+                phone_primary_cpu_chunk_stages[2].layer_end,
+            phone_primary_cpu_chunk_stages.size() > 3 ?
+                phone_primary_cpu_chunk_stages[3].macro_tokens : 0);
     } else if (phone_primary_cpu_chunk_requested) {
         LLAMA_LOG_WARN(
             "[HYBRID_PHONE_CPU_CHUNK] enabled=0 reason=UNSUPPORTED_TOPOLOGY "
@@ -5104,13 +5123,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         } else if (phone_primary_cpu_chunk_candidate) {
             LLAMA_LOG_ERROR(
                 "[HYBRID_PHONE_CPU_CHUNK] ub=%d tokens=%u "
-                "XG=%d XC=%d suffix_macro=%d XT=%d action=RUN\n",
+                "XG=%d XC=%d tensor_macro=%d XT=%d "
+                "phone_macro=%d action=RUN\n",
                 ubatch_id,
                 ubatch.n_tokens,
                 phone_primary_cpu_chunk_stages[0].macro_tokens,
                 phone_primary_cpu_chunk_stages[1].macro_tokens,
                 phone_primary_cpu_chunk_stages[2].macro_tokens,
-                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
+                phone_primary_cpu_chunk_stages.size() > 3 ?
+                    phone_primary_cpu_chunk_stages[3].macro_tokens : 0);
             res = process_ubatch_staged(
                 ubatch,
                 ctx_type_to_graph_type(cparams.ctx_type),
