@@ -1151,6 +1151,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
 
+        int wave_l_out_chunk = -1;
+        int wave_l_out_layer = -1;
+        const bool is_prefill_wave_l_out =
+            tensor->op == GGML_OP_ADD &&
+            ggml_backend_meta_parse_prefill_wave_l_out_chunk(
+                tensor->name, wave_l_out_chunk, wave_l_out_layer);
+
+        if (is_prefill_wave_l_out) {
+            // The split FFN produces PARTIAL tensors on PC/Phone, but the
+            // explicit wavefront l_out node is committed only after Phone has
+            // been reduced into the PC down tensor. Treat the committed node
+            // as MIRRORED so downstream Attention sees a full hidden state.
+            //
+            // This result is independent of the source split states. Return
+            // before recursively walking the residual/source chain so staged
+            // graphs do not build unnecessarily deep split-state recursion.
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
         std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
@@ -1189,20 +1208,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
 
         ggml_backend_meta_split_state split_state;
-        int wave_l_out_chunk = -1;
-        int wave_l_out_layer = -1;
-        const bool is_prefill_wave_l_out =
-            tensor->op == GGML_OP_ADD &&
-            ggml_backend_meta_parse_prefill_wave_l_out_chunk(
-                tensor->name, wave_l_out_chunk, wave_l_out_layer);
-
-        if (is_prefill_wave_l_out) {
-            // The split FFN produces PARTIAL tensors on PC/Phone, but the
-            // explicit wavefront l_out node is committed only after Phone has
-            // been reduced into the PC down tensor. Treat the committed node
-            // as MIRRORED so downstream Attention sees a full hidden state.
-            split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
-        } else switch (tensor->op) {
+        switch (tensor->op) {
             case GGML_OP_NONE: {
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
@@ -1440,7 +1446,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
+        // Tensor storage can be reused across rebuilt graphs. Invalidate only
+        // this stale entry: every cached tensor carries its own byte snapshot
+        // and will be validated on lookup. Clearing the entire cache here
+        // destroys valid ancestor states and can force a very deep recursive
+        // recomputation during staged Meta allocation.
+        buf_ctx->split_state_cache.erase(it);
         it = buf_ctx->split_state_cache.end();
     }
 
