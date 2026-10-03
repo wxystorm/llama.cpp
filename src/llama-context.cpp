@@ -1884,6 +1884,42 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
+        if (stage != nullptr &&
+            res->get_stage_input() != nullptr &&
+            (stage->kind == llama_hybrid_runtime_stage_kind::TENSOR ||
+             stage->kind == llama_hybrid_runtime_stage_kind::PHONE)) {
+            ggml_tensor * stage_input = res->get_stage_input();
+            ggml_backend_t stage_input_backend =
+                ggml_backend_sched_get_tensor_backend(sched_use, stage_input);
+
+            if (stage_input_backend == nullptr) {
+                const ggml_backend_dev_t stage_dev =
+                    model.dev_layer(stage->layer_begin);
+                for (const auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == stage_dev) {
+                        ggml_backend_sched_set_tensor_backend(
+                            sched_use, stage_input, backend.get());
+                        stage_input_backend = backend.get();
+                        break;
+                    }
+                }
+            }
+
+            if (phone_cpu_chunk_stage_trace) {
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_STAGE_INPUT_BIND] stage=%s layers=[%d,%d) "
+                    "tokens=%u input=%s backend=%s dev_type=%d\n",
+                    llama_hybrid_runtime_stage_name(stage->kind),
+                    stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+                    stage_input->name,
+                    stage_input_backend != nullptr ?
+                        ggml_backend_name(stage_input_backend) : "(unassigned)",
+                    stage_input_backend != nullptr ?
+                        (int) ggml_backend_dev_type(
+                            ggml_backend_get_device(stage_input_backend)) : -1);
+            }
+        }
+
         if (phone_cpu_chunk_stage_trace) {
             ggml_tensor * stage_input = res->get_stage_input();
             ggml_backend_t stage_input_backend =
