@@ -1855,8 +1855,25 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             graph_reset_us = ggml_time_us() - graph_reset_begin_us;
         }
 
+        const bool phone_cpu_chunk_stage_trace =
+            stage != nullptr &&
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
+        if (phone_cpu_chunk_stage_trace) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=BUILD_BEGIN\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens);
+        }
+
         const int64_t graph_build_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
+        if (phone_cpu_chunk_stage_trace) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=BUILD_END nodes=%d\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+                gf != nullptr ? ggml_graph_n_nodes(gf) : -1);
+        }
         if (log_prepare_breakdown) {
             graph_build_us = ggml_time_us() - graph_build_begin_us;
         }
@@ -1867,11 +1884,43 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
+        if (phone_cpu_chunk_stage_trace) {
+            ggml_tensor * stage_input = res->get_stage_input();
+            ggml_backend_t stage_input_backend =
+                stage_input != nullptr ?
+                    ggml_backend_sched_get_tensor_backend(sched_use, stage_input) :
+                    nullptr;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
+                "point=ALLOC_BEGIN stage_input=%s input_backend=%s\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+                stage_input != nullptr ? stage_input->name : "(null)",
+                stage_input_backend != nullptr ?
+                    ggml_backend_name(stage_input_backend) : "(unassigned)");
+        }
+
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (phone_cpu_chunk_stage_trace) {
+            ggml_tensor * stage_input = res->get_stage_input();
+            ggml_backend_t stage_input_backend =
+                stage_input != nullptr ?
+                    ggml_backend_sched_get_tensor_backend(sched_use, stage_input) :
+                    nullptr;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
+                "point=ALLOC_END stage_input=%s input_backend=%s splits=%d\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+                stage_input != nullptr ? stage_input->name : "(null)",
+                stage_input_backend != nullptr ?
+                    ggml_backend_name(stage_input_backend) : "(unassigned)",
+                ggml_backend_sched_get_n_splits(sched_use));
         }
         if (log_prepare_breakdown) {
             graph_alloc_us = ggml_time_us() - graph_alloc_begin_us;
@@ -1884,6 +1933,13 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        if (phone_cpu_chunk_stage_trace) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=SET_INPUTS_END\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens);
+        }
 
         if (log_prepare_breakdown) {
             set_inputs_us = ggml_time_us() - set_inputs_begin_us;
@@ -2265,8 +2321,24 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
+    const bool phone_cpu_chunk_stage_trace =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
+    if (phone_cpu_chunk_stage_trace) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
+            "point=COMPUTE_BEGIN splits=%d\n",
+            llama_hybrid_runtime_stage_name(stage.kind),
+            stage.layer_begin, stage.layer_end, block_tokens, n_splits);
+    }
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    if (phone_cpu_chunk_stage_trace) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
+            "point=COMPUTE_END status=%d\n",
+            llama_hybrid_runtime_stage_name(stage.kind),
+            stage.layer_begin, stage.layer_end, block_tokens, (int) ret);
+    }
     if (timing != nullptr) {
         timing->compute_range_us += ggml_time_us() - compute_begin_us;
     }
