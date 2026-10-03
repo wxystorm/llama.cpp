@@ -1485,7 +1485,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     const bool hybrid_init_detail =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
-        std::strcmp(tensor->name, "ffn_moe_probs-45") == 0;
+        std::strncmp(tensor->name, "ffn_moe_probs-", 14) == 0;
 
     if (hybrid_init_detail) {
         GGML_LOG_ERROR(
