@@ -2760,6 +2760,22 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.sync_us / 1000.0,
                 std::max<int64_t>(0, stage_total_us - accounted_us) / 1000.0,
                 blocks.size());
+            if (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PHONE_CPU_CHUNK_STAGE] ub=%d kind=CPU "
+                    "tokens=%u layers=[%d,%d) XC=%d blocks=%zu "
+                    "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    stage.layer_begin,
+                    stage.layer_end,
+                    stage.macro_tokens,
+                    blocks.size(),
+                    stage_total_us / 1000.0,
+                    stage_timing.prepare_us / 1000.0,
+                    stage_timing.compute_range_us / 1000.0,
+                    stage_timing.sync_us / 1000.0);
+            }
         }
 
         if (profile_tensor) {
@@ -2910,6 +2926,23 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.graph_compute_count,
                 profile.graph_rebuild_count,
                 blocks.size());
+            if (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PHONE_CPU_CHUNK_STAGE] ub=%d kind=SUFFIX "
+                    "tokens=%u layers=[%d,%d) macro=%d XT=%d blocks=%zu "
+                    "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    stage.layer_begin,
+                    stage.layer_end,
+                    stage.macro_tokens,
+                    stage.inner_chunk_tokens,
+                    blocks.size(),
+                    stage_total_us / 1000.0,
+                    stage_timing.prepare_us / 1000.0,
+                    stage_timing.compute_range_us / 1000.0,
+                    stage_timing.sync_us / 1000.0);
+            }
 
             LLAMA_LOG_DEBUG(
                 "[TENSOR_BREAKDOWN] ub=%d total=%.3f attn=%.3f "
