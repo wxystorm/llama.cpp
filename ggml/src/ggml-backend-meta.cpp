@@ -796,7 +796,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const bool hybrid_split_detail =
-        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
+        std::getenv("GGML_META_ALLOC_TRACE") != nullptr &&
         std::strncmp(tensor->name, "ffn_moe_weights-", 16) == 0;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
@@ -1527,7 +1527,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     const bool hybrid_init_detail =
-        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
+        std::getenv("GGML_META_ALLOC_TRACE") != nullptr &&
         (std::strncmp(tensor->name, "ffn_moe_probs-", 14) == 0 ||
          std::strncmp(tensor->name, "ffn_moe_weights-", 16) == 0);
 
