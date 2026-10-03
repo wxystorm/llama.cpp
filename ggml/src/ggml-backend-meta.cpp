@@ -838,8 +838,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     }
                     GGML_LOG_ERROR(
                         "[HYBRID_META_SPLIT_MISMATCH] tensor=%s op=%s src_index=%zu "
-                        "lhs_axis=%s lhs_ne={%s} lhs_nr=%u lhs_segments=%zu "
-                        "rhs=%s rhs_axis=%s rhs_ne={%s} rhs_nr=%u rhs_segments=%zu\n",
+                        "lhs_axis=%s lhs_ne={%s} lhs_nr=%u lhs_segments=%u "
+                        "rhs=%s rhs_axis=%s rhs_ne={%s} rhs_nr=%u rhs_segments=%u\n",
                         tensor->name,
                         ggml_op_name(tensor->op),
                         i,
@@ -1502,7 +1502,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     if (hybrid_init_detail) {
         GGML_LOG_ERROR(
             "[HYBRID_META_INIT_DETAIL] tensor=%s point=SPLIT_END "
-            "axis=%s segments=%zu nr0=%u\n",
+            "axis=%s segments=%u nr0=%u\n",
             tensor->name,
             ggml_backend_meta_split_axis_name(split_state.axis),
             split_state.n_segments,
