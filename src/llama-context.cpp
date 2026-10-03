@@ -3049,6 +3049,66 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         }
     }
 
+    const bool prefill_region_profile =
+        batched &&
+        std::getenv("LLAMA_HYBRID_REGION_PROFILE") != nullptr;
+    const bool prefill_region_profile_splits =
+        prefill_region_profile &&
+        std::getenv("LLAMA_HYBRID_REGION_PROFILE_SPLITS") != nullptr;
+
+    enum llama_hybrid_profile_region {
+        LLAMA_HYBRID_PROFILE_GPU = 0,
+        LLAMA_HYBRID_PROFILE_CPU,
+        LLAMA_HYBRID_PROFILE_TENSOR,
+        LLAMA_HYBRID_PROFILE_PHONE,
+        LLAMA_HYBRID_PROFILE_OTHER,
+        LLAMA_HYBRID_PROFILE_COUNT,
+    };
+
+    int64_t prefill_region_prepare_us[LLAMA_HYBRID_PROFILE_COUNT] = {};
+    int64_t prefill_region_submit_us[LLAMA_HYBRID_PROFILE_COUNT] = {};
+    int     prefill_region_splits[LLAMA_HYBRID_PROFILE_COUNT] = {};
+
+    const auto prefill_region_name = [](int region) -> const char * {
+        switch (region) {
+            case LLAMA_HYBRID_PROFILE_GPU:    return "GPU";
+            case LLAMA_HYBRID_PROFILE_CPU:    return "CPU";
+            case LLAMA_HYBRID_PROFILE_TENSOR: return "TENSOR";
+            case LLAMA_HYBRID_PROFILE_PHONE:  return "PHONE";
+            default:                          return "OTHER";
+        }
+    };
+
+    const auto prefill_region_for_backend = [](ggml_backend_t backend) -> int {
+        if (backend == nullptr) {
+            return LLAMA_HYBRID_PROFILE_OTHER;
+        }
+
+        const char * backend_name = ggml_backend_name(backend);
+        if (backend_name != nullptr &&
+            (std::strstr(backend_name, "RPC") != nullptr ||
+             std::strstr(backend_name, "rpc") != nullptr)) {
+            return LLAMA_HYBRID_PROFILE_PHONE;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) {
+            return LLAMA_HYBRID_PROFILE_OTHER;
+        }
+
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_META:
+                return LLAMA_HYBRID_PROFILE_TENSOR;
+            case GGML_BACKEND_DEVICE_TYPE_GPU:
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                return LLAMA_HYBRID_PROFILE_GPU;
+            case GGML_BACKEND_DEVICE_TYPE_CPU:
+                return LLAMA_HYBRID_PROFILE_CPU;
+            default:
+                return LLAMA_HYBRID_PROFILE_OTHER;
+        }
+    };
+
     const int64_t compute_begin_us =
         (batched || decode_profile_this_token) ?
             ggml_time_us() : 0;
@@ -3107,6 +3167,69 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
                 split_submit_us / 1000.0,
                 (int) ret);
         }
+    } else if (prefill_region_profile) {
+        // Preserve compute_range() semantics exactly: prepare and submit every
+        // split in order without adding any synchronization. These timings are
+        // exposed host wall time. Async device work that completes later is
+        // still captured by the existing final output fence.
+        ret = GGML_STATUS_SUCCESS;
+        for (int split_id = 0;
+             split_id < n_splits &&
+             ret == GGML_STATUS_SUCCESS;
+             ++split_id) {
+            ggml_backend_t split_backend =
+                ggml_backend_sched_get_split_backend(
+                    sched_use, split_id);
+            const int region =
+                prefill_region_for_backend(split_backend);
+
+            const int64_t split_prepare_begin_us =
+                ggml_time_us();
+            ret = ggml_backend_sched_prepare_split(
+                sched_use, split_id);
+            const int64_t split_prepare_us =
+                ggml_time_us() - split_prepare_begin_us;
+
+            int64_t split_submit_us = 0;
+            if (ret == GGML_STATUS_SUCCESS) {
+                const int64_t split_submit_begin_us =
+                    ggml_time_us();
+                ret = ggml_backend_sched_compute_split(
+                    sched_use, split_id);
+                split_submit_us =
+                    ggml_time_us() - split_submit_begin_us;
+            }
+
+            prefill_region_prepare_us[region] +=
+                split_prepare_us;
+            prefill_region_submit_us[region] +=
+                split_submit_us;
+            prefill_region_splits[region]++;
+
+            if (prefill_region_profile_splits) {
+                ggml_backend_dev_t split_dev =
+                    split_backend != nullptr ?
+                        ggml_backend_get_device(split_backend) : nullptr;
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_REGION_SPLIT] ub=%d tokens=%u "
+                    "split=%d/%d region=%s backend=%s type=%d "
+                    "prepare_ms=%.3f submit_ms=%.3f host_ms=%.3f "
+                    "status=%d\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    split_id,
+                    n_splits,
+                    prefill_region_name(region),
+                    split_backend != nullptr ?
+                        ggml_backend_name(split_backend) : "(null)",
+                    split_dev != nullptr ?
+                        (int) ggml_backend_dev_type(split_dev) : -1,
+                    split_prepare_us / 1000.0,
+                    split_submit_us / 1000.0,
+                    (split_prepare_us + split_submit_us) / 1000.0,
+                    (int) ret);
+            }
+        }
     } else {
         ret = graph_compute_range(
             sched_use, 0, n_splits, batched);
@@ -3115,6 +3238,44 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     const int64_t compute_us =
         (batched || decode_profile_this_token) ?
             ggml_time_us() - compute_begin_us : 0;
+
+    if (prefill_region_profile) {
+        const auto region_host_us = [&](int region) -> int64_t {
+            return prefill_region_prepare_us[region] +
+                   prefill_region_submit_us[region];
+        };
+        int64_t split_host_us = 0;
+        for (int region = 0;
+             region < LLAMA_HYBRID_PROFILE_COUNT;
+             ++region) {
+            split_host_us += region_host_us(region);
+        }
+
+        LLAMA_LOG_ERROR(
+            "[HYBRID_REGION_WALL] ub=%d tokens=%u splits=%d "
+            "gpu_ms=%.3f cpu_ms=%.3f tensor_ms=%.3f "
+            "phone_ms=%.3f other_ms=%.3f "
+            "split_host_ms=%.3f dispatch_wall_ms=%.3f "
+            "prepare_graph_ms=%.3f "
+            "split_counts=%d/%d/%d/%d/%d "
+            "semantics=EXPOSED_HOST_NO_EXTRA_SYNC\n",
+            ubatch_id,
+            ubatch.n_tokens,
+            n_splits,
+            region_host_us(LLAMA_HYBRID_PROFILE_GPU) / 1000.0,
+            region_host_us(LLAMA_HYBRID_PROFILE_CPU) / 1000.0,
+            region_host_us(LLAMA_HYBRID_PROFILE_TENSOR) / 1000.0,
+            region_host_us(LLAMA_HYBRID_PROFILE_PHONE) / 1000.0,
+            region_host_us(LLAMA_HYBRID_PROFILE_OTHER) / 1000.0,
+            split_host_us / 1000.0,
+            compute_us / 1000.0,
+            prepare_us / 1000.0,
+            prefill_region_splits[LLAMA_HYBRID_PROFILE_GPU],
+            prefill_region_splits[LLAMA_HYBRID_PROFILE_CPU],
+            prefill_region_splits[LLAMA_HYBRID_PROFILE_TENSOR],
+            prefill_region_splits[LLAMA_HYBRID_PROFILE_PHONE],
+            prefill_region_splits[LLAMA_HYBRID_PROFILE_OTHER]);
+    }
 
     if (decode_profile_this_token) {
         LLAMA_LOG_DEBUG(
