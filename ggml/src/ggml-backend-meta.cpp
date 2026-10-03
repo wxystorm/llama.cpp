@@ -795,6 +795,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const bool hybrid_split_detail =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
+        std::strncmp(tensor->name, "ffn_moe_weights-", 16) == 0;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -1049,6 +1052,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_get_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (hybrid_split_detail) {
+            GGML_LOG_ERROR(
+                "[HYBRID_META_GET_ROWS] tensor=%s point=RULE "
+                "src0_axis=%s src0_segments=%u src0_nr0=%u "
+                "src1_axis=%s src1_segments=%u src1_nr0=%u\n",
+                tensor->name,
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                src_ss[0].n_segments,
+                src_ss[0].nr[0],
+                ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                src_ss[1].n_segments,
+                src_ss[1].nr[0]);
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
@@ -1141,7 +1157,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
+            if (hybrid_split_detail) {
+                const ggml_tensor * src = tensor->src[i];
+                GGML_LOG_ERROR(
+                    "[HYBRID_META_GET_ROWS] tensor=%s point=SRC_STATE_BEGIN src_index=%zu "
+                    "src=%s src_op=%s view=%s view_src=%s view_offs=%zu "
+                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "nb=[%zu,%zu,%zu,%zu]\n",
+                    tensor->name,
+                    i,
+                    src->name,
+                    ggml_op_name(src->op),
+                    src->view_src != nullptr ? "yes" : "no",
+                    src->view_src != nullptr ? src->view_src->name : "(null)",
+                    src->view_offs,
+                    src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                    src->nb[0], src->nb[1], src->nb[2], src->nb[3]);
+            }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
+            if (hybrid_split_detail) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_META_GET_ROWS] tensor=%s point=SRC_STATE_END src_index=%zu "
+                    "axis=%s segments=%u nr0=%u\n",
+                    tensor->name,
+                    i,
+                    ggml_backend_meta_split_axis_name(src_ss[i].axis),
+                    src_ss[i].n_segments,
+                    src_ss[i].nr[0]);
+            }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
@@ -1485,7 +1528,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     const bool hybrid_init_detail =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
-        std::strncmp(tensor->name, "ffn_moe_probs-", 14) == 0;
+        (std::strncmp(tensor->name, "ffn_moe_probs-", 14) == 0 ||
+         std::strncmp(tensor->name, "ffn_moe_weights-", 16) == 0);
 
     if (hybrid_init_detail) {
         GGML_LOG_ERROR(
