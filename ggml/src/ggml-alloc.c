@@ -1171,11 +1171,38 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
-        const bool trace_node =
+        const int dst_buffer_id = node_alloc->dst.buffer_id;
+        const bool trace_loop =
             hybrid_galloc_node_trace &&
-            i >= hybrid_galloc_trace_begin &&
-            node_alloc->dst.buffer_id >= 0 &&
-            strstr(ggml_backend_buft_name(galloc->bufts[node_alloc->dst.buffer_id]), "Meta(") != NULL;
+            i >= hybrid_galloc_trace_begin;
+
+        if (trace_loop) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_LOOP] point=ENTER index=%d/%d node_ptr=%p "
+                "dst_buffer_id=%d n_buffers=%d\n",
+                i,
+                graph->n_nodes,
+                (void *) node,
+                dst_buffer_id,
+                galloc->n_buffers);
+        }
+
+        const bool trace_node =
+            trace_loop &&
+            dst_buffer_id >= 0 &&
+            dst_buffer_id < galloc->n_buffers &&
+            strstr(ggml_backend_buft_name(galloc->bufts[dst_buffer_id]), "Meta(") != NULL;
+
+        if (trace_loop && dst_buffer_id >= galloc->n_buffers) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_LOOP] point=INVALID_BUFFER index=%d/%d node_ptr=%p "
+                "dst_buffer_id=%d n_buffers=%d\n",
+                i,
+                graph->n_nodes,
+                (void *) node,
+                dst_buffer_id,
+                galloc->n_buffers);
+        }
 
         if (trace_node) {
             GGML_LOG_ERROR(
