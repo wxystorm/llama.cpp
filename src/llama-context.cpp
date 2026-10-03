@@ -3785,6 +3785,79 @@ int llama_context::decode(const llama_batch & batch_inp) {
         runtime_stages[3].macro_tokens > 0 &&
         runtime_stages[2].macro_tokens >= runtime_stages[3].macro_tokens &&
         runtime_stages[2].macro_tokens % runtime_stages[3].macro_tokens == 0;
+
+    // Phone-primary Tensor uses the full-graph Meta path for its internal
+    // per-chunk route/FFN/join semantics.  A full graph, however, also makes
+    // the preceding PC_ONLY CPU region consume the whole prompt at once, so
+    // XC is only a planner parameter and never reaches runtime.
+    //
+    // The opt-in CPU-prefix staged path fixes that mismatch without staging
+    // the Tensor region itself:
+    //
+    //   GPU(XG chunks) -> CPU(XC chunks) -> [TENSOR_PHONE_PRIMARY + PHONE tail]
+    //
+    // The final suffix is deliberately one full-ubatch stage.  It starts at
+    // the first Tensor layer and ends at n_layer, so the model policy still
+    // builds the existing Phone-primary Meta graph (including the PHONE_ONLY
+    // tail) over the complete token set.  This preserves XT/per-chunk join
+    // semantics while making XC real.
+    const char * phone_primary_cpu_chunk_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE");
+    const bool phone_primary_cpu_chunk_requested =
+        phone_primary_cpu_chunk_env != nullptr &&
+        std::atoi(phone_primary_cpu_chunk_env) != 0;
+    const bool phone_primary_cpu_chunk_topology =
+        has_runtime_plan &&
+        tensor_phone_primary_exec &&
+        runtime_stages.size() >= 3 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
+        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        runtime_plan.cpu_chunk_tokens > 0 &&
+        runtime_plan.tensor_chunk_tokens > 0;
+
+    std::vector<llama_hybrid_runtime_stage>
+        phone_primary_cpu_chunk_stages;
+    if (phone_primary_cpu_chunk_requested &&
+        phone_primary_cpu_chunk_topology) {
+        phone_primary_cpu_chunk_stages.push_back(
+            runtime_stages[0]);
+        phone_primary_cpu_chunk_stages.push_back(
+            runtime_stages[1]);
+
+        const int suffix_macro_tokens =
+            std::max(1, (int) cparams.n_ubatch);
+        phone_primary_cpu_chunk_stages.push_back({
+            llama_hybrid_runtime_stage_kind::TENSOR,
+            runtime_stages[2].layer_begin,
+            (int) hparams.n_layer(),
+            suffix_macro_tokens,
+            runtime_plan.tensor_chunk_tokens,
+        });
+
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
+            "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
+            "SUFFIX=[%d,%d) suffix_macro=%d XT=%d "
+            "mode=PREFIX_STAGED_SUFFIX_FULL\n",
+            phone_primary_cpu_chunk_stages[0].layer_begin,
+            phone_primary_cpu_chunk_stages[0].layer_end,
+            phone_primary_cpu_chunk_stages[0].macro_tokens,
+            phone_primary_cpu_chunk_stages[1].layer_begin,
+            phone_primary_cpu_chunk_stages[1].layer_end,
+            phone_primary_cpu_chunk_stages[1].macro_tokens,
+            phone_primary_cpu_chunk_stages[2].layer_begin,
+            phone_primary_cpu_chunk_stages[2].layer_end,
+            phone_primary_cpu_chunk_stages[2].macro_tokens,
+            phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+    } else if (phone_primary_cpu_chunk_requested) {
+        LLAMA_LOG_WARN(
+            "[HYBRID_PHONE_CPU_CHUNK] enabled=0 reason=UNSUPPORTED_TOPOLOGY "
+            "has_plan=%d phone_primary=%d stages=%zu\n",
+            has_runtime_plan ? 1 : 0,
+            tensor_phone_primary_exec ? 1 : 0,
+            runtime_stages.size());
+    }
     // Qwen2 return-wavefront is currently implemented as a full-graph path.
     // Do not slice a pure GPU->TENSOR prefill into upstream-sized stage graphs:
     // doing so makes each Tensor job only one XT chunk wide (or smaller) and
@@ -4866,6 +4939,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        bool phone_primary_cpu_chunk_candidate =
+            phone_primary_cpu_chunk_requested &&
+            phone_primary_cpu_chunk_topology &&
+            !phone_primary_cpu_chunk_stages.empty() &&
+            cparams.causal_attn &&
+            ubatch.n_tokens > 1 &&
+            ubatch.n_tokens > (uint32_t) runtime_plan.cpu_chunk_tokens &&
+            ubatch.token != nullptr &&
+            ubatch.embd == nullptr &&
+            ubatch.n_pos == 1 &&
+            !ubatch.equal_seqs() &&
+            ubatch.n_seqs_unq == 1 &&
+            !cparams.embeddings &&
+            !cparams.embeddings_nextn &&
+            cparams.cb_eval == nullptr &&
+            std::none_of(
+                cparams.embeddings_layer_inp.begin(),
+                cparams.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; });
+
         bool stage_serial_candidate =
             stage_serial_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 && ubatch.token != nullptr &&
             ubatch.embd == nullptr && ubatch.n_pos == 1 && !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
@@ -4882,6 +4975,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     break;
                 }
             }
+        }
+
+        if (phone_primary_cpu_chunk_requested &&
+            phone_primary_cpu_chunk_topology &&
+            ubatch.n_tokens > (uint32_t) runtime_plan.cpu_chunk_tokens &&
+            !phone_primary_cpu_chunk_candidate) {
+            LLAMA_LOG_WARN(
+                "[HYBRID_PHONE_CPU_CHUNK] ub=%d unsupported ubatch; using full graph\n",
+                ubatch_id);
         }
 
         if (stage_serial_runtime_enabled && !stage_serial_candidate) {
@@ -4966,6 +5068,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_tensor_ready_bytes = 0;
                 hybrid_phone_ready_bytes = 0;
             }
+        } else if (phone_primary_cpu_chunk_candidate) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PHONE_CPU_CHUNK] ub=%d tokens=%u "
+                "XG=%d XC=%d suffix_macro=%d XT=%d action=RUN\n",
+                ubatch_id,
+                ubatch.n_tokens,
+                phone_primary_cpu_chunk_stages[0].macro_tokens,
+                phone_primary_cpu_chunk_stages[1].macro_tokens,
+                phone_primary_cpu_chunk_stages[2].macro_tokens,
+                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+            res = process_ubatch_staged(
+                ubatch,
+                ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(),
+                sched.get(),
+                gf_res_prev.get(),
+                phone_primary_cpu_chunk_stages,
+                ubatch_id,
+                status);
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
                 ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched.get(), gf_res_prev.get(),
