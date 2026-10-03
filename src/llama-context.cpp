@@ -1828,7 +1828,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     const int64_t reuse_check_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     const bool phone_cpu_chunk_stage_trace =
         stage != nullptr &&
-        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
+        std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
     const bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
     if (log_prepare_breakdown) {
         reuse_check_us = ggml_time_us() - reuse_check_begin_us;
@@ -1859,7 +1859,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         }
 
         if (phone_cpu_chunk_stage_trace) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=BUILD_BEGIN\n",
                 llama_hybrid_runtime_stage_name(stage->kind),
                 stage->layer_begin, stage->layer_end, ubatch.n_tokens);
@@ -1868,7 +1868,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         const int64_t graph_build_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
         if (phone_cpu_chunk_stage_trace) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=BUILD_END nodes=%d\n",
                 llama_hybrid_runtime_stage_name(stage->kind),
                 stage->layer_begin, stage->layer_end, ubatch.n_tokens,
@@ -1906,7 +1906,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             }
 
             if (phone_cpu_chunk_stage_trace) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[HYBRID_STAGE_INPUT_BIND] stage=%s layers=[%d,%d) "
                     "tokens=%u input=%s backend=%s dev_type=%d\n",
                     llama_hybrid_runtime_stage_name(stage->kind),
@@ -1926,7 +1926,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 stage_input != nullptr ?
                     ggml_backend_sched_get_tensor_backend(sched_use, stage_input) :
                     nullptr;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
                 "point=ALLOC_BEGIN stage_input=%s input_backend=%s\n",
                 llama_hybrid_runtime_stage_name(stage->kind),
@@ -1948,7 +1948,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 stage_input != nullptr ?
                     ggml_backend_sched_get_tensor_backend(sched_use, stage_input) :
                     nullptr;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
                 "point=ALLOC_END stage_input=%s input_backend=%s splits=%d\n",
                 llama_hybrid_runtime_stage_name(stage->kind),
@@ -1971,7 +1971,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         res->set_inputs(&ubatch);
 
         if (phone_cpu_chunk_stage_trace) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=SET_INPUTS_END\n",
                 llama_hybrid_runtime_stage_name(stage->kind),
                 stage->layer_begin, stage->layer_end, ubatch.n_tokens);
@@ -2358,9 +2358,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     const bool phone_cpu_chunk_stage_trace =
-        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
+        std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
     if (phone_cpu_chunk_stage_trace) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
             "point=COMPUTE_BEGIN splits=%d\n",
             llama_hybrid_runtime_stage_name(stage.kind),
@@ -2369,7 +2369,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
     if (phone_cpu_chunk_stage_trace) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
             "point=COMPUTE_END status=%d\n",
             llama_hybrid_runtime_stage_name(stage.kind),
@@ -2868,8 +2868,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 stage_timing.sync_us / 1000.0,
                 std::max<int64_t>(0, stage_total_us - accounted_us) / 1000.0,
                 blocks.size());
-            if (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr) {
-                LLAMA_LOG_ERROR(
+            if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+                LLAMA_LOG_DEBUG(
                     "[HYBRID_PHONE_CPU_CHUNK_STAGE] ub=%d kind=CPU "
                     "tokens=%u layers=[%d,%d) XC=%d blocks=%zu "
                     "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f\n",
@@ -3034,8 +3034,8 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 profile.graph_compute_count,
                 profile.graph_rebuild_count,
                 blocks.size());
-            if (std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr) {
-                LLAMA_LOG_ERROR(
+            if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+                LLAMA_LOG_DEBUG(
                     "[HYBRID_PHONE_CPU_CHUNK_STAGE] ub=%d kind=SUFFIX "
                     "tokens=%u layers=[%d,%d) macro=%d XT=%d blocks=%zu "
                     "total_ms=%.3f prepare_ms=%.3f compute_ms=%.3f sync_ms=%.3f\n",
@@ -3986,7 +3986,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             });
         }
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
             "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
             "TENSOR=[%d,%d) tensor_macro=%d XT=%d "
@@ -5229,7 +5229,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_phone_ready_bytes = 0;
             }
         } else if (phone_primary_cpu_chunk_candidate) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[HYBRID_PHONE_CPU_CHUNK] ub=%d tokens=%u "
                 "XG=%d XC=%d tensor_macro=%d XT=%d "
                 "phone_macro=%d action=RUN\n",
