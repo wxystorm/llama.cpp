@@ -1218,6 +1218,15 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
 
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
+            if (trace_node) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_GALLOC_NODE] point=SRC_PTR index=%d src_index=%d "
+                    "node_ptr=%p src_ptr=%p src_buffer_id=%d\n",
+                    i, j,
+                    (void *) node,
+                    (void *) src,
+                    node_alloc->src[j].buffer_id);
+            }
             if (src == NULL) {
                 continue;
             }
