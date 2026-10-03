@@ -1826,6 +1826,9 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     }
 
     const int64_t reuse_check_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
+    const bool phone_cpu_chunk_stage_trace =
+        stage != nullptr &&
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
     const bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
     if (log_prepare_breakdown) {
         reuse_check_us = ggml_time_us() - reuse_check_begin_us;
@@ -1855,9 +1858,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             graph_reset_us = ggml_time_us() - graph_reset_begin_us;
         }
 
-        const bool phone_cpu_chunk_stage_trace =
-            stage != nullptr &&
-            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr;
         if (phone_cpu_chunk_stage_trace) {
             LLAMA_LOG_ERROR(
                 "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u point=BUILD_BEGIN\n",
