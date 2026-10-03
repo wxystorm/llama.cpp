@@ -1108,17 +1108,76 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         ggml_gallocr_init_tensor(galloc, leaf, &leaf_alloc->leaf);
     }
     // nodes
+    const bool hybrid_galloc_node_trace =
+        getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL;
+    const int hybrid_galloc_trace_begin =
+        graph->n_nodes > 600 ? graph->n_nodes - 600 : 0;
+
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        const bool trace_node =
+            hybrid_galloc_node_trace &&
+            i >= hybrid_galloc_trace_begin &&
+            node_alloc->dst.buffer_id >= 0 &&
+            strstr(ggml_backend_buft_name(galloc->bufts[node_alloc->dst.buffer_id]), "Meta(") != NULL;
+
+        if (trace_node) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_NODE] point=NODE_BEGIN index=%d/%d node=%s op=%s "
+                "view=%s data=%p dst_buffer_id=%d\n",
+                i, graph->n_nodes,
+                node->name,
+                ggml_op_name(node->op),
+                node->view_src != NULL ? "yes" : "no",
+                node->data,
+                node_alloc->dst.buffer_id);
+        }
+
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (src == NULL) {
                 continue;
             }
+            if (trace_node) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_GALLOC_NODE] point=SRC_BEGIN index=%d src_index=%d "
+                    "node=%s src=%s src_op=%s src_view=%s src_data=%p src_buffer_id=%d\n",
+                    i, j,
+                    node->name,
+                    src->name,
+                    ggml_op_name(src->op),
+                    src->view_src != NULL ? "yes" : "no",
+                    src->data,
+                    node_alloc->src[j].buffer_id);
+            }
             ggml_gallocr_init_tensor(galloc, src, &node_alloc->src[j]);
+            if (trace_node) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_GALLOC_NODE] point=SRC_END index=%d src_index=%d "
+                    "node=%s src=%s src_data=%p src_buffer=%p\n",
+                    i, j,
+                    node->name,
+                    src->name,
+                    src->data,
+                    (void *) src->buffer);
+            }
+        }
+
+        if (trace_node) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_NODE] point=DST_BEGIN index=%d node=%s op=%s\n",
+                i, node->name, ggml_op_name(node->op));
         }
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
+        if (trace_node) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_NODE] point=DST_END index=%d node=%s data=%p buffer=%p\n",
+                i, node->name, node->data, (void *) node->buffer);
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_NODE] point=NODE_END index=%d/%d node=%s\n",
+                i, graph->n_nodes, node->name);
+        }
     }
 
     return true;
