@@ -968,16 +968,71 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
+    const bool hybrid_view_trace =
+        getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL &&
+        tensor->view_src != NULL &&
+        strstr(tensor->name, "ffn_moe_weights-") != NULL;
+
+    if (hybrid_view_trace) {
+        GGML_LOG_ERROR(
+            "[HYBRID_GALLOC_VIEW] point=ENTER tensor=%s op=%s "
+            "tensor_buffer=%p tensor_data=%p view_src=%s view_src_buffer=%p view_src_data=%p "
+            "alloc_buffer_id=%d alloc_chunk=%d alloc_offset=%zu size_max=%zu\n",
+            tensor->name,
+            ggml_op_name(tensor->op),
+            (void *) tensor->buffer,
+            tensor->data,
+            tensor->view_src != NULL ? tensor->view_src->name : "(null)",
+            tensor->view_src != NULL ? (void *) tensor->view_src->buffer : nullptr,
+            tensor->view_src != NULL ? tensor->view_src->data : nullptr,
+            buffer_id,
+            tensor_alloc->addr.chunk,
+            tensor_alloc->addr.offset,
+            tensor_alloc->size_max);
+    }
+
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
     if (tensor->view_src != NULL) {
         if (tensor->buffer == NULL) {
+            if (hybrid_view_trace) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_GALLOC_VIEW] point=VIEW_INIT_BEGIN tensor=%s "
+                    "view_src_buffer=%p view_src_data=%p alloc_offset=%zu\n",
+                    tensor->name,
+                    (void *) tensor->view_src->buffer,
+                    tensor->view_src->data,
+                    tensor_alloc->addr.offset);
+            }
             assert(tensor_alloc->addr.offset == SIZE_MAX);
             if (tensor->view_src->buffer == NULL) {
+                if (hybrid_view_trace) {
+                    GGML_LOG_ERROR(
+                        "[HYBRID_GALLOC_VIEW] point=VIEW_INIT_SKIP_NO_BUFFER tensor=%s\n",
+                        tensor->name);
+                }
                 // this tensor was allocated without ggml-backend
                 return;
             }
             ggml_backend_view_init(tensor);
+            if (hybrid_view_trace) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_GALLOC_VIEW] point=VIEW_INIT_END tensor=%s "
+                    "tensor_buffer=%p tensor_data=%p\n",
+                    tensor->name,
+                    (void *) tensor->buffer,
+                    tensor->data);
+            }
+        } else if (hybrid_view_trace) {
+            GGML_LOG_ERROR(
+                "[HYBRID_GALLOC_VIEW] point=ALREADY_INITIALIZED tensor=%s "
+                "tensor_buffer=%p tensor_data=%p\n",
+                tensor->name,
+                (void *) tensor->buffer,
+                tensor->data);
+        }
+        if (hybrid_view_trace) {
+            GGML_LOG_ERROR("[HYBRID_GALLOC_VIEW] point=RETURN tensor=%s\n", tensor->name);
         }
     } else {
         if (tensor->data == NULL) {
