@@ -1646,16 +1646,42 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     const int64_t scan_begin_us = ggml_time_us();
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
-        if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
-            sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
+        const int cur_id  = sched->node_backend_ids[i];
+        const int prev_id = sched->prev_node_backend_ids[i];
+        if (cur_id < 0 || cur_id >= sched->n_backends ||
+            prev_id < 0 || prev_id >= sched->n_backends) {
+            backend_ids_changed = true;
+            if (getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_ALLOC_TRACE] point=INVALID_NODE_BACKEND_ID index=%d "
+                    "cur=%d prev=%d n_backends=%d\n",
+                    i, cur_id, prev_id, sched->n_backends);
+            }
+            break;
+        }
+        if (cur_id != prev_id &&
+            sched->bufts[cur_id] != sched->bufts[prev_id]) {
             backend_ids_changed = true;
             break;
         }
     }
     if (!backend_ids_changed) {
         for (int i = 0; i < sched->graph.n_leafs; i++) {
-            if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
-                sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
+            const int cur_id  = sched->leaf_backend_ids[i];
+            const int prev_id = sched->prev_leaf_backend_ids[i];
+            if (cur_id < 0 || cur_id >= sched->n_backends ||
+                prev_id < 0 || prev_id >= sched->n_backends) {
+                backend_ids_changed = true;
+                if (getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL) {
+                    GGML_LOG_ERROR(
+                        "[HYBRID_ALLOC_TRACE] point=INVALID_LEAF_BACKEND_ID index=%d "
+                        "cur=%d prev=%d n_backends=%d\n",
+                        i, cur_id, prev_id, sched->n_backends);
+                }
+                break;
+            }
+            if (cur_id != prev_id &&
+                sched->bufts[cur_id] != sched->bufts[prev_id]) {
                 backend_ids_changed = true;
                 break;
             }
@@ -2210,13 +2236,49 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const bool hybrid_alloc_trace =
+        getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL;
+    if (hybrid_alloc_trace) {
+        GGML_LOG_ERROR(
+            "[HYBRID_ALLOC_TRACE] point=SPLIT_GRAPH_BEGIN nodes=%d leafs=%d "
+            "hash_size=%zu n_backends=%d\n",
+            graph->n_nodes, graph->n_leafs,
+            sched->hash_set.size, sched->n_backends);
+    }
+
     const int64_t split_begin_us = ggml_time_us();
     ggml_backend_sched_split_graph(sched, graph);
     const int64_t split_us = ggml_time_us() - split_begin_us;
 
+    if (hybrid_alloc_trace) {
+        GGML_LOG_ERROR(
+            "[HYBRID_ALLOC_TRACE] point=SPLIT_GRAPH_END nodes=%d leafs=%d "
+            "splits=%d split_ms=%.3f\n",
+            graph->n_nodes, graph->n_leafs, sched->n_splits,
+            split_us / 1000.0);
+        for (int i = 0; i < sched->n_splits; ++i) {
+            const ggml_backend_sched_split & split = sched->splits[i];
+            GGML_LOG_ERROR(
+                "[HYBRID_ALLOC_SPLIT] split=%d/%d backend_id=%d backend=%s "
+                "nodes=[%d,%d) inputs=%d\n",
+                i, sched->n_splits, split.backend_id,
+                split.backend_id >= 0 && split.backend_id < sched->n_backends ?
+                    ggml_backend_name(sched->backends[split.backend_id]) : "(invalid)",
+                split.i_start, split.i_end, split.n_inputs);
+        }
+        GGML_LOG_ERROR(
+            "[HYBRID_ALLOC_TRACE] point=ALLOC_SPLITS_BEGIN splits=%d\n",
+            sched->n_splits);
+    }
+
     const int64_t alloc_splits_begin_us = ggml_time_us();
     const bool alloc_ok = ggml_backend_sched_alloc_splits(sched);
     const int64_t alloc_splits_us = ggml_time_us() - alloc_splits_begin_us;
+    if (hybrid_alloc_trace) {
+        GGML_LOG_ERROR(
+            "[HYBRID_ALLOC_TRACE] point=ALLOC_SPLITS_END ok=%d alloc_ms=%.3f\n",
+            alloc_ok ? 1 : 0, alloc_splits_us / 1000.0);
+    }
     const int64_t total_us = ggml_time_us() - total_begin_us;
 
     const bool timing_debug = getenv("GGML_ALLOC_TIMING_DEBUG") != NULL;
