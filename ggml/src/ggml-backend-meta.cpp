@@ -1483,8 +1483,31 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    const bool hybrid_init_detail =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != nullptr &&
+        std::strcmp(tensor->name, "ffn_moe_probs-45") == 0;
+
+    if (hybrid_init_detail) {
+        GGML_LOG_ERROR(
+            "[HYBRID_META_INIT_DETAIL] tensor=%s op=%s point=SPLIT_BEGIN "
+            "src0=%s src1=%s simple_bufs=%zu\n",
+            tensor->name,
+            ggml_op_name(tensor->op),
+            tensor->src[0] != nullptr ? tensor->src[0]->name : "(null)",
+            tensor->src[1] != nullptr ? tensor->src[1]->name : "(null)",
+            n_simple_bufs);
+    }
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
+    if (hybrid_init_detail) {
+        GGML_LOG_ERROR(
+            "[HYBRID_META_INIT_DETAIL] tensor=%s point=SPLIT_END "
+            "axis=%s segments=%zu nr0=%u\n",
+            tensor->name,
+            ggml_backend_meta_split_axis_name(split_state.axis),
+            split_state.n_segments,
+            split_state.nr[0]);
+    }
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
 
@@ -1521,7 +1544,25 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
+        if (hybrid_init_detail) {
+            GGML_LOG_ERROR(
+                "[HYBRID_META_INIT_DETAIL] tensor=%s point=SIMPLE_NEW_BEGIN "
+                "backend=%zu ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "simple_buf=%p\n",
+                tensor->name,
+                j,
+                ne[0], ne[1], ne[2], ne[3],
+                (void *) simple_buf);
+        }
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        if (hybrid_init_detail) {
+            GGML_LOG_ERROR(
+                "[HYBRID_META_INIT_DETAIL] tensor=%s point=SIMPLE_NEW_END "
+                "backend=%zu simple_tensor=%p\n",
+                tensor->name,
+                j,
+                (void *) t_ij);
+        }
         t_ij->op = tensor->op;
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             t_ij->nb[i] = nb[i];
@@ -1566,7 +1607,26 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             if (tensor->src[i] == tensor) {
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
+                if (hybrid_init_detail) {
+                    GGML_LOG_ERROR(
+                        "[HYBRID_META_INIT_DETAIL] tensor=%s point=SRC_MAP_BEGIN "
+                        "backend=%zu src_index=%d src=%s src_buffer=%p\n",
+                        tensor->name,
+                        j,
+                        i,
+                        tensor->src[i]->name,
+                        (void *) tensor->src[i]->buffer);
+                }
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
+                if (hybrid_init_detail) {
+                    GGML_LOG_ERROR(
+                        "[HYBRID_META_INIT_DETAIL] tensor=%s point=SRC_MAP_END "
+                        "backend=%zu src_index=%d mapped=%p\n",
+                        tensor->name,
+                        j,
+                        i,
+                        (void *) t_ij->src[i]);
+                }
             }
         }
 
@@ -1620,7 +1680,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
     }
 
+    if (hybrid_init_detail) {
+        GGML_LOG_ERROR(
+            "[HYBRID_META_INIT_DETAIL] tensor=%s point=MAP_INSERT_BEGIN entries=%zu\n",
+            tensor->name,
+            stc.simple_tensors.size());
+    }
     stc.simple_tensors[tensor] = simple_tensors;
+    if (hybrid_init_detail) {
+        GGML_LOG_ERROR(
+            "[HYBRID_META_INIT_DETAIL] tensor=%s point=MAP_INSERT_END entries=%zu\n",
+            tensor->name,
+            stc.simple_tensors.size());
+    }
 
     return GGML_STATUS_SUCCESS;
 }
