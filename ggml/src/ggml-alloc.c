@@ -983,7 +983,35 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
         if (tensor->data == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
+
+            const bool hybrid_meta_alloc_trace =
+                getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE") != NULL &&
+                strstr(ggml_backend_buft_name(galloc->bufts[buffer_id]), "Meta(") != NULL;
+            if (hybrid_meta_alloc_trace) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_META_TENSOR_ALLOC] point=BEGIN tensor=%s op=%s "
+                    "buffer_id=%d buft=%s chunk=%d offset=%zu size_max=%zu alloc_size=%zu\n",
+                    tensor->name,
+                    ggml_op_name(tensor->op),
+                    buffer_id,
+                    ggml_backend_buft_name(galloc->bufts[buffer_id]),
+                    tensor_alloc->addr.chunk,
+                    tensor_alloc->addr.offset,
+                    tensor_alloc->size_max,
+                    ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor));
+            }
+
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
+
+            if (hybrid_meta_alloc_trace) {
+                GGML_LOG_ERROR(
+                    "[HYBRID_META_TENSOR_ALLOC] point=END tensor=%s op=%s "
+                    "buffer=%p data=%p\n",
+                    tensor->name,
+                    ggml_op_name(tensor->op),
+                    (void *) tensor->buffer,
+                    tensor->data);
+            }
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
