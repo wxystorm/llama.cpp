@@ -4629,59 +4629,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return (last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     };
     auto subgraph_is_phone_owned = [&](size_t sg) -> bool {
-        if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
-            return false;
-        }
-
-        if (!subgraph_last_has_compute(0, sg) &&
-                subgraph_last_has_compute(1, sg)) {
-            return true;
-        }
-
-        // Some attention subgraphs end in a VIEW/RESHAPE tensor such as
-        // Vcur-*.  These metadata nodes can retain COMPUTE on both simple
-        // backends even when every real producer in the subgraph is
-        // Phone-owned.  Using only the terminal node then misclassifies a
-        // PHONE_ONLY block as mirrored and generic communication attempts to
-        // copy the backend-specific view itself, whose strides/view offsets
-        // need not match.
-        ggml_cgraph * pc_graph =
-            backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
-        ggml_cgraph * phone_graph =
-            backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
-        if (pc_graph == nullptr || phone_graph == nullptr ||
-                pc_graph->n_nodes != phone_graph->n_nodes ||
-                pc_graph->n_nodes == 0) {
-            return false;
-        }
-
-        const auto is_metadata_only = [](const ggml_tensor * node) {
-            if (node == nullptr) {
-                return true;
-            }
-            return node->op == GGML_OP_VIEW ||
-                   node->op == GGML_OP_RESHAPE ||
-                   node->op == GGML_OP_PERMUTE ||
-                   node->op == GGML_OP_TRANSPOSE;
-        };
-
-        bool pc_real_compute = false;
-        bool phone_real_compute = false;
-        for (int k = 0; k < pc_graph->n_nodes; ++k) {
-            ggml_tensor * pc_node = pc_graph->nodes[k];
-            ggml_tensor * phone_node = phone_graph->nodes[k];
-
-            if (!is_metadata_only(pc_node) &&
-                    (pc_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                pc_real_compute = true;
-            }
-            if (!is_metadata_only(phone_node) &&
-                    (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                phone_real_compute = true;
-            }
-        }
-
-        return !pc_real_compute && phone_real_compute;
+        return n_backends == 2 &&
+               !subgraph_last_has_compute(0, sg) &&
+               subgraph_last_has_compute(1, sg);
     };
     auto subgraph_will_execute_pc = [&](size_t sg) -> bool {
         if (subgraph_is_phone_owned(sg)) {
@@ -4808,67 +4758,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         layer_tensor_phone_primary_cache[layer] = split_ffn_seen;
         return split_ffn_seen;
     };
-
-    auto subgraph_semantic_phone_only_layer =
-        [&](size_t sg, int & layer) -> bool {
-            layer = -1;
-            if (n_backends != 2 ||
-                    sg >= backend_ctx->n_subgraphs ||
-                    !subgraph_is_phone_owned(sg)) {
-                return false;
-            }
-
-            for (size_t backend = 0; backend < n_backends; ++backend) {
-                ggml_cgraph * graph =
-                    backend_ctx->backend_configs[backend]
-                        .cgraphs[sg].cgraph_main;
-                if (graph == nullptr) {
-                    continue;
-                }
-
-                for (int k = 0; k < graph->n_nodes; ++k) {
-                    const char * name = graph->nodes[k]->name;
-                    int parsed_layer = -1;
-                    int parsed_chars = 0;
-                    const bool parsed =
-                        (std::sscanf(name, "norm-%d%n",
-                                    &parsed_layer, &parsed_chars) == 1 &&
-                         name[parsed_chars] == '\0') ||
-                        std::sscanf(name, "attn_norm-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "Qcur_normed-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "Kcur_normed-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "Qcur-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "Kcur-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "Vcur-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "attn_out-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "ffn_inp-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "ffn_norm-%d",
-                                    &parsed_layer) == 1 ||
-                        std::sscanf(name, "l_out-%d",
-                                    &parsed_layer) == 1;
-
-                    if (!parsed) {
-                        continue;
-                    }
-
-                    if (layer_attention_phone_owned(parsed_layer) &&
-                            !layer_is_tensor_phone_primary(parsed_layer)) {
-                        layer = parsed_layer;
-                        return true;
-                    }
-                }
-            }
-
-            return false;
-        };
 
     auto subgraph_tensor_phone_primary_layer =
         [&](size_t sg, int & layer) -> bool {
@@ -7226,40 +7115,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ++active_count;
                 active_backend = j;
             }
-        }
-
-        int semantic_phone_only_layer = -1;
-        const bool semantic_phone_only =
-            subgraph_semantic_phone_only_layer(
-                i, semantic_phone_only_layer);
-        int semantic_next_phone_only_layer = -1;
-        const bool semantic_next_phone_only =
-            i + 1 < backend_ctx->n_subgraphs &&
-            subgraph_semantic_phone_only_layer(
-                i + 1, semantic_next_phone_only_layer);
-
-        if (semantic_phone_only &&
-                semantic_next_phone_only &&
-                (semantic_next_phone_only_layer == semantic_phone_only_layer ||
-                 semantic_next_phone_only_layer ==
-                     semantic_phone_only_layer + 1)) {
-            handled = true;
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=COMM_KEEP_PHONE_ONLY "
-                    "sg=%zu layer=%d next_layer=%d "
-                    "pc_last_compute=%d phone_last_compute=%d\n",
-                    i,
-                    semantic_phone_only_layer,
-                    semantic_next_phone_only_layer,
-                    nodes[0] != nullptr &&
-                        (nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0,
-                    nodes[1] != nullptr &&
-                        (nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0);
-                fflush(stderr);
-            }
-            return GGML_STATUS_SUCCESS;
         }
 
         auto deferred_prefill_it =
@@ -11262,13 +11117,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 i,
                 prefill_wave_l_out_chunk,
                 prefill_wave_l_out_layer);
-        int semantic_phone_only_layer = -1;
-        const bool semantic_phone_only_sg =
-            subgraph_semantic_phone_only_layer(
-                i, semantic_phone_only_layer);
-        const bool is_phone_only_sg =
-            subgraph_is_phone_only(i) ||
-            semantic_phone_only_sg;
+        const bool is_phone_only_sg = subgraph_is_phone_only(i);
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
         backend_ctx->backend_configs[0]
