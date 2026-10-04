@@ -5245,10 +5245,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             size_t lane =
                 static_cast<size_t>(chunk) %
                 ggml_backend_meta_context::PREFILL_ROUTE_LANES;
-            if (phone_prefill_route_lane_swap) {
-                static_assert(
-                    ggml_backend_meta_context::PREFILL_ROUTE_LANES == 2,
-                    "route lane swap experiment requires exactly two lanes");
+            if (phone_prefill_route_lane_swap && lane < 2) {
                 lane ^= size_t(1);
             }
             return lane;
