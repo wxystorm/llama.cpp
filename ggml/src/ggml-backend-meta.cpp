@@ -2534,6 +2534,17 @@ struct ggml_backend_meta_context {
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES> prefill_route_workers { nullptr,
                                                                                                 nullptr };
 
+    // Dedicated async Meta graph state used only by the hybrid Phone scheduler.
+    // The worker executes the ordinary synchronous Meta graph implementation;
+    // only the caller thread is released early after rebuild/preparation.
+    bool                                 async_graph_compute_enabled = false;
+    bool                                 async_graph_active = false;
+    bool                                 async_graph_prepared = false;
+    ggml_status                          async_graph_status = GGML_STATUS_SUCCESS;
+    std::mutex                           async_graph_mutex;
+    std::condition_variable              async_graph_cv;
+    std::thread                          async_graph_thread;
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -3094,6 +3105,9 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 }
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
+    if (async_graph_thread.joinable()) {
+        async_graph_thread.join();
+    }
     delete compute_workers;
     delete transfer_worker;
     delete prefill_input_worker;
@@ -3221,14 +3235,30 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+static ggml_status ggml_backend_meta_wait_async_graph_impl(
+        ggml_backend_meta_context * backend_ctx) {
+    if (backend_ctx->async_graph_thread.joinable()) {
+        backend_ctx->async_graph_thread.join();
+    }
+
+    std::lock_guard<std::mutex> lock(backend_ctx->async_graph_mutex);
+    backend_ctx->async_graph_active = false;
+    backend_ctx->async_graph_prepared = false;
+    return backend_ctx->async_graph_status;
+}
+
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+    ggml_backend_meta_context * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    (void) ggml_backend_meta_wait_async_graph_impl(backend_ctx);
+
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
 }
 
-static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t meta_graph_start_us = ggml_time_us();
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -10764,6 +10794,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
+    // Async Phone submit may release the hybrid scheduler only after graph
+    // rebuild/preparation is complete. This avoids racing the Meta STC/simple
+    // tensor cache with the next CPU-stage graph construction.
+    {
+        std::lock_guard<std::mutex> lock(backend_ctx->async_graph_mutex);
+        if (backend_ctx->async_graph_active) {
+            backend_ctx->async_graph_prepared = true;
+            backend_ctx->async_graph_cv.notify_all();
+        }
+    }
+
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const size_t timing_sg = i;
@@ -13015,6 +13056,79 @@ auto prefill_norm_sg_has_prework =
     return GGML_STATUS_SUCCESS;
 }
 
+static enum ggml_status ggml_backend_meta_graph_compute(
+        ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_backend_meta_context * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+
+    bool async_enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(backend_ctx->async_graph_mutex);
+        async_enabled = backend_ctx->async_graph_compute_enabled;
+    }
+    if (!async_enabled) {
+        return ggml_backend_meta_graph_compute_impl(backend, cgraph);
+    }
+
+    // There must be at most one in-flight graph for the dedicated Phone
+    // scheduler. Join a stale completed worker defensively before reuse.
+    const ggml_status previous_status =
+        ggml_backend_meta_wait_async_graph_impl(backend_ctx);
+    if (previous_status != GGML_STATUS_SUCCESS) {
+        return previous_status;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(backend_ctx->async_graph_mutex);
+        backend_ctx->async_graph_status = GGML_STATUS_SUCCESS;
+        backend_ctx->async_graph_active = true;
+        backend_ctx->async_graph_prepared = false;
+    }
+
+    backend_ctx->async_graph_thread =
+        std::thread([backend, cgraph, backend_ctx]() {
+            const ggml_status status =
+                ggml_backend_meta_graph_compute_impl(backend, cgraph);
+            {
+                std::lock_guard<std::mutex> lock(
+                    backend_ctx->async_graph_mutex);
+                backend_ctx->async_graph_status = status;
+                backend_ctx->async_graph_active = false;
+            }
+            backend_ctx->async_graph_cv.notify_all();
+        });
+
+    // Wait only until rebuild/preparation has finished. The expensive Meta
+    // execution/Phone handoff then continues on async_graph_thread.
+    {
+        std::unique_lock<std::mutex> lock(backend_ctx->async_graph_mutex);
+        backend_ctx->async_graph_cv.wait(
+            lock,
+            [&]() {
+                return backend_ctx->async_graph_prepared ||
+                       !backend_ctx->async_graph_active;
+            });
+
+        if (!backend_ctx->async_graph_active) {
+            const ggml_status status = backend_ctx->async_graph_status;
+            lock.unlock();
+            if (backend_ctx->async_graph_thread.joinable()) {
+                backend_ctx->async_graph_thread.join();
+            }
+            return status;
+        }
+    }
+
+    if (std::getenv("GGML_META_ASYNC_GRAPH_DEBUG") != nullptr) {
+        printf(
+            "[META_ASYNC_GRAPH_SUBMIT] uid=%" PRIu64
+            " nodes=%d prepared=1\n",
+            cgraph->uid,
+            cgraph->n_nodes);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -13059,6 +13173,29 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+bool ggml_backend_meta_set_async_graph_compute(
+        ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    std::lock_guard<std::mutex> lock(backend_ctx->async_graph_mutex);
+    backend_ctx->async_graph_compute_enabled = enabled;
+    return true;
+}
+
+enum ggml_status ggml_backend_meta_wait_async_graph(
+        ggml_backend_t backend) {
+    if (!ggml_backend_is_meta(backend)) {
+        return GGML_STATUS_SUCCESS;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_wait_async_graph_impl(backend_ctx);
 }
 
 bool ggml_backend_meta_set_tensor_phone_primary_layers(
