@@ -2134,12 +2134,56 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
     GGML_ASSERT(first_split <= last_split);
     GGML_ASSERT(last_split <= sched->n_splits);
 
+    const bool split_timing =
+        getenv("GGML_SCHED_SPLIT_TIMING") != NULL;
+
     for (int split_id = first_split; split_id < last_split; ++split_id) {
+        struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        const int64_t split_begin_us = split_timing ? ggml_time_us() : 0;
+
+        const int64_t prepare_begin_us = split_timing ? ggml_time_us() : 0;
         enum ggml_status status = ggml_backend_sched_prepare_split(sched, split_id);
+        const int64_t prepare_us =
+            split_timing ? ggml_time_us() - prepare_begin_us : 0;
         if (status != GGML_STATUS_SUCCESS) {
+            if (split_timing) {
+                GGML_LOG_DEBUG(
+                    "[SCHED_SPLIT_TIMING] split=%d/%d backend_id=%d backend=%s "
+                    "nodes=%d inputs=%d total_ms=%.3f prepare_ms=%.3f "
+                    "compute_ms=0.000 status=%d\n",
+                    split_id,
+                    sched->n_splits,
+                    split->backend_id,
+                    ggml_backend_name(sched->backends[split->backend_id]),
+                    split->graph.n_nodes,
+                    split->n_inputs,
+                    (ggml_time_us() - split_begin_us) / 1000.0,
+                    prepare_us / 1000.0,
+                    (int) status);
+            }
             return status;
         }
+
+        const int64_t compute_begin_us = split_timing ? ggml_time_us() : 0;
         status = ggml_backend_sched_compute_split(sched, split_id);
+        const int64_t compute_us =
+            split_timing ? ggml_time_us() - compute_begin_us : 0;
+        if (split_timing) {
+            GGML_LOG_DEBUG(
+                "[SCHED_SPLIT_TIMING] split=%d/%d backend_id=%d backend=%s "
+                "nodes=%d inputs=%d total_ms=%.3f prepare_ms=%.3f "
+                "compute_ms=%.3f status=%d\n",
+                split_id,
+                sched->n_splits,
+                split->backend_id,
+                ggml_backend_name(sched->backends[split->backend_id]),
+                split->graph.n_nodes,
+                split->n_inputs,
+                (ggml_time_us() - split_begin_us) / 1000.0,
+                prepare_us / 1000.0,
+                compute_us / 1000.0,
+                (int) status);
+        }
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
