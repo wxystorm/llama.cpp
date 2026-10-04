@@ -3554,10 +3554,13 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
             }
         }
 
-        // Wavefront l_out is a real PC graph node.  Its static position is now
-        // immediately before Attention(L+1,C), so executing it in the normal
-        // PC graph preserves allocator lifetime and ordering.  Secondary
-        // backends keep the mirrored placeholder but never compute this ADD.
+        // Wavefront l_out must execute on the backend that owns the complete
+        // Tensor-layer activation.  Legacy TENSOR_SPLIT reduces the Phone
+        // partial into PC, so PC owns this ADD.  TENSOR_PHONE_PRIMARY does the
+        // opposite: the PC partial is returned to Phone and Phone remains the
+        // single owner across Tensor layers.  Keeping l_out hard-wired to PC
+        // here races/stales the Phone-primary return and can make the first
+        // wavefront graph invalid before Attention(L+1,C) even starts.
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             int chunk = -1;
             int layer = -1;
@@ -3565,8 +3568,32 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
                     cgraph->nodes[i]->name, chunk, layer)) {
                 continue;
             }
-            for (size_t j = 1; j < n_backends; ++j) {
-                backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+
+            const bool phone_primary_wave_l_out =
+                n_backends == 2 &&
+                backend_ctx->tensor_phone_first_layer >= 0 &&
+                layer >= backend_ctx->tensor_phone_first_layer &&
+                layer < backend_ctx->tensor_phone_last_layer;
+
+            if (phone_primary_wave_l_out) {
+                backend_ctx->backend_configs[0].nodes[i]->flags &=
+                    ~GGML_TENSOR_FLAG_COMPUTE;
+                backend_ctx->backend_configs[1].nodes[i]->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+            } else {
+                for (size_t j = 1; j < n_backends; ++j) {
+                    backend_ctx->backend_configs[j].nodes[i]->flags &=
+                        ~GGML_TENSOR_FLAG_COMPUTE;
+                }
+            }
+
+            if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                printf(
+                    "[PREFILL_WAVE_L_OUT_OWNER] "
+                    "layer=%d chunk=%d owner=%s\n",
+                    layer,
+                    chunk,
+                    phone_primary_wave_l_out ? "PHONE" : "PC");
             }
         }
 
@@ -10686,6 +10713,54 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                    layer == phone_layer;
         };
 
+    auto parse_prefill_wave_l_out_sg =
+        [&](size_t i, int & chunk, int & layer) -> bool {
+            if (n_backends != 2 || i >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            auto find_wave_l_out =
+                [&](size_t backend, int & out_chunk, int & out_layer) -> bool {
+                    ggml_cgraph * graph =
+                        backend_ctx->backend_configs[backend]
+                            .cgraphs[i].cgraph_main;
+                    if (graph == nullptr || graph->n_nodes == 0) {
+                        return false;
+                    }
+
+                    bool found = false;
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        int parsed_chunk = -1;
+                        int parsed_layer = -1;
+                        if (!ggml_backend_meta_parse_prefill_wave_l_out_chunk(
+                                graph->nodes[k]->name,
+                                parsed_chunk,
+                                parsed_layer)) {
+                            continue;
+                        }
+                        if (found &&
+                                (parsed_chunk != out_chunk ||
+                                 parsed_layer != out_layer)) {
+                            return false;
+                        }
+                        out_chunk = parsed_chunk;
+                        out_layer = parsed_layer;
+                        found = true;
+                    }
+                    return found;
+                };
+
+            int phone_chunk = -1;
+            int phone_layer = -1;
+            if (!find_wave_l_out(0, chunk, layer) ||
+                    !find_wave_l_out(
+                        1, phone_chunk, phone_layer)) {
+                return false;
+            }
+            return chunk == phone_chunk &&
+                   layer == phone_layer;
+        };
+
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
         if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
                 !subgraph_is_phone_only(i) || !subgraph_is_phone_only(i + 1)) {
@@ -10918,6 +10993,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         int prefill_wave_attn_chunk = -1;
         int prefill_wave_attn_chunk_count = 1;
         int prefill_wave_attn_layer = -1;
+        int prefill_wave_l_out_chunk = -1;
+        int prefill_wave_l_out_layer = -1;
         const bool is_prefill_norm_sg = parse_prefill_sg(
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
@@ -10925,6 +11002,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const bool is_prefill_wave_attn_sg = parse_prefill_wave_attn_sg(
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
+        const bool is_prefill_wave_l_out_sg =
+            parse_prefill_wave_l_out_sg(
+                i,
+                prefill_wave_l_out_chunk,
+                prefill_wave_l_out_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
@@ -11028,10 +11110,74 @@ auto prefill_norm_sg_has_prework =
             has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
         const bool continues_prefill_layer =
-            norm_can_overlap || down_can_overlap || is_prefill_wave_attn_sg;
+            norm_can_overlap ||
+            down_can_overlap ||
+            is_prefill_wave_attn_sg ||
+            is_prefill_wave_l_out_sg;
         if (return_wavefront_graph &&
-                (is_prefill_wave_attn_sg || is_prefill_norm_sg || is_prefill_down_sg)) {
-            if (is_prefill_wave_attn_sg) {
+                (is_prefill_wave_attn_sg ||
+                 is_prefill_wave_l_out_sg ||
+                 is_prefill_norm_sg ||
+                 is_prefill_down_sg)) {
+            if (is_prefill_wave_l_out_sg &&
+                    phone_prefill_chunk_join_active &&
+                    layer_is_tensor_phone_primary(
+                        prefill_wave_l_out_layer)) {
+                // wave_l_out(L,C) consumes the completed split-FFN result for
+                // exactly (L,C).  In Phone-primary mode that result becomes
+                // valid only after the PC partial has returned and its ADD has
+                // been submitted to the ordered Phone compute queue.  Wait
+                // here -- before l_out executes -- rather than at the next
+                // layer's Attention.
+                bool generic_waited = false;
+                const int64_t generic_begin_us = ggml_time_us();
+                const ggml_status generic_status =
+                    wait_prefill_reduce_dependency(
+                        prefill_wave_l_out_layer,
+                        prefill_wave_l_out_chunk,
+                        generic_waited);
+                const int64_t generic_wait_us =
+                    ggml_time_us() - generic_begin_us;
+                if (generic_status != GGML_STATUS_SUCCESS) {
+                    return generic_status;
+                }
+
+                bool phone_waited = false;
+                int64_t phone_wait_us = 0;
+                const ggml_status phone_status =
+                    wait_phone_prefill_pc_dependency(
+                        prefill_wave_l_out_layer,
+                        prefill_wave_l_out_chunk,
+                        phone_waited,
+                        phone_wait_us);
+                if (phone_status != GGML_STATUS_SUCCESS) {
+                    return phone_status;
+                }
+
+                const int64_t dependency_wait_us =
+                    generic_wait_us + phone_wait_us;
+                if (generic_waited || phone_waited) {
+                    ++return_wave_dependency_wait_count;
+                    return_wave_dependency_wait_us +=
+                        dependency_wait_us;
+                    return_wave_dependency_wait_max_us =
+                        std::max(
+                            return_wave_dependency_wait_max_us,
+                            dependency_wait_us);
+                }
+
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_WAVE_L_OUT_DEP_WAIT] "
+                        "layer=%d chunk=%d wait_ms=%.3f "
+                        "generic=%d phone=%d\n",
+                        prefill_wave_l_out_layer,
+                        prefill_wave_l_out_chunk,
+                        dependency_wait_us / 1000.0,
+                        generic_waited ? 1 : 0,
+                        phone_waited ? 1 : 0);
+                }
+            } else if (is_prefill_wave_attn_sg) {
                 // Attention(L,C) consumes OUT(L-1,C), not the most recently
                 // submitted down tensor in graph order.  Let same-layer chunk
                 // prework run while current-layer returns are in flight, and
@@ -12781,7 +12927,10 @@ auto prefill_norm_sg_has_prework =
         if (is_prefill_down_sg) {
             tensor_pc_ffn_us += pc_compute_us;
             tensor_phone_us  += phone_compute_us;
-        } else if (is_prefill_wave_attn_sg || is_prefill_norm_sg || subgraph_is_prefill_pc_only(i)) {
+        } else if (is_prefill_wave_attn_sg ||
+                   is_prefill_wave_l_out_sg ||
+                   is_prefill_norm_sg ||
+                   subgraph_is_prefill_pc_only(i)) {
             // Return-wavefront Attention is its own subgraph.  It must be
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
