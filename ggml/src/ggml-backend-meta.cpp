@@ -4781,7 +4781,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     int parsed_layer = -1;
                     int chunk = -1;
 
-                    const bool parsed =
+                    bool parsed =
                         std::sscanf(
                             node->name, "attn_out-%d",
                             &parsed_layer) == 1 ||
@@ -4796,7 +4796,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ggml_backend_meta_parse_prefill_down_chunk(
                             node->name, chunk, parsed_layer) ||
                         ggml_backend_meta_parse_decode_ffn_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_wave_l_out_chunk(
                             node->name, chunk, parsed_layer);
+
+                    if (!parsed) {
+                        int group_begin = -1;
+                        int group_count = -1;
+                        parsed =
+                            ggml_backend_meta_parse_prefill_wave_attn_out_group(
+                                node->name,
+                                group_begin,
+                                group_count,
+                                parsed_layer);
+                    }
 
                     if (parsed &&
                         layer_is_tensor_phone_primary(parsed_layer)) {
