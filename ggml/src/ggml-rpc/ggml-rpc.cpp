@@ -5175,17 +5175,16 @@ bool rpc_server::get_route_snapshot(
 
     const int64_t lock_begin_us =
         stage_profile ? ggml_time_us() : 0;
-    int64_t lock_acquired_us = lock_begin_us;
-    int64_t ready_us = lock_begin_us;
-    int64_t copy_begin_us = lock_begin_us;
-    int64_t copy_done_us = lock_begin_us;
+    int64_t lock_wait_us = 0;
+    int64_t cv_wait_us = 0;
+    int64_t response_copy_us = 0;
     int64_t slot_fill_us = 0;
     int64_t ready_wait_us = 0;
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
-        if (stage_profile) {
-            lock_acquired_us = ggml_time_us();
-        }
+        const int64_t lock_acquired_us =
+            stage_profile ? ggml_time_us() : lock_begin_us;
+        lock_wait_us = lock_acquired_us - lock_begin_us;
 
         const int64_t cv_wait_begin_us =
             stage_profile ? lock_acquired_us : ggml_time_us();
@@ -5196,7 +5195,8 @@ bool rpc_server::get_route_snapshot(
                         rpc_snapshot_state::READY &&
                     slot.seq == request.seq;
             });
-        ready_us = ggml_time_us();
+        const int64_t ready_us = ggml_time_us();
+        cv_wait_us = ready_us - cv_wait_begin_us;
         ready_wait_us = ready_us - lock_begin_us;
         slot_fill_us = slot.fill_us;
 
@@ -5217,41 +5217,44 @@ bool rpc_server::get_route_snapshot(
         }
 
         slot.state = rpc_snapshot_state::SENDING;
-        copy_begin_us = stage_profile ? ggml_time_us() : ready_us;
+        const int64_t copy_begin_us =
+            stage_profile ? ggml_time_us() : ready_us;
         response = slot.data;
-        copy_done_us = stage_profile ? ggml_time_us() : copy_begin_us;
+        const int64_t copy_done_us =
+            stage_profile ? ggml_time_us() : copy_begin_us;
+        response_copy_us = copy_done_us - copy_begin_us;
         slot.data.clear();
         slot.seq = 0;
         slot.sizes = {};
         slot.fill_us = 0;
         slot.state = rpc_snapshot_state::FREE;
-
-        if (stage_profile) {
-            const int64_t producer_wait_est_us =
-                std::max<int64_t>(0, ready_wait_us - slot_fill_us);
-            std::fprintf(
-                stderr,
-                "[TENSOR_PHONE_RPC_STAGE] side=phone "
-                "stage=route_snapshot_server_wait lane=%u "
-                "seq=%" PRIu64 " bytes=%zu "
-                "enter_to_lock_ms=%.3f lock_wait_ms=%.3f "
-                "cv_wait_ms=%.3f response_copy_ms=%.3f "
-                "producer_wait_est_ms=%.3f fill_ms=%.3f "
-                "ready_wait_ms=%.3f\n",
-                request.lane,
-                request.seq,
-                response.size(),
-                (lock_begin_us - server_enter_us) / 1000.0,
-                (lock_acquired_us - lock_begin_us) / 1000.0,
-                (ready_us - cv_wait_begin_us) / 1000.0,
-                (copy_done_us - copy_begin_us) / 1000.0,
-                producer_wait_est_us / 1000.0,
-                slot_fill_us / 1000.0,
-                ready_wait_us / 1000.0);
-            std::fflush(stderr);
-        }
     }
     slot.cv.notify_all();
+
+    if (stage_profile) {
+        const int64_t producer_wait_est_us =
+            std::max<int64_t>(0, ready_wait_us - slot_fill_us);
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=phone "
+            "stage=route_snapshot_server_wait lane=%u "
+            "seq=%" PRIu64 " bytes=%zu "
+            "enter_to_lock_ms=%.3f lock_wait_ms=%.3f "
+            "cv_wait_ms=%.3f response_copy_ms=%.3f "
+            "producer_wait_est_ms=%.3f fill_ms=%.3f "
+            "ready_wait_ms=%.3f\n",
+            request.lane,
+            request.seq,
+            response.size(),
+            (lock_begin_us - server_enter_us) / 1000.0,
+            lock_wait_us / 1000.0,
+            cv_wait_us / 1000.0,
+            response_copy_us / 1000.0,
+            producer_wait_est_us / 1000.0,
+            slot_fill_us / 1000.0,
+            ready_wait_us / 1000.0);
+        std::fflush(stderr);
+    }
 
     return true;
 }
