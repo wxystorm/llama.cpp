@@ -3907,14 +3907,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
         runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::PHONE &&
         runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens;
+    const bool gpu_cpu_phone_boundary_aligned =
+        runtime_stages.size() == 3 &&
+        runtime_stages[0].macro_tokens > 0 &&
+        runtime_stages[1].macro_tokens > 0 &&
+        runtime_stages[2].macro_tokens > 0 &&
+        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens &&
+        runtime_stages[0].macro_tokens >= runtime_stages[2].macro_tokens &&
+        runtime_stages[0].macro_tokens %
+            std::max(runtime_stages[1].macro_tokens,
+                     runtime_stages[2].macro_tokens) == 0 &&
+        std::max(runtime_stages[1].macro_tokens,
+                 runtime_stages[2].macro_tokens) %
+            std::min(runtime_stages[1].macro_tokens,
+                     runtime_stages[2].macro_tokens) == 0;
     const bool gpu_cpu_phone_topology =
         runtime_stages.size() == 3 &&
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
         runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
         runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens &&
-        runtime_stages[1].macro_tokens >= runtime_stages[2].macro_tokens &&
-        runtime_stages[1].macro_tokens % runtime_stages[2].macro_tokens == 0;
+        gpu_cpu_phone_boundary_aligned;
 
     const bool gpu_tensor_topology =
         runtime_stages.size() == 2 &&
@@ -4551,15 +4563,60 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto blocks = llama_hybrid_plan_boundary(
             job.ubatch.n_tokens, previous_stage.macro_tokens, stage.macro_tokens);
 
-        if (blocks.empty() || std::any_of(
-                blocks.begin(), blocks.end(), [](const llama_hybrid_boundary_block & block) {
-                    return block.action == llama_hybrid_boundary_action::ACCUMULATE;
-                })) {
+        if (blocks.empty()) {
             LLAMA_LOG_ERROR(
-                "[HYBRID_PIPE] ub=%d stage=%zu kind=%s unsupported boundary plan\n",
+                "[HYBRID_PIPE] ub=%d stage=%zu kind=%s empty boundary plan\n",
                 job.ubatch_id, stage_index, llama_hybrid_runtime_stage_name(stage.kind));
             status = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        // V1 supports ACCUMULATE only for an ordinary PHONE stage when all
+        // contributing CPU ranges already live contiguously inside this one
+        // GPU-macro job.  Example: XG=256, XC=128, XP=256.  CPU produces
+        // [0,128)+[128,256) into one job.hidden buffer, so Phone can consume
+        // [0,256) directly without any cross-job gather/copy.
+        for (const auto & block : blocks) {
+            if (block.action != llama_hybrid_boundary_action::ACCUMULATE) {
+                continue;
+            }
+
+            bool contiguous_local_accumulate =
+                stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+                !block.inputs.empty();
+            int covered_until = block.output.token_begin;
+            for (const auto & input : block.inputs) {
+                if (input.token_begin != covered_until || input.n_tokens <= 0) {
+                    contiguous_local_accumulate = false;
+                    break;
+                }
+                covered_until += input.n_tokens;
+            }
+            contiguous_local_accumulate =
+                contiguous_local_accumulate &&
+                covered_until ==
+                    block.output.token_begin + block.output.n_tokens;
+
+            if (!contiguous_local_accumulate) {
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PIPE] ub=%d stage=%zu kind=%s "
+                    "unsupported ACCUMULATE output=[%d,%d) inputs=%zu\n",
+                    job.ubatch_id, stage_index,
+                    llama_hybrid_runtime_stage_name(stage.kind),
+                    block.output.token_begin,
+                    block.output.token_begin + block.output.n_tokens,
+                    block.inputs.size());
+                status = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            LLAMA_LOG_DEBUG(
+                "[HYBRID_PIPE] ub=%d stage=%zu kind=PHONE "
+                "ACCUMULATE_LOCAL output=[%d,%d) inputs=%zu\n",
+                job.ubatch_id, stage_index,
+                block.output.token_begin,
+                block.output.token_begin + block.output.n_tokens,
+                block.inputs.size());
         }
 
         const int64_t n_embd = model.hparams.n_embd;
