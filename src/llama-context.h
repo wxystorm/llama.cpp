@@ -478,6 +478,10 @@ private:
 
     ggml_backend_sched_ptr sched;
     ggml_backend_sched_ptr sched_pipe;
+    // Dedicated scheduler for asynchronously submitted ordinary PHONE stages.
+    // It must not share graph/scheduler state with sched_pipe because the host
+    // may execute the next CPU stage while a previous Phone block is in flight.
+    ggml_backend_sched_ptr sched_phone;
 
     bool sched_need_reserve = true;
 
@@ -503,6 +507,7 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
     llm_graph_result_ptr gf_res_pipe;
+    llm_graph_result_ptr gf_res_phone;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
