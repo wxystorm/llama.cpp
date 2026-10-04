@@ -3978,6 +3978,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const bool phone_exit_profile =
+        std::getenv("GGML_META_PHONE_EXIT_PROFILE") != nullptr;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -8142,6 +8144,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         printf("[PHONE_BLOCK_WAIT_END] layer=%d t=%" PRId64 " dur=%.3f ms\n",
                                deferred_phone_exit_layer, wait_end_us, (wait_end_us - wait_begin_us) / 1000.0);
                     }
+                    if (phone_exit_profile) {
+                        printf(
+                            "[PHONE_ASYNC_META_FENCE] sg=%zu layer=%d phase=pre_copy "
+                            "wait_ms=%.3f rpc_fence=%d\n",
+                            i,
+                            deferred_phone_exit_layer,
+                            (wait_end_us - wait_begin_us) / 1000.0,
+                            rpc_fence != nullptr ? 1 : 0);
+                    }
 
                     auto & bcj_dst = backend_ctx->backend_configs[0];
                     const int64_t copy_start_us = ggml_time_us();
@@ -8156,6 +8167,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     if (pipeline_debug) {
                         printf("[PHONE_EXIT_COPY_END] layer=%d t=%" PRId64 " dur=%.3f ms\n",
                                deferred_phone_exit_layer, copy_start_us + copy_us, copy_us / 1000.0);
+                    }
+                    if (phone_exit_profile) {
+                        printf(
+                            "[PHONE_ASYNC_META_COPY] sg=%zu layer=%d phase=final_l_out "
+                            "bytes=%zu copy_ms=%.3f\n",
+                            i,
+                            deferred_phone_exit_layer,
+                            ggml_nbytes(dst_l_out),
+                            copy_us / 1000.0);
                     }
                     record_copy_wait(copy_us);
                     record_meta_copy(i, 1, 0, dst_l_out, copy_us);
@@ -8319,6 +8339,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     printf("[PHONE_BLOCK_WAIT_END] layer=%d t=%" PRId64 " dur=%.3f ms\n", layer, wait_end_us,
                            (wait_end_us - wait_begin_us) / 1000.0);
                 }
+                if (phone_exit_profile) {
+                    printf(
+                        "[PHONE_ASYNC_META_FENCE] sg=%zu layer=%d phase=pre_add "
+                        "wait_ms=%.3f rpc_fence=%d\n",
+                        i,
+                        layer,
+                        (wait_end_us - wait_begin_us) / 1000.0,
+                        rpc_fence != nullptr ? 1 : 0);
+                }
 
                 if (pipeline_debug) {
                     meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE BEFORE_ADD");
@@ -8336,12 +8365,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_cgraph * layer_graph = get_cgraph_aux();
                 layer_graph->nodes[0] = node_layer;
                 layer_graph->n_nodes = 1;
+                const int64_t add_submit_begin_us = ggml_time_us();
                 const ggml_status status =
                     ggml_backend_graph_compute_async(bcj_src.backend, layer_graph);
+                const int64_t add_submit_us =
+                    ggml_time_us() - add_submit_begin_us;
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+                const int64_t add_fence_begin_us = ggml_time_us();
                 fence_src();
+                const int64_t add_fence_us =
+                    ggml_time_us() - add_fence_begin_us;
+                if (phone_exit_profile) {
+                    printf(
+                        "[PHONE_ASYNC_META_ADD] sg=%zu layer=%d "
+                        "submit_ms=%.3f fence_ms=%.3f\n",
+                        i,
+                        layer,
+                        add_submit_us / 1000.0,
+                        add_fence_us / 1000.0);
+                }
 
                 if (pipeline_debug) {
                     meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE POST_ADD");
@@ -8368,6 +8412,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug && phone_owner_exit) {
                     printf("[PHONE_EXIT_COPY_END] layer=%d t=%" PRId64 " dur=%.3f ms\n", layer,
                            copy_start_us + copy_us, copy_us / 1000.0);
+                }
+                if (phone_exit_profile) {
+                    printf(
+                        "[PHONE_ASYNC_META_COPY] sg=%zu layer=%d phase=handoff "
+                        "bytes=%zu copy_ms=%.3f external=%d internal=%d\n",
+                        i,
+                        layer,
+                        ggml_nbytes(dst_l_out),
+                        copy_us / 1000.0,
+                        external_backend_handoff ? 1 : 0,
+                        internal_pc_handoff ? 1 : 0);
                 }
                 record_copy_wait(copy_us);
                 record_meta_copy(i, 1, 0, dst_l_out, copy_us);
@@ -11921,8 +11976,27 @@ auto prefill_norm_sg_has_prework =
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
         }
+        const int64_t phone_worker_submit_begin_us = ggml_time_us();
         compute_workers.start_graph(1, phone_graph);
+        const int64_t phone_worker_submit_us =
+            ggml_time_us() - phone_worker_submit_begin_us;
+        const int64_t phone_worker_wait_begin_us = ggml_time_us();
         compute_status = compute_workers.wait(1);
+        const int64_t phone_worker_wait_us =
+            ggml_time_us() - phone_worker_wait_begin_us;
+        if (phone_exit_profile) {
+            printf(
+                "[PHONE_ASYNC_META_WORKER] sg=%zu fused=%d layers=%d..%d "
+                "nodes=%d submit_ms=%.3f wait_ms=%.3f status=%d\n",
+                i,
+                phone_block_fused ? 1 : 0,
+                first_fused_layer,
+                phone_block_last_layer,
+                phone_graph != nullptr ? phone_graph->n_nodes : 0,
+                phone_worker_submit_us / 1000.0,
+                phone_worker_wait_us / 1000.0,
+                (int) compute_status);
+        }
 
         if (direct_route_bound) {
             if (direct_route_rebound) {
