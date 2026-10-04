@@ -3980,6 +3980,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
     const bool phone_exit_profile =
         std::getenv("GGML_META_PHONE_EXIT_PROFILE") != nullptr;
+    const bool meta_sg_timing =
+        std::getenv("GGML_META_SG_TIMING") != nullptr;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -10764,6 +10766,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const size_t timing_sg = i;
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
@@ -12363,6 +12366,7 @@ auto prefill_norm_sg_has_prework =
             phone_block_last_layer >= 0 &&
             !layer_is_tensor_phone_primary(
                 phone_block_last_layer);
+        int64_t subgraph_comm_wall_us = 0;
         if (n_backends > 1 &&
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
@@ -12397,9 +12401,36 @@ auto prefill_norm_sg_has_prework =
             }
             ++reduce_count;
             const int64_t reduce_us = ggml_time_us() - reduce_start_us;
+            subgraph_comm_wall_us = reduce_us;
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
         }
+
+        if (meta_sg_timing) {
+            const int64_t subgraph_total_wall_us =
+                ggml_time_us() - layer_wall_start_us;
+            const int64_t subgraph_other_wall_us =
+                std::max<int64_t>(
+                    0,
+                    subgraph_total_wall_us -
+                        subgraph_compute_wall_us -
+                        subgraph_comm_wall_us);
+            printf(
+                "[META_SG_TIMING] sg=%zu comm_sg=%zu "
+                "layer=%d..%d fused=%d "
+                "total_ms=%.3f compute_ms=%.3f comm_ms=%.3f "
+                "other_ms=%.3f\n",
+                timing_sg,
+                communication_sg,
+                timing_first_layer,
+                timing_last_layer,
+                phone_block_fused ? 1 : 0,
+                subgraph_total_wall_us / 1000.0,
+                subgraph_compute_wall_us / 1000.0,
+                subgraph_comm_wall_us / 1000.0,
+                subgraph_other_wall_us / 1000.0);
+        }
+
         if (phone_block_fused) {
             i = communication_sg;
         }
