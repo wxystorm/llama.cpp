@@ -3260,18 +3260,6 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t meta_graph_start_us = ggml_time_us();
-    const bool wave_crash_trace =
-        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
-    if (wave_crash_trace) {
-        fprintf(
-            stderr,
-            "[WAVE_CRASH_TRACE] phase=META_ENTER uid=%" PRIu64
-            " nodes=%d leafs=%d\n",
-            cgraph->uid,
-            cgraph->n_nodes,
-            cgraph->n_leafs);
-        fflush(stderr);
-    }
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -3308,27 +3296,7 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
         assert(needs_rebuild);
     }
 
-    if (wave_crash_trace) {
-        fprintf(
-            stderr,
-            "[WAVE_CRASH_TRACE] phase=META_REBUILD_CHECK uid=%" PRIu64
-            " cached_uid=%" PRIu64 " needs=%d max_nnodes=%zu nodes=%d\n",
-            cgraph->uid,
-            backend_ctx->uid,
-            needs_rebuild ? 1 : 0,
-            backend_ctx->max_nnodes,
-            cgraph->n_nodes);
-        fflush(stderr);
-    }
-
     if (needs_rebuild) {
-        if (wave_crash_trace) {
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=META_REBUILD_BEGIN uid=%" PRIu64 "\n",
-                cgraph->uid);
-            fflush(stderr);
-        }
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
@@ -3586,13 +3554,10 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
             }
         }
 
-        // Wavefront l_out must execute on the backend that owns the complete
-        // Tensor-layer activation.  Legacy TENSOR_SPLIT reduces the Phone
-        // partial into PC, so PC owns this ADD.  TENSOR_PHONE_PRIMARY does the
-        // opposite: the PC partial is returned to Phone and Phone remains the
-        // single owner across Tensor layers.  Keeping l_out hard-wired to PC
-        // here races/stales the Phone-primary return and can make the first
-        // wavefront graph invalid before Attention(L+1,C) even starts.
+        // Wavefront l_out is a real PC graph node.  Its static position is now
+        // immediately before Attention(L+1,C), so executing it in the normal
+        // PC graph preserves allocator lifetime and ordering.  Secondary
+        // backends keep the mirrored placeholder but never compute this ADD.
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             int chunk = -1;
             int layer = -1;
@@ -3600,32 +3565,8 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
                     cgraph->nodes[i]->name, chunk, layer)) {
                 continue;
             }
-
-            const bool phone_primary_wave_l_out =
-                n_backends == 2 &&
-                backend_ctx->tensor_phone_first_layer >= 0 &&
-                layer >= backend_ctx->tensor_phone_first_layer &&
-                layer < backend_ctx->tensor_phone_last_layer;
-
-            if (phone_primary_wave_l_out) {
-                backend_ctx->backend_configs[0].nodes[i]->flags &=
-                    ~GGML_TENSOR_FLAG_COMPUTE;
-                backend_ctx->backend_configs[1].nodes[i]->flags |=
-                    GGML_TENSOR_FLAG_COMPUTE;
-            } else {
-                for (size_t j = 1; j < n_backends; ++j) {
-                    backend_ctx->backend_configs[j].nodes[i]->flags &=
-                        ~GGML_TENSOR_FLAG_COMPUTE;
-                }
-            }
-
-            if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
-                printf(
-                    "[PREFILL_WAVE_L_OUT_OWNER] "
-                    "layer=%d chunk=%d owner=%s\n",
-                    layer,
-                    chunk,
-                    phone_primary_wave_l_out ? "PHONE" : "PC");
+            for (size_t j = 1; j < n_backends; ++j) {
+                backend_ctx->backend_configs[j].nodes[i]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
             }
         }
 
@@ -4005,16 +3946,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     }
     if (needs_rebuild) {
         meta_rebuild_us = ggml_time_us() - meta_rebuild_begin_us;
-        if (wave_crash_trace) {
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=META_REBUILD_END uid=%" PRIu64
-                " subgraphs=%zu rebuild_ms=%.3f\n",
-                cgraph->uid,
-                backend_ctx->n_subgraphs,
-                meta_rebuild_us / 1000.0);
-            fflush(stderr);
-        }
     }
 
     size_t iga = 0; // i graph aux
@@ -4781,7 +4712,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     int parsed_layer = -1;
                     int chunk = -1;
 
-                    bool parsed =
+                    const bool parsed =
                         std::sscanf(
                             node->name, "attn_out-%d",
                             &parsed_layer) == 1 ||
@@ -4796,24 +4727,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ggml_backend_meta_parse_prefill_down_chunk(
                             node->name, chunk, parsed_layer) ||
                         ggml_backend_meta_parse_decode_ffn_chunk(
-                            node->name, chunk, parsed_layer) ||
-                        ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                            node->name, chunk, parsed_layer) ||
-                        ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
-                            node->name, chunk, parsed_layer) ||
-                        ggml_backend_meta_parse_prefill_wave_l_out_chunk(
                             node->name, chunk, parsed_layer);
-
-                    if (!parsed) {
-                        int group_begin = -1;
-                        int group_count = -1;
-                        parsed =
-                            ggml_backend_meta_parse_prefill_wave_attn_out_group(
-                                node->name,
-                                group_begin,
-                                group_count,
-                                parsed_layer);
-                    }
 
                     if (parsed &&
                         layer_is_tensor_phone_primary(parsed_layer)) {
@@ -5315,16 +5229,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
     }
-
-    const bool phone_primary_wavefront_graph =
-        return_wavefront_graph &&
-        return_wavefront_first_layer !=
-            std::numeric_limits<int>::max() &&
-        layer_is_tensor_phone_primary(
-            return_wavefront_first_layer);
-    const bool legacy_return_wavefront_graph =
-        return_wavefront_graph &&
-        !phone_primary_wavefront_graph;
 
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
@@ -6428,72 +6332,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     add_us / 1000.0);
             }
 
-            const int joined_layer = branch_it->layer;
-            const int joined_chunk = branch_it->chunk;
             const size_t joined_sg = branch_it->sg;
             pending_phone_prefill_routes.erase(
-                { joined_layer, joined_chunk });
+                { branch_it->layer, branch_it->chunk });
             deferred_phone_prefill_return_sgs.erase(joined_sg);
             pending_phone_prefill_pc_branches.erase(branch_it);
 
-            const bool layer_pending =
-                std::any_of(
-                    pending_phone_prefill_pc_branches.begin(),
-                    pending_phone_prefill_pc_branches.end(),
-                    [&](const phone_prefill_pc_branch & branch) {
-                        return branch.layer == joined_layer;
-                    });
-            if (!layer_pending) {
-                phone_prefill_lane1_return_gates.erase(joined_layer);
-                if (pipeline_debug ||
-                        tensor_phone_stage_profile) {
-                    printf(
-                        "[PHONE_PREFILL_CHUNK_JOIN_LAYER_READY] "
-                        "layer=%d ready_after_chunk=%d mode=PER_CHUNK\n",
-                        joined_layer,
-                        joined_chunk);
-                }
-            }
-
             return GGML_STATUS_SUCCESS;
-        };
-
-    auto has_pending_phone_prefill_pc_for_layer =
-        [&](int layer) -> bool {
-            return std::any_of(
-                pending_phone_prefill_pc_branches.begin(),
-                pending_phone_prefill_pc_branches.end(),
-                [&](const phone_prefill_pc_branch & branch) {
-                    return branch.layer == layer;
-                });
-        };
-
-    auto wait_phone_prefill_pc_dependency =
-        [&](int layer, int chunk, bool & waited, int64_t & wait_us)
-            -> ggml_status {
-            waited = false;
-            wait_us = 0;
-
-            const auto branch_it =
-                std::find_if(
-                    pending_phone_prefill_pc_branches.begin(),
-                    pending_phone_prefill_pc_branches.end(),
-                    [&](const phone_prefill_pc_branch & branch) {
-                        return branch.layer == layer &&
-                            branch.chunk == chunk;
-                    });
-            if (branch_it ==
-                    pending_phone_prefill_pc_branches.end()) {
-                // Already reaped opportunistically.
-                return GGML_STATUS_SUCCESS;
-            }
-
-            waited = true;
-            const int64_t begin_us = ggml_time_us();
-            const ggml_status status =
-                join_phone_prefill_pc_chunk(layer, chunk, true);
-            wait_us = ggml_time_us() - begin_us;
-            return status;
         };
 
     auto reap_phone_prefill_pc_layer =
@@ -6556,38 +6401,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         layer,
                         chunk,
                         wait_for_all);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
-            }
-        };
-
-    auto reap_phone_prefill_pc_layers_before =
-        [&](int layer_exclusive, bool & waited, int64_t & wait_us)
-            -> ggml_status {
-            waited = false;
-            wait_us = 0;
-
-            while (true) {
-                int old_layer = std::numeric_limits<int>::max();
-                for (const auto & branch :
-                        pending_phone_prefill_pc_branches) {
-                    if (branch.layer < layer_exclusive) {
-                        old_layer = std::min(
-                            old_layer, branch.layer);
-                    }
-                }
-                if (old_layer ==
-                        std::numeric_limits<int>::max()) {
-                    return GGML_STATUS_SUCCESS;
-                }
-
-                waited = true;
-                const int64_t begin_us = ggml_time_us();
-                const ggml_status status =
-                    reap_phone_prefill_pc_layer(
-                        old_layer, true);
-                wait_us += ggml_time_us() - begin_us;
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -7176,14 +6989,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
-                const bool wavefront_defer_layer =
-                    return_wavefront_graph &&
-                    phone_prefill_chunk_join_active;
                 const int64_t reap_begin_us = ggml_time_us();
                 const ggml_status join_status =
                     reap_phone_prefill_pc_layer(
                         deferred_layer_0,
-                        last_chunk && !wavefront_defer_layer);
+                        last_chunk);
                 const int64_t reap_us =
                     ggml_time_us() - reap_begin_us;
                 if (join_status != GGML_STATUS_SUCCESS) {
@@ -7213,18 +7023,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         reap_us / 1000.0);
                 }
 
-                if (last_chunk && !wavefront_defer_layer) {
+                if (last_chunk) {
                     GGML_ASSERT(pending_after == 0);
-                } else if (last_chunk &&
-                           wavefront_defer_layer &&
-                           (pipeline_debug ||
-                            tensor_phone_stage_profile)) {
-                    printf(
-                        "[PHONE_PREFILL_WAVE_LAYER_DEFER] "
-                        "layer=%d last_chunk=%d pending=%zu\n",
-                        deferred_layer_0,
-                        deferred_chunk_0,
-                        pending_after);
+                    phone_prefill_lane1_return_gates.erase(
+                        deferred_layer_0);
+
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile) {
+                        printf(
+                            "[PHONE_PREFILL_CHUNK_JOIN_LAYER_READY] "
+                            "layer=%d last_chunk=%d\n",
+                            deferred_layer_0,
+                            deferred_chunk_0);
+                    }
                 }
             } else if (last_chunk) {
                 const ggml_status drain_status =
@@ -10782,54 +10593,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                    layer == phone_layer;
         };
 
-    auto parse_prefill_wave_l_out_sg =
-        [&](size_t i, int & chunk, int & layer) -> bool {
-            if (n_backends != 2 || i >= backend_ctx->n_subgraphs) {
-                return false;
-            }
-
-            auto find_wave_l_out =
-                [&](size_t backend, int & out_chunk, int & out_layer) -> bool {
-                    ggml_cgraph * graph =
-                        backend_ctx->backend_configs[backend]
-                            .cgraphs[i].cgraph_main;
-                    if (graph == nullptr || graph->n_nodes == 0) {
-                        return false;
-                    }
-
-                    bool found = false;
-                    for (int k = 0; k < graph->n_nodes; ++k) {
-                        int parsed_chunk = -1;
-                        int parsed_layer = -1;
-                        if (!ggml_backend_meta_parse_prefill_wave_l_out_chunk(
-                                graph->nodes[k]->name,
-                                parsed_chunk,
-                                parsed_layer)) {
-                            continue;
-                        }
-                        if (found &&
-                                (parsed_chunk != out_chunk ||
-                                 parsed_layer != out_layer)) {
-                            return false;
-                        }
-                        out_chunk = parsed_chunk;
-                        out_layer = parsed_layer;
-                        found = true;
-                    }
-                    return found;
-                };
-
-            int phone_chunk = -1;
-            int phone_layer = -1;
-            if (!find_wave_l_out(0, chunk, layer) ||
-                    !find_wave_l_out(
-                        1, phone_chunk, phone_layer)) {
-                return false;
-            }
-            return chunk == phone_chunk &&
-                   layer == phone_layer;
-        };
-
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
         if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
                 !subgraph_is_phone_only(i) || !subgraph_is_phone_only(i + 1)) {
@@ -11042,49 +10805,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
     }
 
-    if (wave_crash_trace) {
-        fprintf(
-            stderr,
-            "[WAVE_CRASH_TRACE] phase=META_EXEC_BEGIN subgraphs=%zu\n",
-            backend_ctx->n_subgraphs);
-        fflush(stderr);
-    }
-
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        if (wave_crash_trace) {
-            const ggml_cgraph * pc_trace_graph =
-                n_backends > 0 ?
-                    backend_ctx->backend_configs[0].cgraphs[i].cgraph_main :
-                    nullptr;
-            const ggml_cgraph * phone_trace_graph =
-                n_backends > 1 ?
-                    backend_ctx->backend_configs[1].cgraphs[i].cgraph_main :
-                    nullptr;
-            const char * pc_first =
-                pc_trace_graph != nullptr && pc_trace_graph->n_nodes > 0 ?
-                    pc_trace_graph->nodes[0]->name : "(none)";
-            const char * pc_last =
-                pc_trace_graph != nullptr && pc_trace_graph->n_nodes > 0 ?
-                    pc_trace_graph->nodes[pc_trace_graph->n_nodes - 1]->name :
-                    "(none)";
-            const char * phone_first =
-                phone_trace_graph != nullptr && phone_trace_graph->n_nodes > 0 ?
-                    phone_trace_graph->nodes[0]->name : "(none)";
-            const char * phone_last =
-                phone_trace_graph != nullptr && phone_trace_graph->n_nodes > 0 ?
-                    phone_trace_graph->nodes[phone_trace_graph->n_nodes - 1]->name :
-                    "(none)";
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=META_SG_BEGIN sg=%zu "
-                "pc_nodes=%d phone_nodes=%d pc=[%s..%s] phone=[%s..%s]\n",
-                i,
-                pc_trace_graph != nullptr ? pc_trace_graph->n_nodes : 0,
-                phone_trace_graph != nullptr ? phone_trace_graph->n_nodes : 0,
-                pc_first, pc_last, phone_first, phone_last);
-            fflush(stderr);
-        }
         const size_t timing_sg = i;
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
@@ -11103,8 +10825,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         int prefill_wave_attn_chunk = -1;
         int prefill_wave_attn_chunk_count = 1;
         int prefill_wave_attn_layer = -1;
-        int prefill_wave_l_out_chunk = -1;
-        int prefill_wave_l_out_layer = -1;
         const bool is_prefill_norm_sg = parse_prefill_sg(
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
@@ -11112,11 +10832,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const bool is_prefill_wave_attn_sg = parse_prefill_wave_attn_sg(
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
-        const bool is_prefill_wave_l_out_sg =
-            parse_prefill_wave_l_out_sg(
-                i,
-                prefill_wave_l_out_chunk,
-                prefill_wave_l_out_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
@@ -11210,15 +10925,6 @@ auto prefill_norm_sg_has_prework =
 
         return false;
     };
-        int phone_primary_prefill_route_layer = -1;
-        int phone_primary_prefill_route_chunk = -1;
-        const bool is_phone_primary_prefill_route_sg =
-            tensor_phone_stage_route_identity(
-                i,
-                phone_primary_prefill_route_layer,
-                phone_primary_prefill_route_chunk) &&
-            phone_primary_prefill_route_chunk >= 0;
-
         const bool norm_can_overlap =
             is_prefill_norm_sg &&
             has_pending_prefill_reduce_for_layer(prefill_norm_layer) &&
@@ -11229,89 +10935,10 @@ auto prefill_norm_sg_has_prework =
             has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
         const bool continues_prefill_layer =
-            norm_can_overlap ||
-            down_can_overlap ||
-            is_prefill_wave_attn_sg ||
-            is_prefill_wave_l_out_sg ||
-            is_phone_primary_prefill_route_sg;
-
-        if (wave_crash_trace &&
-                is_phone_primary_prefill_route_sg) {
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=PREWORK_ROUTE_CONTINUE "
-                "sg=%zu layer=%d chunk=%d pending_phone_layer=%d\n",
-                i,
-                phone_primary_prefill_route_layer,
-                phone_primary_prefill_route_chunk,
-                has_pending_phone_prefill_pc_for_layer(
-                    phone_primary_prefill_route_layer) ? 1 : 0);
-            fflush(stderr);
-        }
+            norm_can_overlap || down_can_overlap || is_prefill_wave_attn_sg;
         if (return_wavefront_graph &&
-                (is_prefill_wave_attn_sg ||
-                 is_prefill_wave_l_out_sg ||
-                 is_prefill_norm_sg ||
-                 is_prefill_down_sg)) {
-            if (is_prefill_wave_l_out_sg &&
-                    phone_prefill_chunk_join_active &&
-                    layer_is_tensor_phone_primary(
-                        prefill_wave_l_out_layer)) {
-                // wave_l_out(L,C) consumes the completed split-FFN result for
-                // exactly (L,C).  In Phone-primary mode that result becomes
-                // valid only after the PC partial has returned and its ADD has
-                // been submitted to the ordered Phone compute queue.  Wait
-                // here -- before l_out executes -- rather than at the next
-                // layer's Attention.
-                bool generic_waited = false;
-                const int64_t generic_begin_us = ggml_time_us();
-                const ggml_status generic_status =
-                    wait_prefill_reduce_dependency(
-                        prefill_wave_l_out_layer,
-                        prefill_wave_l_out_chunk,
-                        generic_waited);
-                const int64_t generic_wait_us =
-                    ggml_time_us() - generic_begin_us;
-                if (generic_status != GGML_STATUS_SUCCESS) {
-                    return generic_status;
-                }
-
-                bool phone_waited = false;
-                int64_t phone_wait_us = 0;
-                const ggml_status phone_status =
-                    wait_phone_prefill_pc_dependency(
-                        prefill_wave_l_out_layer,
-                        prefill_wave_l_out_chunk,
-                        phone_waited,
-                        phone_wait_us);
-                if (phone_status != GGML_STATUS_SUCCESS) {
-                    return phone_status;
-                }
-
-                const int64_t dependency_wait_us =
-                    generic_wait_us + phone_wait_us;
-                if (generic_waited || phone_waited) {
-                    ++return_wave_dependency_wait_count;
-                    return_wave_dependency_wait_us +=
-                        dependency_wait_us;
-                    return_wave_dependency_wait_max_us =
-                        std::max(
-                            return_wave_dependency_wait_max_us,
-                            dependency_wait_us);
-                }
-
-                if (pipeline_debug) {
-                    printf(
-                        "[PHONE_WAVE_L_OUT_DEP_WAIT] "
-                        "layer=%d chunk=%d wait_ms=%.3f "
-                        "generic=%d phone=%d\n",
-                        prefill_wave_l_out_layer,
-                        prefill_wave_l_out_chunk,
-                        dependency_wait_us / 1000.0,
-                        generic_waited ? 1 : 0,
-                        phone_waited ? 1 : 0);
-                }
-            } else if (is_prefill_wave_attn_sg) {
+                (is_prefill_wave_attn_sg || is_prefill_norm_sg || is_prefill_down_sg)) {
+            if (is_prefill_wave_attn_sg) {
                 // Attention(L,C) consumes OUT(L-1,C), not the most recently
                 // submitted down tensor in graph order.  Let same-layer chunk
                 // prework run while current-layer returns are in flight, and
@@ -11322,27 +10949,12 @@ auto prefill_norm_sg_has_prework =
                 int64_t older_wait_us = 0;
                 const ggml_status older_status = wait_prefill_reduces_before(
                     prefill_wave_attn_layer - 1, older_waited, older_wait_us);
+                if (older_waited) {
+                    ++return_wave_old_layer_wait_count;
+                    return_wave_old_layer_wait_us += older_wait_us;
+                }
                 if (older_status != GGML_STATUS_SUCCESS) {
                     return older_status;
-                }
-
-                bool older_phone_waited = false;
-                int64_t older_phone_wait_us = 0;
-                if (phone_prefill_chunk_join_active) {
-                    const ggml_status phone_status =
-                        reap_phone_prefill_pc_layers_before(
-                            prefill_wave_attn_layer - 1,
-                            older_phone_waited,
-                            older_phone_wait_us);
-                    if (phone_status != GGML_STATUS_SUCCESS) {
-                        return phone_status;
-                    }
-                }
-
-                if (older_waited || older_phone_waited) {
-                    ++return_wave_old_layer_wait_count;
-                    return_wave_old_layer_wait_us +=
-                        older_wait_us + older_phone_wait_us;
                 }
 
                 bool waited = false;
@@ -11351,77 +10963,37 @@ auto prefill_norm_sg_has_prework =
                     for (int dep_chunk = prefill_wave_attn_chunk;
                          dep_chunk < prefill_wave_attn_chunk + prefill_wave_attn_chunk_count;
                          ++dep_chunk) {
-                        bool reduce_dep_waited = false;
-                        const int64_t reduce_wait_start_us =
-                            ggml_time_us();
-                        const ggml_status reduce_status =
-                            wait_prefill_reduce_dependency(
-                                prefill_wave_attn_layer - 1,
-                                dep_chunk,
-                                reduce_dep_waited);
-                        const int64_t reduce_dep_wait_us =
-                            ggml_time_us() - reduce_wait_start_us;
-                        if (reduce_status != GGML_STATUS_SUCCESS) {
-                            return reduce_status;
-                        }
-
-                        bool phone_dep_waited = false;
-                        int64_t phone_dep_wait_us = 0;
-                        if (phone_prefill_chunk_join_active) {
-                            const ggml_status phone_status =
-                                wait_phone_prefill_pc_dependency(
-                                    prefill_wave_attn_layer - 1,
-                                    dep_chunk,
-                                    phone_dep_waited,
-                                    phone_dep_wait_us);
-                            if (phone_status != GGML_STATUS_SUCCESS) {
-                                return phone_status;
-                            }
-                        }
-
-                        const bool dep_waited =
-                            reduce_dep_waited ||
-                            phone_dep_waited;
-                        const int64_t dep_wait_us =
-                            reduce_dep_wait_us +
-                            phone_dep_wait_us;
+                        bool dep_waited = false;
+                        const int64_t wait_start_us = ggml_time_us();
+                        const ggml_status status = wait_prefill_reduce_dependency(
+                            prefill_wave_attn_layer - 1, dep_chunk, dep_waited);
+                        const int64_t dep_wait_us = ggml_time_us() - wait_start_us;
                         dependency_wait_us += dep_wait_us;
                         waited = waited || dep_waited;
                         if (dep_waited) {
                             ++return_wave_dependency_wait_count;
                             return_wave_dependency_wait_us += dep_wait_us;
                             return_wave_dependency_wait_max_us =
-                                std::max(
-                                    return_wave_dependency_wait_max_us,
-                                    dep_wait_us);
+                                std::max(return_wave_dependency_wait_max_us, dep_wait_us);
                             if (pipeline_debug) {
                                 printf(
-                                    "[RETURN_WAVEFRONT_DEP_WAIT] "
-                                    "layer=%d chunk=%d "
-                                    "group_begin=%d group_count=%d "
-                                    "predecessor=%d wait_ms=%.3f "
-                                    "generic=%d phone=%d\n",
-                                    prefill_wave_attn_layer,
-                                    dep_chunk,
-                                    prefill_wave_attn_chunk,
-                                    prefill_wave_attn_chunk_count,
-                                    prefill_wave_attn_layer - 1,
-                                    dep_wait_us / 1000.0,
-                                    reduce_dep_waited ? 1 : 0,
-                                    phone_dep_waited ? 1 : 0);
+                                    "[RETURN_WAVEFRONT_DEP_WAIT] layer=%d chunk=%d group_begin=%d group_count=%d "
+                                    "predecessor=%d wait_ms=%.3f\n",
+                                    prefill_wave_attn_layer, dep_chunk,
+                                    prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
+                                    prefill_wave_attn_layer - 1, dep_wait_us / 1000.0);
                             }
+                        }
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
                         }
                     }
                 }
 
                 const bool predecessor_layer_still_in_flight =
                     prefill_wave_attn_layer > return_wavefront_first_layer &&
-                    (has_pending_prefill_reduce_for_layer(
-                         prefill_wave_attn_layer - 1) ||
-                     has_pending_phone_prefill_pc_for_layer(
-                         prefill_wave_attn_layer - 1));
-                if (has_pending_prefill_reduce() ||
-                        !pending_phone_prefill_pc_branches.empty()) {
+                    has_pending_prefill_reduce_for_layer(prefill_wave_attn_layer - 1);
+                if (has_pending_prefill_reduce()) {
                     ++return_wave_overlap_boundaries;
                 }
                 if (predecessor_layer_still_in_flight) {
@@ -11436,15 +11008,11 @@ auto prefill_norm_sg_has_prework =
                         prefill_wave_attn_chunk_count, waited ? 1 : 0,
                         dependency_wait_us / 1000.0,
                         predecessor_layer_still_in_flight ? 1 : 0,
-                        (has_pending_prefill_reduce() ||
-                         !pending_phone_prefill_pc_branches.empty()) ? 1 : 0);
+                        has_pending_prefill_reduce() ? 1 : 0);
                 }
             } else if (is_prefill_down_sg &&
                        prefill_down_layer > return_wavefront_first_layer &&
-                       (has_pending_prefill_reduce_for_layer(
-                            prefill_down_layer - 1) ||
-                        has_pending_phone_prefill_pc_for_layer(
-                            prefill_down_layer - 1))) {
+                       has_pending_prefill_reduce_for_layer(prefill_down_layer - 1)) {
                 // The exact predecessor dependency was already enforced at
                 // this chunk's Attention prework.  Reaching down while another
                 // L-1 chunk still returns means Phone FFN(L,C) is submitted
@@ -11453,22 +11021,7 @@ auto prefill_norm_sg_has_prework =
             }
             // Norm subgraphs need no additional return wait: their Attention
             // prework has already enforced the exact OUT dependency.
-        } else if ((has_pending_prefill_reduce() ||
-                    (return_wavefront_graph &&
-                     phone_prefill_chunk_join_active &&
-                     !pending_phone_prefill_pc_branches.empty())) &&
-                   !continues_prefill_layer) {
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=PREWORK_BARRIER_BEGIN "
-                    "sg=%zu pending_reduce=%d pending_phone=%zu\n",
-                    i,
-                    has_pending_prefill_reduce() ? 1 : 0,
-                    pending_phone_prefill_pc_branches.size());
-                fflush(stderr);
-            }
-
+        } else if (has_pending_prefill_reduce() && !continues_prefill_layer) {
             size_t pending_lanes = 0;
             int barrier_layer = -1;
             for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
@@ -11477,28 +11030,9 @@ auto prefill_norm_sg_has_prework =
                     barrier_layer = std::max(barrier_layer, pending_prefill_reduce_layer[lane]);
                 }
             }
-            for (const auto & branch :
-                    pending_phone_prefill_pc_branches) {
-                ++pending_lanes;
-                barrier_layer =
-                    std::max(barrier_layer, branch.layer);
-            }
-
             int last_lane = -1;
             const int64_t wait_start_us = ggml_time_us();
-            ggml_status status = GGML_STATUS_SUCCESS;
-            if (has_pending_prefill_reduce()) {
-                status = wait_all_prefill_reduces(&last_lane);
-            }
-            while (status == GGML_STATUS_SUCCESS &&
-                   return_wavefront_graph &&
-                   phone_prefill_chunk_join_active &&
-                   !pending_phone_prefill_pc_branches.empty()) {
-                const int pending_layer =
-                    pending_phone_prefill_pc_branches.front().layer;
-                status = reap_phone_prefill_pc_layer(
-                    pending_layer, true);
-            }
+            const ggml_status status = wait_all_prefill_reduces(&last_lane);
             const int64_t wait_us = ggml_time_us() - wait_start_us;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
@@ -11634,20 +11168,6 @@ auto prefill_norm_sg_has_prework =
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
-        if (wave_crash_trace) {
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=DOWN_ENTER sg=%zu "
-                "layer=%d chunk=%d phone_primary_wave=%d "
-                "legacy_return_wave=%d\n",
-                i,
-                prefill_down_layer,
-                prefill_down_chunk,
-                phone_primary_wavefront_graph ? 1 : 0,
-                legacy_return_wavefront_graph ? 1 : 0);
-            fflush(stderr);
-        }
-
         const bool has_async_prefill_input =
             pending_prefill_input_task != 0;
 
@@ -11656,7 +11176,7 @@ auto prefill_norm_sg_has_prework =
             GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
         }
 
-        if (legacy_return_wavefront_graph) {
+        if (return_wavefront_graph) {
             // Dense graphs normally arrive here with an async PC->Phone input
             // task. MoE can insert Router/Top-K/expert subgraphs between the
             // norm and down boundaries, so Meta may legitimately fall back to
@@ -11711,28 +11231,12 @@ auto prefill_norm_sg_has_prework =
             { prefill_down_layer, prefill_down_chunk });
         const bool pipeline_phone_prefill_down =
             phone_prefill_chunk_pipeline &&
-            (!return_wavefront_graph ||
-             phone_primary_wavefront_graph) &&
+            !return_wavefront_graph &&
             !has_async_prefill_input &&
             layer_attention_phone_owned(prefill_down_layer) &&
             route_it != pending_phone_prefill_routes.end() &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
-
-        if (wave_crash_trace) {
-            fprintf(
-                stderr,
-                "[WAVE_CRASH_TRACE] phase=DOWN_PATH sg=%zu "
-                "layer=%d chunk=%d route_present=%d "
-                "chunk_pipeline=%d use_phone_pipeline=%d\n",
-                i,
-                prefill_down_layer,
-                prefill_down_chunk,
-                route_it != pending_phone_prefill_routes.end() ? 1 : 0,
-                phone_prefill_chunk_pipeline ? 1 : 0,
-                pipeline_phone_prefill_down ? 1 : 0);
-            fflush(stderr);
-        }
 
         if (pipeline_phone_prefill_down) {
             const phone_prefill_route_task route = route_it->second;
@@ -12291,22 +11795,7 @@ auto prefill_norm_sg_has_prework =
 
             compute_status = phone_status;
         } else {
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_START sg=%zu "
-                    "layer=%d chunk=%d\n",
-                    i, prefill_down_layer, prefill_down_chunk);
-                fflush(stderr);
-            }
             compute_workers.start(0, i);
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_SUBMITTED sg=%zu\n",
-                    i);
-                fflush(stderr);
-            }
 
             if (has_async_prefill_input) {
                 GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
@@ -12337,41 +11826,11 @@ auto prefill_norm_sg_has_prework =
                 GGML_LOG_INFO("[PREFILL_CHUNK_SUBMIT_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", prefill_down_layer,
                        prefill_down_chunk, chunk_submit_begin_us);
             }
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_PHONE_START sg=%zu "
-                    "layer=%d chunk=%d\n",
-                    i, prefill_down_layer, prefill_down_chunk);
-                fflush(stderr);
-            }
             compute_workers.start(1, i);
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_WAIT_PC sg=%zu\n",
-                    i);
-                fflush(stderr);
-            }
             const ggml_status pc_status = compute_workers.wait(0);
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_DONE sg=%zu status=%d\n",
-                    i, (int) pc_status);
-                fflush(stderr);
-            }
             const ggml_status phone_status = compute_workers.wait(1);
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=DOWN_PHONE_DONE sg=%zu status=%d\n",
-                    i, (int) phone_status);
-                fflush(stderr);
-            }
 
-            if (legacy_return_wavefront_graph &&
-                    phone_status == GGML_STATUS_SUCCESS) {
+            if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
                 if (snapshot_prepares[i].prepared) {
                     return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
                 } else if (pipeline_debug) {
@@ -12962,28 +12421,10 @@ auto prefill_norm_sg_has_prework =
             bool communication_complete = false;
 
             const int64_t specialized_start_us = ggml_time_us();
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=COMM_BEGIN sg=%zu\n",
-                    communication_sg);
-                fflush(stderr);
-            }
             const ggml_status specialized_status =
                 specialized_communication(
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
-            if (wave_crash_trace) {
-                fprintf(
-                    stderr,
-                    "[WAVE_CRASH_TRACE] phase=COMM_END sg=%zu "
-                    "status=%d handled=%d compute_complete=%d\n",
-                    communication_sg,
-                    (int) specialized_status,
-                    communication_complete ? 1 : 0,
-                    compute_complete ? 1 : 0);
-                fflush(stderr);
-            }
             subgraph_specialized_us =
                 ggml_time_us() - specialized_start_us;
             subgraph_specialized_handled = communication_complete;
@@ -13165,10 +12606,7 @@ auto prefill_norm_sg_has_prework =
         if (is_prefill_down_sg) {
             tensor_pc_ffn_us += pc_compute_us;
             tensor_phone_us  += phone_compute_us;
-        } else if (is_prefill_wave_attn_sg ||
-                   is_prefill_wave_l_out_sg ||
-                   is_prefill_norm_sg ||
-                   subgraph_is_prefill_pc_only(i)) {
+        } else if (is_prefill_wave_attn_sg || is_prefill_norm_sg || subgraph_is_prefill_pc_only(i)) {
             // Return-wavefront Attention is its own subgraph.  It must be
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
