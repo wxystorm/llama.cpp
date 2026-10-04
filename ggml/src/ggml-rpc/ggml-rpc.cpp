@@ -5164,15 +5164,31 @@ bool rpc_server::get_route_snapshot(
         return false;
     }
 
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t server_enter_us =
+        stage_profile ? ggml_time_us() : 0;
+
     rpc_route_snapshot_slot & slot =
         route_snapshot_devices[request.device]->
             slots[request.lane];
 
-    const int64_t wait_begin_us = ggml_time_us();
+    const int64_t lock_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+    int64_t lock_acquired_us = lock_begin_us;
+    int64_t ready_us = lock_begin_us;
+    int64_t copy_begin_us = lock_begin_us;
+    int64_t copy_done_us = lock_begin_us;
     int64_t slot_fill_us = 0;
     int64_t ready_wait_us = 0;
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
+        if (stage_profile) {
+            lock_acquired_us = ggml_time_us();
+        }
+
+        const int64_t cv_wait_begin_us =
+            stage_profile ? lock_acquired_us : ggml_time_us();
         slot.cv.wait(
             lock,
             [&]() {
@@ -5180,7 +5196,8 @@ bool rpc_server::get_route_snapshot(
                         rpc_snapshot_state::READY &&
                     slot.seq == request.seq;
             });
-        ready_wait_us = ggml_time_us() - wait_begin_us;
+        ready_us = ggml_time_us();
+        ready_wait_us = ready_us - lock_begin_us;
         slot_fill_us = slot.fill_us;
 
         for (size_t i = 0; i < 3; ++i) {
@@ -5200,33 +5217,41 @@ bool rpc_server::get_route_snapshot(
         }
 
         slot.state = rpc_snapshot_state::SENDING;
+        copy_begin_us = stage_profile ? ggml_time_us() : ready_us;
         response = slot.data;
+        copy_done_us = stage_profile ? ggml_time_us() : copy_begin_us;
         slot.data.clear();
         slot.seq = 0;
         slot.sizes = {};
         slot.fill_us = 0;
         slot.state = rpc_snapshot_state::FREE;
+
+        if (stage_profile) {
+            const int64_t producer_wait_est_us =
+                std::max<int64_t>(0, ready_wait_us - slot_fill_us);
+            std::fprintf(
+                stderr,
+                "[TENSOR_PHONE_RPC_STAGE] side=phone "
+                "stage=route_snapshot_server_wait lane=%u "
+                "seq=%" PRIu64 " bytes=%zu "
+                "enter_to_lock_ms=%.3f lock_wait_ms=%.3f "
+                "cv_wait_ms=%.3f response_copy_ms=%.3f "
+                "producer_wait_est_ms=%.3f fill_ms=%.3f "
+                "ready_wait_ms=%.3f\n",
+                request.lane,
+                request.seq,
+                response.size(),
+                (lock_begin_us - server_enter_us) / 1000.0,
+                (lock_acquired_us - lock_begin_us) / 1000.0,
+                (ready_us - cv_wait_begin_us) / 1000.0,
+                (copy_done_us - copy_begin_us) / 1000.0,
+                producer_wait_est_us / 1000.0,
+                slot_fill_us / 1000.0,
+                ready_wait_us / 1000.0);
+            std::fflush(stderr);
+        }
     }
     slot.cv.notify_all();
-
-    if (rpc_tensor_phone_stage_profile_enabled()) {
-        const int64_t producer_wait_est_us =
-            std::max<int64_t>(0, ready_wait_us - slot_fill_us);
-        std::fprintf(
-            stderr,
-            "[TENSOR_PHONE_RPC_STAGE] side=phone "
-            "stage=route_snapshot_ready lane=%u "
-            "seq=%" PRIu64 " bytes=%zu "
-            "producer_wait_est_ms=%.3f fill_ms=%.3f "
-            "ready_wait_ms=%.3f\n",
-            request.lane,
-            request.seq,
-            response.size(),
-            producer_wait_est_us / 1000.0,
-            slot_fill_us / 1000.0,
-            ready_wait_us / 1000.0);
-        std::fflush(stderr);
-    }
 
     return true;
 }
@@ -7036,33 +7061,82 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_GET_ROUTE_SNAPSHOT: {
+                const bool stage_profile =
+                    rpc_tensor_phone_stage_profile_enabled();
+                const int64_t request_recv_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+
                 rpc_msg_get_route_snapshot_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t request_recv_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> response;
+                const int64_t dispatch_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
                 if (!server.get_route_snapshot(request, response)) {
                     return;
                 }
-                const int64_t send_begin_us =
-                    rpc_tensor_phone_stage_profile_enabled() ?
-                        ggml_time_us() : 0;
-                if (!send_msg(
-                        sock,
-                        response.data(),
-                        response.size())) {
+                const int64_t dispatch_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                // Preserve send_msg() wire semantics exactly, but expose the
+                // response-size header and payload writes separately.  This
+                // lets the client-side response_header_wait be reconciled with
+                // server wait/copy time without changing the RPC protocol.
+                const uint64_t out_size =
+                    static_cast<uint64_t>(response.size());
+
+                const int64_t header_send_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+                if (!sock->send_data(
+                        &out_size,
+                        sizeof(out_size))) {
                     return;
                 }
-                if (rpc_tensor_phone_stage_profile_enabled()) {
+                const int64_t header_send_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (!response.empty() &&
+                        !sock->send_data(
+                            response.data(),
+                            response.size())) {
+                    return;
+                }
+                const int64_t payload_send_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (stage_profile) {
                     std::fprintf(
                         stderr,
                         "[TENSOR_PHONE_RPC_STAGE] side=phone "
-                        "stage=route_snapshot_wire_send lane=%u "
-                        "seq=%" PRIu64 " bytes=%zu send_msg_ms=%.3f\n",
+                        "stage=route_snapshot_server_dispatch lane=%u "
+                        "seq=%" PRIu64 " bytes=%zu "
+                        "request_body_recv_ms=%.3f "
+                        "recv_to_dispatch_ms=%.3f "
+                        "get_route_total_ms=%.3f "
+                        "dispatch_to_header_ms=%.3f "
+                        "header_send_ms=%.3f payload_send_ms=%.3f "
+                        "wire_send_total_ms=%.3f\n",
                         request.lane,
                         request.seq,
                         response.size(),
-                        (ggml_time_us() - send_begin_us) / 1000.0);
+                        (request_recv_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        (dispatch_begin_us -
+                            request_recv_done_us) / 1000.0,
+                        (dispatch_done_us -
+                            dispatch_begin_us) / 1000.0,
+                        (header_send_begin_us -
+                            dispatch_done_us) / 1000.0,
+                        (header_send_done_us -
+                            header_send_begin_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_done_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_begin_us) / 1000.0);
                     std::fflush(stderr);
                 }
                 break;
