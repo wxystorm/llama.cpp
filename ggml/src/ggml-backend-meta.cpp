@@ -5236,6 +5236,30 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr;
     const bool phone_prefill_chunk_join =
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
+    const bool phone_prefill_route_lane_swap =
+        std::getenv("GGML_RPC_ROUTE_LANE_SWAP") != nullptr;
+
+    auto phone_prefill_route_lane_for_chunk =
+        [&](int chunk) -> size_t {
+            GGML_ASSERT(chunk >= 0);
+            size_t lane =
+                static_cast<size_t>(chunk) %
+                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+            if (phone_prefill_route_lane_swap) {
+                static_assert(
+                    ggml_backend_meta_context::PREFILL_ROUTE_LANES == 2,
+                    "route lane swap experiment requires exactly two lanes");
+                lane ^= size_t(1);
+            }
+            return lane;
+        };
+
+    if ((pipeline_debug || tensor_phone_stage_profile) &&
+            phone_prefill_route_lane_swap) {
+        printf(
+            "[PHONE_PREFILL_ROUTE_LANE_MAP] swap=1 "
+            "chunk_even=1 chunk_odd=0\n");
+    }
 
     // Fine-grained Phone-primary correctness fences for A/B isolation.
     // The legacy STRICT_FENCE remains an umbrella and preserves its older
@@ -5646,8 +5670,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             const size_t lane =
-                static_cast<size_t>(chunk) %
-                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+                phone_prefill_route_lane_for_chunk(chunk);
             auto & route_worker =
                 backend_ctx->prefill_route_workers[lane];
             if (route_worker == nullptr) {
@@ -7395,8 +7418,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (allow_prefill_route_pipeline) {
                 const size_t lane =
-                    static_cast<size_t>(phone_route_chunk) %
-                    ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+                    phone_prefill_route_lane_for_chunk(
+                        phone_route_chunk);
 
                 auto & route_worker =
                     backend_ctx->prefill_route_workers[lane];
