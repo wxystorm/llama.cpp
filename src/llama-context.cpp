@@ -5207,6 +5207,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const int32_t n_outputs_saved = n_outputs;
         bool apply_mctx = false;
+        llama_hybrid_stage_timing phone_stage_timing {};
+        const int64_t phone_submit_begin_us = ggml_time_us();
         llm_graph_result * result = run_hybrid_stage_block(
             job.ubatch, stage,
             token_begin, block_tokens,
@@ -5216,10 +5218,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
             sched_phone.get(), gf_res_phone.get(),
             job.ubatch_id, job.stage_index, block_index,
             block.action, block_outputs,
-            apply_mctx, false, status, nullptr);
+            apply_mctx, false, status, &phone_stage_timing);
+        const int64_t phone_submit_total_us =
+            ggml_time_us() - phone_submit_begin_us;
         n_outputs = n_outputs_saved;
         static_cast<llama_kv_cache_context *>(
             mctx.get())->clear_stage_range();
+
+        if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+            const int64_t phone_submit_accounted_us =
+                phone_stage_timing.prepare_us +
+                phone_stage_timing.compute_range_us +
+                phone_stage_timing.sync_us;
+            const int64_t phone_submit_unaccounted_us =
+                std::max<int64_t>(
+                    0,
+                    phone_submit_total_us -
+                        phone_submit_accounted_us);
+            LLAMA_LOG_DEBUG(
+                "[PHONE_ASYNC_SUBMIT_TIMING] ub=%d block=%zu/%zu "
+                "tokens=%u total_ms=%.3f prepare_ms=%.3f "
+                "compute_ms=%.3f sync_ms=%.3f unaccounted_ms=%.3f "
+                "status=%d\n",
+                job.ubatch_id,
+                block_index + 1,
+                hybrid_phone_pending.blocks.size(),
+                block_tokens,
+                phone_submit_total_us / 1000.0,
+                phone_stage_timing.prepare_us / 1000.0,
+                phone_stage_timing.compute_range_us / 1000.0,
+                phone_stage_timing.sync_us / 1000.0,
+                phone_submit_unaccounted_us / 1000.0,
+                (int) status);
+        }
 
         if (result == nullptr || status != GGML_STATUS_SUCCESS) {
             hybrid_phone_pending = {};
