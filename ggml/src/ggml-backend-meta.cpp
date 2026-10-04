@@ -4629,9 +4629,59 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return (last->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     };
     auto subgraph_is_phone_owned = [&](size_t sg) -> bool {
-        return n_backends == 2 &&
-               !subgraph_last_has_compute(0, sg) &&
-               subgraph_last_has_compute(1, sg);
+        if (n_backends != 2 || sg >= backend_ctx->n_subgraphs) {
+            return false;
+        }
+
+        if (!subgraph_last_has_compute(0, sg) &&
+                subgraph_last_has_compute(1, sg)) {
+            return true;
+        }
+
+        // Some attention subgraphs end in a VIEW/RESHAPE tensor such as
+        // Vcur-*.  These metadata nodes can retain COMPUTE on both simple
+        // backends even when every real producer in the subgraph is
+        // Phone-owned.  Using only the terminal node then misclassifies a
+        // PHONE_ONLY block as mirrored and generic communication attempts to
+        // copy the backend-specific view itself, whose strides/view offsets
+        // need not match.
+        ggml_cgraph * pc_graph =
+            backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+        ggml_cgraph * phone_graph =
+            backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+        if (pc_graph == nullptr || phone_graph == nullptr ||
+                pc_graph->n_nodes != phone_graph->n_nodes ||
+                pc_graph->n_nodes == 0) {
+            return false;
+        }
+
+        const auto is_metadata_only = [](const ggml_tensor * node) {
+            if (node == nullptr) {
+                return true;
+            }
+            return node->op == GGML_OP_VIEW ||
+                   node->op == GGML_OP_RESHAPE ||
+                   node->op == GGML_OP_PERMUTE ||
+                   node->op == GGML_OP_TRANSPOSE;
+        };
+
+        bool pc_real_compute = false;
+        bool phone_real_compute = false;
+        for (int k = 0; k < pc_graph->n_nodes; ++k) {
+            ggml_tensor * pc_node = pc_graph->nodes[k];
+            ggml_tensor * phone_node = phone_graph->nodes[k];
+
+            if (!is_metadata_only(pc_node) &&
+                    (pc_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                pc_real_compute = true;
+            }
+            if (!is_metadata_only(phone_node) &&
+                    (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                phone_real_compute = true;
+            }
+        }
+
+        return !pc_real_compute && phone_real_compute;
     };
     auto subgraph_will_execute_pc = [&](size_t sg) -> bool {
         if (subgraph_is_phone_owned(sg)) {
@@ -4763,7 +4813,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         [&](size_t sg, int & layer) -> bool {
             layer = -1;
             if (n_backends != 2 ||
-                    sg >= backend_ctx->n_subgraphs) {
+                    sg >= backend_ctx->n_subgraphs ||
+                    !subgraph_is_phone_owned(sg)) {
                 return false;
             }
 
