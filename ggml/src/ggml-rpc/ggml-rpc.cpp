@@ -2127,6 +2127,59 @@ static bool ggml_backend_rpc_route_mark_ready(
         request);
 }
 
+static constexpr uint64_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG =
+    UINT64_C(1) << 63;
+
+struct rpc_route_topk_compact_layout {
+    bool supported = false;
+    size_t rows = 0;
+    size_t row_bytes = 0;
+    size_t stride_bytes = 0;
+    size_t wire_bytes = 0;
+};
+
+static rpc_route_topk_compact_layout
+rpc_route_topk_compact_layout_for_tensor(
+        const ggml_tensor * tensor) {
+    rpc_route_topk_compact_layout layout {};
+    if (tensor == nullptr ||
+            tensor->type != GGML_TYPE_I32 ||
+            tensor->ne[0] <= 0 ||
+            tensor->ne[1] <= 0 ||
+            tensor->ne[2] != 1 ||
+            tensor->ne[3] != 1 ||
+            tensor->nb[0] != sizeof(int32_t)) {
+        return layout;
+    }
+
+    const size_t cols = static_cast<size_t>(tensor->ne[0]);
+    const size_t rows = static_cast<size_t>(tensor->ne[1]);
+    if (cols > SIZE_MAX / sizeof(int32_t)) {
+        return layout;
+    }
+    const size_t row_bytes = cols * sizeof(int32_t);
+    if (tensor->nb[1] < row_bytes ||
+            rows > SIZE_MAX / row_bytes) {
+        return layout;
+    }
+
+    const size_t wire_bytes = rows * row_bytes;
+    const size_t storage_bytes = ggml_nbytes(tensor);
+    if (wire_bytes > storage_bytes ||
+            (rows > 0 &&
+             (rows - 1) > (storage_bytes - row_bytes) / tensor->nb[1])) {
+        return layout;
+    }
+
+    layout.supported = true;
+    layout.rows = rows;
+    layout.row_bytes = row_bytes;
+    layout.stride_bytes = tensor->nb[1];
+    layout.wire_bytes = wire_bytes;
+    return layout;
+}
+
+
 static bool ggml_backend_rpc_route_snapshot_ready(
         ggml_backend_t backend,
         uint64_t seq,
@@ -3700,57 +3753,6 @@ struct rpc_snapshot_device {
     std::array<rpc_snapshot_slot, 2> slots;
 };
 
-static constexpr uint64_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG =
-    UINT64_C(1) << 63;
-
-struct rpc_route_topk_compact_layout {
-    bool supported = false;
-    size_t rows = 0;
-    size_t row_bytes = 0;
-    size_t stride_bytes = 0;
-    size_t wire_bytes = 0;
-};
-
-static rpc_route_topk_compact_layout
-rpc_route_topk_compact_layout_for_tensor(
-        const ggml_tensor * tensor) {
-    rpc_route_topk_compact_layout layout {};
-    if (tensor == nullptr ||
-            tensor->type != GGML_TYPE_I32 ||
-            tensor->ne[0] <= 0 ||
-            tensor->ne[1] <= 0 ||
-            tensor->ne[2] != 1 ||
-            tensor->ne[3] != 1 ||
-            tensor->nb[0] != sizeof(int32_t)) {
-        return layout;
-    }
-
-    const size_t cols = static_cast<size_t>(tensor->ne[0]);
-    const size_t rows = static_cast<size_t>(tensor->ne[1]);
-    if (cols > SIZE_MAX / sizeof(int32_t)) {
-        return layout;
-    }
-    const size_t row_bytes = cols * sizeof(int32_t);
-    if (tensor->nb[1] < row_bytes ||
-            rows > SIZE_MAX / row_bytes) {
-        return layout;
-    }
-
-    const size_t wire_bytes = rows * row_bytes;
-    const size_t storage_bytes = ggml_nbytes(tensor);
-    if (wire_bytes > storage_bytes ||
-            (rows > 0 &&
-             (rows - 1) > (storage_bytes - row_bytes) / tensor->nb[1])) {
-        return layout;
-    }
-
-    layout.supported = true;
-    layout.rows = rows;
-    layout.row_bytes = row_bytes;
-    layout.stride_bytes = tensor->nb[1];
-    layout.wire_bytes = wire_bytes;
-    return layout;
-}
 
 struct rpc_route_snapshot_slot {
     std::mutex mutex;
