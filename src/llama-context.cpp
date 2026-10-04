@@ -2369,8 +2369,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             llama_hybrid_runtime_stage_name(stage.kind),
             stage.layer_begin, stage.layer_end, block_tokens, n_splits);
     }
+    ggml_backend_t async_meta_backend = nullptr;
+    bool async_meta_armed = false;
+    const bool async_phone_meta_candidate =
+        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        !synchronize &&
+        n_splits == 1;
+    if (async_phone_meta_candidate) {
+        async_meta_backend =
+            ggml_backend_sched_get_split_backend(sched_use, 0);
+        async_meta_armed =
+            ggml_backend_meta_set_async_graph_compute(
+                async_meta_backend, true);
+        if (phone_cpu_chunk_stage_trace) {
+            LLAMA_LOG_DEBUG(
+                "[PHONE_ASYNC_META_ARM] ub=%d block=%zu splits=%d "
+                "armed=%d backend=%s\n",
+                ubatch_id,
+                block_index,
+                n_splits,
+                async_meta_armed ? 1 : 0,
+                async_meta_backend != nullptr ?
+                    ggml_backend_name(async_meta_backend) : "(null)");
+        }
+    } else if (stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+               !synchronize &&
+               phone_cpu_chunk_stage_trace) {
+        LLAMA_LOG_DEBUG(
+            "[PHONE_ASYNC_META_ARM] ub=%d block=%zu splits=%d "
+            "armed=0 reason=requires-single-split\n",
+            ubatch_id,
+            block_index,
+            n_splits);
+    }
+
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    if (async_meta_armed) {
+        (void) ggml_backend_meta_set_async_graph_compute(
+            async_meta_backend, false);
+    }
     if (phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
@@ -5285,6 +5323,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
             job.ubatch_id,
             block_index + 1,
             hybrid_phone_pending.blocks.size());
+
+        if (ggml_backend_sched_get_n_splits(
+                sched_phone.get()) == 1) {
+            ggml_backend_t phone_split_backend =
+                ggml_backend_sched_get_split_backend(
+                    sched_phone.get(), 0);
+            const ggml_status async_meta_status =
+                ggml_backend_meta_wait_async_graph(
+                    phone_split_backend);
+            if (async_meta_status != GGML_STATUS_SUCCESS) {
+                status = async_meta_status;
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PIPE] ub=%d PHONE_ASYNC_META_FAILED "
+                    "block=%zu/%zu status=%d\n",
+                    job.ubatch_id,
+                    block_index + 1,
+                    hybrid_phone_pending.blocks.size(),
+                    (int) status);
+                hybrid_phone_pending = {};
+                return nullptr;
+            }
+        }
 
         ggml_backend_sched_synchronize(sched_phone.get());
         const int64_t ready_us = ggml_time_us();
