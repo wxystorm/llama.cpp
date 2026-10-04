@@ -718,11 +718,14 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_pipe.reset(new llm_graph_result(max_nodes));
+    gf_res_phone.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                        cparams.pipeline_parallel, cparams.op_offload));
     sched_pipe.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
                                             false, cparams.op_offload));
+    sched_phone.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                                             false, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -4266,9 +4269,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool ordinary_vertical_pipeline =
             gpu_cpu_topology || gpu_phone_topology || gpu_cpu_phone_topology;
         LLAMA_LOG_DEBUG(
-            "[HYBRID_PIPE] mode=%s batch=%u ubatch=%u macros=%u stages=%zu\n",
+            "[HYBRID_PIPE] mode=%s batch=%u ubatch=%u macros=%u stages=%zu phone_async=%d\n",
             ordinary_vertical_pipeline ? "VERTICAL_NO_TENSOR" : "GPU_DOWNSTREAM",
-            n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size());
+            n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size(),
+            (gpu_cpu_phone_topology &&
+             std::getenv("LLAMA_HYBRID_DISABLE_PHONE_ASYNC") == nullptr) ? 1 : 0);
     } else if (stage_serial_runtime_enabled) {
         // Serial staged execution already materializes every stage output into
         // a full hidden buffer. Use the largest stage macro for the memory
@@ -4377,6 +4382,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
     std::deque<llama_hybrid_job> hybrid_cpu_ready_q;
     std::deque<llama_hybrid_job> hybrid_tensor_ready_q;
     std::deque<llama_hybrid_job> hybrid_phone_ready_q;
+
+    struct llama_hybrid_phone_pending_state {
+        bool active = false;
+        llama_hybrid_job job;
+        std::vector<llama_hybrid_boundary_block> blocks;
+        size_t block_index = 0;
+        int64_t submit_us = 0;
+    };
+    llama_hybrid_phone_pending_state hybrid_phone_pending;
+
+    const char * disable_phone_async_env =
+        std::getenv("LLAMA_HYBRID_DISABLE_PHONE_ASYNC");
+    const bool hybrid_phone_async_enabled =
+        gpu_cpu_phone_topology &&
+        !(disable_phone_async_env != nullptr &&
+          std::atoi(disable_phone_async_env) != 0);
+
     size_t hybrid_tensor_ready_bytes = 0;
     size_t hybrid_phone_ready_bytes = 0;
     size_t hybrid_tensor_queue_limit_bytes = 16ull * 1024 * 1024;
@@ -4405,7 +4427,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const auto hybrid_has_ready = [&]() {
-        return !hybrid_cpu_ready_q.empty() || !hybrid_tensor_ready_q.empty() || !hybrid_phone_ready_q.empty();
+        return !hybrid_cpu_ready_q.empty() ||
+               !hybrid_tensor_ready_q.empty() ||
+               !hybrid_phone_ready_q.empty() ||
+               hybrid_phone_pending.active ||
+               (!hybrid_phone_pending.blocks.empty() &&
+                hybrid_phone_pending.block_index <
+                    hybrid_phone_pending.blocks.size());
     };
 
     std::deque<llama_prefill_pipe_slot *> handoff_q;
@@ -5061,6 +5089,207 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return result;
     };
 
+    const auto hybrid_phone_validate_blocks =
+            [&](const llama_hybrid_job & job,
+                const std::vector<llama_hybrid_boundary_block> & blocks,
+                ggml_status & status) -> bool {
+        if (blocks.empty()) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PIPE] ub=%d PHONE async empty boundary plan\n",
+                job.ubatch_id);
+            status = GGML_STATUS_FAILED;
+            return false;
+        }
+
+        for (const auto & block : blocks) {
+            if (block.action != llama_hybrid_boundary_action::ACCUMULATE) {
+                continue;
+            }
+
+            bool contiguous = !block.inputs.empty();
+            int covered_until = block.output.token_begin;
+            for (const auto & input : block.inputs) {
+                if (input.token_begin != covered_until || input.n_tokens <= 0) {
+                    contiguous = false;
+                    break;
+                }
+                covered_until += input.n_tokens;
+            }
+            contiguous =
+                contiguous &&
+                covered_until ==
+                    block.output.token_begin + block.output.n_tokens;
+            if (!contiguous) {
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_PIPE] ub=%d PHONE async unsupported ACCUMULATE "
+                    "output=[%d,%d) inputs=%zu\n",
+                    job.ubatch_id,
+                    block.output.token_begin,
+                    block.output.token_begin + block.output.n_tokens,
+                    block.inputs.size());
+                status = GGML_STATUS_FAILED;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto hybrid_phone_submit_next = [&](ggml_status & status) {
+        GGML_ASSERT(hybrid_phone_async_enabled);
+        GGML_ASSERT(!hybrid_phone_pending.active);
+
+        if (hybrid_phone_pending.blocks.empty()) {
+            GGML_ASSERT(!hybrid_phone_ready_q.empty());
+
+            const size_t phone_bytes =
+                hybrid_phone_ready_q.front().hidden.capacity() *
+                sizeof(float);
+            GGML_ASSERT(hybrid_phone_ready_bytes >= phone_bytes);
+            hybrid_phone_ready_bytes -= phone_bytes;
+
+            hybrid_phone_pending.job =
+                std::move(hybrid_phone_ready_q.front());
+            hybrid_phone_ready_q.pop_front();
+            hybrid_phone_pending.block_index = 0;
+
+            const auto & job = hybrid_phone_pending.job;
+            GGML_ASSERT(job.stage_index < runtime_stages.size());
+            GGML_ASSERT(
+                runtime_stages[job.stage_index].kind ==
+                llama_hybrid_runtime_stage_kind::PHONE);
+
+            const auto & previous_stage =
+                runtime_stages[job.stage_index - 1];
+            const auto & stage =
+                runtime_stages[job.stage_index];
+            hybrid_phone_pending.blocks =
+                llama_hybrid_plan_boundary(
+                    job.ubatch.n_tokens,
+                    previous_stage.macro_tokens,
+                    stage.macro_tokens);
+
+            if (!hybrid_phone_validate_blocks(
+                    job, hybrid_phone_pending.blocks, status)) {
+                hybrid_phone_pending = {};
+                return;
+            }
+
+            LLAMA_LOG_DEBUG(
+                "[HYBRID_PIPE] ub=%d PHONE_ASYNC_DEQUEUE "
+                "job_mib=%.2f queue_mib=%.2f blocks=%zu\n",
+                job.ubatch_id,
+                phone_bytes / 1048576.0,
+                hybrid_phone_ready_bytes / 1048576.0,
+                hybrid_phone_pending.blocks.size());
+            LLAMA_LOG_DEBUG(
+                "[HYBRID_PIPE] ub=%d PHONE_PHASE_BEGIN stage=%zu blocks=%zu mode=ASYNC_BLOCK\n",
+                job.ubatch_id, job.stage_index,
+                hybrid_phone_pending.blocks.size());
+        }
+
+        auto & job = hybrid_phone_pending.job;
+        const auto & stage = runtime_stages[job.stage_index];
+        const size_t block_index = hybrid_phone_pending.block_index;
+        GGML_ASSERT(block_index < hybrid_phone_pending.blocks.size());
+        const auto & block = hybrid_phone_pending.blocks[block_index];
+
+        const uint32_t token_begin = block.output.token_begin;
+        const uint32_t block_tokens = block.output.n_tokens;
+        const int64_t n_embd = model.hparams.n_embd;
+        float * stage_input =
+            job.hidden.data() + (size_t) token_begin * n_embd;
+
+        int32_t block_outputs = 0;
+        for (uint32_t i = 0; i < block_tokens; ++i) {
+            block_outputs +=
+                job.ubatch.output[token_begin + i] != 0;
+        }
+
+        const int32_t n_outputs_saved = n_outputs;
+        bool apply_mctx = false;
+        llm_graph_result * result = run_hybrid_stage_block(
+            job.ubatch, stage,
+            token_begin, block_tokens,
+            stage_input, nullptr,
+            ctx_type_to_graph_type(cparams.ctx_type),
+            mctx.get(),
+            sched_phone.get(), gf_res_phone.get(),
+            job.ubatch_id, job.stage_index, block_index,
+            block.action, block_outputs,
+            apply_mctx, false, status, nullptr);
+        n_outputs = n_outputs_saved;
+        static_cast<llama_kv_cache_context *>(
+            mctx.get())->clear_stage_range();
+
+        if (result == nullptr || status != GGML_STATUS_SUCCESS) {
+            hybrid_phone_pending = {};
+            return;
+        }
+
+        hybrid_phone_pending.active = true;
+        hybrid_phone_pending.submit_us = ggml_time_us();
+        LLAMA_LOG_DEBUG(
+            "[HYBRID_PIPE] ub=%d PHONE_SUBMIT block=%zu/%zu "
+            "tokens=[%u,%u) action=%s\n",
+            job.ubatch_id,
+            block_index + 1,
+            hybrid_phone_pending.blocks.size(),
+            token_begin, token_begin + block_tokens,
+            llama_hybrid_boundary_action_name(block.action));
+    };
+
+    const auto hybrid_phone_harvest =
+            [&](ggml_status & status) -> llm_graph_result * {
+        GGML_ASSERT(hybrid_phone_async_enabled);
+        GGML_ASSERT(hybrid_phone_pending.active);
+
+        auto & job = hybrid_phone_pending.job;
+        const size_t block_index =
+            hybrid_phone_pending.block_index;
+        const auto & block =
+            hybrid_phone_pending.blocks[block_index];
+
+        LLAMA_LOG_DEBUG(
+            "[HYBRID_PIPE] ub=%d PHONE_WAIT block=%zu/%zu\n",
+            job.ubatch_id,
+            block_index + 1,
+            hybrid_phone_pending.blocks.size());
+
+        ggml_backend_sched_synchronize(sched_phone.get());
+        const int64_t ready_us = ggml_time_us();
+        LLAMA_LOG_DEBUG(
+            "[HYBRID_PIPE] ub=%d PHONE_READY block=%zu/%zu "
+            "tokens=[%d,%d) wall_ms=%.3f\n",
+            job.ubatch_id,
+            block_index + 1,
+            hybrid_phone_pending.blocks.size(),
+            block.output.token_begin,
+            block.output.token_begin + block.output.n_tokens,
+            (ready_us - hybrid_phone_pending.submit_us) / 1000.0);
+
+        hybrid_phone_pending.active = false;
+        ++hybrid_phone_pending.block_index;
+
+        if (hybrid_phone_pending.block_index <
+            hybrid_phone_pending.blocks.size()) {
+            hybrid_phone_submit_next(status);
+            return nullptr;
+        }
+
+        const bool has_outputs = job.n_outputs > 0;
+        const int completed_ub = job.ubatch_id;
+        const size_t completed_stage = job.stage_index;
+        job.stage_index++;
+
+        GGML_ASSERT(job.stage_index == runtime_stages.size());
+        LLAMA_LOG_DEBUG(
+            "[HYBRID_PIPE] ub=%d PHONE_PHASE_END stage=%zu mode=ASYNC_BLOCK\n",
+            completed_ub, completed_stage);
+
+        hybrid_phone_pending = {};
+        return has_outputs ? gf_res_phone.get() : nullptr;
+    };
+
     const auto hybrid_run_phone_one = [&](ggml_status & status) -> llm_graph_result * {
         GGML_ASSERT(!hybrid_phone_ready_q.empty());
 
@@ -5091,8 +5320,65 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return nullptr;
         }
 
-        const bool phone_pressure = hybrid_phone_ready_bytes >= hybrid_phone_queue_limit_bytes;
-        const bool tensor_pressure = hybrid_tensor_ready_bytes >= hybrid_tensor_queue_limit_bytes;
+        const bool phone_pressure =
+            hybrid_phone_ready_bytes >= hybrid_phone_queue_limit_bytes;
+        const bool tensor_pressure =
+            hybrid_tensor_ready_bytes >= hybrid_tensor_queue_limit_bytes;
+
+        // Ordinary GPU->CPU->PHONE can keep one Phone block in flight on its
+        // dedicated scheduler while the host immediately runs the next CPU
+        // job.  Only harvest the Phone block when CPU work is no longer ready
+        // (or queue pressure explicitly asks us to drain it).
+        if (hybrid_phone_async_enabled) {
+            if (!hybrid_phone_pending.active &&
+                hybrid_phone_pending.blocks.empty() &&
+                !hybrid_phone_ready_q.empty()) {
+                hybrid_phone_submit_next(status);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return nullptr;
+                }
+            }
+
+            if (phone_pressure && hybrid_phone_pending.active) {
+                LLAMA_LOG_DEBUG(
+                    "[HYBRID_SCHED] choose=PHONE_ASYNC_HARVEST reason=HWM "
+                    "cpu_q=%zu phone_q=%zu phone_mib=%.2f\n",
+                    hybrid_cpu_ready_q.size(),
+                    hybrid_phone_ready_q.size(),
+                    hybrid_phone_ready_bytes / 1048576.0);
+                return hybrid_phone_harvest(status);
+            }
+
+            if (!hybrid_cpu_ready_q.empty()) {
+                LLAMA_LOG_DEBUG(
+                    "[HYBRID_SCHED] choose=CPU reason=PHONE_ASYNC_OVERLAP "
+                    "cpu_q=%zu phone_pending=%d phone_q=%zu\n",
+                    hybrid_cpu_ready_q.size(),
+                    hybrid_phone_pending.active ? 1 : 0,
+                    hybrid_phone_ready_q.size());
+                return hybrid_run_cpu_one(status);
+            }
+
+            if (!hybrid_tensor_ready_q.empty()) {
+                return hybrid_run_tensor_one(status);
+            }
+
+            if (hybrid_phone_pending.active) {
+                return hybrid_phone_harvest(status);
+            }
+
+            if (!hybrid_phone_pending.blocks.empty()) {
+                hybrid_phone_submit_next(status);
+                return nullptr;
+            }
+
+            if (!hybrid_phone_ready_q.empty()) {
+                hybrid_phone_submit_next(status);
+                return nullptr;
+            }
+
+            return nullptr;
+        }
 
         if (phone_pressure && !hybrid_phone_ready_q.empty()) {
             LLAMA_LOG_DEBUG(
@@ -5285,8 +5571,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
                 if (status == GGML_STATUS_SUCCESS) {
-                    sched_use = sched_pipe.get();
-                    res_use   = gf_res_pipe.get();
+                    if (hybrid_phone_async_enabled) {
+                        sched_use = sched_phone.get();
+                        res_use   = gf_res_phone.get();
+                    } else {
+                        sched_use = sched_pipe.get();
+                        res_use   = gf_res_pipe.get();
+                    }
                 }
             } else if (status == GGML_STATUS_SUCCESS) {
                 pipe_success = true;
@@ -5295,7 +5586,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             if (status != GGML_STATUS_SUCCESS) {
                 synchronize();
+                if (hybrid_phone_pending.active) {
+                    ggml_backend_sched_synchronize(sched_phone.get());
+                }
                 hybrid_gpu_pending_active = false;
+                hybrid_phone_pending = {};
                 hybrid_cpu_ready_q.clear();
                 hybrid_tensor_ready_q.clear();
                 hybrid_phone_ready_q.clear();
