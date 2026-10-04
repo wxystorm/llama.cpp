@@ -3260,6 +3260,18 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     const int64_t meta_graph_start_us = ggml_time_us();
+    const bool wave_crash_trace =
+        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
+    if (wave_crash_trace) {
+        fprintf(
+            stderr,
+            "[WAVE_CRASH_TRACE] phase=META_ENTER uid=%" PRIu64
+            " nodes=%d leafs=%d\n",
+            cgraph->uid,
+            cgraph->n_nodes,
+            cgraph->n_leafs);
+        fflush(stderr);
+    }
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -3296,7 +3308,27 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
         assert(needs_rebuild);
     }
 
+    if (wave_crash_trace) {
+        fprintf(
+            stderr,
+            "[WAVE_CRASH_TRACE] phase=META_REBUILD_CHECK uid=%" PRIu64
+            " cached_uid=%" PRIu64 " needs=%d max_nnodes=%zu nodes=%d\n",
+            cgraph->uid,
+            backend_ctx->uid,
+            needs_rebuild ? 1 : 0,
+            backend_ctx->max_nnodes,
+            cgraph->n_nodes);
+        fflush(stderr);
+    }
+
     if (needs_rebuild) {
+        if (wave_crash_trace) {
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=META_REBUILD_BEGIN uid=%" PRIu64 "\n",
+                cgraph->uid);
+            fflush(stderr);
+        }
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
@@ -3973,6 +4005,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     }
     if (needs_rebuild) {
         meta_rebuild_us = ggml_time_us() - meta_rebuild_begin_us;
+        if (wave_crash_trace) {
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=META_REBUILD_END uid=%" PRIu64
+                " subgraphs=%zu rebuild_ms=%.3f\n",
+                cgraph->uid,
+                backend_ctx->n_subgraphs,
+                meta_rebuild_us / 1000.0);
+            fflush(stderr);
+        }
     }
 
     size_t iga = 0; // i graph aux
@@ -10973,8 +11015,49 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
     }
 
+    if (wave_crash_trace) {
+        fprintf(
+            stderr,
+            "[WAVE_CRASH_TRACE] phase=META_EXEC_BEGIN subgraphs=%zu\n",
+            backend_ctx->n_subgraphs);
+        fflush(stderr);
+    }
+
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        if (wave_crash_trace) {
+            const ggml_cgraph * pc_trace_graph =
+                n_backends > 0 ?
+                    backend_ctx->backend_configs[0].cgraphs[i].cgraph_main :
+                    nullptr;
+            const ggml_cgraph * phone_trace_graph =
+                n_backends > 1 ?
+                    backend_ctx->backend_configs[1].cgraphs[i].cgraph_main :
+                    nullptr;
+            const char * pc_first =
+                pc_trace_graph != nullptr && pc_trace_graph->n_nodes > 0 ?
+                    pc_trace_graph->nodes[0]->name : "(none)";
+            const char * pc_last =
+                pc_trace_graph != nullptr && pc_trace_graph->n_nodes > 0 ?
+                    pc_trace_graph->nodes[pc_trace_graph->n_nodes - 1]->name :
+                    "(none)";
+            const char * phone_first =
+                phone_trace_graph != nullptr && phone_trace_graph->n_nodes > 0 ?
+                    phone_trace_graph->nodes[0]->name : "(none)";
+            const char * phone_last =
+                phone_trace_graph != nullptr && phone_trace_graph->n_nodes > 0 ?
+                    phone_trace_graph->nodes[phone_trace_graph->n_nodes - 1]->name :
+                    "(none)";
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=META_SG_BEGIN sg=%zu "
+                "pc_nodes=%d phone_nodes=%d pc=[%s..%s] phone=[%s..%s]\n",
+                i,
+                pc_trace_graph != nullptr ? pc_trace_graph->n_nodes : 0,
+                phone_trace_graph != nullptr ? phone_trace_graph->n_nodes : 0,
+                pc_first, pc_last, phone_first, phone_last);
+            fflush(stderr);
+        }
         const size_t timing_sg = i;
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
