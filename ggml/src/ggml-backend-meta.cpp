@@ -11193,6 +11193,15 @@ auto prefill_norm_sg_has_prework =
 
         return false;
     };
+        int phone_primary_prefill_route_layer = -1;
+        int phone_primary_prefill_route_chunk = -1;
+        const bool is_phone_primary_prefill_route_sg =
+            tensor_phone_stage_route_identity(
+                i,
+                phone_primary_prefill_route_layer,
+                phone_primary_prefill_route_chunk) &&
+            phone_primary_prefill_route_chunk >= 0;
+
         const bool norm_can_overlap =
             is_prefill_norm_sg &&
             has_pending_prefill_reduce_for_layer(prefill_norm_layer) &&
@@ -11206,7 +11215,22 @@ auto prefill_norm_sg_has_prework =
             norm_can_overlap ||
             down_can_overlap ||
             is_prefill_wave_attn_sg ||
-            is_prefill_wave_l_out_sg;
+            is_prefill_wave_l_out_sg ||
+            is_phone_primary_prefill_route_sg;
+
+        if (wave_crash_trace &&
+                is_phone_primary_prefill_route_sg) {
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=PREWORK_ROUTE_CONTINUE "
+                "sg=%zu layer=%d chunk=%d pending_phone_layer=%d\n",
+                i,
+                phone_primary_prefill_route_layer,
+                phone_primary_prefill_route_chunk,
+                has_pending_phone_prefill_pc_for_layer(
+                    phone_primary_prefill_route_layer) ? 1 : 0);
+            fflush(stderr);
+        }
         if (return_wavefront_graph &&
                 (is_prefill_wave_attn_sg ||
                  is_prefill_wave_l_out_sg ||
@@ -11417,6 +11441,17 @@ auto prefill_norm_sg_has_prework =
                      phone_prefill_chunk_join_active &&
                      !pending_phone_prefill_pc_branches.empty())) &&
                    !continues_prefill_layer) {
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=PREWORK_BARRIER_BEGIN "
+                    "sg=%zu pending_reduce=%d pending_phone=%zu\n",
+                    i,
+                    has_pending_prefill_reduce() ? 1 : 0,
+                    pending_phone_prefill_pc_branches.size());
+                fflush(stderr);
+            }
+
             size_t pending_lanes = 0;
             int barrier_layer = -1;
             for (size_t lane = 0; lane < ggml_backend_meta_context::PREFILL_RETURN_LANES; ++lane) {
