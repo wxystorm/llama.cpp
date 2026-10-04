@@ -2371,9 +2371,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
     ggml_backend_t async_meta_backend = nullptr;
     bool async_meta_armed = false;
+    const bool async_phone_meta_disabled =
+        std::getenv("LLAMA_HYBRID_DISABLE_META_ASYNC") != nullptr;
     const bool async_phone_meta_candidate =
         stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
         !synchronize &&
+        !async_phone_meta_disabled &&
         n_splits == 1;
     if (async_phone_meta_candidate) {
         async_meta_backend =
@@ -2397,10 +2400,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
             "[PHONE_ASYNC_META_ARM] ub=%d block=%zu splits=%d "
-            "armed=0 reason=requires-single-split\n",
+            "armed=0 reason=%s\n",
             ubatch_id,
             block_index,
-            n_splits);
+            n_splits,
+            async_phone_meta_disabled ?
+                "disabled-by-env" : "requires-single-split");
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
