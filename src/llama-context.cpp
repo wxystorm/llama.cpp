@@ -2330,6 +2330,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool                               synchronize,
         ggml_status &                      ret,
         llama_hybrid_stage_timing *        timing) {
+    const bool wave_crash_trace =
+        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
+    if (wave_crash_trace) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=STAGE_ENTER ub=%d stage=%zu kind=%s "
+            "layers=[%d,%d) block=%zu tokens=[%u,%u)\n",
+            ubatch_id, stage_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            stage.layer_begin, stage.layer_end,
+            block_index, token_begin, token_begin + block_tokens);
+    }
+
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2349,8 +2361,24 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
 
     const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
+    if (wave_crash_trace) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=PREPARE_BEGIN ub=%d stage=%zu kind=%s "
+            "tokens=%u\n",
+            ubatch_id, stage_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            block_tokens);
+    }
     llm_graph_result * result = prepare_ubatch(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx, &stage);
+    if (wave_crash_trace) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=PREPARE_END ub=%d stage=%zu kind=%s "
+            "result=%p status=%d\n",
+            ubatch_id, stage_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            (void *) result, (int) ret);
+    }
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -2409,7 +2437,23 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
+    if (wave_crash_trace) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=COMPUTE_BEGIN ub=%d stage=%zu kind=%s "
+            "splits=%d tokens=%u\n",
+            ubatch_id, stage_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            n_splits, block_tokens);
+    }
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    if (wave_crash_trace) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=COMPUTE_END ub=%d stage=%zu kind=%s "
+            "status=%d\n",
+            ubatch_id, stage_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            (int) ret);
+    }
     if (async_meta_armed) {
         (void) ggml_backend_meta_set_async_graph_compute(
             async_meta_backend, false);
