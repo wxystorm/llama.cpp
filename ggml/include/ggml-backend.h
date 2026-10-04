@@ -515,6 +515,18 @@ extern "C" {
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
+    // Run the next Meta graph_compute on a dedicated worker and return once
+    // graph rebuild/preparation has completed. Intended for the dedicated
+    // hybrid Phone scheduler, whose graph lifetime is kept valid until harvest.
+    // Returns false for non-Meta backends.
+    GGML_API bool ggml_backend_meta_set_async_graph_compute(
+        ggml_backend_t backend, bool enabled);
+
+    // Join a pending async Meta graph, if any, and return its compute status.
+    // Non-Meta backends and Meta backends without pending work return SUCCESS.
+    GGML_API enum ggml_status ggml_backend_meta_wait_async_graph(
+        ggml_backend_t backend);
+
     //
     // Utils
     //
