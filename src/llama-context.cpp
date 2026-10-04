@@ -3889,6 +3889,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
         tensor_phone_first_layer >= 0 &&
         tensor_phone_last_layer > tensor_phone_first_layer;
 
+    // Ordinary vertical-pipeline topologies.  Keep these independent of
+    // Tensor execution so the first inter-stage overlap path can be validated
+    // without changing the existing Tensor/Phone-primary ownership semantics.
+    //
+    // The generalized queue currently does not accumulate multiple upstream
+    // jobs into one downstream job, so every downstream macro must be no
+    // larger than its upstream macro.  For the optional Phone tail keep an
+    // exact subdivision to avoid cross-job range assembly in this first step.
+    const bool gpu_cpu_topology =
+        runtime_stages.size() == 2 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
+        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens;
+    const bool gpu_phone_topology =
+        runtime_stages.size() == 2 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens;
+    const bool gpu_cpu_phone_topology =
+        runtime_stages.size() == 3 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
+        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        runtime_stages[0].macro_tokens >= runtime_stages[1].macro_tokens &&
+        runtime_stages[1].macro_tokens >= runtime_stages[2].macro_tokens &&
+        runtime_stages[1].macro_tokens % runtime_stages[2].macro_tokens == 0;
+
     const bool gpu_tensor_topology =
         runtime_stages.size() == 2 &&
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
@@ -4021,7 +4048,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         !tensor_phone_primary_exec &&
         valid_stage_macros && generalized_stage_arch &&
         !return_wavefront_full_graph_override &&
-        (gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
+        (gpu_cpu_topology || gpu_phone_topology || gpu_cpu_phone_topology ||
+         gpu_tensor_topology || gpu_cpu_tensor_topology || gpu_tensor_phone_topology ||
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
@@ -4223,8 +4251,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         (int) stage_queue_runtime_enabled, (int) (n_macros >= 2), (int) cparams.warmup);
     } else if (generalized_stage_queue_runtime_enabled) {
         runtime_ubatch = std::min<uint32_t>(cparams.n_ubatch, runtime_stages.front().macro_tokens);
+        const bool ordinary_vertical_pipeline =
+            gpu_cpu_topology || gpu_phone_topology || gpu_cpu_phone_topology;
         LLAMA_LOG_DEBUG(
-            "[HYBRID_PIPE] mode=GPU_DOWNSTREAM batch=%u ubatch=%u macros=%u stages=%zu\n",
+            "[HYBRID_PIPE] mode=%s batch=%u ubatch=%u macros=%u stages=%zu\n",
+            ordinary_vertical_pipeline ? "VERTICAL_NO_TENSOR" : "GPU_DOWNSTREAM",
             n_tokens_all, runtime_ubatch, generalized_macros, runtime_stages.size());
     } else if (stage_serial_runtime_enabled) {
         // Serial staged execution already materializes every stage output into
@@ -4922,7 +4953,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return result;
     };
 
-    const auto hybrid_run_cpu_one = [&](ggml_status & status) {
+    const auto hybrid_run_cpu_one = [&](ggml_status & status) -> llm_graph_result * {
         GGML_ASSERT(!hybrid_cpu_ready_q.empty());
 
         llama_hybrid_job job = std::move(hybrid_cpu_ready_q.front());
@@ -4930,14 +4961,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         GGML_ASSERT(job.stage_index < runtime_stages.size());
         GGML_ASSERT(runtime_stages[job.stage_index].kind == llama_hybrid_runtime_stage_kind::CPU);
 
-        hybrid_run_downstream_stage(job, status);
-        if (status != GGML_STATUS_SUCCESS) {
-            return;
+        llm_graph_result * result =
+            hybrid_run_downstream_stage(job, status);
+        if (result == nullptr || status != GGML_STATUS_SUCCESS) {
+            return nullptr;
         }
 
         if (job.stage_index < runtime_stages.size()) {
             hybrid_enqueue_ready(std::move(job), status);
+            return nullptr;
         }
+
+        return result;
     };
 
     const auto hybrid_run_tensor_one = [&](ggml_status & status) -> llm_graph_result * {
@@ -5023,8 +5058,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "[HYBRID_SCHED] choose=CPU reason=PRIORITY cpu_q=%zu tensor_q=%zu tensor_mib=%.2f\n",
                 hybrid_cpu_ready_q.size(), hybrid_tensor_ready_q.size(),
                 hybrid_tensor_ready_bytes / 1048576.0);
-            hybrid_run_cpu_one(status);
-            return nullptr;
+            return hybrid_run_cpu_one(status);
         }
 
         if (!hybrid_tensor_ready_q.empty()) {
