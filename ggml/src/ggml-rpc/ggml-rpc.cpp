@@ -2304,6 +2304,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     const rpc_route_topk_compact_layout topk_layout =
         rpc_route_topk_compact_layout_for_tensor(dst1);
     const bool compact_topk =
+        std::getenv("GGML_RPC_DISABLE_ROUTE_TOPK_COMPACT") == nullptr &&
         remote_patch >=
             RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH &&
         topk_layout.supported &&
