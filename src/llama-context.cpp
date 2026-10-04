@@ -4051,8 +4051,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         phone_primary_cpu_chunk_stages.push_back(
             runtime_stages[1]);
 
+        // Experimental first step toward a real Tensor wavefront:
+        // optionally make the combined Phone-primary suffix consume one XT
+        // mini-ubatch at a time instead of the full ubatch.  The existing
+        // staged executor and boundary planner then naturally produce
+        // [0,XT), [XT,2*XT), ... jobs.  Each job still runs the complete
+        // Tensor+Phone suffix synchronously, so this changes only traversal
+        // order (chunk-major) and does not introduce cross-job concurrency.
+        //
+        // run_hybrid_stage_block() already calls set_stage_range() before
+        // building each sliced ubatch, so causal attention sees the KV prefix
+        // produced by earlier mini-jobs.
+        const char * chunk_major_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_MAJOR");
+        const bool phone_primary_chunk_major =
+            chunk_major_env != nullptr &&
+            std::atoi(chunk_major_env) != 0;
+
         const int suffix_macro_tokens =
-            std::max(1, (int) cparams.n_ubatch);
+            phone_primary_chunk_major ?
+                std::max(1, runtime_plan.tensor_chunk_tokens) :
+                std::max(1, (int) cparams.n_ubatch);
         phone_primary_cpu_chunk_stages.push_back({
             llama_hybrid_runtime_stage_kind::TENSOR,
             runtime_stages[2].layer_begin,
@@ -4066,7 +4085,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
                 "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
                 "SUFFIX=[%d,%d) suffix_macro=%d XT=%d "
-                "mode=PREFIX_STAGED_COMBINED_SUFFIX\n",
+                "mode=%s\n",
                 phone_primary_cpu_chunk_stages[0].layer_begin,
                 phone_primary_cpu_chunk_stages[0].layer_end,
                 phone_primary_cpu_chunk_stages[0].macro_tokens,
@@ -4076,7 +4095,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 phone_primary_cpu_chunk_stages[2].layer_begin,
                 phone_primary_cpu_chunk_stages[2].layer_end,
                 phone_primary_cpu_chunk_stages[2].macro_tokens,
-                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
+                phone_primary_chunk_major ?
+                    "PREFIX_STAGED_CHUNK_MAJOR_SUFFIX" :
+                    "PREFIX_STAGED_COMBINED_SUFFIX");
         }
     } else if (phone_primary_cpu_chunk_requested) {
         LLAMA_LOG_WARN(
