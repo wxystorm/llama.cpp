@@ -205,14 +205,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         llama_hybrid_runtime_prefill_chunk_tokens();
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
-    const bool phone_primary_wavefront_requested =
-        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT") != nullptr;
-    const bool any_wavefront_requested =
-        return_wavefront_requested ||
-        phone_primary_wavefront_requested;
 
     bool moe_stage_wavefront =
-        any_wavefront_requested &&
+        return_wavefront_requested &&
         stage_graph &&
         n_tokens > 1 &&
         ubatch.n_pos == 1 &&
@@ -223,55 +218,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         layer_end - layer_begin > 1 &&
         loras->empty();
 
-    const llama_hybrid_layer_mode wavefront_mode =
-        model.hybrid_layer_mode(layer_begin);
-    const bool phone_primary_wavefront =
-        moe_stage_wavefront &&
-        phone_primary_wavefront_requested &&
-        wavefront_mode ==
-            llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
-    const bool tensor_split_wavefront =
-        moe_stage_wavefront &&
-        return_wavefront_requested &&
-        wavefront_mode ==
-            llama_hybrid_layer_mode::TENSOR_SPLIT;
-    moe_stage_wavefront =
-        phone_primary_wavefront ||
-        tensor_split_wavefront;
-
-    int moe_wavefront_layer_end = layer_begin;
-    if (moe_stage_wavefront) {
-        for (int il = layer_begin; il < layer_end; ++il) {
-            if (model.hybrid_layer_mode(il) != wavefront_mode ||
-                    cvec->tensor_for(il) != nullptr) {
-                break;
-            }
-            moe_wavefront_layer_end = il + 1;
-        }
-
-        // Preserve the existing pure TENSOR_SPLIT contract: its wavefront
-        // still owns the complete stage.  Phone-primary is different because
-        // the staged suffix intentionally combines a TENSOR_PHONE_PRIMARY
-        // prefix with a PHONE_ONLY tail; allow the wavefront to stop at that
-        // mode boundary and let the normal graph builder continue the tail.
-        if (tensor_split_wavefront &&
-                moe_wavefront_layer_end != layer_end) {
-            moe_stage_wavefront = false;
-        }
-
-        if (phone_primary_wavefront) {
-            if (moe_wavefront_layer_end - layer_begin <= 1) {
-                moe_stage_wavefront = false;
-            }
-            for (int il = moe_wavefront_layer_end;
-                 moe_stage_wavefront && il < layer_end;
-                 ++il) {
-                moe_stage_wavefront =
-                    model.hybrid_layer_mode(il) ==
-                        llama_hybrid_layer_mode::PHONE_ONLY &&
-                    cvec->tensor_for(il) == nullptr;
-            }
-        }
+    for (int il = layer_begin; moe_stage_wavefront && il < layer_end; ++il) {
+        moe_stage_wavefront =
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            cvec->tensor_for(il) == nullptr;
     }
 
     std::vector<int> wave_chunk_sizes;
@@ -319,34 +270,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
 
-    const bool wave_crash_trace =
-        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
-    if (wave_crash_trace && any_wavefront_requested && stage_graph && n_tokens > 1) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=GRAPH_ELIGIBILITY "
-            "enabled=%d phone_primary=%d tokens=%" PRId64
-            " stage=[%d,%d) wave=[%d,%d) chunks=%zu groups=%zu XT=%d\n",
-            moe_stage_wavefront ? 1 : 0,
-            phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
-            n_tokens, layer_begin, layer_end,
-            layer_begin,
-            moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin,
-            wave_chunk_sizes.size(),
-            wave_attn_group_counts.size(),
-            planned_chunk_tokens);
-    }
-
-    if (any_wavefront_requested && stage_graph && n_tokens > 1) {
+    if (return_wavefront_requested && stage_graph && n_tokens > 1) {
         LLAMA_LOG_DEBUG(
-            "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d phone_primary=%d "
-            "tokens=%" PRId64 " stage=[%d,%d) wave=[%d,%d) "
-            "equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
+            "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d tokens=%" PRId64
+            " layers=[%d,%d) equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
             "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
             moe_stage_wavefront ? 1 : 0,
-            phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
             n_tokens, layer_begin, layer_end,
-            layer_begin,
-            moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin,
             ubatch.equal_seqs() ? 1 : 0,
             ubatch.n_seqs, ubatch.n_seqs_unq,
             planned_chunk_tokens, wave_attn_target_tokens,
@@ -356,27 +286,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             wave_attn_group_counts.size());
     }
 
-    // A Phone-primary wavefront may be only the Tensor prefix of a combined
-    // Tensor+Phone suffix.  Its PHONE_ONLY tail still needs the ordinary
-    // full-range attention input, while the wavefront prefix uses
-    // build_attn_inp_kv_range() per group.
     llm_graph_input_attn_kv * inp_attn =
-        !moe_stage_wavefront ||
-        moe_wavefront_layer_end < layer_end ?
-            build_attn_inp_kv() :
-            nullptr;
+        moe_stage_wavefront ? nullptr : build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
     if (moe_stage_wavefront) {
-        if (wave_crash_trace) {
-            LLAMA_LOG_ERROR(
-                "[WAVE_CRASH_TRACE] phase=WAVE_BUILD_BEGIN "
-                "tokens=%" PRId64 " layers=[%d,%d) tail=%d\n",
-                n_tokens, layer_begin, moe_wavefront_layer_end,
-                layer_end - moe_wavefront_layer_end);
-        }
-
         std::vector<int64_t> chunk_begin(
             wave_chunk_sizes.size(), 0);
         std::vector<ggml_tensor *> hidden_chunks;
@@ -422,14 +337,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_LAYOUT] layers=[%d,%d) tokens=%" PRId64
             " XT=%d attn_target=%d chunks=%s groups=%s "
-            "first_attn=%" PRId64 " phone_primary=%d tail_layers=%d\n",
-            layer_begin, moe_wavefront_layer_end, n_tokens,
+            "first_attn=%" PRId64 "\n",
+            layer_begin, layer_end, n_tokens,
             planned_chunk_tokens, wave_attn_target_tokens,
             list_tokens(wave_chunk_sizes).c_str(),
             list_tokens(coarse_group_tokens).c_str(),
-            n_tokens,
-            phone_primary_wavefront ? 1 : 0,
-            layer_end - moe_wavefront_layer_end);
+            n_tokens);
 
         ggml_tensor * wave_entry = ggml_cont(ctx0, inpL);
         cb(wave_entry, "prefill_wave_entry", layer_begin);
@@ -444,16 +357,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         for (int wave_layer = layer_begin;
-             wave_layer < moe_wavefront_layer_end;
+             wave_layer < layer_end;
              ++wave_layer) {
-            if (wave_crash_trace) {
-                LLAMA_LOG_ERROR(
-                    "[WAVE_CRASH_TRACE] phase=WAVE_LAYER_BEGIN "
-                    "layer=%d first=%d chunks=%zu\n",
-                    wave_layer,
-                    wave_layer == layer_begin ? 1 : 0,
-                    wave_chunk_sizes.size());
-            }
             // The first Tensor layer already owns a complete macro from the
             // previous stage. Keep its Attention fully fused. Only later
             // layers trade coarse Attention grouping for cross-layer return
@@ -654,35 +559,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         norm_name.c_str(),
                         wave_layer);
 
-                    llm_graph_moe_routing phone_routing;
-                    if (phone_primary_wavefront) {
-                        phone_routing =
-                            build_moe_routing(
-                                ffn_norm,
-                                model.layers[wave_layer].ffn_gate_inp,
-                                nullptr,
-                                nullptr,
-                                n_expert, n_expert_used,
-                                true,
-                                hparams.expert_weights_scale,
-                                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                                wave_layer);
-                        const std::string route_topk_name =
-                            "phone_prefill_route_topk_chunk_" +
-                            std::to_string(ci);
-                        const std::string route_weights_name =
-                            "phone_prefill_route_weights_chunk_" +
-                            std::to_string(ci);
-                        cb(
-                            phone_routing.selected_experts,
-                            route_topk_name.c_str(),
-                            wave_layer);
-                        cb(
-                            phone_routing.weights,
-                            route_weights_name.c_str(),
-                            wave_layer);
-                    }
-
                     ggml_tensor * down =
                         build_moe_ffn(
                             ffn_norm,
@@ -699,11 +575,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             nullptr, nullptr,
                             model.layers[wave_layer].ffn_up_exps_s,
                             model.layers[wave_layer].ffn_gate_exps_s,
-                            model.layers[wave_layer].ffn_down_exps_s,
-                            phone_routing.selected_experts,
-                            1,
-                            nullptr,
-                            phone_routing.weights);
+                            model.layers[wave_layer].ffn_down_exps_s);
                     const std::string down_name =
                         "prefill_ffn_down_chunk_" +
                         std::to_string(ci);
@@ -725,19 +597,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
             GGML_ASSERT(
                 group_start == wave_chunk_sizes.size());
-            if (wave_crash_trace) {
-                LLAMA_LOG_ERROR(
-                    "[WAVE_CRASH_TRACE] phase=WAVE_LAYER_END layer=%d\n",
-                    wave_layer);
-            }
-        }
-
-        if (wave_crash_trace) {
-            LLAMA_LOG_ERROR(
-                "[WAVE_CRASH_TRACE] phase=WAVE_FINALIZE_BEGIN "
-                "last_layer=%d chunks=%zu\n",
-                moe_wavefront_layer_end - 1,
-                wave_chunk_sizes.size());
         }
 
         for (size_t ci = 0;
@@ -759,7 +618,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cb(
                 wave_l_out,
                 wave_l_out_name.c_str(),
-                moe_wavefront_layer_end - 1);
+                layer_end - 1);
             ggml_build_forward_expand(gf, wave_l_out);
             hidden_chunks[ci] = wave_l_out;
         }
@@ -774,51 +633,36 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     hidden_chunks[ci], 1);
         }
         if (hidden_chunks.size() > 1) {
-            cb(cur, "l_out", moe_wavefront_layer_end - 1);
+            cb(cur, "l_out", layer_end - 1);
         }
 
-        if (moe_wavefront_layer_end == layer_end) {
-            if (!build_output_head) {
-                res->t_stage_output = cur;
-                ggml_build_forward_expand(gf, cur);
-                return;
-            }
-
-            if (inp_out_ids) {
-                cur = ggml_get_rows(
-                    ctx0, cur, inp_out_ids);
-            }
-
-            cur = build_norm(
-                cur, model.output_norm, NULL,
-                LLM_NORM_RMS, -1);
-            cb(cur, "result_norm", -1);
-            res->t_embd = cur;
-
-            cur = build_lora_mm(
-                model.output, cur, model.output_s);
-            cb(cur, "result_output", -1);
-            res->t_logits = cur;
-
+        if (!build_output_head) {
+            res->t_stage_output = cur;
             ggml_build_forward_expand(gf, cur);
             return;
         }
 
-        // Combined Phone-primary suffix: continue the PHONE_ONLY tail with the
-        // fully materialized Tensor-wavefront output as its normal layer input.
-        inpL = cur;
-        if (wave_crash_trace) {
-            LLAMA_LOG_ERROR(
-                "[WAVE_CRASH_TRACE] phase=WAVE_BUILD_END "
-                "wave=[%d,%d) tail=[%d,%d)\n",
-                layer_begin, moe_wavefront_layer_end,
-                moe_wavefront_layer_end, layer_end);
+        if (inp_out_ids) {
+            cur = ggml_get_rows(
+                ctx0, cur, inp_out_ids);
         }
+
+        cur = build_norm(
+            cur, model.output_norm, NULL,
+            LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(
+            model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
     }
 
-    const int normal_layer_begin =
-        moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin;
-    for (int il = normal_layer_begin; il < layer_end; ++il) {
+    for (int il = layer_begin; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
