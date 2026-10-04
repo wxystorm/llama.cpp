@@ -5299,6 +5299,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
     }
 
+    const bool phone_primary_wavefront_graph =
+        return_wavefront_graph &&
+        return_wavefront_first_layer !=
+            std::numeric_limits<int>::max() &&
+        layer_is_tensor_phone_primary(
+            return_wavefront_first_layer);
+    const bool legacy_return_wavefront_graph =
+        return_wavefront_graph &&
+        !phone_primary_wavefront_graph;
+
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
     int64_t return_wave_dependency_wait_max_us = 0;
@@ -11572,6 +11582,20 @@ auto prefill_norm_sg_has_prework =
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
+        if (wave_crash_trace) {
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=DOWN_ENTER sg=%zu "
+                "layer=%d chunk=%d phone_primary_wave=%d "
+                "legacy_return_wave=%d\n",
+                i,
+                prefill_down_layer,
+                prefill_down_chunk,
+                phone_primary_wavefront_graph ? 1 : 0,
+                legacy_return_wavefront_graph ? 1 : 0);
+            fflush(stderr);
+        }
+
         const bool has_async_prefill_input =
             pending_prefill_input_task != 0;
 
@@ -11580,7 +11604,7 @@ auto prefill_norm_sg_has_prework =
             GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
         }
 
-        if (return_wavefront_graph) {
+        if (legacy_return_wavefront_graph) {
             // Dense graphs normally arrive here with an async PC->Phone input
             // task. MoE can insert Router/Top-K/expert subgraphs between the
             // norm and down boundaries, so Meta may legitimately fall back to
@@ -11635,12 +11659,28 @@ auto prefill_norm_sg_has_prework =
             { prefill_down_layer, prefill_down_chunk });
         const bool pipeline_phone_prefill_down =
             phone_prefill_chunk_pipeline &&
-            !return_wavefront_graph &&
+            (!return_wavefront_graph ||
+             phone_primary_wavefront_graph) &&
             !has_async_prefill_input &&
             layer_attention_phone_owned(prefill_down_layer) &&
             route_it != pending_phone_prefill_routes.end() &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
+
+        if (wave_crash_trace) {
+            fprintf(
+                stderr,
+                "[WAVE_CRASH_TRACE] phase=DOWN_PATH sg=%zu "
+                "layer=%d chunk=%d route_present=%d "
+                "chunk_pipeline=%d use_phone_pipeline=%d\n",
+                i,
+                prefill_down_layer,
+                prefill_down_chunk,
+                route_it != pending_phone_prefill_routes.end() ? 1 : 0,
+                phone_prefill_chunk_pipeline ? 1 : 0,
+                pipeline_phone_prefill_down ? 1 : 0);
+            fflush(stderr);
+        }
 
         if (pipeline_phone_prefill_down) {
             const phone_prefill_route_task route = route_it->second;
@@ -12199,7 +12239,22 @@ auto prefill_norm_sg_has_prework =
 
             compute_status = phone_status;
         } else {
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_START sg=%zu "
+                    "layer=%d chunk=%d\n",
+                    i, prefill_down_layer, prefill_down_chunk);
+                fflush(stderr);
+            }
             compute_workers.start(0, i);
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_SUBMITTED sg=%zu\n",
+                    i);
+                fflush(stderr);
+            }
 
             if (has_async_prefill_input) {
                 GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
@@ -12230,11 +12285,41 @@ auto prefill_norm_sg_has_prework =
                 GGML_LOG_INFO("[PREFILL_CHUNK_SUBMIT_BEGIN] layer=%d chunk=%d t=%" PRId64 "\n", prefill_down_layer,
                        prefill_down_chunk, chunk_submit_begin_us);
             }
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_PHONE_START sg=%zu "
+                    "layer=%d chunk=%d\n",
+                    i, prefill_down_layer, prefill_down_chunk);
+                fflush(stderr);
+            }
             compute_workers.start(1, i);
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_WAIT_PC sg=%zu\n",
+                    i);
+                fflush(stderr);
+            }
             const ggml_status pc_status = compute_workers.wait(0);
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_PC_DONE sg=%zu status=%d\n",
+                    i, (int) pc_status);
+                fflush(stderr);
+            }
             const ggml_status phone_status = compute_workers.wait(1);
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=DOWN_PHONE_DONE sg=%zu status=%d\n",
+                    i, (int) phone_status);
+                fflush(stderr);
+            }
 
-            if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
+            if (legacy_return_wavefront_graph &&
+                    phone_status == GGML_STATUS_SUCCESS) {
                 if (snapshot_prepares[i].prepared) {
                     return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
                 } else if (pipeline_debug) {
@@ -12825,10 +12910,28 @@ auto prefill_norm_sg_has_prework =
             bool communication_complete = false;
 
             const int64_t specialized_start_us = ggml_time_us();
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=COMM_BEGIN sg=%zu\n",
+                    communication_sg);
+                fflush(stderr);
+            }
             const ggml_status specialized_status =
                 specialized_communication(
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
+            if (wave_crash_trace) {
+                fprintf(
+                    stderr,
+                    "[WAVE_CRASH_TRACE] phase=COMM_END sg=%zu "
+                    "status=%d handled=%d compute_complete=%d\n",
+                    communication_sg,
+                    (int) specialized_status,
+                    communication_complete ? 1 : 0,
+                    compute_complete ? 1 : 0);
+                fflush(stderr);
+            }
             subgraph_specialized_us =
                 ggml_time_us() - specialized_start_us;
             subgraph_specialized_handled = communication_complete;
