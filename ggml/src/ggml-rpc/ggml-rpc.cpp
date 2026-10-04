@@ -2218,9 +2218,11 @@ static bool ggml_backend_rpc_get_route_snapshot(
     }
 
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH = 13;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
-    if (rpc_get_remote_patch(compute_key) <
-            RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
+    const uint8_t remote_patch =
+        rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
         return false;
     }
 
@@ -2230,17 +2232,40 @@ static bool ggml_backend_rpc_get_route_snapshot(
     request.lane = lane;
     request.seq = seq;
 
-    size_t total_size = 0;
+    std::array<size_t, 3> storage_sizes {};
+    size_t storage_total_size = 0;
     for (size_t i = 0; i < 3; ++i) {
         if (dsts[i] == nullptr) {
             return false;
         }
         const size_t size = ggml_nbytes(dsts[i]);
-        if (size > SIZE_MAX - total_size) {
+        if (size > SIZE_MAX - storage_total_size ||
+                size >= RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG) {
             return false;
         }
+        storage_sizes[i] = size;
         request.sizes[i] = size;
-        total_size += size;
+        storage_total_size += size;
+    }
+
+    const rpc_route_topk_compact_layout topk_layout =
+        rpc_route_topk_compact_layout_for_tensor(dst1);
+    const bool compact_topk =
+        remote_patch >=
+            RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH &&
+        topk_layout.supported &&
+        topk_layout.wire_bytes < storage_sizes[1];
+
+    size_t wire_total_size = storage_total_size;
+    size_t topk_wire_bytes = storage_sizes[1];
+    if (compact_topk) {
+        topk_wire_bytes = topk_layout.wire_bytes;
+        wire_total_size =
+            storage_total_size -
+            storage_sizes[1] +
+            topk_wire_bytes;
+        request.sizes[1] |=
+            RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG;
     }
 
     auto * rpc_dev_ctx =
@@ -2273,12 +2298,9 @@ static bool ggml_backend_rpc_get_route_snapshot(
     const int64_t dst_sync_us =
         stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
-    std::vector<uint8_t> response(total_size);
+    std::vector<uint8_t> response(wire_total_size);
     const int64_t rpc_begin_us = ggml_time_us();
 
-    // Keep the same wire protocol and callback point as send_rpc_cmd_staged(),
-    // but time each phase separately so route latency can be attributed to
-    // producer readiness versus payload transfer.
     bool status = send_rpc_cmd(
         route_sock,
         RPC_CMD_GET_ROUTE_SNAPSHOT,
@@ -2322,15 +2344,51 @@ static bool ggml_backend_rpc_get_route_snapshot(
     const int64_t dst_set_begin_us =
         stage_profile ? ggml_time_us() : 0;
     size_t offset = 0;
-    for (size_t i = 0; i < 3; ++i) {
-        const size_t size = static_cast<size_t>(request.sizes[i]);
+
+    ggml_backend_tensor_set(
+        dst0,
+        response.data() + offset,
+        0,
+        storage_sizes[0]);
+    offset += storage_sizes[0];
+
+    if (compact_topk) {
+        std::vector<uint8_t> expanded_topk(
+            storage_sizes[1],
+            uint8_t(0));
+        for (size_t row = 0;
+                row < topk_layout.rows;
+                ++row) {
+            std::memcpy(
+                expanded_topk.data() +
+                    row * topk_layout.stride_bytes,
+                response.data() +
+                    offset +
+                    row * topk_layout.row_bytes,
+                topk_layout.row_bytes);
+        }
         ggml_backend_tensor_set(
-            dsts[i],
+            dst1,
+            expanded_topk.data(),
+            0,
+            expanded_topk.size());
+        offset += topk_wire_bytes;
+    } else {
+        ggml_backend_tensor_set(
+            dst1,
             response.data() + offset,
             0,
-            size);
-        offset += size;
+            storage_sizes[1]);
+        offset += storage_sizes[1];
     }
+
+    ggml_backend_tensor_set(
+        dst2,
+        response.data() + offset,
+        0,
+        storage_sizes[2]);
+    offset += storage_sizes[2];
+
     GGML_ASSERT(offset == response.size());
     const int64_t dst_set_us =
         stage_profile ? ggml_time_us() - dst_set_begin_us : 0;
@@ -2339,12 +2397,18 @@ static bool ggml_backend_rpc_get_route_snapshot(
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
-            "stage=route_snapshot bytes=%zu lane=%u "
+            "stage=route_snapshot bytes=%zu storage_bytes=%zu "
+            "compact_topk=%d topk_storage_bytes=%zu "
+            "topk_wire_bytes=%zu lane=%u "
             "seq=%" PRIu64 " dst_sync_ms=%.3f "
             "request_send_ms=%.3f response_header_wait_ms=%.3f "
             "payload_recv_ms=%.3f rpc_roundtrip_ms=%.3f "
             "dst_set_ms=%.3f total_ms=%.3f\n",
-            total_size,
+            wire_total_size,
+            storage_total_size,
+            compact_topk ? 1 : 0,
+            storage_sizes[1],
+            topk_wire_bytes,
             lane,
             seq,
             dst_sync_us / 1000.0,
@@ -3636,6 +3700,58 @@ struct rpc_snapshot_device {
     std::array<rpc_snapshot_slot, 2> slots;
 };
 
+static constexpr uint64_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG =
+    UINT64_C(1) << 63;
+
+struct rpc_route_topk_compact_layout {
+    bool supported = false;
+    size_t rows = 0;
+    size_t row_bytes = 0;
+    size_t stride_bytes = 0;
+    size_t wire_bytes = 0;
+};
+
+static rpc_route_topk_compact_layout
+rpc_route_topk_compact_layout_for_tensor(
+        const ggml_tensor * tensor) {
+    rpc_route_topk_compact_layout layout {};
+    if (tensor == nullptr ||
+            tensor->type != GGML_TYPE_I32 ||
+            tensor->ne[0] <= 0 ||
+            tensor->ne[1] <= 0 ||
+            tensor->ne[2] != 1 ||
+            tensor->ne[3] != 1 ||
+            tensor->nb[0] != sizeof(int32_t)) {
+        return layout;
+    }
+
+    const size_t cols = static_cast<size_t>(tensor->ne[0]);
+    const size_t rows = static_cast<size_t>(tensor->ne[1]);
+    if (cols > SIZE_MAX / sizeof(int32_t)) {
+        return layout;
+    }
+    const size_t row_bytes = cols * sizeof(int32_t);
+    if (tensor->nb[1] < row_bytes ||
+            rows > SIZE_MAX / row_bytes) {
+        return layout;
+    }
+
+    const size_t wire_bytes = rows * row_bytes;
+    const size_t storage_bytes = ggml_nbytes(tensor);
+    if (wire_bytes > storage_bytes ||
+            (rows > 0 &&
+             (rows - 1) > (storage_bytes - row_bytes) / tensor->nb[1])) {
+        return layout;
+    }
+
+    layout.supported = true;
+    layout.rows = rows;
+    layout.row_bytes = row_bytes;
+    layout.stride_bytes = tensor->nb[1];
+    layout.wire_bytes = wire_bytes;
+    return layout;
+}
+
 struct rpc_route_snapshot_slot {
     std::mutex mutex;
     std::condition_variable cv;
@@ -3643,6 +3759,11 @@ struct rpc_route_snapshot_slot {
     std::array<uint64_t, 3> sizes {};
     uint64_t seq = 0;
     int64_t fill_us = 0;
+    bool topk_compact_supported = false;
+    size_t topk_rows = 0;
+    size_t topk_row_bytes = 0;
+    size_t topk_stride_bytes = 0;
+    size_t topk_wire_bytes = 0;
     rpc_snapshot_state state = rpc_snapshot_state::FREE;
 };
 
@@ -5084,6 +5205,9 @@ bool rpc_server::route_snapshot_ready(
             static_cast<size_t>(request.sizes[i]);
     }
 
+    const rpc_route_topk_compact_layout topk_layout =
+        rpc_route_topk_compact_layout_for_tensor(tensors[1]);
+
     rpc_route_snapshot_slot & slot =
         route_snapshot_devices[request.device]->
             slots[request.lane];
@@ -5103,6 +5227,14 @@ bool rpc_server::route_snapshot_ready(
             request.sizes[1],
             request.sizes[2],
         };
+        slot.topk_compact_supported =
+            topk_layout.supported &&
+            topk_layout.wire_bytes <
+                static_cast<size_t>(request.sizes[1]);
+        slot.topk_rows = topk_layout.rows;
+        slot.topk_row_bytes = topk_layout.row_bytes;
+        slot.topk_stride_bytes = topk_layout.stride_bytes;
+        slot.topk_wire_bytes = topk_layout.wire_bytes;
         slot.data.resize(total_size);
     }
 
@@ -5133,6 +5265,11 @@ bool rpc_server::route_snapshot_ready(
             slot.data.clear();
             slot.seq = 0;
             slot.fill_us = 0;
+            slot.topk_compact_supported = false;
+            slot.topk_rows = 0;
+            slot.topk_row_bytes = 0;
+            slot.topk_stride_bytes = 0;
+            slot.topk_wire_bytes = 0;
         }
     }
     slot.cv.notify_all();
@@ -5142,10 +5279,17 @@ bool rpc_server::route_snapshot_ready(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=route_snapshot_fill lane=%u "
-            "seq=%" PRIu64 " bytes=%zu fill_ms=%.3f status=%d\n",
+            "seq=%" PRIu64 " bytes=%zu "
+            "topk_storage_bytes=%" PRIu64 " topk_wire_bytes=%zu "
+            "compact_topk_eligible=%d fill_ms=%.3f status=%d\n",
             request.lane,
             request.seq,
             total_size,
+            request.sizes[1],
+            topk_layout.wire_bytes,
+            (topk_layout.supported &&
+             topk_layout.wire_bytes <
+                static_cast<size_t>(request.sizes[1])) ? 1 : 0,
             fill_us / 1000.0,
             ok ? 1 : 0);
         std::fflush(stderr);
@@ -5169,6 +5313,16 @@ bool rpc_server::get_route_snapshot(
     const int64_t server_enter_us =
         stage_profile ? ggml_time_us() : 0;
 
+    const bool compact_topk_requested =
+        (request.sizes[1] &
+         RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG) != 0;
+    std::array<uint64_t, 3> requested_sizes = {
+        request.sizes[0],
+        request.sizes[1] &
+            ~RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG,
+        request.sizes[2],
+    };
+
     rpc_route_snapshot_slot & slot =
         route_snapshot_devices[request.device]->
             slots[request.lane];
@@ -5180,6 +5334,10 @@ bool rpc_server::get_route_snapshot(
     int64_t response_copy_us = 0;
     int64_t slot_fill_us = 0;
     int64_t ready_wait_us = 0;
+    size_t storage_total_size = 0;
+    size_t topk_storage_bytes = 0;
+    size_t topk_wire_bytes = 0;
+    bool compact_topk_used = false;
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         const int64_t lock_acquired_us =
@@ -5201,7 +5359,7 @@ bool rpc_server::get_route_snapshot(
         slot_fill_us = slot.fill_us;
 
         for (size_t i = 0; i < 3; ++i) {
-            if (slot.sizes[i] != request.sizes[i]) {
+            if (slot.sizes[i] != requested_sizes[i]) {
                 GGML_LOG_ERROR(
                     "[RPC_ROUTE_SNAPSHOT_MISMATCH] "
                     "lane=%u seq=%" PRIu64
@@ -5210,16 +5368,85 @@ bool rpc_server::get_route_snapshot(
                     request.lane,
                     request.seq,
                     i,
-                    request.sizes[i],
+                    requested_sizes[i],
                     slot.sizes[i]);
                 return false;
             }
+            if (slot.sizes[i] > SIZE_MAX - storage_total_size) {
+                return false;
+            }
+            storage_total_size +=
+                static_cast<size_t>(slot.sizes[i]);
+        }
+
+        topk_storage_bytes =
+            static_cast<size_t>(slot.sizes[1]);
+        topk_wire_bytes = topk_storage_bytes;
+        compact_topk_used =
+            compact_topk_requested &&
+            slot.topk_compact_supported;
+
+        if (compact_topk_requested &&
+                !slot.topk_compact_supported) {
+            GGML_LOG_ERROR(
+                "[RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_UNSUPPORTED] "
+                "lane=%u seq=%" PRIu64 "\n",
+                request.lane,
+                request.seq);
+            return false;
         }
 
         slot.state = rpc_snapshot_state::SENDING;
         const int64_t copy_begin_us =
             stage_profile ? ggml_time_us() : ready_us;
-        response = slot.data;
+
+        if (compact_topk_used) {
+            topk_wire_bytes = slot.topk_wire_bytes;
+            const size_t hidden_bytes =
+                static_cast<size_t>(slot.sizes[0]);
+            const size_t weights_bytes =
+                static_cast<size_t>(slot.sizes[2]);
+            if (hidden_bytes > SIZE_MAX - topk_wire_bytes ||
+                    hidden_bytes + topk_wire_bytes >
+                        SIZE_MAX - weights_bytes) {
+                return false;
+            }
+
+            response.resize(
+                hidden_bytes +
+                topk_wire_bytes +
+                weights_bytes);
+
+            std::memcpy(
+                response.data(),
+                slot.data.data(),
+                hidden_bytes);
+
+            const uint8_t * topk_src =
+                slot.data.data() + hidden_bytes;
+            uint8_t * topk_dst =
+                response.data() + hidden_bytes;
+            for (size_t row = 0;
+                    row < slot.topk_rows;
+                    ++row) {
+                std::memcpy(
+                    topk_dst + row * slot.topk_row_bytes,
+                    topk_src + row * slot.topk_stride_bytes,
+                    slot.topk_row_bytes);
+            }
+
+            std::memcpy(
+                response.data() +
+                    hidden_bytes +
+                    topk_wire_bytes,
+                slot.data.data() +
+                    hidden_bytes +
+                    topk_storage_bytes,
+                weights_bytes);
+        } else {
+            response = slot.data;
+        }
+
         const int64_t copy_done_us =
             stage_profile ? ggml_time_us() : copy_begin_us;
         response_copy_us = copy_done_us - copy_begin_us;
@@ -5227,6 +5454,11 @@ bool rpc_server::get_route_snapshot(
         slot.seq = 0;
         slot.sizes = {};
         slot.fill_us = 0;
+        slot.topk_compact_supported = false;
+        slot.topk_rows = 0;
+        slot.topk_row_bytes = 0;
+        slot.topk_stride_bytes = 0;
+        slot.topk_wire_bytes = 0;
         slot.state = rpc_snapshot_state::FREE;
     }
     slot.cv.notify_all();
@@ -5238,7 +5470,9 @@ bool rpc_server::get_route_snapshot(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=route_snapshot_server_wait lane=%u "
-            "seq=%" PRIu64 " bytes=%zu "
+            "seq=%" PRIu64 " bytes=%zu storage_bytes=%zu "
+            "compact_topk=%d topk_storage_bytes=%zu "
+            "topk_wire_bytes=%zu "
             "enter_to_lock_ms=%.3f lock_wait_ms=%.3f "
             "cv_wait_ms=%.3f response_copy_ms=%.3f "
             "producer_wait_est_ms=%.3f fill_ms=%.3f "
@@ -5246,6 +5480,10 @@ bool rpc_server::get_route_snapshot(
             request.lane,
             request.seq,
             response.size(),
+            storage_total_size,
+            compact_topk_used ? 1 : 0,
+            topk_storage_bytes,
+            topk_wire_bytes,
             (lock_begin_us - server_enter_us) / 1000.0,
             lock_wait_us / 1000.0,
             cv_wait_us / 1000.0,
