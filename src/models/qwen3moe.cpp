@@ -319,6 +319,23 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
 
+    const bool wave_crash_trace =
+        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
+    if (wave_crash_trace && any_wavefront_requested && stage_graph && n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[WAVE_CRASH_TRACE] phase=GRAPH_ELIGIBILITY "
+            "enabled=%d phone_primary=%d tokens=%" PRId64
+            " stage=[%d,%d) wave=[%d,%d) chunks=%zu groups=%zu XT=%d\n",
+            moe_stage_wavefront ? 1 : 0,
+            phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
+            n_tokens, layer_begin, layer_end,
+            layer_begin,
+            moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin,
+            wave_chunk_sizes.size(),
+            wave_attn_group_counts.size(),
+            planned_chunk_tokens);
+    }
+
     if (any_wavefront_requested && stage_graph && n_tokens > 1) {
         LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d phone_primary=%d "
@@ -352,6 +369,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
     if (moe_stage_wavefront) {
+        if (wave_crash_trace) {
+            LLAMA_LOG_ERROR(
+                "[WAVE_CRASH_TRACE] phase=WAVE_BUILD_BEGIN "
+                "tokens=%" PRId64 " layers=[%d,%d) tail=%d\n",
+                n_tokens, layer_begin, moe_wavefront_layer_end,
+                layer_end - moe_wavefront_layer_end);
+        }
+
         std::vector<int64_t> chunk_begin(
             wave_chunk_sizes.size(), 0);
         std::vector<ggml_tensor *> hidden_chunks;
@@ -421,6 +446,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         for (int wave_layer = layer_begin;
              wave_layer < moe_wavefront_layer_end;
              ++wave_layer) {
+            if (wave_crash_trace) {
+                LLAMA_LOG_ERROR(
+                    "[WAVE_CRASH_TRACE] phase=WAVE_LAYER_BEGIN "
+                    "layer=%d first=%d chunks=%zu\n",
+                    wave_layer,
+                    wave_layer == layer_begin ? 1 : 0,
+                    wave_chunk_sizes.size());
+            }
             // The first Tensor layer already owns a complete macro from the
             // previous stage. Keep its Attention fully fused. Only later
             // layers trade coarse Attention grouping for cross-layer return
@@ -692,6 +725,19 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
             GGML_ASSERT(
                 group_start == wave_chunk_sizes.size());
+            if (wave_crash_trace) {
+                LLAMA_LOG_ERROR(
+                    "[WAVE_CRASH_TRACE] phase=WAVE_LAYER_END layer=%d\n",
+                    wave_layer);
+            }
+        }
+
+        if (wave_crash_trace) {
+            LLAMA_LOG_ERROR(
+                "[WAVE_CRASH_TRACE] phase=WAVE_FINALIZE_BEGIN "
+                "last_layer=%d chunks=%zu\n",
+                moe_wavefront_layer_end - 1,
+                wave_chunk_sizes.size());
         }
 
         for (size_t ci = 0;
@@ -761,6 +807,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         // Combined Phone-primary suffix: continue the PHONE_ONLY tail with the
         // fully materialized Tensor-wavefront output as its normal layer input.
         inpL = cur;
+        if (wave_crash_trace) {
+            LLAMA_LOG_ERROR(
+                "[WAVE_CRASH_TRACE] phase=WAVE_BUILD_END "
+                "wave=[%d,%d) tail=[%d,%d)\n",
+                layer_begin, moe_wavefront_layer_end,
+                moe_wavefront_layer_end, layer_end);
+        }
     }
 
     const int normal_layer_begin =
