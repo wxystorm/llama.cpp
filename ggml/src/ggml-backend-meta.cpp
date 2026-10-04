@@ -12367,18 +12367,32 @@ auto prefill_norm_sg_has_prework =
             !layer_is_tensor_phone_primary(
                 phone_block_last_layer);
         int64_t subgraph_comm_wall_us = 0;
+        int64_t subgraph_specialized_us = 0;
+        int64_t subgraph_comm_allreduce_us = 0;
+        int64_t subgraph_fallback_us = 0;
+        bool subgraph_specialized_handled = false;
+        bool subgraph_comm_attempted = false;
+        bool subgraph_comm_handled = false;
+        bool subgraph_fallback_used = false;
         if (n_backends > 1 &&
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
+
+            const int64_t specialized_start_us = ggml_time_us();
             const ggml_status specialized_status =
                 specialized_communication(
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
+            subgraph_specialized_us =
+                ggml_time_us() - specialized_start_us;
+            subgraph_specialized_handled = communication_complete;
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
             }
+
             if (!communication_complete && backend_ctx->comm_ctx) {
+                subgraph_comm_attempted = true;
                 ++reduce_comm_count;
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
@@ -12389,12 +12403,19 @@ auto prefill_norm_sg_has_prework =
                 }
                 const int64_t comm_start_us = ggml_time_us();
                 communication_complete = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-                reduce_comm_us += ggml_time_us() - comm_start_us;
+                subgraph_comm_allreduce_us =
+                    ggml_time_us() - comm_start_us;
+                subgraph_comm_handled = communication_complete;
+                reduce_comm_us += subgraph_comm_allreduce_us;
             }
 
             if (!communication_complete) {
+                subgraph_fallback_used = true;
                 ++reduce_fallback_count;
+                const int64_t fallback_start_us = ggml_time_us();
                 const ggml_status status = allreduce_fallback(communication_sg);
+                subgraph_fallback_us =
+                    ggml_time_us() - fallback_start_us;
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -12404,6 +12425,33 @@ auto prefill_norm_sg_has_prework =
             subgraph_comm_wall_us = reduce_us;
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
+
+            if (meta_sg_timing) {
+                const int64_t subgraph_comm_unaccounted_us =
+                    std::max<int64_t>(
+                        0,
+                        subgraph_comm_wall_us -
+                            subgraph_specialized_us -
+                            subgraph_comm_allreduce_us -
+                            subgraph_fallback_us);
+                printf(
+                    "[META_SG_COMM_TIMING] sg=%zu "
+                    "total_ms=%.3f specialized_ms=%.3f "
+                    "specialized_handled=%d "
+                    "comm_allreduce_ms=%.3f comm_attempted=%d "
+                    "comm_handled=%d fallback_ms=%.3f "
+                    "fallback_used=%d unaccounted_ms=%.3f\n",
+                    communication_sg,
+                    subgraph_comm_wall_us / 1000.0,
+                    subgraph_specialized_us / 1000.0,
+                    subgraph_specialized_handled ? 1 : 0,
+                    subgraph_comm_allreduce_us / 1000.0,
+                    subgraph_comm_attempted ? 1 : 0,
+                    subgraph_comm_handled ? 1 : 0,
+                    subgraph_fallback_us / 1000.0,
+                    subgraph_fallback_used ? 1 : 0,
+                    subgraph_comm_unaccounted_us / 1000.0);
+            }
         }
 
         if (meta_sg_timing) {
