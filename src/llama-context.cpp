@@ -2330,18 +2330,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool                               synchronize,
         ggml_status &                      ret,
         llama_hybrid_stage_timing *        timing) {
-    const bool wave_crash_trace =
-        std::getenv("LLAMA_HYBRID_WAVE_CRASH_TRACE") != nullptr;
-    if (wave_crash_trace) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=STAGE_ENTER ub=%d stage=%zu kind=%s "
-            "layers=[%d,%d) block=%zu tokens=[%u,%u)\n",
-            ubatch_id, stage_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            stage.layer_begin, stage.layer_end,
-            block_index, token_begin, token_begin + block_tokens);
-    }
-
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2361,24 +2349,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         block_index, llama_hybrid_boundary_action_name(action), token_begin, token_begin + block_tokens);
 
     const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    if (wave_crash_trace) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=PREPARE_BEGIN ub=%d stage=%zu kind=%s "
-            "tokens=%u\n",
-            ubatch_id, stage_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            block_tokens);
-    }
     llm_graph_result * result = prepare_ubatch(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx, &stage);
-    if (wave_crash_trace) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=PREPARE_END ub=%d stage=%zu kind=%s "
-            "result=%p status=%d\n",
-            ubatch_id, stage_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            (void *) result, (int) ret);
-    }
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -2437,23 +2409,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    if (wave_crash_trace) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=COMPUTE_BEGIN ub=%d stage=%zu kind=%s "
-            "splits=%d tokens=%u\n",
-            ubatch_id, stage_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            n_splits, block_tokens);
-    }
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
-    if (wave_crash_trace) {
-        LLAMA_LOG_ERROR(
-            "[WAVE_CRASH_TRACE] phase=COMPUTE_END ub=%d stage=%zu kind=%s "
-            "status=%d\n",
-            ubatch_id, stage_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            (int) ret);
-    }
     if (async_meta_armed) {
         (void) ggml_backend_meta_set_async_graph_compute(
             async_meta_backend, false);
@@ -4095,27 +4051,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         phone_primary_cpu_chunk_stages.push_back(
             runtime_stages[1]);
 
-        // Experimental first step toward a real Tensor wavefront:
-        // optionally make the combined Phone-primary suffix consume one XT
-        // mini-ubatch at a time instead of the full ubatch.  The existing
-        // staged executor and boundary planner then naturally produce
-        // [0,XT), [XT,2*XT), ... jobs.  Each job still runs the complete
-        // Tensor+Phone suffix synchronously, so this changes only traversal
-        // order (chunk-major) and does not introduce cross-job concurrency.
-        //
-        // run_hybrid_stage_block() already calls set_stage_range() before
-        // building each sliced ubatch, so causal attention sees the KV prefix
-        // produced by earlier mini-jobs.
-        const char * chunk_major_env =
-            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_MAJOR");
-        const bool phone_primary_chunk_major =
-            chunk_major_env != nullptr &&
-            std::atoi(chunk_major_env) != 0;
-
         const int suffix_macro_tokens =
-            phone_primary_chunk_major ?
-                std::max(1, runtime_plan.tensor_chunk_tokens) :
-                std::max(1, (int) cparams.n_ubatch);
+            std::max(1, (int) cparams.n_ubatch);
         phone_primary_cpu_chunk_stages.push_back({
             llama_hybrid_runtime_stage_kind::TENSOR,
             runtime_stages[2].layer_begin,
@@ -4129,7 +4066,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
                 "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
                 "SUFFIX=[%d,%d) suffix_macro=%d XT=%d "
-                "mode=%s\n",
+                "mode=PREFIX_STAGED_COMBINED_SUFFIX\n",
                 phone_primary_cpu_chunk_stages[0].layer_begin,
                 phone_primary_cpu_chunk_stages[0].layer_end,
                 phone_primary_cpu_chunk_stages[0].macro_tokens,
@@ -4139,10 +4076,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 phone_primary_cpu_chunk_stages[2].layer_begin,
                 phone_primary_cpu_chunk_stages[2].layer_end,
                 phone_primary_cpu_chunk_stages[2].macro_tokens,
-                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
-                phone_primary_chunk_major ?
-                    "PREFIX_STAGED_CHUNK_MAJOR_SUFFIX" :
-                    "PREFIX_STAGED_COMBINED_SUFFIX");
+                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
         }
     } else if (phone_primary_cpu_chunk_requested) {
         LLAMA_LOG_WARN(
