@@ -8241,19 +8241,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
 
-            ggml_tensor * src_l_out =
-                stage_output_index >= 0 ?
-                    backend_ctx->backend_configs[1]
-                        .nodes[(size_t) stage_output_index] :
-                    nullptr;
-            ggml_tensor * dst_l_out =
-                stage_output_index >= 0 ?
-                    backend_ctx->backend_configs[0]
-                        .nodes[(size_t) stage_output_index] :
-                    nullptr;
+            // This block should only be reachable on the scheduler split that
+            // actually contains the terminal stage output.
+            GGML_ASSERT(stage_output_index >= 0);
 
-            if (stage_output_index < 0 ||
-                    src_l_out == nullptr ||
+            ggml_tensor * src_l_out =
+                backend_ctx->backend_configs[1]
+                    .nodes[(size_t) stage_output_index];
+            ggml_tensor * dst_l_out =
+                backend_ctx->backend_configs[0]
+                    .nodes[(size_t) stage_output_index];
+
+            if (src_l_out == nullptr ||
                     dst_l_out == nullptr) {
                 fprintf(
                     stderr,
@@ -13123,9 +13122,44 @@ auto prefill_norm_sg_has_prework =
             subgraph_is_phone_only(communication_sg) &&
             !subgraph_tensor_phone_primary_layer(
                 communication_sg, terminal_tp_layer);
+
+        int terminal_phone_wave_output_index = -1;
+        int terminal_phone_wave_layer = -1;
+        if (phone_primary_wavefront_graph &&
+                backend_ctx->tensor_phone_first_layer >= 0 &&
+                backend_ctx->tensor_phone_last_layer >
+                    backend_ctx->tensor_phone_first_layer) {
+            terminal_phone_wave_layer =
+                backend_ctx->tensor_phone_last_layer - 1;
+            char terminal_expected[64];
+            std::snprintf(
+                terminal_expected,
+                sizeof(terminal_expected),
+                "l_out-%d",
+                terminal_phone_wave_layer);
+            for (int node_index = cgraph->n_nodes - 1;
+                 node_index >= 0;
+                 --node_index) {
+                ggml_tensor * original = cgraph->nodes[node_index];
+                if (original != nullptr &&
+                        std::strcmp(
+                            original->name,
+                            terminal_expected) == 0) {
+                    terminal_phone_wave_output_index = node_index;
+                    break;
+                }
+            }
+        }
+
+        // Meta itself can be one of several scheduler splits for a staged
+        // Tensor graph. Reaching the last Meta subgraph only means the current
+        // scheduler split ended; it does NOT mean the whole T stage ended.
+        // Only the split that actually contains l_out-(tensor_end-1) owns the
+        // terminal Phone->PC mirror.
         const bool terminal_phone_wavefront =
             phone_primary_wavefront_graph &&
-            communication_sg + 1 >= backend_ctx->n_subgraphs;
+            communication_sg + 1 >= backend_ctx->n_subgraphs &&
+            terminal_phone_wave_output_index >= 0;
         const bool force_phone_block_exit =
             phone_block_fused &&
             phone_block_last_layer >= 0 &&
