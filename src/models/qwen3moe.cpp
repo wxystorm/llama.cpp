@@ -191,7 +191,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
     GGML_ASSERT(hidden_input == (layer_begin > 0));
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
-    GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
+    // Device-resident staged handoff may provide the hidden activation
+    // directly after graph allocation, so a hidden-input stage can
+    // intentionally have neither host tokens nor host embeddings here.
+    GGML_ASSERT(!hidden_input || ubatch.token == nullptr);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
