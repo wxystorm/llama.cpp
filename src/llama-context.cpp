@@ -7031,6 +7031,37 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             }
         }
 
+        // Phone-primary prefill wavefront must stay on the Meta backend as
+        // one scheduler region. Leaving callback nodes unassigned lets the
+        // generic scheduler pull cheap Attention/view-adjacent ops onto
+        // CPU/CUDA, which fragments the Tensor graph and forces Meta to drain
+        // its local pending chunk state at each scheduler split.
+        const char * phone_wavefront_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+        const bool pin_phone_wavefront_meta =
+            il >= 0 &&
+            ubatch.n_tokens > 1 &&
+            phone_wavefront_env != nullptr &&
+            std::atoi(phone_wavefront_env) != 0 &&
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+
+        if (pin_phone_wavefront_meta) {
+            const ggml_backend_dev_t dev_layer =
+                model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) ==
+                        dev_layer &&
+                        ggml_backend_is_meta(backend.get()) &&
+                        ggml_backend_supports_op(
+                            backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(
+                        sched_use, cur, backend.get());
+                    return;
+                }
+            }
+        }
+
         // PC_ONLY layers placed on CPU_DIRECT must stay as one CPU region.
         // The generic scheduler deliberately expands higher-priority GPU
         // assignments across unassigned ops while not expanding CPU, which
