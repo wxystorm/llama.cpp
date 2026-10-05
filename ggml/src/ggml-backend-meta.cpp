@@ -8229,20 +8229,41 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 "l_out-%d",
                 phone_wave_terminal_layer);
 
-            ggml_tensor * src_l_out =
-                find_exact_named_tensor(1, expected);
-            ggml_tensor * dst_l_out =
-                find_exact_named_tensor(0, expected);
+            int stage_output_index = -1;
+            for (int node_index = cgraph->n_nodes - 1;
+                 node_index >= 0;
+                 --node_index) {
+                ggml_tensor * original = cgraph->nodes[node_index];
+                if (original != nullptr &&
+                        std::strcmp(original->name, expected) == 0) {
+                    stage_output_index = node_index;
+                    break;
+                }
+            }
 
-            if (src_l_out == nullptr || dst_l_out == nullptr) {
+            ggml_tensor * src_l_out =
+                stage_output_index >= 0 ?
+                    backend_ctx->backend_configs[1]
+                        .nodes[(size_t) stage_output_index] :
+                    nullptr;
+            ggml_tensor * dst_l_out =
+                stage_output_index >= 0 ?
+                    backend_ctx->backend_configs[0]
+                        .nodes[(size_t) stage_output_index] :
+                    nullptr;
+
+            if (stage_output_index < 0 ||
+                    src_l_out == nullptr ||
+                    dst_l_out == nullptr) {
                 fprintf(
                     stderr,
                     "[PHONE_WAVE_TERMINAL_MISSING] "
-                    "sg=%zu layer=%d expected=%s src=%p dst=%p "
-                    "last_pc=%s last_phone=%s\n",
+                    "sg=%zu layer=%d expected=%s index=%d "
+                    "src=%p dst=%p last_pc=%s last_phone=%s\n",
                     i,
                     phone_wave_terminal_layer,
                     expected,
+                    stage_output_index,
                     (void *) src_l_out,
                     (void *) dst_l_out,
                     nodes[0] != nullptr ? nodes[0]->name : "(null)",
@@ -8288,11 +8309,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (pipeline_debug || tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_WAVE_TERMINAL_MIRROR] "
-                    "sg=%zu layer=%d src=%s dst=%s bytes=%zu "
+                    "sg=%zu layer=%d index=%d src=%s dst=%s bytes=%zu "
                     "fence_ms=%.3f copy_ms=%.3f "
                     "last_pc=%s last_phone=%s\n",
                     i,
                     phone_wave_terminal_layer,
+                    stage_output_index,
                     src_l_out->name,
                     dst_l_out->name,
                     ggml_nbytes(dst_l_out),
