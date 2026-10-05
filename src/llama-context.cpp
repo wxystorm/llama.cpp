@@ -4032,6 +4032,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool phone_primary_cpu_chunk_requested =
         phone_primary_cpu_chunk_env != nullptr &&
         std::atoi(phone_primary_cpu_chunk_env) != 0;
+    const char * phone_primary_wavefront_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+    const bool phone_primary_wavefront_requested =
+        phone_primary_wavefront_env != nullptr &&
+        std::atoi(phone_primary_wavefront_env) != 0;
     const bool phone_primary_cpu_chunk_topology =
         has_runtime_plan &&
         tensor_phone_primary_exec &&
@@ -4053,20 +4058,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const int suffix_macro_tokens =
             std::max(1, (int) cparams.n_ubatch);
+        const int tensor_stage_end =
+            phone_primary_wavefront_requested ?
+                runtime_stages[2].layer_end :
+                (int) hparams.n_layer();
         phone_primary_cpu_chunk_stages.push_back({
             llama_hybrid_runtime_stage_kind::TENSOR,
             runtime_stages[2].layer_begin,
-            (int) hparams.n_layer(),
+            tensor_stage_end,
             suffix_macro_tokens,
             runtime_plan.tensor_chunk_tokens,
         });
+
+        // Correctness-first V1: when Phone-primary wavefront is enabled, keep
+        // the Tensor region isolated and run any PHONE_ONLY tail as a separate
+        // staged region. This avoids mixing T wavefront ownership with tail
+        // ownership until exact (layer, chunk) dependencies are stable.
+        if (phone_primary_wavefront_requested) {
+            for (size_t i = 3; i < runtime_stages.size(); ++i) {
+                phone_primary_cpu_chunk_stages.push_back(runtime_stages[i]);
+            }
+        }
 
         if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
             LLAMA_LOG_DEBUG(
                 "[HYBRID_PHONE_CPU_CHUNK] enabled=1 "
                 "GPU=[%d,%d) XG=%d CPU=[%d,%d) XC=%d "
                 "SUFFIX=[%d,%d) suffix_macro=%d XT=%d "
-                "mode=PREFIX_STAGED_COMBINED_SUFFIX\n",
+                "mode=%s stages=%zu\n",
                 phone_primary_cpu_chunk_stages[0].layer_begin,
                 phone_primary_cpu_chunk_stages[0].layer_end,
                 phone_primary_cpu_chunk_stages[0].macro_tokens,
@@ -4076,7 +4095,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 phone_primary_cpu_chunk_stages[2].layer_begin,
                 phone_primary_cpu_chunk_stages[2].layer_end,
                 phone_primary_cpu_chunk_stages[2].macro_tokens,
-                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens);
+                phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
+                phone_primary_wavefront_requested ?
+                    "PREFIX_STAGED_T_WAVEFRONT_SPLIT_TAIL" :
+                    "PREFIX_STAGED_COMBINED_SUFFIX",
+                phone_primary_cpu_chunk_stages.size());
         }
     } else if (phone_primary_cpu_chunk_requested) {
         LLAMA_LOG_WARN(
