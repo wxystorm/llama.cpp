@@ -8227,6 +8227,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 backend_ctx->tensor_phone_first_layer;
 
         if (phone_wave_terminal_output) {
+            const char * resident_handoff_env =
+                std::getenv(
+                    "LLAMA_HYBRID_TENSOR_PHONE_RESIDENT_HANDOFF");
+            const bool resident_handoff =
+                resident_handoff_env != nullptr &&
+                std::atoi(resident_handoff_env) != 0;
+
+            if (resident_handoff) {
+                handled = true;
+                if (pipeline_debug ||
+                    tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_WAVE_TERMINAL_RESIDENT] "
+                        "sg=%zu layer=%d action=KEEP_PHONE\n",
+                        i,
+                        backend_ctx->tensor_phone_last_layer - 1);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
             const int phone_wave_terminal_layer =
                 backend_ctx->tensor_phone_last_layer - 1;
             GGML_ASSERT(
