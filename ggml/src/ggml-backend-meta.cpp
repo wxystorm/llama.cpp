@@ -3140,6 +3140,12 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
         GGML_ASSERT(comm_free != nullptr);
         comm_free(comm_ctx);
     }
+
+    // Resident bridge buffers belong to the Phone simple backend. Release
+    // them while that backend is still alive; context members are otherwise
+    // destroyed only after this destructor body returns.
+    phone_stage_bridges.clear();
+
     for (auto & bc : backend_configs) {
         ggml_backend_free(bc.backend);
     }
