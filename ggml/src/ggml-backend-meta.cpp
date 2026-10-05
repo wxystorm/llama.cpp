@@ -13074,6 +13074,9 @@ auto prefill_norm_sg_has_prework =
             subgraph_is_phone_only(communication_sg) &&
             !subgraph_tensor_phone_primary_layer(
                 communication_sg, terminal_tp_layer);
+        const bool terminal_phone_wavefront =
+            phone_primary_wavefront_graph &&
+            communication_sg + 1 >= backend_ctx->n_subgraphs;
         const bool force_phone_block_exit =
             phone_block_fused &&
             phone_block_last_layer >= 0 &&
@@ -13088,7 +13091,9 @@ auto prefill_norm_sg_has_prework =
         bool subgraph_comm_handled = false;
         bool subgraph_fallback_used = false;
         if (n_backends > 1 &&
-                (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
+                (communication_sg < backend_ctx->n_subgraphs - 1 ||
+                 terminal_phone_exit ||
+                 terminal_phone_wavefront)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
 
@@ -13120,6 +13125,20 @@ auto prefill_norm_sg_has_prework =
             subgraph_specialized_handled = communication_complete;
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
+            }
+
+            // Correctness-first guard: a terminal Phone-primary wavefront must
+            // be consumed by the specialized terminal mirror path.  Falling
+            // through to generic all-reduce/fallback would operate on the
+            // logical MIRRORED placeholder and can silently produce finite but
+            // stale logits instead of surfacing the ownership bug.
+            if (terminal_phone_wavefront && !communication_complete) {
+                fprintf(
+                    stderr,
+                    "[PHONE_WAVE_TERMINAL_UNHANDLED] sg=%zu subgraphs=%zu\n",
+                    communication_sg,
+                    backend_ctx->n_subgraphs);
+                return GGML_STATUS_FAILED;
             }
 
             if (!communication_complete && backend_ctx->comm_ctx) {
