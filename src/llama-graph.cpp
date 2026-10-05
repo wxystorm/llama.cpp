@@ -167,7 +167,8 @@ void llm_graph_input_stage::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_stage::can_reuse(const llm_graph_params & params) {
-    return hidden->ne[1] == params.ubatch.n_tokens;
+    return params.ubatch.token == nullptr &&
+           hidden->ne[1] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
