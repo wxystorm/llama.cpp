@@ -210,6 +210,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool phone_primary_wavefront_requested =
         phone_primary_wavefront_env != nullptr &&
         std::atoi(phone_primary_wavefront_env) != 0;
+    const bool phone_primary_wavefront_runtime_ready =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_CHUNK_PIPELINE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_PRODUCER_ROUTE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
     const bool any_wavefront_requested =
         return_wavefront_requested ||
         phone_primary_wavefront_requested;
@@ -231,6 +239,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool phone_primary_wavefront =
         moe_stage_wavefront &&
         phone_primary_wavefront_requested &&
+        phone_primary_wavefront_runtime_ready &&
         wavefront_mode ==
             llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
     const bool tensor_split_wavefront =
@@ -332,11 +341,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     if (any_wavefront_requested && stage_graph && n_tokens > 1) {
         LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d phone_primary=%d "
-            "tokens=%" PRId64 " stage=[%d,%d) wave=[%d,%d) "
+            "phone_runtime_ready=%d tokens=%" PRId64
+            " stage=[%d,%d) wave=[%d,%d) "
             "equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
             "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
             moe_stage_wavefront ? 1 : 0,
             phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
+            phone_primary_wavefront_runtime_ready ? 1 : 0,
             n_tokens, layer_begin, layer_end,
             layer_begin,
             moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin,
