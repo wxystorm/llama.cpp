@@ -2961,6 +2961,13 @@ llm_graph_result * llama_context::process_ubatch_staged(
     bool apply_mctx = true;
     llm_graph_result * result = nullptr;
 
+    const char * resident_handoff_env =
+        std::getenv(
+            "LLAMA_HYBRID_TENSOR_PHONE_RESIDENT_HANDOFF");
+    const bool resident_handoff_enabled =
+        resident_handoff_env != nullptr &&
+        std::atoi(resident_handoff_env) != 0;
+
     const auto finish = [&](ggml_status status) {
         kv_mctx->clear_stage_range();
         n_outputs = n_outputs_outer;
@@ -2975,6 +2982,49 @@ llm_graph_result * llama_context::process_ubatch_staged(
             stage.kind == llama_hybrid_runtime_stage_kind::CPU;
         const bool profile_tensor =
             stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
+
+        const bool resident_tensor_to_phone =
+            resident_handoff_enabled &&
+            !last_stage &&
+            stage.kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+            stages[stage_index + 1].kind ==
+                llama_hybrid_runtime_stage_kind::PHONE &&
+            stage.layer_end ==
+                stages[stage_index + 1].layer_begin &&
+            stage.layer_end < (int) model.hparams.n_layer() &&
+            model.hybrid_layer_mode(stage.layer_begin) ==
+                llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY &&
+            model.hybrid_layer_mode(stage.layer_end) ==
+                llama_hybrid_layer_mode::PHONE_ONLY;
+
+        const bool resident_phone_input =
+            resident_handoff_enabled &&
+            !first_stage &&
+            stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+            stages[stage_index - 1].kind ==
+                llama_hybrid_runtime_stage_kind::TENSOR &&
+            stages[stage_index - 1].layer_end ==
+                stage.layer_begin &&
+            stage.layer_begin > 0 &&
+            model.hybrid_layer_mode(stage.layer_begin - 1) ==
+                llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+
+        if ((resident_tensor_to_phone ||
+             resident_phone_input) &&
+            std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+            LLAMA_LOG_DEBUG(
+                "[PHONE_STAGE_RESIDENT_BOUNDARY] ub=%d stage=%zu "
+                "kind=%s layers=[%d,%d) output_resident=%d "
+                "input_resident=%d\n",
+                ubatch_id,
+                stage_index,
+                llama_hybrid_runtime_stage_name(stage.kind),
+                stage.layer_begin,
+                stage.layer_end,
+                resident_tensor_to_phone ? 1 : 0,
+                resident_phone_input ? 1 : 0);
+        }
+
         llama_hybrid_stage_timing stage_timing {};
         const int64_t stage_wall_begin_us =
             (profile_cpu || profile_tensor) ? ggml_time_us() : 0;
@@ -3007,18 +3057,25 @@ llm_graph_result * llama_context::process_ubatch_staged(
             return nullptr;
         }
 
-        if (!last_stage) {
-            hidden[stage_index & 1].resize((size_t) n_embd * ubatch.n_tokens);
+        if (!last_stage && !resident_tensor_to_phone) {
+            hidden[stage_index & 1].resize(
+                (size_t) n_embd * ubatch.n_tokens);
         }
 
         for (size_t block_index = 0; block_index < blocks.size(); ++block_index) {
             const auto & block = blocks[block_index];
             const uint32_t token_begin = block.output.token_begin;
             const uint32_t block_tokens = block.output.n_tokens;
-            float * stage_input = first_stage ? nullptr :
-                hidden[(stage_index - 1) & 1].data() + (size_t) token_begin * n_embd;
-            float * stage_output = last_stage ? nullptr :
-                hidden[stage_index & 1].data() + (size_t) token_begin * n_embd;
+            float * stage_input =
+                (first_stage || resident_phone_input) ?
+                    nullptr :
+                    hidden[(stage_index - 1) & 1].data() +
+                        (size_t) token_begin * n_embd;
+            float * stage_output =
+                (last_stage || resident_tensor_to_phone) ?
+                    nullptr :
+                    hidden[stage_index & 1].data() +
+                        (size_t) token_begin * n_embd;
 
             int32_t block_outputs = 0;
             if (last_stage) {
