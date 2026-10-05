@@ -520,6 +520,8 @@ extern "C" {
     // scheduler graph rebuilds, then restore a requested token range directly
     // into the next Meta stage input without routing the payload through host
     // memory. Intended for TENSOR_PHONE_PRIMARY -> PHONE_ONLY handoff.
+    GGML_API bool ggml_backend_meta_set_phone_stage_resident_handoff(
+        ggml_backend_t backend, bool enabled);
     GGML_API bool ggml_backend_meta_phone_stage_bridge_store(
         ggml_backend_t backend,
         const struct ggml_tensor * tensor,
