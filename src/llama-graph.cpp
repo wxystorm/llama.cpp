@@ -152,15 +152,22 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_stage::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(ubatch->embd != nullptr);
     GGML_ASSERT(n_embd == hidden->ne[0]);
+
+    // A staged Phone-resident handoff intentionally leaves ubatch->embd null:
+    // the caller fills the allocated Meta stage input directly from a
+    // Phone-local bridge after set_inputs() has initialized the remaining
+    // graph inputs.  The ordinary host-backed path is unchanged.
+    if (ubatch->embd == nullptr) {
+        return;
+    }
 
     const int64_t n_tokens = ubatch->n_tokens;
     ggml_backend_tensor_set(hidden, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(hidden));
 }
 
 bool llm_graph_input_stage::can_reuse(const llm_graph_params & params) {
-    return params.ubatch.embd != nullptr && hidden->ne[1] == params.ubatch.n_tokens;
+    return hidden->ne[1] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
