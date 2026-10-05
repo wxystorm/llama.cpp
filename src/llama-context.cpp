@@ -2386,6 +2386,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         return nullptr;
     }
 
+    const bool phone_cpu_chunk_stage_trace =
+        std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
+
     if (phone_resident_input) {
         ggml_tensor * stage_input_tensor =
             result->get_stage_input();
@@ -2440,8 +2443,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
-    const bool phone_cpu_chunk_stage_trace =
-        std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
     if (phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
