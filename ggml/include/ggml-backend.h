@@ -509,6 +509,7 @@ extern "C" {
         int64_t return_rpc_total_us;
     };
 
+    GGML_API bool ggml_backend_is_meta(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer);
