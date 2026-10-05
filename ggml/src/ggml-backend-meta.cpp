@@ -3594,6 +3594,7 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
         // single owner across Tensor layers.  Keeping l_out hard-wired to PC
         // here races/stales the Phone-primary return and can make the first
         // wavefront graph invalid before Attention(L+1,C) even starts.
+        bool phone_primary_wave_graph = false;
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             int chunk = -1;
             int layer = -1;
@@ -3609,6 +3610,7 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
                 layer < backend_ctx->tensor_phone_last_layer;
 
             if (phone_primary_wave_l_out) {
+                phone_primary_wave_graph = true;
                 backend_ctx->backend_configs[0].nodes[i]->flags &=
                     ~GGML_TENSOR_FLAG_COMPUTE;
                 backend_ctx->backend_configs[1].nodes[i]->flags |=
@@ -3627,6 +3629,54 @@ static enum ggml_status ggml_backend_meta_graph_compute_impl(ggml_backend_t back
                     layer,
                     chunk,
                     phone_primary_wave_l_out ? "PHONE" : "PC");
+            }
+        }
+
+        // The wavefront stage output is a CONCAT of the final per-chunk
+        // l_out tensors.  Those chunk tensors are Phone-owned in
+        // TENSOR_PHONE_PRIMARY, so the CONCAT must be Phone-owned too.
+        // Otherwise PC concatenates stale placeholder buffers and the generic
+        // "mirrored l_out" fast path incorrectly treats that stale PC result
+        // as complete.  The terminal communication path mirrors this one
+        // complete CONCAT back to PC for staged host extraction.
+        if (phone_primary_wave_graph && n_backends == 2) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node == nullptr || node->op != GGML_OP_CONCAT) {
+                    continue;
+                }
+
+                int layer = -1;
+                int parsed = 0;
+                const bool exact_l_out =
+                    std::sscanf(
+                        node->name,
+                        "l_out-%d%n",
+                        &layer,
+                        &parsed) == 1 &&
+                    node->name[parsed] == '\0';
+
+                const bool phone_primary_stage_output =
+                    exact_l_out &&
+                    backend_ctx->tensor_phone_first_layer >= 0 &&
+                    layer >= backend_ctx->tensor_phone_first_layer &&
+                    layer < backend_ctx->tensor_phone_last_layer;
+
+                if (!phone_primary_stage_output) {
+                    continue;
+                }
+
+                backend_ctx->backend_configs[0].nodes[i]->flags &=
+                    ~GGML_TENSOR_FLAG_COMPUTE;
+                backend_ctx->backend_configs[1].nodes[i]->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+
+                if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                    printf(
+                        "[PREFILL_WAVE_STAGE_OUT_OWNER] "
+                        "layer=%d op=CONCAT owner=PHONE\n",
+                        layer);
+                }
             }
         }
 
