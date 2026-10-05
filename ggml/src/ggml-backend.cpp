@@ -1523,6 +1523,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
+
+                        if (n_inputs ==
+                                GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS &&
+                                split_input_limit_for_backend(
+                                    cur_backend_id) >
+                                    GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS &&
+                                getenv("GGML_META_PIPELINE_DEBUG") != NULL) {
+                            fprintf(
+                                stderr,
+                                "[SCHED_META_SPLIT_RELAX] "
+                                "backend=%s inputs=%d->%d action=KEEP_SPLIT\n",
+                                ggml_backend_name(
+                                    sched->backends[cur_backend_id]),
+                                GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS,
+                                split_input_limit_for_backend(
+                                    cur_backend_id));
+                        }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
