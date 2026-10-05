@@ -309,7 +309,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         // 64-token Attention can cost more than the return barrier it hides.
         // Requiring >= 75% of the target keeps useful layouts such as
         // 103+153 (target=128) and 128+128, while falling back for 128+64.
-        if (moe_stage_wavefront) {
+        if (moe_stage_wavefront && !phone_primary_wavefront) {
             const int min_group_tokens =
                 qwen3moe_wave_attn_min_group_tokens(
                     wave_attn_target_tokens);
