@@ -887,9 +887,16 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_BACKENDS 16
 #endif
 
+#define GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS 30
+
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+#define GGML_SCHED_MAX_SPLIT_INPUTS 96
 #endif
+
+static_assert(
+    GGML_SCHED_MAX_SPLIT_INPUTS >=
+        GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS,
+    "scheduler split input capacity must cover the default limit");
 
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
@@ -933,6 +940,7 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+    int max_split_inputs;
 
     // pipeline parallelism support
     int n_copies;
@@ -1378,6 +1386,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // pass 5: split graph, find tensors that need to be copied
     {
+        const auto split_input_limit_for_backend =
+            [&](int backend_id) -> int {
+                if (backend_id >= 0 &&
+                        backend_id < sched->n_backends &&
+                        sched->max_split_inputs >
+                            GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS &&
+                        ggml_backend_is_meta(
+                            sched->backends[backend_id])) {
+                    return sched->max_split_inputs;
+                }
+                return GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS;
+            };
+
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
         // find the backend of the first split, skipping view ops
@@ -1422,7 +1443,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    if (split->n_inputs ==
+                            split_input_limit_for_backend(
+                                cur_backend_id)) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
@@ -1533,7 +1556,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    int graph_size =
+        std::max(graph->n_nodes, graph->n_leafs) +
+        sched->n_splits *
+            sched->max_split_inputs * 2 *
+            sched->n_copies;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -2217,6 +2244,16 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
+    const char * phone_wavefront_env =
+        getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+    const bool phone_wavefront_split_relax =
+        phone_wavefront_env != NULL &&
+        atoi(phone_wavefront_env) != 0;
+    sched->max_split_inputs =
+        phone_wavefront_split_relax ?
+            GGML_SCHED_MAX_SPLIT_INPUTS :
+            GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS;
+
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -2227,7 +2264,10 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    const size_t nodes_size =
+        graph_size +
+        ggml_sched_max_splits *
+            (size_t) sched->max_split_inputs * 2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -2236,7 +2276,11 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    sched->context_buffer_size =
+        ggml_sched_max_splits *
+            (size_t) sched->max_split_inputs * 2 *
+            sizeof(struct ggml_tensor) +
+        ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
     const int initial_splits_capacity = 16;
@@ -2253,6 +2297,14 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+    }
+
+    if (phone_wavefront_split_relax) {
+        GGML_LOG_INFO(
+            "[SCHED_META_SPLIT_INPUT_LIMIT] default=%d meta=%d capacity=%d\n",
+            GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS,
+            sched->max_split_inputs,
+            GGML_SCHED_MAX_SPLIT_INPUTS);
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
