@@ -8201,37 +8201,58 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         // activation to process_ubatch_staged(), whose Meta tensor read uses
         // backend 0 for MIRRORED values. Intermediate wave_l_out chunks remain
         // Phone-owned; mirror only the already-complete terminal l_out once.
-        // Do not use the generic Phone exit path here because that path adds
-        // the residual before copying and would double-add this committed l_out.
-        int phone_wave_terminal_layer = -1;
-        int phone_wave_terminal_parsed = 0;
+        //
+        // Do not infer the stage output from the last node of the last
+        // subgraph. Scheduler splitting may end that subgraph on a view/copy
+        // helper even though the logical stage output is l_out-(T_end-1).
+        // Resolve the terminal l_out by Tensor range and exact tensor name
+        // across the whole Meta graph instead.
         const bool phone_wave_terminal_output =
             phone_primary_wavefront_graph &&
-            active_count == 1 &&
-            active_backend == 1 &&
+            n_backends == 2 &&
             i + 1 >= backend_ctx->n_subgraphs &&
-            nodes[1] != nullptr &&
-            std::sscanf(
-                nodes[1]->name,
-                "l_out-%d%n",
-                &phone_wave_terminal_layer,
-                &phone_wave_terminal_parsed) == 1 &&
-            nodes[1]->name[phone_wave_terminal_parsed] == '\0' &&
-            layer_is_tensor_phone_primary(phone_wave_terminal_layer);
+            backend_ctx->tensor_phone_first_layer >= 0 &&
+            backend_ctx->tensor_phone_last_layer >
+                backend_ctx->tensor_phone_first_layer;
 
         if (phone_wave_terminal_output) {
+            const int phone_wave_terminal_layer =
+                backend_ctx->tensor_phone_last_layer - 1;
+            GGML_ASSERT(
+                layer_is_tensor_phone_primary(
+                    phone_wave_terminal_layer));
+
             char expected[64];
             std::snprintf(
                 expected,
                 sizeof(expected),
                 "l_out-%d",
                 phone_wave_terminal_layer);
+
+            ggml_tensor * src_l_out =
+                find_exact_named_tensor(1, expected);
             ggml_tensor * dst_l_out =
                 find_exact_named_tensor(0, expected);
-            GGML_ASSERT(dst_l_out != nullptr);
+
+            if (src_l_out == nullptr || dst_l_out == nullptr) {
+                fprintf(
+                    stderr,
+                    "[PHONE_WAVE_TERMINAL_MISSING] "
+                    "sg=%zu layer=%d expected=%s src=%p dst=%p "
+                    "last_pc=%s last_phone=%s\n",
+                    i,
+                    phone_wave_terminal_layer,
+                    expected,
+                    (void *) src_l_out,
+                    (void *) dst_l_out,
+                    nodes[0] != nullptr ? nodes[0]->name : "(null)",
+                    nodes[1] != nullptr ? nodes[1]->name : "(null)");
+                return GGML_STATUS_FAILED;
+            }
+
             GGML_ASSERT(
                 ggml_nbytes(dst_l_out) ==
-                ggml_nbytes(nodes[1]));
+                ggml_nbytes(src_l_out));
 
             auto & bcj_src = backend_ctx->backend_configs[1];
             auto & bcj_dst = backend_ctx->backend_configs[0];
@@ -8251,14 +8272,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_backend_tensor_copy_async(
                 bcj_src.backend,
                 bcj_dst.backend,
-                nodes[1],
+                src_l_out,
                 dst_l_out);
             ggml_backend_synchronize(bcj_dst.backend);
             const int64_t copy_us =
                 ggml_time_us() - copy_begin_us;
 
             record_copy_wait(copy_us);
-            record_meta_copy(i, 1, 0, dst_l_out, copy_us);
+            record_meta_copy(
+                i, 1, 0, src_l_out, copy_us);
             record_direct_copy();
             debug_terminal_handoff_dst = dst_l_out;
             handled = true;
@@ -8266,13 +8288,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (pipeline_debug || tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_WAVE_TERMINAL_MIRROR] "
-                    "sg=%zu layer=%d bytes=%zu "
-                    "fence_ms=%.3f copy_ms=%.3f\n",
+                    "sg=%zu layer=%d src=%s dst=%s bytes=%zu "
+                    "fence_ms=%.3f copy_ms=%.3f "
+                    "last_pc=%s last_phone=%s\n",
                     i,
                     phone_wave_terminal_layer,
+                    src_l_out->name,
+                    dst_l_out->name,
                     ggml_nbytes(dst_l_out),
                     fence_us / 1000.0,
-                    copy_us / 1000.0);
+                    copy_us / 1000.0,
+                    nodes[0] != nullptr ? nodes[0]->name : "(null)",
+                    nodes[1] != nullptr ? nodes[1]->name : "(null)");
             }
             return GGML_STATUS_SUCCESS;
         }
