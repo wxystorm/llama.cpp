@@ -2514,6 +2514,17 @@ struct ggml_backend_meta_context {
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
 
+    struct phone_stage_bridge_state {
+        ggml_backend_buffer_ptr buffer;
+        size_t                  capacity_bytes = 0;
+        size_t                  row_bytes      = 0;
+        size_t                  total_tokens   = 0;
+        int64_t                 n_embd         = 0;
+        ggml_type               type           = GGML_TYPE_F32;
+    };
+    std::map<int, phone_stage_bridge_state> phone_stage_bridges;
+    std::mutex                              phone_stage_bridge_mutex;
+
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
     std::map<int, int64_t>           tensor_profile_wave_layer_start_us;
