@@ -2524,6 +2524,7 @@ struct ggml_backend_meta_context {
     };
     std::map<int, phone_stage_bridge_state> phone_stage_bridges;
     std::mutex                              phone_stage_bridge_mutex;
+    bool                                    phone_stage_resident_handoff_active = false;
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
@@ -8227,14 +8228,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 backend_ctx->tensor_phone_first_layer;
 
         if (phone_wave_terminal_output) {
-            const char * resident_handoff_env =
-                std::getenv(
-                    "LLAMA_HYBRID_TENSOR_PHONE_RESIDENT_HANDOFF");
-            const bool resident_handoff =
-                resident_handoff_env != nullptr &&
-                std::atoi(resident_handoff_env) != 0;
-
-            if (resident_handoff) {
+            if (backend_ctx->phone_stage_resident_handoff_active) {
                 handled = true;
                 if (pipeline_debug ||
                     tensor_phone_stage_profile) {
@@ -14174,6 +14168,22 @@ bool ggml_backend_meta_tensor_profile_get(
     return true;
 }
 
+
+bool ggml_backend_meta_set_phone_stage_resident_handoff(
+        ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    backend_ctx->phone_stage_resident_handoff_active = enabled;
+    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+        printf(
+            "[PHONE_STAGE_RESIDENT_ARM] enabled=%d\n",
+            enabled ? 1 : 0);
+    }
+    return true;
+}
 
 bool ggml_backend_meta_phone_stage_bridge_store(
         ggml_backend_t backend,
