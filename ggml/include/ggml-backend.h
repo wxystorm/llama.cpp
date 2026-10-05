@@ -516,6 +516,22 @@ extern "C" {
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
+    // Persist a staged hidden activation in Phone-local storage across
+    // scheduler graph rebuilds, then restore a requested token range directly
+    // into the next Meta stage input without routing the payload through host
+    // memory. Intended for TENSOR_PHONE_PRIMARY -> PHONE_ONLY handoff.
+    GGML_API bool ggml_backend_meta_phone_stage_bridge_store(
+        ggml_backend_t backend,
+        const struct ggml_tensor * tensor,
+        int bridge_id,
+        size_t token_begin,
+        size_t total_tokens);
+    GGML_API bool ggml_backend_meta_phone_stage_bridge_load(
+        ggml_backend_t backend,
+        struct ggml_tensor * tensor,
+        int bridge_id,
+        size_t token_begin);
+
     // Run the next Meta graph_compute on a dedicated worker and return once
     // graph rebuild/preparation has completed. Intended for the dedicated
     // hybrid Phone scheduler, whose graph lifetime is kept valid until harvest.
