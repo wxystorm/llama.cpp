@@ -2442,6 +2442,49 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
+    ggml_backend_t resident_output_meta_backend = nullptr;
+    if (phone_resident_output) {
+        ggml_tensor * stage_output_tensor =
+            result->get_stage_output();
+        resident_output_meta_backend =
+            stage_output_tensor != nullptr ?
+                ggml_backend_sched_get_tensor_backend(
+                    sched_use, stage_output_tensor) :
+                nullptr;
+
+        if (!ggml_backend_is_meta(
+                resident_output_meta_backend)) {
+            resident_output_meta_backend = nullptr;
+            const int n_backends =
+                ggml_backend_sched_get_n_backends(sched_use);
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t candidate =
+                    ggml_backend_sched_get_backend(
+                        sched_use, i);
+                if (ggml_backend_is_meta(candidate)) {
+                    resident_output_meta_backend =
+                        candidate;
+                    break;
+                }
+            }
+        }
+
+        if (stage_output_tensor == nullptr ||
+            resident_output_meta_backend == nullptr ||
+            !ggml_backend_meta_set_phone_stage_resident_handoff(
+                resident_output_meta_backend, true)) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_STAGE_BRIDGE] ub=%d block=%zu "
+                "action=ARM_FAILED tokens=[%u,%u)\n",
+                ubatch_id,
+                block_index,
+                token_begin,
+                token_begin + block_tokens);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     if (phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
@@ -2491,6 +2534,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    if (resident_output_meta_backend != nullptr) {
+        (void) ggml_backend_meta_set_phone_stage_resident_handoff(
+            resident_output_meta_backend, false);
+    }
     if (async_meta_armed) {
         (void) ggml_backend_meta_set_async_graph_compute(
             async_meta_backend, false);
@@ -2515,25 +2562,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ggml_tensor * stage_output_tensor =
             result->get_stage_output();
         ggml_backend_t bridge_backend =
-            stage_output_tensor != nullptr ?
-                ggml_backend_sched_get_tensor_backend(
-                    sched_use, stage_output_tensor) :
-                nullptr;
-
-        if (!ggml_backend_is_meta(bridge_backend)) {
-            bridge_backend = nullptr;
-            const int n_backends =
-                ggml_backend_sched_get_n_backends(sched_use);
-            for (int i = 0; i < n_backends; ++i) {
-                ggml_backend_t candidate =
-                    ggml_backend_sched_get_backend(
-                        sched_use, i);
-                if (ggml_backend_is_meta(candidate)) {
-                    bridge_backend = candidate;
-                    break;
-                }
-            }
-        }
+            resident_output_meta_backend;
 
         if (stage_output_tensor == nullptr ||
             bridge_backend == nullptr ||
