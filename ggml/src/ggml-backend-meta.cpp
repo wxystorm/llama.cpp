@@ -14153,3 +14153,185 @@ bool ggml_backend_meta_tensor_profile_get(
     }
     return true;
 }
+
+
+bool ggml_backend_meta_phone_stage_bridge_store(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        int bridge_id,
+        size_t token_begin,
+        size_t total_tokens) {
+    if (!ggml_backend_is_meta(backend) ||
+        tensor == nullptr ||
+        bridge_id < 0 ||
+        total_tokens == 0) {
+        return false;
+    }
+
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    if (backend_ctx->backend_configs.size() < 2) {
+        return false;
+    }
+
+    ggml_tensor * phone_tensor =
+        ggml_backend_meta_buffer_simple_tensor(tensor, 1);
+    if (phone_tensor == nullptr ||
+        phone_tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(phone_tensor) ||
+        phone_tensor->ne[2] != 1 ||
+        phone_tensor->ne[3] != 1 ||
+        token_begin + (size_t) phone_tensor->ne[1] > total_tokens) {
+        return false;
+    }
+
+    const size_t row_bytes =
+        (size_t) phone_tensor->ne[0] *
+        ggml_type_size(phone_tensor->type);
+    const size_t total_bytes = row_bytes * total_tokens;
+    ggml_backend_t phone_backend =
+        backend_ctx->backend_configs[1].backend;
+
+    std::lock_guard<std::mutex> lock(
+        backend_ctx->phone_stage_bridge_mutex);
+    auto & bridge =
+        backend_ctx->phone_stage_bridges[bridge_id];
+
+    const bool layout_changed =
+        bridge.n_embd != phone_tensor->ne[0] ||
+        bridge.type != phone_tensor->type ||
+        bridge.row_bytes != row_bytes ||
+        bridge.total_tokens != total_tokens;
+
+    if (!bridge.buffer ||
+        bridge.capacity_bytes < total_bytes ||
+        layout_changed) {
+        bridge.buffer.reset(
+            ggml_backend_alloc_buffer(
+                phone_backend, total_bytes));
+        if (!bridge.buffer) {
+            return false;
+        }
+        bridge.capacity_bytes = total_bytes;
+        bridge.row_bytes      = row_bytes;
+        bridge.total_tokens   = total_tokens;
+        bridge.n_embd         = phone_tensor->ne[0];
+        bridge.type           = phone_tensor->type;
+    }
+
+    ggml_tensor bridge_tensor = *phone_tensor;
+    bridge_tensor.buffer = bridge.buffer.get();
+    bridge_tensor.data =
+        (char *) ggml_backend_buffer_get_base(
+            bridge.buffer.get()) +
+        token_begin * row_bytes;
+    bridge_tensor.view_src  = nullptr;
+    bridge_tensor.view_offs = 0;
+    ggml_set_name(
+        &bridge_tensor,
+        "phone_stage_bridge_store");
+
+    // The Meta graph uses asynchronous simple backends.  Fence only the Phone
+    // producer before consuming its stage output; do not synchronize PC.
+    ggml_backend_synchronize(phone_backend);
+    ggml_backend_tensor_copy(
+        phone_tensor, &bridge_tensor);
+
+    if (std::getenv(
+            "GGML_META_PIPELINE_DEBUG") != nullptr) {
+        printf(
+            "[PHONE_STAGE_BRIDGE_STORE] id=%d "
+            "tokens=[%zu,%zu) total=%zu bytes=%zu "
+            "src=%s action=PHONE_LOCAL_COPY\n",
+            bridge_id,
+            token_begin,
+            token_begin +
+                (size_t) phone_tensor->ne[1],
+            total_tokens,
+            ggml_nbytes(phone_tensor),
+            phone_tensor->name);
+    }
+
+    return true;
+}
+
+bool ggml_backend_meta_phone_stage_bridge_load(
+        ggml_backend_t backend,
+        ggml_tensor * tensor,
+        int bridge_id,
+        size_t token_begin) {
+    if (!ggml_backend_is_meta(backend) ||
+        tensor == nullptr ||
+        bridge_id < 0) {
+        return false;
+    }
+
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    if (backend_ctx->backend_configs.size() < 2) {
+        return false;
+    }
+
+    ggml_tensor * phone_tensor =
+        ggml_backend_meta_buffer_simple_tensor(tensor, 1);
+    if (phone_tensor == nullptr ||
+        phone_tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(phone_tensor) ||
+        phone_tensor->ne[2] != 1 ||
+        phone_tensor->ne[3] != 1) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        backend_ctx->phone_stage_bridge_mutex);
+    auto it =
+        backend_ctx->phone_stage_bridges.find(
+            bridge_id);
+    if (it == backend_ctx->phone_stage_bridges.end()) {
+        return false;
+    }
+
+    auto & bridge = it->second;
+    const size_t row_bytes =
+        (size_t) phone_tensor->ne[0] *
+        ggml_type_size(phone_tensor->type);
+    if (!bridge.buffer ||
+        bridge.n_embd != phone_tensor->ne[0] ||
+        bridge.type != phone_tensor->type ||
+        bridge.row_bytes != row_bytes ||
+        token_begin + (size_t) phone_tensor->ne[1] >
+            bridge.total_tokens) {
+        return false;
+    }
+
+    ggml_tensor bridge_tensor = *phone_tensor;
+    bridge_tensor.buffer = bridge.buffer.get();
+    bridge_tensor.data =
+        (char *) ggml_backend_buffer_get_base(
+            bridge.buffer.get()) +
+        token_begin * row_bytes;
+    bridge_tensor.view_src  = nullptr;
+    bridge_tensor.view_offs = 0;
+    ggml_set_name(
+        &bridge_tensor,
+        "phone_stage_bridge_load");
+
+    ggml_backend_tensor_copy(
+        &bridge_tensor, phone_tensor);
+
+    if (std::getenv(
+            "GGML_META_PIPELINE_DEBUG") != nullptr) {
+        printf(
+            "[PHONE_STAGE_BRIDGE_LOAD] id=%d "
+            "tokens=[%zu,%zu) bytes=%zu "
+            "dst=%s action=PHONE_LOCAL_COPY\n",
+            bridge_id,
+            token_begin,
+            token_begin +
+                (size_t) phone_tensor->ne[1],
+            ggml_nbytes(phone_tensor),
+            phone_tensor->name);
+    }
+
+    return true;
+}
