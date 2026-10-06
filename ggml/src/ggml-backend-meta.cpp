@@ -5403,21 +5403,192 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     bool return_wavefront_graph = false;
     int  return_wavefront_first_layer = std::numeric_limits<int>::max();
+    const bool wave_detect_debug =
+        std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr ||
+        std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
+
+    struct wave_detect_stats {
+        size_t wave_ffn_inp   = 0;
+        size_t wave_l_out     = 0;
+        size_t wave_attn      = 0;
+        size_t wave_attn_group = 0;
+        size_t prefill_norm   = 0;
+        size_t prefill_down   = 0;
+        size_t route_topk     = 0;
+        size_t route_weights  = 0;
+        const char * first_wave_ffn_inp = nullptr;
+        const char * first_wave_l_out = nullptr;
+        const char * first_wave_attn = nullptr;
+        const char * first_wave_attn_group = nullptr;
+        const char * first_prefill_norm = nullptr;
+        const char * first_prefill_down = nullptr;
+        const char * first_route_topk = nullptr;
+        const char * first_route_weights = nullptr;
+    };
+
+    std::array<wave_detect_stats, 2> wave_detect_by_backend {};
+
     if (n_backends == 2) {
-        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
-            ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
-            if (graph == nullptr) {
-                continue;
-            }
-            for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
-                int chunk = -1;
-                int layer = -1;
-                if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                        graph->nodes[node_id]->name, chunk, layer)) {
-                    return_wavefront_graph = true;
-                    return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
+        for (size_t backend = 0; backend < 2; ++backend) {
+            auto & stats = wave_detect_by_backend[backend];
+
+            for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+
+                for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
+                    ggml_tensor * node = graph->nodes[node_id];
+                    if (node == nullptr) {
+                        continue;
+                    }
+
+                    const char * name = node->name;
+                    int chunk = -1;
+                    int layer = -1;
+
+                    if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
+                            name, chunk, layer)) {
+                        ++stats.wave_ffn_inp;
+                        if (stats.first_wave_ffn_inp == nullptr) {
+                            stats.first_wave_ffn_inp = name;
+                        }
+                        if (backend == 0) {
+                            return_wavefront_graph = true;
+                            return_wavefront_first_layer =
+                                std::min(return_wavefront_first_layer, layer);
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_prefill_wave_l_out_chunk(
+                            name, chunk, layer)) {
+                        ++stats.wave_l_out;
+                        if (stats.first_wave_l_out == nullptr) {
+                            stats.first_wave_l_out = name;
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
+                            name, chunk, layer)) {
+                        ++stats.wave_attn;
+                        if (stats.first_wave_attn == nullptr) {
+                            stats.first_wave_attn = name;
+                        }
+                    }
+
+                    int group_begin = -1;
+                    int group_count = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_prefill_wave_attn_out_group(
+                            name, group_begin, group_count, layer)) {
+                        ++stats.wave_attn_group;
+                        if (stats.first_wave_attn_group == nullptr) {
+                            stats.first_wave_attn_group = name;
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_prefill_norm_chunk(
+                            name, chunk, layer)) {
+                        ++stats.prefill_norm;
+                        if (stats.first_prefill_norm == nullptr) {
+                            stats.first_prefill_norm = name;
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_prefill_down_chunk(
+                            name, chunk, layer)) {
+                        ++stats.prefill_down;
+                        if (stats.first_prefill_down == nullptr) {
+                            stats.first_prefill_down = name;
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_phone_route_topk(
+                            name, chunk, layer)) {
+                        ++stats.route_topk;
+                        if (stats.first_route_topk == nullptr) {
+                            stats.first_route_topk = name;
+                        }
+                    }
+
+                    chunk = -1;
+                    layer = -1;
+                    if (ggml_backend_meta_parse_phone_route_weights(
+                            name, chunk, layer)) {
+                        ++stats.route_weights;
+                        if (stats.first_route_weights == nullptr) {
+                            stats.first_route_weights = name;
+                        }
+                    }
                 }
             }
+
+            if (wave_detect_debug) {
+                printf(
+                    "[PHONE_WAVE_DETECT] uid=%" PRIu64
+                    " backend=%s subgraphs=%zu "
+                    "wave_ffn_inp=%zu wave_l_out=%zu "
+                    "wave_attn=%zu wave_attn_group=%zu "
+                    "prefill_norm=%zu prefill_down=%zu "
+                    "route_topk=%zu route_weights=%zu "
+                    "first_wave_ffn_inp=%s first_wave_l_out=%s "
+                    "first_wave_attn=%s first_wave_attn_group=%s "
+                    "first_prefill_norm=%s first_prefill_down=%s "
+                    "first_route_topk=%s first_route_weights=%s\n",
+                    cgraph->uid,
+                    backend == 0 ? "PC" : "PHONE",
+                    backend_ctx->n_subgraphs,
+                    stats.wave_ffn_inp,
+                    stats.wave_l_out,
+                    stats.wave_attn,
+                    stats.wave_attn_group,
+                    stats.prefill_norm,
+                    stats.prefill_down,
+                    stats.route_topk,
+                    stats.route_weights,
+                    stats.first_wave_ffn_inp != nullptr ?
+                        stats.first_wave_ffn_inp : "(none)",
+                    stats.first_wave_l_out != nullptr ?
+                        stats.first_wave_l_out : "(none)",
+                    stats.first_wave_attn != nullptr ?
+                        stats.first_wave_attn : "(none)",
+                    stats.first_wave_attn_group != nullptr ?
+                        stats.first_wave_attn_group : "(none)",
+                    stats.first_prefill_norm != nullptr ?
+                        stats.first_prefill_norm : "(none)",
+                    stats.first_prefill_down != nullptr ?
+                        stats.first_prefill_down : "(none)",
+                    stats.first_route_topk != nullptr ?
+                        stats.first_route_topk : "(none)",
+                    stats.first_route_weights != nullptr ?
+                        stats.first_route_weights : "(none)");
+            }
+        }
+
+        if (wave_detect_debug) {
+            printf(
+                "[PHONE_WAVE_DETECT_RESULT] uid=%" PRIu64
+                " return_wavefront=%d first_layer=%d "
+                "pc_wave_ffn_inp=%zu phone_wave_ffn_inp=%zu\n",
+                cgraph->uid,
+                return_wavefront_graph ? 1 : 0,
+                return_wavefront_first_layer ==
+                        std::numeric_limits<int>::max() ?
+                    -1 : return_wavefront_first_layer,
+                wave_detect_by_backend[0].wave_ffn_inp,
+                wave_detect_by_backend[1].wave_ffn_inp);
         }
     }
 
