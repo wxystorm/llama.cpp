@@ -13191,11 +13191,19 @@ auto prefill_norm_sg_has_prework =
             phone_primary_wavefront_graph &&
             communication_sg + 1 >= backend_ctx->n_subgraphs &&
             terminal_phone_wave_output_index >= 0;
-        const bool phone_block_continues_on_phone =
+        const bool phone_block_next_sg_on_phone =
             phone_block_fused &&
             communication_sg + 1 < backend_ctx->n_subgraphs &&
             subgraph_will_execute_phone(
                 communication_sg + 1);
+        const bool phone_block_next_layer_on_phone =
+            phone_block_fused &&
+            phone_block_last_layer >= 0 &&
+            layer_attention_phone_owned(
+                phone_block_last_layer + 1);
+        const bool phone_block_continues_on_phone =
+            phone_block_next_sg_on_phone ||
+            phone_block_next_layer_on_phone;
         const bool force_phone_block_exit =
             phone_block_fused &&
             phone_block_last_layer >= 0 &&
@@ -13208,10 +13216,15 @@ auto prefill_norm_sg_has_prework =
                 phone_block_continues_on_phone) {
             printf(
                 "[PHONE_BLOCK_KEEP_PHONE] "
-                "layers=%d..%d next_sg=%zu action=NO_PC_EXIT\n",
+                "layers=%d..%d next_sg=%zu "
+                "next_sg_phone=%d next_layer=%d "
+                "next_layer_phone=%d action=NO_PC_EXIT\n",
                 timing_first_layer,
                 phone_block_last_layer,
-                communication_sg + 1);
+                communication_sg + 1,
+                phone_block_next_sg_on_phone ? 1 : 0,
+                phone_block_last_layer + 1,
+                phone_block_next_layer_on_phone ? 1 : 0);
         }
         int64_t subgraph_comm_wall_us = 0;
         int64_t subgraph_specialized_us = 0;
