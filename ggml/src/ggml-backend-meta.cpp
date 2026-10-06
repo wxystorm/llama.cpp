@@ -4365,6 +4365,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     std::map<int, std::shared_ptr<phone_prefill_lane1_return_gate>>
         phone_prefill_lane1_return_gates;
 
+    // Optional critical-path-aware return frontier. Route transfer and PC FFN
+    // work may finish out of order, but PC->Phone payloads are admitted in
+    // phone_ffn_seq order so later chunks cannot steal bandwidth from the next
+    // causal chunk needed by the wavefront.
+    struct phone_prefill_critical_return_state {
+        std::mutex mutex;
+        std::condition_variable cv;
+        uint64_t next_seq = 0;
+        bool cancelled = false;
+    };
+    auto phone_prefill_critical_return_state_ptr =
+        std::make_shared<phone_prefill_critical_return_state>();
+
+    struct phone_prefill_critical_return_guard {
+        std::shared_ptr<phone_prefill_critical_return_state> state;
+
+        ~phone_prefill_critical_return_guard() {
+            if (state == nullptr) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->cancelled = true;
+            }
+            state->cv.notify_all();
+        }
+    } phone_prefill_critical_return_guard_instance {
+        phone_prefill_critical_return_state_ptr
+    };
+
     // If graph execution exits early while a lane-1 return is waiting for the
     // last route handoff, wake it so worker destruction cannot deadlock.
     struct phone_prefill_lane1_return_gate_guard {
@@ -5441,6 +5471,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr;
     const bool phone_prefill_chunk_join =
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
+    const bool phone_prefill_critical_return =
+        std::getenv("GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
     const bool phone_prefill_route_lane_swap =
         std::getenv("GGML_RPC_ROUTE_LANE_SWAP") != nullptr;
     const bool phone_prefill_pc_ready_schedule =
@@ -5530,13 +5562,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             0,
             0);
 
+    const bool phone_prefill_critical_return_active =
+        phone_prefill_critical_return &&
+        phone_prefill_chunk_join_active;
+
     if (pipeline_debug && phone_prefill_async_return) {
         printf(
             "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
-            "requested=1 active=%d ordered=%d chunk_join=%d\n",
+            "requested=1 active=%d ordered=%d chunk_join=%d "
+            "critical_return=%d\n",
             phone_prefill_async_return_active ? 1 : 0,
             phone_prefill_ordered_return_active ? 1 : 0,
-            phone_prefill_chunk_join_active ? 1 : 0);
+            phone_prefill_chunk_join_active ? 1 : 0,
+            phone_prefill_critical_return_active ? 1 : 0);
     }
 
     struct phone_prefill_binding_backup {
@@ -12372,6 +12410,19 @@ auto prefill_norm_sg_has_prework =
                     lane1_return_gate = gate;
                 }
 
+                std::shared_ptr<phone_prefill_critical_return_state>
+                    critical_return_state;
+                if (phone_prefill_critical_return_active) {
+                    critical_return_state =
+                        phone_prefill_critical_return_state_ptr;
+                    std::lock_guard<std::mutex> lock(
+                        critical_return_state->mutex);
+                    if (critical_return_state->next_seq == 0) {
+                        critical_return_state->next_seq =
+                            phone_ffn_seq;
+                    }
+                }
+
                 ggml_backend_meta_transfer_worker * return_worker =
                     return_worker_slot;
                 const ggml_backend_rpc_set_tensor_async_return_t
@@ -12388,6 +12439,7 @@ auto prefill_norm_sg_has_prework =
                      use_chunk_join_return,
                      return_lane,
                      lane1_return_gate,
+                     critical_return_state,
                      phone_ffn_seq,
                      phone_backend,
                      phone_return_stage,
@@ -12424,6 +12476,35 @@ auto prefill_norm_sg_has_prework =
                                 ggml_time_us() -
                                 gate_wait_begin_us;
                             if (lane1_return_gate->cancelled) {
+                                if (critical_return_state != nullptr) {
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                            critical_return_state->mutex);
+                                        critical_return_state->cancelled = true;
+                                    }
+                                    critical_return_state->cv.notify_all();
+                                }
+                                return GGML_STATUS_FAILED;
+                            }
+                        }
+
+                        int64_t critical_gate_wait_us = 0;
+                        if (critical_return_state != nullptr) {
+                            const int64_t gate_wait_begin_us =
+                                ggml_time_us();
+                            std::unique_lock<std::mutex> gate_lock(
+                                critical_return_state->mutex);
+                            critical_return_state->cv.wait(
+                                gate_lock,
+                                [&]() {
+                                    return critical_return_state->cancelled ||
+                                        critical_return_state->next_seq ==
+                                            phone_ffn_seq;
+                                });
+                            critical_gate_wait_us =
+                                ggml_time_us() -
+                                gate_wait_begin_us;
+                            if (critical_return_state->cancelled) {
                                 return GGML_STATUS_FAILED;
                             }
                         }
@@ -12447,26 +12528,45 @@ auto prefill_norm_sg_has_prework =
                         const int64_t send_us =
                             ggml_time_us() - send_begin_us;
 
+                        if (critical_return_state != nullptr) {
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    critical_return_state->mutex);
+                                if (!sent) {
+                                    critical_return_state->cancelled = true;
+                                } else {
+                                    GGML_ASSERT(
+                                        critical_return_state->next_seq ==
+                                        phone_ffn_seq);
+                                    ++critical_return_state->next_seq;
+                                }
+                            }
+                            critical_return_state->cv.notify_all();
+                        }
+
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
                             printf(
                                 "[PHONE_PREFILL_RETURN_ASYNC] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " pc_wait_ms=%.3f lane_gate_wait_ms=%.3f "
+                                "critical_gate_wait_ms=%.3f "
                                 "send_ms=%.3f return_lane=%zu bytes=%zu "
                                 "ffn_seq=%" PRIu64
-                                " chunk_join=%d status=%d\n",
+                                " chunk_join=%d critical_return=%d status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
                                 pc_wait_us / 1000.0,
                                 lane_gate_wait_us / 1000.0,
+                                critical_gate_wait_us / 1000.0,
                                 send_us / 1000.0,
                                 return_lane,
                                 return_payload->size(),
                                 phone_ffn_seq,
                                 use_chunk_join_return ? 1 : 0,
+                                critical_return_state != nullptr ? 1 : 0,
                                 sent ? 1 : 0);
                         }
 
