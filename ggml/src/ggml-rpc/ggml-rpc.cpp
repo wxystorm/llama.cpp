@@ -823,22 +823,59 @@ static bool send_rpc_cmd(
         input_size);
 }
 
+struct rpc_cmd_roundtrip_profile {
+    int64_t request_send_us         = 0;
+    int64_t response_header_wait_us = 0;
+    int64_t response_body_wait_us   = 0;
+};
+
+static thread_local rpc_cmd_roundtrip_profile *
+    rpc_cmd_roundtrip_profile_active = nullptr;
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    rpc_cmd_roundtrip_profile * const profile =
+        rpc_cmd_roundtrip_profile_active;
+
+    const int64_t request_send_begin_us =
+        profile != nullptr ? ggml_time_us() : 0;
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    const int64_t request_send_done_us =
+        profile != nullptr ? ggml_time_us() : 0;
+
     uint64_t out_size;
+    const int64_t response_header_begin_us =
+        profile != nullptr ? ggml_time_us() : 0;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
     }
+    const int64_t response_header_done_us =
+        profile != nullptr ? ggml_time_us() : 0;
+
     if (out_size != output_size) {
         return false;
     }
+
+    const int64_t response_body_begin_us =
+        profile != nullptr ? ggml_time_us() : 0;
     if (!sock->recv_data(output, output_size)) {
         return false;
     }
+    const int64_t response_body_done_us =
+        profile != nullptr ? ggml_time_us() : 0;
+
+    if (profile != nullptr) {
+        profile->request_send_us =
+            request_send_done_us - request_send_begin_us;
+        profile->response_header_wait_us =
+            response_header_done_us - response_header_begin_us;
+        profile->response_body_wait_us =
+            response_body_done_us - response_body_begin_us;
+    }
+
     return true;
 }
 
@@ -2248,6 +2285,14 @@ static bool ggml_backend_rpc_route_snapshot_ready(
     RPC_STATUS_ASSERT(sock != nullptr);
 
     rpc_msg_route_snapshot_ready_rsp response {};
+    rpc_cmd_roundtrip_profile roundtrip_profile {};
+    rpc_cmd_roundtrip_profile * const previous_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (stage_profile) {
+        rpc_cmd_roundtrip_profile_active =
+            &roundtrip_profile;
+    }
+
     const int64_t rpc_begin_us =
         stage_profile ? ggml_time_us() : 0;
     const bool status = send_rpc_cmd(
@@ -2261,18 +2306,26 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         stage_profile ? ggml_time_us() : 0;
 
     if (stage_profile) {
+        rpc_cmd_roundtrip_profile_active =
+            previous_profile;
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=route_snapshot_ready_client lane=%u "
             "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
-            "get_socket_ms=%.3f rpc_roundtrip_ms=%.3f "
-            "total_ms=%.3f status=%d result=%d\n",
+            "get_socket_ms=%.3f request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f "
+            "rpc_roundtrip_ms=%.3f total_ms=%.3f "
+            "status=%d result=%d\n",
             lane,
             seq,
             sizeof(request),
             sizeof(response),
             (socket_done_us - socket_begin_us) / 1000.0,
+            roundtrip_profile.request_send_us / 1000.0,
+            roundtrip_profile.response_header_wait_us / 1000.0,
+            roundtrip_profile.response_body_wait_us / 1000.0,
             (rpc_done_us - rpc_begin_us) / 1000.0,
             (rpc_done_us - client_begin_us) / 1000.0,
             status ? 1 : 0,
