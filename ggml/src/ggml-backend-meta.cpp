@@ -4151,6 +4151,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const bool reduce_summary =
+        std::getenv("GGML_META_REDUCE_SUMMARY") != nullptr;
     const bool phone_exit_profile =
         std::getenv("GGML_META_PHONE_EXIT_PROFILE") != nullptr;
     const bool meta_sg_timing =
@@ -14020,6 +14022,60 @@ auto prefill_norm_sg_has_prework =
                    pipeline_submit_sum_us / 1000.0 / pipeline_gap_count,
                    pipeline_gap_sum_us / 1000.0 / pipeline_gap_count,
                    pipeline_gap_max_us / 1000.0);
+        }
+    }
+
+    if (reduce_summary && !pipeline_debug) {
+        const double reduce_avg_us =
+            reduce_count > 0 ? double(reduce_wall_us) / reduce_count : 0.0;
+        const int64_t reduce_profiled_us =
+            reduce_copy_wait_us + reduce_add_us + reduce_zero_us + reduce_comm_us;
+        const int64_t reduce_other_us =
+            std::max<int64_t>(0, reduce_wall_us - reduce_profiled_us);
+
+        printf(
+            "[META_REDUCE_SUMMARY] uid=%" PRIu64
+            " subgraphs=%zu reduce_total_ms=%.3f count=%zu avg_ms=%.3f max_ms=%.3f"
+            " fallback=%zu comm_ms=%.3f comm_count=%zu"
+            " copy_wait_ms=%.3f add_ms=%.3f zero_ms=%.3f other_ms=%.3f"
+            " direct=%zu reduce_to_primary=%zu zero_copy_skips=%zu\n",
+            cgraph->uid,
+            backend_ctx->n_subgraphs,
+            reduce_wall_us / 1000.0,
+            reduce_count,
+            reduce_avg_us / 1000.0,
+            reduce_max_us / 1000.0,
+            reduce_fallback_count,
+            reduce_comm_us / 1000.0,
+            reduce_comm_count,
+            reduce_copy_wait_us / 1000.0,
+            reduce_add_us / 1000.0,
+            reduce_zero_us / 1000.0,
+            reduce_other_us / 1000.0,
+            direct_copy_count,
+            reduce_to_primary_count,
+            reduce_zero_copy_skips);
+
+        for (size_t j_src = 0; j_src < n_backends; ++j_src) {
+            for (size_t j_dst = 0; j_dst < n_backends; ++j_dst) {
+                const auto & stats =
+                    reduce_copy_by_direction[j_src*n_backends + j_dst];
+                if (stats.count == 0) {
+                    continue;
+                }
+                printf(
+                    "[META_REDUCE_COPY_SUM] uid=%" PRIu64
+                    " dir=%zu->%zu count=%zu total_ms=%.3f avg_ms=%.3f"
+                    " max_ms=%.3f bytes_mib=%.3f\n",
+                    cgraph->uid,
+                    j_src,
+                    j_dst,
+                    stats.count,
+                    stats.total_us / 1000.0,
+                    (double(stats.total_us) / stats.count) / 1000.0,
+                    stats.max_us / 1000.0,
+                    stats.bytes / (1024.0 * 1024.0));
+            }
         }
     }
 
