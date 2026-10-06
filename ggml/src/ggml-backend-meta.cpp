@@ -5410,27 +5410,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 continue;
             }
             for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
-                const char * name = graph->nodes[node_id]->name;
-
                 int chunk = -1;
                 int layer = -1;
                 if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                        name, chunk, layer)) {
-                    return_wavefront_graph = true;
-                    return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
-                    continue;
-                }
-
-                // Phone-primary MoE prefill no longer necessarily carries the
-                // legacy prefill_wave_ffn_inp_chunk_* marker.  Its chunked route
-                // marker is the stable staged-prefill boundary; decode route
-                // markers parse with chunk == -1 and are intentionally ignored.
-                chunk = -1;
-                layer = -1;
-                if (ggml_backend_meta_parse_phone_route_topk(
-                        name, chunk, layer) &&
-                        chunk >= 0 &&
-                        layer_is_tensor_phone_primary(layer)) {
+                        graph->nodes[node_id]->name, chunk, layer)) {
                     return_wavefront_graph = true;
                     return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
                 }
@@ -5441,6 +5424,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool wave_detect_debug =
         std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr ||
         std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
+    bool phone_primary_profile_graph = false;
+    int  phone_primary_profile_first_layer = std::numeric_limits<int>::max();
 
     if (wave_detect_debug && n_backends == 2) {
         struct wave_detect_stats {
@@ -5551,6 +5536,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         if (stats.first_route_topk == nullptr) {
                             stats.first_route_topk = name;
                         }
+                        if (backend == 0 &&
+                                chunk >= 0 &&
+                                layer_is_tensor_phone_primary(layer)) {
+                            phone_primary_profile_graph = true;
+                            phone_primary_profile_first_layer =
+                                std::min(phone_primary_profile_first_layer, layer);
+                        }
                     }
 
                     chunk = -1;
@@ -5608,15 +5600,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         printf(
             "[PHONE_WAVE_DETECT_RESULT] uid=%" PRIu64
             " return_wavefront=%d first_layer=%d "
+            "phone_profile=%d phone_profile_first_layer=%d "
             "pc_wave_ffn_inp=%zu phone_wave_ffn_inp=%zu\n",
             cgraph->uid,
             return_wavefront_graph ? 1 : 0,
             return_wavefront_first_layer ==
                     std::numeric_limits<int>::max() ?
                 -1 : return_wavefront_first_layer,
+            phone_primary_profile_graph ? 1 : 0,
+            phone_primary_profile_first_layer ==
+                    std::numeric_limits<int>::max() ?
+                -1 : phone_primary_profile_first_layer,
             stats_by_backend[0].wave_ffn_inp,
             stats_by_backend[1].wave_ffn_inp);
     }
+
+    const bool runtime_profile_graph =
+        return_wavefront_graph || phone_primary_profile_graph;
 
     const bool phone_primary_wavefront_graph =
         return_wavefront_graph &&
@@ -13933,9 +13933,9 @@ auto prefill_norm_sg_has_prework =
             meta_other_all_us / 1000.0);
     }
 
-    if (return_wavefront_graph) {
+    if (runtime_profile_graph) {
         printf(
-            "[RETURN_WAVEFRONT_SUM] enabled=1 dependency_wait_count=%" PRId64
+            "[RETURN_WAVEFRONT_SUM] enabled=%d profile_only=%d dependency_wait_count=%" PRId64
             " dependency_wait_ms=%.3f dependency_wait_max_ms=%.3f"
             " overlap_boundaries=%" PRId64
             " ahead_attn=%" PRId64
@@ -13948,6 +13948,8 @@ auto prefill_norm_sg_has_prework =
             " lane_reuse_wait_ms=%.3f lane_reuse_wait_max_ms=%.3f"
             " legacy_layer_barrier_count=%" PRId64
             " legacy_layer_barrier_wait_ms=%.3f legacy_layer_barrier_wait_max_ms=%.3f\n",
+            return_wavefront_graph ? 1 : 0,
+            (!return_wavefront_graph && phone_primary_profile_graph) ? 1 : 0,
             return_wave_dependency_wait_count,
             return_wave_dependency_wait_us / 1000.0,
             return_wave_dependency_wait_max_us / 1000.0,
@@ -14090,15 +14092,15 @@ auto prefill_norm_sg_has_prework =
             return_overlap_ratio);
     }
 
-    const int64_t meta_graph_end_us = return_wavefront_graph ? ggml_time_us() : 0;
+    const int64_t meta_graph_end_us = runtime_profile_graph ? ggml_time_us() : 0;
     const int64_t meta_total_us =
-        return_wavefront_graph ? meta_graph_end_us - meta_graph_start_us : 0;
+        runtime_profile_graph ? meta_graph_end_us - meta_graph_start_us : 0;
     const int64_t main_accounted_us =
-        return_wavefront_graph ? compute_wall_us + reduce_wall_us + layer_barrier_wait_us : 0;
+        runtime_profile_graph ? compute_wall_us + reduce_wall_us + layer_barrier_wait_us : 0;
     const int64_t other_main_us =
-        return_wavefront_graph ? std::max<int64_t>(0, meta_total_us - main_accounted_us) : 0;
+        runtime_profile_graph ? std::max<int64_t>(0, meta_total_us - main_accounted_us) : 0;
 
-    if (return_wavefront_graph) {
+    if (runtime_profile_graph) {
         printf(
             "[TENSOR_RUNTIME_SUM] "
             "attn_ms=%.3f pc_ffn_ms=%.3f h2d_ms=%.3f phone_ms=%.3f "
@@ -14241,7 +14243,7 @@ auto prefill_norm_sg_has_prework =
         if (needs_rebuild) {
             backend_ctx->tensor_profile.graph_rebuild_count += 1;
         }
-        if (return_wavefront_graph) {
+        if (runtime_profile_graph) {
             backend_ctx->tensor_profile.compute_wall_us += compute_wall_us;
             backend_ctx->tensor_profile.reduce_wall_us  += reduce_wall_us;
             backend_ctx->tensor_profile.meta_total_us   += meta_total_us;
