@@ -2235,10 +2235,21 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         request.sizes[i] = ggml_nbytes(srcs[i]);
     }
 
+    const bool stage_profile =
+        rpc_tensor_phone_stage_profile_enabled();
+    const int64_t client_begin_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    const int64_t socket_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     auto sock = get_socket(rpc_ctx->endpoint);
+    const int64_t socket_done_us =
+        stage_profile ? ggml_time_us() : 0;
     RPC_STATUS_ASSERT(sock != nullptr);
 
     rpc_msg_route_snapshot_ready_rsp response {};
+    const int64_t rpc_begin_us =
+        stage_profile ? ggml_time_us() : 0;
     const bool status = send_rpc_cmd(
         sock,
         RPC_CMD_ROUTE_SNAPSHOT_READY,
@@ -2246,6 +2257,29 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         sizeof(request),
         &response,
         sizeof(response));
+    const int64_t rpc_done_us =
+        stage_profile ? ggml_time_us() : 0;
+
+    if (stage_profile) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=pc "
+            "stage=route_snapshot_ready_client lane=%u "
+            "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
+            "get_socket_ms=%.3f rpc_roundtrip_ms=%.3f "
+            "total_ms=%.3f status=%d result=%d\n",
+            lane,
+            seq,
+            sizeof(request),
+            sizeof(response),
+            (socket_done_us - socket_begin_us) / 1000.0,
+            (rpc_done_us - rpc_begin_us) / 1000.0,
+            (rpc_done_us - client_begin_us) / 1000.0,
+            status ? 1 : 0,
+            status && response.result != 0 ? 1 : 0);
+        std::fflush(stderr);
+    }
+
     return status && response.result != 0;
 }
 
@@ -7295,19 +7329,61 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_ROUTE_SNAPSHOT_READY: {
+                const bool stage_profile =
+                    rpc_tensor_phone_stage_profile_enabled();
+                const int64_t request_recv_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+
                 rpc_msg_route_snapshot_ready_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t request_recv_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
                 rpc_msg_route_snapshot_ready_rsp response {};
+                const int64_t handler_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
                 if (!server.route_snapshot_ready(request, response)) {
                     return;
                 }
+                const int64_t handler_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                const int64_t response_send_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
                 if (!send_msg(
                         sock,
                         &response,
                         sizeof(response))) {
                     return;
+                }
+                const int64_t response_send_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (stage_profile) {
+                    std::fprintf(
+                        stderr,
+                        "[TENSOR_PHONE_RPC_STAGE] side=phone "
+                        "stage=route_snapshot_ready_server lane=%u "
+                        "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
+                        "request_recv_ms=%.3f handler_ms=%.3f "
+                        "response_send_ms=%.3f total_ms=%.3f "
+                        "result=%d\n",
+                        request.lane,
+                        request.seq,
+                        sizeof(request),
+                        sizeof(response),
+                        (request_recv_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        (handler_done_us -
+                            handler_begin_us) / 1000.0,
+                        (response_send_done_us -
+                            response_send_begin_us) / 1000.0,
+                        (response_send_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        response.result != 0 ? 1 : 0);
+                    std::fflush(stderr);
                 }
                 break;
             }
