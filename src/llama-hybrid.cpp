@@ -2692,7 +2692,6 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
     std::vector<double> prev_join(n, 0.0);
     double serial_baseline_ms = first_common_ms;
     double first_layer_done_ms = 0.0;
-    double previous_layer_done_ms = 0.0;
     double final_done_ms = 0.0;
 
     for (int layer = 0; layer < tensor_layers; ++layer) {
@@ -2823,7 +2822,6 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
         if (layer == 0) {
             first_layer_done_ms = layer_done_ms;
         }
-        previous_layer_done_ms = layer_done_ms;
         final_done_ms = layer_done_ms;
     }
 
