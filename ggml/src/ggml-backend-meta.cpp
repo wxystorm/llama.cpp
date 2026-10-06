@@ -2525,6 +2525,7 @@ struct ggml_backend_meta_context {
     std::map<int, phone_stage_bridge_state> phone_stage_bridges;
     std::mutex                              phone_stage_bridge_mutex;
     bool                                    phone_stage_resident_handoff_active = false;
+    bool                                    phone_stage_terminal_discard_active = false;
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
@@ -8395,6 +8396,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             layer_is_tensor_phone_primary(
                 force_phone_block_layer);
 
+        if (backend_ctx->phone_stage_terminal_discard_active &&
+                active_count == 1 &&
+                active_backend == 1 &&
+                (force_phone_block_exit ||
+                 i + 1 >= backend_ctx->n_subgraphs)) {
+            handled = true;
+            if (pipeline_debug ||
+                    tensor_phone_stage_profile) {
+                printf(
+                    "[PHONE_STAGE_TERMINAL_DISCARD] "
+                    "sg=%zu layer=%d node=%s "
+                    "action=KEEP_PHONE_NO_EXPORT\n",
+                    i,
+                    force_phone_block_layer,
+                    nodes[1] != nullptr ?
+                        nodes[1]->name : "(null)");
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
@@ -14216,6 +14237,22 @@ bool ggml_backend_meta_set_phone_stage_resident_handoff(
     if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
         printf(
             "[PHONE_STAGE_RESIDENT_ARM] enabled=%d\n",
+            enabled ? 1 : 0);
+    }
+    return true;
+}
+
+bool ggml_backend_meta_set_phone_stage_terminal_discard(
+        ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    backend_ctx->phone_stage_terminal_discard_active = enabled;
+    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+        printf(
+            "[PHONE_STAGE_TERMINAL_DISCARD_ARM] enabled=%d\n",
             enabled ? 1 : 0);
     }
     return true;
