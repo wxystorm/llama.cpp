@@ -8398,9 +8398,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
         if (backend_ctx->phone_stage_terminal_discard_active &&
                 active_count == 1 &&
-                active_backend == 1 &&
-                (force_phone_block_exit ||
-                 i + 1 >= backend_ctx->n_subgraphs)) {
+                active_backend == 1) {
+            // The hybrid stage runner only arms this mode for a terminal
+            // PHONE stage whose caller requested no stage/block output.
+            // Therefore any Phone-only intermediate scheduler split in this
+            // block is internal state and must remain Phone-resident.  Do not
+            // let scheduler topology manufacture a transient Phone->PC export
+            // before the block reaches its final layer.
             handled = true;
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
