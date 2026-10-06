@@ -263,6 +263,7 @@ enum rpc_cmd {
     RPC_CMD_GET_ROUTE_SNAPSHOT,
     RPC_CMD_PHONE_FFN_MARK_READY,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
+    RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
     RPC_CMD_COUNT,
 };
 
@@ -283,6 +284,7 @@ static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY == 29, "RPC_CMD_ROUTE_SNAPSHOT_READY 
 static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -2235,9 +2237,11 @@ static bool ggml_backend_rpc_route_snapshot_ready(
     }
 
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_ASYNC_MIN_PATCH = 14;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
-    if (rpc_get_remote_patch(compute_key) <
-            RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
+    const uint8_t remote_patch =
+        rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
         return false;
     }
 
@@ -2272,6 +2276,11 @@ static bool ggml_backend_rpc_route_snapshot_ready(
         request.sizes[i] = ggml_nbytes(srcs[i]);
     }
 
+    const bool async_requested =
+        std::getenv("GGML_META_PHONE_PREFILL_ASYNC_SNAPSHOT_READY") != nullptr;
+    const bool async_enabled =
+        async_requested &&
+        remote_patch >= RPC_ROUTE_SNAPSHOT_ASYNC_MIN_PATCH;
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t client_begin_us =
@@ -2283,6 +2292,45 @@ static bool ggml_backend_rpc_route_snapshot_ready(
     const int64_t socket_done_us =
         stage_profile ? ggml_time_us() : 0;
     RPC_STATUS_ASSERT(sock != nullptr);
+
+    if (async_enabled) {
+        const int64_t send_begin_us =
+            stage_profile ? ggml_time_us() : 0;
+        const bool status =
+            send_rpc_cmd_compact_small(
+                sock,
+                RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
+                request);
+        const int64_t send_done_us =
+            stage_profile ? ggml_time_us() : 0;
+
+        if (stage_profile) {
+            std::fprintf(
+                stderr,
+                "[TENSOR_PHONE_RPC_STAGE] side=pc "
+                "stage=route_snapshot_ready_client lane=%u "
+                "seq=%" PRIu64 " request_bytes=%zu response_bytes=0 "
+                "async_requested=1 async_enabled=1 remote_patch=%u "
+                "get_socket_ms=%.3f request_send_ms=%.3f "
+                "response_header_wait_ms=0.000 "
+                "response_body_wait_ms=0.000 "
+                "rpc_roundtrip_ms=%.3f total_ms=%.3f "
+                "status=%d result=%d\n",
+                lane,
+                seq,
+                sizeof(request),
+                static_cast<unsigned>(remote_patch),
+                (socket_done_us - socket_begin_us) / 1000.0,
+                (send_done_us - send_begin_us) / 1000.0,
+                (send_done_us - send_begin_us) / 1000.0,
+                (send_done_us - client_begin_us) / 1000.0,
+                status ? 1 : 0,
+                status ? 1 : 0);
+            std::fflush(stderr);
+        }
+
+        return status;
+    }
 
     rpc_msg_route_snapshot_ready_rsp response {};
     rpc_cmd_roundtrip_profile roundtrip_profile {};
@@ -2313,6 +2361,7 @@ static bool ggml_backend_rpc_route_snapshot_ready(
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=route_snapshot_ready_client lane=%u "
             "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
+            "async_requested=%d async_enabled=0 remote_patch=%u "
             "get_socket_ms=%.3f request_send_ms=%.3f "
             "response_header_wait_ms=%.3f "
             "response_body_wait_ms=%.3f "
@@ -2322,6 +2371,8 @@ static bool ggml_backend_rpc_route_snapshot_ready(
             seq,
             sizeof(request),
             sizeof(response),
+            async_requested ? 1 : 0,
+            static_cast<unsigned>(remote_patch),
             (socket_done_us - socket_begin_us) / 1000.0,
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
@@ -7434,6 +7485,51 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         (response_send_done_us -
                             response_send_begin_us) / 1000.0,
                         (response_send_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        response.result != 0 ? 1 : 0);
+                    std::fflush(stderr);
+                }
+                break;
+            }
+            case RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC: {
+                const bool stage_profile =
+                    rpc_tensor_phone_stage_profile_enabled();
+                const int64_t request_recv_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                rpc_msg_route_snapshot_ready_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                const int64_t request_recv_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                rpc_msg_route_snapshot_ready_rsp response {};
+                const int64_t handler_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+                if (!server.route_snapshot_ready(request, response)) {
+                    return;
+                }
+                const int64_t handler_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (stage_profile) {
+                    std::fprintf(
+                        stderr,
+                        "[TENSOR_PHONE_RPC_STAGE] side=phone "
+                        "stage=route_snapshot_ready_async_server lane=%u "
+                        "seq=%" PRIu64 " request_bytes=%zu response_bytes=0 "
+                        "request_recv_ms=%.3f handler_ms=%.3f "
+                        "response_send_ms=0.000 total_ms=%.3f "
+                        "result=%d\n",
+                        request.lane,
+                        request.seq,
+                        sizeof(request),
+                        (request_recv_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        (handler_done_us -
+                            handler_begin_us) / 1000.0,
+                        (handler_done_us -
                             request_recv_begin_us) / 1000.0,
                         response.result != 0 ? 1 : 0);
                     std::fflush(stderr);
