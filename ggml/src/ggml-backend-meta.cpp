@@ -12457,6 +12457,14 @@ auto prefill_norm_sg_has_prework =
                         const int64_t pc_wait_us =
                             ggml_time_us() - wait_begin_us;
                         if (pc_status != GGML_STATUS_SUCCESS) {
+                            if (critical_return_state != nullptr) {
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        critical_return_state->mutex);
+                                    critical_return_state->cancelled = true;
+                                }
+                                critical_return_state->cv.notify_all();
+                            }
                             return pc_status;
                         }
 
