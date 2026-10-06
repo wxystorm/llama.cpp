@@ -13191,11 +13191,28 @@ auto prefill_norm_sg_has_prework =
             phone_primary_wavefront_graph &&
             communication_sg + 1 >= backend_ctx->n_subgraphs &&
             terminal_phone_wave_output_index >= 0;
+        const bool phone_block_continues_on_phone =
+            phone_block_fused &&
+            communication_sg + 1 < backend_ctx->n_subgraphs &&
+            subgraph_will_execute_phone(
+                communication_sg + 1);
         const bool force_phone_block_exit =
             phone_block_fused &&
             phone_block_last_layer >= 0 &&
             !layer_is_tensor_phone_primary(
-                phone_block_last_layer);
+                phone_block_last_layer) &&
+            !phone_block_continues_on_phone;
+
+        if (pipeline_debug &&
+                phone_block_fused &&
+                phone_block_continues_on_phone) {
+            printf(
+                "[PHONE_BLOCK_KEEP_PHONE] "
+                "layers=%d..%d next_sg=%zu action=NO_PC_EXIT\n",
+                timing_first_layer,
+                phone_block_last_layer,
+                communication_sg + 1);
+        }
         int64_t subgraph_comm_wall_us = 0;
         int64_t subgraph_specialized_us = 0;
         int64_t subgraph_comm_allreduce_us = 0;
