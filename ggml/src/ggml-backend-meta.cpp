@@ -5410,10 +5410,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 continue;
             }
             for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
+                const char * name = graph->nodes[node_id]->name;
+
                 int chunk = -1;
                 int layer = -1;
                 if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
-                        graph->nodes[node_id]->name, chunk, layer)) {
+                        name, chunk, layer)) {
+                    return_wavefront_graph = true;
+                    return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
+                    continue;
+                }
+
+                // Phone-primary MoE prefill no longer necessarily carries the
+                // legacy prefill_wave_ffn_inp_chunk_* marker.  Its chunked route
+                // marker is the stable staged-prefill boundary; decode route
+                // markers parse with chunk == -1 and are intentionally ignored.
+                chunk = -1;
+                layer = -1;
+                if (ggml_backend_meta_parse_phone_route_topk(
+                        name, chunk, layer) &&
+                        chunk >= 0 &&
+                        layer_is_tensor_phone_primary(layer)) {
                     return_wavefront_graph = true;
                     return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
                 }
