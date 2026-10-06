@@ -823,6 +823,16 @@ void llama_hybrid_plan_print(const llama_hybrid_plan & plan) {
         "phone_peak_mib=%.2f\n",
         plan.predicted_gpu_busy_ms, plan.predicted_downstream_ms, plan.predicted_gpu_wait_ms,
         plan.predicted_tensor_peak_bytes / 1048576.0, plan.predicted_phone_peak_bytes / 1048576.0);
+    if (plan.tensor_phone_primary && plan.tensor_layers > 0) {
+        LLAMA_LOG_INFO(
+            "[HYBRID_PLAN_PHONE_WAVE] enabled=1 critical_return=%d "
+            "layers=%d XT=%d R=%.3f\n",
+            std::getenv(
+                "GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr ? 1 : 0,
+            plan.tensor_layers,
+            plan.tensor_chunk_tokens,
+            plan.tensor_pc_ratio);
+    }
 }
 
 static size_t llama_hybrid_effective_budget(size_t requested, size_t free_mem, double default_fraction) {
@@ -2548,6 +2558,301 @@ static double llama_hybrid_tensor_phone_misc_cost(
         phone_layer_base_ms - phone_attn_base_ms - full_ffn_ms);
 }
 
+struct llama_hybrid_phone_wavefront_detail {
+    int    chunks             = 0;
+    double first_layer_ms     = 0.0;
+    double steady_layer_ms    = 0.0;
+    double done_ms            = 0.0;
+    double serial_baseline_ms = 0.0;
+    double overlap_saved_ms   = 0.0;
+};
+
+static bool llama_hybrid_tensor_phone_wavefront_cost(
+        const llama_hybrid_profile & profile,
+        float                        target_pc_ratio,
+        int                          tensor_layers,
+        int                          total_tokens,
+        int                          chunk_tokens,
+        int                          kv_tokens,
+        int                          max_chunks,
+        bool                         critical_return,
+        double &                     result_ms,
+        llama_hybrid_phone_wavefront_detail * detail = nullptr) {
+    result_ms = 0.0;
+    if (!profile.is_moe ||
+        tensor_layers <= 0 ||
+        total_tokens <= 0 ||
+        chunk_tokens <= 0 ||
+        profile.n_embd <= 0 ||
+        target_pc_ratio <= 0.0f ||
+        target_pc_ratio >= 1.0f) {
+        return false;
+    }
+
+    std::vector<int> chunks;
+    if (!llama_hybrid_select_tensor_phone_chunks(
+            profile, target_pc_ratio, total_tokens,
+            chunk_tokens, max_chunks, chunks) ||
+        chunks.empty()) {
+        return false;
+    }
+
+    kv_tokens = std::max(kv_tokens, total_tokens);
+    if (profile.n_ctx_train > 0) {
+        kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
+    }
+    const int past_tokens = std::max(0, kv_tokens - total_tokens);
+
+    double full_layer_base = 0.0;
+    double full_attn_base  = 0.0;
+    double full_attn_kv    = 0.0;
+    if (!llama_hybrid_layer_block_cost(
+            profile.phone_layer_blocks, total_tokens, true,
+            full_layer_base) ||
+        !llama_hybrid_attn_cost(
+            profile.phone_attn, total_tokens, total_tokens,
+            full_attn_base) ||
+        !llama_hybrid_attn_cost(
+            profile.phone_attn, total_tokens, kv_tokens,
+            full_attn_kv)) {
+        return false;
+    }
+
+    const double first_common_ms =
+        full_attn_kv +
+        llama_hybrid_tensor_phone_misc_cost(
+            profile, total_tokens,
+            full_layer_base, full_attn_base);
+
+    const size_t n = chunks.size();
+    std::vector<double> later_common_ms(n, 0.0);
+    std::vector<double> route_ms(n, 0.0);
+    std::vector<double> return_ms(n, 0.0);
+    std::vector<size_t> payload_bytes(n, 0);
+
+    int prefix_tokens = 0;
+    for (size_t ci = 0; ci < n; ++ci) {
+        const int tokens = chunks[ci];
+        prefix_tokens += tokens;
+        const int chunk_kv_tokens =
+            std::max(
+                tokens,
+                std::min(
+                    kv_tokens,
+                    past_tokens + prefix_tokens));
+
+        double chunk_layer_base = 0.0;
+        double chunk_attn_base  = 0.0;
+        double chunk_attn_kv    = 0.0;
+        if (!llama_hybrid_layer_block_cost(
+                profile.phone_layer_blocks, tokens, true,
+                chunk_layer_base) ||
+            !llama_hybrid_attn_cost(
+                profile.phone_attn, tokens, tokens,
+                chunk_attn_base) ||
+            !llama_hybrid_attn_cost(
+                profile.phone_attn, tokens, chunk_kv_tokens,
+                chunk_attn_kv)) {
+            return false;
+        }
+
+        later_common_ms[ci] =
+            chunk_attn_kv +
+            llama_hybrid_tensor_phone_misc_cost(
+                profile, tokens,
+                chunk_layer_base, chunk_attn_base);
+
+        payload_bytes[ci] =
+            (size_t) profile.n_embd *
+            (size_t) tokens *
+            sizeof(float);
+        if (!llama_hybrid_transfer_cost(
+                profile.snapshot_phone_to_pc,
+                payload_bytes[ci], route_ms[ci]) ||
+            !llama_hybrid_transfer_cost(
+                profile.pc_to_phone,
+                payload_bytes[ci], return_ms[ci])) {
+            return false;
+        }
+    }
+
+    const bool pc_ready_schedule =
+        std::getenv(
+            "GGML_META_PHONE_PREFILL_DISABLE_PC_READY_SCHED") == nullptr;
+
+    std::array<double, LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES>
+        route_lane_available {};
+    std::array<double, LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES>
+        return_lane_available {};
+
+    double phone_available = first_common_ms;
+    double pc_available = 0.0;
+    double critical_return_available = 0.0;
+
+    std::vector<double> prev_join(n, 0.0);
+    double serial_baseline_ms = first_common_ms;
+    double first_layer_done_ms = 0.0;
+    double previous_layer_done_ms = 0.0;
+    double final_done_ms = 0.0;
+
+    for (int layer = 0; layer < tensor_layers; ++layer) {
+        const float layer_ratio =
+            llama_hybrid_mixed_profile_ratio_for_layer(
+                profile, target_pc_ratio,
+                layer, tensor_layers);
+
+        std::vector<double> route_issue(n, 0.0);
+        std::vector<double> route_ready(n, 0.0);
+        std::vector<double> phone_ffn_ready(n, 0.0);
+        std::vector<double> pc_ready(n, 0.0);
+        std::vector<double> return_ready(n, 0.0);
+        std::vector<double> pc_cost(n, 0.0);
+        std::vector<double> phone_cost(n, 0.0);
+
+        for (size_t ci = 0; ci < n; ++ci) {
+            const int tokens = chunks[ci];
+            if (!llama_hybrid_ffn_cost(
+                    profile.cpu_ffn, tokens,
+                    layer_ratio, pc_cost[ci]) ||
+                !llama_hybrid_ffn_cost(
+                    profile.phone_ffn, tokens,
+                    1.0f - layer_ratio,
+                    phone_cost[ci])) {
+                return false;
+            }
+
+            if (layer > 0) {
+                phone_available =
+                    std::max(phone_available, prev_join[ci]);
+                phone_available += later_common_ms[ci];
+                serial_baseline_ms += later_common_ms[ci];
+            }
+
+            route_issue[ci] = phone_available;
+            const size_t route_lane =
+                ci % LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES;
+            const double route_start =
+                std::max(
+                    route_issue[ci],
+                    route_lane_available[route_lane]);
+            route_ready[ci] =
+                route_start + route_ms[ci];
+            route_lane_available[route_lane] =
+                route_ready[ci];
+
+            phone_available += phone_cost[ci];
+            phone_ffn_ready[ci] = phone_available;
+
+            serial_baseline_ms +=
+                route_ms[ci] +
+                pc_cost[ci] +
+                phone_cost[ci] +
+                return_ms[ci] +
+                profile.reduce_ms;
+        }
+
+        std::vector<size_t> pc_order(n);
+        std::iota(pc_order.begin(), pc_order.end(), size_t(0));
+        if (pc_ready_schedule) {
+            std::stable_sort(
+                pc_order.begin(), pc_order.end(),
+                [&](size_t a, size_t b) {
+                    if (route_ready[a] != route_ready[b]) {
+                        return route_ready[a] < route_ready[b];
+                    }
+                    return a < b;
+                });
+        }
+
+        for (const size_t ci : pc_order) {
+            pc_available =
+                std::max(pc_available, route_ready[ci]);
+            pc_available += pc_cost[ci];
+            pc_ready[ci] = pc_available;
+        }
+
+        const double lane1_gate_open =
+            route_issue.empty() ? 0.0 : route_issue.back();
+
+        for (size_t ci = 0; ci < n; ++ci) {
+            const size_t return_lane =
+                ci % LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES;
+            double start = pc_ready[ci];
+
+            if (return_lane == 1) {
+                start = std::max(start, lane1_gate_open);
+            }
+
+            if (critical_return) {
+                start =
+                    std::max(start, critical_return_available);
+                start =
+                    std::max(
+                        start,
+                        return_lane_available[return_lane]);
+            } else {
+                start =
+                    std::max(
+                        start,
+                        return_lane_available[return_lane]);
+            }
+
+            return_ready[ci] =
+                start + return_ms[ci];
+            return_lane_available[return_lane] =
+                return_ready[ci];
+            if (critical_return) {
+                critical_return_available =
+                    return_ready[ci];
+            }
+        }
+
+        std::vector<double> join_ready(n, 0.0);
+        double layer_done_ms = phone_available;
+        for (size_t ci = 0; ci < n; ++ci) {
+            join_ready[ci] =
+                std::max(
+                    phone_ffn_ready[ci],
+                    return_ready[ci]) +
+                profile.reduce_ms;
+            layer_done_ms =
+                std::max(layer_done_ms, join_ready[ci]);
+        }
+
+        prev_join = std::move(join_ready);
+        if (layer == 0) {
+            first_layer_done_ms = layer_done_ms;
+        }
+        previous_layer_done_ms = layer_done_ms;
+        final_done_ms = layer_done_ms;
+    }
+
+    result_ms = final_done_ms;
+    if (!std::isfinite(result_ms)) {
+        return false;
+    }
+
+    if (detail != nullptr) {
+        detail->chunks = (int) n;
+        detail->first_layer_ms = first_layer_done_ms;
+        detail->steady_layer_ms =
+            tensor_layers > 1 ?
+                std::max(
+                    0.0,
+                    (final_done_ms - first_layer_done_ms) /
+                        (tensor_layers - 1)) :
+                first_layer_done_ms;
+        detail->done_ms = final_done_ms;
+        detail->serial_baseline_ms = serial_baseline_ms;
+        detail->overlap_saved_ms =
+            std::max(
+                0.0,
+                serial_baseline_ms - final_done_ms);
+    }
+
+    return true;
+}
+
 bool llama_hybrid_runtime_predict_tensor_compute(
         int tokens, llama_hybrid_tensor_compute_prediction & prediction) {
     prediction = {};
@@ -3643,10 +3948,12 @@ bool llama_hybrid_predict_decode_plan(
 struct llama_hybrid_lp_model {
     int layers = 0;
 
-    double cpu_cost          = 0.0;
-    double tensor_cost       = 0.0;
-    double tensor_phone_cost = 0.0;
-    double phone_cost        = 0.0;
+    double cpu_cost                 = 0.0;
+    double tensor_cost              = 0.0;
+    double tensor_phone_cost        = 0.0;
+    double tensor_phone_first_cost  = 0.0;
+    double tensor_phone_steady_cost = 0.0;
+    double phone_cost               = 0.0;
 
     double pc_cpu_bytes    = 0.0;
     double pc_tensor_bytes = 0.0;
@@ -3816,6 +4123,55 @@ static bool llama_hybrid_coarse_lp_model(const llama_hybrid_profile &     profil
         }
     }
 
+    model.tensor_phone_first_cost =
+        model.tensor_phone_cost;
+    model.tensor_phone_steady_cost =
+        model.tensor_phone_cost;
+
+    if (std::isfinite(model.tensor_phone_cost) &&
+        profile.is_moe) {
+        int tensor_kv_tokens = constraints.score_kv_tokens;
+        if (tensor_kv_tokens <= 0) {
+            tensor_kv_tokens = constraints.target_ctx > 0 ?
+                constraints.target_ctx : profile.n_ctx_train;
+        }
+        tensor_kv_tokens =
+            std::max(tensor_kv_tokens, work_tokens);
+        if (profile.n_ctx_train > 0) {
+            tensor_kv_tokens =
+                std::min(
+                    tensor_kv_tokens,
+                    profile.n_ctx_train);
+        }
+
+        const bool critical_return =
+            std::getenv(
+                "GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
+        double depth1_ms = 0.0;
+        double depth2_ms = 0.0;
+        if (llama_hybrid_tensor_phone_wavefront_cost(
+                profile, pc_ratio,
+                1, work_tokens,
+                tensor_chunk_tokens,
+                tensor_kv_tokens,
+                constraints.max_tensor_chunks,
+                critical_return,
+                depth1_ms) &&
+            llama_hybrid_tensor_phone_wavefront_cost(
+                profile, pc_ratio,
+                2, work_tokens,
+                tensor_chunk_tokens,
+                tensor_kv_tokens,
+                constraints.max_tensor_chunks,
+                critical_return,
+                depth2_ms)) {
+            model.tensor_phone_first_cost =
+                depth1_ms;
+            model.tensor_phone_steady_cost =
+                std::max(0.0, depth2_ms - depth1_ms);
+        }
+    }
+
     if (profile.layer_weight_bytes.size() != (size_t) profile.n_layer ||
         profile.layer_attn_forced_bytes.size() != (size_t) profile.n_layer ||
         profile.layer_ffn_split_bytes.size() != (size_t) profile.n_layer ||
@@ -3974,9 +4330,18 @@ static bool llama_hybrid_coarse_plan_score(
         if (!std::isfinite(tensor_cost)) {
             return false;
         }
-        downstream_ms +=
-            plan.tensor_layers * tensor_cost *
-            llama_hybrid_tensor_depth_factor(plan.tensor_layers);
+        if (plan.tensor_phone_primary &&
+            std::isfinite(model.tensor_phone_first_cost) &&
+            std::isfinite(model.tensor_phone_steady_cost)) {
+            downstream_ms +=
+                model.tensor_phone_first_cost +
+                std::max(0, plan.tensor_layers - 1) *
+                    model.tensor_phone_steady_cost;
+        } else {
+            downstream_ms +=
+                plan.tensor_layers * tensor_cost *
+                llama_hybrid_tensor_depth_factor(plan.tensor_layers);
+        }
     }
 
     if (plan.phone_layers > 0 ||
@@ -5126,36 +5491,23 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         double tensor_layer_ms = 0.0;
         for (const int macro_tokens : macro_chunks) {
             if (candidate.tensor_phone_primary) {
-                double tensor_ffn_total_ms = 0.0;
-                double phone_layer_base = 0.0;
-                double phone_attn_base  = 0.0;
-                double phone_attn_kv    = 0.0;
-                if (!llama_hybrid_tensor_phone_mixed_ffn_total_cost(
-                        profile, candidate.tensor_pc_ratio,
-                        candidate.tensor_layers, macro_tokens,
+                const bool critical_return =
+                    std::getenv(
+                        "GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
+                double wavefront_ms = 0.0;
+                if (!llama_hybrid_tensor_phone_wavefront_cost(
+                        profile,
+                        candidate.tensor_pc_ratio,
+                        candidate.tensor_layers,
+                        macro_tokens,
                         candidate.tensor_chunk_tokens,
-                        tensor_ffn_total_ms,
-                        constraints.max_tensor_chunks) ||
-                    !llama_hybrid_layer_block_cost(
-                        profile.phone_layer_blocks, macro_tokens, true,
-                        phone_layer_base) ||
-                    !llama_hybrid_attn_cost(
-                        profile.phone_attn, macro_tokens, macro_tokens,
-                        phone_attn_base) ||
-                    !llama_hybrid_attn_cost(
-                        profile.phone_attn, macro_tokens, kv_tokens,
-                        phone_attn_kv)) {
+                        kv_tokens,
+                        constraints.max_tensor_chunks,
+                        critical_return,
+                        wavefront_ms)) {
                     return false;
                 }
-
-                const double common_layer_ms =
-                    phone_attn_kv +
-                    llama_hybrid_tensor_phone_misc_cost(
-                        profile, macro_tokens,
-                        phone_layer_base, phone_attn_base);
-                tensor_total_ms +=
-                    candidate.tensor_layers * common_layer_ms +
-                    tensor_ffn_total_ms;
+                tensor_total_ms += wavefront_ms;
             } else {
                 double tensor_ffn_ms = 0.0;
                 double cpu_layer_base = 0.0;
