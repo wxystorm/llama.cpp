@@ -5215,6 +5215,9 @@ bool rpc_server::route_snapshot_ready(
         route_snapshot_devices[request.device]->
             slots[request.lane];
 
+    const int64_t snapshot_begin_us = ggml_time_us();
+    const int64_t free_wait_begin_us = snapshot_begin_us;
+    int64_t free_wait_us = 0;
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         slot.cv.wait(
@@ -5223,6 +5226,7 @@ bool rpc_server::route_snapshot_ready(
                 return slot.state ==
                     rpc_snapshot_state::FREE;
             });
+        free_wait_us = ggml_time_us() - free_wait_begin_us;
         slot.state = rpc_snapshot_state::FILLING;
         slot.seq = request.seq;
         slot.sizes = {
@@ -5284,7 +5288,8 @@ bool rpc_server::route_snapshot_ready(
             "stage=route_snapshot_fill lane=%u "
             "seq=%" PRIu64 " bytes=%zu "
             "topk_storage_bytes=%" PRIu64 " topk_wire_bytes=%zu "
-            "compact_topk_eligible=%d fill_ms=%.3f status=%d\n",
+            "compact_topk_eligible=%d free_wait_ms=%.3f "
+            "fill_ms=%.3f total_ms=%.3f status=%d\n",
             request.lane,
             request.seq,
             total_size,
@@ -5293,7 +5298,9 @@ bool rpc_server::route_snapshot_ready(
             (topk_layout.supported &&
              topk_layout.wire_bytes <
                 static_cast<size_t>(request.sizes[1])) ? 1 : 0,
+            free_wait_us / 1000.0,
             fill_us / 1000.0,
+            (ggml_time_us() - snapshot_begin_us) / 1000.0,
             ok ? 1 : 0);
         std::fflush(stderr);
     }
