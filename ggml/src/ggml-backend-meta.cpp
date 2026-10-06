@@ -2538,7 +2538,9 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
-    ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
+    std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES>
+        prefill_pc_workers {};
+    std::mutex prefill_pc_compute_mutex;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -3125,7 +3127,9 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
     delete prefill_input_worker;
-    delete prefill_pc_worker;
+    for (auto * worker : prefill_pc_workers) {
+        delete worker;
+    }
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
@@ -4388,6 +4392,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int layer = -1;
         int chunk = -1;
         size_t sg = 0;
+        ggml_backend_meta_transfer_worker * pc_worker = nullptr;
         uint64_t pc_task = 0;
         uint64_t return_task = 0;
         size_t return_lane = 0;
@@ -5438,6 +5443,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
     const bool phone_prefill_route_lane_swap =
         std::getenv("GGML_RPC_ROUTE_LANE_SWAP") != nullptr;
+    const bool phone_prefill_pc_ready_schedule =
+        std::getenv(
+            "GGML_META_PHONE_PREFILL_DISABLE_PC_READY_SCHED") == nullptr;
 
     auto phone_prefill_route_lane_for_chunk =
         [&](int chunk) -> size_t {
@@ -6420,8 +6428,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(return_worker != nullptr);
 
             const bool pc_ready_before =
-                backend_ctx->prefill_pc_worker != nullptr &&
-                backend_ctx->prefill_pc_worker->is_completed(
+                branch_it->pc_worker != nullptr &&
+                branch_it->pc_worker->is_completed(
                     branch_it->pc_task);
             const bool return_ready_before =
                 return_worker->is_completed(
@@ -6666,7 +6674,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto drain_phone_prefill_pc_layer =
         [&](int layer) -> ggml_status {
-            if (backend_ctx->prefill_pc_worker == nullptr) {
+            const bool has_layer_pc =
+                std::any_of(
+                    pending_phone_prefill_pc_branches.begin(),
+                    pending_phone_prefill_pc_branches.end(),
+                    [&](const phone_prefill_pc_branch & branch) {
+                        return branch.layer == layer &&
+                            branch.pc_worker != nullptr;
+                    });
+            if (!has_layer_pc) {
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -6678,7 +6694,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     continue;
                 }
                 ++layer_chunk_count;
-                if (backend_ctx->prefill_pc_worker->is_completed(
+                GGML_ASSERT(branch.pc_worker != nullptr);
+                if (branch.pc_worker->is_completed(
                         branch.pc_task)) {
                     ++pc_ready_at_entry;
                 }
@@ -6775,7 +6792,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             size_t pc_ready_after_phone_fence = 0;
             for (const auto & branch : pending_phone_prefill_pc_branches) {
                 if (branch.layer == layer &&
-                        backend_ctx->prefill_pc_worker->is_completed(
+                        branch.pc_worker != nullptr &&
+                        branch.pc_worker->is_completed(
                             branch.pc_task)) {
                     ++pc_ready_after_phone_fence;
                 }
@@ -6834,8 +6852,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     GGML_ASSERT(branch.return_stage != nullptr);
 
                     const int64_t pc_wait_begin_us = ggml_time_us();
+                    GGML_ASSERT(branch.pc_worker != nullptr);
                     const ggml_status pc_status =
-                        backend_ctx->prefill_pc_worker->wait(
+                        branch.pc_worker->wait(
                             branch.pc_task);
                     const int64_t pc_wait_us =
                         ggml_time_us() - pc_wait_begin_us;
@@ -6973,8 +6992,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     const int64_t wait_begin_us =
                         ggml_time_us();
+                    GGML_ASSERT(it->pc_worker != nullptr);
                     const ggml_status pc_status =
-                        backend_ctx->prefill_pc_worker->wait(
+                        it->pc_worker->wait(
                             it->pc_task);
                     const int64_t wait_us =
                         ggml_time_us() - wait_begin_us;
@@ -11983,10 +12003,20 @@ auto prefill_norm_sg_has_prework =
                 return route_stage_status;
             }
 
-            if (backend_ctx->prefill_pc_worker == nullptr) {
-                backend_ctx->prefill_pc_worker =
+            GGML_ASSERT(
+                route.lane <
+                ggml_backend_meta_context::PREFILL_ROUTE_LANES);
+            const size_t pc_worker_lane =
+                phone_prefill_pc_ready_schedule ?
+                    route.lane : 0;
+            auto & pc_worker_slot =
+                backend_ctx->prefill_pc_workers[pc_worker_lane];
+            if (pc_worker_slot == nullptr) {
+                pc_worker_slot =
                     new ggml_backend_meta_transfer_worker();
             }
+            ggml_backend_meta_transfer_worker * pc_worker =
+                pc_worker_slot;
 
             ggml_cgraph * pc_graph =
                 backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
@@ -12124,9 +12154,10 @@ auto prefill_norm_sg_has_prework =
             }
 
             const uint64_t pc_task =
-                backend_ctx->prefill_pc_worker->enqueue(
+                pc_worker->enqueue(
                     [&, route, pc_graph, pc_backend,
                         pc_return_src, return_payload,
+                        pc_worker_lane,
                         prefill_down_layer, prefill_down_chunk, i]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t route_wait_begin_us = ggml_time_us();
@@ -12137,6 +12168,17 @@ auto prefill_norm_sg_has_prework =
                         if (route_status != GGML_STATUS_SUCCESS) {
                             return route_status;
                         }
+
+                        // Route waits are lane-local and may complete out of
+                        // chunk order.  Serialize only the PC backend critical
+                        // section so the first ready route can compute next
+                        // without allowing concurrent graph execution or
+                        // allocator-managed input/output reuse.
+                        const int64_t pc_gate_begin_us = ggml_time_us();
+                        std::unique_lock<std::mutex> pc_compute_lock(
+                            backend_ctx->prefill_pc_compute_mutex);
+                        const int64_t pc_gate_wait_us =
+                            ggml_time_us() - pc_gate_begin_us;
 
                         const int64_t stage_copy_begin_us =
                             ggml_time_us();
@@ -12275,14 +12317,18 @@ auto prefill_norm_sg_has_prework =
                             printf(
                                 "[PHONE_PREFILL_PC_BRANCH] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " route_wait_ms=%.3f stage_copy_ms=%.3f "
-                                "pc_compute_ms=%.3f return_stage_ms=%.3f "
-                                "status=%d\n",
+                                " ready_sched=%d pc_lane=%zu "
+                                "route_wait_ms=%.3f pc_gate_wait_ms=%.3f "
+                                "stage_copy_ms=%.3f pc_compute_ms=%.3f "
+                                "return_stage_ms=%.3f status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
+                                phone_prefill_pc_ready_schedule ? 1 : 0,
+                                pc_worker_lane,
                                 route_wait_us / 1000.0,
+                                pc_gate_wait_us / 1000.0,
                                 stage_copy_us / 1000.0,
                                 pc_compute_us / 1000.0,
                                 return_stage_us / 1000.0,
@@ -12326,8 +12372,6 @@ auto prefill_norm_sg_has_prework =
                     lane1_return_gate = gate;
                 }
 
-                ggml_backend_meta_transfer_worker * pc_worker =
-                    backend_ctx->prefill_pc_worker;
                 ggml_backend_meta_transfer_worker * return_worker =
                     return_worker_slot;
                 const ggml_backend_rpc_set_tensor_async_return_t
@@ -12498,6 +12542,7 @@ auto prefill_norm_sg_has_prework =
                 prefill_down_layer,
                 prefill_down_chunk,
                 i,
+                pc_worker,
                 pc_task,
                 return_task,
                 return_lane,
@@ -12513,13 +12558,16 @@ auto prefill_norm_sg_has_prework =
                     "[PHONE_PREFILL_PHONE_BRANCH] "
                     "layer=%d chunk=%d sg=%zu route_stage_wait_ms=%.3f "
                     "phone_wall_ms=%.3f pc_task=%" PRIu64
-                    " ffn_seq=%" PRIu64 " deferred=%d\n",
+                    " pc_lane=%zu ready_sched=%d "
+                    "ffn_seq=%" PRIu64 " deferred=%d\n",
                     prefill_down_layer,
                     prefill_down_chunk,
                     i,
                     stage_wait_us / 1000.0,
                     phone_wall_us / 1000.0,
                     pc_task,
+                    pc_worker_lane,
+                    phone_prefill_pc_ready_schedule ? 1 : 0,
                     phone_ffn_seq,
                     defer_local_phone_ffn ? 1 : 0);
             }
