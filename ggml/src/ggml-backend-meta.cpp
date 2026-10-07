@@ -12416,6 +12416,15 @@ auto prefill_norm_sg_has_prework =
                     phone_xlayer_v2_chunk_gate_wait_us +=
                         gate_wait_us;
 
+                    if (xlayer_boundary_diag) {
+                        std::lock_guard<std::mutex> lock(
+                            xlayer_boundary_diag_mutex);
+                        xlayer_boundary_diag_by_pred_layer[
+                            predecessor_layer].
+                                next_ffn_gate_wait_us =
+                                    gate_wait_us;
+                    }
+
                     const bool predecessor_still_pending =
                         has_pending_prefill_reduce_for_layer(
                             predecessor_layer) ||
@@ -12830,7 +12839,9 @@ auto prefill_norm_sg_has_prework =
                     phone_primary_xlayer_wave &&
                     prefill_down_chunk == 0 &&
                     prefill_down_layer >
-                        phone_primary_xlayer_first_layer) {
+                        phone_primary_xlayer_first_layer &&
+                    prefill_down_layer <=
+                        phone_primary_xlayer_last_layer) {
                 const int predecessor_layer =
                     prefill_down_layer - 1;
                 xlayer_boundary_diag_stats diag;
