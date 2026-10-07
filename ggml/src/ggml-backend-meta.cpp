@@ -5676,6 +5676,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_ffn_gate_count        = 0;
     int64_t phone_xlayer_ffn_gate_wait_us      = 0;
     int64_t phone_xlayer_ffn_gate_wait_max_us  = 0;
+
+    // Diagnostic-only per-boundary accounting for the conservative
+    // Phone-primary cross-layer path.  Async return workers update only the
+    // send/gate fields under the mutex; the main Meta thread records the
+    // predecessor drain and the next layer's chunk0 route-stage residual.
+    // No extra waits, fences, or execution-order changes are introduced.
+    const bool xlayer_boundary_diag =
+        std::getenv("GGML_META_XLAYER_BOUNDARY_DIAG") != nullptr;
+    struct xlayer_boundary_diag_stats {
+        int64_t pred_tail_us = -1;
+        int64_t pred_phone_fence_us = -1;
+        int64_t pred_pc_wait_us = -1;
+        int64_t pred_return_wait_us = -1;
+        int64_t pred_return_send_sum_us = 0;
+        int64_t pred_return_send_max_us = 0;
+        int64_t pred_critical_gate_wait_sum_us = 0;
+        int64_t pred_critical_gate_wait_max_us = 0;
+        size_t  pred_return_send_count = 0;
+        int64_t next_chunk0_route_wait_us = -1;
+        int64_t next_ffn_gate_wait_us = -1;
+    };
+    std::mutex xlayer_boundary_diag_mutex;
+    std::map<int, xlayer_boundary_diag_stats>
+        xlayer_boundary_diag_by_pred_layer;
+
     int64_t return_wave_phone_credit_wait_count = 0;
     int64_t return_wave_phone_credit_wait_us    = 0;
     int64_t return_wave_phone_credit_wait_max_us = 0;
@@ -7446,9 +7471,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
 
+            const int64_t tail_wall_us =
+                ggml_time_us() - tail_begin_us;
+            if (xlayer_boundary_diag &&
+                    phone_primary_xlayer_wave) {
+                std::lock_guard<std::mutex> lock(
+                    xlayer_boundary_diag_mutex);
+                auto & diag =
+                    xlayer_boundary_diag_by_pred_layer[layer];
+                diag.pred_tail_us = tail_wall_us;
+                diag.pred_phone_fence_us = phone_fence_us;
+                diag.pred_pc_wait_us = pc_wait_total_us;
+                diag.pred_return_wait_us = return_wait_total_us;
+            }
+
             if (pipeline_debug || tensor_phone_stage_profile) {
-                const int64_t tail_wall_us =
-                    ggml_time_us() - tail_begin_us;
                 printf(
                     "[PHONE_PREFILL_PC_DRAIN] "
                     "layer=%d chunks=%zu ready_at_entry=%zu "
@@ -12196,6 +12233,15 @@ auto prefill_norm_sg_has_prework =
                             phone_xlayer_ffn_gate_wait_max_us,
                             gate_wait_us);
 
+                    if (xlayer_boundary_diag) {
+                        std::lock_guard<std::mutex> lock(
+                            xlayer_boundary_diag_mutex);
+                        xlayer_boundary_diag_by_pred_layer[
+                            predecessor_layer].
+                                next_ffn_gate_wait_us =
+                                    gate_wait_us;
+                    }
+
                     if (xlayer_wave_trace) {
                         printf(
                             "[XLAYER_WAVE] layer=%d chunk=%d "
@@ -12521,6 +12567,54 @@ auto prefill_norm_sg_has_prework =
                 ggml_time_us() - stage_wait_begin_us;
             if (route_stage_status != GGML_STATUS_SUCCESS) {
                 return route_stage_status;
+            }
+
+            if (xlayer_boundary_diag &&
+                    phone_primary_xlayer_wave &&
+                    prefill_down_chunk == 0 &&
+                    prefill_down_layer >
+                        phone_primary_xlayer_first_layer) {
+                const int predecessor_layer =
+                    prefill_down_layer - 1;
+                xlayer_boundary_diag_stats diag;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        xlayer_boundary_diag_mutex);
+                    auto & stored =
+                        xlayer_boundary_diag_by_pred_layer[
+                            predecessor_layer];
+                    stored.next_chunk0_route_wait_us =
+                        stage_wait_us;
+                    diag = stored;
+                }
+
+                printf(
+                    "[XLAYER_BOUNDARY_DIAG] "
+                    "pred_layer=%d next_layer=%d "
+                    "pred_tail_ms=%.3f "
+                    "pred_phone_fence_ms=%.3f "
+                    "pred_pc_wait_ms=%.3f "
+                    "pred_return_wait_ms=%.3f "
+                    "pred_return_send_count=%zu "
+                    "pred_return_send_sum_ms=%.3f "
+                    "pred_return_send_max_ms=%.3f "
+                    "pred_critical_gate_wait_sum_ms=%.3f "
+                    "pred_critical_gate_wait_max_ms=%.3f "
+                    "next_ffn_gate_wait_ms=%.3f "
+                    "next_chunk0_route_wait_ms=%.3f\n",
+                    predecessor_layer,
+                    prefill_down_layer,
+                    diag.pred_tail_us / 1000.0,
+                    diag.pred_phone_fence_us / 1000.0,
+                    diag.pred_pc_wait_us / 1000.0,
+                    diag.pred_return_wait_us / 1000.0,
+                    diag.pred_return_send_count,
+                    diag.pred_return_send_sum_us / 1000.0,
+                    diag.pred_return_send_max_us / 1000.0,
+                    diag.pred_critical_gate_wait_sum_us / 1000.0,
+                    diag.pred_critical_gate_wait_max_us / 1000.0,
+                    diag.next_ffn_gate_wait_us / 1000.0,
+                    diag.next_chunk0_route_wait_us / 1000.0);
             }
 
             GGML_ASSERT(
@@ -12943,7 +13037,11 @@ auto prefill_norm_sg_has_prework =
                      prefill_down_chunk,
                      i,
                      pipeline_debug,
-                     tensor_phone_stage_profile]
+                     tensor_phone_stage_profile,
+                     phone_primary_xlayer_wave,
+                     xlayer_boundary_diag,
+                     &xlayer_boundary_diag_mutex,
+                     &xlayer_boundary_diag_by_pred_layer]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t wait_begin_us =
                             ggml_time_us();
@@ -13030,6 +13128,27 @@ auto prefill_norm_sg_has_prework =
                                     return_payload->size());
                         const int64_t send_us =
                             ggml_time_us() - send_begin_us;
+
+                        if (xlayer_boundary_diag &&
+                                phone_primary_xlayer_wave) {
+                            std::lock_guard<std::mutex> lock(
+                                xlayer_boundary_diag_mutex);
+                            auto & diag =
+                                xlayer_boundary_diag_by_pred_layer[
+                                    prefill_down_layer];
+                            diag.pred_return_send_sum_us += send_us;
+                            diag.pred_return_send_max_us =
+                                std::max(
+                                    diag.pred_return_send_max_us,
+                                    send_us);
+                            diag.pred_critical_gate_wait_sum_us +=
+                                critical_gate_wait_us;
+                            diag.pred_critical_gate_wait_max_us =
+                                std::max(
+                                    diag.pred_critical_gate_wait_max_us,
+                                    critical_gate_wait_us);
+                            ++diag.pred_return_send_count;
+                        }
 
                         if (critical_return_state != nullptr) {
                             {
