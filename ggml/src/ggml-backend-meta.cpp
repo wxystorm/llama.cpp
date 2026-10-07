@@ -4359,9 +4359,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         pending_phone_prefill_routes;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
-    std::array<int64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
-        phone_prefill_route_lane_last_us {};
-    std::mutex phone_prefill_route_lane_stats_mutex;
+    // Dynamic route scheduling keeps each chunk wave on distinct network
+    // lanes.  The key is {layer, chunk / PREFILL_ROUTE_LANES}; later waves may
+    // reuse lanes after every route lane has been represented once.
+    std::map<std::pair<int, int>, uint32_t>
+        phone_prefill_route_lane_used_mask;
 
     struct phone_prefill_lane1_return_gate {
         std::mutex mutex;
@@ -5743,95 +5745,100 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto phone_prefill_route_lane_for_chunk =
         [&](int layer, int chunk) -> size_t {
-            const size_t preferred =
+            const size_t static_preferred =
                 phone_prefill_route_static_lane_for_chunk(chunk);
             if (!phone_prefill_route_dynamic_lane ||
                     phone_prefill_route_single_lane >= 0) {
-                return preferred;
+                return static_preferred;
             }
 
-            std::array<int64_t,
-                ggml_backend_meta_context::PREFILL_ROUTE_LANES>
-                last_us {};
-            {
-                std::lock_guard<std::mutex> lock(
-                    phone_prefill_route_lane_stats_mutex);
-                last_us = phone_prefill_route_lane_last_us;
-            }
-
-            size_t selected =
+            constexpr size_t lane_count =
                 ggml_backend_meta_context::PREFILL_ROUTE_LANES;
-            bool selected_known = false;
-            int64_t selected_last_us = 0;
+            static_assert(
+                lane_count <= 32,
+                "dynamic route lane mask requires <= 32 lanes");
 
-            for (size_t lane = 0;
-                    lane <
-                        ggml_backend_meta_context::PREFILL_ROUTE_LANES;
-                    ++lane) {
+            // Rotate the static mapping by layer so no TCP connection is
+            // permanently tied to a particular chunk position.  Rotation
+            // preserves the one-to-one mapping within a chunk wave.
+            const int wave =
+                chunk / static_cast<int>(lane_count);
+            const size_t rotation =
+                static_cast<size_t>(
+                    (layer >= 0 ? layer : 0) + wave) %
+                lane_count;
+            const size_t preferred =
+                (static_preferred + rotation) % lane_count;
+
+            auto & used_mask =
+                phone_prefill_route_lane_used_mask[
+                    { layer, wave }];
+
+            auto lane_idle = [&](size_t lane) {
                 const uint64_t pending =
                     pending_phone_prefill_route_lane_task[lane];
                 auto * worker =
                     backend_ctx->prefill_route_workers[lane];
-                const bool idle =
-                    pending == 0 ||
+                return pending == 0 ||
                     (worker != nullptr &&
                      worker->is_completed(pending));
-                if (!idle) {
+            };
+
+            size_t selected = lane_count;
+            bool selected_idle = false;
+
+            // First choice: an unused, currently idle lane.  Search from the
+            // rotated preferred lane so each layer naturally uses a different
+            // permutation while preserving full route concurrency.
+            for (size_t offset = 0; offset < lane_count; ++offset) {
+                const size_t lane =
+                    (preferred + offset) % lane_count;
+                const uint32_t bit =
+                    uint32_t(1) << static_cast<uint32_t>(lane);
+                if ((used_mask & bit) != 0 || !lane_idle(lane)) {
                     continue;
                 }
+                selected = lane;
+                selected_idle = true;
+                break;
+            }
 
-                const bool known = last_us[lane] > 0;
-                bool better = selected ==
-                    ggml_backend_meta_context::PREFILL_ROUTE_LANES;
-                if (!better && known != selected_known) {
-                    better = known;
-                } else if (!better && known && selected_known) {
-                    better =
-                        last_us[lane] < selected_last_us ||
-                        (last_us[lane] == selected_last_us &&
-                         lane == preferred);
-                } else if (!better && !known && !selected_known) {
-                    better = lane == preferred;
-                }
-
-                if (better) {
-                    selected = lane;
-                    selected_known = known;
-                    selected_last_us = last_us[lane];
+            // If every unused lane is still busy from earlier work, keep the
+            // no-duplicate invariant for this chunk wave and choose an unused
+            // lane.  The existing lane-reuse wait below will wait only for
+            // that lane instead of collapsing multiple chunks onto one lane.
+            if (selected == lane_count) {
+                for (size_t offset = 0; offset < lane_count; ++offset) {
+                    const size_t lane =
+                        (preferred + offset) % lane_count;
+                    const uint32_t bit =
+                        uint32_t(1) << static_cast<uint32_t>(lane);
+                    if ((used_mask & bit) == 0) {
+                        selected = lane;
+                        break;
+                    }
                 }
             }
 
-            const bool found_idle =
-                selected <
-                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
-            if (!found_idle) {
-                selected = preferred;
-                selected_last_us = last_us[selected];
-            }
+            GGML_ASSERT(selected < lane_count);
+            used_mask |=
+                uint32_t(1) << static_cast<uint32_t>(selected);
 
             if (pipeline_debug || tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_PREFILL_ROUTE_LANE_PICK] "
-                    "layer=%d chunk=%d preferred=%zu selected=%zu "
-                    "idle=%d last_ms=%.3f\n",
+                    "layer=%d chunk=%d wave=%d static=%zu "
+                    "preferred=%zu selected=%zu idle=%d used_mask=0x%08x\n",
                     layer,
                     chunk,
+                    wave,
+                    static_preferred,
                     preferred,
                     selected,
-                    found_idle ? 1 : 0,
-                    selected_last_us / 1000.0);
+                    selected_idle ? 1 : 0,
+                    used_mask);
             }
             return selected;
-        };
-
-    auto phone_prefill_record_route_lane_time =
-        [&](size_t lane, int64_t route_us) {
-            if (!phone_prefill_route_dynamic_lane) {
-                return;
-            }
-            std::lock_guard<std::mutex> lock(
-                phone_prefill_route_lane_stats_mutex);
-            phone_prefill_route_lane_last_us[lane] = route_us;
         };
 
     if ((pipeline_debug || tensor_phone_stage_profile) &&
@@ -5842,7 +5849,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_dynamic_lane) {
         printf(
-            "[PHONE_PREFILL_ROUTE_LANE_MAP] dynamic=1 swap=%d\n",
+            "[PHONE_PREFILL_ROUTE_LANE_MAP] "
+            "dynamic=1 policy=distinct_rotating swap=%d\n",
             phone_prefill_route_lane_swap ? 1 : 0);
     } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_lane_swap) {
@@ -6362,9 +6370,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         const int64_t route_us =
                             ggml_time_us() -
                             route_begin_us;
-                        phone_prefill_record_route_lane_time(
-                            lane, route_us);
-
                         route_set_stage_ready(nullptr, nullptr);
 
                         if (!used) {
@@ -8302,9 +8307,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 route_src_weights, stage_weights);
                             const int64_t route_us =
                                 ggml_time_us() - route_begin_us;
-                            phone_prefill_record_route_lane_time(
-                                lane, route_us);
-
                             route_set_stage_ready(nullptr, nullptr);
                             if (route_set_wait_seq != nullptr) {
                                 route_set_wait_seq(0);
@@ -12456,7 +12458,20 @@ auto prefill_norm_sg_has_prework =
                 ggml_backend_meta_context::PREFILL_ROUTE_LANES);
             const size_t pc_worker_lane =
                 phone_prefill_pc_ready_schedule ?
-                    route.lane : 0;
+                    phone_prefill_route_static_lane_for_chunk(
+                        prefill_down_chunk) :
+                    0;
+            if (pipeline_debug || tensor_phone_stage_profile) {
+                printf(
+                    "[PHONE_PREFILL_PC_WORKER_PICK] "
+                    "layer=%d chunk=%d route_lane=%zu pc_lane=%zu "
+                    "dynamic_route=%d\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    route.lane,
+                    pc_worker_lane,
+                    phone_prefill_route_dynamic_lane ? 1 : 0);
+            }
             auto & pc_worker_slot =
                 backend_ctx->prefill_pc_workers[pc_worker_lane];
             if (pc_worker_slot == nullptr) {
