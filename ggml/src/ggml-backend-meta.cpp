@@ -7559,16 +7559,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (last_chunk && !wavefront_defer_layer) {
                     GGML_ASSERT(pending_after == 0);
-                } else if (last_chunk &&
-                           wavefront_defer_layer &&
-                           (pipeline_debug ||
-                            tensor_phone_stage_profile)) {
+                } else if (last_chunk && wavefront_defer_layer) {
                     printf(
-                        "[PHONE_PREFILL_WAVE_LAYER_DEFER] "
-                        "layer=%d last_chunk=%d pending=%zu\n",
+                        "[XLAYER_WAVE] layer=%d event=LAYER_DEFER "
+                        "last_chunk=%d pending=%zu\n",
                         deferred_layer_0,
                         deferred_chunk_0,
                         pending_after);
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile) {
+                        printf(
+                            "[PHONE_PREFILL_WAVE_LAYER_DEFER] "
+                            "layer=%d last_chunk=%d pending=%zu\n",
+                            deferred_layer_0,
+                            deferred_chunk_0,
+                            pending_after);
+                    }
                 }
             } else if (last_chunk) {
                 const ggml_status drain_status =
@@ -11786,6 +11792,18 @@ auto prefill_norm_sg_has_prework =
                     return generic_status;
                 }
 
+                if (phone_primary_xlayer_wave &&
+                        prefill_wave_l_out_layer <
+                            phone_primary_xlayer_last_layer) {
+                    printf(
+                        "[XLAYER_WAVE] layer=%d chunk=%d "
+                        "event=WAIT_PREDECESSOR pred_layer=%d pred_chunk=%d\n",
+                        prefill_wave_l_out_layer + 1,
+                        prefill_wave_l_out_chunk,
+                        prefill_wave_l_out_layer,
+                        prefill_wave_l_out_chunk);
+                }
+
                 bool phone_waited = false;
                 int64_t phone_wait_us = 0;
                 const ggml_status phone_status =
@@ -11924,6 +11942,19 @@ auto prefill_norm_sg_has_prework =
                     }
                 }
 
+                if (phone_primary_xlayer_wave &&
+                        prefill_wave_attn_layer >
+                            phone_primary_xlayer_first_layer) {
+                    printf(
+                        "[XLAYER_WAVE] layer=%d chunk=%d event=START "
+                        "pred_layer=%d waited=%d wait_ms=%.3f\n",
+                        prefill_wave_attn_layer,
+                        prefill_wave_attn_chunk,
+                        prefill_wave_attn_layer - 1,
+                        waited ? 1 : 0,
+                        dependency_wait_us / 1000.0);
+                }
+
                 const bool predecessor_layer_still_in_flight =
                     prefill_wave_attn_layer > active_wavefront_first_layer &&
                     (has_pending_prefill_reduce_for_layer(
@@ -11993,6 +12024,16 @@ auto prefill_norm_sg_has_prework =
                 ++pending_lanes;
                 barrier_layer =
                     std::max(barrier_layer, branch.layer);
+            }
+
+            if (phone_primary_xlayer_wave &&
+                    barrier_layer >= phone_primary_xlayer_first_layer &&
+                    barrier_layer <= phone_primary_xlayer_last_layer) {
+                printf(
+                    "[XLAYER_WAVE] layer=%d event=WINDOW_DRAIN "
+                    "pending=%zu\n",
+                    barrier_layer,
+                    pending_phone_prefill_pc_branches.size());
             }
 
             int last_lane = -1;
