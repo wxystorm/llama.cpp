@@ -2491,10 +2491,11 @@ struct ggml_backend_meta_context {
         // earlier partial before the layer-tail ADD.
         std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
 
-        // Cross-layer FFN-ahead V2: save the Phone-local FFN partial for any
-        // chunk that is still pending when a layer is deferred.  The same
-        // chunk in layer L+1 cannot run until layer L's exact chunk dependency
-        // is joined, so one slot per chunk is sufficient across layers.
+        // Cross-layer FFN-ahead V2 direct storage. Phone FFN writes its
+        // partial directly into one stable buffer per chunk, so a later layer
+        // cannot overwrite a predecessor partial that is still waiting for
+        // the PC return. Exact per-chunk dependencies make the slot reusable
+        // before the same chunk of the next layer reaches FFN.
         std::vector<ggml_backend_buffer_ptr>
             prefill_phone_xlayer_partial_stage_bufs;
 
@@ -4454,7 +4455,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         size_t return_lane = 0;
         uint64_t phone_ffn_seq = 0;
         ggml_tensor * return_stage = nullptr;
-        ggml_tensor * phone_partial_stage = nullptr;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
@@ -5692,10 +5692,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_ffn_gate_wait_max_us  = 0;
     int64_t phone_xlayer_v2_chunk_gate_count   = 0;
     int64_t phone_xlayer_v2_chunk_gate_wait_us = 0;
-    int64_t phone_xlayer_v2_stage_count        = 0;
-    int64_t phone_xlayer_v2_stage_us           = 0;
-    int64_t phone_xlayer_v2_restore_count      = 0;
-    int64_t phone_xlayer_v2_restore_us         = 0;
+    int64_t phone_xlayer_v2_direct_bind_count  = 0;
 
     // Diagnostic-only per-boundary accounting for the conservative
     // Phone-primary cross-layer path.  Async return workers update only the
@@ -6003,115 +6000,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_prefill_chunk_join_active ? 1 : 0);
     }
 
-    auto stage_phone_xlayer_pending_partials =
-        [&](int layer) -> ggml_status {
-            if (!phone_primary_xlayer_ffn_ahead_v2_active ||
-                    layer < phone_primary_xlayer_first_layer ||
-                    layer >= phone_primary_xlayer_last_layer) {
-                return GGML_STATUS_SUCCESS;
-            }
-
-            auto & bcj_phone = backend_ctx->backend_configs[1];
-            auto & stage_bufs =
-                bcj_phone.prefill_phone_xlayer_partial_stage_bufs;
-
-            for (auto & branch : pending_phone_prefill_pc_branches) {
-                if (branch.layer != layer ||
-                        branch.phone_partial_stage != nullptr) {
-                    continue;
-                }
-
-                // Exact chunk dependencies guarantee that a stage slot for
-                // chunk C from layer L has been consumed before layer L+1,C
-                // can reach FFN. Assert that invariant before reusing a slot.
-                for (const auto & other :
-                        pending_phone_prefill_pc_branches) {
-                    if (&other == &branch) {
-                        continue;
-                    }
-                    GGML_ASSERT(
-                        other.chunk != branch.chunk ||
-                        other.phone_partial_stage == nullptr);
-                }
-
-                GGML_ASSERT(
-                    branch.sg <
-                    bcj_phone.cgraphs.size());
-                ggml_cgraph * phone_graph =
-                    bcj_phone.cgraphs[branch.sg].cgraph_main;
-                GGML_ASSERT(phone_graph != nullptr);
-                GGML_ASSERT(phone_graph->n_nodes > 0);
-
-                ggml_tensor * phone_partial =
-                    phone_graph->nodes[phone_graph->n_nodes - 1];
-                int partial_chunk = -1;
-                int partial_layer = -1;
-                GGML_ASSERT(
-                    ggml_backend_meta_parse_prefill_down_chunk(
-                        phone_partial->name,
-                        partial_chunk,
-                        partial_layer));
-                GGML_ASSERT(partial_chunk == branch.chunk);
-                GGML_ASSERT(partial_layer == branch.layer);
-
-                const size_t slot =
-                    static_cast<size_t>(branch.chunk);
-                if (stage_bufs.size() <= slot) {
-                    stage_bufs.resize(slot + 1);
-                }
-
-                const size_t bytes =
-                    ggml_nbytes(phone_partial);
-                auto & stage_buf = stage_bufs[slot];
-                if (!stage_buf ||
-                        ggml_backend_buffer_get_size(stage_buf.get()) <
-                            bytes) {
-                    stage_buf.reset(
-                        ggml_backend_alloc_buffer(
-                            bcj_phone.backend,
-                            bytes));
-                }
-                GGML_ASSERT(stage_buf != nullptr);
-
-                ggml_tensor * stage =
-                    get_node_aux(phone_partial);
-                stage->buffer = stage_buf.get();
-                stage->data =
-                    ggml_backend_buffer_get_base(stage_buf.get());
-
-                const int64_t stage_begin_us = ggml_time_us();
-                // Both tensors live on the same RPC backend. The RPC buffer
-                // copy path stays server-side when supported; the generic
-                // helper preserves correctness as a fallback.
-                ggml_backend_tensor_copy(
-                    phone_partial,
-                    stage);
-                const int64_t stage_us =
-                    ggml_time_us() - stage_begin_us;
-
-                branch.phone_partial_stage = stage;
-                ++phone_xlayer_v2_stage_count;
-                phone_xlayer_v2_stage_us += stage_us;
-
-                if (pipeline_debug ||
-                        tensor_phone_stage_profile ||
-                        xlayer_wave_trace) {
-                    printf(
-                        "[XLAYER_FFN_PARTIAL_STAGE] "
-                        "layer=%d chunk=%d sg=%zu bytes=%zu "
-                        "stage_ms=%.3f\n",
-                        branch.layer,
-                        branch.chunk,
-                        branch.sg,
-                        bytes,
-                        stage_us / 1000.0);
-                }
-            }
-
-            return GGML_STATUS_SUCCESS;
-        };
-
-
     if (pipeline_debug && phone_prefill_async_return) {
         printf(
             "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
@@ -6356,6 +6244,61 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return true;
         };
 
+
+    auto bind_phone_prefill_down_direct =
+        [&](int layer, int chunk, ggml_cgraph * phone_graph) -> bool {
+            if (!phone_primary_xlayer_ffn_ahead_v2_active ||
+                    layer < phone_primary_xlayer_first_layer ||
+                    layer >= phone_primary_xlayer_last_layer ||
+                    chunk < 0 ||
+                    phone_graph == nullptr ||
+                    phone_graph->n_nodes <= 0) {
+                return false;
+            }
+
+            ggml_tensor * phone_partial =
+                phone_graph->nodes[phone_graph->n_nodes - 1];
+            int parsed_chunk = -1;
+            int parsed_layer = -1;
+            if (!ggml_backend_meta_parse_prefill_down_chunk(
+                    phone_partial->name,
+                    parsed_chunk,
+                    parsed_layer) ||
+                    parsed_chunk != chunk ||
+                    parsed_layer != layer) {
+                return false;
+            }
+
+            // Slot C can be reused only after the exact (L-1,C) dependency
+            // has joined. That is the same dependency enforced before FFN
+            // dispatch in V2, so no second live owner for this chunk exists.
+            auto & slots =
+                backend_ctx->backend_configs[1].
+                    prefill_phone_xlayer_partial_stage_bufs;
+            const size_t slot = static_cast<size_t>(chunk);
+            if (slots.size() <= slot) {
+                slots.resize(slot + 1);
+            }
+
+            bind_phone_prefill_storage(
+                layer,
+                phone_partial,
+                slots[slot]);
+            ++phone_xlayer_v2_direct_bind_count;
+
+            if (pipeline_debug ||
+                    tensor_phone_stage_profile ||
+                    xlayer_wave_trace) {
+                printf(
+                    "[XLAYER_FFN_DIRECT_BIND] "
+                    "layer=%d chunk=%d bytes=%zu buffer=%p\n",
+                    layer,
+                    chunk,
+                    ggml_nbytes(phone_partial),
+                    (void *) phone_partial->buffer);
+            }
+            return true;
+        };
 
     // Producer-driven Phone->PC route path.
     //
@@ -6913,8 +6856,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         [&](size_t sg,
             int layer,
             int chunk,
-            ggml_tensor * return_stage,
-            ggml_tensor * phone_partial_stage) -> ggml_status {
+            ggml_tensor * return_stage) -> ggml_status {
             constexpr size_t j_dst = 1;
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
             ggml_cgraph * phone_graph =
@@ -6932,37 +6874,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(phone_chunk == chunk);
             GGML_ASSERT(phone_layer == layer);
             GGML_ASSERT(ggml_are_same_layout(node_dst, return_stage));
-
-            int64_t partial_restore_us = 0;
-            if (phone_partial_stage != nullptr) {
-                GGML_ASSERT(
-                    ggml_are_same_layout(
-                        node_dst,
-                        phone_partial_stage));
-                const int64_t restore_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy(
-                    phone_partial_stage,
-                    node_dst);
-                partial_restore_us =
-                    ggml_time_us() - restore_begin_us;
-                ++phone_xlayer_v2_restore_count;
-                phone_xlayer_v2_restore_us +=
-                    partial_restore_us;
-
-                if (pipeline_debug ||
-                        tensor_phone_stage_profile ||
-                        xlayer_wave_trace) {
-                    printf(
-                        "[XLAYER_FFN_PARTIAL_RESTORE] "
-                        "layer=%d chunk=%d sg=%zu bytes=%zu "
-                        "restore_ms=%.3f\n",
-                        layer,
-                        chunk,
-                        sg,
-                        ggml_nbytes(phone_partial_stage),
-                        partial_restore_us / 1000.0);
-                }
-            }
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src =
@@ -6998,14 +6909,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (pipeline_debug || tensor_phone_stage_profile) {
                 printf(
                     "[PHONE_PREFILL_ASYNC_ADD_SUBMIT] "
-                    "layer=%d chunk=%d sg=%zu bytes=%zu "
-                    "partial_restore_ms=%.3f submit_ms=%.3f "
+                    "layer=%d chunk=%d sg=%zu bytes=%zu submit_ms=%.3f "
                     "status=%d\n",
                     layer,
                     chunk,
                     sg,
                     ggml_nbytes(return_stage),
-                    partial_restore_us / 1000.0,
                     submit_us / 1000.0,
                     (int) status);
             }
@@ -7095,8 +7004,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     branch_it->sg,
                     branch_it->layer,
                     branch_it->chunk,
-                    branch_it->return_stage,
-                    branch_it->phone_partial_stage);
+                    branch_it->return_stage);
             const int64_t add_us =
                 ggml_time_us() - add_begin_us;
             if (add_status != GGML_STATUS_SUCCESS) {
@@ -7542,8 +7450,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             branch.sg,
                             branch.layer,
                             branch.chunk,
-                            branch.return_stage,
-                            branch.phone_partial_stage);
+                            branch.return_stage);
                     add_submit_total_us +=
                         ggml_time_us() - add_begin_us;
                     if (add_status != GGML_STATUS_SUCCESS) {
@@ -7939,13 +7846,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (last_chunk && !wavefront_defer_layer) {
                     GGML_ASSERT(pending_after == 0);
                 } else if (last_chunk && wavefront_defer_layer) {
-                    const ggml_status stage_status =
-                        stage_phone_xlayer_pending_partials(
-                            deferred_layer_0);
-                    if (stage_status != GGML_STATUS_SUCCESS) {
-                        return stage_status;
-                    }
-
                     if (xlayer_wave_trace) {
                         printf(
                             "[XLAYER_WAVE] layer=%d event=LAYER_DEFER "
@@ -13473,6 +13373,17 @@ auto prefill_norm_sg_has_prework =
                 route.phone_stage_topk != nullptr &&
                 route.phone_stage_weights != nullptr;
 
+            const bool xlayer_direct_bound =
+                bind_phone_prefill_down_direct(
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    phone_graph);
+            uint64_t saved_phone_ffn_uid = 0;
+            if (xlayer_direct_bound) {
+                saved_phone_ffn_uid = phone_graph->uid;
+                phone_graph->uid = 0;
+            }
+
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             int64_t phone_wall_us = 0;
             if (defer_local_phone_ffn) {
@@ -13528,6 +13439,10 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
+            if (xlayer_direct_bound) {
+                phone_graph->uid = saved_phone_ffn_uid;
+            }
+
             pending_phone_prefill_pc_branches.push_back({
                 prefill_down_layer,
                 prefill_down_chunk,
@@ -13538,7 +13453,6 @@ auto prefill_norm_sg_has_prework =
                 return_lane,
                 phone_ffn_seq,
                 phone_return_stage,
-                nullptr,
             });
             deferred_phone_prefill_return_sgs[i] =
                 prefill_down_layer;
@@ -14626,17 +14540,11 @@ auto prefill_norm_sg_has_prework =
             "[XLAYER_FFN_AHEAD_V2_SUM] active=%d "
             "chunk_gate_count=%" PRId64
             " chunk_gate_wait_ms=%.3f "
-            "partial_stage_count=%" PRId64
-            " partial_stage_ms=%.3f "
-            "partial_restore_count=%" PRId64
-            " partial_restore_ms=%.3f\n",
+            "direct_bind_count=%" PRId64 "\n",
             phone_primary_xlayer_ffn_ahead_v2_active ? 1 : 0,
             phone_xlayer_v2_chunk_gate_count,
             phone_xlayer_v2_chunk_gate_wait_us / 1000.0,
-            phone_xlayer_v2_stage_count,
-            phone_xlayer_v2_stage_us / 1000.0,
-            phone_xlayer_v2_restore_count,
-            phone_xlayer_v2_restore_us / 1000.0);
+            phone_xlayer_v2_direct_bind_count);
     }
 
     if (runtime_profile_graph) {
