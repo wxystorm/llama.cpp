@@ -5405,6 +5405,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     bool return_wavefront_graph = false;
     int  return_wavefront_first_layer = std::numeric_limits<int>::max();
+    bool phone_primary_xlayer_wave = false;
+    int  phone_primary_xlayer_first_layer = std::numeric_limits<int>::max();
+    int  phone_primary_xlayer_last_layer = -1;
     if (n_backends == 2) {
         for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
             ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
@@ -5416,8 +5419,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 int layer = -1;
                 if (ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
                         graph->nodes[node_id]->name, chunk, layer)) {
-                    return_wavefront_graph = true;
-                    return_wavefront_first_layer = std::min(return_wavefront_first_layer, layer);
+                    if (layer_is_tensor_phone_primary(layer)) {
+                        phone_primary_xlayer_wave = true;
+                        phone_primary_xlayer_first_layer =
+                            std::min(phone_primary_xlayer_first_layer, layer);
+                        phone_primary_xlayer_last_layer =
+                            std::max(phone_primary_xlayer_last_layer, layer);
+                    } else {
+                        return_wavefront_graph = true;
+                        return_wavefront_first_layer =
+                            std::min(return_wavefront_first_layer, layer);
+                    }
                 }
             }
         }
@@ -5618,17 +5630,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     }
 
     const bool runtime_profile_graph =
-        return_wavefront_graph || phone_primary_profile_graph;
+        return_wavefront_graph ||
+        phone_primary_xlayer_wave ||
+        phone_primary_profile_graph;
 
-    const bool phone_primary_wavefront_graph =
-        return_wavefront_graph &&
-        return_wavefront_first_layer !=
-            std::numeric_limits<int>::max() &&
-        layer_is_tensor_phone_primary(
-            return_wavefront_first_layer);
+    // Keep legacy return-wavefront semantics completely separate from the
+    // Phone-primary cross-layer path.  Phone-primary is detected from wave
+    // markers that belong to TENSOR_PHONE_PRIMARY layers, but it must not
+    // enable the generic return-wavefront reduce/credit/barrier machinery.
     const bool legacy_return_wavefront_graph =
-        return_wavefront_graph &&
-        !phone_primary_wavefront_graph;
+        return_wavefront_graph;
+    const int active_wavefront_first_layer =
+        phone_primary_xlayer_wave ?
+            phone_primary_xlayer_first_layer :
+            return_wavefront_first_layer;
 
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
@@ -7504,8 +7519,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 const bool wavefront_defer_layer =
-                    return_wavefront_graph &&
-                    phone_prefill_chunk_join_active;
+                    phone_primary_xlayer_wave &&
+                    phone_prefill_chunk_join_active &&
+                    deferred_layer_0 >= phone_primary_xlayer_first_layer &&
+                    deferred_layer_0 <= phone_primary_xlayer_last_layer;
                 const int64_t reap_begin_us = ggml_time_us();
                 const ggml_status join_status =
                     reap_phone_prefill_pc_layer(
@@ -8484,7 +8501,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         // Resolve the terminal l_out by Tensor range and exact tensor name
         // across the whole Meta graph instead.
         const bool phone_wave_terminal_output =
-            phone_primary_wavefront_graph &&
+            false &&
             n_backends == 2 &&
             i + 1 >= backend_ctx->n_subgraphs &&
             backend_ctx->tensor_phone_first_layer >= 0 &&
@@ -11740,7 +11757,8 @@ auto prefill_norm_sg_has_prework =
                     phone_primary_prefill_route_layer) ? 1 : 0);
             fflush(stderr);
         }
-        if (return_wavefront_graph &&
+        if ((legacy_return_wavefront_graph ||
+             phone_primary_xlayer_wave) &&
                 (is_prefill_wave_attn_sg ||
                  is_prefill_wave_l_out_sg ||
                  is_prefill_norm_sg ||
@@ -11839,7 +11857,7 @@ auto prefill_norm_sg_has_prework =
 
                 bool waited = false;
                 int64_t dependency_wait_us = 0;
-                if (prefill_wave_attn_layer > return_wavefront_first_layer) {
+                if (prefill_wave_attn_layer > active_wavefront_first_layer) {
                     for (int dep_chunk = prefill_wave_attn_chunk;
                          dep_chunk < prefill_wave_attn_chunk + prefill_wave_attn_chunk_count;
                          ++dep_chunk) {
@@ -11907,7 +11925,7 @@ auto prefill_norm_sg_has_prework =
                 }
 
                 const bool predecessor_layer_still_in_flight =
-                    prefill_wave_attn_layer > return_wavefront_first_layer &&
+                    prefill_wave_attn_layer > active_wavefront_first_layer &&
                     (has_pending_prefill_reduce_for_layer(
                          prefill_wave_attn_layer - 1) ||
                      has_pending_phone_prefill_pc_for_layer(
@@ -11932,7 +11950,7 @@ auto prefill_norm_sg_has_prework =
                          !pending_phone_prefill_pc_branches.empty()) ? 1 : 0);
                 }
             } else if (is_prefill_down_sg &&
-                       prefill_down_layer > return_wavefront_first_layer &&
+                       prefill_down_layer > active_wavefront_first_layer &&
                        (has_pending_prefill_reduce_for_layer(
                             prefill_down_layer - 1) ||
                         has_pending_phone_prefill_pc_for_layer(
@@ -11946,7 +11964,8 @@ auto prefill_norm_sg_has_prework =
             // Norm subgraphs need no additional return wait: their Attention
             // prework has already enforced the exact OUT dependency.
         } else if ((has_pending_prefill_reduce() ||
-                    (return_wavefront_graph &&
+                    ((legacy_return_wavefront_graph ||
+                      phone_primary_xlayer_wave) &&
                      phone_prefill_chunk_join_active &&
                      !pending_phone_prefill_pc_branches.empty())) &&
                    !continues_prefill_layer) {
@@ -11983,7 +12002,8 @@ auto prefill_norm_sg_has_prework =
                 status = wait_all_prefill_reduces(&last_lane);
             }
             while (status == GGML_STATUS_SUCCESS &&
-                   return_wavefront_graph &&
+                   (legacy_return_wavefront_graph ||
+                    phone_primary_xlayer_wave) &&
                    phone_prefill_chunk_join_active &&
                    !pending_phone_prefill_pc_branches.empty()) {
                 const int pending_layer =
@@ -11994,7 +12014,9 @@ auto prefill_norm_sg_has_prework =
             const int64_t wait_us = ggml_time_us() - wait_start_us;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
-            if (return_wavefront_graph && barrier_layer >= return_wavefront_first_layer) {
+            if ((legacy_return_wavefront_graph ||
+                 phone_primary_xlayer_wave) &&
+                    barrier_layer >= active_wavefront_first_layer) {
                 return_wave_layer_barrier_us[barrier_layer] += wait_us;
             }
             if (wait_us >= layer_barrier_wait_max_us) {
@@ -12135,7 +12157,7 @@ auto prefill_norm_sg_has_prework =
                 i,
                 prefill_down_layer,
                 prefill_down_chunk,
-                phone_primary_wavefront_graph ? 1 : 0,
+                phone_primary_xlayer_wave ? 1 : 0,
                 legacy_return_wavefront_graph ? 1 : 0);
             fflush(stderr);
         }
@@ -12203,8 +12225,7 @@ auto prefill_norm_sg_has_prework =
             { prefill_down_layer, prefill_down_chunk });
         const bool pipeline_phone_prefill_down =
             phone_prefill_chunk_pipeline &&
-            (!return_wavefront_graph ||
-             phone_primary_wavefront_graph) &&
+            !legacy_return_wavefront_graph &&
             !has_async_prefill_input &&
             layer_attention_phone_owned(prefill_down_layer) &&
             route_it != pending_phone_prefill_routes.end() &&
@@ -13418,7 +13439,8 @@ auto prefill_norm_sg_has_prework =
     subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
     compute_wall_us += subgraph_compute_wall_us;
 
-    if (return_wavefront_graph) {
+    if (legacy_return_wavefront_graph ||
+            phone_primary_xlayer_wave) {
         int wave_profile_layer = -1;
         if (is_prefill_wave_attn_sg) {
             wave_profile_layer = prefill_wave_attn_layer;
@@ -13429,7 +13451,7 @@ auto prefill_norm_sg_has_prework =
         } else {
             wave_profile_layer = subgraph_layer(i);
         }
-        if (wave_profile_layer >= return_wavefront_first_layer) {
+        if (wave_profile_layer >= active_wavefront_first_layer) {
             return_wave_layer_compute_wall_us[wave_profile_layer] += subgraph_compute_wall_us;
         }
     }
@@ -13536,7 +13558,7 @@ auto prefill_norm_sg_has_prework =
 
         int terminal_phone_wave_output_index = -1;
         int terminal_phone_wave_layer = -1;
-        if (phone_primary_wavefront_graph &&
+        if (false &&
                 backend_ctx->tensor_phone_first_layer >= 0 &&
                 backend_ctx->tensor_phone_last_layer >
                     backend_ctx->tensor_phone_first_layer) {
@@ -13568,7 +13590,7 @@ auto prefill_norm_sg_has_prework =
         // Only the split that actually contains l_out-(tensor_end-1) owns the
         // terminal Phone->PC mirror.
         const bool terminal_phone_wavefront =
-            phone_primary_wavefront_graph &&
+            false &&
             communication_sg + 1 >= backend_ctx->n_subgraphs &&
             terminal_phone_wave_output_index >= 0;
         const bool phone_block_next_sg_on_phone =
@@ -13950,8 +13972,8 @@ auto prefill_norm_sg_has_prework =
             " lane_reuse_wait_ms=%.3f lane_reuse_wait_max_ms=%.3f"
             " legacy_layer_barrier_count=%" PRId64
             " legacy_layer_barrier_wait_ms=%.3f legacy_layer_barrier_wait_max_ms=%.3f\n",
-            return_wavefront_graph ? 1 : 0,
-            (!return_wavefront_graph && phone_primary_profile_graph) ? 1 : 0,
+            legacy_return_wavefront_graph ? 1 : 0,
+            phone_primary_xlayer_wave ? 1 : 0,
             return_wave_dependency_wait_count,
             return_wave_dependency_wait_us / 1000.0,
             return_wave_dependency_wait_max_us / 1000.0,
