@@ -986,7 +986,8 @@ static bool send_rpc_cmd_staged(
         const void * input,
         size_t input_size,
         void * output,
-        size_t output_size) {
+        size_t output_size,
+        rpc_cmd_roundtrip_profile * profile = nullptr) {
 
     const int64_t t0 = ggml_time_us();
 
@@ -1017,6 +1018,15 @@ static bool send_rpc_cmd_staged(
     }
 
     const int64_t t_done = ggml_time_us();
+
+    if (profile != nullptr) {
+        profile->request_send_us =
+            t_request_done - t0;
+        profile->response_header_wait_us =
+            t_stage - t_request_done;
+        profile->response_body_wait_us =
+            t_done - t_stage;
+    }
 
     if (RPC_DEBUG) {
         printf(
@@ -2715,20 +2725,31 @@ static bool ggml_backend_rpc_get_tensor_batch3(
 
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
+    const bool route_profile =
+        stage_profile ||
+        std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
     const int64_t client_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
 
     // Match the generic copy fallback's destination-safety contract, but do it
     // once for the whole Router packet instead of once per tensor.
     const int64_t dst_sync_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
     if (!staged_route) {
         ggml_backend_synchronize(backend_dst);
     }
     const int64_t dst_sync_us =
-        stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
+        route_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
     std::vector<uint8_t> response(total_size);
+
+    rpc_cmd_roundtrip_profile route_roundtrip {};
+    rpc_cmd_roundtrip_profile * const previous_roundtrip_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (route_profile && !staged_route) {
+        rpc_cmd_roundtrip_profile_active =
+            &route_roundtrip;
+    }
 
     const int64_t rpc_begin_us = ggml_time_us();
     bool status = false;
@@ -2744,7 +2765,8 @@ static bool ggml_backend_rpc_get_tensor_batch3(
                 &wait_request,
                 sizeof(wait_request),
                 response.data(),
-                response.size()) :
+                response.size(),
+                route_profile ? &route_roundtrip : nullptr) :
             send_rpc_cmd(
                 sock,
                 RPC_CMD_GET_TENSOR_BATCH3_WAIT,
@@ -2760,7 +2782,8 @@ static bool ggml_backend_rpc_get_tensor_batch3(
                 &request,
                 sizeof(request),
                 response.data(),
-                response.size()) :
+                response.size(),
+                route_profile ? &route_roundtrip : nullptr) :
             send_rpc_cmd(
                 sock,
                 RPC_CMD_GET_TENSOR_BATCH3,
@@ -2770,10 +2793,16 @@ static bool ggml_backend_rpc_get_tensor_batch3(
                 response.size());
     }
     const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
+
+    if (route_profile && !staged_route) {
+        rpc_cmd_roundtrip_profile_active =
+            previous_roundtrip_profile;
+    }
+
     RPC_STATUS_ASSERT(status);
 
     const int64_t dst_set_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
     size_t response_offset = 0;
     for (size_t i = 0; i < 3; ++i) {
         ggml_backend_tensor_set(
@@ -2785,7 +2814,7 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     }
     GGML_ASSERT(response_offset == response.size());
     const int64_t dst_set_us =
-        stage_profile ? ggml_time_us() - dst_set_begin_us : 0;
+        route_profile ? ggml_time_us() - dst_set_begin_us : 0;
 
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
@@ -2793,6 +2822,28 @@ static bool ggml_backend_rpc_get_tensor_batch3(
             total_size,
             rpc_us / 1000.0);
     }
+    if (route_profile) {
+        std::fprintf(
+            stderr,
+            "[RPC_ROUTE_STAGE] side=pc stage=router_batch "
+            "bytes=%zu staged=%d lane=%d wait_seq=%" PRIu64 " "
+            "dst_sync_ms=%.3f request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f payload_recv_ms=%.3f "
+            "rpc_roundtrip_ms=%.3f dst_set_ms=%.3f total_ms=%.3f\n",
+            total_size,
+            staged_route ? 1 : 0,
+            staged_route ? rpc_route_transfer_lane : -1,
+            rpc_route_wait_seq,
+            dst_sync_us / 1000.0,
+            route_roundtrip.request_send_us / 1000.0,
+            route_roundtrip.response_header_wait_us / 1000.0,
+            route_roundtrip.response_body_wait_us / 1000.0,
+            rpc_us / 1000.0,
+            dst_set_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+
     if (stage_profile) {
         std::fprintf(
             stderr,
@@ -5656,9 +5707,32 @@ bool rpc_server::route_mark_ready(
     return true;
 }
 
+struct rpc_route_batch_server_profile {
+    bool valid = false;
+    uint64_t wait_seq = 0;
+    int64_t wait_us = 0;
+    int64_t prepare_us = 0;
+    int64_t device_read_us = 0;
+    size_t bytes = 0;
+    bool opencl_batch_used = false;
+};
+
+static thread_local rpc_route_batch_server_profile
+    rpc_route_batch_server_stage {};
+
+static bool rpc_route_stage_profile_enabled() {
+    return rpc_tensor_phone_stage_profile_enabled() ||
+        std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
+}
+
 bool rpc_server::get_tensor_batch3_wait(
         const rpc_msg_get_tensor_batch3_wait_req & request,
         std::vector<uint8_t> & response) {
+    const bool route_profile =
+        rpc_route_stage_profile_enabled();
+    const int64_t wait_begin_us =
+        route_profile ? ggml_time_us() : 0;
+
     if (request.wait_seq != 0) {
         std::unique_lock<std::mutex> lock(route_ready_mutex);
         route_ready_cv.wait(
@@ -5669,6 +5743,14 @@ bool rpc_server::get_tensor_batch3_wait(
                        it->second >= request.wait_seq;
             });
     }
+
+    if (route_profile) {
+        rpc_route_batch_server_stage.wait_seq =
+            request.wait_seq;
+        rpc_route_batch_server_stage.wait_us =
+            ggml_time_us() - wait_begin_us;
+    }
+
     return get_tensor_batch3(request.batch, response);
 }
 
@@ -5677,8 +5759,10 @@ bool rpc_server::get_tensor_batch3(
         std::vector<uint8_t> & response) {
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
+    const bool route_profile =
+        rpc_route_stage_profile_enabled();
     const int64_t server_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
 
     size_t sizes[3] = {};
     size_t response_offsets[3] = {};
@@ -5695,7 +5779,7 @@ bool rpc_server::get_tensor_batch3(
     response.resize(total_size);
     const int64_t read_begin_us = ggml_time_us();
     const int64_t prepare_us =
-        stage_profile ? read_begin_us - server_begin_us : 0;
+        route_profile ? read_begin_us - server_begin_us : 0;
 
     bool opencl_batch_used = false;
     if (std::getenv("GGML_RPC_DISABLE_OPENCL_BATCH3_READ") == nullptr) {
@@ -5769,6 +5853,16 @@ bool rpc_server::get_tensor_batch3(
     }
 
     const int64_t read_us = ggml_time_us() - read_begin_us;
+
+    if (route_profile) {
+        rpc_route_batch_server_stage.valid = true;
+        rpc_route_batch_server_stage.prepare_us = prepare_us;
+        rpc_route_batch_server_stage.device_read_us = read_us;
+        rpc_route_batch_server_stage.bytes = total_size;
+        rpc_route_batch_server_stage.opencl_batch_used =
+            opencl_batch_used;
+    }
+
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_SERVER_GET_BATCH3] bytes=%zu opencl_wait1=%d total=%.3f ms\n",
@@ -7385,16 +7479,58 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_GET_TENSOR_BATCH3: {
+                const bool route_profile =
+                    std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
+                rpc_route_batch_server_stage = {};
+                const int64_t request_begin_us =
+                    route_profile ? ggml_time_us() : 0;
+
                 rpc_msg_get_tensor_batch3_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t request_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> response;
+                const int64_t handler_begin_us =
+                    route_profile ? ggml_time_us() : 0;
                 if (!server.get_tensor_batch3(request, response)) {
                     return;
                 }
+                const int64_t handler_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
+                const int64_t send_begin_us =
+                    route_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+                const int64_t send_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
+                if (route_profile &&
+                        rpc_route_batch_server_stage.valid) {
+                    const auto & p =
+                        rpc_route_batch_server_stage;
+                    std::fprintf(
+                        stderr,
+                        "[RPC_ROUTE_STAGE] side=phone stage=router_batch "
+                        "bytes=%zu wait_seq=%" PRIu64 " wait_ms=%.3f "
+                        "opencl_batch=%d prepare_ms=%.3f device_read_ms=%.3f "
+                        "request_recv_ms=%.3f handler_ms=%.3f "
+                        "response_send_ms=%.3f total_dispatch_ms=%.3f\n",
+                        p.bytes,
+                        p.wait_seq,
+                        p.wait_us / 1000.0,
+                        p.opencl_batch_used ? 1 : 0,
+                        p.prepare_us / 1000.0,
+                        p.device_read_us / 1000.0,
+                        (request_done_us - request_begin_us) / 1000.0,
+                        (handler_done_us - handler_begin_us) / 1000.0,
+                        (send_done_us - send_begin_us) / 1000.0,
+                        (send_done_us - request_begin_us) / 1000.0);
+                    std::fflush(stderr);
                 }
                 break;
             }
@@ -7419,16 +7555,58 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_GET_TENSOR_BATCH3_WAIT: {
+                const bool route_profile =
+                    std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
+                rpc_route_batch_server_stage = {};
+                const int64_t request_begin_us =
+                    route_profile ? ggml_time_us() : 0;
+
                 rpc_msg_get_tensor_batch3_wait_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t request_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> response;
+                const int64_t handler_begin_us =
+                    route_profile ? ggml_time_us() : 0;
                 if (!server.get_tensor_batch3_wait(request, response)) {
                     return;
                 }
+                const int64_t handler_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
+                const int64_t send_begin_us =
+                    route_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+                const int64_t send_done_us =
+                    route_profile ? ggml_time_us() : 0;
+
+                if (route_profile &&
+                        rpc_route_batch_server_stage.valid) {
+                    const auto & p =
+                        rpc_route_batch_server_stage;
+                    std::fprintf(
+                        stderr,
+                        "[RPC_ROUTE_STAGE] side=phone stage=router_batch "
+                        "bytes=%zu wait_seq=%" PRIu64 " wait_ms=%.3f "
+                        "opencl_batch=%d prepare_ms=%.3f device_read_ms=%.3f "
+                        "request_recv_ms=%.3f handler_ms=%.3f "
+                        "response_send_ms=%.3f total_dispatch_ms=%.3f\n",
+                        p.bytes,
+                        p.wait_seq,
+                        p.wait_us / 1000.0,
+                        p.opencl_batch_used ? 1 : 0,
+                        p.prepare_us / 1000.0,
+                        p.device_read_us / 1000.0,
+                        (request_done_us - request_begin_us) / 1000.0,
+                        (handler_done_us - handler_begin_us) / 1000.0,
+                        (send_done_us - send_begin_us) / 1000.0,
+                        (send_done_us - request_begin_us) / 1000.0);
+                    std::fflush(stderr);
                 }
                 break;
             }
