@@ -5693,6 +5693,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_v2_chunk_gate_count   = 0;
     int64_t phone_xlayer_v2_chunk_gate_wait_us = 0;
     int64_t phone_xlayer_v2_direct_bind_count  = 0;
+    int64_t phone_xlayer_v2_throttle_count     = 0;
+    int64_t phone_xlayer_v2_throttle_wait_us   = 0;
+    int64_t phone_xlayer_v2_throttle_wait_max_us = 0;
 
     // Diagnostic-only per-boundary accounting for the conservative
     // Phone-primary cross-layer path.  Async return workers update only the
@@ -12287,11 +12290,9 @@ auto prefill_norm_sg_has_prework =
 
                 if (phone_primary_xlayer_wave &&
                         phone_primary_xlayer_ffn_ahead_v2_active) {
-                    // Cross-layer V2: the mathematical dependency is exact
-                    // per chunk.  Defensively wait only for (L-1,C); never
-                    // drain unrelated predecessor chunks. Pending Phone-local
-                    // partials for those unrelated chunks were snapshotted at
-                    // LAYER_DEFER, so allocator reuse by FFN(L,C) is safe.
+                    // Cross-layer V2: first satisfy the exact mathematical
+                    // dependency (L-1,C). Stable per-chunk Phone FFN storage
+                    // keeps unrelated predecessor chunks alive safely.
                     const int64_t gate_begin_us = ggml_time_us();
 
                     bool reduce_waited = false;
@@ -12331,6 +12332,66 @@ auto prefill_norm_sg_has_prework =
                                     gate_wait_us;
                     }
 
+                    // Resource-aware admission: keep FFN at most one chunk
+                    // ahead of predecessor return completion. Before starting
+                    // FFN(L,C), prioritize joining (L-1,C+1). This leaves
+                    // (L-1,C+2...) available for overlap, but prevents the
+                    // next-layer Phone FFN from starving the immediately
+                    // critical predecessor return/ADD.
+                    const int next_pred_chunk =
+                        prefill_down_chunk + 1;
+                    const bool has_next_pred_chunk =
+                        find_down_chunk(
+                            0,
+                            true,
+                            predecessor_layer,
+                            next_pred_chunk) != nullptr ||
+                        find_down_chunk(
+                            1,
+                            true,
+                            predecessor_layer,
+                            next_pred_chunk) != nullptr;
+
+                    bool throttle_reduce_waited = false;
+                    bool throttle_phone_waited = false;
+                    int64_t throttle_phone_wait_us = 0;
+                    int64_t throttle_wait_us = 0;
+                    if (has_next_pred_chunk) {
+                        const int64_t throttle_begin_us =
+                            ggml_time_us();
+
+                        const ggml_status throttle_reduce_status =
+                            wait_prefill_reduce_dependency(
+                                predecessor_layer,
+                                next_pred_chunk,
+                                throttle_reduce_waited);
+                        if (throttle_reduce_status !=
+                                GGML_STATUS_SUCCESS) {
+                            return throttle_reduce_status;
+                        }
+
+                        const ggml_status throttle_phone_status =
+                            wait_phone_prefill_pc_dependency(
+                                predecessor_layer,
+                                next_pred_chunk,
+                                throttle_phone_waited,
+                                throttle_phone_wait_us);
+                        if (throttle_phone_status !=
+                                GGML_STATUS_SUCCESS) {
+                            return throttle_phone_status;
+                        }
+
+                        throttle_wait_us =
+                            ggml_time_us() - throttle_begin_us;
+                        ++phone_xlayer_v2_throttle_count;
+                        phone_xlayer_v2_throttle_wait_us +=
+                            throttle_wait_us;
+                        phone_xlayer_v2_throttle_wait_max_us =
+                            std::max(
+                                phone_xlayer_v2_throttle_wait_max_us,
+                                throttle_wait_us);
+                    }
+
                     const bool predecessor_still_pending =
                         has_pending_prefill_reduce_for_layer(
                             predecessor_layer) ||
@@ -12347,13 +12408,21 @@ auto prefill_norm_sg_has_prework =
                             "[XLAYER_WAVE] layer=%d chunk=%d "
                             "event=FFN_CHUNK_GATE_PASS pred_layer=%d "
                             "wait_ms=%.3f reduce_waited=%d "
-                            "phone_waited=%d predecessor_pending=%d\n",
+                            "phone_waited=%d throttle_next=%d "
+                            "throttle_wait_ms=%.3f "
+                            "throttle_reduce_waited=%d "
+                            "throttle_phone_waited=%d "
+                            "predecessor_pending=%d\n",
                             prefill_down_layer,
                             prefill_down_chunk,
                             predecessor_layer,
                             gate_wait_us / 1000.0,
                             reduce_waited ? 1 : 0,
                             phone_waited ? 1 : 0,
+                            has_next_pred_chunk ? 1 : 0,
+                            throttle_wait_us / 1000.0,
+                            throttle_reduce_waited ? 1 : 0,
+                            throttle_phone_waited ? 1 : 0,
                             predecessor_still_pending ? 1 : 0);
                     }
                 } else if (phone_primary_xlayer_wave &&
@@ -14566,11 +14635,17 @@ auto prefill_norm_sg_has_prework =
             "[XLAYER_FFN_AHEAD_V2_SUM] active=%d "
             "chunk_gate_count=%" PRId64
             " chunk_gate_wait_ms=%.3f "
-            "direct_bind_count=%" PRId64 "\n",
+            "direct_bind_count=%" PRId64
+            " throttle_count=%" PRId64
+            " throttle_wait_ms=%.3f "
+            " throttle_wait_max_ms=%.3f\n",
             phone_primary_xlayer_ffn_ahead_v2_active ? 1 : 0,
             phone_xlayer_v2_chunk_gate_count,
             phone_xlayer_v2_chunk_gate_wait_us / 1000.0,
-            phone_xlayer_v2_direct_bind_count);
+            phone_xlayer_v2_direct_bind_count,
+            phone_xlayer_v2_throttle_count,
+            phone_xlayer_v2_throttle_wait_us / 1000.0,
+            phone_xlayer_v2_throttle_wait_max_us / 1000.0);
     }
 
     if (runtime_profile_graph) {
