@@ -4151,6 +4151,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const bool xlayer_wave_trace =
+        std::getenv("GGML_META_XLAYER_WAVE_TRACE") != nullptr;
     const bool reduce_summary =
         std::getenv("GGML_META_REDUCE_SUMMARY") != nullptr;
     const bool phone_exit_profile =
@@ -5645,7 +5647,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_primary_xlayer_first_layer :
             return_wavefront_first_layer;
 
-    if (phone_primary_xlayer_wave) {
+    if (phone_primary_xlayer_wave && xlayer_wave_trace) {
         printf(
             "[XLAYER_WAVE] event=ENABLE first_layer=%d last_layer=%d "
             "legacy_return_wave=%d\n",
@@ -7569,12 +7571,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (last_chunk && !wavefront_defer_layer) {
                     GGML_ASSERT(pending_after == 0);
                 } else if (last_chunk && wavefront_defer_layer) {
-                    printf(
-                        "[XLAYER_WAVE] layer=%d event=LAYER_DEFER "
-                        "last_chunk=%d pending=%zu\n",
-                        deferred_layer_0,
-                        deferred_chunk_0,
-                        pending_after);
+                    if (xlayer_wave_trace) {
+                        printf(
+                            "[XLAYER_WAVE] layer=%d event=LAYER_DEFER "
+                            "last_chunk=%d pending=%zu\n",
+                            deferred_layer_0,
+                            deferred_chunk_0,
+                            pending_after);
+                    }
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
                         printf(
@@ -11802,6 +11806,7 @@ auto prefill_norm_sg_has_prework =
                 }
 
                 if (phone_primary_xlayer_wave &&
+                        xlayer_wave_trace &&
                         prefill_wave_l_out_layer <
                             phone_primary_xlayer_last_layer) {
                     printf(
@@ -11952,6 +11957,7 @@ auto prefill_norm_sg_has_prework =
                 }
 
                 if (phone_primary_xlayer_wave &&
+                        xlayer_wave_trace &&
                         prefill_wave_attn_layer >
                             phone_primary_xlayer_first_layer) {
                     printf(
@@ -12036,6 +12042,7 @@ auto prefill_norm_sg_has_prework =
             }
 
             if (phone_primary_xlayer_wave &&
+                    xlayer_wave_trace &&
                     barrier_layer >= phone_primary_xlayer_first_layer &&
                     barrier_layer <= phone_primary_xlayer_last_layer) {
                 printf(
