@@ -213,6 +213,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool phone_primary_wavefront_requested =
         phone_primary_wavefront_env != nullptr &&
         std::atoi(phone_primary_wavefront_env) != 0;
+    const char * phone_primary_wave_max_layers_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVE_MAX_LAYERS");
+    int phone_primary_wave_max_layers = 2;
+    if (phone_primary_wave_max_layers_env != nullptr) {
+        const int requested_max_layers =
+            std::atoi(phone_primary_wave_max_layers_env);
+        if (requested_max_layers > 0) {
+            phone_primary_wave_max_layers =
+                std::max(2, requested_max_layers);
+        }
+    }
     const bool phone_primary_wavefront_runtime_ready =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr &&
@@ -265,26 +276,24 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         // Preserve the existing pure TENSOR_SPLIT contract: its wavefront
-        // still owns the complete stage.  Phone-primary is different because
-        // the staged suffix intentionally combines a TENSOR_PHONE_PRIMARY
-        // prefix with a PHONE_ONLY tail; allow the wavefront to stop at that
-        // mode boundary and let the normal graph builder continue the tail.
+        // still owns the complete stage.
         if (tensor_split_wavefront &&
                 moe_wavefront_layer_end != layer_end) {
             moe_stage_wavefront = false;
         }
 
         if (phone_primary_wavefront) {
+            // Correctness-first cross-layer V1 deliberately limits the
+            // Phone-primary wavefront to a small prefix.  The remaining
+            // TENSOR_PHONE_PRIMARY layers (and any PHONE_ONLY tail) fall back
+            // to the ordinary graph builder below.  This lets us validate
+            // L,C -> L+1,C dependencies without changing the stable suffix.
+            moe_wavefront_layer_end =
+                std::min(
+                    moe_wavefront_layer_end,
+                    layer_begin + phone_primary_wave_max_layers);
             if (moe_wavefront_layer_end - layer_begin <= 1) {
                 moe_stage_wavefront = false;
-            }
-            for (int il = moe_wavefront_layer_end;
-                 moe_stage_wavefront && il < layer_end;
-                 ++il) {
-                moe_stage_wavefront =
-                    model.hybrid_layer_mode(il) ==
-                        llama_hybrid_layer_mode::PHONE_ONLY &&
-                    cvec->tensor_for(il) == nullptr;
             }
         }
     }
@@ -347,7 +356,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             "phone_runtime_ready=%d tokens=%" PRId64
             " stage=[%d,%d) wave=[%d,%d) "
             "equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
-            "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
+            "XT=%d target=%d min_group=%d phone_wave_max=%d "
+            "chunks=%zu groups=%zu\n",
             moe_stage_wavefront ? 1 : 0,
             phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
             phone_primary_wavefront_runtime_ready ? 1 : 0,
@@ -359,6 +369,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             planned_chunk_tokens, wave_attn_target_tokens,
             qwen3moe_wave_attn_min_group_tokens(
                 wave_attn_target_tokens),
+            phone_primary_wave_max_layers,
             wave_chunk_sizes.size(),
             wave_attn_group_counts.size());
     }
