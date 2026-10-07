@@ -6272,6 +6272,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             // Slot C can be reused only after the exact (L-1,C) dependency
             // has joined. That is the same dependency enforced before FFN
             // dispatch in V2, so no second live owner for this chunk exists.
+            for (const auto & branch : pending_phone_prefill_pc_branches) {
+                GGML_ASSERT(
+                    branch.chunk != chunk ||
+                    branch.layer >= layer);
+            }
+
             auto & slots =
                 backend_ctx->backend_configs[1].
                     prefill_phone_xlayer_partial_stage_bufs;
@@ -13414,6 +13420,9 @@ auto prefill_norm_sg_has_prework =
                 phone_status = compute_workers.wait(1);
                 phone_wall_us = ggml_time_us() - phone_begin_us;
                 if (phone_status != GGML_STATUS_SUCCESS) {
+                    if (xlayer_direct_bound) {
+                        phone_graph->uid = saved_phone_ffn_uid;
+                    }
                     return phone_status;
                 }
 
@@ -14495,6 +14504,23 @@ auto prefill_norm_sg_has_prework =
             return status;
         }
     }
+
+    // V2 may consume a predecessor layer entirely through exact per-chunk
+    // joins, so that layer never necessarily reaches drain_phone_prefill_pc_layer().
+    // At this point all branch/route/reduce work is complete; restore every
+    // descriptor that was rebound to stable Phone storage before the cached
+    // Meta graph is used by the next request.
+    if (!phone_prefill_direct_bindings.empty()) {
+        std::vector<int> rebound_layers;
+        rebound_layers.reserve(phone_prefill_direct_bindings.size());
+        for (const auto & entry : phone_prefill_direct_bindings) {
+            rebound_layers.push_back(entry.first);
+        }
+        for (int layer : rebound_layers) {
+            restore_phone_prefill_direct_bindings(layer);
+        }
+    }
+    phone_prefill_route_producer_seq.clear();
 
     if (return_wavefront_graph && return_wave_snapshot_ready_waiter != nullptr) {
         // Full returns are drained now, so any remaining producer credits are
