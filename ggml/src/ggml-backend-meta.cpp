@@ -4359,6 +4359,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         pending_phone_prefill_routes;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
+    std::array<int64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
+        phone_prefill_route_lane_last_us {};
+    std::mutex phone_prefill_route_lane_stats_mutex;
 
     struct phone_prefill_lane1_return_gate {
         std::mutex mutex;
@@ -5700,6 +5703,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
     const bool phone_prefill_route_lane_swap =
         std::getenv("GGML_RPC_ROUTE_LANE_SWAP") != nullptr;
+    const bool phone_prefill_route_dynamic_lane =
+        std::getenv("GGML_RPC_ROUTE_DYNAMIC_LANE") != nullptr;
     const char * phone_prefill_route_single_lane_env =
         std::getenv("GGML_RPC_ROUTE_SINGLE_LANE");
     int phone_prefill_route_single_lane = -1;
@@ -5720,7 +5725,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv(
             "GGML_META_PHONE_PREFILL_DISABLE_PC_READY_SCHED") == nullptr;
 
-    auto phone_prefill_route_lane_for_chunk =
+    auto phone_prefill_route_static_lane_for_chunk =
         [&](int chunk) -> size_t {
             GGML_ASSERT(chunk >= 0);
             if (phone_prefill_route_single_lane >= 0) {
@@ -5736,11 +5741,109 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return lane;
         };
 
+    auto phone_prefill_route_lane_for_chunk =
+        [&](int layer, int chunk) -> size_t {
+            const size_t preferred =
+                phone_prefill_route_static_lane_for_chunk(chunk);
+            if (!phone_prefill_route_dynamic_lane ||
+                    phone_prefill_route_single_lane >= 0) {
+                return preferred;
+            }
+
+            std::array<int64_t,
+                ggml_backend_meta_context::PREFILL_ROUTE_LANES>
+                last_us {};
+            {
+                std::lock_guard<std::mutex> lock(
+                    phone_prefill_route_lane_stats_mutex);
+                last_us = phone_prefill_route_lane_last_us;
+            }
+
+            size_t selected =
+                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+            bool selected_known = false;
+            int64_t selected_last_us = 0;
+
+            for (size_t lane = 0;
+                    lane <
+                        ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+                    ++lane) {
+                const uint64_t pending =
+                    pending_phone_prefill_route_lane_task[lane];
+                auto * worker =
+                    backend_ctx->prefill_route_workers[lane];
+                const bool idle =
+                    pending == 0 ||
+                    (worker != nullptr &&
+                     worker->is_completed(pending));
+                if (!idle) {
+                    continue;
+                }
+
+                const bool known = last_us[lane] > 0;
+                bool better = selected ==
+                    ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+                if (!better && known != selected_known) {
+                    better = known;
+                } else if (!better && known && selected_known) {
+                    better =
+                        last_us[lane] < selected_last_us ||
+                        (last_us[lane] == selected_last_us &&
+                         lane == preferred);
+                } else if (!better && !known && !selected_known) {
+                    better = lane == preferred;
+                }
+
+                if (better) {
+                    selected = lane;
+                    selected_known = known;
+                    selected_last_us = last_us[lane];
+                }
+            }
+
+            const bool found_idle =
+                selected <
+                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+            if (!found_idle) {
+                selected = preferred;
+                selected_last_us = last_us[selected];
+            }
+
+            if (pipeline_debug || tensor_phone_stage_profile) {
+                printf(
+                    "[PHONE_PREFILL_ROUTE_LANE_PICK] "
+                    "layer=%d chunk=%d preferred=%zu selected=%zu "
+                    "idle=%d last_ms=%.3f\n",
+                    layer,
+                    chunk,
+                    preferred,
+                    selected,
+                    found_idle ? 1 : 0,
+                    selected_last_us / 1000.0);
+            }
+            return selected;
+        };
+
+    auto phone_prefill_record_route_lane_time =
+        [&](size_t lane, int64_t route_us) {
+            if (!phone_prefill_route_dynamic_lane) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(
+                phone_prefill_route_lane_stats_mutex);
+            phone_prefill_route_lane_last_us[lane] = route_us;
+        };
+
     if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_single_lane >= 0) {
         printf(
             "[PHONE_PREFILL_ROUTE_LANE_MAP] single_lane=%d\n",
             phone_prefill_route_single_lane);
+    } else if ((pipeline_debug || tensor_phone_stage_profile) &&
+            phone_prefill_route_dynamic_lane) {
+        printf(
+            "[PHONE_PREFILL_ROUTE_LANE_MAP] dynamic=1 swap=%d\n",
+            phone_prefill_route_lane_swap ? 1 : 0);
     } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_lane_swap) {
         printf(
@@ -6163,7 +6266,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             const size_t lane =
-                phone_prefill_route_lane_for_chunk(chunk);
+                phone_prefill_route_lane_for_chunk(layer, chunk);
             auto & route_worker =
                 backend_ctx->prefill_route_workers[lane];
             if (route_worker == nullptr) {
@@ -6259,6 +6362,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         const int64_t route_us =
                             ggml_time_us() -
                             route_begin_us;
+                        phone_prefill_record_route_lane_time(
+                            lane, route_us);
 
                         route_set_stage_ready(nullptr, nullptr);
 
@@ -8027,6 +8132,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (allow_prefill_route_pipeline) {
                 const size_t lane =
                     phone_prefill_route_lane_for_chunk(
+                        phone_route_layer,
                         phone_route_chunk);
 
                 auto & route_worker =
@@ -8196,6 +8302,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 route_src_weights, stage_weights);
                             const int64_t route_us =
                                 ggml_time_us() - route_begin_us;
+                            phone_prefill_record_route_lane_time(
+                                lane, route_us);
 
                             route_set_stage_ready(nullptr, nullptr);
                             if (route_set_wait_seq != nullptr) {
