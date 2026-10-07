@@ -4153,6 +4153,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
     const bool xlayer_wave_trace =
         std::getenv("GGML_META_XLAYER_WAVE_TRACE") != nullptr;
+    const char * phone_primary_xlayer_ffn_ahead_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_XLAYER_FFN_AHEAD");
+    const bool phone_primary_xlayer_ffn_ahead =
+        phone_primary_xlayer_ffn_ahead_env != nullptr &&
+        std::atoi(phone_primary_xlayer_ffn_ahead_env) != 0;
     const bool reduce_summary =
         std::getenv("GGML_META_REDUCE_SUMMARY") != nullptr;
     const bool phone_exit_profile =
@@ -5655,10 +5660,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     if (phone_primary_xlayer_wave && xlayer_wave_trace) {
         printf(
             "[XLAYER_WAVE] event=ENABLE first_layer=%d last_layer=%d "
-            "legacy_return_wave=%d\n",
+            "legacy_return_wave=%d ffn_ahead=%d\n",
             phone_primary_xlayer_first_layer,
             phone_primary_xlayer_last_layer,
-            legacy_return_wavefront_graph ? 1 : 0);
+            legacy_return_wavefront_graph ? 1 : 0,
+            phone_primary_xlayer_ffn_ahead ? 1 : 0);
     }
 
     int64_t return_wave_dependency_wait_count  = 0;
@@ -5667,6 +5673,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_overlap_boundaries     = 0;
     int64_t return_wave_ahead_attn_chunks      = 0;
     int64_t return_wave_ahead_phone_submits    = 0;
+    int64_t phone_xlayer_ffn_gate_count        = 0;
+    int64_t phone_xlayer_ffn_gate_wait_us      = 0;
+    int64_t phone_xlayer_ffn_gate_wait_max_us  = 0;
     int64_t return_wave_phone_credit_wait_count = 0;
     int64_t return_wave_phone_credit_wait_us    = 0;
     int64_t return_wave_phone_credit_wait_max_us = 0;
@@ -12136,11 +12145,72 @@ auto prefill_norm_sg_has_prework =
                             prefill_down_layer - 1) ||
                         has_pending_phone_prefill_pc_for_layer(
                             prefill_down_layer - 1))) {
-                // The exact predecessor dependency was already enforced at
-                // this chunk's Attention prework.  Reaching down while another
-                // L-1 chunk still returns means Phone FFN(L,C) is submitted
-                // ahead of the old layer's complete return frontier.
-                ++return_wave_ahead_phone_submits;
+                const int predecessor_layer =
+                    prefill_down_layer - 1;
+
+                if (phone_primary_xlayer_wave &&
+                        !phone_primary_xlayer_ffn_ahead) {
+                    // Conservative cross-layer V1: allow the next layer's
+                    // l_out/Attention/norm/router/route prework to overlap the
+                    // predecessor return tail, but do not let the next FFN
+                    // cross that frontier.  This keeps allocator-managed FFN
+                    // inputs and Phone/PC worker queues on the proven
+                    // layer-serial side of the boundary while still hiding
+                    // one chunk of pre-route work.
+                    const int64_t gate_begin_us = ggml_time_us();
+
+                    ggml_status gate_status = GGML_STATUS_SUCCESS;
+                    for (size_t lane = 0;
+                         lane <
+                            ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                         ++lane) {
+                        if (pending_prefill_reduce_task[lane] == 0 ||
+                                pending_prefill_reduce_layer[lane] !=
+                                    predecessor_layer) {
+                            continue;
+                        }
+                        gate_status =
+                            wait_prefill_reduce_lane(lane);
+                        if (gate_status != GGML_STATUS_SUCCESS) {
+                            break;
+                        }
+                    }
+
+                    if (gate_status == GGML_STATUS_SUCCESS &&
+                            has_pending_phone_prefill_pc_for_layer(
+                                predecessor_layer)) {
+                        gate_status =
+                            drain_phone_prefill_pc_layer(
+                                predecessor_layer);
+                    }
+                    if (gate_status != GGML_STATUS_SUCCESS) {
+                        return gate_status;
+                    }
+
+                    const int64_t gate_wait_us =
+                        ggml_time_us() - gate_begin_us;
+                    ++phone_xlayer_ffn_gate_count;
+                    phone_xlayer_ffn_gate_wait_us += gate_wait_us;
+                    phone_xlayer_ffn_gate_wait_max_us =
+                        std::max(
+                            phone_xlayer_ffn_gate_wait_max_us,
+                            gate_wait_us);
+
+                    if (xlayer_wave_trace) {
+                        printf(
+                            "[XLAYER_WAVE] layer=%d chunk=%d "
+                            "event=FFN_GATE_DRAIN pred_layer=%d "
+                            "wait_ms=%.3f\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            predecessor_layer,
+                            gate_wait_us / 1000.0);
+                    }
+                } else {
+                    // Opt-in aggressive mode retains the older behavior for
+                    // later A/B testing once the conservative path is stable.
+                    ++return_wave_ahead_phone_submits;
+                }
             }
             // Norm subgraphs need no additional return wait: their Attention
             // prework has already enforced the exact OUT dependency.
@@ -14169,6 +14239,9 @@ auto prefill_norm_sg_has_prework =
             " overlap_boundaries=%" PRId64
             " ahead_attn=%" PRId64
             " ahead_phone_submit=%" PRId64
+            " xlayer_ffn_gate_count=%" PRId64
+            " xlayer_ffn_gate_wait_ms=%.3f"
+            " xlayer_ffn_gate_wait_max_ms=%.3f"
             " phone_credit_wait_count=%" PRId64
             " phone_credit_wait_ms=%.3f phone_credit_wait_max_ms=%.3f"
             " old_layer_wait_count=%" PRId64
@@ -14185,6 +14258,9 @@ auto prefill_norm_sg_has_prework =
             return_wave_overlap_boundaries,
             return_wave_ahead_attn_chunks,
             return_wave_ahead_phone_submits,
+            phone_xlayer_ffn_gate_count,
+            phone_xlayer_ffn_gate_wait_us / 1000.0,
+            phone_xlayer_ffn_gate_wait_max_us / 1000.0,
             return_wave_phone_credit_wait_count,
             return_wave_phone_credit_wait_us / 1000.0,
             return_wave_phone_credit_wait_max_us / 1000.0,
