@@ -5645,6 +5645,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_primary_xlayer_first_layer :
             return_wavefront_first_layer;
 
+    if (phone_primary_xlayer_wave) {
+        printf(
+            "[XLAYER_WAVE] event=ENABLE first_layer=%d last_layer=%d "
+            "legacy_return_wave=%d\n",
+            phone_primary_xlayer_first_layer,
+            phone_primary_xlayer_last_layer,
+            legacy_return_wavefront_graph ? 1 : 0);
+    }
+
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
     int64_t return_wave_dependency_wait_max_us = 0;
