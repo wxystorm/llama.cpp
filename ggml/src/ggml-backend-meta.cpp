@@ -5700,6 +5700,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
     const bool phone_prefill_route_lane_swap =
         std::getenv("GGML_RPC_ROUTE_LANE_SWAP") != nullptr;
+    const char * phone_prefill_route_single_lane_env =
+        std::getenv("GGML_RPC_ROUTE_SINGLE_LANE");
+    int phone_prefill_route_single_lane = -1;
+    if (phone_prefill_route_single_lane_env != nullptr) {
+        char * end = nullptr;
+        const long lane =
+            std::strtol(phone_prefill_route_single_lane_env, &end, 10);
+        if (end != phone_prefill_route_single_lane_env &&
+                *end == '\0' &&
+                lane >= 0 &&
+                lane < static_cast<long>(
+                    ggml_backend_meta_context::PREFILL_ROUTE_LANES)) {
+            phone_prefill_route_single_lane =
+                static_cast<int>(lane);
+        }
+    }
     const bool phone_prefill_pc_ready_schedule =
         std::getenv(
             "GGML_META_PHONE_PREFILL_DISABLE_PC_READY_SCHED") == nullptr;
@@ -5707,6 +5723,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     auto phone_prefill_route_lane_for_chunk =
         [&](int chunk) -> size_t {
             GGML_ASSERT(chunk >= 0);
+            if (phone_prefill_route_single_lane >= 0) {
+                return static_cast<size_t>(
+                    phone_prefill_route_single_lane);
+            }
             size_t lane =
                 static_cast<size_t>(chunk) %
                 ggml_backend_meta_context::PREFILL_ROUTE_LANES;
@@ -5717,6 +5737,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         };
 
     if ((pipeline_debug || tensor_phone_stage_profile) &&
+            phone_prefill_route_single_lane >= 0) {
+        printf(
+            "[PHONE_PREFILL_ROUTE_LANE_MAP] single_lane=%d\n",
+            phone_prefill_route_single_lane);
+    } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_lane_swap) {
         printf(
             "[PHONE_PREFILL_ROUTE_LANE_MAP] swap=1 "
