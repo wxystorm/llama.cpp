@@ -4322,6 +4322,59 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool phone_primary_wavefront_requested =
         phone_primary_wavefront_env != nullptr &&
         std::atoi(phone_primary_wavefront_env) != 0;
+
+    // Minimal cross-layer entry for the common P=0 Phone-primary layout:
+    //
+    //   GPU prefix -> full-ubatch TENSOR_PHONE_PRIMARY suffix
+    //
+    // The ordinary full graph has stage_graph=false, so Qwen3-MoE cannot emit
+    // its wave markers there.  Build an explicit two-stage graph instead.  The
+    // GPU stage may still run in XG-sized blocks; process_ubatch_staged()
+    // accumulates those host boundary blocks into one full Tensor suffix block.
+    // Keep V1 restricted to a terminal Tensor stage so there is no PHONE_ONLY
+    // tail ownership transition in the same experiment.
+    const bool phone_primary_gpu_tensor_wavefront_topology =
+        has_runtime_plan &&
+        tensor_phone_primary_exec &&
+        phone_primary_wavefront_requested &&
+        runtime_stages.size() == 2 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        runtime_stages[1].layer_end == (int) hparams.n_layer() &&
+        runtime_plan.tensor_chunk_tokens > 0;
+
+    std::vector<llama_hybrid_runtime_stage>
+        phone_primary_gpu_tensor_wavefront_stages;
+    if (phone_primary_gpu_tensor_wavefront_topology) {
+        phone_primary_gpu_tensor_wavefront_stages.push_back(
+            runtime_stages[0]);
+
+        const int tensor_macro_tokens =
+            std::max(1, (int) cparams.n_ubatch);
+        phone_primary_gpu_tensor_wavefront_stages.push_back({
+            llama_hybrid_runtime_stage_kind::TENSOR,
+            runtime_stages[1].layer_begin,
+            runtime_stages[1].layer_end,
+            tensor_macro_tokens,
+            runtime_plan.tensor_chunk_tokens,
+        });
+
+        if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+            LLAMA_LOG_DEBUG(
+                "[HYBRID_PHONE_XLAYER] enabled=1 topology=GPU_TENSOR "
+                "GPU=[%d,%d) XG=%d TENSOR=[%d,%d) "
+                "suffix_macro=%d XT=%d\n",
+                phone_primary_gpu_tensor_wavefront_stages[0].layer_begin,
+                phone_primary_gpu_tensor_wavefront_stages[0].layer_end,
+                phone_primary_gpu_tensor_wavefront_stages[0].macro_tokens,
+                phone_primary_gpu_tensor_wavefront_stages[1].layer_begin,
+                phone_primary_gpu_tensor_wavefront_stages[1].layer_end,
+                phone_primary_gpu_tensor_wavefront_stages[1].macro_tokens,
+                phone_primary_gpu_tensor_wavefront_stages[1].
+                    inner_chunk_tokens);
+        }
+    }
+
     const bool phone_primary_cpu_chunk_topology =
         has_runtime_plan &&
         tensor_phone_primary_exec &&
@@ -5863,6 +5916,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        bool phone_primary_gpu_tensor_wavefront_candidate =
+            phone_primary_gpu_tensor_wavefront_topology &&
+            !phone_primary_gpu_tensor_wavefront_stages.empty() &&
+            cparams.causal_attn &&
+            ubatch.n_tokens > 1 &&
+            ubatch.n_tokens >
+                (uint32_t) runtime_plan.tensor_chunk_tokens &&
+            ubatch.token != nullptr &&
+            ubatch.embd == nullptr &&
+            ubatch.n_pos == 1 &&
+            !ubatch.equal_seqs() &&
+            ubatch.n_seqs_unq == 1 &&
+            !cparams.embeddings &&
+            !cparams.embeddings_nextn &&
+            cparams.cb_eval == nullptr &&
+            std::none_of(
+                cparams.embeddings_layer_inp.begin(),
+                cparams.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; });
+
         bool phone_primary_cpu_chunk_candidate =
             phone_primary_cpu_chunk_requested &&
             phone_primary_cpu_chunk_topology &&
@@ -5882,6 +5955,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 cparams.embeddings_layer_inp.begin(),
                 cparams.embeddings_layer_inp.end(),
                 [](bool enabled) { return enabled; });
+
+        if (phone_primary_wavefront_requested &&
+                has_runtime_plan &&
+                tensor_phone_primary_exec &&
+                !phone_primary_gpu_tensor_wavefront_topology &&
+                std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+            LLAMA_LOG_DEBUG(
+                "[HYBRID_PHONE_XLAYER] enabled=0 "
+                "reason=UNSUPPORTED_GPU_TENSOR_TOPOLOGY stages=%zu\n",
+                runtime_stages.size());
+        }
 
         bool stage_serial_candidate =
             stage_serial_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 && ubatch.token != nullptr &&
@@ -6001,6 +6085,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_tensor_ready_bytes = 0;
                 hybrid_phone_ready_bytes = 0;
             }
+        } else if (phone_primary_gpu_tensor_wavefront_candidate) {
+            if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+                LLAMA_LOG_DEBUG(
+                    "[HYBRID_PHONE_XLAYER] ub=%d tokens=%u "
+                    "XG=%d suffix_macro=%d XT=%d action=RUN\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    phone_primary_gpu_tensor_wavefront_stages[0].
+                        macro_tokens,
+                    phone_primary_gpu_tensor_wavefront_stages[1].
+                        macro_tokens,
+                    phone_primary_gpu_tensor_wavefront_stages[1].
+                        inner_chunk_tokens);
+            }
+            res = process_ubatch_staged(
+                ubatch,
+                ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(),
+                sched.get(),
+                gf_res_prev.get(),
+                phone_primary_gpu_tensor_wavefront_stages,
+                ubatch_id,
+                status);
         } else if (phone_primary_cpu_chunk_candidate) {
             if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
                 LLAMA_LOG_DEBUG(
