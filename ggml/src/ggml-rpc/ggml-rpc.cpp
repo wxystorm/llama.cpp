@@ -2489,16 +2489,19 @@ static bool ggml_backend_rpc_get_route_snapshot(
 
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
+    const bool route_profile =
+        stage_profile ||
+        std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
     const int64_t client_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
 
     // Destination staging is private per chunk/lane. Keep the generic
     // destination-safety contract explicit for correctness.
     const int64_t dst_sync_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
     ggml_backend_synchronize(backend_dst);
     const int64_t dst_sync_us =
-        stage_profile ? ggml_time_us() - dst_sync_begin_us : 0;
+        route_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
     std::vector<uint8_t> response(wire_total_size);
     const int64_t rpc_begin_us = ggml_time_us();
@@ -2544,7 +2547,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         payload_done_us - response_header_us;
 
     const int64_t dst_set_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
     size_t offset = 0;
 
     ggml_backend_tensor_set(
@@ -2593,7 +2596,35 @@ static bool ggml_backend_rpc_get_route_snapshot(
 
     GGML_ASSERT(offset == response.size());
     const int64_t dst_set_us =
-        stage_profile ? ggml_time_us() - dst_set_begin_us : 0;
+        route_profile ? ggml_time_us() - dst_set_begin_us : 0;
+
+    if (route_profile) {
+        std::fprintf(
+            stderr,
+            "[RPC_ROUTE_STAGE] side=pc "
+            "stage=route_snapshot bytes=%zu storage_bytes=%zu "
+            "compact_topk=%d topk_storage_bytes=%zu "
+            "topk_wire_bytes=%zu lane=%u "
+            "seq=%" PRIu64 " dst_sync_ms=%.3f "
+            "request_send_ms=%.3f response_header_wait_ms=%.3f "
+            "payload_recv_ms=%.3f rpc_roundtrip_ms=%.3f "
+            "dst_set_ms=%.3f total_ms=%.3f\n",
+            wire_total_size,
+            storage_total_size,
+            compact_topk ? 1 : 0,
+            storage_sizes[1],
+            topk_wire_bytes,
+            lane,
+            seq,
+            dst_sync_us / 1000.0,
+            request_send_us / 1000.0,
+            response_header_wait_us / 1000.0,
+            payload_recv_us / 1000.0,
+            rpc_us / 1000.0,
+            dst_set_us / 1000.0,
+            (ggml_time_us() - client_begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
 
     if (stage_profile) {
         std::fprintf(
@@ -5509,8 +5540,11 @@ bool rpc_server::get_route_snapshot(
 
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
+    const bool route_profile =
+        stage_profile ||
+        std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
     const int64_t server_enter_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
 
     const bool compact_topk_requested =
         (request.sizes[1] &
@@ -5527,7 +5561,7 @@ bool rpc_server::get_route_snapshot(
             slots[request.lane];
 
     const int64_t lock_begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        route_profile ? ggml_time_us() : 0;
     int64_t lock_wait_us = 0;
     int64_t cv_wait_us = 0;
     int64_t response_copy_us = 0;
@@ -5540,11 +5574,11 @@ bool rpc_server::get_route_snapshot(
     {
         std::unique_lock<std::mutex> lock(slot.mutex);
         const int64_t lock_acquired_us =
-            stage_profile ? ggml_time_us() : lock_begin_us;
+            route_profile ? ggml_time_us() : lock_begin_us;
         lock_wait_us = lock_acquired_us - lock_begin_us;
 
         const int64_t cv_wait_begin_us =
-            stage_profile ? lock_acquired_us : ggml_time_us();
+            route_profile ? lock_acquired_us : ggml_time_us();
         slot.cv.wait(
             lock,
             [&]() {
@@ -5597,7 +5631,7 @@ bool rpc_server::get_route_snapshot(
 
         slot.state = rpc_snapshot_state::SENDING;
         const int64_t copy_begin_us =
-            stage_profile ? ggml_time_us() : ready_us;
+            route_profile ? ggml_time_us() : ready_us;
 
         if (compact_topk_used) {
             topk_wire_bytes = slot.topk_wire_bytes;
@@ -5647,7 +5681,7 @@ bool rpc_server::get_route_snapshot(
         }
 
         const int64_t copy_done_us =
-            stage_profile ? ggml_time_us() : copy_begin_us;
+            route_profile ? ggml_time_us() : copy_begin_us;
         response_copy_us = copy_done_us - copy_begin_us;
         slot.data.clear();
         slot.seq = 0;
@@ -5661,6 +5695,35 @@ bool rpc_server::get_route_snapshot(
         slot.state = rpc_snapshot_state::FREE;
     }
     slot.cv.notify_all();
+
+    if (route_profile) {
+        const int64_t producer_wait_est_us =
+            std::max<int64_t>(0, ready_wait_us - slot_fill_us);
+        std::fprintf(
+            stderr,
+            "[RPC_ROUTE_STAGE] side=phone "
+            "stage=route_snapshot_wait lane=%u "
+            "seq=%" PRIu64 " bytes=%zu storage_bytes=%zu "
+            "compact_topk=%d topk_storage_bytes=%zu "
+            "topk_wire_bytes=%zu "
+            "lock_wait_ms=%.3f cv_wait_ms=%.3f "
+            "response_copy_ms=%.3f producer_wait_est_ms=%.3f "
+            "fill_ms=%.3f ready_wait_ms=%.3f\n",
+            request.lane,
+            request.seq,
+            response.size(),
+            storage_total_size,
+            compact_topk_used ? 1 : 0,
+            topk_storage_bytes,
+            topk_wire_bytes,
+            lock_wait_us / 1000.0,
+            cv_wait_us / 1000.0,
+            response_copy_us / 1000.0,
+            producer_wait_est_us / 1000.0,
+            slot_fill_us / 1000.0,
+            ready_wait_us / 1000.0);
+        std::fflush(stderr);
+    }
 
     if (stage_profile) {
         const int64_t producer_wait_est_us =
@@ -7717,24 +7780,27 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             case RPC_CMD_GET_ROUTE_SNAPSHOT: {
                 const bool stage_profile =
                     rpc_tensor_phone_stage_profile_enabled();
+                const bool route_profile =
+                    stage_profile ||
+                    std::getenv("GGML_RPC_ROUTE_STAGE_PROFILE") != nullptr;
                 const int64_t request_recv_begin_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
 
                 rpc_msg_get_route_snapshot_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 const int64_t request_recv_done_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
 
                 std::vector<uint8_t> response;
                 const int64_t dispatch_begin_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
                 if (!server.get_route_snapshot(request, response)) {
                     return;
                 }
                 const int64_t dispatch_done_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
 
                 // Preserve send_msg() wire semantics exactly, but expose the
                 // response-size header and payload writes separately.  This
@@ -7744,14 +7810,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     static_cast<uint64_t>(response.size());
 
                 const int64_t header_send_begin_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
                 if (!sock->send_data(
                         &out_size,
                         sizeof(out_size))) {
                     return;
                 }
                 const int64_t header_send_done_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
 
                 if (!response.empty() &&
                         !sock->send_data(
@@ -7760,7 +7826,33 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 const int64_t payload_send_done_us =
-                    stage_profile ? ggml_time_us() : 0;
+                    route_profile ? ggml_time_us() : 0;
+
+                if (route_profile) {
+                    std::fprintf(
+                        stderr,
+                        "[RPC_ROUTE_STAGE] side=phone "
+                        "stage=route_snapshot_dispatch lane=%u "
+                        "seq=%" PRIu64 " bytes=%zu "
+                        "request_body_recv_ms=%.3f "
+                        "get_route_total_ms=%.3f "
+                        "header_send_ms=%.3f payload_send_ms=%.3f "
+                        "wire_send_total_ms=%.3f\n",
+                        request.lane,
+                        request.seq,
+                        response.size(),
+                        (request_recv_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        (dispatch_done_us -
+                            dispatch_begin_us) / 1000.0,
+                        (header_send_done_us -
+                            header_send_begin_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_done_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_begin_us) / 1000.0);
+                    std::fflush(stderr);
+                }
 
                 if (stage_profile) {
                     std::fprintf(
