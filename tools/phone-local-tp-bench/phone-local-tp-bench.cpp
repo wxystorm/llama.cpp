@@ -82,7 +82,10 @@ static std::unique_ptr<Graph> build(File&f,int layer,ggml_backend_t backend,int6
  for(int k=1;k<topk;k++)b->out=ggml_add(b->ctx,b->out,ggml_view_2d(b->ctx,e,embd,tokens,e->nb[2],(size_t)k*e->nb[1]));
  if(topk==1)b->out=ggml_cont(b->ctx,b->out);
  b->gf=ggml_new_graph_custom(b->ctx,128,false);ggml_build_forward_expand(b->gf,b->out);
- for(int i=0;i<b->gf->n_nodes;i++)check(ggml_backend_supports_op(backend,b->gf->nodes[i]),std::string("unsupported op: ")+ggml_op_name(b->gf->nodes[i]->op));
+ for(int i=0;i<ggml_graph_n_nodes(b->gf);i++){
+  ggml_tensor *node=ggml_graph_node(b->gf,i);
+  check(ggml_backend_supports_op(backend,node),std::string("unsupported op: ")+ggml_op_name(node->op));
+ }
  b->buf=ggml_backend_alloc_ctx_tensors(b->ctx,backend);check(b->buf!=nullptr,"backend allocation failed");
  f.load(gw,b->gate,from,width,false);f.load(uw,b->up,from,width,false);f.load(dw,b->down,from,width,true);
  std::vector<float> inp((size_t)embd*tokens);
