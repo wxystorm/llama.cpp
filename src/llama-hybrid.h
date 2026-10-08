@@ -179,6 +179,9 @@ struct llama_hybrid_profile {
 
     std::vector<llama_hybrid_transfer_point> gpu_to_pc;
     std::vector<llama_hybrid_transfer_point> pc_to_phone;
+    // Measured SET_TENSOR_ASYNC_RETURN_WAIT round trip. Keys are the original
+    // F32 output size; samples include F16 wire conversion when enabled.
+    std::vector<llama_hybrid_transfer_point> phone_prefill_return;
     std::vector<llama_hybrid_transfer_point> snapshot_phone_to_pc;
     std::vector<llama_hybrid_transfer_point> phone_to_pc;
 
