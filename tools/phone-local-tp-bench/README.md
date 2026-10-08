@@ -47,3 +47,39 @@ Outputs:
 - `[PHONE_LOCAL_SUM]`: per-layer medians and mixed-mode speedup
 
 **Important limitations:** The `[PHONE_LOCAL_SUM]` timing represents a small set of independently benchmarked FFN layers, *not* actual 400-token prefill throughput. Each layer gets its own deterministic input, not the previous layer's output. Output check uses a diagnostic relative-L2 threshold and needs investigation if marked CHECK. It is not proof of token-level correctness. CPU/GPU share physical DRAM but the initial join uses tensor readback and an upload, not zero-copy. Quantization support and performance depend on the phone's OpenCL backend. This code has not been compiled or run on the target Android/Adreno phone here.
+
+## Diagnosing Adreno SIGSEGV while loading kernels
+
+The OpenCL backend intentionally delays `load_cl_kernels()` until the **first GPU
+buffer allocation**. A crash during `ggml_opencl: loading OpenCL kernels...`
+is therefore an initialization failure; the benchmark may not yet have run
+the FFN graph.
+
+Build the updated branch and isolate kernel loading without opening the GGUF:
+
+```bash
+git pull --ff-only origin phone-local-tensor-bench
+cmake --build build-phone-local --target llama-phone-local-tp-bench -j4
+
+set -o pipefail
+GGML_OPENCL_BUILD_TRACE=1 LD_LIBRARY_PATH=/vendor/lib64 \
+  ./build-phone-local/bin/llama-phone-local-tp-bench --probe-opencl \
+  2>&1 | tee phone-local-opencl-init.log
+```
+
+The `[PHONE_LOCAL_BOOT]` lines use stderr (so they are not buffered by the
+`tee` stdout pipe). `[OPENCL_BUILD_TRACE]` prints the source hint, a
+monotonic kernel compile ID, and the before/after of each `clBuildProgram`.
+If it crashes after `phase=clBuildProgram_begin` but before the matching
+`phase=clBuildProgram_end`, the vendor OpenCL compiler is the leading
+suspect. Capture the final 30-50 lines from the combined log.
+
+If the probe passes, rerun the regular two-layer benchmark using
+`2>&1 | tee phone-local-25pct.log`. The last `[PHONE_LOCAL_BOOT]` marker
+will distinguish GGUF loading, graph preparation, buffer allocation, and
+weight loading.
+
+Diagnostic workaround, **not comparable with the optimized Adreno baseline**:
+rebuild with `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` and retry the probe.
+If this changes the outcome, an Adreno-specific OpenCL kernel or compilation
+path may be involved. Restore the option to ON for performance measurements.
