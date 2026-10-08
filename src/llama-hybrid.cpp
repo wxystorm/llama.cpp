@@ -825,9 +825,23 @@ void llama_hybrid_plan_print(const llama_hybrid_plan & plan) {
         plan.predicted_gpu_busy_ms, plan.predicted_downstream_ms, plan.predicted_gpu_wait_ms,
         plan.predicted_tensor_peak_bytes / 1048576.0, plan.predicted_phone_peak_bytes / 1048576.0);
     if (plan.tensor_phone_primary && plan.tensor_layers > 0) {
+        const char * wave_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+        const char * v2_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_XLAYER_FFN_AHEAD_V2");
+        const char * big_wave_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_BIG_WAVE");
+        const char * return_f16_env =
+            std::getenv("GGML_RPC_RETURN_F16");
         LLAMA_LOG_INFO(
-            "[HYBRID_PLAN_PHONE_WAVE] enabled=1 critical_return=%d "
-            "layers=%d XT=%d R=%.3f\n",
+            "[HYBRID_PLAN_PHONE_WAVE] requested=%d bounded_v2_requested=%d "
+            "big_wave_requested=%d return_f16_requested=%d "
+            "critical_return=%d layers=%d XT=%d R=%.3f\n",
+            wave_env != nullptr && std::atoi(wave_env) != 0 ? 1 : 0,
+            v2_env != nullptr && std::atoi(v2_env) != 0 ? 1 : 0,
+            big_wave_env != nullptr && std::atoi(big_wave_env) != 0 ? 1 : 0,
+            return_f16_env != nullptr &&
+                std::atoi(return_f16_env) != 0 ? 1 : 0,
             std::getenv(
                 "GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr ? 1 : 0,
             plan.tensor_layers,
