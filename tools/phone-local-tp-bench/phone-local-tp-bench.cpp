@@ -432,19 +432,26 @@ static std::vector<float> full_initial(int64_t embd,int tokens) {
 static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
                                std::vector<float> &hidden) {
  FullTimes t;
+ const bool step_trace=std::getenv("PHONE_FULL_TRACE")!=nullptr;
+ const auto trace=[&](const char *phase){
+  if(step_trace)std::fprintf(stderr,"[PHONE_FULL_STEP] layer=%d phase=%s\n",layer.il,phase);
+ };
  const auto begin=clk::now();
  auto &pre=*layer.pre;
  auto &gb=*layer.gpu_ffn;
  check(hidden.size()*sizeof(float)==ggml_nbytes(pre.input),"hidden state shape mismatch");
 
  auto phase=clk::now();
+ trace("attention_router_begin");
  ggml_backend_tensor_set(pre.input,hidden.data(),0,hidden.size()*sizeof(float));
  check(ggml_backend_graph_compute(gpu,pre.graph)==GGML_STATUS_SUCCESS,
        "GPU attention/router graph failed");
  ggml_backend_synchronize(gpu);
  t.attention_router=ms(phase);
+ trace("attention_router_ok");
 
  phase=clk::now();
+ trace("ffn_stage_begin");
  ggml_backend_tensor_copy(pre.ffn_norm,gb.x);
  ggml_backend_tensor_copy(pre.ids,gb.ids);
  ggml_backend_tensor_copy(pre.mix,gb.mix);
@@ -457,6 +464,8 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
  }
  ggml_backend_synchronize(gpu);
  t.stage=ms(phase);
+ trace("ffn_stage_ok");
+ trace("ffn_parallel_begin");
 
  if(layer.cpu_ffn){
   auto &cb=*layer.cpu_ffn;
@@ -468,6 +477,8 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
  }else{
   t.gpu_ffn=compute(gb);
  }
+ trace("ffn_parallel_ok");
+ trace("join_begin");
  phase=clk::now();
  auto gpu_partial=output(gb);
  if(layer.cpu_ffn){
@@ -482,6 +493,7 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
  hidden.swap(residual);
  t.join=ms(phase);
  t.total=ms(begin);
+ trace("join_ok");
  return t;
 }
 static std::vector<std::unique_ptr<FullLayer>> full_build_layers(
