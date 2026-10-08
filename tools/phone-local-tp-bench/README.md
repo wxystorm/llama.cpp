@@ -99,3 +99,62 @@ for **all experts**, then uploads it with a single
 New `[PHONE_LOCAL_WEIGHT]` markers show assemble/upload boundaries and byte
 counts. This increases temporary host memory but does not increase the number
 of resident GPU layer weights.
+
+
+## Continuous Qwen3-MoE layers: Attention + Router + CPU/GPU FFN
+
+Pass --full-layer to select the new opt-in test; without it the original
+FFN-only microbenchmark remains unchanged.
+
+Each layer now executes real GGUF-weighted Attention on Adreno OpenCL:
+attention RMSNorm; Q/K/V projection; Q/K RMSNorm and NeoX RoPE;
+400-token causal, non-flash GQA Attention; output projection and residual;
+FFN RMSNorm; real GGUF Router softmax/Top-K and renormalized expert weights.
+Both comparison modes use exactly the same GPU Attention and Router.
+GPU-only executes the whole quantized MoE FFN on the GPU.
+CPU+GPU uses quant-block-aligned complementary FFN intermediate shards
+in parallel, then adds their results with the Attention residual.
+The resulting hidden states are passed to the NEXT layer.
+
+Inputs remain fixed deterministic synthetic hidden states, not tokenizer
+outputs. This is a continuous, prefill-shaped hidden-state benchmark, NOT
+the complete model: no tokenizer/embedding, logits head, persistent KV
+cache, sampling, RPC, pipeline or chunking. The causal attention graph is
+non-flash, and the conservative GPU-to-FFN staging and CPU host joins
+are included in both modes' timings. Full-model prefill performance
+cannot be inferred directly from these measurements.
+
+First, smoke-test one layer and one iteration in Termux:
+
+    git pull --ff-only origin phone-local-tensor-bench
+    cmake --build build-phone-local --target llama-phone-local-tp-bench -j4
+    LD_LIBRARY_PATH=/vendor/lib64 ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 1 --tokens 400 --topk 8 \
+      --cpu-ratio 0.25 --threads 8 --warmup 0 --runs 1 \
+      2>&1 | tee phone-full-smoke.log
+
+Then measure a contiguous two-layer pass (weights loaded outside timing):
+
+    LD_LIBRARY_PATH=/vendor/lib64 ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 2 --tokens 400 --topk 8 \
+      --cpu-ratio 0.25 --threads 8 --warmup 2 --runs 5 \
+      2>&1 | tee phone-full-layer-2.log
+
+Diagnostics:
+- [PHONE_LAYER_BOOT] GPU Attention + Router construction/weight load.
+- [PHONE_LAYER_LAYOUT] layer dimensions and quant-aligned FFN division.
+- [PHONE_FULL_LAYER] per-layer GPU Attention+Router, stage, GPU FFN,
+  CPU FFN, Join and total.
+- [PHONE_FULL_RUN] wall-clock time across the entire requested layer range.
+- [PHONE_FULL_CHECK] final hidden-state GPU-only versus split relative L2.
+- [PHONE_FULL_SUM] median complete-layer-range latency and speedup.
+
+A failed final-state relative-L2 comparison (>= 0.03) returns exit code 2.
+Changes in Top-K decisions can amplify errors over several layers.
+Both benchmark modes preload weights for all requested layers, and their
+GPU allocations are released between GPU-only and CPU+GPU phases.
+Start with 1-2 layers to keep phone peak memory usage manageable.
+Mode order is currently GPU-only then mixed; later measurements should
+alternate or randomize order to control DVFS and thermal drift.
