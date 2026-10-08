@@ -593,26 +593,146 @@ static std::vector<FullRound> full_measure(
   std::vector<float> hidden=initial;
   const auto begin=clk::now();
   for(const auto &layer:layers){
-   auto t=run_full_layer(*layer,gpu,hidden);
-   round.layers.push_back(t);
-   if(rep>=0){
-    std::cout<<"[PHONE_FULL_LAYER] mode="<<mode<<" layer="<<layer->il
+   round.layers.push_back(run_full_layer(*layer,gpu,hidden));
+  }
+  // Record wall time BEFORE formatting/printing per-layer records. Console I/O
+  // can otherwise create apparent multi-ms latency spikes in total_ms.
+  round.wall=ms(begin);
+  round.output.swap(hidden);
+  if(rep>=0){
+   for(size_t i=0;i<layers.size();i++){
+    const auto &t=round.layers[i];
+    const auto &p=t.stage_parts;
+    std::cout<<"[PHONE_FULL_LAYER] mode="<<mode<<" layer="<<layers[i]->il
       <<" rep="<<rep<<" attn_router_ms="<<t.attention_router
       <<" stage_ms="<<t.stage<<" gpu_ffn_ms="<<t.gpu_ffn
       <<" cpu_ffn_ms="<<t.cpu_ffn<<" join_ms="<<t.join
       <<" total_ms="<<t.total<<"\n";
+    std::cout<<"[PHONE_FULL_STAGE] mode="<<mode<<" layer="<<layers[i]->il
+      <<" rep="<<rep<<" gpu_norm_ms="<<p.gpu_norm
+      <<" gpu_ids_ms="<<p.gpu_ids<<" gpu_mix_ms="<<p.gpu_mix
+      <<" cpu_norm_ms="<<p.cpu_norm<<" cpu_ids_ms="<<p.cpu_ids
+      <<" cpu_mix_ms="<<p.cpu_mix<<" cpu_sync_ms="<<p.cpu_sync
+      <<" gpu_sync_ms="<<p.gpu_sync<<" other_ms="<<p.other
+      <<" accounted_ms="<<p.accounted()<<" total_ms="<<t.stage<<"\n";
    }
-  }
-  round.wall=ms(begin);
-  round.output.swap(hidden);
-  if(rep>=0){
    std::cout<<"[PHONE_FULL_RUN] mode="<<mode<<" rep="<<rep
             <<" layers="<<layers.size()<<" total_ms="<<round.wall<<"\n";
    measured.push_back(std::move(round));
   }
  }
+ // Median cost per copy and per synchronization point, grouped by layer.
+ for(size_t li=0;li<layers.size();li++){
+  std::vector<double> stage,gpu_norm,gpu_ids,gpu_mix;
+  std::vector<double> cpu_norm,cpu_ids,cpu_mix,cpu_sync,gpu_sync,other;
+  for(const auto &round:measured){
+   const FullTimes &t=round.layers[li];
+   const auto &p=t.stage_parts;
+   stage.push_back(t.stage);
+   gpu_norm.push_back(p.gpu_norm);
+   gpu_ids.push_back(p.gpu_ids);
+   gpu_mix.push_back(p.gpu_mix);
+   cpu_norm.push_back(p.cpu_norm);
+   cpu_ids.push_back(p.cpu_ids);
+   cpu_mix.push_back(p.cpu_mix);
+   cpu_sync.push_back(p.cpu_sync);
+   gpu_sync.push_back(p.gpu_sync);
+   other.push_back(p.other);
+  }
+  std::cout<<"[PHONE_FULL_STAGE_SUM] mode="<<mode<<" layer="<<layers[li]->il
+   <<" total_median_ms="<<med(stage)
+   <<" gpu_norm_median_ms="<<med(gpu_norm)
+   <<" gpu_ids_median_ms="<<med(gpu_ids)
+   <<" gpu_mix_median_ms="<<med(gpu_mix)
+   <<" cpu_norm_median_ms="<<med(cpu_norm)
+   <<" cpu_ids_median_ms="<<med(cpu_ids)
+   <<" cpu_mix_median_ms="<<med(cpu_mix)
+   <<" cpu_sync_median_ms="<<med(cpu_sync)
+   <<" gpu_sync_median_ms="<<med(gpu_sync)
+   <<" other_median_ms="<<med(other)<<"\n";
+ }
  return measured;
 }
+
+// One diagnostic pass per mode, fully OUTSIDE the measured trials.
+// Capture hidden states after EVERY layer and each GPU Router Top-K choice.
+struct FullDiagnostics {
+ std::vector<std::vector<float>> layer_output;
+ std::vector<std::vector<int32_t>> router_ids;
+};
+static FullDiagnostics full_capture_diagnostics(
+ ggml_backend_t gpu,
+ const std::vector<std::unique_ptr<FullLayer>> &layers,
+ const std::vector<float> &initial, const char *mode) {
+ FullDiagnostics d;
+ d.layer_output.reserve(layers.size());
+ d.router_ids.reserve(layers.size());
+ std::vector<float> hidden=initial;
+ std::fprintf(stderr,"[PHONE_FULL_DIAG] mode=%s phase=begin layers=%zu\n",mode,layers.size());
+ for(const auto &layer:layers){
+  (void)run_full_layer(*layer,gpu,hidden);
+  d.layer_output.push_back(hidden);
+  const ggml_tensor *ids=layer->pre->ids;
+  check(ids->type==GGML_TYPE_I32,"Router IDs type mismatch during diagnostics");
+  const size_t count=static_cast<size_t>(ggml_nelements(ids));
+  std::vector<int32_t> values(count);
+  ggml_backend_tensor_get(ids,values.data(),0,count*sizeof(int32_t));
+  d.router_ids.push_back(std::move(values));
+ }
+ std::fprintf(stderr,"[PHONE_FULL_DIAG] mode=%s phase=end layers=%zu\n",mode,layers.size());
+ return d;
+}
+
+static bool full_report_layer_checks(
+ const Opt &o,const FullDiagnostics &base,const FullDiagnostics &mixed) {
+ check(base.layer_output.size()==static_cast<size_t>(o.layers) &&
+       mixed.layer_output.size()==base.layer_output.size() &&
+       base.router_ids.size()==base.layer_output.size() &&
+       mixed.router_ids.size()==base.layer_output.size(),
+       "per-layer diagnostic count mismatch");
+ bool all_ok=true;
+ for(size_t li=0;li<base.layer_output.size();li++){
+  const auto &a=base.layer_output[li];
+  const auto &b=mixed.layer_output[li];
+  check(a.size()==b.size(),"per-layer hidden-state lengths differ");
+  double error2=0,reference2=0,max_abs=0;
+  for(size_t j=0;j<a.size();j++){
+   check(std::isfinite(a[j])&&std::isfinite(b[j]),
+         "non-finite value in per-layer hidden-state check");
+   const double diff=static_cast<double>(a[j])-b[j];
+   error2+=diff*diff;
+   reference2+=static_cast<double>(a[j])*a[j];
+   max_abs=std::max(max_abs,std::abs(diff));
+  }
+  const double relative_l2=std::sqrt(error2/std::max(reference2,1.0e-24));
+  const auto &ref_ids=base.router_ids[li];
+  const auto &mix_ids=mixed.router_ids[li];
+  const size_t expected=static_cast<size_t>(o.tokens)*static_cast<size_t>(o.topk);
+  check(ref_ids.size()==expected&&mix_ids.size()==expected,
+        "Router Top-K IDs diagnostic shape mismatch");
+  size_t changed_choices=0,changed_tokens=0;
+  for(int token=0;token<o.tokens;token++){
+   bool token_changed=false;
+   for(int k=0;k<o.topk;k++){
+    const size_t j=static_cast<size_t>(token)*o.topk+k;
+    if(ref_ids[j]!=mix_ids[j]){
+     token_changed=true;
+     changed_choices++;
+    }
+   }
+   if(token_changed)changed_tokens++;
+  }
+  const bool ok=relative_l2<0.03;
+  all_ok=all_ok&&ok;
+  std::cout<<"[PHONE_FULL_LAYER_CHECK] layer="<<(o.layer+static_cast<int>(li))
+           <<" rel_l2="<<relative_l2<<" max_abs="<<max_abs
+           <<" changed_router_tokens="<<changed_tokens
+           <<" changed_router_slots="<<changed_choices
+           <<" status="<<(ok?"OK":"CHECK")<<"\n";
+ }
+ return all_ok;
+}
+
 static int run_full(const Opt&o) {
  check(o.cpu_ratio>0,"--full-layer requires --cpu-ratio > 0 for a comparison");
  ggml_backend_load_all();
