@@ -34,8 +34,10 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <inttypes.h>
 #include <string.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <fstream>
@@ -1103,6 +1105,22 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
 
     program_size = strlen(program_buffer);
 
+    // Opt-in, crash-safe breadcrumbs for vendor OpenCL compiler failures.
+    static std::atomic<unsigned> build_sequence { 0 };
+    const unsigned build_id = build_sequence.fetch_add(1, std::memory_order_relaxed);
+    const bool build_trace = std::getenv("GGML_OPENCL_BUILD_TRACE") != nullptr;
+    if (build_trace) {
+        const char * hint = strstr(program_buffer, "__kernel");
+        if (hint == nullptr) hint = strstr(program_buffer, "kernel void");
+        if (hint == nullptr) hint = program_buffer;
+        int hint_len = 0;
+        while (hint[hint_len] != '\n' && hint[hint_len] != '\0' && hint_len < 100) ++hint_len;
+        std::fprintf(stderr,
+            "[OPENCL_BUILD_TRACE] id=%u phase=begin tag=%s source_bytes=%zu hint=%.*s\n",
+            build_id, tag ? tag : "-", program_size, hint_len, hint);
+        std::fflush(stderr);
+    }
+
     const int max_attempts = retry_queue ? 3 : 1;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         p = clCreateProgramWithSource(ctx, 1, (const char**)&program_buffer, &program_size, &err);
@@ -1112,7 +1130,15 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
             return NULL;
         }
 
+        if (build_trace) {
+            std::fprintf(stderr, "[OPENCL_BUILD_TRACE] id=%u phase=clBuildProgram_begin attempt=%d\n", build_id, attempt + 1);
+            std::fflush(stderr);
+        }
         err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
+        if (build_trace) {
+            std::fprintf(stderr, "[OPENCL_BUILD_TRACE] id=%u phase=clBuildProgram_end attempt=%d err=%d\\n", build_id, attempt + 1, err);
+            std::fflush(stderr);
+        }
         if (err == CL_SUCCESS) {
             return p;
         }
