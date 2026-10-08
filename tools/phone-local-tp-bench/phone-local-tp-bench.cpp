@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -21,15 +24,15 @@ using clk = std::chrono::steady_clock;
 static double ms(clk::time_point t) { return std::chrono::duration<double,std::milli>(clk::now()-t).count(); }
 static void check(bool x,const std::string & msg) { if(!x) throw std::runtime_error(msg); }
 static double med(std::vector<double> x){std::sort(x.begin(),x.end());return x[x.size()/2];}
-struct Opt {std::string model;int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;};
+struct Opt {std::string model;int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_opencl=false;};
 static Opt options(int argc,char **argv) {
- Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
+ Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_opencl=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
  if(a=="-m")o.model=v;else if(a=="--layer")o.layer=std::stoi(v);else if(a=="--layers")o.layers=std::stoi(v);
  else if(a=="--tokens")o.tokens=std::stoi(v);else if(a=="--topk")o.topk=std::stoi(v);
  else if(a=="--threads")o.threads=std::stoi(v);else if(a=="--runs")o.runs=std::stoi(v);
  else if(a=="--warmup")o.warmup=std::stoi(v);else if(a=="--cpu-ratio")o.cpu_ratio=std::stod(v);
  else throw std::runtime_error("unknown option "+a);}
- check(!o.model.empty()&&o.layer>=0&&o.layers>0&&o.tokens>0&&o.topk>0&&o.threads>0&&o.runs>0&&o.warmup>=0&&o.cpu_ratio>=0&&o.cpu_ratio<1,"invalid benchmark options");return o;
+ check((!o.model.empty()||o.probe_opencl)&&o.layer>=0&&o.layers>0&&o.tokens>0&&o.topk>0&&o.threads>0&&o.runs>0&&o.warmup>=0&&o.cpu_ratio>=0&&o.cpu_ratio<1,"invalid benchmark options");return o;
 }
 struct File {
  gguf_context *uf=nullptr;ggml_context *ctx=nullptr;std::ifstream f;size_t data=0;
@@ -86,8 +89,12 @@ static std::unique_ptr<Graph> build(File&f,int layer,ggml_backend_t backend,int6
   ggml_tensor *node=ggml_graph_node(b->gf,i);
   check(ggml_backend_supports_op(backend,node),std::string("unsupported op: ")+ggml_op_name(node->op));
  }
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=buffer_alloc_begin layer=%d backend=%s width=%lld\n",layer,ggml_backend_name(backend),(long long)width);
  b->buf=ggml_backend_alloc_ctx_tensors(b->ctx,backend);check(b->buf!=nullptr,"backend allocation failed");
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=buffer_alloc_ok layer=%d backend=%s\n",layer,ggml_backend_name(backend));
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=weights_load_begin layer=%d backend=%s\n",layer,ggml_backend_name(backend));
  f.load(gw,b->gate,from,width,false);f.load(uw,b->up,from,width,false);f.load(dw,b->down,from,width,true);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=weights_load_ok layer=%d backend=%s\n",layer,ggml_backend_name(backend));
  std::vector<float> inp((size_t)embd*tokens);
  for(size_t i=0;i<inp.size();i++)inp[i]=0.02f*std::sin(float((i+(size_t)layer*9973)%8191)*0.037f);
  std::vector<int32_t> ids((size_t)topk*tokens);
@@ -114,20 +121,44 @@ static void compare(const std::vector<float>&a,const std::vector<float>&b,int la
  double rel=std::sqrt(err/std::max(norm,1e-24));std::cout<<"[PHONE_LOCAL_CHECK] layer="<<layer<<" rel_l2="<<rel<<" status="<<(rel<0.03?"OK":"CHECK")<<"\n";
 }
 static int run(const Opt&o){
- ggml_backend_load_all();auto gpu=ggml_backend_dev_init(device(true),nullptr),cpu=ggml_backend_dev_init(device(false),nullptr);
- check(gpu&&cpu,"backend init failed");threads(cpu,o.threads);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=backend_load_begin\n");
+ ggml_backend_load_all();
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=backend_load_ok\n");
+ auto gpu_device=device(true);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_init_begin device=%s\n",ggml_backend_dev_name(gpu_device));
+ auto gpu=ggml_backend_dev_init(gpu_device,nullptr);
+ check(gpu!=nullptr,"GPU backend init failed");
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_init_ok\n");
+ auto cpu_device=device(false);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=cpu_init_begin device=%s\n",ggml_backend_dev_name(cpu_device));
+ auto cpu=ggml_backend_dev_init(cpu_device,nullptr);
+ check(cpu!=nullptr,"CPU backend init failed");threads(cpu,o.threads);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=cpu_init_ok\n");
+ if(o.probe_opencl){
+  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=opencl_probe_alloc_begin size=4096\n");
+  ggml_backend_buffer_t probe=ggml_backend_alloc_buffer(gpu,4096);
+  check(probe!=nullptr,"OpenCL probe allocation failed");
+  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=opencl_probe_alloc_ok\n");
+  ggml_backend_buffer_free(probe);
+  ggml_backend_free(cpu);ggml_backend_free(gpu);return 0;
+ }
  std::cout<<std::fixed<<std::setprecision(3);
  std::cout<<"[PHONE_LOCAL_CONFIG] tokens="<<o.tokens<<" layers="<<o.layers<<" cpu_ratio="<<o.cpu_ratio<<" gpu="<<ggml_backend_name(gpu)<<" cpu="<<ggml_backend_name(cpu)<<"\n";
  {
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gguf_open_begin\n");
  File f(o.model);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gguf_open_ok\n");
  for(int il=o.layer;il<o.layer+o.layers;il++){
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=layer_begin layer=%d\n",il);
  auto w=f.get(il,"ffn_down_exps");int64_t ff=w.t->ne[0],alignment=std::lcm<int64_t>(128,ggml_blck_size(w.t->type));
  check(ff%alignment==0,"FFN width not aligned");int64_t blocks=ff/alignment;
  int64_t cb=std::llround(blocks*o.cpu_ratio);cb=std::min<int64_t>(blocks-1,std::max<int64_t>(o.cpu_ratio>0?1:0,cb));
  int64_t cw=cb*alignment,gw=ff-cw;std::vector<double> base,times;std::vector<float> reference;
  std::cout<<"[PHONE_LOCAL_LAYER] layer="<<il<<" ffn="<<ff<<" gpu_width="<<gw<<" cpu_width="<<cw<<" actual_cpu_ratio="<<double(cw)/ff<<"\n";
  {
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_reference_build_begin layer=%d\n",il);
  auto full=build(f,il,gpu,0,ff,o.tokens,o.topk);
+ std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_reference_build_ok layer=%d\n",il);
  for(int rep=-o.warmup;rep<o.runs;rep++){double t=compute(*full);if(rep>=0){base.push_back(t);std::cout<<"[PHONE_LOCAL_TP] layer="<<il<<" mode=GPU_ONLY rep="<<rep<<" total_ms="<<t<<"\n";}}
  reference=output(*full);
  }
