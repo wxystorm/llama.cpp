@@ -5716,6 +5716,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_v2_throttle_wait_us   = 0;
     int64_t phone_xlayer_v2_throttle_wait_max_us = 0;
     int64_t phone_xlayer_v2_throttle_profile_count = 0;
+    int64_t phone_xlayer_v2_throttle_reduce_us = 0;
     int64_t phone_xlayer_v2_throttle_pc_residual_us = 0;
     int64_t phone_xlayer_v2_throttle_return_gate_us = 0;
     int64_t phone_xlayer_v2_throttle_return_rpc_us = 0;
@@ -12538,11 +12539,16 @@ auto prefill_norm_sg_has_prework =
                         const int64_t throttle_begin_us =
                             ggml_time_us();
 
+                        const int64_t throttle_reduce_begin_us =
+                            ggml_time_us();
                         const ggml_status throttle_reduce_status =
                             wait_prefill_reduce_dependency(
                                 predecessor_layer,
                                 next_pred_chunk,
                                 throttle_reduce_waited);
+                        const int64_t throttle_reduce_wait_us =
+                            ggml_time_us() -
+                            throttle_reduce_begin_us;
                         if (throttle_reduce_status !=
                                 GGML_STATUS_SUCCESS) {
                             return throttle_reduce_status;
@@ -12581,6 +12587,8 @@ auto prefill_norm_sg_has_prework =
                         if (xlayer_throttle_profile &&
                                 throttle_phone_waited) {
                             ++phone_xlayer_v2_throttle_profile_count;
+                            phone_xlayer_v2_throttle_reduce_us +=
+                                throttle_reduce_wait_us;
                             phone_xlayer_v2_throttle_pc_residual_us +=
                                 throttle_breakdown.pc_residual_us;
                             phone_xlayer_v2_throttle_return_gate_us +=
@@ -12600,7 +12608,7 @@ auto prefill_norm_sg_has_prework =
                                 "[XLAYER_THROTTLE_BREAKDOWN] "
                                 "pred_layer=%d pred_chunk=%d "
                                 "next_layer=%d next_chunk=%d "
-                                "total_ms=%.3f "
+                                "total_ms=%.3f reduce_ms=%.3f "
                                 "pc_ready_entry=%d "
                                 "return_ready_entry=%d "
                                 "pc_residual_ms=%.3f "
@@ -12616,7 +12624,8 @@ auto prefill_norm_sg_has_prework =
                                 next_pred_chunk,
                                 prefill_down_layer,
                                 prefill_down_chunk,
-                                throttle_breakdown.total_us / 1000.0,
+                                throttle_wait_us / 1000.0,
+                                throttle_reduce_wait_us / 1000.0,
                                 throttle_breakdown.pc_ready_at_entry ? 1 : 0,
                                 throttle_breakdown.return_ready_at_entry ? 1 : 0,
                                 throttle_breakdown.pc_residual_us / 1000.0,
@@ -14925,11 +14934,13 @@ auto prefill_norm_sg_has_prework =
             "[XLAYER_THROTTLE_SUM] samples=%" PRId64
             " pc_ready_entry=%" PRId64
             " return_ready_entry=%" PRId64
-            " pc_residual_ms=%.3f return_gate_ms=%.3f "
-            "return_rpc_ms=%.3f add_submit_ms=%.3f other_ms=%.3f\n",
+            " reduce_ms=%.3f pc_residual_ms=%.3f "
+            "return_gate_ms=%.3f return_rpc_ms=%.3f "
+            "add_submit_ms=%.3f other_ms=%.3f\n",
             phone_xlayer_v2_throttle_profile_count,
             phone_xlayer_v2_throttle_pc_ready_entry_count,
             phone_xlayer_v2_throttle_return_ready_entry_count,
+            phone_xlayer_v2_throttle_reduce_us / 1000.0,
             phone_xlayer_v2_throttle_pc_residual_us / 1000.0,
             phone_xlayer_v2_throttle_return_gate_us / 1000.0,
             phone_xlayer_v2_throttle_return_rpc_us / 1000.0,
