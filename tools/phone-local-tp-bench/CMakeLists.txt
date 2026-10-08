@@ -1,0 +1,5 @@
+set(TARGET llama-phone-local-tp-bench)
+add_executable(${TARGET} phone-local-tp-bench.cpp)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+target_link_libraries(${TARGET} PRIVATE ggml)
+target_include_directories(${TARGET} PRIVATE ../../ggml/include)
