@@ -5076,11 +5076,43 @@ struct llama_hybrid_sim_result {
     std::string schedule;
 };
 
+// Match the actual generalized Stage Queue constraints before using its
+// overlap model for a Tensor-free (GPU -> CPU -> PHONE) placement.
+// Without the runtime queue, those stages must retain their serial score.
+static bool llama_hybrid_tensor_free_stage_queue_eligible(
+        const llama_hybrid_profile & profile,
+        const llama_hybrid_plan &    plan,
+        int                          work_tokens) {
+    const char * queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
+    const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
+    if (!profile.is_moe ||
+        queue_env == nullptr || std::atoi(queue_env) == 0 ||
+        plan.tensor_layers != 0 || plan.tensor_phone_primary ||
+        plan.gpu_pc_layers <= 0 || plan.phone_layers <= 0 ||
+        cpu_layers < 0 || plan.gpu_chunk_tokens <= 0 ||
+        plan.phone_chunk_tokens <= 0 ||
+        work_tokens <= plan.gpu_chunk_tokens) {
+        return false;
+    }
+    if (cpu_layers == 0) {
+        return plan.gpu_chunk_tokens >= plan.phone_chunk_tokens;
+    }
+    if (plan.cpu_chunk_tokens <= 0) {
+        return false;
+    }
+    const int larger = std::max(plan.cpu_chunk_tokens, plan.phone_chunk_tokens);
+    const int smaller = std::min(plan.cpu_chunk_tokens, plan.phone_chunk_tokens);
+    return plan.gpu_chunk_tokens >= larger &&
+           plan.gpu_chunk_tokens % larger == 0 &&
+           larger % smaller == 0;
+}
+
 static std::vector<llama_hybrid_sim_stage> llama_hybrid_sim_stages(const llama_hybrid_plan & plan) {
     std::vector<llama_hybrid_sim_stage> stages;
     const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
 
-    if (plan.gpu_pc_layers <= 0 || plan.tensor_layers <= 0) {
+    if (plan.gpu_pc_layers <= 0 ||
+        (plan.tensor_layers <= 0 && plan.phone_layers <= 0)) {
         return stages;
     }
 
@@ -5090,7 +5122,9 @@ static std::vector<llama_hybrid_sim_stage> llama_hybrid_sim_stages(const llama_h
         upstream_macro = plan.cpu_chunk_tokens;
         stages.push_back({ llama_hybrid_sim_stage_kind::CPU, cpu_layers, upstream_macro });
     }
-    stages.push_back({ llama_hybrid_sim_stage_kind::TENSOR, plan.tensor_layers, upstream_macro });
+    if (plan.tensor_layers > 0) {
+        stages.push_back({ llama_hybrid_sim_stage_kind::TENSOR, plan.tensor_layers, upstream_macro });
+    }
     if (plan.phone_layers > 0) {
         stages.push_back({ llama_hybrid_sim_stage_kind::PHONE, plan.phone_layers, plan.phone_chunk_tokens });
     }
@@ -5639,6 +5673,8 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         candidate.predicted_phone_peak_bytes = 0;
 
         if (!candidate.tensor_phone_primary &&
+            (candidate.tensor_layers > 0 ||
+             llama_hybrid_tensor_free_stage_queue_eligible(profile, candidate, work_tokens)) &&
             !llama_hybrid_sim_stages(candidate).empty()) {
             llama_hybrid_sim_result sim;
             if (!llama_hybrid_simulate_prefill(
@@ -8619,6 +8655,10 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     size_t reject_pc              = 0;
     size_t reject_phone           = 0;
     size_t reject_gpu             = 0;
+    size_t tensor_free_feasible   = 0;
+    size_t tensor_feasible        = 0;
+    std::optional<llama_hybrid_plan> best_tensor_free;
+    std::optional<llama_hybrid_plan> best_tensor;
 
     for (auto plan : candidates) {
         if (!llama_hybrid_score_plan(profile, constraints, plan)) {
@@ -8646,6 +8686,16 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
         ++memory_feasible;
 
+        auto & family_best = plan.tensor_layers == 0 ? best_tensor_free : best_tensor;
+        if (plan.tensor_layers == 0) {
+            ++tensor_free_feasible;
+        } else {
+            ++tensor_feasible;
+        }
+        if (!family_best || plan.predicted_ms < family_best->predicted_ms) {
+            family_best = plan;
+        }
+
         if (!found || plan.predicted_ms < best_plan.predicted_ms ||
             (plan.predicted_ms == best_plan.predicted_ms && plan.gpu_memory < best_plan.gpu_memory)) {
             best_plan = plan;
@@ -8658,6 +8708,32 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         "reject_pc=%zu reject_phone=%zu reject_gpu=%zu pc_budget=%zu phone_budget=%zu gpu_budget=%zu\n",
         scored, memory_feasible, memory_estimate_failed, reject_pc, reject_phone, reject_gpu,
         pc_budget, phone_budget, gpu_budget);
+
+    const auto print_family_best = [&](const char * family,
+                                       size_t feasible,
+                                       const std::optional<llama_hybrid_plan> & candidate) {
+        if (!candidate) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PLAN_FAMILY] family=%s feasible=%zu score_tokens=%d selected=none\n",
+                family, feasible, constraints.target_ubatch_tokens);
+            return;
+        }
+        const auto & p = *candidate;
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PLAN_FAMILY] family=%s feasible=%zu score_tokens=%d "
+            "T=%d primary=%s P=%d C=%d G=%d R=%.3f "
+            "XG=%d XC=%d XT=%d XP=%d predicted_ms=%.3f "
+            "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f\n",
+            family, feasible, constraints.target_ubatch_tokens,
+            p.tensor_layers, p.tensor_phone_primary ? "PHONE" : "PC",
+            p.phone_layers, p.pc_layers, p.gpu_pc_layers, p.tensor_pc_ratio,
+            p.gpu_chunk_tokens, p.cpu_chunk_tokens,
+            p.tensor_chunk_tokens, p.phone_chunk_tokens, p.predicted_ms,
+            p.predicted_gpu_busy_ms, p.predicted_downstream_ms,
+            p.predicted_gpu_wait_ms);
+    };
+    print_family_best("T0", tensor_free_feasible, best_tensor_free);
+    print_family_best("TENSOR", tensor_feasible, best_tensor);
 
     if (!found) {
         LLAMA_LOG_ERROR("%s: no scoreable hybrid plans\n", __func__);
