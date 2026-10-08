@@ -10300,7 +10300,7 @@ static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
 static bool ggml_backend_opencl_buffer_copy_tensor(
         ggml_backend_buffer_t dst_buffer, const ggml_tensor * src, ggml_tensor * dst) {
     const char * enabled = std::getenv("GGML_OPENCL_DIRECT_COPY");
-    if (enabled != nullptr && std::strcmp(enabled, "0") == 0) {
+    if (enabled != nullptr && strcmp(enabled, "0") == 0) {
         return false;
     }
     if (src == nullptr || dst == nullptr || src->buffer == nullptr ||
