@@ -296,7 +296,8 @@ struct Prefix {
 
  ggml_tensor* weight(File& f,int layer,const char *suffix) {
   auto weight=f.get(layer,suffix);
-  ggml_tensor *t=ggml_new_tensor(ctx,weight.t->type,weight.t->n_dims,weight.t->ne);
+  const int dims=weight.t->ne[3]>1?4:(weight.t->ne[2]>1?3:(weight.t->ne[1]>1?2:1));
+  ggml_tensor *t=ggml_new_tensor(ctx,weight.t->type,dims,weight.t->ne);
   ggml_set_name(t,weight.name.c_str());
   weights.emplace_back(weight,t);
   return t;
