@@ -7997,15 +7997,69 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
+                const bool throttle_profile =
+                    rpc_xlayer_throttle_profile_enabled();
+                const int64_t total_begin_us =
+                    throttle_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> input;
+                const int64_t recv_begin_us =
+                    throttle_profile ? ggml_time_us() : 0;
                 if (!recv_msg(sock, input)) {
                     return;
                 }
+                const int64_t recv_end_us =
+                    throttle_profile ? ggml_time_us() : 0;
+
+                uint64_t profile_seq = 0;
+                uint32_t profile_device = 0;
+                size_t profile_payload_bytes = 0;
+                if (throttle_profile &&
+                        input.size() >=
+                            sizeof(rpc_msg_set_tensor_async_return_wait_req)) {
+                    rpc_msg_set_tensor_async_return_wait_req
+                        profile_request {};
+                    memcpy(
+                        &profile_request,
+                        input.data(),
+                        sizeof(profile_request));
+                    profile_seq = profile_request.phone_ffn_seq;
+                    profile_device = profile_request.device;
+                    profile_payload_bytes =
+                        input.size() - sizeof(profile_request);
+                }
+
+                const int64_t handler_begin_us =
+                    throttle_profile ? ggml_time_us() : 0;
                 if (!server.set_tensor_async_return_wait(input)) {
                     return;
                 }
+                const int64_t handler_end_us =
+                    throttle_profile ? ggml_time_us() : 0;
+
+                const int64_t ack_begin_us =
+                    throttle_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
+                }
+                const int64_t ack_end_us =
+                    throttle_profile ? ggml_time_us() : 0;
+
+                if (throttle_profile) {
+                    std::fprintf(
+                        stderr,
+                        "[XLAYER_RETURN_SERVER] device=%u seq=%" PRIu64
+                        " bytes=%zu recv_msg_ms=%.3f "
+                        "handler_ms=%.3f ack_send_ms=%.3f "
+                        "server_total_ms=%.3f\n",
+                        profile_device,
+                        profile_seq,
+                        profile_payload_bytes,
+                        (recv_end_us - recv_begin_us) / 1000.0,
+                        (handler_end_us - handler_begin_us) / 1000.0,
+                        (ack_end_us - ack_begin_us) / 1000.0,
+                        (ack_end_us - total_begin_us) / 1000.0);
+                    std::fflush(stderr);
                 }
                 break;
             }
