@@ -469,7 +469,10 @@ static void full_copy_exact(const ggml_tensor *source, ggml_tensor *dest,
 }
 
 static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
-                               std::vector<float> &hidden) {
+                               std::vector<float> &hidden,
+                               const std::vector<int32_t> *forced_ids=nullptr,
+                               const std::vector<float> *forced_mix=nullptr) {
+ check((forced_ids==nullptr)==(forced_mix==nullptr),"fixed Router controls must provide both ids and weights");
  FullTimes t;
  const bool step_trace=std::getenv("PHONE_FULL_TRACE")!=nullptr;
  const auto trace=[&](const char *phase){
@@ -516,6 +519,25 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
  stage_sync(gpu,part.gpu_sync);
  t.stage=ms(phase);
  part.other=std::max(0.0,t.stage-part.accounted());
+ // Diagnostic-only control: feed baseline GPU-only Router decisions and
+ // mixture weights to both FFN shards. Preserve the normal Stage/compute path
+ // and all timed runs when forced_ids/forced_mix are absent.
+ if(forced_ids!=nullptr){
+  const auto set_fixed=[&](Graph &target){
+   check(ggml_nbytes(target.ids)==forced_ids->size()*sizeof(int32_t),
+         "fixed Router ID shape mismatch");
+   check(ggml_nbytes(target.mix)==forced_mix->size()*sizeof(float),
+         "fixed Router weight shape mismatch");
+   ggml_backend_tensor_set(target.ids,forced_ids->data(),0,ggml_nbytes(target.ids));
+   ggml_backend_tensor_set(target.mix,forced_mix->data(),0,ggml_nbytes(target.mix));
+  };
+  set_fixed(gb);
+  if(layer.cpu_ffn){
+   set_fixed(*layer.cpu_ffn);
+   ggml_backend_synchronize(layer.cpu_ffn->backend);
+  }
+  ggml_backend_synchronize(gpu);
+ }
  trace("ffn_stage_ok");
  trace("ffn_parallel_begin");
 
@@ -659,18 +681,29 @@ static std::vector<FullRound> full_measure(
 struct FullDiagnostics {
  std::vector<std::vector<float>> layer_output;
  std::vector<std::vector<int32_t>> router_ids;
+ std::vector<std::vector<float>> router_mix;
 };
 static FullDiagnostics full_capture_diagnostics(
  ggml_backend_t gpu,
  const std::vector<std::unique_ptr<FullLayer>> &layers,
- const std::vector<float> &initial, const char *mode) {
+ const std::vector<float> &initial, const char *mode,
+ const FullDiagnostics *fixed_router=nullptr) {
  FullDiagnostics d;
  d.layer_output.reserve(layers.size());
  d.router_ids.reserve(layers.size());
+ d.router_mix.reserve(layers.size());
+ if(fixed_router!=nullptr){
+  check(fixed_router->router_ids.size()==layers.size() &&
+        fixed_router->router_mix.size()==layers.size(),
+        "fixed Router baseline layer count mismatch");
+ }
  std::vector<float> hidden=initial;
  std::fprintf(stderr,"[PHONE_FULL_DIAG] mode=%s phase=begin layers=%zu\n",mode,layers.size());
- for(const auto &layer:layers){
-  (void)run_full_layer(*layer,gpu,hidden);
+ for(size_t i=0;i<layers.size();i++){
+  const auto &layer=layers[i];
+  const auto *ref_ids=fixed_router?&fixed_router->router_ids[i]:nullptr;
+  const auto *ref_mix=fixed_router?&fixed_router->router_mix[i]:nullptr;
+  (void)run_full_layer(*layer,gpu,hidden,ref_ids,ref_mix);
   d.layer_output.push_back(hidden);
   const ggml_tensor *ids=layer->pre->ids;
   check(ids->type==GGML_TYPE_I32,"Router IDs type mismatch during diagnostics");
@@ -678,6 +711,12 @@ static FullDiagnostics full_capture_diagnostics(
   std::vector<int32_t> values(count);
   ggml_backend_tensor_get(ids,values.data(),0,count*sizeof(int32_t));
   d.router_ids.push_back(std::move(values));
+  const ggml_tensor *mix=layer->pre->mix;
+  check(mix->type==GGML_TYPE_F32 && ggml_is_contiguous(mix),
+        "Router mixture weights not contiguous");
+  std::vector<float> weights(static_cast<size_t>(ggml_nelements(mix)));
+  ggml_backend_tensor_get(mix,weights.data(),0,weights.size()*sizeof(float));
+  d.router_mix.push_back(std::move(weights));
  }
  std::fprintf(stderr,"[PHONE_FULL_DIAG] mode=%s phase=end layers=%zu\n",mode,layers.size());
  return d;
