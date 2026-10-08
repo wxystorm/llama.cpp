@@ -83,3 +83,19 @@ Diagnostic workaround, **not comparable with the optimized Adreno baseline**:
 rebuild with `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` and retry the probe.
 If this changes the outcome, an Adreno-specific OpenCL kernel or compilation
 path may be involved. Restore the option to ON for performance measurements.
+
+## Quantized MoE OpenCL weight initialization
+
+OpenCL `GGML_OPENCL_SOA_Q` converts the complete quantized tensor to its
+device-side layout during `ggml_backend_tensor_set`. It is **not** safe to
+upload one expert at a time with nonzero tensor offsets: the OpenCL conversion
+can read `ggml_nbytes(tensor)` from the host pointer even if the requested
+upload is smaller. This previously caused a SIGSEGV after
+`[PHONE_LOCAL_BOOT] phase=weights_load_begin`.
+
+The benchmark now builds each shard tensor in a contiguous host AoS array
+for **all experts**, then uploads it with a single
+`ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor))` call.
+New `[PHONE_LOCAL_WEIGHT]` markers show assemble/upload boundaries and byte
+counts. This increases temporary host memory but does not increase the number
+of resident GPU layer weights.
