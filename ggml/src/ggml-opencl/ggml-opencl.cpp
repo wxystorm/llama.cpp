@@ -1136,7 +1136,7 @@ static cl_program build_program_from_source_ex(cl_context ctx, cl_device_id dev,
         }
         err = clBuildProgram(p, 0, NULL, compile_opts.c_str(), NULL, NULL);
         if (build_trace) {
-            std::fprintf(stderr, "[OPENCL_BUILD_TRACE] id=%u phase=clBuildProgram_end attempt=%d err=%d\\n", build_id, attempt + 1, err);
+            std::fprintf(stderr, "[OPENCL_BUILD_TRACE] id=%u phase=clBuildProgram_end attempt=%d err=%d\n", build_id, attempt + 1, err);
             std::fflush(stderr);
         }
         if (err == CL_SUCCESS) {
