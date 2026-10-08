@@ -32,10 +32,6 @@ static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
 }
 
-static bool rpc_xlayer_throttle_profile_enabled() {
-    return std::getenv("GGML_META_XLAYER_THROTTLE_PROFILE") != nullptr;
-}
-
 struct rpc_tensor_phone_graph_stage {
     const char * stage = "graph_compute";
     const char * mode = "unknown";
@@ -5055,15 +5051,6 @@ bool rpc_server::set_tensor_async_return_wait(
         return false;
     }
 
-    const bool stage_profile =
-        rpc_tensor_phone_stage_profile_enabled();
-    const bool throttle_profile =
-        rpc_xlayer_throttle_profile_enabled();
-    const bool measure_profile =
-        stage_profile || throttle_profile;
-    const int64_t handler_begin_us =
-        measure_profile ? ggml_time_us() : 0;
-
     rpc_msg_set_tensor_async_return_wait_req request {};
     memcpy(&request, input.data(), sizeof(request));
 
@@ -5072,8 +5059,7 @@ bool rpc_server::set_tensor_async_return_wait(
         return false;
     }
 
-    const int64_t wait_begin_us =
-        measure_profile ? ggml_time_us() : 0;
+    const int64_t wait_begin_us = ggml_time_us();
     {
         std::unique_lock<std::mutex> lock(phone_ffn_ready_mutex);
         phone_ffn_ready_cv.wait(
@@ -5094,13 +5080,8 @@ bool rpc_server::set_tensor_async_return_wait(
             phone_ffn_ready_seqs.erase(it);
         }
     }
-    const int64_t wait_end_us =
-        measure_profile ? ggml_time_us() : 0;
-    const int64_t wait_us =
-        measure_profile ? wait_end_us - wait_begin_us : 0;
+    const int64_t wait_us = ggml_time_us() - wait_begin_us;
 
-    const int64_t repack_begin_us =
-        measure_profile ? ggml_time_us() : 0;
     const size_t data_size = input.size() - sizeof(request);
     std::vector<uint8_t> legacy_input(
         sizeof(rpc_tensor) + sizeof(uint64_t) + data_size);
@@ -5123,60 +5104,18 @@ bool rpc_server::set_tensor_async_return_wait(
         cursor += data_size;
     }
     GGML_ASSERT(cursor == legacy_input.size());
-    const int64_t repack_end_us =
-        measure_profile ? ggml_time_us() : 0;
-    const int64_t repack_us =
-        measure_profile ? repack_end_us - repack_begin_us : 0;
 
-    const int64_t write_begin_us =
-        measure_profile ? ggml_time_us() : 0;
     const bool status = set_tensor_async_return(legacy_input);
-    const int64_t write_end_us =
-        measure_profile ? ggml_time_us() : 0;
-    const int64_t write_us =
-        measure_profile ? write_end_us - write_begin_us : 0;
-    const int64_t handler_us =
-        measure_profile ? write_end_us - handler_begin_us : 0;
-    const int64_t other_us =
-        measure_profile ?
-            std::max<int64_t>(
-                0,
-                handler_us - wait_us - repack_us - write_us) :
-            0;
 
-    if (throttle_profile) {
-        std::fprintf(
-            stderr,
-            "[XLAYER_RETURN_PHONE] device=%u seq=%" PRIu64
-            " bytes=%zu ffn_wait_ms=%.3f repack_ms=%.3f "
-            "write_ms=%.3f other_ms=%.3f handler_ms=%.3f "
-            "status=%d\n",
-            request.device,
-            request.phone_ffn_seq,
-            data_size,
-            wait_us / 1000.0,
-            repack_us / 1000.0,
-            write_us / 1000.0,
-            other_us / 1000.0,
-            handler_us / 1000.0,
-            status ? 1 : 0);
-        std::fflush(stderr);
-    }
-
-    if (stage_profile) {
+    if (rpc_tensor_phone_stage_profile_enabled()) {
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=return_chunk_join device=%u seq=%" PRIu64
-            " ffn_wait_ms=%.3f repack_ms=%.3f write_ms=%.3f "
-            "other_ms=%.3f handler_ms=%.3f bytes=%zu status=%d\n",
+            " ffn_wait_ms=%.3f bytes=%zu status=%d\n",
             request.device,
             request.phone_ffn_seq,
             wait_us / 1000.0,
-            repack_us / 1000.0,
-            write_us / 1000.0,
-            other_us / 1000.0,
-            handler_us / 1000.0,
             data_size,
             status ? 1 : 0);
         std::fflush(stderr);
@@ -5184,7 +5123,6 @@ bool rpc_server::set_tensor_async_return_wait(
 
     return status;
 }
-
 bool rpc_server::set_tensor_recompute_snapshot(const std::vector<uint8_t> & input) {
     if (input.size() < sizeof(rpc_msg_set_tensor_recompute_snapshot_req)) {
         return false;
@@ -7997,69 +7935,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
-                const bool throttle_profile =
-                    rpc_xlayer_throttle_profile_enabled();
-                const int64_t total_begin_us =
-                    throttle_profile ? ggml_time_us() : 0;
-
                 std::vector<uint8_t> input;
-                const int64_t recv_begin_us =
-                    throttle_profile ? ggml_time_us() : 0;
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                const int64_t recv_end_us =
-                    throttle_profile ? ggml_time_us() : 0;
-
-                uint64_t profile_seq = 0;
-                uint32_t profile_device = 0;
-                size_t profile_payload_bytes = 0;
-                if (throttle_profile &&
-                        input.size() >=
-                            sizeof(rpc_msg_set_tensor_async_return_wait_req)) {
-                    rpc_msg_set_tensor_async_return_wait_req
-                        profile_request {};
-                    memcpy(
-                        &profile_request,
-                        input.data(),
-                        sizeof(profile_request));
-                    profile_seq = profile_request.phone_ffn_seq;
-                    profile_device = profile_request.device;
-                    profile_payload_bytes =
-                        input.size() - sizeof(profile_request);
-                }
-
-                const int64_t handler_begin_us =
-                    throttle_profile ? ggml_time_us() : 0;
                 if (!server.set_tensor_async_return_wait(input)) {
                     return;
                 }
-                const int64_t handler_end_us =
-                    throttle_profile ? ggml_time_us() : 0;
-
-                const int64_t ack_begin_us =
-                    throttle_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
-                }
-                const int64_t ack_end_us =
-                    throttle_profile ? ggml_time_us() : 0;
-
-                if (throttle_profile) {
-                    std::fprintf(
-                        stderr,
-                        "[XLAYER_RETURN_SERVER] device=%u seq=%" PRIu64
-                        " bytes=%zu recv_msg_ms=%.3f "
-                        "handler_ms=%.3f ack_send_ms=%.3f "
-                        "server_total_ms=%.3f\n",
-                        profile_device,
-                        profile_seq,
-                        profile_payload_bytes,
-                        (recv_end_us - recv_begin_us) / 1000.0,
-                        (handler_end_us - handler_begin_us) / 1000.0,
-                        (ack_end_us - ack_begin_us) / 1000.0,
-                        (ack_end_us - total_begin_us) / 1000.0);
-                    std::fflush(stderr);
                 }
                 break;
             }
