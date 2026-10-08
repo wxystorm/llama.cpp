@@ -3462,8 +3462,21 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
+    const bool throttle_profile =
+        std::getenv("GGML_META_XLAYER_THROTTLE_PROFILE") != nullptr;
+    const bool measure_profile =
+        stage_profile || throttle_profile;
+
+    rpc_cmd_roundtrip_profile roundtrip_profile {};
+    rpc_cmd_roundtrip_profile * const previous_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (measure_profile) {
+        rpc_cmd_roundtrip_profile_active =
+            &roundtrip_profile;
+    }
+
     const int64_t begin_us =
-        stage_profile ? ggml_time_us() : 0;
+        measure_profile ? ggml_time_us() : 0;
 
     const bool status = send_rpc_cmd(
         sock,
@@ -3473,16 +3486,46 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         nullptr,
         0);
 
+    const int64_t end_us =
+        measure_profile ? ggml_time_us() : 0;
+    if (measure_profile) {
+        rpc_cmd_roundtrip_profile_active =
+            previous_profile;
+    }
+
+    if (throttle_profile) {
+        std::fprintf(
+            stderr,
+            "[XLAYER_RETURN_RPC] seq=%" PRIu64
+            " lane=%zu bytes=%zu request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
+            phone_ffn_seq,
+            return_lane,
+            data_size,
+            roundtrip_profile.request_send_us / 1000.0,
+            roundtrip_profile.response_header_wait_us / 1000.0,
+            roundtrip_profile.response_body_wait_us / 1000.0,
+            (end_us - begin_us) / 1000.0,
+            status ? 1 : 0);
+        std::fflush(stderr);
+    }
+
     if (stage_profile) {
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=return_chunk_join seq=%" PRIu64
-            " lane=%zu bytes=%zu total_ms=%.3f status=%d\n",
+            " lane=%zu bytes=%zu request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
-            (ggml_time_us() - begin_us) / 1000.0,
+            roundtrip_profile.request_send_us / 1000.0,
+            roundtrip_profile.response_header_wait_us / 1000.0,
+            roundtrip_profile.response_body_wait_us / 1000.0,
+            (end_us - begin_us) / 1000.0,
             status ? 1 : 0);
         std::fflush(stderr);
     }
