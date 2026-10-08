@@ -416,8 +416,17 @@ struct FullLayer {
  std::unique_ptr<Graph> gpu_ffn;
  std::unique_ptr<Graph> cpu_ffn;
 };
+struct StageBreakdown {
+ double gpu_norm=0,gpu_ids=0,gpu_mix=0;
+ double cpu_norm=0,cpu_ids=0,cpu_mix=0;
+ double cpu_sync=0,gpu_sync=0,other=0;
+ double accounted() const {
+  return gpu_norm+gpu_ids+gpu_mix+cpu_norm+cpu_ids+cpu_mix+cpu_sync+gpu_sync;
+ }
+};
 struct FullTimes {
  double attention_router=0,stage=0,gpu_ffn=0,cpu_ffn=0,join=0,total=0;
+ StageBreakdown stage_parts;
 };
 struct FullRound {
  double wall=0;
@@ -482,18 +491,31 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
 
  phase=clk::now();
  trace("ffn_stage_begin");
- full_copy_exact(pre.ffn_norm,gb.x,layer.il,"GPU/ffn_norm");
- full_copy_exact(pre.ids,gb.ids,layer.il,"GPU/expert_ids");
- full_copy_exact(pre.mix,gb.mix,layer.il,"GPU/expert_weights");
+ const auto stage_copy=[&](const ggml_tensor *src,ggml_tensor *dst,
+                           const char *name,double &elapsed){
+  const auto start=clk::now();
+  full_copy_exact(src,dst,layer.il,name);
+  elapsed=ms(start);
+ };
+ const auto stage_sync=[&](ggml_backend_t backend,double &elapsed){
+  const auto start=clk::now();
+  ggml_backend_synchronize(backend);
+  elapsed=ms(start);
+ };
+ auto &part=t.stage_parts;
+ stage_copy(pre.ffn_norm,gb.x,"GPU/ffn_norm",part.gpu_norm);
+ stage_copy(pre.ids,gb.ids,"GPU/expert_ids",part.gpu_ids);
+ stage_copy(pre.mix,gb.mix,"GPU/expert_weights",part.gpu_mix);
  if(layer.cpu_ffn){
   auto &cb=*layer.cpu_ffn;
-  full_copy_exact(pre.ffn_norm,cb.x,layer.il,"CPU/ffn_norm");
-  full_copy_exact(pre.ids,cb.ids,layer.il,"CPU/expert_ids");
-  full_copy_exact(pre.mix,cb.mix,layer.il,"CPU/expert_weights");
-  ggml_backend_synchronize(cb.backend);
+  stage_copy(pre.ffn_norm,cb.x,"CPU/ffn_norm",part.cpu_norm);
+  stage_copy(pre.ids,cb.ids,"CPU/expert_ids",part.cpu_ids);
+  stage_copy(pre.mix,cb.mix,"CPU/expert_weights",part.cpu_mix);
+  stage_sync(cb.backend,part.cpu_sync);
  }
- ggml_backend_synchronize(gpu);
+ stage_sync(gpu,part.gpu_sync);
  t.stage=ms(phase);
+ part.other=std::max(0.0,t.stage-part.accounted());
  trace("ffn_stage_ok");
  trace("ffn_parallel_begin");
 
@@ -552,6 +574,11 @@ static std::vector<std::unique_ptr<FullLayer>> full_build_layers(
   if(cpu_width>0){
    lr->cpu_ffn=build(f,il,cpu,gpu_width,cpu_width,o.tokens,o.topk);
   }
+  std::fprintf(stderr,
+   "[PHONE_FULL_STAGE_BYTES] mode=%s layer=%d norm_bytes=%zu ids_bytes=%zu mix_bytes=%zu copies_gpu=3 copies_cpu=%d\n",
+   mixed?"CPU_GPU":"GPU_ONLY",il,
+   ggml_nbytes(lr->pre->ffn_norm),ggml_nbytes(lr->pre->ids),
+   ggml_nbytes(lr->pre->mix),mixed?3:0);
   layers.push_back(std::move(lr));
  }
  return layers;
