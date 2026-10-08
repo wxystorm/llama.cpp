@@ -158,3 +158,18 @@ GPU allocations are released between GPU-only and CPU+GPU phases.
 Start with 1-2 layers to keep phone peak memory usage manageable.
 Mode order is currently GPU-only then mixed; later measurements should
 alternate or randomize order to control DVFS and thermal drift.
+
+
+Optional step-by-step debug for the first one-layer smoke test:
+
+    PHONE_FULL_TRACE=1 LD_LIBRARY_PATH=/vendor/lib64 \
+      ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 1 --tokens 400 \
+      --topk 8 --cpu-ratio 0.25 --threads 8 --warmup 0 --runs 1 \
+      2>&1 | tee phone-full-step.log
+
+Trace phases: attention_router_begin/ok, ffn_stage_begin/ok,
+ffn_parallel_begin/ok, join_begin/ok. No effect when PHONE_FULL_TRACE
+is unset. This allows isolating an OpenCL/CPU failure without verbose
+kernel-level logging.
