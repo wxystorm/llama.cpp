@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -24,9 +25,9 @@ using clk = std::chrono::steady_clock;
 static double ms(clk::time_point t) { return std::chrono::duration<double,std::milli>(clk::now()-t).count(); }
 static void check(bool x,const std::string & msg) { if(!x) throw std::runtime_error(msg); }
 static double med(std::vector<double> x){std::sort(x.begin(),x.end());return x[x.size()/2];}
-struct Opt {std::string model;int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_opencl=false;};
+struct Opt {std::string model;int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_opencl=false;bool full_layer=false;};
 static Opt options(int argc,char **argv) {
- Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_opencl=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
+ Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_opencl=true;continue;}if(a=="--full-layer"){o.full_layer=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
  if(a=="-m")o.model=v;else if(a=="--layer")o.layer=std::stoi(v);else if(a=="--layers")o.layers=std::stoi(v);
  else if(a=="--tokens")o.tokens=std::stoi(v);else if(a=="--topk")o.topk=std::stoi(v);
  else if(a=="--threads")o.threads=std::stoi(v);else if(a=="--runs")o.runs=std::stoi(v);
@@ -214,4 +215,394 @@ static int run(const Opt&o){
  }
  ggml_backend_free(cpu);ggml_backend_free(gpu);return 0;
 }
-int main(int argc,char **argv){try{return run(options(argc,argv));}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
+
+
+// Full Qwen3-MoE layer experiment: GPU Attention + Router; GPU/CPU MoE FFN.
+// This mode is independent of the legacy FFN-only microbenchmark above.
+// It uses real model weights, deterministic hidden states, causal attention
+// over the entire prefix, and propagates the layer output into the next layer.
+// No tokenizer, layer pipeline, KV cache reuse, flash attention, or PC RPC.
+
+static float metadata_f32(File & f, const std::string & name, float fallback) {
+ const int64_t key=gguf_find_key(f.uf,name.c_str());
+ if(key<0) return fallback;
+ const gguf_type t=gguf_get_kv_type(f.uf,key);
+ if(t==GGUF_TYPE_FLOAT32) return gguf_get_val_f32(f.uf,key);
+ if(t==GGUF_TYPE_FLOAT64) return static_cast<float>(gguf_get_val_f64(f.uf,key));
+ throw std::runtime_error("unexpected GGUF numeric type: "+name);
+}
+static int64_t metadata_i64(File & f, const std::string & name, int64_t fallback) {
+ const int64_t key=gguf_find_key(f.uf,name.c_str());
+ if(key<0) return fallback;
+ const gguf_type t=gguf_get_kv_type(f.uf,key);
+ if(t==GGUF_TYPE_UINT32) return gguf_get_val_u32(f.uf,key);
+ if(t==GGUF_TYPE_UINT64) return static_cast<int64_t>(gguf_get_val_u64(f.uf,key));
+ if(t==GGUF_TYPE_INT32) return gguf_get_val_i32(f.uf,key);
+ if(t==GGUF_TYPE_INT64) return gguf_get_val_i64(f.uf,key);
+ throw std::runtime_error("unexpected GGUF integer type: "+name);
+}
+
+struct LayerGeometry {
+ int64_t embd=0,head_dim=0,heads=0,kv_heads=0,experts=0,ff=0;
+ float rms_eps=1.0e-6f,rope_base=1000000.0f,rope_scale=1.0f;
+ int context=40960;
+};
+static LayerGeometry layer_geometry(File & f,int layer,int topk) {
+ const int64_t arch_key=gguf_find_key(f.uf,"general.architecture");
+ check(arch_key>=0 && std::string(gguf_get_val_str(f.uf,arch_key))=="qwen3moe",
+       "--full-layer currently supports GGUF architecture qwen3moe only");
+ LayerGeometry g;
+ auto norm=f.get(layer,"attn_norm"),qn=f.get(layer,"attn_q_norm");
+ auto q=f.get(layer,"attn_q"),k=f.get(layer,"attn_k"),v=f.get(layer,"attn_v");
+ auto wo=f.get(layer,"attn_output"),gate=f.get(layer,"ffn_gate_exps");
+ g.embd=norm.t->ne[0];
+ g.head_dim=qn.t->ne[0];
+ check(g.head_dim>0 && q.t->ne[1]%g.head_dim==0 &&
+       k.t->ne[1]%g.head_dim==0 && v.t->ne[1]==k.t->ne[1],
+       "Qwen3 Q/K/V attention geometry mismatch");
+ g.heads=q.t->ne[1]/g.head_dim;
+ g.kv_heads=k.t->ne[1]/g.head_dim;
+ g.experts=gate.t->ne[2];
+ g.ff=gate.t->ne[1];
+ check(g.embd>0 && g.heads>0 && g.kv_heads>0 && g.heads%g.kv_heads==0 &&
+       g.ff>0 && g.experts>=topk && g.head_dim%2==0,
+       "invalid Qwen3-MoE layer parameters");
+ check(q.t->ne[0]==g.embd && k.t->ne[0]==g.embd &&
+       v.t->ne[0]==g.embd && wo.t->ne[0]==g.heads*g.head_dim &&
+       wo.t->ne[1]==g.embd, "attention weight sizes mismatch");
+ g.rms_eps=metadata_f32(f,"qwen3moe.attention.layer_norm_rms_epsilon",1.0e-6f);
+ g.rope_base=metadata_f32(f,"qwen3moe.rope.freq_base",1000000.0f);
+ float scaling=metadata_f32(f,"qwen3moe.rope.scaling.factor",1.0f);
+ check(scaling>0,"invalid rope scaling");
+ g.rope_scale=1.0f/scaling;
+ g.context=static_cast<int>(metadata_i64(f,"qwen3moe.context_length",40960));
+ const int64_t used=metadata_i64(f,"qwen3moe.expert_used_count",topk);
+ check(used==topk,"--topk must equal GGUF expert_used_count for full-layer correctness");
+ return g;
+}
+
+struct Prefix {
+ ggml_context * ctx=nullptr;
+ ggml_backend_buffer_t buffer=nullptr;
+ ggml_cgraph * graph=nullptr;
+ ggml_backend_t backend=nullptr;
+ ggml_tensor * input=nullptr,*positions=nullptr,*mask=nullptr;
+ ggml_tensor * residual=nullptr,*ffn_norm=nullptr,*ids=nullptr,*mix=nullptr;
+ std::vector<std::pair<File::Weight,ggml_tensor*>> weights;
+ ~Prefix(){if(buffer)ggml_backend_buffer_free(buffer);if(ctx)ggml_free(ctx);}
+ Prefix(const Prefix&)=delete;
+ Prefix& operator=(const Prefix&)=delete;
+ Prefix()=default;
+
+ ggml_tensor* weight(File& f,int layer,const char *suffix) {
+  auto weight=f.get(layer,suffix);
+  ggml_tensor *t=ggml_new_tensor(ctx,weight.t->type,weight.t->n_dims,weight.t->ne);
+  ggml_set_name(t,weight.name.c_str());
+  weights.emplace_back(weight,t);
+  return t;
+ }
+};
+static void prefix_upload_weight(File & f,const File::Weight &w,ggml_tensor*dst) {
+ const size_t bytes=ggml_nbytes(dst);
+ check(bytes==gguf_get_tensor_size(f.uf,w.id),"prefix weight size mismatch: "+w.name);
+ std::vector<uint8_t> raw(bytes);
+ f.read(f.data+gguf_get_tensor_offset(f.uf,w.id),raw.data(),bytes);
+ // Quantized OpenCL SoA conversion must receive a complete contiguous tensor.
+ ggml_backend_tensor_set(dst,raw.data(),0,bytes);
+}
+static std::unique_ptr<Prefix> make_prefix(
+ File& f,int layer,ggml_backend_t gpu,int tokens,int topk,const LayerGeometry &g) {
+ auto p=std::make_unique<Prefix>();p->backend=gpu;
+ constexpr size_t graph_capacity=512;
+ ggml_init_params params={1536*ggml_tensor_overhead()+
+                          ggml_graph_overhead_custom(graph_capacity,false),
+                          nullptr,true};
+ p->ctx=ggml_init(params);
+ check(p->ctx!=nullptr,"full-layer GGML graph context failed");
+ ggml_context *c=p->ctx;
+ p->input=ggml_new_tensor_2d(c,GGML_TYPE_F32,g.embd,tokens);
+ p->positions=ggml_new_tensor_1d(c,GGML_TYPE_I32,tokens);
+ p->mask=ggml_new_tensor_2d(c,GGML_TYPE_F32,tokens,tokens);
+ ggml_set_name(p->input,"phone_local_layer_input");
+ ggml_set_name(p->positions,"phone_local_positions");
+ ggml_set_name(p->mask,"phone_local_causal_mask");
+ auto norm_a=p->weight(f,layer,"attn_norm");
+ auto wq=p->weight(f,layer,"attn_q");
+ auto wk=p->weight(f,layer,"attn_k");
+ auto wv=p->weight(f,layer,"attn_v");
+ auto wo=p->weight(f,layer,"attn_output");
+ auto nq=p->weight(f,layer,"attn_q_norm");
+ auto nk=p->weight(f,layer,"attn_k_norm");
+ auto norm_f=p->weight(f,layer,"ffn_norm");
+ auto router=p->weight(f,layer,"ffn_gate_inp");
+
+ // Original Qwen3-MoE order: RMS Norm -> QKV -> headwise Q/K RMS Norm
+ // -> NeoX RoPE -> causal GQA Attention -> attention output + residual.
+ ggml_tensor *n=ggml_mul(c,ggml_rms_norm(c,p->input,g.rms_eps),norm_a);
+ ggml_tensor *q=ggml_mul_mat(c,wq,n);
+ ggml_tensor *k=ggml_mul_mat(c,wk,n);
+ ggml_tensor *v=ggml_mul_mat(c,wv,n);
+ q=ggml_reshape_3d(c,q,g.head_dim,g.heads,tokens);
+ k=ggml_reshape_3d(c,k,g.head_dim,g.kv_heads,tokens);
+ v=ggml_reshape_3d(c,v,g.head_dim,g.kv_heads,tokens);
+ q=ggml_mul(c,ggml_rms_norm(c,q,g.rms_eps),nq);
+ k=ggml_mul(c,ggml_rms_norm(c,k,g.rms_eps),nk);
+ q=ggml_rope_ext(c,q,p->positions,nullptr,g.head_dim,
+                 GGML_ROPE_TYPE_NEOX,g.context,g.rope_base,g.rope_scale,
+                 0.0f,1.0f,32.0f,1.0f);
+ k=ggml_rope_ext(c,k,p->positions,nullptr,g.head_dim,
+                 GGML_ROPE_TYPE_NEOX,g.context,g.rope_base,g.rope_scale,
+                 0.0f,1.0f,32.0f,1.0f);
+ q=ggml_permute(c,q,0,2,1,3); // [head_dim,tokens,heads]
+ k=ggml_permute(c,k,0,2,1,3); // [head_dim,tokens,kv_heads]
+ v=ggml_permute(c,v,0,2,1,3);
+ ggml_tensor *kq=ggml_mul_mat(c,k,q); // [keys,queries,heads]
+ ggml_mul_mat_set_prec(kq,GGML_PREC_F32);
+ kq=ggml_soft_max_ext(c,kq,p->mask,1.0f/std::sqrt(float(g.head_dim)),0.0f);
+ v=ggml_cont(c,ggml_transpose(c,v));
+ ggml_tensor *av=ggml_mul_mat(c,v,kq);
+ av=ggml_permute(c,av,0,2,1,3);
+ av=ggml_cont_2d(c,av,g.head_dim*g.heads,tokens);
+ ggml_tensor *attn_out=ggml_mul_mat(c,wo,av);
+ p->residual=ggml_add(c,p->input,attn_out);
+
+ // GPU executes the full real Router: Softmax -> TopK -> normalized
+ // expert weights. Both FFN shards subsequently consume exactly these IDs.
+ p->ffn_norm=ggml_mul(c,ggml_rms_norm(c,p->residual,g.rms_eps),norm_f);
+ ggml_tensor *router_logits=ggml_mul_mat(c,router,p->ffn_norm);
+ ggml_tensor *probs=ggml_soft_max(c,router_logits);
+ p->ids=ggml_argsort_top_k(c,probs,topk);
+ ggml_tensor *probs_3d=ggml_reshape_3d(c,probs,1,g.experts,tokens);
+ ggml_tensor *chosen=ggml_get_rows(c,probs_3d,p->ids);
+ chosen=ggml_reshape_2d(c,chosen,topk,tokens);
+ ggml_tensor *weight_sum=ggml_clamp(c,ggml_sum_rows(c,chosen),6.103515625e-5f,INFINITY);
+ p->mix=ggml_reshape_3d(c,ggml_div(c,chosen,weight_sum),1,topk,tokens);
+
+ p->graph=ggml_new_graph_custom(c,graph_capacity,false);
+ ggml_build_forward_expand(p->graph,p->residual);
+ ggml_build_forward_expand(p->graph,p->ffn_norm);
+ ggml_build_forward_expand(p->graph,p->ids);
+ ggml_build_forward_expand(p->graph,p->mix);
+ for(int i=0;i<ggml_graph_n_nodes(p->graph);++i){
+  auto *node=ggml_graph_node(p->graph,i);
+  check(ggml_backend_supports_op(gpu,node),
+        std::string("OpenCL cannot execute full-layer op: ")+ggml_op_name(node->op));
+ }
+ std::fprintf(stderr,"[PHONE_LAYER_BOOT] layer=%d phase=gpu_attn_router_alloc_begin\n",layer);
+ p->buffer=ggml_backend_alloc_ctx_tensors(c,gpu);
+ check(p->buffer!=nullptr,"GPU attention/router buffer allocation failed");
+ std::fprintf(stderr,"[PHONE_LAYER_BOOT] layer=%d phase=gpu_attn_router_weights_begin\n",layer);
+ for(const auto &w:p->weights)prefix_upload_weight(f,w.first,w.second);
+ std::vector<int32_t> pos(tokens);
+ for(int t=0;t<tokens;t++)pos[t]=t;
+ ggml_backend_tensor_set(p->positions,pos.data(),0,pos.size()*sizeof(int32_t));
+ std::vector<float> mask(static_cast<size_t>(tokens)*tokens);
+ for(int qpos=0;qpos<tokens;qpos++)
+  for(int kpos=0;kpos<tokens;kpos++)
+   mask[static_cast<size_t>(qpos)*tokens+kpos]=kpos<=qpos?0.0f:-INFINITY;
+ ggml_backend_tensor_set(p->mask,mask.data(),0,mask.size()*sizeof(float));
+ ggml_backend_synchronize(gpu);
+ std::fprintf(stderr,"[PHONE_LAYER_BOOT] layer=%d phase=gpu_attn_router_ready\n",layer);
+ return p;
+}
+
+struct FullLayer {
+ int il=-1;
+ std::unique_ptr<Prefix> pre;
+ std::unique_ptr<Graph> gpu_ffn;
+ std::unique_ptr<Graph> cpu_ffn;
+};
+struct FullTimes {
+ double attention_router=0,stage=0,gpu_ffn=0,cpu_ffn=0,join=0,total=0;
+};
+struct FullRound {
+ double wall=0;
+ std::vector<FullTimes> layers;
+ std::vector<float> output;
+};
+
+static std::vector<float> full_initial(int64_t embd,int tokens) {
+ std::vector<float> data(static_cast<size_t>(embd)*tokens);
+ for(size_t i=0;i<data.size();++i)
+  data[i]=0.02f*std::sin(float(i%8191)*0.037f);
+ return data;
+}
+
+static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
+                               std::vector<float> &hidden) {
+ FullTimes t;
+ const auto begin=clk::now();
+ auto &pre=*layer.pre;
+ auto &gb=*layer.gpu_ffn;
+ check(hidden.size()*sizeof(float)==ggml_nbytes(pre.input),"hidden state shape mismatch");
+
+ auto phase=clk::now();
+ ggml_backend_tensor_set(pre.input,hidden.data(),0,hidden.size()*sizeof(float));
+ check(ggml_backend_graph_compute(gpu,pre.graph)==GGML_STATUS_SUCCESS,
+       "GPU attention/router graph failed");
+ ggml_backend_synchronize(gpu);
+ t.attention_router=ms(phase);
+
+ phase=clk::now();
+ ggml_backend_tensor_copy(pre.ffn_norm,gb.x);
+ ggml_backend_tensor_copy(pre.ids,gb.ids);
+ ggml_backend_tensor_copy(pre.mix,gb.mix);
+ if(layer.cpu_ffn){
+  auto &cb=*layer.cpu_ffn;
+  ggml_backend_tensor_copy(pre.ffn_norm,cb.x);
+  ggml_backend_tensor_copy(pre.ids,cb.ids);
+  ggml_backend_tensor_copy(pre.mix,cb.mix);
+  ggml_backend_synchronize(cb.backend);
+ }
+ ggml_backend_synchronize(gpu);
+ t.stage=ms(phase);
+
+ if(layer.cpu_ffn){
+  auto &cb=*layer.cpu_ffn;
+  std::exception_ptr error;
+  std::thread worker([&]{try{t.cpu_ffn=compute(cb);}catch(...){error=std::current_exception();}});
+  try{t.gpu_ffn=compute(gb);}catch(...){worker.join();throw;}
+  worker.join();
+  if(error)std::rethrow_exception(error);
+ }else{
+  t.gpu_ffn=compute(gb);
+ }
+ phase=clk::now();
+ auto gpu_partial=output(gb);
+ if(layer.cpu_ffn){
+  auto cpu_partial=output(*layer.cpu_ffn);
+  check(cpu_partial.size()==gpu_partial.size(),"FFN partial shapes differ");
+  for(size_t i=0;i<gpu_partial.size();i++)gpu_partial[i]+=cpu_partial[i];
+ }
+ std::vector<float> residual(hidden.size());
+ ggml_backend_tensor_get(pre.residual,residual.data(),0,residual.size()*sizeof(float));
+ check(residual.size()==gpu_partial.size(),"FFN/residual shape mismatch");
+ for(size_t i=0;i<residual.size();i++)residual[i]+=gpu_partial[i];
+ hidden.swap(residual);
+ t.join=ms(phase);
+ t.total=ms(begin);
+ return t;
+}
+static std::vector<std::unique_ptr<FullLayer>> full_build_layers(
+ File&f,const Opt&o,ggml_backend_t gpu,ggml_backend_t cpu,bool mixed) {
+ std::vector<std::unique_ptr<FullLayer>> layers;
+ for(int il=o.layer;il<o.layer+o.layers;il++){
+  const LayerGeometry g=layer_geometry(f,il,o.topk);
+  const int64_t alignment=std::lcm<int64_t>(128,ggml_blck_size(f.get(il,"ffn_down_exps").t->type));
+  check(g.ff%alignment==0,"FFN width not aligned for quantized tensor split");
+  const int64_t blocks=g.ff/alignment;
+  int64_t cb=0;
+  if(mixed){
+   cb=std::llround(blocks*o.cpu_ratio);
+   cb=std::min<int64_t>(blocks-1,std::max<int64_t>(1,cb));
+  }
+  const int64_t cpu_width=cb*alignment;
+  const int64_t gpu_width=g.ff-cpu_width;
+  std::fprintf(stderr,
+   "[PHONE_LAYER_LAYOUT] layer=%d mode=%s n_embd=%lld heads=%lld kv_heads=%lld head_dim=%lld ffn=%lld cpu_ffn=%lld gpu_ffn=%lld actual_cpu_ratio=%.3f\n",
+   il,mixed?"CPU_GPU":"GPU_ONLY",(long long)g.embd,(long long)g.heads,
+   (long long)g.kv_heads,(long long)g.head_dim,(long long)g.ff,
+   (long long)cpu_width,(long long)gpu_width,double(cpu_width)/g.ff);
+  auto lr=std::make_unique<FullLayer>();lr->il=il;
+  lr->pre=make_prefix(f,il,gpu,o.tokens,o.topk,g);
+  lr->gpu_ffn=build(f,il,gpu,0,gpu_width,o.tokens,o.topk);
+  if(cpu_width>0){
+   lr->cpu_ffn=build(f,il,cpu,gpu_width,cpu_width,o.tokens,o.topk);
+  }
+  layers.push_back(std::move(lr));
+ }
+ return layers;
+}
+static std::vector<FullRound> full_measure(
+ const Opt&o,ggml_backend_t gpu,const std::vector<std::unique_ptr<FullLayer>>&layers,
+ const std::vector<float> &initial,const char *mode) {
+ std::vector<FullRound> measured;
+ for(int rep=-o.warmup;rep<o.runs;rep++){
+  FullRound round;
+  round.layers.reserve(layers.size());
+  std::vector<float> hidden=initial;
+  const auto begin=clk::now();
+  for(const auto &layer:layers){
+   auto t=run_full_layer(*layer,gpu,hidden);
+   round.layers.push_back(t);
+   if(rep>=0){
+    std::cout<<"[PHONE_FULL_LAYER] mode="<<mode<<" layer="<<layer->il
+      <<" rep="<<rep<<" attn_router_ms="<<t.attention_router
+      <<" stage_ms="<<t.stage<<" gpu_ffn_ms="<<t.gpu_ffn
+      <<" cpu_ffn_ms="<<t.cpu_ffn<<" join_ms="<<t.join
+      <<" total_ms="<<t.total<<"\n";
+   }
+  }
+  round.wall=ms(begin);
+  round.output.swap(hidden);
+  if(rep>=0){
+   std::cout<<"[PHONE_FULL_RUN] mode="<<mode<<" rep="<<rep
+            <<" layers="<<layers.size()<<" total_ms="<<round.wall<<"\n";
+   measured.push_back(std::move(round));
+  }
+ }
+ return measured;
+}
+static int run_full(const Opt&o) {
+ check(o.cpu_ratio>0,"--full-layer requires --cpu-ratio > 0 for a comparison");
+ ggml_backend_load_all();
+ auto gpu=ggml_backend_dev_init(device(true),nullptr);
+ auto cpu=ggml_backend_dev_init(device(false),nullptr);
+ check(gpu&&cpu,"GPU/CPU backend init failed");
+ threads(cpu,o.threads);
+ std::cout<<std::fixed<<std::setprecision(3);
+ std::fprintf(stderr,
+  "[PHONE_FULL_CONFIG] first_layer=%d layers=%d tokens=%d topk=%d cpu_ratio_request=%.4f threads=%d warmup=%d runs=%d attn=causal_nonflash router=real_gguf_weights input=synthetic\n",
+  o.layer,o.layers,o.tokens,o.topk,o.cpu_ratio,o.threads,o.warmup,o.runs);
+ int status=0;
+ {
+  File f(o.model);
+  const auto geom=layer_geometry(f,o.layer,o.topk);
+  auto initial=full_initial(geom.embd,o.tokens);
+  std::vector<FullRound> baseline,split;
+  std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=gpu_only_build_begin\n");
+  {
+   auto all=full_build_layers(f,o,gpu,cpu,false);
+   std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=gpu_only_build_ok\n");
+   baseline=full_measure(o,gpu,all,initial,"GPU_ONLY");
+  }
+  std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=mixed_build_begin\n");
+  {
+   auto all=full_build_layers(f,o,gpu,cpu,true);
+   std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=mixed_build_ok\n");
+   split=full_measure(o,gpu,all,initial,"CPU_GPU");
+  }
+  std::vector<double> a,b;
+  for(const auto &v:baseline)a.push_back(v.wall);
+  for(const auto &v:split)b.push_back(v.wall);
+  const double base_ms=med(a),mixed_ms=med(b);
+  const auto &reference=baseline.back().output;
+  const auto &got=split.back().output;
+  check(reference.size()==got.size(),"full-layer comparison output length mismatch");
+  double error=0,norm=0,max_abs=0;
+  for(size_t i=0;i<reference.size();i++){
+   check(std::isfinite(reference[i])&&std::isfinite(got[i]),
+         "non-finite full-layer hidden state");
+   const double diff=double(reference[i])-got[i];
+   error+=diff*diff;
+   norm+=double(reference[i])*reference[i];
+   max_abs=std::max(max_abs,std::abs(diff));
+  }
+  const double rel=std::sqrt(error/std::max(norm,1.0e-24));
+  const bool good=rel<0.03;
+  std::cout<<"[PHONE_FULL_CHECK] rel_l2="<<rel<<" max_abs="<<max_abs
+           <<" status="<<(good?"OK":"CHECK")<<"\n";
+  std::cout<<"[PHONE_FULL_SUM] gpu_only_median_ms="<<base_ms
+           <<" mixed_median_ms="<<mixed_ms
+           <<" speedup="<<base_ms/mixed_ms
+           <<" layers="<<o.layers<<" tokens="<<o.tokens<<"\n";
+  // A failed numerical check invalidates the timing comparison.
+  if(!good)status=2;
+ }
+ ggml_backend_free(cpu);
+ ggml_backend_free(gpu);
+ return status;
+}
+
+int main(int argc,char **argv){try{const Opt o=options(argc,argv);return o.full_layer?run_full(o):run(o);}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
+
