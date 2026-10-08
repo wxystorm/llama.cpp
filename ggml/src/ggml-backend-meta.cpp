@@ -4161,6 +4161,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
     const bool xlayer_wave_trace =
         std::getenv("GGML_META_XLAYER_WAVE_TRACE") != nullptr;
+    const bool xlayer_throttle_profile =
+        std::getenv("GGML_META_XLAYER_THROTTLE_PROFILE") != nullptr;
     const char * phone_primary_xlayer_ffn_ahead_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_XLAYER_FFN_AHEAD");
     const bool phone_primary_xlayer_ffn_ahead =
@@ -4445,6 +4447,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_lane1_return_gates
     };
 
+    struct phone_prefill_return_timing {
+        int64_t pc_done_us = 0;
+        int64_t pc_route_wait_us = 0;
+        int64_t pc_gate_wait_us = 0;
+        int64_t pc_stage_copy_us = 0;
+        int64_t pc_compute_us = 0;
+        int64_t pc_return_stage_us = 0;
+        int64_t return_worker_pc_wait_us = 0;
+        int64_t return_lane_gate_wait_us = 0;
+        int64_t return_critical_gate_wait_us = 0;
+        int64_t return_send_begin_us = 0;
+        int64_t return_send_end_us = 0;
+        int64_t add_submit_begin_us = 0;
+        int64_t add_submit_end_us = 0;
+    };
+
     struct phone_prefill_pc_branch {
         int layer = -1;
         int chunk = -1;
@@ -4455,6 +4473,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         size_t return_lane = 0;
         uint64_t phone_ffn_seq = 0;
         ggml_tensor * return_stage = nullptr;
+        std::shared_ptr<phone_prefill_return_timing> timing;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
@@ -5696,6 +5715,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_v2_throttle_count     = 0;
     int64_t phone_xlayer_v2_throttle_wait_us   = 0;
     int64_t phone_xlayer_v2_throttle_wait_max_us = 0;
+    int64_t phone_xlayer_v2_throttle_profile_count = 0;
+    int64_t phone_xlayer_v2_throttle_pc_residual_us = 0;
+    int64_t phone_xlayer_v2_throttle_return_gate_us = 0;
+    int64_t phone_xlayer_v2_throttle_return_rpc_us = 0;
+    int64_t phone_xlayer_v2_throttle_add_submit_us = 0;
+    int64_t phone_xlayer_v2_throttle_other_us = 0;
+    int64_t phone_xlayer_v2_throttle_pc_ready_entry_count = 0;
+    int64_t phone_xlayer_v2_throttle_return_ready_entry_count = 0;
 
     // Diagnostic-only per-boundary accounting for the conservative
     // Phone-primary cross-layer path.  Async return workers update only the
@@ -7008,14 +7035,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             // ordered Phone compute socket/queue, so write -> ADD is ordered
             // without a host fence.
             const int64_t add_begin_us = ggml_time_us();
+            if (branch_it->timing != nullptr) {
+                branch_it->timing->add_submit_begin_us =
+                    add_begin_us;
+            }
             const ggml_status add_status =
                 submit_phone_prefill_staged_add(
                     branch_it->sg,
                     branch_it->layer,
                     branch_it->chunk,
                     branch_it->return_stage);
+            const int64_t add_end_us = ggml_time_us();
             const int64_t add_us =
-                ggml_time_us() - add_begin_us;
+                add_end_us - add_begin_us;
+            if (branch_it->timing != nullptr) {
+                branch_it->timing->add_submit_end_us =
+                    add_end_us;
+            }
             if (add_status != GGML_STATUS_SUCCESS) {
                 return add_status;
             }
@@ -7106,6 +7142,148 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const ggml_status status =
                 join_phone_prefill_pc_chunk(layer, chunk, true);
             wait_us = ggml_time_us() - begin_us;
+            return status;
+        };
+
+    struct xlayer_throttle_wait_breakdown {
+        bool pc_ready_at_entry = false;
+        bool return_ready_at_entry = false;
+        int64_t total_us = 0;
+        int64_t pc_residual_us = 0;
+        int64_t return_gate_us = 0;
+        int64_t return_rpc_us = 0;
+        int64_t add_submit_us = 0;
+        int64_t other_us = 0;
+        int64_t worker_pc_wait_us = 0;
+        int64_t worker_lane_gate_wait_us = 0;
+        int64_t worker_critical_gate_wait_us = 0;
+        int64_t pc_compute_us = 0;
+        int64_t pc_return_stage_us = 0;
+    };
+
+    auto overlap_us =
+        [](int64_t window_begin,
+           int64_t window_end,
+           int64_t phase_begin,
+           int64_t phase_end) -> int64_t {
+            if (phase_begin <= 0 || phase_end <= phase_begin ||
+                    window_end <= window_begin) {
+                return 0;
+            }
+            const int64_t begin =
+                std::max(window_begin, phase_begin);
+            const int64_t end =
+                std::min(window_end, phase_end);
+            return std::max<int64_t>(0, end - begin);
+        };
+
+    auto wait_phone_prefill_pc_dependency_profiled =
+        [&](int layer,
+            int chunk,
+            bool & waited,
+            int64_t & wait_us,
+            xlayer_throttle_wait_breakdown & breakdown)
+            -> ggml_status {
+            breakdown = {};
+            waited = false;
+            wait_us = 0;
+
+            const auto branch_it =
+                std::find_if(
+                    pending_phone_prefill_pc_branches.begin(),
+                    pending_phone_prefill_pc_branches.end(),
+                    [&](const phone_prefill_pc_branch & branch) {
+                        return branch.layer == layer &&
+                            branch.chunk == chunk;
+                    });
+            if (branch_it ==
+                    pending_phone_prefill_pc_branches.end()) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            const auto timing = branch_it->timing;
+            breakdown.pc_ready_at_entry =
+                branch_it->pc_worker != nullptr &&
+                branch_it->pc_worker->is_completed(
+                    branch_it->pc_task);
+            GGML_ASSERT(
+                branch_it->return_lane <
+                ggml_backend_meta_context::PREFILL_RETURN_LANES);
+            ggml_backend_meta_transfer_worker * return_worker =
+                backend_ctx->prefill_return_workers[
+                    branch_it->return_lane];
+            breakdown.return_ready_at_entry =
+                return_worker != nullptr &&
+                return_worker->is_completed(
+                    branch_it->return_task);
+
+            waited = true;
+            const int64_t begin_us = ggml_time_us();
+            const ggml_status status =
+                join_phone_prefill_pc_chunk(
+                    layer, chunk, true);
+            const int64_t end_us = ggml_time_us();
+            wait_us = end_us - begin_us;
+            breakdown.total_us = wait_us;
+
+            if (timing != nullptr) {
+                breakdown.worker_pc_wait_us =
+                    timing->return_worker_pc_wait_us;
+                breakdown.worker_lane_gate_wait_us =
+                    timing->return_lane_gate_wait_us;
+                breakdown.worker_critical_gate_wait_us =
+                    timing->return_critical_gate_wait_us;
+                breakdown.pc_compute_us =
+                    timing->pc_compute_us;
+                breakdown.pc_return_stage_us =
+                    timing->pc_return_stage_us;
+
+                if (timing->pc_done_us > begin_us) {
+                    breakdown.pc_residual_us =
+                        std::max<int64_t>(
+                            0,
+                            std::min(end_us, timing->pc_done_us) -
+                                begin_us);
+                }
+
+                const int64_t gate_begin_us =
+                    std::max(
+                        begin_us,
+                        timing->pc_done_us > 0 ?
+                            timing->pc_done_us : begin_us);
+                if (timing->return_send_begin_us > gate_begin_us) {
+                    breakdown.return_gate_us =
+                        std::max<int64_t>(
+                            0,
+                            std::min(
+                                end_us,
+                                timing->return_send_begin_us) -
+                                gate_begin_us);
+                }
+
+                breakdown.return_rpc_us =
+                    overlap_us(
+                        begin_us,
+                        end_us,
+                        timing->return_send_begin_us,
+                        timing->return_send_end_us);
+                breakdown.add_submit_us =
+                    overlap_us(
+                        begin_us,
+                        end_us,
+                        timing->add_submit_begin_us,
+                        timing->add_submit_end_us);
+            }
+
+            const int64_t accounted_us =
+                breakdown.pc_residual_us +
+                breakdown.return_gate_us +
+                breakdown.return_rpc_us +
+                breakdown.add_submit_us;
+            breakdown.other_us =
+                std::max<int64_t>(
+                    0,
+                    breakdown.total_us - accounted_us);
             return status;
         };
 
@@ -12370,12 +12548,21 @@ auto prefill_norm_sg_has_prework =
                             return throttle_reduce_status;
                         }
 
+                        xlayer_throttle_wait_breakdown
+                            throttle_breakdown;
                         const ggml_status throttle_phone_status =
-                            wait_phone_prefill_pc_dependency(
-                                predecessor_layer,
-                                next_pred_chunk,
-                                throttle_phone_waited,
-                                throttle_phone_wait_us);
+                            xlayer_throttle_profile ?
+                                wait_phone_prefill_pc_dependency_profiled(
+                                    predecessor_layer,
+                                    next_pred_chunk,
+                                    throttle_phone_waited,
+                                    throttle_phone_wait_us,
+                                    throttle_breakdown) :
+                                wait_phone_prefill_pc_dependency(
+                                    predecessor_layer,
+                                    next_pred_chunk,
+                                    throttle_phone_waited,
+                                    throttle_phone_wait_us);
                         if (throttle_phone_status !=
                                 GGML_STATUS_SUCCESS) {
                             return throttle_phone_status;
@@ -12390,6 +12577,59 @@ auto prefill_norm_sg_has_prework =
                             std::max(
                                 phone_xlayer_v2_throttle_wait_max_us,
                                 throttle_wait_us);
+
+                        if (xlayer_throttle_profile &&
+                                throttle_phone_waited) {
+                            ++phone_xlayer_v2_throttle_profile_count;
+                            phone_xlayer_v2_throttle_pc_residual_us +=
+                                throttle_breakdown.pc_residual_us;
+                            phone_xlayer_v2_throttle_return_gate_us +=
+                                throttle_breakdown.return_gate_us;
+                            phone_xlayer_v2_throttle_return_rpc_us +=
+                                throttle_breakdown.return_rpc_us;
+                            phone_xlayer_v2_throttle_add_submit_us +=
+                                throttle_breakdown.add_submit_us;
+                            phone_xlayer_v2_throttle_other_us +=
+                                throttle_breakdown.other_us;
+                            phone_xlayer_v2_throttle_pc_ready_entry_count +=
+                                throttle_breakdown.pc_ready_at_entry ? 1 : 0;
+                            phone_xlayer_v2_throttle_return_ready_entry_count +=
+                                throttle_breakdown.return_ready_at_entry ? 1 : 0;
+
+                            printf(
+                                "[XLAYER_THROTTLE_BREAKDOWN] "
+                                "pred_layer=%d pred_chunk=%d "
+                                "next_layer=%d next_chunk=%d "
+                                "total_ms=%.3f "
+                                "pc_ready_entry=%d "
+                                "return_ready_entry=%d "
+                                "pc_residual_ms=%.3f "
+                                "return_gate_ms=%.3f "
+                                "return_rpc_ms=%.3f "
+                                "add_submit_ms=%.3f other_ms=%.3f "
+                                "worker_pc_wait_ms=%.3f "
+                                "worker_lane_gate_ms=%.3f "
+                                "worker_critical_gate_ms=%.3f "
+                                "pc_compute_ms=%.3f "
+                                "pc_return_stage_ms=%.3f\n",
+                                predecessor_layer,
+                                next_pred_chunk,
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                throttle_breakdown.total_us / 1000.0,
+                                throttle_breakdown.pc_ready_at_entry ? 1 : 0,
+                                throttle_breakdown.return_ready_at_entry ? 1 : 0,
+                                throttle_breakdown.pc_residual_us / 1000.0,
+                                throttle_breakdown.return_gate_us / 1000.0,
+                                throttle_breakdown.return_rpc_us / 1000.0,
+                                throttle_breakdown.add_submit_us / 1000.0,
+                                throttle_breakdown.other_us / 1000.0,
+                                throttle_breakdown.worker_pc_wait_us / 1000.0,
+                                throttle_breakdown.worker_lane_gate_wait_us / 1000.0,
+                                throttle_breakdown.worker_critical_gate_wait_us / 1000.0,
+                                throttle_breakdown.pc_compute_us / 1000.0,
+                                throttle_breakdown.pc_return_stage_us / 1000.0);
+                        }
                     }
 
                     const bool predecessor_still_pending =
@@ -13023,10 +13263,14 @@ auto prefill_norm_sg_has_prework =
                         100.0 * (double) phone_ff / (double) total_ff : 0.0);
             }
 
+            auto return_timing =
+                std::make_shared<phone_prefill_return_timing>();
+
             const uint64_t pc_task =
                 pc_worker->enqueue(
                     [&, route, pc_graph, pc_backend,
                         pc_return_src, return_payload,
+                        return_timing,
                         pc_worker_lane,
                         prefill_down_layer, prefill_down_chunk, i]
                     (uint64_t task_id) -> ggml_status {
@@ -13182,6 +13426,19 @@ auto prefill_norm_sg_has_prework =
                                 return_stage_begin_us;
                         }
 
+                        return_timing->pc_route_wait_us =
+                            route_wait_us;
+                        return_timing->pc_gate_wait_us =
+                            pc_gate_wait_us;
+                        return_timing->pc_stage_copy_us =
+                            stage_copy_us;
+                        return_timing->pc_compute_us =
+                            pc_compute_us;
+                        return_timing->pc_return_stage_us =
+                            return_stage_us;
+                        return_timing->pc_done_us =
+                            ggml_time_us();
+
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
                             printf(
@@ -13276,6 +13533,7 @@ auto prefill_norm_sg_has_prework =
                      phone_backend,
                      phone_return_stage,
                      return_payload,
+                     return_timing,
                      prefill_down_layer,
                      prefill_down_chunk,
                      i,
@@ -13292,6 +13550,8 @@ auto prefill_norm_sg_has_prework =
                             pc_worker->wait(pc_task);
                         const int64_t pc_wait_us =
                             ggml_time_us() - wait_begin_us;
+                        return_timing->return_worker_pc_wait_us =
+                            pc_wait_us;
                         if (pc_status != GGML_STATUS_SUCCESS) {
                             if (critical_return_state != nullptr) {
                                 {
@@ -13319,6 +13579,8 @@ auto prefill_norm_sg_has_prework =
                             lane_gate_wait_us =
                                 ggml_time_us() -
                                 gate_wait_begin_us;
+                            return_timing->return_lane_gate_wait_us =
+                                lane_gate_wait_us;
                             if (lane1_return_gate->cancelled) {
                                 if (critical_return_state != nullptr) {
                                     {
@@ -13348,6 +13610,8 @@ auto prefill_norm_sg_has_prework =
                             critical_gate_wait_us =
                                 ggml_time_us() -
                                 gate_wait_begin_us;
+                            return_timing->return_critical_gate_wait_us =
+                                critical_gate_wait_us;
                             if (critical_return_state->cancelled) {
                                 return GGML_STATUS_FAILED;
                             }
@@ -13355,6 +13619,8 @@ auto prefill_norm_sg_has_prework =
 
                         const int64_t send_begin_us =
                             ggml_time_us();
+                        return_timing->return_send_begin_us =
+                            send_begin_us;
                         const bool sent =
                             use_chunk_join_return ?
                                 async_return_wait(
@@ -13369,8 +13635,12 @@ auto prefill_norm_sg_has_prework =
                                     phone_return_stage,
                                     return_payload->data(),
                                     return_payload->size());
+                        const int64_t send_end_us =
+                            ggml_time_us();
                         const int64_t send_us =
-                            ggml_time_us() - send_begin_us;
+                            send_end_us - send_begin_us;
+                        return_timing->return_send_end_us =
+                            send_end_us;
 
                         if (xlayer_boundary_diag &&
                                 phone_primary_xlayer_wave) {
@@ -13531,6 +13801,7 @@ auto prefill_norm_sg_has_prework =
                 return_lane,
                 phone_ffn_seq,
                 phone_return_stage,
+                return_timing,
             });
             deferred_phone_prefill_return_sgs[i] =
                 prefill_down_layer;
@@ -14646,6 +14917,24 @@ auto prefill_norm_sg_has_prework =
             phone_xlayer_v2_throttle_count,
             phone_xlayer_v2_throttle_wait_us / 1000.0,
             phone_xlayer_v2_throttle_wait_max_us / 1000.0);
+    }
+
+    if (runtime_profile_graph &&
+            xlayer_throttle_profile) {
+        printf(
+            "[XLAYER_THROTTLE_SUM] samples=%" PRId64
+            " pc_ready_entry=%" PRId64
+            " return_ready_entry=%" PRId64
+            " pc_residual_ms=%.3f return_gate_ms=%.3f "
+            "return_rpc_ms=%.3f add_submit_ms=%.3f other_ms=%.3f\n",
+            phone_xlayer_v2_throttle_profile_count,
+            phone_xlayer_v2_throttle_pc_ready_entry_count,
+            phone_xlayer_v2_throttle_return_ready_entry_count,
+            phone_xlayer_v2_throttle_pc_residual_us / 1000.0,
+            phone_xlayer_v2_throttle_return_gate_us / 1000.0,
+            phone_xlayer_v2_throttle_return_rpc_us / 1000.0,
+            phone_xlayer_v2_throttle_add_submit_us / 1000.0,
+            phone_xlayer_v2_throttle_other_us / 1000.0);
     }
 
     if (runtime_profile_graph) {
