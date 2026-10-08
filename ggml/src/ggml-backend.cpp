@@ -888,15 +888,28 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #define GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS 30
+#define GGML_SCHED_PHONE_WAVE_MAX_SPLIT_INPUTS 96
+#define GGML_SCHED_PHONE_BIG_WAVE_MAX_SPLIT_INPUTS 512
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 96
+#define GGML_SCHED_MAX_SPLIT_INPUTS GGML_SCHED_PHONE_BIG_WAVE_MAX_SPLIT_INPUTS
 #endif
+
+// Temporary scheduler bookkeeping is sized per graph node.  Keep the old
+// 96-input factor even when a single Meta split is allowed to accumulate more
+// inputs: total cross-backend source references are bounded by graph nodes
+// times GGML_MAX_SRC, while tensor copies are bounded by the scheduler hash
+// entries times backend/copy fanout.  Inflating this factor to 512 would only
+// multiply host scratch memory without being required by one large split.
+#define GGML_SCHED_SPLIT_SCRATCH_INPUTS GGML_SCHED_PHONE_WAVE_MAX_SPLIT_INPUTS
 
 static_assert(
     GGML_SCHED_MAX_SPLIT_INPUTS >=
-        GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS,
-    "scheduler split input capacity must cover the default limit");
+        GGML_SCHED_PHONE_BIG_WAVE_MAX_SPLIT_INPUTS,
+    "scheduler split input capacity must cover Phone big-wave limit");
+static_assert(
+    GGML_SCHED_SPLIT_SCRATCH_INPUTS >= GGML_MAX_SRC,
+    "scheduler scratch factor must cover per-node source fanout");
 
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
@@ -1573,11 +1586,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size =
-        std::max(graph->n_nodes, graph->n_leafs) +
-        sched->n_splits *
-            sched->max_split_inputs * 2 *
-            sched->n_copies;
+    size_t total_split_inputs = 0;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        total_split_inputs +=
+            (size_t) sched->splits[i].n_inputs;
+    }
+    const size_t total_input_refs =
+        total_split_inputs + (size_t) sched->n_graph_inputs;
+    const size_t graph_size_extra =
+        total_input_refs * 2 * (size_t) sched->n_copies;
+    const size_t graph_size_needed =
+        (size_t) std::max(graph->n_nodes, graph->n_leafs) +
+        graph_size_extra;
+    GGML_ASSERT(graph_size_needed <= (size_t) INT_MAX);
+    int graph_size = (int) graph_size_needed;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -2266,9 +2288,17 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     const bool phone_wavefront_split_relax =
         phone_wavefront_env != NULL &&
         atoi(phone_wavefront_env) != 0;
+    const char * phone_big_wave_env =
+        getenv("LLAMA_HYBRID_PHONE_PRIMARY_BIG_WAVE");
+    const bool phone_big_wave =
+        phone_wavefront_split_relax &&
+        phone_big_wave_env != NULL &&
+        atoi(phone_big_wave_env) != 0;
     sched->max_split_inputs =
+        phone_big_wave ?
+            GGML_SCHED_PHONE_BIG_WAVE_MAX_SPLIT_INPUTS :
         phone_wavefront_split_relax ?
-            GGML_SCHED_MAX_SPLIT_INPUTS :
+            GGML_SCHED_PHONE_WAVE_MAX_SPLIT_INPUTS :
             GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS;
 
     sched->n_backends = n_backends;
@@ -2284,7 +2314,7 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     const size_t nodes_size =
         graph_size +
         ggml_sched_max_splits *
-            (size_t) sched->max_split_inputs * 2;
+            (size_t) GGML_SCHED_SPLIT_SCRATCH_INPUTS * 2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -2295,7 +2325,7 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
 
     sched->context_buffer_size =
         ggml_sched_max_splits *
-            (size_t) sched->max_split_inputs * 2 *
+            (size_t) GGML_SCHED_SPLIT_SCRATCH_INPUTS * 2 *
             sizeof(struct ggml_tensor) +
         ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -2318,10 +2348,13 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
 
     if (phone_wavefront_split_relax) {
         GGML_LOG_INFO(
-            "[SCHED_META_SPLIT_INPUT_LIMIT] default=%d meta=%d capacity=%d\n",
+            "[SCHED_META_SPLIT_INPUT_LIMIT] default=%d meta=%d capacity=%d "
+            "big_wave=%d scratch_factor=%d\n",
             GGML_SCHED_DEFAULT_MAX_SPLIT_INPUTS,
             sched->max_split_inputs,
-            GGML_SCHED_MAX_SPLIT_INPUTS);
+            GGML_SCHED_MAX_SPLIT_INPUTS,
+            phone_big_wave ? 1 : 0,
+            GGML_SCHED_SPLIT_SCRATCH_INPUTS);
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
