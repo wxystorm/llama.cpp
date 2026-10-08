@@ -750,18 +750,22 @@ static int run_full(const Opt&o) {
   const auto geom=layer_geometry(f,o.layer,o.topk);
   auto initial=full_initial(geom.embd,o.tokens);
   std::vector<FullRound> baseline,split;
+  FullDiagnostics base_diag,mixed_diag;
   std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=gpu_only_build_begin\n");
   {
    auto all=full_build_layers(f,o,gpu,cpu,false);
    std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=gpu_only_build_ok\n");
    baseline=full_measure(o,gpu,all,initial,"GPU_ONLY");
+   base_diag=full_capture_diagnostics(gpu,all,initial,"GPU_ONLY");
   }
   std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=mixed_build_begin\n");
   {
    auto all=full_build_layers(f,o,gpu,cpu,true);
    std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=mixed_build_ok\n");
    split=full_measure(o,gpu,all,initial,"CPU_GPU");
+   mixed_diag=full_capture_diagnostics(gpu,all,initial,"CPU_GPU");
   }
+  const bool layer_checks_ok=full_report_layer_checks(o,base_diag,mixed_diag);
   std::vector<double> a,b;
   for(const auto &v:baseline)a.push_back(v.wall);
   for(const auto &v:split)b.push_back(v.wall);
@@ -787,7 +791,7 @@ static int run_full(const Opt&o) {
            <<" speedup="<<base_ms/mixed_ms
            <<" layers="<<o.layers<<" tokens="<<o.tokens<<"\n";
   // A failed numerical check invalidates the timing comparison.
-  if(!good)status=2;
+  if(!good || !layer_checks_ok)status=2;
  }
  ggml_backend_free(cpu);
  ggml_backend_free(gpu);
