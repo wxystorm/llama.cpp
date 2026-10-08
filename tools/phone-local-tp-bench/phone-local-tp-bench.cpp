@@ -48,13 +48,42 @@ struct File {
   size_t rf=ggml_row_size(type,down?full:rows),rp=ggml_row_size(type,down?width:rows);
   size_t ef=rf*(down?rows:full),ep=rp*(down?rows:width),base=data+gguf_get_tensor_offset(uf,w.id);
   check(gguf_get_tensor_size(uf,w.id)==ef*(size_t)experts&&ggml_nbytes(dst)==ep*(size_t)experts,"weight bytes mismatch");
-  std::vector<uint8_t> buf(down?ef:ep),part(down?ep:0);
-  for(int64_t e=0;e<experts;e++){size_t pos=base+(size_t)e*ef;
-   if(!down){read(pos+(size_t)start*rf,buf.data(),ep);ggml_backend_tensor_set(dst,buf.data(),(size_t)e*ep,ep);}
-   else {read(pos,buf.data(),ef);size_t off=ggml_row_size(type,start);
-    for(int64_t r=0;r<rows;r++)std::memcpy(part.data()+(size_t)r*rp,buf.data()+(size_t)r*rf+off,rp);
-    ggml_backend_tensor_set(dst,part.data(),(size_t)e*ep,ep);}
+  // OpenCL SOA_Q converts the ENTIRE quantized tensor on the first set_tensor
+  // call, regardless of the supplied partial size/offset. Never submit a
+  // single-expert buffer to a multi-expert quantized OpenCL tensor: the device
+  // implementation reads ggml_nbytes(dst) from the supplied host pointer.
+  // Assemble all expert shards in canonical GGUF AoS order and upload once.
+  const size_t dst_bytes = ggml_nbytes(dst);
+  check(ep != 0 && static_cast<size_t>(experts) <= dst_bytes / ep &&
+        static_cast<size_t>(experts) * ep == dst_bytes,
+        "destination tensor size mismatch");
+  std::vector<uint8_t> packed(dst_bytes);
+  std::vector<uint8_t> scratch(down ? ef : 0);
+  std::fprintf(stderr,
+       "[PHONE_LOCAL_WEIGHT] phase=assemble_begin tensor=%s type=%s src_expert_bytes=%zu dst_expert_bytes=%zu experts=%lld total_bytes=%zu\n",
+       w.name.c_str(), ggml_type_name(type), ef, ep, (long long)experts, dst_bytes);
+  for(int64_t e=0;e<experts;e++){
+    const size_t pos=base+static_cast<size_t>(e)*ef;
+    uint8_t *destination=packed.data()+static_cast<size_t>(e)*ep;
+    if(!down){
+      // Gate/Up shard is a contiguous range of rows within each expert.
+      read(pos+static_cast<size_t>(start)*rf,destination,ep);
+    }else{
+      // Down shard consists of a quant-block-aligned slice of EVERY row.
+      read(pos,scratch.data(),ef);
+      const size_t inside_row=ggml_row_size(type,start);
+      for(int64_t row=0;row<rows;row++){
+        std::memcpy(destination+static_cast<size_t>(row)*rp,
+                    scratch.data()+static_cast<size_t>(row)*rf+inside_row,rp);
+      }
+    }
   }
+  std::fprintf(stderr,
+       "[PHONE_LOCAL_WEIGHT] phase=upload_begin tensor=%s bytes=%zu\n",
+       w.name.c_str(), dst_bytes);
+  ggml_backend_tensor_set(dst,packed.data(),0,dst_bytes);
+  std::fprintf(stderr,
+       "[PHONE_LOCAL_WEIGHT] phase=upload_ok tensor=%s\n",w.name.c_str());
  }
 };
 struct Graph {
