@@ -17,6 +17,7 @@ On this branch, in the repository root:
 
 ```bash
 cmake -S . -B build-phone-local -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=OFF \
   -DGGML_OPENCL=ON \
   -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
   -DGGML_RPC=OFF -DGGML_OPENMP=OFF
