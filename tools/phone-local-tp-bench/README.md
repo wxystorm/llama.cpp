@@ -221,3 +221,70 @@ Be aware of this accounting change when comparing against older logs.
 If Stage has spikes, compare CPU ffn_norm copies (large activation tensors)
 against small ids/mix copies, then the two explicit synchronization calls.
 Do not prematurely conclude that time attributed to a copy is only memcpy.
+
+
+## OpenCL GPU-to-GPU direct copy experiment
+
+The OpenCL buffer backend can now copy dense, contiguous F32/I32 tensors
+directly on the GPU using clEnqueueCopyBuffer. This removes the generic
+GPU->host->GPU copy fallback for compatible Router/Attention-to-FFN tensors.
+Full GGUF quantized weights, BF16 tensors, views, aliased/overlapping regions
+and transfers between different OpenCL buffer types are excluded and keep
+their previous copy behavior. Event completion is waited for before returning.
+
+The following environment variables affect only this optional optimization:
+- GGML_OPENCL_DIRECT_COPY=0: disable fast copy, use old host-mediated path
+- GGML_OPENCL_DIRECT_COPY=1: enable fast copy (also the default)
+- GGML_OPENCL_DIRECT_COPY_TRACE=1: emit [OPENCL_DIRECT_COPY] for successful
+  copies, with type, bytes and end-to-end wall_ms, and fallback errors.
+
+Stage A/B on the SAME phone binary (run after rebuilding):
+
+    GGML_OPENCL_DIRECT_COPY=0 LD_LIBRARY_PATH=/vendor/lib64 \
+      ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 2 --tokens 400 --topk 8 \
+      --cpu-ratio 0.25 --threads 8 --warmup 2 --runs 5 \
+      2>&1 | tee phone-full-copy-off.log
+
+    GGML_OPENCL_DIRECT_COPY=1 GGML_OPENCL_DIRECT_COPY_TRACE=1 \
+      PHONE_FULL_FIXED_ROUTER=1 LD_LIBRARY_PATH=/vendor/lib64 \
+      ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 2 --tokens 400 --topk 8 \
+      --cpu-ratio 0.25 --threads 8 --warmup 2 --runs 5 \
+      2>&1 | tee phone-full-copy-on.log
+
+Filtered output:
+
+    grep -E '\[(OPENCL_DIRECT_COPY|PHONE_FULL_(STAGE_SUM|LAYER_CHECK|FIXED_ROUTER_CHECK|CHECK|SUM))\]' \
+      phone-full-copy-on.log
+
+Expected fast-copy successes are F32 ffn_norm and I32 expert IDs.
+Small or view-backed Router mix tensors may use the older fallback.
+Compare GPU-only AND CPU+GPU Stage medians and full-layer wall times.
+Copy timings include command enqueue and event wait, not just device kernel
+time; heat, scheduling and test order may affect reported speedups.
+
+Router diagnostic labels:
+- changed_router_slots: changed Top-K rank positions across all tokens.
+- changed_router_tokens: tokens with at least one changed Top-K rank slot.
+- changed_router_set_tokens: tokens whose actual unordered expert selection
+  differs (sort Top-K IDs for each token before comparing).
+- reordered_only_tokens: tokens whose set is identical but ranks differ.
+
+PHONE_FULL_FIXED_ROUTER=1 also runs a separate UNTIMED control pass for
+CPU+GPU that forcibly supplies the baseline GPU-only Router IDs AND baseline
+Router mixture weights at each layer. It produces
+[PHONE_FULL_FIXED_ROUTER_CHECK] with normal_rel_l2 and fixed_rel_l2.
+This is a controlled diagnostic, not a valid production route: the CPU+GPU
+hidden state can still differ from the GPU-only hidden state, and the forced
+mixture weights were calculated from the GPU-only hidden state.
+It helps estimate how much extra discrepancy comes from routing choices
+and weights versus split FFN computation and propagated hidden differences.
+Measured runs always retain their own Router decisions and weights.
+
+NOTE: This branch has not been validated on Adreno after the direct-copy
+change. Start with a one-layer smoke test if the OpenCL runtime reports
+a failure, and disable the fast path with GGML_OPENCL_DIRECT_COPY=0 as a
+fallback. Keep baseline logs for comparison.
