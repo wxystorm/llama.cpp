@@ -406,12 +406,36 @@ struct rpc_msg_phone_ffn_mark_ready_req {
     uint64_t seq;
 };
 
-struct rpc_msg_set_tensor_async_return_wait_req {
+static constexpr uint64_t RPC_RETURN_WIRE_MAGIC =
+    UINT64_C(0x4650313652455455);
+
+enum rpc_return_wire_type : uint32_t {
+    RPC_RETURN_WIRE_RAW = 0,
+    RPC_RETURN_WIRE_F16 = 1,
+};
+
+struct rpc_msg_set_tensor_async_return_wait_req_v14 {
     uint32_t device;
     uint64_t phone_ffn_seq;
     rpc_tensor tensor;
     uint64_t offset;
 };
+
+struct rpc_msg_set_tensor_async_return_wait_req {
+    uint32_t device;
+    uint64_t phone_ffn_seq;
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t wire_magic;
+    uint32_t wire_type;
+    uint32_t reserved;
+    uint64_t original_size;
+};
+
+static_assert(
+    offsetof(rpc_msg_set_tensor_async_return_wait_req, wire_magic) ==
+        sizeof(rpc_msg_set_tensor_async_return_wait_req_v14),
+    "return-wait v15 request must preserve the v14 prefix");
 
 struct rpc_msg_route_snapshot_ready_req {
     uint32_t device;
@@ -3404,9 +3428,10 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     }
 
     constexpr uint8_t RPC_PHONE_FFN_JOIN_MIN_PATCH = 11;
+    constexpr uint8_t RPC_RETURN_F16_MIN_PATCH = 15;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
-    if (rpc_get_remote_patch(compute_key) <
-            RPC_PHONE_FFN_JOIN_MIN_PATCH) {
+    const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_PHONE_FFN_JOIN_MIN_PATCH) {
         return false;
     }
 
@@ -3447,17 +3472,71 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     auto sock = return_sock;
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    rpc_msg_set_tensor_async_return_wait_req request {};
-    request.device = rpc_ctx->device;
-    request.phone_ffn_seq = phone_ffn_seq;
-    request.tensor = serialize_tensor(dst);
-    request.offset = 0;
+    const char * f16_env =
+        std::getenv("GGML_RPC_RETURN_F16");
+    const bool f16_requested =
+        f16_env != nullptr && std::atoi(f16_env) != 0;
+    const bool use_extended =
+        remote_patch >= RPC_RETURN_F16_MIN_PATCH;
+    const bool use_f16 =
+        f16_requested &&
+        use_extended &&
+        dst->type == GGML_TYPE_F32 &&
+        data_size % sizeof(float) == 0;
 
-    const size_t input_size = sizeof(request) + data_size;
-    std::vector<uint8_t> input(input_size);
-    memcpy(input.data(), &request, sizeof(request));
-    if (data_size > 0) {
-        memcpy(input.data() + sizeof(request), data, data_size);
+    std::vector<ggml_fp16_t> f16_payload;
+    const void * wire_data = data;
+    size_t wire_size = data_size;
+    if (use_f16) {
+        const size_t n_elements =
+            data_size / sizeof(float);
+        f16_payload.resize(n_elements);
+        ggml_fp32_to_fp16_row(
+            static_cast<const float *>(data),
+            f16_payload.data(),
+            static_cast<int64_t>(n_elements));
+        wire_data = f16_payload.data();
+        wire_size =
+            n_elements * sizeof(ggml_fp16_t);
+    }
+
+    std::vector<uint8_t> input;
+    if (use_extended) {
+        rpc_msg_set_tensor_async_return_wait_req request {};
+        request.device = rpc_ctx->device;
+        request.phone_ffn_seq = phone_ffn_seq;
+        request.tensor = serialize_tensor(dst);
+        request.offset = 0;
+        request.wire_magic = RPC_RETURN_WIRE_MAGIC;
+        request.wire_type =
+            use_f16 ? RPC_RETURN_WIRE_F16 :
+                RPC_RETURN_WIRE_RAW;
+        request.original_size = data_size;
+
+        input.resize(sizeof(request) + wire_size);
+        memcpy(input.data(), &request, sizeof(request));
+        if (wire_size > 0) {
+            memcpy(
+                input.data() + sizeof(request),
+                wire_data,
+                wire_size);
+        }
+    } else {
+        rpc_msg_set_tensor_async_return_wait_req_v14 request {};
+        request.device = rpc_ctx->device;
+        request.phone_ffn_seq = phone_ffn_seq;
+        request.tensor = serialize_tensor(dst);
+        request.offset = 0;
+
+        input.resize(sizeof(request) + data_size);
+        memcpy(input.data(), &request, sizeof(request));
+        if (data_size > 0) {
+            memcpy(
+                input.data() + sizeof(request),
+                data,
+                data_size);
+        }
+        wire_size = data_size;
     }
 
     const bool stage_profile =
@@ -3497,12 +3576,15 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         std::fprintf(
             stderr,
             "[XLAYER_RETURN_RPC] seq=%" PRIu64
-            " lane=%zu bytes=%zu request_send_ms=%.3f "
+            " lane=%zu bytes=%zu wire_bytes=%zu wire=%s "
+            "request_send_ms=%.3f "
             "response_header_wait_ms=%.3f "
             "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
+            wire_size,
+            use_f16 ? "f16" : "raw",
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
@@ -3516,12 +3598,15 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=return_chunk_join seq=%" PRIu64
-            " lane=%zu bytes=%zu request_send_ms=%.3f "
+            " lane=%zu bytes=%zu wire_bytes=%zu wire=%s "
+            "request_send_ms=%.3f "
             "response_header_wait_ms=%.3f "
             "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
+            wire_size,
+            use_f16 ? "f16" : "raw",
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
@@ -3532,7 +3617,6 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     return status;
 }
-
 static bool ggml_backend_rpc_set_tensor_async_return(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -5047,16 +5131,63 @@ bool rpc_server::phone_ffn_mark_ready(
 bool rpc_server::set_tensor_async_return_wait(
         const std::vector<uint8_t> & input) {
     if (input.size() <
-            sizeof(rpc_msg_set_tensor_async_return_wait_req)) {
+            sizeof(rpc_msg_set_tensor_async_return_wait_req_v14)) {
         return false;
     }
 
-    rpc_msg_set_tensor_async_return_wait_req request {};
+    rpc_msg_set_tensor_async_return_wait_req_v14 request {};
     memcpy(&request, input.data(), sizeof(request));
+
+    bool extended = false;
+    uint32_t wire_type = RPC_RETURN_WIRE_RAW;
+    size_t header_size = sizeof(request);
+    size_t original_size =
+        input.size() - header_size;
+
+    if (input.size() >=
+            sizeof(rpc_msg_set_tensor_async_return_wait_req)) {
+        rpc_msg_set_tensor_async_return_wait_req request_v15 {};
+        memcpy(
+            &request_v15,
+            input.data(),
+            sizeof(request_v15));
+        if (request_v15.wire_magic ==
+                RPC_RETURN_WIRE_MAGIC &&
+                (request_v15.wire_type ==
+                    RPC_RETURN_WIRE_RAW ||
+                 request_v15.wire_type ==
+                    RPC_RETURN_WIRE_F16)) {
+            extended = true;
+            wire_type = request_v15.wire_type;
+            header_size = sizeof(request_v15);
+            original_size =
+                static_cast<size_t>(
+                    request_v15.original_size);
+        }
+    }
 
     if (request.device >= backends.size() ||
             request.phone_ffn_seq == 0) {
         return false;
+    }
+
+    const size_t wire_size =
+        input.size() - header_size;
+    if (wire_type == RPC_RETURN_WIRE_RAW) {
+        if (wire_size != original_size) {
+            return false;
+        }
+    } else {
+        if (!extended ||
+                request.tensor.type !=
+                    static_cast<uint32_t>(GGML_TYPE_F32) ||
+                original_size == 0 ||
+                original_size % sizeof(float) != 0 ||
+                wire_size !=
+                    (original_size / sizeof(float)) *
+                        sizeof(ggml_fp16_t)) {
+            return false;
+        }
     }
 
     const int64_t wait_begin_us = ggml_time_us();
@@ -5082,9 +5213,10 @@ bool rpc_server::set_tensor_async_return_wait(
     }
     const int64_t wait_us = ggml_time_us() - wait_begin_us;
 
-    const size_t data_size = input.size() - sizeof(request);
     std::vector<uint8_t> legacy_input(
-        sizeof(rpc_tensor) + sizeof(uint64_t) + data_size);
+        sizeof(rpc_tensor) +
+        sizeof(uint64_t) +
+        original_size);
     size_t cursor = 0;
     memcpy(
         legacy_input.data() + cursor,
@@ -5096,27 +5228,43 @@ bool rpc_server::set_tensor_async_return_wait(
         &request.offset,
         sizeof(request.offset));
     cursor += sizeof(request.offset);
-    if (data_size > 0) {
+
+    const uint8_t * wire_data =
+        input.data() + header_size;
+    if (wire_type == RPC_RETURN_WIRE_F16) {
+        const size_t n_elements =
+            original_size / sizeof(float);
+        ggml_fp16_to_fp32_row(
+            reinterpret_cast<const ggml_fp16_t *>(wire_data),
+            reinterpret_cast<float *>(
+                legacy_input.data() + cursor),
+            static_cast<int64_t>(n_elements));
+        cursor += original_size;
+    } else if (original_size > 0) {
         memcpy(
             legacy_input.data() + cursor,
-            input.data() + sizeof(request),
-            data_size);
-        cursor += data_size;
+            wire_data,
+            original_size);
+        cursor += original_size;
     }
     GGML_ASSERT(cursor == legacy_input.size());
 
-    const bool status = set_tensor_async_return(legacy_input);
+    const bool status =
+        set_tensor_async_return(legacy_input);
 
     if (rpc_tensor_phone_stage_profile_enabled()) {
         std::fprintf(
             stderr,
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=return_chunk_join device=%u seq=%" PRIu64
-            " ffn_wait_ms=%.3f bytes=%zu status=%d\n",
+            " ffn_wait_ms=%.3f bytes=%zu wire_bytes=%zu wire=%s "
+            "status=%d\n",
             request.device,
             request.phone_ffn_seq,
             wait_us / 1000.0,
-            data_size,
+            original_size,
+            wire_size,
+            wire_type == RPC_RETURN_WIRE_F16 ? "f16" : "raw",
             status ? 1 : 0);
         std::fflush(stderr);
     }
