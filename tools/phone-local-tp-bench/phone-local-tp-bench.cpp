@@ -804,7 +804,9 @@ static int run_full(const Opt&o) {
   const auto geom=layer_geometry(f,o.layer,o.topk);
   auto initial=full_initial(geom.embd,o.tokens);
   std::vector<FullRound> baseline,split;
-  FullDiagnostics base_diag,mixed_diag;
+  const bool fixed_router_probe=std::getenv("PHONE_FULL_FIXED_ROUTER")!=nullptr &&
+                                  std::strcmp(std::getenv("PHONE_FULL_FIXED_ROUTER"),"0")!=0;
+  FullDiagnostics base_diag,mixed_diag,fixed_diag;
   std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=gpu_only_build_begin\n");
   {
    auto all=full_build_layers(f,o,gpu,cpu,false);
@@ -818,8 +820,37 @@ static int run_full(const Opt&o) {
    std::fprintf(stderr,"[PHONE_FULL_BOOT] phase=mixed_build_ok\n");
    split=full_measure(o,gpu,all,initial,"CPU_GPU");
    mixed_diag=full_capture_diagnostics(gpu,all,initial,"CPU_GPU");
+   if(fixed_router_probe){
+    fixed_diag=full_capture_diagnostics(gpu,all,initial,"CPU_GPU_FIXED_ROUTER",&base_diag);
+   }
   }
   const bool layer_checks_ok=full_report_layer_checks(o,base_diag,mixed_diag);
+  if(fixed_router_probe){
+   for(size_t li=0;li<base_diag.layer_output.size();li++){
+    const auto &reference=base_diag.layer_output[li];
+    const auto &control=fixed_diag.layer_output[li];
+    const auto &normal=mixed_diag.layer_output[li];
+    check(reference.size()==control.size() && reference.size()==normal.size(),
+          "fixed Router control output shape mismatch");
+    double ref2=0,ctrl_error2=0,normal_error2=0,ctrl_max=0;
+    for(size_t j=0;j<reference.size();j++){
+     check(std::isfinite(reference[j])&&std::isfinite(control[j]),
+           "non-finite fixed Router output");
+     const double ctrl_diff=static_cast<double>(reference[j])-control[j];
+     const double normal_diff=static_cast<double>(reference[j])-normal[j];
+     ref2+=static_cast<double>(reference[j])*reference[j];
+     ctrl_error2+=ctrl_diff*ctrl_diff;
+     normal_error2+=normal_diff*normal_diff;
+     ctrl_max=std::max(ctrl_max,std::abs(ctrl_diff));
+    }
+    const double denom=std::max(ref2,1.0e-24);
+    std::cout<<"[PHONE_FULL_FIXED_ROUTER_CHECK] layer="<<(o.layer+static_cast<int>(li))
+             <<" normal_rel_l2="<<std::sqrt(normal_error2/denom)
+             <<" fixed_rel_l2="<<std::sqrt(ctrl_error2/denom)
+             <<" fixed_max_abs="<<ctrl_max
+             <<" control=baseline_ids_and_mix_unmeasured\n";
+   }
+  }
   std::vector<double> a,b;
   for(const auto &v:baseline)a.push_back(v.wall);
   for(const auto &v:split)b.push_back(v.wall);
