@@ -711,14 +711,27 @@ static bool full_report_layer_checks(
   check(ref_ids.size()==expected&&mix_ids.size()==expected,
         "Router Top-K IDs diagnostic shape mismatch");
   size_t changed_choices=0,changed_tokens=0;
+  size_t changed_set_tokens=0,reordered_only_tokens=0;
   for(int token=0;token<o.tokens;token++){
    bool token_changed=false;
+   std::vector<int32_t> ref_set,mixed_set;
+   ref_set.reserve(o.topk);
+   mixed_set.reserve(o.topk);
    for(int k=0;k<o.topk;k++){
     const size_t j=static_cast<size_t>(token)*o.topk+k;
+    ref_set.push_back(ref_ids[j]);
+    mixed_set.push_back(mix_ids[j]);
     if(ref_ids[j]!=mix_ids[j]){
      token_changed=true;
      changed_choices++;
     }
+   }
+   std::sort(ref_set.begin(),ref_set.end());
+   std::sort(mixed_set.begin(),mixed_set.end());
+   if(ref_set!=mixed_set){
+    changed_set_tokens++;
+   }else if(token_changed){
+    reordered_only_tokens++;
    }
    if(token_changed)changed_tokens++;
   }
@@ -728,6 +741,8 @@ static bool full_report_layer_checks(
            <<" rel_l2="<<relative_l2<<" max_abs="<<max_abs
            <<" changed_router_tokens="<<changed_tokens
            <<" changed_router_slots="<<changed_choices
+           <<" changed_router_set_tokens="<<changed_set_tokens
+           <<" reordered_only_tokens="<<reordered_only_tokens
            <<" status="<<(ok?"OK":"CHECK")<<"\n";
  }
  return all_ok;
