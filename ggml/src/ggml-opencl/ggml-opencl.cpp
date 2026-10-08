@@ -10287,6 +10287,103 @@ static void ggml_backend_opencl_buffer_reset(ggml_backend_buffer_t buffer) {
     ctx->reset();
 }
 
+// The default GGML cross-buffer tensor copy falls back to a GPU->host read
+// followed by a host->GPU write when .cpy_tensor is absent.  For the phone's
+// split FFN path the attention/Router output and GPU FFN input are ordinary
+// dense tensors in the SAME OpenCL context: use a device-side copy instead.
+//
+// Intentionally restricted to contiguous non-view F32/I32 tensors.  Quantized
+// tensor extras may use Adreno SoA component buffers and MUST continue through
+// their existing conversion path.  Refuse all cross-device/context copies,
+// views and overlapping alias regions without enqueueing anything, so the
+// generic ggml-backend.cpp fallback remains available.
+static bool ggml_backend_opencl_buffer_copy_tensor(
+        ggml_backend_buffer_t dst_buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    const char * enabled = std::getenv("GGML_OPENCL_DIRECT_COPY");
+    if (enabled != nullptr && std::strcmp(enabled, "0") == 0) {
+        return false;
+    }
+    if (src == nullptr || dst == nullptr || src->buffer == nullptr ||
+            dst->buffer != dst_buffer || src->view_src != nullptr ||
+            dst->view_src != nullptr ||
+            (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_I32) ||
+            src->type != dst->type ||
+            !ggml_are_same_layout(src, dst) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+            src->extra == nullptr || dst->extra == nullptr ||
+            src->buffer->buft == nullptr || dst_buffer->buft == nullptr ||
+            src->buffer->buft != dst_buffer->buft ||
+            src->buffer->buft->device == nullptr) {
+        return false;
+    }
+
+    auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(
+        dst_buffer->buft->device->context);
+    if (dev_ctx == nullptr || dev_ctx->backend_ctx == nullptr ||
+            dev_ctx->backend_ctx->context == nullptr ||
+            dev_ctx->backend_ctx->queue == nullptr) {
+        return false;
+    }
+
+    auto * src_extra = static_cast<ggml_tensor_extra_cl *>(src->extra);
+    auto * dst_extra = static_cast<ggml_tensor_extra_cl *>(dst->extra);
+    if (src_extra->data_device == nullptr || dst_extra->data_device == nullptr) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes != ggml_nbytes(dst)) {
+        return false;
+    }
+    if (nbytes == 0) {
+        return true;
+    }
+
+    // Non-view tensors' extras store their absolute offset in cl_mem.
+    const size_t src_offset = (size_t) src_extra->offset;
+    const size_t dst_offset = (size_t) dst_extra->offset;
+    if (src_extra->data_device == dst_extra->data_device) {
+        if (src_offset == dst_offset) {
+            return true;
+        }
+        // clEnqueueCopyBuffer rejects overlapping regions of the same cl_mem.
+        // Keep the host-mediated copy as a safe fallback for aliased tensors.
+        if ((src_offset <= dst_offset && dst_offset - src_offset < nbytes) ||
+            (dst_offset < src_offset && src_offset - dst_offset < nbytes)) {
+            return false;
+        }
+    }
+
+    const bool trace = std::getenv("GGML_OPENCL_DIRECT_COPY_TRACE") != nullptr;
+    const int64_t wall_start_us = trace ? ggml_time_us() : 0;
+    cl_event event = nullptr;
+    cl_int err = clEnqueueCopyBuffer(
+        dev_ctx->backend_ctx->queue, src_extra->data_device,
+        dst_extra->data_device, src_offset, dst_offset, nbytes,
+        0, nullptr, &event);
+    if (err != CL_SUCCESS) {
+        if (trace) {
+            GGML_LOG_INFO("[OPENCL_DIRECT_COPY] status=FALLBACK error=%d type=%s bytes=%zu\n",
+                          err, ggml_type_name(src->type), nbytes);
+        }
+        return false;
+    }
+
+    // The generic cpy_tensor API is synchronous.  Wait on the copy event
+    // before returning, preserving semantics for arbitrary callers.  The
+    // in-order Adreno queue also respects prior Attention/Router kernels.
+    const cl_int wait_err = clWaitForEvents(1, &event);
+    const cl_int release_err = clReleaseEvent(event);
+    CL_CHECK(wait_err);
+    CL_CHECK(release_err);
+    if (trace) {
+        GGML_LOG_INFO("[OPENCL_DIRECT_COPY] status=OK type=%s bytes=%zu wall_ms=%.3f\n",
+                      ggml_type_name(src->type), nbytes,
+                      (ggml_time_us() - wall_start_us) / 1000.0);
+    }
+    return true;
+}
+
 static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_opencl_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_opencl_buffer_get_base,
@@ -10296,7 +10393,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .get_tensor      = */ ggml_backend_opencl_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
     /* .get_tensor_2d   = */ NULL,
-    /* .cpy_tensor      = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_opencl_buffer_copy_tensor,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
 };
