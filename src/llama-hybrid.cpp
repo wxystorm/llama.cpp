@@ -2067,12 +2067,15 @@ static bool llama_hybrid_tensor_phone_ffn_cost_for_chunks(
         double phone_ms  = 0.0;
         double return_ms = 0.0;
 
-        // Route snapshots use the snapshot RPC path.  The return partial uses
-        // the normal PC->Phone transfer profile.
+        // The Phone-primary return is a dedicated asynchronous RPC, not
+        // generic tensor_copy. Prefer measurements of that exact path.
+        const auto & return_profile =
+            profile.phone_prefill_return.empty() ?
+                profile.pc_to_phone : profile.phone_prefill_return;
         if (!llama_hybrid_transfer_cost(
                 profile.snapshot_phone_to_pc, bytes, route_ms) ||
             !llama_hybrid_transfer_cost(
-                profile.pc_to_phone, bytes, return_ms) ||
+                return_profile, bytes, return_ms) ||
             !llama_hybrid_ffn_cost(
                 profile.cpu_ffn, tokens, pc_ratio, pc_ms) ||
             !llama_hybrid_ffn_cost(
@@ -2671,7 +2674,9 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
                 profile.snapshot_phone_to_pc,
                 payload_bytes[ci], route_ms[ci]) ||
             !llama_hybrid_transfer_cost(
-                profile.pc_to_phone,
+                profile.phone_prefill_return.empty() ?
+                    profile.pc_to_phone :
+                    profile.phone_prefill_return,
                 payload_bytes[ci], return_ms[ci])) {
             return false;
         }
@@ -2680,6 +2685,42 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
     const bool pc_ready_schedule =
         std::getenv(
             "GGML_META_PHONE_PREFILL_DISABLE_PC_READY_SCHED") == nullptr;
+
+    // The Qwen3-MoE builder only creates a cross-layer Phone wave when
+    // requested and all of the Phone-owned pipeline features are enabled.
+    // It limits the wave to a prefix of the Tensor stage; subsequent layers
+    // fall back to the ordinary layer-serial graph path.
+    const char * wave_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+    const bool wave_requested =
+        wave_env != nullptr && std::atoi(wave_env) != 0;
+    const bool wave_runtime_ready =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_CHUNK_PIPELINE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_PRODUCER_ROUTE") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_ASYNC_RETURN") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr &&
+        std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
+    int active_wave_layers = 1;
+    if (wave_requested && wave_runtime_ready && tensor_layers > 1) {
+        int wave_max_layers = 2;
+        const char * max_env =
+            std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVE_MAX_LAYERS");
+        if (max_env != nullptr && std::atoi(max_env) > 0) {
+            wave_max_layers =
+                std::max(2, std::atoi(max_env));
+        }
+        active_wave_layers =
+            std::min(tensor_layers, wave_max_layers);
+    }
+
+    const char * v2_env =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_XLAYER_FFN_AHEAD_V2");
+    const bool bounded_v2 =
+        active_wave_layers > 1 &&
+        v2_env != nullptr &&
+        std::atoi(v2_env) != 0;
 
     std::array<double, LLAMA_HYBRID_PHONE_PREFILL_ROUTE_LANES>
         route_lane_available {};
@@ -2696,6 +2737,22 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
     double final_done_ms = 0.0;
 
     for (int layer = 0; layer < tensor_layers; ++layer) {
+        // Outside the graph wave each layer must drain its predecessor and
+        // perform the full layer attention/misc pass, not the chunked
+        // cross-layer prework modeled inside the wave.
+        const bool serial_after_wave =
+            layer > 0 && layer >= active_wave_layers;
+        if (serial_after_wave) {
+            const double predecessor_done =
+                *std::max_element(prev_join.begin(), prev_join.end());
+            phone_available =
+                std::max(phone_available, predecessor_done) +
+                first_common_ms;
+            pc_available =
+                std::max(pc_available, predecessor_done);
+            serial_baseline_ms += first_common_ms;
+        }
+
         const float layer_ratio =
             llama_hybrid_mixed_profile_ratio_for_layer(
                 profile, target_pc_ratio,
@@ -2721,7 +2778,7 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
                 return false;
             }
 
-            if (layer > 0) {
+            if (layer > 0 && !serial_after_wave) {
                 phone_available =
                     std::max(phone_available, prev_join[ci]);
                 phone_available += later_common_ms[ci];
@@ -2740,6 +2797,15 @@ static bool llama_hybrid_tensor_phone_wavefront_cost(
             route_lane_available[route_lane] =
                 route_ready[ci];
 
+            // Bounded V2 enforces both the exact (L-1,C) dependency and a
+            // non-mathematical return-priority guard on (L-1,C+1).
+            // Router/route handoff may proceed first; the next Phone FFN
+            // cannot enter until that predecessor return+join is posted.
+            if (layer > 0 && !serial_after_wave &&
+                    bounded_v2 && ci + 1 < n) {
+                phone_available =
+                    std::max(phone_available, prev_join[ci + 1]);
+            }
             phone_available += phone_cost[ci];
             phone_ffn_ready[ci] = phone_available;
 
