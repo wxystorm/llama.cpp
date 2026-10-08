@@ -766,6 +766,7 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
 
     llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
+    llama_hybrid_transfer_print("phone_prefill_return", profile.phone_prefill_return);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
     llama_hybrid_transfer_print("phone_to_pc", profile.phone_to_pc);
 
@@ -5847,6 +5848,7 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
     }
 
     profile.pc_to_phone.clear();
+    profile.phone_prefill_return.clear();
     profile.snapshot_phone_to_pc.clear();
     profile.phone_to_pc.clear();
     profile.dual_phone_to_pc.clear();
@@ -5920,6 +5922,103 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
 
         profile.pc_to_phone.push_back({ bytes, pc_to_phone_ms, pc_to_phone_wall_ms });
         profile.phone_to_pc.push_back({ bytes, phone_to_pc_ms, phone_to_pc_ms });
+    }
+
+    // Measure the actual Phone-primary return RPC instead of the generic
+    // tensor_copy + fence profile. The timer includes F32->F16 conversion on
+    // the PC and F16->F32 restoration on the Phone when the wire option is on.
+    const auto mark_phone_ffn_ready =
+        reinterpret_cast<ggml_backend_rpc_phone_ffn_mark_ready_t>(
+            llama_hybrid_rpc_get_proc_address(
+                phone_backend,
+                GGML_BACKEND_RPC_PHONE_FFN_MARK_READY_PROC));
+    const auto return_wait =
+        reinterpret_cast<ggml_backend_rpc_set_tensor_async_return_wait_t>(
+            llama_hybrid_rpc_get_proc_address(
+                phone_backend,
+                GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC));
+
+    if (profile.is_moe &&
+            mark_phone_ffn_ready != nullptr &&
+            return_wait != nullptr &&
+            return_wait(phone_backend, nullptr, nullptr, 0, 0, 0)) {
+        static std::atomic<uint64_t> next_return_probe_seq{
+            uint64_t(1) << 62
+        };
+        std::vector<float> return_data(max_bytes / sizeof(float));
+        for (size_t k = 0; k < return_data.size(); ++k) {
+            return_data[k] =
+                static_cast<float>(static_cast<int>(k % 127) - 63) *
+                0.015625f;
+        }
+
+        const char * f16_env = std::getenv("GGML_RPC_RETURN_F16");
+        const bool f16_requested =
+            f16_env != nullptr && std::atoi(f16_env) != 0;
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_RETURN] mode=%s source=async_return_wait sizes=%zu\n",
+            f16_requested ? "F16_REQUESTED" : "F32",
+            chunk_tokens.size());
+
+        profile.phone_prefill_return.reserve(chunk_tokens.size());
+        for (size_t i = 0; i < chunk_tokens.size(); ++i) {
+            const size_t bytes = ggml_nbytes(phone_tensors[i]);
+            std::array<double, LLAMA_HYBRID_RPC_MEASURE_RUNS> samples {};
+
+            for (int run = 0;
+                 run < LLAMA_HYBRID_RPC_WARMUP_RUNS +
+                       LLAMA_HYBRID_RPC_MEASURE_RUNS;
+                 ++run) {
+                rpc_fence(phone_backend);
+
+                // High probe seqs do not collide with runtime FFN-ready seqs.
+                const uint64_t seq =
+                    next_return_probe_seq.fetch_add(
+                        1, std::memory_order_relaxed);
+                if (!mark_phone_ffn_ready(phone_backend, seq)) {
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_PROFILE_RETURN] failed to mark ready\n");
+                    return false;
+                }
+
+                const size_t lane =
+                    static_cast<size_t>(run) %
+                    LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES;
+                const int64_t begin_us = ggml_time_us();
+                const bool sent =
+                    return_wait(
+                        phone_backend,
+                        phone_tensors[i],
+                        return_data.data(),
+                        bytes,
+                        seq,
+                        lane);
+                const int64_t end_us = ggml_time_us();
+                if (!sent) {
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_PROFILE_RETURN] failed bytes=%zu lane=%zu\n",
+                        bytes, lane);
+                    return false;
+                }
+
+                // Retire the async OpenCL write and the retained payload
+                // outside the measured RPC round trip.
+                rpc_fence(phone_backend);
+                if (run >= LLAMA_HYBRID_RPC_WARMUP_RUNS) {
+                    samples[run - LLAMA_HYBRID_RPC_WARMUP_RUNS] =
+                        (end_us - begin_us) / 1000.0;
+                }
+            }
+
+            const double ms = llama_hybrid_rpc_median(samples);
+            profile.phone_prefill_return.push_back({bytes, ms, ms});
+            LLAMA_LOG_INFO(
+                "[HYBRID_PROFILE_RETURN] bytes=%zu ms=%.3f mode=%s\n",
+                bytes, ms, f16_requested ? "F16_REQUESTED" : "F32");
+        }
+    } else {
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_RETURN] unavailable; fallback=pc_to_phone\n");
     }
 
     const auto snapshot_arm = reinterpret_cast<ggml_backend_rpc_snapshot_arm_t>(
@@ -6047,6 +6146,7 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
     }
 
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
+    llama_hybrid_transfer_print("phone_prefill_return", profile.phone_prefill_return);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
     llama_hybrid_transfer_print("phone_to_pc", profile.phone_to_pc);
     for (const auto & point : profile.dual_phone_to_pc) {
