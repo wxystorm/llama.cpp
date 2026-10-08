@@ -372,7 +372,10 @@ static std::unique_ptr<Prefix> make_prefix(
  p->ffn_norm=ggml_mul(c,ggml_rms_norm(c,p->residual,g.rms_eps),norm_f);
  ggml_tensor *router_logits=ggml_mul_mat(c,router,p->ffn_norm);
  ggml_tensor *probs=ggml_soft_max(c,router_logits);
- p->ids=ggml_argsort_top_k(c,probs,topk);
+ // ggml_argsort_top_k returns a STRIDED view of all expert IDs.
+ // Pack the [topk, tokens] view before handing it to separately allocated
+ // FFN graphs, because ggml_backend_tensor_copy requires identical layouts.
+ p->ids=ggml_cont(c,ggml_argsort_top_k(c,probs,topk));
  ggml_tensor *probs_3d=ggml_reshape_3d(c,probs,1,g.experts,tokens);
  ggml_tensor *chosen=ggml_get_rows(c,probs_3d,p->ids);
  chosen=ggml_reshape_2d(c,chosen,topk,tokens);
@@ -429,6 +432,33 @@ static std::vector<float> full_initial(int64_t embd,int tokens) {
  return data;
 }
 
+// Do not let GGML's hard assertion abort the phone process with no context.
+// A view can have the correct shape but a different stride layout.
+static void full_copy_exact(const ggml_tensor *source, ggml_tensor *dest,
+                            int layer, const char *label) {
+ bool compatible=source && dest && source->type==dest->type;
+ for(int i=0;i<GGML_MAX_DIMS && compatible;i++){
+  compatible=source->ne[i]==dest->ne[i] && source->nb[i]==dest->nb[i];
+ }
+ if(!compatible){
+  std::fprintf(stderr,"[PHONE_FULL_LAYOUT_ERROR] layer=%d tensor=%s\n",layer,label);
+  if(source) std::fprintf(stderr,
+   "  src type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+   ggml_type_name(source->type),
+   (long long)source->ne[0],(long long)source->ne[1],
+   (long long)source->ne[2],(long long)source->ne[3],
+   source->nb[0],source->nb[1],source->nb[2],source->nb[3]);
+  if(dest) std::fprintf(stderr,
+   "  dst type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+   ggml_type_name(dest->type),
+   (long long)dest->ne[0],(long long)dest->ne[1],
+   (long long)dest->ne[2],(long long)dest->ne[3],
+   dest->nb[0],dest->nb[1],dest->nb[2],dest->nb[3]);
+  throw std::runtime_error(std::string("FFN input layout mismatch: ")+label);
+ }
+ ggml_backend_tensor_copy(source,dest);
+}
+
 static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
                                std::vector<float> &hidden) {
  FullTimes t;
@@ -452,14 +482,14 @@ static FullTimes run_full_layer(FullLayer &layer,ggml_backend_t gpu,
 
  phase=clk::now();
  trace("ffn_stage_begin");
- ggml_backend_tensor_copy(pre.ffn_norm,gb.x);
- ggml_backend_tensor_copy(pre.ids,gb.ids);
- ggml_backend_tensor_copy(pre.mix,gb.mix);
+ full_copy_exact(pre.ffn_norm,gb.x,layer.il,"GPU/ffn_norm");
+ full_copy_exact(pre.ids,gb.ids,layer.il,"GPU/expert_ids");
+ full_copy_exact(pre.mix,gb.mix,layer.il,"GPU/expert_weights");
  if(layer.cpu_ffn){
   auto &cb=*layer.cpu_ffn;
-  ggml_backend_tensor_copy(pre.ffn_norm,cb.x);
-  ggml_backend_tensor_copy(pre.ids,cb.ids);
-  ggml_backend_tensor_copy(pre.mix,cb.mix);
+  full_copy_exact(pre.ffn_norm,cb.x,layer.il,"CPU/ffn_norm");
+  full_copy_exact(pre.ids,cb.ids,layer.il,"CPU/expert_ids");
+  full_copy_exact(pre.mix,cb.mix,layer.il,"CPU/expert_weights");
   ggml_backend_synchronize(cb.backend);
  }
  ggml_backend_synchronize(gpu);
