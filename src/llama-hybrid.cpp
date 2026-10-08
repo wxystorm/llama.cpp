@@ -4536,6 +4536,10 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
     std::array<std::vector<llama_hybrid_coarse_candidate>, 32> family_top;
     std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_LOW_TENSOR_ANCHORS.size()> low_tensor_top;
     std::array<std::vector<llama_hybrid_coarse_candidate>, LLAMA_HYBRID_TENSOR_DEPTH_BUCKETS> tensor_depth_top;
+    // Do not let all Tensor-free finalists cluster at one Phone depth:
+    // measured pipeline placements can beat deep Tensor despite coarse scores.
+    std::vector<std::vector<llama_hybrid_coarse_candidate>> tensor_free_phone_depth_top(
+        (size_t) profile.n_layer + 1);
     std::vector<llama_hybrid_coarse_candidate> global_top;
     std::vector<llama_hybrid_coarse_candidate> margin_pool;
 
@@ -4764,6 +4768,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                             candidate.family    =
                                 llama_hybrid_topology_family(plan);
 
+                            if (plan.tensor_layers == 0) {
+                                llama_hybrid_coarse_insert_top(
+                                    tensor_free_phone_depth_top[(size_t) plan.phone_layers],
+                                    candidate, 2);
+                            }
                             llama_hybrid_coarse_insert_top(
                                 family_top[(size_t) candidate.family], candidate,
                                 LLAMA_HYBRID_COARSE_FAMILY_TOP_K);
@@ -4832,6 +4841,11 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         }
     }
     for (const auto & bucket : tensor_depth_top) {
+        for (const auto & candidate : bucket) {
+            keep_unique(candidate);
+        }
+    }
+    for (const auto & bucket : tensor_free_phone_depth_top) {
         for (const auto & candidate : bucket) {
             keep_unique(candidate);
         }
@@ -5446,6 +5460,212 @@ static bool llama_hybrid_simulate_prefill(
     return std::isfinite(result.makespan_ms);
 }
 
+// Tensor-free GPU -> CPU -> PHONE has a dedicated asynchronous Phone
+// scheduler at runtime. The generic simulator charges PHONE work to host_ms,
+// incorrectly serializing it with later CPU jobs. Model the real submit/harvest
+// order instead. This is a cost model only; no execution or RPC path changes.
+static bool llama_hybrid_simulate_tensor_free_phone_async(
+        const llama_hybrid_profile &     profile,
+        const llama_hybrid_constraints & constraints,
+        const llama_hybrid_plan &        plan,
+        int                              tokens,
+        llama_hybrid_sim_result &        result) {
+    const auto stages = llama_hybrid_sim_stages(plan);
+    if (stages.size() != 3 ||
+        stages[0].kind != llama_hybrid_sim_stage_kind::GPU ||
+        stages[1].kind != llama_hybrid_sim_stage_kind::CPU ||
+        stages[2].kind != llama_hybrid_sim_stage_kind::PHONE ||
+        tokens <= plan.gpu_chunk_tokens || profile.n_embd <= 0) {
+        return false;
+    }
+
+    int kv_tokens = constraints.score_kv_tokens;
+    if (kv_tokens <= 0) {
+        kv_tokens = constraints.target_ctx > 0 ?
+            constraints.target_ctx : profile.n_ctx_train;
+    }
+    kv_tokens = std::max(kv_tokens, tokens);
+    if (profile.n_ctx_train > 0) {
+        kv_tokens = std::min(kv_tokens, profile.n_ctx_train);
+    }
+
+    const auto chunks = llama_hybrid_split_by_chunk_size(tokens, plan.gpu_chunk_tokens);
+    const size_t phone_limit = llama_hybrid_sim_queue_limit("LLAMA_HYBRID_PHONE_QUEUE_MB");
+    size_t cpu_ready_max = 2;
+    if (const char * env = std::getenv("LLAMA_HYBRID_CPU_READY_MAX")) {
+        const long long parsed = std::atoll(env);
+        if (parsed > 0) {
+            cpu_ready_max = (size_t) parsed;
+        }
+    }
+
+    struct sim_job {
+        int tokens = 0;
+        size_t bytes = 0;
+    };
+    std::deque<sim_job> cpu_queue;
+    std::deque<sim_job> phone_queue;
+    sim_job gpu_job;
+    sim_job phone_job;
+    std::vector<int> phone_blocks;
+    size_t phone_block_index = 0;
+    size_t phone_queued_bytes = 0;
+    size_t phone_inflight_bytes = 0;
+    double host_ms = 0.0;
+    double gpu_finish_ms = 0.0;
+    double phone_finish_ms = 0.0;
+    bool gpu_pending = false;
+    bool phone_pending = false;
+    result = {};
+
+    const auto stage_cost = [&](size_t stage, int job_tokens, double & cost_ms) {
+        return llama_hybrid_sim_stage_cost(
+            profile, plan, stages, stage, job_tokens,
+            kv_tokens, constraints.max_tensor_chunks, cost_ms);
+    };
+    const auto update_phone_peak = [&]() {
+        result.phone_peak_bytes = std::max(
+            result.phone_peak_bytes, phone_queued_bytes + phone_inflight_bytes);
+    };
+    const auto phone_submit_next = [&]() {
+        if (phone_pending) {
+            return false;
+        }
+        if (phone_blocks.empty()) {
+            if (phone_queue.empty()) {
+                return false;
+            }
+            phone_job = phone_queue.front();
+            phone_queue.pop_front();
+            phone_queued_bytes -= phone_job.bytes;
+            phone_inflight_bytes = phone_job.bytes;
+            update_phone_peak();
+            phone_blocks = llama_hybrid_split_by_chunk_size(
+                phone_job.tokens, plan.phone_chunk_tokens);
+            phone_block_index = 0;
+        }
+        if (phone_block_index >= phone_blocks.size()) {
+            return false;
+        }
+
+        double cost_ms = 0.0;
+        if (!stage_cost(2, phone_blocks[phone_block_index], cost_ms)) {
+            return false;
+        }
+        phone_finish_ms = std::max(host_ms, phone_finish_ms) + cost_ms;
+        result.downstream_ms += cost_ms;
+        phone_pending = true;
+        return true;
+    };
+    const auto phone_harvest = [&]() {
+        if (!phone_pending) {
+            return false;
+        }
+        host_ms = std::max(host_ms, phone_finish_ms);
+        phone_pending = false;
+        ++phone_block_index;
+        // The real harvest immediately submits the next Phone block.
+        if (phone_block_index < phone_blocks.size()) {
+            return phone_submit_next();
+        }
+        phone_blocks.clear();
+        phone_block_index = 0;
+        phone_inflight_bytes = 0;
+        phone_job = {};
+        return true;
+    };
+    const auto gpu_harvest = [&]() {
+        if (!gpu_pending) {
+            return false;
+        }
+        result.gpu_wait_ms += std::max(0.0, gpu_finish_ms - host_ms);
+        host_ms = std::max(host_ms, gpu_finish_ms);
+        cpu_queue.push_back(gpu_job);
+        gpu_job = {};
+        gpu_pending = false;
+        return true;
+    };
+    const auto has_ready = [&]() {
+        return !cpu_queue.empty() || !phone_queue.empty() ||
+               phone_pending || !phone_blocks.empty();
+    };
+    const auto run_ready_one = [&]() {
+        // Runtime first launches Phone asynchronously when the device is idle.
+        if (!phone_pending && phone_blocks.empty() && !phone_queue.empty()) {
+            if (!phone_submit_next()) {
+                return false;
+            }
+        }
+        // Queue pressure can force a Phone harvest ahead of CPU work.
+        if (phone_queued_bytes >= phone_limit && phone_pending) {
+            return phone_harvest();
+        }
+        if (!cpu_queue.empty()) {
+            const sim_job job = cpu_queue.front();
+            cpu_queue.pop_front();
+            double cost_ms = 0.0;
+            if (!stage_cost(1, job.tokens, cost_ms)) {
+                return false;
+            }
+            host_ms += cost_ms;
+            result.downstream_ms += cost_ms;
+            phone_queue.push_back(job);
+            phone_queued_bytes += job.bytes;
+            update_phone_peak();
+            return true;
+        }
+        if (phone_pending) {
+            return phone_harvest();
+        }
+        if (!phone_blocks.empty() || !phone_queue.empty()) {
+            return phone_submit_next();
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        if (gpu_pending) {
+            while (cpu_queue.size() >= cpu_ready_max) {
+                if (!run_ready_one()) {
+                    return false;
+                }
+            }
+            if (!gpu_harvest()) {
+                return false;
+            }
+        }
+
+        const int job_tokens = chunks[i];
+        double gpu_ms = 0.0;
+        if (!stage_cost(0, job_tokens, gpu_ms)) {
+            return false;
+        }
+        gpu_job = {
+            job_tokens,
+            (size_t) profile.n_embd * (size_t) job_tokens * sizeof(float),
+        };
+        gpu_finish_ms = std::max(host_ms, gpu_finish_ms) + gpu_ms;
+        result.gpu_busy_ms += gpu_ms;
+        gpu_pending = true;
+
+        if (has_ready() && !run_ready_one()) {
+            return false;
+        }
+        if (i + 1 == chunks.size()) {
+            if (!gpu_harvest()) {
+                return false;
+            }
+            while (has_ready()) {
+                if (!run_ready_one()) {
+                    return false;
+                }
+            }
+        }
+    }
+    result.makespan_ms = host_ms;
+    return std::isfinite(result.makespan_ms);
+}
+
 bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
                              const llama_hybrid_constraints & constraints,
                              llama_hybrid_plan &              plan) {
@@ -5672,13 +5892,25 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         candidate.predicted_tensor_peak_bytes = 0;
         candidate.predicted_phone_peak_bytes = 0;
 
+        const bool tensor_free_queue =
+            candidate.tensor_layers == 0 &&
+            llama_hybrid_tensor_free_stage_queue_eligible(
+                profile, candidate, work_tokens);
         if (!candidate.tensor_phone_primary &&
-            (candidate.tensor_layers > 0 ||
-             llama_hybrid_tensor_free_stage_queue_eligible(profile, candidate, work_tokens)) &&
+            (candidate.tensor_layers > 0 || tensor_free_queue) &&
             !llama_hybrid_sim_stages(candidate).empty()) {
+            const char * disable_async =
+                std::getenv("LLAMA_HYBRID_DISABLE_PHONE_ASYNC");
+            const bool phone_async = tensor_free_queue &&
+                candidate.pc_layers > candidate.gpu_pc_layers &&
+                (disable_async == nullptr || std::atoi(disable_async) == 0);
             llama_hybrid_sim_result sim;
-            if (!llama_hybrid_simulate_prefill(
-                    profile, constraints, candidate, work_tokens, false, sim)) {
+            const bool ok = phone_async ?
+                llama_hybrid_simulate_tensor_free_phone_async(
+                    profile, constraints, candidate, work_tokens, sim) :
+                llama_hybrid_simulate_prefill(
+                    profile, constraints, candidate, work_tokens, false, sim);
+            if (!ok) {
                 return false;
             }
             candidate.predicted_ms = sim.makespan_ms;
@@ -8723,14 +8955,18 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             "[HYBRID_PLAN_FAMILY] family=%s feasible=%zu score_tokens=%d "
             "T=%d primary=%s P=%d C=%d G=%d R=%.3f "
             "XG=%d XC=%d XT=%d XP=%d predicted_ms=%.3f "
-            "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f\n",
+            "gpu_busy_ms=%.3f downstream_ms=%.3f gpu_wait_ms=%.3f "
+            "stage_queue_eligible=%d\n",
             family, feasible, constraints.target_ubatch_tokens,
             p.tensor_layers, p.tensor_phone_primary ? "PHONE" : "PC",
             p.phone_layers, p.pc_layers, p.gpu_pc_layers, p.tensor_pc_ratio,
             p.gpu_chunk_tokens, p.cpu_chunk_tokens,
             p.tensor_chunk_tokens, p.phone_chunk_tokens, p.predicted_ms,
             p.predicted_gpu_busy_ms, p.predicted_downstream_ms,
-            p.predicted_gpu_wait_ms);
+            p.predicted_gpu_wait_ms,
+            p.tensor_layers == 0 &&
+            llama_hybrid_tensor_free_stage_queue_eligible(
+                profile, p, constraints.target_ubatch_tokens) ? 1 : 0);
     };
     print_family_best("T0", tensor_free_feasible, best_tensor_free);
     print_family_best("TENSOR", tensor_feasible, best_tensor);
