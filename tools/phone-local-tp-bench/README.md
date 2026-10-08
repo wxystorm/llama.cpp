@@ -173,3 +173,51 @@ Trace phases: attention_router_begin/ok, ffn_stage_begin/ok,
 ffn_parallel_begin/ok, join_begin/ok. No effect when PHONE_FULL_TRACE
 is unset. This allows isolating an OpenCL/CPU failure without verbose
 kernel-level logging.
+
+
+## Stage and correctness breakdown
+
+The --full-layer mode now times the six Router-to-FFN tensor copies
+and two explicit backend synchronizations separately.
+
+- [PHONE_FULL_STAGE_BYTES]: bytes for ffn_norm, expert IDs and expert mixture weights.
+- [PHONE_FULL_STAGE]: per-repetition gpu_norm_ms, gpu_ids_ms, gpu_mix_ms,
+  cpu_norm_ms, cpu_ids_ms, cpu_mix_ms, cpu_sync_ms, gpu_sync_ms,
+  other_ms, accounted_ms and total_ms.
+- [PHONE_FULL_STAGE_SUM]: per-layer medians for every copy, sync and total Stage.
+- [PHONE_FULL_DIAG]: one additional, untimed pass per mode.
+- [PHONE_FULL_LAYER_CHECK]: per-layer relative L2, maximum absolute error,
+  changed_router_tokens, changed_router_slots and status.
+
+Each copy duration is the wall-clock duration of ggml_backend_tensor_copy,
+NOT necessarily direct DMA time. The backend can implicitly wait for device
+work or fall back to host transfer. Individual medians therefore need not
+sum to the median Stage total.
+
+GPU-only and CPU+GPU each get one separate UNTIMED diagnostic pass. It
+collects the hidden state after every layer and GPU Router Top-K IDs.
+Any per-layer relative L2 >= 0.03 returns CHECK and exit code 2.
+Changed expert selection is reported for diagnosis, not considered a
+standalone failure.
+
+Also, [PHONE_FULL_RUN] wall time is recorded BEFORE per-layer log printing;
+terminal formatting and printing no longer contribute to the wall time.
+Be aware of this accounting change when comparing against older logs.
+
+### Run on Termux
+
+    git pull --ff-only origin phone-local-tensor-bench
+    cmake --build build-phone-local --target llama-phone-local-tp-bench -j4
+    set -o pipefail
+    LD_LIBRARY_PATH=/vendor/lib64 ./build-phone-local/bin/llama-phone-local-tp-bench \
+      -m ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+      --full-layer --layer 0 --layers 2 --tokens 400 --topk 8 \
+      --cpu-ratio 0.25 --threads 8 --warmup 2 --runs 5 \
+      2>&1 | tee phone-full-stage-breakdown.log
+
+    grep -E '\[PHONE_FULL_(STAGE_SUM|LAYER_CHECK|CHECK|SUM)\]' \
+      phone-full-stage-breakdown.log
+
+If Stage has spikes, compare CPU ffn_norm copies (large activation tensors)
+against small ids/mix copies, then the two explicit synchronization calls.
+Do not prematurely conclude that time attributed to a copy is only memcpy.
