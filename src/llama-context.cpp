@@ -5487,7 +5487,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 LLAMA_LOG_DEBUG(
                     "[PRED_CPU_STAGE] ub=%d tokens=%d kv_tokens=%d layers=%d XC=%d "
-                    "pred_total_ms=%.3f pred_per_layer_ms=%.3f "
+                    "profile_threads=%d runtime_threads=%d pred_total_ms=%.3f pred_per_layer_ms=%.3f "
                     "profile_mode=%s profile_range=[%d,%d] "
                     "exact_chunks=%d interp_chunks=%d extrap_chunks=%d "
                     "layer_profile_mode=%s layer_profile_range=[%d,%d]\n",
@@ -5496,6 +5496,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.kv_tokens,
                     cpu_prediction.cpu_layers,
                     cpu_prediction.cpu_chunk_tokens,
+                    cpu_prediction.profile_threads,
+                    cparams.n_threads_batch,
                     cpu_prediction.total_ms,
                     cpu_prediction.per_layer_ms,
                     profile_mode,
@@ -5523,6 +5525,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // calibration is applied to candidate scoring or execution.
                 LLAMA_LOG_DEBUG(
                     "[CPU_COST_BREAKDOWN] ub=%d tokens=%d layers=%d XC=%d "
+                    "profile_threads=%d runtime_threads=%d "
                     "profile_depth=%d score_kv_tokens=%d "
                     "layer_base_ms=%.3f kv_correction_ms=%.3f "
                     "predicted_ms=%.3f actual_compute_ms=%.3f "
@@ -5531,6 +5534,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cpu_prediction.tokens,
                     cpu_prediction.cpu_layers,
                     cpu_prediction.cpu_chunk_tokens,
+                    cpu_prediction.profile_threads,
+                    cparams.n_threads_batch,
                     cpu_prediction.profile_max_layers,
                     cpu_prediction.kv_tokens,
                     cpu_prediction.layer_base_ms,

@@ -8264,8 +8264,17 @@ bool llama_hybrid_profile_moe_full_layer(
     // Never replace the scoring profile vectors with the test measurements.
     const char * thread_diag = std::getenv("LLAMA_HYBRID_CPU_PROFILE_THREAD_DIAG");
     const int test_threads = thread_diag != nullptr ? std::atoi(thread_diag) : 0;
+    const int base_threads =
+        profile.cpu_profile_threads > 0 ?
+            profile.cpu_profile_threads : GGML_DEFAULT_N_THREADS;
+    if (test_threads > 0 && test_threads == base_threads) {
+        LLAMA_LOG_INFO(
+            "[CPU_PROFILE_THREAD_DIAG] status=ALREADY_MATCHED "
+            "base_threads=%d test_threads=%d scoring_unchanged=1\n",
+            base_threads, test_threads);
+    }
     if (test_threads >= 1 && test_threads <= 64 &&
-        test_threads != GGML_DEFAULT_N_THREADS &&
+        test_threads != base_threads &&
         attn_desc.n_ctx_orig >= 64) {
         const auto baseline = std::find_if(
             profile.cpu_layer_blocks.begin(), profile.cpu_layer_blocks.end(),
@@ -8327,7 +8336,7 @@ bool llama_hybrid_profile_moe_full_layer(
             }
             // Restore even when either side-car probe fails. The primary
             // profile vectors retain their original 4-thread measurements.
-            set_threads(cpu_backend, GGML_DEFAULT_N_THREADS);
+            set_threads(cpu_backend, base_threads);
 
             if (branch_ok) {
                 const double base_total_per_layer =
@@ -8347,7 +8356,7 @@ bool llama_hybrid_profile_moe_full_layer(
                     "test_over_base=%.4f "
                     "profile_pool=standalone scoring_unchanged=1\n",
                     LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
-                    GGML_DEFAULT_N_THREADS, test_threads,
+                    base_threads, test_threads,
                     baseline_attn_ms, test_attn_ms,
                     base_branch_per_layer, test_branch_per_layer,
                     base_total_per_layer, test_total_per_layer,
@@ -8393,7 +8402,7 @@ bool llama_hybrid_profile_moe_full_layer(
                                 "test_over_base_kv512=%.4f "
                                 "scoring_unchanged=1\n",
                                 query_tokens, query_tokens, kv_tokens,
-                                GGML_DEFAULT_N_THREADS, test_threads,
+                                base_threads, test_threads,
                                 test_attn_ms, flash_q_ms, flash_kv_ms,
                                 flash_kv_ms - flash_q_ms,
                                 corrected_attn_ms, test_branch_per_layer,
@@ -8425,19 +8434,19 @@ bool llama_hybrid_profile_moe_full_layer(
                         "[CPU_PROFILE_THREAD_KV_DIAG] status=SKIP_BASE_PROBE "
                         "base_threads=%d test_threads=%d "
                         "scoring_unchanged=1\n",
-                        GGML_DEFAULT_N_THREADS, test_threads);
+                        base_threads, test_threads);
                 }
                 LLAMA_LOG_WARN(
                     "[CPU_PROFILE_THREAD_DIAG] status=PROBE_FAILED "
                     "base_threads=%d test_threads=%d scoring_unchanged=1\n",
-                    GGML_DEFAULT_N_THREADS, test_threads);
+                    base_threads, test_threads);
             }
         } else {
             LLAMA_LOG_WARN(
                 "[CPU_PROFILE_THREAD_DIAG] status=UNAVAILABLE "
                 "base_threads=%d test_threads=%d "
                 "has_baseline=%d has_thread_setter=%d\n",
-                GGML_DEFAULT_N_THREADS, test_threads,
+                base_threads, test_threads,
                 has_baseline ? 1 : 0, set_threads != nullptr ? 1 : 0);
         }
     }
