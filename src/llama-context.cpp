@@ -2623,7 +2623,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             "graph_count=%" PRId64 " attn_marks=%" PRId64 " "
             "router_marks=%" PRId64 " layer_marks=%" PRId64 " "
             "pred_available=%d pred_attn_ms=%.3f pred_ffn_misc_ms=%.3f "
-            "pred_total_ms=%.3f status=%d\n",
+            "pred_total_ms=%.3f markers_complete=%d status=%d\n",
             ubatch_id, stage_index, block_index,
             token_begin, token_begin + block_tokens,
             stage.layer_end - stage.layer_begin,
@@ -2640,6 +2640,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             pred_ok ? pred.model_attn_ms : 0.0,
             pred_ok ? pred.model_ffn_misc_ms : 0.0,
             pred_ok ? pred.total_ms : 0.0,
+            (int) (real_cpu_profile.attention_end_count ==
+                       stage.layer_end - stage.layer_begin &&
+                   real_cpu_profile.router_end_count ==
+                       stage.layer_end - stage.layer_begin &&
+                   real_cpu_profile.layer_end_count ==
+                       stage.layer_end - stage.layer_begin),
             (int) ret);
     }
     if (terminal_discard_meta_backend != nullptr) {

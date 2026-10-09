@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -126,6 +127,78 @@ static void ggml_backend_cpu_stage_profile_accumulate(
     dst.layer_end_count     += src.layer_end_count;
 }
 
+// One line per CPU backend graph, only when explicitly requested. A CPU
+// Stage can comprise many scheduler graphs, so a stage-level cumulative
+// timer cannot assign cross-graph work to Attention without this trace.
+static void ggml_backend_cpu_stage_profile_trace_graph(
+        const struct ggml_cgraph * graph,
+        const struct ggml_cpu_stage_profile & sample) {
+    const char * enabled = std::getenv("LLAMA_HYBRID_REAL_CPU_GRAPH_TRACE");
+    if (enabled == nullptr || std::atoi(enabled) == 0) {
+        return;
+    }
+    int ffn_inp = 0;
+    int argsort = 0;
+    int topk = 0;
+    int l_out = 0;
+    int attn_names = 0;
+    int flash_attn = 0;
+    int compute_nodes = 0;
+    const char * first = "(empty)";
+    const char * last = "(empty)";
+    const char * first_op = "(empty)";
+    const char * last_op = "(empty)";
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        const char * name = node->name;
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            if (compute_nodes == 0) {
+                first = name;
+                first_op = ggml_op_name(node->op);
+            }
+            last = name;
+            last_op = ggml_op_name(node->op);
+            ++compute_nodes;
+        }
+        if (std::strncmp(name, "ffn_inp-", 8) == 0) {
+            ++ffn_inp;
+        }
+        if (std::strncmp(name, "ffn_moe_argsort-", 16) == 0) {
+            ++argsort;
+        }
+        if (std::strncmp(name, "ffn_moe_topk-", 13) == 0) {
+            ++topk;
+        }
+        if (std::strncmp(name, "l_out-", 6) == 0) {
+            ++l_out;
+        }
+        if (std::strncmp(name, "attn_", 5) == 0 ||
+            std::strncmp(name, "Qcur", 4) == 0 ||
+            std::strncmp(name, "Kcur", 4) == 0 ||
+            std::strncmp(name, "Vcur", 4) == 0) {
+            ++attn_names;
+        }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ++flash_attn;
+        }
+    }
+    GGML_LOG_DEBUG(
+        "[CPU_REAL_GRAPH] graph_ms=%.3f nodes=%d compute_nodes=%d "
+        "first=%s first_op=%s last=%s last_op=%s "
+        "ffn_inp=%d argsort=%d topk_view=%d l_out=%d "
+        "attn_named=%d flash_attn=%d "
+        "measured_attn_ms=%.3f measured_router_ms=%.3f "
+        "measured_expert_ms=%.3f measured_other_ms=%.3f\n",
+        sample.graph_us / 1000.0,
+        graph->n_nodes, compute_nodes,
+        first, first_op, last, last_op,
+        ffn_inp, argsort, topk, l_out, attn_names, flash_attn,
+        sample.attention_us / 1000.0,
+        sample.router_us / 1000.0,
+        sample.expert_us / 1000.0,
+        sample.other_us / 1000.0);
+}
+
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
 
@@ -186,6 +259,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     cpu_plan->cplan.stage_profile = nullptr;
     if (cpu_ctx->stage_profile_active) {
         ggml_backend_cpu_stage_profile_accumulate(cpu_ctx->stage_profile, graph_profile);
+        ggml_backend_cpu_stage_profile_trace_graph(&cpu_plan->cgraph, graph_profile);
     }
     return status;
 }
@@ -217,6 +291,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     const ggml_status status = ggml_graph_compute(cgraph, &cplan);
     if (cpu_ctx->stage_profile_active) {
         ggml_backend_cpu_stage_profile_accumulate(cpu_ctx->stage_profile, graph_profile);
+        ggml_backend_cpu_stage_profile_trace_graph(cgraph, graph_profile);
     }
     return status;
 }

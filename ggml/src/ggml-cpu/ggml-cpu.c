@@ -3144,9 +3144,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (ggml_cpu_stage_name_prefix(name, "ffn_inp-")) {
                 next_phase = GGML_CPU_STAGE_ROUTER;
                 ++stage_profile->attention_end_count;
-            } else if (ggml_cpu_stage_name_prefix(name, "ffn_moe_topk-")) {
-                next_phase = GGML_CPU_STAGE_EXPERT;
-                ++stage_profile->router_end_count;
+            } else if (ggml_cpu_stage_name_prefix(name, "ffn_moe_argsort-") ||
+                       ggml_cpu_stage_name_prefix(name, "ffn_moe_topk-")) {
+                // ggml_argsort_top_k returns a VIEW on the computed
+                // GGML_OP_ARGSORT tensor. The VIEW (ffn_moe_topk) can be
+                // skipped by the CPU executor; its src[0] has the executable
+                // name ffn_moe_argsort, so use that as the primary boundary.
+                if (stage_phase == GGML_CPU_STAGE_ROUTER) {
+                    next_phase = GGML_CPU_STAGE_EXPERT;
+                    ++stage_profile->router_end_count;
+                }
             } else if (ggml_cpu_stage_name_prefix(name, "l_out-")) {
                 next_phase = node_n == last_layer_end ?
                     GGML_CPU_STAGE_OTHER : GGML_CPU_STAGE_ATTENTION;
