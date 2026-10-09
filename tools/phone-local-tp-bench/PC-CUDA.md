@@ -84,3 +84,52 @@ production end-to-end CUDA inference.
 The full-layer run must pass PHONE_FULL_CHECK and PHONE_FULL_LAYER_CHECK
 before using its speedup figure as meaningful. CUDA/Windows execution
 has not yet been compiled or benchmarked on the user's PC.
+
+## Dense SwiGLU FFN (Qwen2 / Qwen3 / Llama / Mistral)
+
+The new --dense mode reuses the CPU/CUDA intermediate-width partition, but
+loads dense 2D GGUF weights: blk.N.ffn_gate.weight, blk.N.ffn_up.weight
+and blk.N.ffn_down.weight. It evaluates down(silu(gate(x)) * up(x)).
+Do not combine --dense with --full-layer: this is FFN-only, not Attention.
+
+Use an actual **dense** GGUF (not Qwen3-30B-A3B MoE). Replace the example
+path with the dense file already on your PC. First rebuild this branch:
+
+~~~powershell
+git pull --ff-only origin pc-local-tensor-bench
+cmake --build build-pc-local --config Release --target llama-phone-local-tp-bench --parallel 8
+$exe = '.\build-pc-local\bin\Release\llama-phone-local-tp-bench.exe'
+$denseModel = 'E:\llama\models\Qwen3-32B-Q4_K_M.gguf'
+& $exe -m $denseModel --dense --gpu-backend cuda --layer 0 --layers 1 --tokens 400 --cpu-ratio 0.10 --threads 8 --warmup 2 --runs 5 2>&1 | Tee-Object -FilePath pc-dense-400-r10.log
+~~~
+
+The output reports [DENSE_LOCAL_LAYER] dimensions and actual split,
+[DENSE_LOCAL_TP] per-trial GPU_ONLY and CPU_GPU Stage/GPU/CPU/Join time,
+[DENSE_LOCAL_CHECK] relative L2 check, and [DENSE_LOCAL_SUM] medians.
+
+Once the first run passes, sweep tokens and ratios:
+
+~~~powershell
+foreach ($n in @(1,16,64,128,400)) {
+  foreach ($ratio in @(0.05,0.10,0.20)) {
+    $tag = $ratio.ToString('0.00',[System.Globalization.CultureInfo]::InvariantCulture)
+    & $exe -m $denseModel --dense --gpu-backend cuda --layer 0 --layers 1 --tokens $n --cpu-ratio $ratio --threads 8 --warmup 2 --runs 5 2>&1 | Tee-Object -FilePath "pc-dense-$n-r$tag.log"
+  }
+}
+Select-String -Path 'pc-dense-*.log' -Pattern '\[DENSE_LOCAL_(LAYER|CHECK|SUM)\]'
+~~~
+
+The 2D dense FFN often has a much wider intermediate dimension than MoE
+experts, so its 128/QK_K alignment allows finer nonzero CPU ratios.
+
+GPU-only times synchronized GPU compute. CPU+GPU includes CUDA-to-CPU
+input staging, concurrent CPU/GPU FFN computation, host-side partial
+sum, and re-upload of the result. GPU-only output readback is only done
+outside the timed repetitions for correctness. This is a reasonable
+conservative mixed path, but Stage/Join overhead differs between modes.
+
+Both modes use **real quantized GGUF FFN weights**, synthetic activations,
+and SwiGLU. Not full transformer inference: no embeddings, Attention,
+RMSNorm, KV cache, sampling or RPC. A 1-token run is an FFN shape probe,
+not full decode speed. This version has not yet been built or run on the
+user Windows CUDA machine; collect logs if the first run fails.
