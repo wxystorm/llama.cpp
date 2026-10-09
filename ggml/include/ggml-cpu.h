@@ -7,6 +7,22 @@
 extern "C" {
 #endif
 
+    // Timings for actual CPU graph execution, sampled at existing node
+    // barriers. Only populated when a CPU stage explicitly opts in.
+    // All durations are elapsed (wall) microseconds, NOT CPU core-time.
+    struct ggml_cpu_stage_profile {
+        int64_t attention_us;
+        int64_t router_us;
+        int64_t expert_us;
+        int64_t other_us;
+        int64_t graph_us;
+
+        int64_t graph_count;
+        int64_t attention_end_count;
+        int64_t router_end_count;
+        int64_t layer_end_count;
+    };
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {
@@ -22,6 +38,10 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // Optional profile target, provided by the CPU backend for the
+        // duration of ggml_graph_compute(). Null means no extra timing.
+        struct ggml_cpu_stage_profile * stage_profile;
     };
 
     // numa strategies

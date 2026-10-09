@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
@@ -2582,8 +2583,65 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 "disabled-by-env" : "requires-single-split");
     }
 
+    // Profile the ACTUAL CPU graph (and only this stage block) when asked.
+    // The hook is resolved dynamically because CPU can be a loaded backend.
+    using cpu_profile_control_fn = bool (*)(
+        ggml_backend_t, int, struct ggml_cpu_stage_profile *);
+    cpu_profile_control_fn cpu_profile_control = nullptr;
+    bool cpu_profile_armed = false;
+    if (stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+        block_tokens >= 16 && backend_cpu != nullptr) {
+        const char * enabled = std::getenv("LLAMA_HYBRID_REAL_CPU_PROFILE");
+        if (enabled != nullptr && std::atoi(enabled) != 0) {
+            ggml_backend_reg_t reg =
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            cpu_profile_control =
+                reinterpret_cast<cpu_profile_control_fn>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cpu_stage_profile_control"));
+            if (cpu_profile_control != nullptr) {
+                cpu_profile_armed = cpu_profile_control(backend_cpu, 0, nullptr);
+            }
+        }
+    }
+
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    const int64_t compute_end_us = timing != nullptr ? ggml_time_us() : 0;
+    struct ggml_cpu_stage_profile real_cpu_profile = {};
+    const bool real_cpu_profile_ok = cpu_profile_armed &&
+        cpu_profile_control(backend_cpu, 1, &real_cpu_profile);
+    if (real_cpu_profile_ok) {
+        llama_hybrid_cpu_compute_prediction pred = {};
+        const bool pred_ok = llama_hybrid_runtime_predict_cpu_compute(
+            (int) block_tokens, pred);
+        LLAMA_LOG_DEBUG(
+            "[CPU_REAL_OPS] ub=%d stage=%zu block=%zu "
+            "tokens=[%u,%u) n_layers=%d "
+            "attn_ms=%.3f router_to_topk_ms=%.3f expert_tail_ms=%.3f "
+            "other_ms=%.3f graph_ms=%.3f "
+            "graph_count=%" PRId64 " attn_marks=%" PRId64 " "
+            "router_marks=%" PRId64 " layer_marks=%" PRId64 " "
+            "pred_available=%d pred_attn_ms=%.3f pred_ffn_misc_ms=%.3f "
+            "pred_total_ms=%.3f status=%d\n",
+            ubatch_id, stage_index, block_index,
+            token_begin, token_begin + block_tokens,
+            stage.layer_end - stage.layer_begin,
+            real_cpu_profile.attention_us / 1000.0,
+            real_cpu_profile.router_us / 1000.0,
+            real_cpu_profile.expert_us / 1000.0,
+            real_cpu_profile.other_us / 1000.0,
+            real_cpu_profile.graph_us / 1000.0,
+            real_cpu_profile.graph_count,
+            real_cpu_profile.attention_end_count,
+            real_cpu_profile.router_end_count,
+            real_cpu_profile.layer_end_count,
+            pred_ok ? 1 : 0,
+            pred_ok ? pred.model_attn_ms : 0.0,
+            pred_ok ? pred.model_ffn_misc_ms : 0.0,
+            pred_ok ? pred.total_ms : 0.0,
+            (int) ret);
+    }
     if (terminal_discard_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_terminal_discard(
             terminal_discard_meta_backend, false);
@@ -2604,7 +2662,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             stage.layer_begin, stage.layer_end, block_tokens, (int) ret);
     }
     if (timing != nullptr) {
-        timing->compute_range_us += ggml_time_us() - compute_begin_us;
+        // Keep the stage's existing compute timer independent of diagnostic
+        // extraction and output formatting.
+        timing->compute_range_us += compute_end_us - compute_begin_us;
     }
     if (ret != GGML_STATUS_SUCCESS) {
         return nullptr;

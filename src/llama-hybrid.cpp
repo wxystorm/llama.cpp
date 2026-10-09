@@ -5007,6 +5007,18 @@ bool llama_hybrid_runtime_predict_cpu_compute(
         return false;
     }
 
+    double model_attn_ms = 0.0;
+    const auto cpu_chunks = llama_hybrid_split_by_chunk_size(
+        tokens, plan.cpu_chunk_tokens);
+    for (const int chunk_tokens : cpu_chunks) {
+        double attn_chunk_ms = 0.0;
+        if (!llama_hybrid_attn_cost(
+                profile.cpu_attn, chunk_tokens, kv_tokens, attn_chunk_ms)) {
+            return false;
+        }
+        model_attn_ms += cpu_layers * attn_chunk_ms;
+    }
+
     int profile_min_tokens = std::numeric_limits<int>::max();
     int profile_max_tokens = 0;
     int profile_min_layers = std::numeric_limits<int>::max();
@@ -5068,11 +5080,16 @@ bool llama_hybrid_runtime_predict_cpu_compute(
         cpu_layers > 0 ? total_ms / cpu_layers : 0.0;
     prediction.layer_base_ms                = layer_base_ms;
     prediction.kv_correction_ms             = kv_correction_ms;
+    prediction.model_attn_ms                = model_attn_ms;
+    // Preserve the exact original total, including its nonnegative clamp.
+    prediction.model_ffn_misc_ms            = total_ms - model_attn_ms;
 
     return std::isfinite(prediction.total_ms) &&
            std::isfinite(prediction.per_layer_ms) &&
            std::isfinite(prediction.layer_base_ms) &&
-           std::isfinite(prediction.kv_correction_ms);
+           std::isfinite(prediction.kv_correction_ms) &&
+           std::isfinite(prediction.model_attn_ms) &&
+           std::isfinite(prediction.model_ffn_misc_ms);
 }
 
 enum class llama_hybrid_sim_stage_kind {

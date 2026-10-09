@@ -107,7 +107,24 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    bool                          stage_profile_active = false;
+    struct ggml_cpu_stage_profile stage_profile = {};
 };
+
+static void ggml_backend_cpu_stage_profile_accumulate(
+        struct ggml_cpu_stage_profile & dst,
+        const struct ggml_cpu_stage_profile & src) {
+    dst.attention_us        += src.attention_us;
+    dst.router_us           += src.router_us;
+    dst.expert_us           += src.expert_us;
+    dst.other_us            += src.other_us;
+    dst.graph_us            += src.graph_us;
+    dst.graph_count         += src.graph_count;
+    dst.attention_end_count += src.attention_end_count;
+    dst.router_end_count    += src.router_end_count;
+    dst.layer_end_count     += src.layer_end_count;
+}
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
@@ -161,10 +178,16 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
-
-    GGML_UNUSED(backend);
+    struct ggml_cpu_stage_profile graph_profile = {};
+    cpu_plan->cplan.stage_profile = cpu_ctx->stage_profile_active ? &graph_profile : nullptr;
+    const ggml_status status = ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    cpu_plan->cplan.stage_profile = nullptr;
+    if (cpu_ctx->stage_profile_active) {
+        ggml_backend_cpu_stage_profile_accumulate(cpu_ctx->stage_profile, graph_profile);
+    }
+    return status;
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -187,7 +210,15 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    struct ggml_cpu_stage_profile graph_profile = {};
+    if (cpu_ctx->stage_profile_active) {
+        cplan.stage_profile = &graph_profile;
+    }
+    const ggml_status status = ggml_graph_compute(cgraph, &cplan);
+    if (cpu_ctx->stage_profile_active) {
+        ggml_backend_cpu_stage_profile_accumulate(cpu_ctx->stage_profile, graph_profile);
+    }
+    return status;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -248,6 +279,35 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
 bool ggml_backend_is_cpu(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cpu_guid());
+}
+
+// Function-pointer hook resolved through the CPU backend registry. The caller
+// explicitly brackets ONE real CPU stage block; unrelated graphs are never
+// instrumented unless they execute inside that bracket.
+static bool ggml_backend_cpu_stage_profile_control(
+        ggml_backend_t backend_cpu,
+        int action,
+        struct ggml_cpu_stage_profile * result) {
+    if (!ggml_backend_is_cpu(backend_cpu)) {
+        return false;
+    }
+    auto * ctx = (struct ggml_backend_cpu_context *) backend_cpu->context;
+    if (action == 0) {
+        if (ctx->stage_profile_active) {
+            return false;
+        }
+        ctx->stage_profile = {};
+        ctx->stage_profile_active = true;
+        return true;
+    }
+    if (action == 1 && ctx->stage_profile_active) {
+        ctx->stage_profile_active = false;
+        if (result != nullptr) {
+            *result = ctx->stage_profile;
+        }
+        return true;
+    }
+    return false;
 }
 
 void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
@@ -640,6 +700,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cpu_stage_profile_control") == 0) {
+        return (void *) ggml_backend_cpu_stage_profile_control;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

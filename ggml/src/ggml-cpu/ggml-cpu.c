@@ -3024,6 +3024,34 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+enum ggml_cpu_stage_phase {
+    GGML_CPU_STAGE_OTHER,
+    GGML_CPU_STAGE_ATTENTION,
+    GGML_CPU_STAGE_ROUTER,
+    GGML_CPU_STAGE_EXPERT,
+};
+
+// Stage boundaries come from the actual Qwen3-MoE llama graph. The
+// cumulative intervals are measured after the existing per-node barrier:
+// no graph slicing, no new synchronization, and no synthetic re-execution.
+static bool ggml_cpu_stage_name_prefix(const char * name, const char * prefix) {
+    return strncmp(name, prefix, strlen(prefix)) == 0;
+}
+
+static void ggml_cpu_stage_account(struct ggml_cpu_stage_profile * profile,
+                                   enum ggml_cpu_stage_phase phase,
+                                   int64_t delta_us) {
+    if (delta_us < 0) {
+        return;
+    }
+    switch (phase) {
+        case GGML_CPU_STAGE_ATTENTION: profile->attention_us += delta_us; break;
+        case GGML_CPU_STAGE_ROUTER:    profile->router_us    += delta_us; break;
+        case GGML_CPU_STAGE_EXPERT:    profile->expert_us    += delta_us; break;
+        case GGML_CPU_STAGE_OTHER:     profile->other_us     += delta_us; break;
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3051,6 +3079,33 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #else
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
+
+    // Use only the main ggml worker to maintain timing counters. Every
+    // transition occurs after a barrier already required by ggml.
+    struct ggml_cpu_stage_profile * stage_profile =
+        state->ith == 0 ? cplan->stage_profile : NULL;
+    enum ggml_cpu_stage_phase stage_phase = GGML_CPU_STAGE_OTHER;
+    int last_layer_end = -1;
+    if (stage_profile != NULL) {
+        bool has_ffn_start = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const char * name = cgraph->nodes[i]->name;
+            if (ggml_cpu_stage_name_prefix(name, "ffn_inp-")) {
+                has_ffn_start = true;
+            }
+            if (ggml_cpu_stage_name_prefix(name, "l_out-")) {
+                last_layer_end = i;
+            }
+        }
+        // A split without stage boundary nodes remains OTHER; don't
+        // pretend that it is entirely Attention.
+        if (has_ffn_start) {
+            stage_phase = GGML_CPU_STAGE_ATTENTION;
+        }
+    }
+    const int64_t stage_graph_begin_us =
+        stage_profile != NULL ? ggml_time_us() : 0;
+    int64_t stage_checkpoint_us = stage_graph_begin_us;
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3082,6 +3137,30 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (stage_profile != NULL) {
+            const char * name = node->name;
+            enum ggml_cpu_stage_phase next_phase = stage_phase;
+            if (ggml_cpu_stage_name_prefix(name, "ffn_inp-")) {
+                next_phase = GGML_CPU_STAGE_ROUTER;
+                ++stage_profile->attention_end_count;
+            } else if (ggml_cpu_stage_name_prefix(name, "ffn_moe_topk-")) {
+                next_phase = GGML_CPU_STAGE_EXPERT;
+                ++stage_profile->router_end_count;
+            } else if (ggml_cpu_stage_name_prefix(name, "l_out-")) {
+                next_phase = node_n == last_layer_end ?
+                    GGML_CPU_STAGE_OTHER : GGML_CPU_STAGE_ATTENTION;
+                ++stage_profile->layer_end_count;
+            }
+
+            if (next_phase != stage_phase) {
+                const int64_t now_us = ggml_time_us();
+                ggml_cpu_stage_account(
+                    stage_profile, stage_phase, now_us - stage_checkpoint_us);
+                stage_checkpoint_us = now_us;
+                stage_phase = next_phase;
+            }
+        }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3091,6 +3170,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (stage_profile != NULL) {
+        const int64_t now_us = ggml_time_us();
+        ggml_cpu_stage_account(
+            stage_profile, stage_phase, now_us - stage_checkpoint_us);
+        stage_profile->graph_us += now_us - stage_graph_begin_us;
+        ++stage_profile->graph_count;
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

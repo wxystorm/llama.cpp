@@ -241,6 +241,11 @@ struct llama_hybrid_cpu_compute_prediction {
     // effective KV/Attention correction. Their sum equals total_ms.
     double layer_base_ms    = 0.0;
     double kv_correction_ms = 0.0;
+
+    // Model-only accounting for comparing the actual CPU operators with
+    // the synthetic Attention and complete-layer Profile anchors.
+    double model_attn_ms     = 0.0;
+    double model_ffn_misc_ms = 0.0;
 };
 
 struct llama_hybrid_tensor_compute_prediction {
