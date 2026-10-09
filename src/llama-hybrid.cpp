@@ -8028,6 +8028,138 @@ bool llama_hybrid_profile_moe_full_layer(
             profile.gpu_layer_blocks.front().wall_ms;
     }
 
+    // Experimental depth probes are deliberately kept out of
+    // profile.cpu_layer_blocks. The Planner must continue to score exactly
+    // against the existing one-layer and four-layer CPU anchors until these
+    // new measurements are understood and explicitly adopted.
+    //
+    // Opt in because 8/16 synthetic MoE layers contain DISTINCT expert
+    // weights and can temporarily allocate several GiB at model startup.
+    const char * cpu_depth_diag = std::getenv("LLAMA_HYBRID_CPU_DEPTH_DIAG");
+    if (cpu_depth_diag != nullptr && std::atoi(cpu_depth_diag) != 0) {
+        constexpr size_t mib = 1024ull * 1024ull;
+        size_t max_probe_mib = 8192;
+        if (const char * value = std::getenv("LLAMA_HYBRID_CPU_DEPTH_DIAG_MAX_MIB")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && *end == '\0' && parsed > 0 && parsed <= 65536) {
+                max_probe_mib = (size_t) parsed;
+            }
+        }
+
+        // Refresh free RAM and keep 40% headroom. The explicit MiB cap may
+        // further restrict a probe, never expand it past this safety margin.
+        size_t free_bytes = profile.pc_free_mem;
+        size_t free_now = 0;
+        size_t total_now = 0;
+        if (llama_hybrid_read_backend_memory(cpu_backend, free_now, total_now)) {
+            free_bytes = free_now;
+        }
+        const size_t probe_budget_bytes = std::min(
+            max_probe_mib * mib, (size_t) ((long double) free_bytes * 0.60L));
+
+        LLAMA_LOG_INFO(
+            "[HYBRID_CPU_DEPTH_DIAG] enabled=1 scoring_unchanged=1 "
+            "free_mib=%.1f budget_mib=%.1f cap_mib=%zu "
+            "tokens=64,128,256 depths=4,8,16\n",
+            free_bytes / (double) mib,
+            probe_budget_bytes / (double) mib,
+            max_probe_mib);
+
+        // These extra probes measure the same synthetic MoE branch graph as
+        // the existing 4-layer anchor. Attention is still an independent
+        // per-layer estimate, NOT a measured fused 8/16-layer Attention graph.
+        for (const int tokens : std::array<int, 3>{64, 128, 256}) {
+            if (tokens > attn_desc.n_ctx_orig) {
+                continue;
+            }
+            const auto base = std::find_if(
+                profile.cpu_layer_blocks.begin(), profile.cpu_layer_blocks.end(),
+                [&](const llama_hybrid_layer_compute_point & point) {
+                    return point.tokens == tokens &&
+                        point.layers == LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS;
+                });
+            if (base == profile.cpu_layer_blocks.end()) {
+                LLAMA_LOG_WARN(
+                    "[HYBRID_CPU_DEPTH_DIAG] tokens=%d status=SKIP_NO_4L_BASE\n",
+                    tokens);
+                continue;
+            }
+
+            double attn_ms = 0.0;
+            if (!llama_hybrid_attn_cost(
+                    profile.cpu_attn, tokens, tokens, attn_ms)) {
+                LLAMA_LOG_WARN(
+                    "[HYBRID_CPU_DEPTH_DIAG] tokens=%d status=SKIP_NO_ATTN\n",
+                    tokens);
+                continue;
+            }
+
+            const double per_layer_4 = base->wall_ms /
+                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS;
+            std::array<double, 2> deeper_per_layer = { -1.0, -1.0 };
+            std::array<const char *, 2> probe_status = { "NOT_RUN", "NOT_RUN" };
+            bool earlier_probe_failed = false;
+            for (size_t di = 0; di < 2; ++di) {
+                const int layers = di == 0 ? 8 : 16;
+                // Include metadata, activations, and allocator margin on top
+                // of the raw per-layer synthetic MoE weights.
+                const long double estimated_bytes =
+                    (long double) moe_desc.weight_bytes * layers * 1.25L;
+                const double estimated_mib = (double) (estimated_bytes / mib);
+
+                if (layers > profile.n_layer) {
+                    probe_status[di] = "SKIP_MODEL_DEPTH";
+                } else if (earlier_probe_failed) {
+                    probe_status[di] = "SKIP_PREVIOUS_FAILURE";
+                } else if (probe_budget_bytes == 0 ||
+                           estimated_bytes > (long double) probe_budget_bytes) {
+                    probe_status[di] = "SKIP_MEMORY";
+                } else {
+                    llama_hybrid_graph_timing branch_timing;
+                    if (!llama_hybrid_profile_moe_branch_block_point(
+                            attn_desc, moe_desc, cpu_backend,
+                            layers, tokens, branch_timing)) {
+                        probe_status[di] = "PROBE_FAILED";
+                        earlier_probe_failed = true;
+                    } else {
+                        const double total_ms = branch_timing.wall_ms + layers * attn_ms;
+                        deeper_per_layer[di] = total_ms / layers;
+                        probe_status[di] = "OK";
+                        LLAMA_LOG_INFO(
+                            "[HYBRID_CPU_DEPTH_DIAG] tokens=%d layers=%d "
+                            "status=OK branch_ms=%.3f attn_ms_per_layer=%.3f "
+                            "total_ms=%.3f per_layer_ms=%.3f ratio_to_4=%.4f "
+                            "estimated_mib=%.1f\n",
+                            tokens, layers, branch_timing.wall_ms,
+                            attn_ms, total_ms, deeper_per_layer[di],
+                            per_layer_4 > 0.0 ? deeper_per_layer[di] / per_layer_4 : 0.0,
+                            estimated_mib);
+                    }
+                }
+                if (probe_status[di] != nullptr && deeper_per_layer[di] < 0.0) {
+                    LLAMA_LOG_WARN(
+                        "[HYBRID_CPU_DEPTH_DIAG] tokens=%d layers=%d status=%s "
+                        "estimated_mib=%.1f budget_mib=%.1f\n",
+                        tokens, layers, probe_status[di],
+                        estimated_mib, probe_budget_bytes / (double) mib);
+                }
+            }
+            LLAMA_LOG_INFO(
+                "[HYBRID_CPU_DEPTH_COMPARE] tokens=%d per_layer_4_ms=%.3f "
+                "per_layer_8_ms=%.3f per_layer_16_ms=%.3f "
+                "ratio_8_to_4=%.4f ratio_16_to_4=%.4f "
+                "status_8=%s status_16=%s scoring_unchanged=1\n",
+                tokens, per_layer_4,
+                deeper_per_layer[0], deeper_per_layer[1],
+                per_layer_4 > 0.0 && deeper_per_layer[0] >= 0.0 ?
+                    deeper_per_layer[0] / per_layer_4 : -1.0,
+                per_layer_4 > 0.0 && deeper_per_layer[1] >= 0.0 ?
+                    deeper_per_layer[1] / per_layer_4 : -1.0,
+                probe_status[0], probe_status[1]);
+        }
+    }
+
     return !profile.cpu_layer_blocks.empty() &&
            !profile.phone_layer_blocks.empty() &&
            (gpu_backend == nullptr || !profile.gpu_layer_blocks.empty());
