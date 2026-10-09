@@ -4959,8 +4959,9 @@ static bool llama_hybrid_layer_region_cost(
     return std::isfinite(result_ms);
 }
 
-bool llama_hybrid_runtime_predict_cpu_compute(
-        int tokens, llama_hybrid_cpu_compute_prediction & prediction) {
+static bool llama_hybrid_runtime_predict_cpu_compute_impl(
+        int tokens, int kv_override,
+        llama_hybrid_cpu_compute_prediction & prediction) {
     prediction = {};
     if (tokens <= 0) {
         return false;
@@ -4991,6 +4992,11 @@ bool llama_hybrid_runtime_predict_cpu_compute(
     if (kv_tokens <= 0) {
         kv_tokens = constraints.target_ctx > 0 ?
             constraints.target_ctx : profile.n_ctx_train;
+    }
+    // Opt-in diagnostic can override only the KV width. The original
+    // Planner-compatible entry point always passes kv_override == 0.
+    if (kv_override > 0) {
+        kv_tokens = kv_override;
     }
     kv_tokens = std::max(kv_tokens, tokens);
     if (profile.n_ctx_train > 0) {
@@ -5090,6 +5096,22 @@ bool llama_hybrid_runtime_predict_cpu_compute(
            std::isfinite(prediction.kv_correction_ms) &&
            std::isfinite(prediction.model_attn_ms) &&
            std::isfinite(prediction.model_ffn_misc_ms);
+}
+
+bool llama_hybrid_runtime_predict_cpu_compute(
+        int tokens, llama_hybrid_cpu_compute_prediction & prediction) {
+    return llama_hybrid_runtime_predict_cpu_compute_impl(
+        tokens, 0, prediction);
+}
+
+bool llama_hybrid_runtime_predict_cpu_compute_at_kv(
+        int tokens, int actual_n_kv,
+        llama_hybrid_cpu_compute_prediction & prediction) {
+    if (actual_n_kv <= 0) {
+        return false;
+    }
+    return llama_hybrid_runtime_predict_cpu_compute_impl(
+        tokens, actual_n_kv, prediction);
 }
 
 enum class llama_hybrid_sim_stage_kind {

@@ -569,6 +569,11 @@ LLAMA_API void llama_hybrid_runtime_wave_calibration_set(const llama_hybrid_wave
 LLAMA_API bool llama_hybrid_runtime_wave_calibration_get(llama_hybrid_wave_calibration & calibration);
 LLAMA_API bool llama_hybrid_runtime_predict_cpu_compute(
     int tokens, llama_hybrid_cpu_compute_prediction & prediction);
+// Diagnostic-only: recompute the existing CPU estimate at the KV width of
+// the REAL runtime graph instead of the fixed planner score_kv_tokens.
+// No scoring or plan selection paths call this override.
+LLAMA_API bool llama_hybrid_runtime_predict_cpu_compute_at_kv(
+    int tokens, int actual_n_kv, llama_hybrid_cpu_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(

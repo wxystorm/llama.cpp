@@ -2745,6 +2745,58 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                        stage.layer_end - stage.layer_begin),
             (int) ret);
     }
+    // KV used by the real graph comes from the KV cache context AFTER
+    // apply_ubatch, including its padding. set_stage_range() only slices
+    // cell indexes; it does not change n_kv between XC subblocks.
+    if (ret == GGML_STATUS_SUCCESS &&
+        stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+        block_tokens > 1) {
+        const char * kv_diag = std::getenv("LLAMA_HYBRID_CPU_KV_DIAG");
+        if (kv_diag != nullptr && std::atoi(kv_diag) != 0) {
+            const uint32_t actual_n_kv = kv_mctx->get_n_kv();
+            llama_hybrid_cpu_compute_prediction at_score = {};
+            llama_hybrid_cpu_compute_prediction at_runtime_kv = {};
+            const bool score_ok = llama_hybrid_runtime_predict_cpu_compute(
+                (int) block_tokens, at_score);
+            const bool kv_ok = actual_n_kv > 0 &&
+                llama_hybrid_runtime_predict_cpu_compute_at_kv(
+                    (int) block_tokens, (int) actual_n_kv, at_runtime_kv);
+            if (score_ok && kv_ok) {
+                LLAMA_LOG_DEBUG(
+                    "[CPU_KV_DIAG] ub=%d stage=%zu block=%zu "
+                    "tokens=[%u,%u) block_tokens=%u layers=%d "
+                    "score_kv=%d graph_n_kv_padded=%u "
+                    "score_attn_ms=%.3f graph_kv_attn_ms=%.3f attn_delta_ms=%.3f "
+                    "score_ffn_misc_ms=%.3f graph_kv_ffn_misc_ms=%.3f "
+                    "score_total_ms=%.3f graph_kv_total_ms=%.3f "
+                    "total_delta_ms=%.3f real_ops_valid=%d "
+                    "real_attn_ms=%.3f real_ffn_misc_ms=%.3f "
+                    "runtime_threads=%d scoring_unchanged=1\n",
+                    ubatch_id, stage_index, block_index,
+                    token_begin, token_begin + block_tokens,
+                    block_tokens, stage.layer_end - stage.layer_begin,
+                    at_score.kv_tokens, actual_n_kv,
+                    at_score.model_attn_ms, at_runtime_kv.model_attn_ms,
+                    at_score.model_attn_ms - at_runtime_kv.model_attn_ms,
+                    at_score.model_ffn_misc_ms, at_runtime_kv.model_ffn_misc_ms,
+                    at_score.total_ms, at_runtime_kv.total_ms,
+                    at_score.total_ms - at_runtime_kv.total_ms,
+                    real_cpu_profile_ok ? 1 : 0,
+                    real_cpu_profile_ok ?
+                        real_cpu_profile.attention_us / 1000.0 : -1.0,
+                    real_cpu_profile_ok ?
+                        (real_cpu_profile.router_us + real_cpu_profile.expert_us +
+                         real_cpu_profile.other_us) / 1000.0 : -1.0,
+                    cparams.n_threads_batch);
+            } else {
+                LLAMA_LOG_WARN(
+                    "[CPU_KV_DIAG] ub=%d block=%zu status=PROFILE_UNAVAILABLE "
+                    "score_ok=%d kv_ok=%d graph_n_kv_padded=%u\n",
+                    ubatch_id, block_index, score_ok ? 1 : 0, kv_ok ? 1 : 0,
+                    actual_n_kv);
+            }
+        }
+    }
     if (terminal_discard_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_terminal_discard(
             terminal_discard_meta_backend, false);
