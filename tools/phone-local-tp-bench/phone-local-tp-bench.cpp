@@ -25,9 +25,9 @@ using clk = std::chrono::steady_clock;
 static double ms(clk::time_point t) { return std::chrono::duration<double,std::milli>(clk::now()-t).count(); }
 static void check(bool x,const std::string & msg) { if(!x) throw std::runtime_error(msg); }
 static double med(std::vector<double> x){std::sort(x.begin(),x.end());return x[x.size()/2];}
-struct Opt {std::string model;std::string gpu_backend="auto";int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_gpu=false;bool list_devices=false;bool full_layer=false;};
+struct Opt {std::string model;std::string gpu_backend="auto";int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_gpu=false;bool list_devices=false;bool full_layer=false;bool dense=false;};
 static Opt options(int argc,char **argv) {
- Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_gpu=true;o.gpu_backend="opencl";continue;}if(a=="--probe-gpu"){o.probe_gpu=true;continue;}if(a=="--list-devices"){o.list_devices=true;continue;}if(a=="--full-layer"){o.full_layer=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
+ Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_gpu=true;o.gpu_backend="opencl";continue;}if(a=="--probe-gpu"){o.probe_gpu=true;continue;}if(a=="--list-devices"){o.list_devices=true;continue;}if(a=="--full-layer"){o.full_layer=true;continue;}if(a=="--dense"){o.dense=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
  if(a=="-m")o.model=v;else if(a=="--layer")o.layer=std::stoi(v);else if(a=="--layers")o.layers=std::stoi(v);
  else if(a=="--tokens")o.tokens=std::stoi(v);else if(a=="--topk")o.topk=std::stoi(v);
  else if(a=="--threads")o.threads=std::stoi(v);else if(a=="--runs")o.runs=std::stoi(v);
@@ -35,7 +35,7 @@ static Opt options(int argc,char **argv) {
  else throw std::runtime_error("unknown option "+a);}
  check((!o.model.empty()||o.probe_gpu||o.list_devices)&&o.layer>=0&&o.layers>0&&o.tokens>0&&o.topk>0&&o.threads>0&&o.runs>0&&o.warmup>=0&&o.cpu_ratio>=0&&o.cpu_ratio<1&&
        (o.gpu_backend=="auto"||o.gpu_backend=="cuda"||o.gpu_backend=="opencl"),
-       "invalid benchmark options: --gpu-backend must be auto, cuda or opencl");return o;
+       "invalid benchmark options: --gpu-backend must be auto, cuda or opencl");check(!(o.dense&&o.full_layer),"--dense and --full-layer cannot be combined; dense tests are FFN-only");return o;
 }
 struct File {
  gguf_context *uf=nullptr;ggml_context *ctx=nullptr;std::ifstream f;size_t data=0;
@@ -137,6 +137,65 @@ static std::unique_ptr<Graph> build(File&f,int layer,ggml_backend_t backend,int6
  ggml_backend_tensor_set(b->mix,mix.data(),0,mix.size()*sizeof(float));ggml_backend_synchronize(backend);
  return b;
 }
+// FFN-only dense SwiGLU probe. The same File::load() slicing works for 2D
+// GGUF dense weights (the implicit expert dimension is one). The quantized
+// gate/up weight rows and down weight columns are complementary partitions.
+static std::unique_ptr<Graph> dense_build(
+    File &f,int layer,ggml_backend_t backend,
+    int64_t from,int64_t width,int tokens) {
+ auto gw=f.get(layer,"ffn_gate");
+ auto uw=f.get(layer,"ffn_up");
+ auto dw=f.get(layer,"ffn_down");
+ const int64_t embd=gw.t->ne[0];
+ const int64_t ff=gw.t->ne[1];
+ check(embd>0 && ff>0 && from>=0 && width>0 && from+width<=ff,
+       "invalid dense FFN slice");
+ check(gw.t->ne[2]==1 && uw.t->ne[2]==1 && dw.t->ne[2]==1 &&
+       uw.t->ne[0]==embd && uw.t->ne[1]==ff &&
+       dw.t->ne[0]==ff && dw.t->ne[1]==embd,
+       "dense SwiGLU requires 2D gate/up/down GGUF weights with compatible dimensions");
+ auto b=std::make_unique<Graph>();
+ b->backend=backend;
+ ggml_init_params p={128*ggml_tensor_overhead()+ggml_graph_overhead_custom(64,false),nullptr,true};
+ b->ctx=ggml_init(p);
+ check(b->ctx!=nullptr,"dense graph context allocation failed");
+ b->x=ggml_new_tensor_2d(b->ctx,GGML_TYPE_F32,embd,tokens);
+ b->gate=ggml_new_tensor_2d(b->ctx,gw.t->type,embd,width);
+ b->up=ggml_new_tensor_2d(b->ctx,uw.t->type,embd,width);
+ b->down=ggml_new_tensor_2d(b->ctx,dw.t->type,width,embd);
+ ggml_set_name(b->x,"dense_ffn_input");
+ ggml_set_name(b->gate,"dense_ffn_gate");
+ ggml_set_name(b->up,"dense_ffn_up");
+ ggml_set_name(b->down,"dense_ffn_down");
+ auto gate=ggml_silu(b->ctx,ggml_mul_mat(b->ctx,b->gate,b->x));
+ auto up=ggml_mul_mat(b->ctx,b->up,b->x);
+ b->out=ggml_mul_mat(b->ctx,b->down,ggml_mul(b->ctx,gate,up));
+ b->gf=ggml_new_graph_custom(b->ctx,64,false);
+ ggml_build_forward_expand(b->gf,b->out);
+ for(int i=0;i<ggml_graph_n_nodes(b->gf);i++){
+  auto *op=ggml_graph_node(b->gf,i);
+  check(ggml_backend_supports_op(backend,op),
+        std::string("dense FFN unsupported op on ")+ggml_backend_name(backend)+": "+ggml_op_name(op->op));
+ }
+ std::fprintf(stderr,"[DENSE_LOCAL_BOOT] layer=%d backend=%s phase=alloc_begin ff_width=%lld\n",
+              layer,ggml_backend_name(backend),(long long)width);
+ b->buf=ggml_backend_alloc_ctx_tensors(b->ctx,backend);
+ check(b->buf!=nullptr,"dense backend tensor allocation failed");
+ std::fprintf(stderr,"[DENSE_LOCAL_BOOT] layer=%d backend=%s phase=weights_begin\n",
+              layer,ggml_backend_name(backend));
+ f.load(gw,b->gate,from,width,false);
+ f.load(uw,b->up,from,width,false);
+ f.load(dw,b->down,from,width,true);
+ std::vector<float> input((size_t)embd*tokens);
+ for(size_t i=0;i<input.size();i++)
+  input[i]=0.02f*std::sin(float((i+(size_t)layer*9973)%8191)*0.037f);
+ ggml_backend_tensor_set(b->x,input.data(),0,input.size()*sizeof(float));
+ ggml_backend_synchronize(backend);
+ std::fprintf(stderr,"[DENSE_LOCAL_BOOT] layer=%d backend=%s phase=ready\n",
+              layer,ggml_backend_name(backend));
+ return b;
+}
+
 static double compute(Graph &b){auto t=clk::now();check(ggml_backend_graph_compute(b.backend,b.gf)==GGML_STATUS_SUCCESS,"graph_compute failed");ggml_backend_synchronize(b.backend);return ms(t);}
 static std::vector<float> output(Graph &b){std::vector<float> x((size_t)ggml_nelements(b.out));ggml_backend_tensor_get(b.out,x.data(),0,x.size()*sizeof(float));return x;}
 // CUDA on the PC and OpenCL on the phone share the graph and FFN tests.
@@ -244,6 +303,126 @@ static int run(const Opt&o){
  ggml_backend_free(cpu);ggml_backend_free(gpu);return 0;
 }
 
+
+// Compare GPU-only vs local CPU+GPU parallel FFN using actual dense GGUF
+// SwiGLU weights. This intentionally excludes Attention, Norm and KV cache.
+static int run_dense(const Opt &o){
+ check(o.cpu_ratio>0.0,"--dense requires --cpu-ratio > 0 to compare CPU+GPU");
+ ggml_backend_load_all();
+ auto gpu=ggml_backend_dev_init(device(true,o.gpu_backend),nullptr);
+ auto cpu=ggml_backend_dev_init(device(false,o.gpu_backend),nullptr);
+ check(gpu!=nullptr && cpu!=nullptr,"dense CUDA/CPU backend initialization failed");
+ threads(cpu,o.threads);
+ int status=0;
+ std::cout<<std::fixed<<std::setprecision(3);
+ std::cout<<"[DENSE_LOCAL_CONFIG] gpu="<<ggml_backend_name(gpu)
+          <<" cpu="<<ggml_backend_name(cpu)
+          <<" tokens="<<o.tokens<<" layers="<<o.layers
+          <<" threads="<<o.threads<<" cpu_ratio_request="<<o.cpu_ratio
+          <<" warmup="<<o.warmup<<" runs="<<o.runs
+          <<" activation=swiglu input=synthetic\n";
+ {
+  File f(o.model);
+  const int64_t arch_key=gguf_find_key(f.uf,"general.architecture");
+  check(arch_key>=0,"dense GGUF is missing general.architecture");
+  const std::string arch=gguf_get_val_str(f.uf,arch_key);
+  check(arch=="qwen2" || arch=="qwen3" || arch=="llama" || arch=="mistral",
+        "--dense supports known SwiGLU GGUF architectures: qwen2, qwen3, llama, mistral");
+  for(int il=o.layer;il<o.layer+o.layers;il++){
+   const auto gate=f.get(il,"ffn_gate"),up=f.get(il,"ffn_up"),down=f.get(il,"ffn_down");
+   const int64_t ff=down.t->ne[0],embd=down.t->ne[1];
+   check(ff>0 && embd>0 && gate.t->ne[0]==embd && gate.t->ne[1]==ff &&
+         up.t->ne[0]==embd && up.t->ne[1]==ff &&
+         gate.t->ne[2]==1 && up.t->ne[2]==1 && down.t->ne[2]==1,
+         "incompatible dense SwiGLU weight shapes");
+   const int64_t align=std::lcm<int64_t>(128,ggml_blck_size(down.t->type));
+   check(ff%align==0 && ff>=2*align,
+         "dense FFN width must permit at least two aligned shards");
+   const int64_t blocks=ff/align;
+   const int64_t cpu_blocks=std::min<int64_t>(blocks-1,std::max<int64_t>(1,std::llround(blocks*o.cpu_ratio)));
+   const int64_t cpu_width=cpu_blocks*align,gpu_width=ff-cpu_width;
+   std::cout<<"[DENSE_LOCAL_LAYER] layer="<<il<<" embd="<<embd<<" ffn="<<ff
+            <<" align="<<align<<" gpu_width="<<gpu_width<<" cpu_width="<<cpu_width
+            <<" actual_cpu_ratio="<<double(cpu_width)/ff<<"\n";
+   std::vector<double> gpu_only,mixed,stages,gpu_parts,cpu_parts,joins;
+   std::vector<float> reference,joined;
+   {
+    auto full=dense_build(f,il,gpu,0,ff,o.tokens);
+    for(int rep=-o.warmup;rep<o.runs;rep++){
+     const double t=compute(*full);
+     if(rep>=0){
+      gpu_only.push_back(t);
+      std::cout<<"[DENSE_LOCAL_TP] layer="<<il<<" mode=GPU_ONLY rep="<<rep
+               <<" compute_ms="<<t<<" total_ms="<<t<<"\n";
+     }
+    }
+    reference=output(*full);
+   }
+   {
+    auto gp=dense_build(f,il,gpu,0,gpu_width,o.tokens);
+    auto cp=dense_build(f,il,cpu,gpu_width,cpu_width,o.tokens);
+    for(int rep=-o.warmup;rep<o.runs;rep++){
+     const auto start=clk::now();
+     ggml_backend_tensor_copy(gp->x,cp->x);
+     ggml_backend_synchronize(cpu);
+     const double stage=ms(start);
+     double gpu_ms=0,cpu_ms=0;
+     std::exception_ptr error;
+     std::thread worker([&]{
+      try{cpu_ms=compute(*cp);}
+      catch(...){error=std::current_exception();}
+     });
+     try{gpu_ms=compute(*gp);}catch(...){worker.join();throw;}
+     worker.join();
+     if(error)std::rethrow_exception(error);
+     const auto join_start=clk::now();
+     auto sum=output(*gp);
+     const auto partial=output(*cp);
+     check(sum.size()==partial.size(),"dense FFN partial output shape mismatch");
+     for(size_t i=0;i<sum.size();i++)sum[i]+=partial[i];
+     // Model the return to the GPU-side continuation in both CUDA and OpenCL.
+     ggml_backend_tensor_set(gp->out,sum.data(),0,sum.size()*sizeof(float));
+     ggml_backend_synchronize(gpu);
+     const double join=ms(join_start),total=ms(start);
+     if(rep>=0){
+      stages.push_back(stage);gpu_parts.push_back(gpu_ms);
+      cpu_parts.push_back(cpu_ms);joins.push_back(join);mixed.push_back(total);
+      std::cout<<"[DENSE_LOCAL_TP] layer="<<il<<" mode=CPU_GPU rep="<<rep
+               <<" stage_ms="<<stage<<" gpu_ms="<<gpu_ms
+               <<" cpu_ms="<<cpu_ms<<" join_ms="<<join
+               <<" total_ms="<<total<<"\n";
+     }
+    }
+    joined=output(*gp);
+   }
+   check(reference.size()==joined.size(),"dense FFN result length mismatch");
+   double error=0,norm=0,max_abs=0;
+   for(size_t i=0;i<reference.size();i++){
+    check(std::isfinite(reference[i]) && std::isfinite(joined[i]),"non-finite dense FFN result");
+    const double delta=(double)reference[i]-joined[i];
+    error+=delta*delta;norm+=(double)reference[i]*reference[i];
+    max_abs=std::max(max_abs,std::abs(delta));
+   }
+   const double rel=std::sqrt(error/std::max(norm,1.0e-24));
+   const bool ok=rel<0.03;
+   std::cout<<"[DENSE_LOCAL_CHECK] layer="<<il<<" rel_l2="<<rel
+            <<" max_abs="<<max_abs<<" status="<<(ok?"OK":"CHECK")<<"\n";
+   if(!ok)status=2;
+   const double gpu_med=med(gpu_only),mixed_med=med(mixed);
+   std::cout<<"[DENSE_LOCAL_SUM] layer="<<il
+            <<" gpu_median_ms="<<gpu_med
+            <<" mixed_median_ms="<<mixed_med
+            <<" speedup="<<gpu_med/mixed_med
+            <<" stage_median_ms="<<med(stages)
+            <<" gpu_part_median_ms="<<med(gpu_parts)
+            <<" cpu_part_median_ms="<<med(cpu_parts)
+            <<" join_median_ms="<<med(joins)
+            <<" actual_cpu_ratio="<<double(cpu_width)/ff<<"\n";
+  }
+ }
+ ggml_backend_free(cpu);ggml_backend_free(gpu);
+ return status;
+}
 
 // Full Qwen3-MoE layer experiment: GPU Attention + Router; GPU/CPU MoE FFN.
 // This mode is independent of the legacy FFN-only microbenchmark above.
@@ -911,5 +1090,5 @@ static int run_full(const Opt&o) {
  return status;
 }
 
-int main(int argc,char **argv){try{const Opt o=options(argc,argv);if(o.list_devices)return list_devices();return o.full_layer?run_full(o):run(o);}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
+int main(int argc,char **argv){try{const Opt o=options(argc,argv);if(o.list_devices)return list_devices();return o.dense?run_dense(o):(o.full_layer?run_full(o):run(o));}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
 
