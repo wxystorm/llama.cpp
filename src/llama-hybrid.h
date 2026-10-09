@@ -137,6 +137,22 @@ struct llama_hybrid_attn_desc {
     size_t weight_bytes = 0;
 };
 
+// Optional startup-only synthetic probe, never used by the Planner scorer.
+// 64-query-token Attention is combined with a 4-layer MoE branch at the same
+// CPU thread count; KV correction comes from measured Flash Attention kernels.
+struct llama_hybrid_cpu_thread_kv_diag {
+    int threads        = 0;
+    int query_tokens   = 0;
+    int kv_tokens      = 0;
+    int branch_layers  = 0;
+
+    double attn_base_ms          = 0.0;
+    double flash_base_ms         = 0.0;
+    double flash_long_ms         = 0.0;
+    double attn_long_ms          = 0.0;
+    double branch_per_layer_ms   = 0.0;
+};
+
 struct llama_hybrid_profile {
     bool is_moe = false;
     // Matches the generalized vertical Stage Queue architecture gate in llama-context.cpp.
@@ -158,6 +174,10 @@ struct llama_hybrid_profile {
     std::vector<llama_hybrid_attn_compute_point> cpu_attn;
     std::vector<llama_hybrid_attn_compute_point> phone_attn;
     std::vector<llama_hybrid_attn_compute_point> gpu_attn;
+
+    // Populated only when LLAMA_HYBRID_CPU_PROFILE_KV_DIAG is enabled.
+    // Read-only runtime reference data, deliberately excluded from scoring.
+    llama_hybrid_cpu_thread_kv_diag cpu_thread_kv_diag;
 
     std::vector<llama_hybrid_layer_compute_point> cpu_layer_blocks;
     std::vector<llama_hybrid_layer_compute_point> phone_layer_blocks;
@@ -574,6 +594,8 @@ LLAMA_API bool llama_hybrid_runtime_predict_cpu_compute(
 // No scoring or plan selection paths call this override.
 LLAMA_API bool llama_hybrid_runtime_predict_cpu_compute_at_kv(
     int tokens, int actual_n_kv, llama_hybrid_cpu_compute_prediction & prediction);
+LLAMA_API bool llama_hybrid_runtime_cpu_thread_kv_diag_get(
+    llama_hybrid_cpu_thread_kv_diag & diag);
 LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
     int tokens, llama_hybrid_tensor_compute_prediction & prediction);
 LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(

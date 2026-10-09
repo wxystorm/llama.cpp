@@ -2833,6 +2833,86 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
         }
     }
+    // Direct compare: 8-thread synthetic attention(KV=512) + 4-layer MoE
+    // profile extrapolated to the actual 27-layer CPU_DIRECT graph. Require
+    // matching tokens/KV/threads and 1 CPU split with complete FFN boundaries.
+    // This sidecar never changes the original per-stage execution or scorer.
+    if (ret == GGML_STATUS_SUCCESS &&
+        stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+        block_tokens >= 16 &&
+        real_cpu_profile_ok) {
+        const char * kv_compare_env =
+            std::getenv("LLAMA_HYBRID_CPU_PROFILE_KV_DIAG");
+        if (kv_compare_env != nullptr && std::atoi(kv_compare_env) != 0) {
+            llama_hybrid_cpu_thread_kv_diag probe = {};
+            const bool have_probe =
+                llama_hybrid_runtime_cpu_thread_kv_diag_get(probe);
+            const int real_layers = stage.layer_end - stage.layer_begin;
+            const uint32_t graph_n_kv = kv_mctx->get_n_kv();
+            const bool pure_cpu =
+                n_splits == 1 &&
+                ggml_backend_sched_get_split_backend(sched_use, 0) == backend_cpu;
+            const bool markers_complete =
+                real_cpu_profile.graph_count == 1 &&
+                real_cpu_profile.attention_end_count == real_layers &&
+                real_cpu_profile.router_end_count == real_layers &&
+                real_cpu_profile.layer_end_count == real_layers;
+            if (have_probe &&
+                probe.threads == cparams.n_threads_batch &&
+                probe.query_tokens == (int) block_tokens &&
+                probe.kv_tokens == (int) graph_n_kv &&
+                pure_cpu && markers_complete) {
+                const double predicted_attn =
+                    probe.attn_long_ms * real_layers;
+                const double predicted_moe =
+                    probe.branch_per_layer_ms * real_layers;
+                const double predicted_total = predicted_attn + predicted_moe;
+                const double real_attn =
+                    real_cpu_profile.attention_us / 1000.0;
+                const double real_moe =
+                    (real_cpu_profile.router_us +
+                     real_cpu_profile.expert_us +
+                     real_cpu_profile.other_us) / 1000.0;
+                const double real_total = real_cpu_profile.graph_us / 1000.0;
+                llama_hybrid_cpu_compute_prediction original = {};
+                const bool original_ok =
+                    llama_hybrid_runtime_predict_cpu_compute_at_kv(
+                        (int) block_tokens, (int) graph_n_kv, original);
+                LLAMA_LOG_DEBUG(
+                    "[CPU_THREAD_KV_REAL_COMPARE] status=OK "
+                    "ub=%d stage=%zu block=%zu tokens=[%u,%u) "
+                    "query=%u kv=%u layers=%d threads=%d "
+                    "old_4t_pred_ms=%.3f "
+                    "pred_8t_attn_ms=%.3f real_attn_ms=%.3f "
+                    "pred_8t_moe_ms=%.3f real_moe_ms=%.3f "
+                    "pred_8t_total_ms=%.3f real_total_ms=%.3f "
+                    "pred_minus_real_ms=%.3f real_over_pred=%.4f "
+                    "scoring_unchanged=1\n",
+                    ubatch_id, stage_index, block_index,
+                    token_begin, token_begin + block_tokens,
+                    block_tokens, graph_n_kv, real_layers,
+                    cparams.n_threads_batch,
+                    original_ok ? original.total_ms : -1.0,
+                    predicted_attn, real_attn,
+                    predicted_moe, real_moe,
+                    predicted_total, real_total,
+                    predicted_total - real_total,
+                    predicted_total > 0.0 ?
+                        real_total / predicted_total : 0.0);
+            } else {
+                LLAMA_LOG_DEBUG(
+                    "[CPU_THREAD_KV_REAL_COMPARE] status=SKIP "
+                    "ub=%d block=%zu tokens=%u kv=%u threads=%d "
+                    "probe_ready=%d probe_query=%d probe_kv=%d "
+                    "probe_threads=%d pure_cpu=%d markers_complete=%d\n",
+                    ubatch_id, block_index, block_tokens, graph_n_kv,
+                    cparams.n_threads_batch,
+                    have_probe ? 1 : 0, probe.query_tokens, probe.kv_tokens,
+                    probe.threads, pure_cpu ? 1 : 0,
+                    markers_complete ? 1 : 0);
+            }
+        }
+    }
     if (terminal_discard_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_terminal_discard(
             terminal_discard_meta_backend, false);

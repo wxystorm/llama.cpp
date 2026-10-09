@@ -5153,6 +5153,21 @@ bool llama_hybrid_runtime_predict_cpu_compute_at_kv(
         tokens, actual_n_kv, prediction);
 }
 
+bool llama_hybrid_runtime_cpu_thread_kv_diag_get(
+        llama_hybrid_cpu_thread_kv_diag & diag) {
+    diag = {};
+    std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+    if (!g_llama_hybrid_runtime_profile.has_value()) {
+        return false;
+    }
+    diag = g_llama_hybrid_runtime_profile->cpu_thread_kv_diag;
+    return diag.threads > 0 && diag.query_tokens > 0 &&
+           diag.kv_tokens >= diag.query_tokens &&
+           diag.branch_layers > 0 &&
+           diag.attn_long_ms > 0.0 &&
+           diag.branch_per_layer_ms > 0.0;
+}
+
 enum class llama_hybrid_sim_stage_kind {
     GPU,
     CPU,
@@ -8281,7 +8296,36 @@ bool llama_hybrid_profile_moe_full_layer(
                 llama_hybrid_profile_moe_branch_block_point(
                     attn_desc, moe_desc, cpu_backend,
                     LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS, 64, test_branch);
-            // Restore even if either diagnostic probe fails.
+
+            // Measure exactly the same Flash Attention KV correction used by
+            // the Planner's CPU attention model, but with test_threads.
+            // Full Attention is measured at query=KV=64. A 64->512
+            // Flash-kernel delta is then added to that full-graph baseline.
+            // Do not substitute the Flash kernel cost for full Attention.
+            const char * kv_diag_env = std::getenv(
+                "LLAMA_HYBRID_CPU_PROFILE_KV_DIAG");
+            const bool request_kv_diag =
+                kv_diag_env != nullptr && std::atoi(kv_diag_env) != 0;
+            const int query_tokens = 64;
+            const int kv_tokens = 512;
+            const bool can_probe_kv =
+                request_kv_diag && branch_ok && attn_desc.n_ctx_orig >= kv_tokens;
+            double flash_q_ms = 0.0;
+            double flash_kv_ms = 0.0;
+            size_t flash_runtime_bytes = 0;
+            bool flash_base_ok = false;
+            bool flash_long_ok = false;
+            if (can_probe_kv) {
+                flash_base_ok = llama_hybrid_profile_attn_kv_kernel_point(
+                    attn_desc, cpu_backend, query_tokens, query_tokens,
+                    flash_q_ms, flash_runtime_bytes);
+                flash_long_ok = flash_base_ok &&
+                    llama_hybrid_profile_attn_kv_kernel_point(
+                        attn_desc, cpu_backend, query_tokens, kv_tokens,
+                        flash_kv_ms, flash_runtime_bytes);
+            }
+            // Restore even when either side-car probe fails. The primary
+            // profile vectors retain their original 4-thread measurements.
             set_threads(cpu_backend, GGML_DEFAULT_N_THREADS);
 
             if (branch_ok) {
@@ -8308,7 +8352,80 @@ bool llama_hybrid_profile_moe_full_layer(
                     base_total_per_layer, test_total_per_layer,
                     base_total_per_layer > 0.0 ?
                         test_total_per_layer / base_total_per_layer : 0.0);
+                if (request_kv_diag) {
+                    if (flash_base_ok && flash_long_ok) {
+                        // Exactly the same additive KV adjustment as
+                        // llama_hybrid_profile_attention(), but at 8 threads.
+                        const double corrected_attn_ms =
+                            test_attn_ms + flash_kv_ms - flash_q_ms;
+                        double baseline4_attn_kv_ms = 0.0;
+                        const bool baseline4_kv_ok = llama_hybrid_attn_cost(
+                            profile.cpu_attn, query_tokens, kv_tokens,
+                            baseline4_attn_kv_ms);
+                        if (std::isfinite(corrected_attn_ms) &&
+                            corrected_attn_ms > 0.0) {
+                            profile.cpu_thread_kv_diag = {
+                                test_threads, query_tokens, kv_tokens,
+                                LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                                test_attn_ms, flash_q_ms, flash_kv_ms,
+                                corrected_attn_ms, test_branch_per_layer
+                            };
+                            const double test_kv_per_layer =
+                                corrected_attn_ms + test_branch_per_layer;
+                            const double baseline4_kv_per_layer =
+                                baseline4_kv_ok ?
+                                    baseline4_attn_kv_ms +
+                                    base_branch_per_layer : 0.0;
+                            LLAMA_LOG_INFO(
+                                "[CPU_PROFILE_THREAD_KV_DIAG] status=OK "
+                                "query=%d kv_base=%d kv_long=%d "
+                                "base_threads=%d test_threads=%d "
+                                "full_attn_8t_q64_ms=%.3f "
+                                "flash_8t_q64_ms=%.3f flash_8t_kv512_ms=%.3f "
+                                "kv_flash_delta_ms=%.3f "
+                                "full_attn_8t_kv512_est_ms=%.3f "
+                                "moe_8t_per_layer_ms=%.3f "
+                                "total_8t_kv512_per_layer_ms=%.3f "
+                                "total_8t_kv512_for27_ms=%.3f "
+                                "full_attn_4t_kv512_ms=%.3f "
+                                "total_4t_kv512_per_layer_ms=%.3f "
+                                "test_over_base_kv512=%.4f "
+                                "scoring_unchanged=1\n",
+                                query_tokens, query_tokens, kv_tokens,
+                                GGML_DEFAULT_N_THREADS, test_threads,
+                                test_attn_ms, flash_q_ms, flash_kv_ms,
+                                flash_kv_ms - flash_q_ms,
+                                corrected_attn_ms, test_branch_per_layer,
+                                test_kv_per_layer, test_kv_per_layer * 27.0,
+                                baseline4_kv_ok ? baseline4_attn_kv_ms : -1.0,
+                                baseline4_kv_per_layer,
+                                baseline4_kv_per_layer > 0.0 ?
+                                    test_kv_per_layer / baseline4_kv_per_layer : -1.0);
+                        } else {
+                            LLAMA_LOG_WARN(
+                                "[CPU_PROFILE_THREAD_KV_DIAG] status=BAD_ESTIMATE "
+                                "full_q_ms=%.3f flash_base_ms=%.3f "
+                                "flash_long_ms=%.3f scoring_unchanged=1\n",
+                                test_attn_ms, flash_q_ms, flash_kv_ms);
+                        }
+                    } else {
+                        LLAMA_LOG_WARN(
+                            "[CPU_PROFILE_THREAD_KV_DIAG] status=PROBE_FAILED "
+                            "query=64 kv=512 threads=%d "
+                            "baseline_ok=%d flash_base_ok=%d flash_long_ok=%d "
+                            "scoring_unchanged=1\n",
+                            test_threads, branch_ok ? 1 : 0,
+                            flash_base_ok ? 1 : 0, flash_long_ok ? 1 : 0);
+                    }
+                }
             } else {
+                if (request_kv_diag) {
+                    LLAMA_LOG_WARN(
+                        "[CPU_PROFILE_THREAD_KV_DIAG] status=SKIP_BASE_PROBE "
+                        "base_threads=%d test_threads=%d "
+                        "scoring_unchanged=1\n",
+                        GGML_DEFAULT_N_THREADS, test_threads);
+                }
                 LLAMA_LOG_WARN(
                     "[CPU_PROFILE_THREAD_DIAG] status=PROBE_FAILED "
                     "base_threads=%d test_threads=%d scoring_unchanged=1\n",
