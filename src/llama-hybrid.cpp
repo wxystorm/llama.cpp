@@ -9211,6 +9211,39 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 parsed);
         }
     }
+    // Keep XG and XP fixed when isolating CPU XC sensitivity in benchmarks.
+    // The constraints already support these values; only the env plumbing
+    // was missing. Explicit invalid values fail instead of silently drifting.
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_GPU_CHUNK_TOKENS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0 && parsed <= 4096) {
+            constraints.fixed_gpu_chunk_tokens = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] gpu_chunk_tokens=%ld source=environment\n",
+                parsed);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] invalid gpu_chunk_tokens=%s\n", value);
+            return false;
+        }
+    }
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_PHONE_CHUNK_TOKENS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0 && parsed <= 4096) {
+            constraints.fixed_phone_chunk_tokens = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] phone_chunk_tokens=%ld source=environment\n",
+                parsed);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] invalid phone_chunk_tokens=%s\n", value);
+            return false;
+        }
+    }
     if (const char * value =
             std::getenv("LLAMA_HYBRID_FIXED_CPU_CHUNK_TOKENS")) {
         char * end = nullptr;
