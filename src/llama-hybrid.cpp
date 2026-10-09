@@ -5105,6 +5105,7 @@ static bool llama_hybrid_runtime_predict_cpu_compute_impl(
         }
     }
 
+    prediction.profile_threads             = profile.cpu_profile_threads;
     prediction.tokens                      = tokens;
     prediction.kv_tokens                   = kv_tokens;
     prediction.cpu_layers                  = cpu_layers;
@@ -8943,6 +8944,69 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
+    // Model-load CPU synthetic profiling defaults to four threads, unlike
+    // real prefill which uses -tb. Allow opt-in matching for A/B experiments:
+    //   LLAMA_HYBRID_PROFILE_CPU_THREADS=legacy  (or unset): original 4T
+    //   LLAMA_HYBRID_PROFILE_CPU_THREADS=auto    : effective CLI -tb/-t
+    //   LLAMA_HYBRID_PROFILE_CPU_THREADS=N       : explicit 1..256
+    const int runtime_batch_threads = params.hybrid_profile_cpu_threads;
+    int profile_cpu_threads = GGML_DEFAULT_N_THREADS;
+    const char * cpu_profile_mode = "legacy";
+    if (const char * value = std::getenv("LLAMA_HYBRID_PROFILE_CPU_THREADS")) {
+        if (*value != '\0' && std::strcmp(value, "legacy") != 0 &&
+            std::strcmp(value, "0") != 0) {
+            if (std::strcmp(value, "auto") == 0) {
+                profile_cpu_threads = runtime_batch_threads;
+                cpu_profile_mode = "auto";
+            } else {
+                char * end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                if (end == value || *end != '\0' ||
+                    parsed < 1 || parsed > 256) {
+                    LLAMA_LOG_ERROR(
+                        "[HYBRID_CPU_PROFILE_THREADS] status=INVALID "
+                        "value=%s expected=legacy,auto,1..256\n", value);
+                    return false;
+                }
+                profile_cpu_threads = (int) parsed;
+                cpu_profile_mode = "fixed";
+            }
+        }
+    }
+    if (profile_cpu_threads < 1 || profile_cpu_threads > 256) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_CPU_PROFILE_THREADS] status=INVALID_RUNTIME_THREADS "
+            "mode=%s runtime_batch_threads=%d; "
+            "pass -tb N or use an explicit thread count\n",
+            cpu_profile_mode, runtime_batch_threads);
+        return false;
+    }
+    if (profile_cpu_threads != GGML_DEFAULT_N_THREADS) {
+        const ggml_backend_reg_t cpu_reg =
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu.get()));
+        using set_threads_fn = void (*)(ggml_backend_t, int);
+        auto set_threads = cpu_reg != nullptr ?
+            reinterpret_cast<set_threads_fn>(
+                ggml_backend_reg_get_proc_address(
+                    cpu_reg, "ggml_backend_set_n_threads")) : nullptr;
+        if (set_threads == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_CPU_PROFILE_THREADS] status=UNSUPPORTED "
+                "requested_threads=%d backend=%s\n",
+                profile_cpu_threads, ggml_backend_name(cpu.get()));
+            return false;
+        }
+        set_threads(cpu.get(), profile_cpu_threads);
+    }
+    const char * strict_cpu_env = std::getenv("LLAMA_HYBRID_CPU_DIRECT_STRICT");
+    LLAMA_LOG_INFO(
+        "[HYBRID_CPU_PROFILE_THREADS] status=OK mode=%s "
+        "profile_threads=%d runtime_batch_threads=%d "
+        "backend=%s cpu_direct_strict=%d\n",
+        cpu_profile_mode, profile_cpu_threads, runtime_batch_threads,
+        ggml_backend_name(cpu.get()),
+        strict_cpu_env != nullptr && std::atoi(strict_cpu_env) != 0 ? 1 : 0);
+
     const bool is_qwen3_moe = ml.get_arch() == LLM_ARCH_QWEN3MOE;
     if (ml.get_arch() != LLM_ARCH_LLAMA &&
         ml.get_arch() != LLM_ARCH_QWEN2 &&
@@ -8995,6 +9059,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
 
     llama_hybrid_profile profile;
+    profile.cpu_profile_threads = profile_cpu_threads;
     profile.is_moe = is_qwen3_moe;
     profile.stage_queue_arch_supported = ml.get_arch() == LLM_ARCH_QWEN2 || is_qwen3_moe;
     profile.n_layer = n_layer;
@@ -9084,6 +9149,22 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             LLAMA_LOG_ERROR(
                 "[HYBRID_FIXED] pc_layers=%ld source=environment\n",
                 parsed);
+        }
+    }
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_FIXED_GPU_PC_LAYERS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' &&
+            parsed >= 0 && parsed <= profile.n_layer) {
+            constraints.fixed_gpu_pc_layers = (int) parsed;
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] gpu_pc_layers=%ld source=environment\n",
+                parsed);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_FIXED] invalid gpu_pc_layers=%s\n", value);
+            return false;
         }
     }
     if (const char * value =
