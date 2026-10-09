@@ -1786,6 +1786,40 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         stage != nullptr;
     const bool log_prepare_breakdown = log_formal_prepare || log_stage_prepare;
 
+    // Experiment B: force every operation in the prefill CPU_DIRECT Stage
+    // onto the raw CPU backend, including otherwise unlabelled Flash
+    // Attention and output-projection nodes. Off unless explicitly requested.
+    // Never touch GPU/TENSOR/PHONE stages or the ordinary decode graph.
+    const char * cpu_strict_env = std::getenv("LLAMA_HYBRID_CPU_DIRECT_STRICT");
+    const bool strict_cpu_stage =
+        stage != nullptr &&
+        stage->kind == llama_hybrid_runtime_stage_kind::CPU &&
+        cpu_strict_env != nullptr &&
+        std::atoi(cpu_strict_env) != 0;
+
+    if (strict_cpu_stage) {
+        if (backend_cpu == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[CPU_DIRECT_STRICT] status=FAIL reason=NO_CPU_BACKEND\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        // Only a contiguous region of actual CPU_DIRECT layers may be
+        // pinned. Abort explicitly if a hybrid or CUDA layer slips in.
+        const auto cpu_dev = ggml_backend_get_device(backend_cpu);
+        for (int il = stage->layer_begin; il < stage->layer_end; ++il) {
+            if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::PC_ONLY ||
+                model.dev_layer(il) != cpu_dev) {
+                LLAMA_LOG_ERROR(
+                    "[CPU_DIRECT_STRICT] status=FAIL reason=NON_CPU_DIRECT_LAYER "
+                    "layer=%d stage_layers=[%d,%d)\n",
+                    il, stage->layer_begin, stage->layer_end);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+    }
+
     const int64_t prepare_total_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     int64_t apply_mctx_us    = 0;
     int64_t graph_params_us  = 0;
@@ -1888,6 +1922,34 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
+        if (strict_cpu_stage) {
+            // The CPU_DIRECT callback normally pins only named tensors.
+            // Flash Attention's interior GGML_OP_FLASH_ATTN_EXT node and
+            // Attention output MUL_MAT are not necessarily named by cb().
+            // Pin all executable graph nodes BEFORE scheduler allocation,
+            // thereby also blocking GPU-priority propagation/offloading.
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (!ggml_backend_supports_op(backend_cpu, node)) {
+                    LLAMA_LOG_ERROR(
+                        "[CPU_DIRECT_STRICT] status=FAIL reason=UNSUPPORTED_CPU_OP "
+                        "stage_layers=[%d,%d) node=%d op=%s tensor=%s\n",
+                        stage->layer_begin, stage->layer_end,
+                        i, ggml_op_name(node->op), node->name);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                ggml_backend_sched_set_tensor_backend(
+                    sched_use, node, backend_cpu);
+            }
+            LLAMA_LOG_INFO(
+                "[CPU_DIRECT_STRICT] action=PIN_ALL "
+                "stage_layers=[%d,%d) tokens=%u nodes=%d\n",
+                stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+                n_nodes);
+        }
+
         if (stage != nullptr &&
             res->get_stage_input() != nullptr &&
             (stage->kind == llama_hybrid_runtime_stage_kind::TENSOR ||
@@ -1964,6 +2026,41 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         }
         if (log_prepare_breakdown) {
             graph_alloc_us = ggml_time_us() - graph_alloc_begin_us;
+        }
+    }
+
+    if (strict_cpu_stage) {
+        // Validate both fresh allocations and reused graphs. A CPU-only
+        // graph may be split into multiple CPU regions, but any CUDA/Meta
+        // region invalidates the strict experiment and is rejected.
+        const int split_count = ggml_backend_sched_get_n_splits(sched_use);
+        int foreign_splits = 0;
+        for (int i = 0; i < split_count; ++i) {
+            ggml_backend_t split_backend =
+                ggml_backend_sched_get_split_backend(sched_use, i);
+            if (split_backend != backend_cpu) {
+                ++foreign_splits;
+                LLAMA_LOG_ERROR(
+                    "[CPU_DIRECT_STRICT] status=FAIL reason=NON_CPU_SPLIT "
+                    "stage_layers=[%d,%d) tokens=%u split=%d backend=%s\n",
+                    stage->layer_begin, stage->layer_end,
+                    ubatch.n_tokens, i,
+                    split_backend != nullptr ?
+                        ggml_backend_name(split_backend) : "(null)");
+            }
+        }
+        LLAMA_LOG_INFO(
+            "[CPU_DIRECT_STRICT] status=%s "
+            "stage_layers=[%d,%d) tokens=%u reused=%d "
+            "graph_nodes=%d splits=%d non_cpu_splits=%d\n",
+            foreign_splits == 0 && split_count > 0 ? "OK" : "FAIL",
+            stage->layer_begin, stage->layer_end, ubatch.n_tokens,
+            reused_graph ? 1 : 0,
+            ggml_graph_n_nodes(gf),
+            split_count, foreign_splits);
+        if (foreign_splits != 0 || split_count == 0) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
         }
     }
 
