@@ -305,6 +305,8 @@ extern "C" {
         bool     hybrid_auto;
         uint32_t hybrid_target_ctx;
         uint32_t hybrid_target_ubatch_tokens;
+        // Intended prefill thread count (-tb); 0 if unknown.
+        int32_t  hybrid_profile_cpu_threads;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

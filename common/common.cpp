@@ -1565,6 +1565,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.hybrid_auto     = params.hybrid_auto;
+    // The Planner runs before the context exists. Forward the same effective
+    // -tb thread count that common_context_params_to_llama() will use.
+    mparams.hybrid_profile_cpu_threads =
+        params.cpuparams_batch.n_threads == -1 ?
+            params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

@@ -154,6 +154,8 @@ struct llama_hybrid_cpu_thread_kv_diag {
 };
 
 struct llama_hybrid_profile {
+    int cpu_profile_threads = 4; // measured CPU Profile, not runtime decode
+
     bool is_moe = false;
     // Matches the generalized vertical Stage Queue architecture gate in llama-context.cpp.
     bool stage_queue_arch_supported = false;
@@ -238,6 +240,7 @@ struct llama_hybrid_profile {
 };
 
 struct llama_hybrid_cpu_compute_prediction {
+    int profile_threads  = 0;
     int tokens           = 0;
     int kv_tokens        = 0;
     int cpu_layers       = 0;
