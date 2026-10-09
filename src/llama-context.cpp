@@ -1950,6 +1950,42 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 n_nodes);
         }
 
+        // Inspect the actual unmodified CPU stage graph before scheduler
+        // splitting. Operator counts can be divided by layer count and
+        // compared against synthetic Attention and MoE branch fingerprints.
+        if (strict_cpu_stage && ubatch.n_tokens > 1) {
+            const char * compare = std::getenv("LLAMA_HYBRID_CPU_GRAPH_COMPARE");
+            if (compare != nullptr && std::atoi(compare) != 0) {
+                const int nodes = ggml_graph_n_nodes(gf);
+                int flash = 0, mul_mat = 0, mul_mat_id = 0, argsort = 0;
+                int rms_norm = 0, rope = 0, cpy = 0;
+                int get_rows = 0, add = 0, soft_max = 0;
+                for (int i = 0; i < nodes; ++i) {
+                    switch (ggml_graph_node(gf, i)->op) {
+                        case GGML_OP_FLASH_ATTN_EXT: ++flash; break;
+                        case GGML_OP_MUL_MAT:        ++mul_mat; break;
+                        case GGML_OP_MUL_MAT_ID:     ++mul_mat_id; break;
+                        case GGML_OP_ARGSORT:        ++argsort; break;
+                        case GGML_OP_RMS_NORM:       ++rms_norm; break;
+                        case GGML_OP_ROPE:           ++rope; break;
+                        case GGML_OP_CPY:            ++cpy; break;
+                        case GGML_OP_GET_ROWS:       ++get_rows; break;
+                        case GGML_OP_ADD:            ++add; break;
+                        case GGML_OP_SOFT_MAX:       ++soft_max; break;
+                        default: break;
+                    }
+                }
+                LLAMA_LOG_INFO(
+                    "[CPU_REAL_GRAPH_OPS] tokens=%u layers=%d nodes=%d "
+                    "flash=%d mul_mat=%d mul_mat_id=%d argsort=%d rms_norm=%d "
+                    "rope=%d cpy=%d get_rows=%d add=%d soft_max=%d "
+                    "stage_threads_batch=%d graph_mode=CPU_DIRECT_STRICT\n",
+                    ubatch.n_tokens, stage->layer_end - stage->layer_begin,
+                    nodes, flash, mul_mat, mul_mat_id, argsort, rms_norm,
+                    rope, cpy, get_rows, add, soft_max, cparams.n_threads_batch);
+            }
+        }
+
         if (stage != nullptr &&
             res->get_stage_input() != nullptr &&
             (stage->kind == llama_hybrid_runtime_stage_kind::TENSOR ||

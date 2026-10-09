@@ -550,6 +550,45 @@ struct llama_hybrid_graph_timing {
     double compute_est_ms = 0.0;
 };
 
+// Topology-only diagnostics: identical counters are logged for the actual
+// CPU Stage graph. These never execute or mutate extra graph nodes.
+static void llama_hybrid_log_synthetic_cpu_ops(
+        ggml_backend_t backend, ggml_cgraph * graph,
+        const char * kind, int tokens, int layers) {
+    const char * enabled = std::getenv("LLAMA_HYBRID_CPU_GRAPH_COMPARE");
+    if (enabled == nullptr || std::atoi(enabled) == 0 ||
+        backend == nullptr || graph == nullptr || tokens != 64 ||
+        ggml_backend_dev_type(ggml_backend_get_device(backend)) !=
+            GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return;
+    }
+    int flash = 0, mul_mat = 0, mul_mat_id = 0, argsort = 0;
+    int rms_norm = 0, rope = 0, cpy = 0, get_rows = 0, add = 0, soft_max = 0;
+    const int nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < nodes; ++i) {
+        switch (ggml_graph_node(graph, i)->op) {
+            case GGML_OP_FLASH_ATTN_EXT: ++flash; break;
+            case GGML_OP_MUL_MAT:        ++mul_mat; break;
+            case GGML_OP_MUL_MAT_ID:     ++mul_mat_id; break;
+            case GGML_OP_ARGSORT:        ++argsort; break;
+            case GGML_OP_RMS_NORM:       ++rms_norm; break;
+            case GGML_OP_ROPE:           ++rope; break;
+            case GGML_OP_CPY:            ++cpy; break;
+            case GGML_OP_GET_ROWS:       ++get_rows; break;
+            case GGML_OP_ADD:            ++add; break;
+            case GGML_OP_SOFT_MAX:       ++soft_max; break;
+            default: break;
+        }
+    }
+    LLAMA_LOG_INFO(
+        "[CPU_SYNTH_GRAPH_OPS] kind=%s tokens=%d layers=%d nodes=%d "
+        "flash=%d mul_mat=%d mul_mat_id=%d argsort=%d rms_norm=%d "
+        "rope=%d cpy=%d get_rows=%d add=%d soft_max=%d "
+        "profile_pool=standalone scoring_unchanged=1\n",
+        kind, tokens, layers, nodes, flash, mul_mat, mul_mat_id,
+        argsort, rms_norm, rope, cpy, get_rows, add, soft_max);
+}
+
 static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backend,
                                               ggml_cgraph *               graph,
                                               llama_hybrid_graph_timing & result) {
@@ -7284,6 +7323,8 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
 
+    llama_hybrid_log_synthetic_cpu_ops(backend, graph, "ATTENTION", tokens, 1);
+
     const size_t total_buffer = ggml_backend_buffer_get_size(buffer.get());
     size_t       weight_bytes = 0;
     if (!llama_hybrid_add_bytes(weight_bytes, ggml_nbytes(attn_norm_w)) ||
@@ -7857,6 +7898,9 @@ static bool llama_hybrid_profile_moe_branch_block_point(
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
 
+    llama_hybrid_log_synthetic_cpu_ops(
+        backend, graph, "MOE_BRANCH", tokens, n_layers);
+
     if (!llama_hybrid_profile_graph_timing(
             backend, graph, timing)) {
         LLAMA_LOG_ERROR(
@@ -8196,6 +8240,87 @@ bool llama_hybrid_profile_moe_full_layer(
                 per_layer_4 > 0.0 && deeper_per_layer[1] >= 0.0 ?
                     deeper_per_layer[1] / per_layer_4 : -1.0,
                 probe_status[0], probe_status[1]);
+        }
+    }
+
+    // Side-car thread-count A/B: profiling currently uses a standalone
+    // default-4-thread backend, whereas runtime prefill uses -tb/-t.
+    // Never replace the scoring profile vectors with the test measurements.
+    const char * thread_diag = std::getenv("LLAMA_HYBRID_CPU_PROFILE_THREAD_DIAG");
+    const int test_threads = thread_diag != nullptr ? std::atoi(thread_diag) : 0;
+    if (test_threads >= 1 && test_threads <= 64 &&
+        test_threads != GGML_DEFAULT_N_THREADS &&
+        attn_desc.n_ctx_orig >= 64) {
+        const auto baseline = std::find_if(
+            profile.cpu_layer_blocks.begin(), profile.cpu_layer_blocks.end(),
+            [](const llama_hybrid_layer_compute_point & point) {
+                return point.tokens == 64 &&
+                    point.layers == LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS;
+            });
+        double baseline_attn_ms = 0.0;
+        const bool has_baseline =
+            baseline != profile.cpu_layer_blocks.end() &&
+            llama_hybrid_attn_cost(profile.cpu_attn, 64, 64, baseline_attn_ms);
+        const ggml_backend_reg_t reg =
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_backend));
+        using set_threads_fn = void (*)(ggml_backend_t, int);
+        auto set_threads = reg != nullptr ?
+            reinterpret_cast<set_threads_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_set_n_threads")) : nullptr;
+
+        if (has_baseline && set_threads != nullptr) {
+            set_threads(cpu_backend, test_threads);
+            double test_attn_ms = 0.0;
+            size_t attn_runtime_bytes = 0;
+            llama_hybrid_graph_timing test_branch = {};
+            const bool attn_ok = llama_hybrid_profile_attn_point(
+                attn_desc, cpu_backend, 64, 64,
+                test_attn_ms, attn_runtime_bytes);
+            const bool branch_ok = attn_ok &&
+                llama_hybrid_profile_moe_branch_block_point(
+                    attn_desc, moe_desc, cpu_backend,
+                    LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS, 64, test_branch);
+            // Restore even if either diagnostic probe fails.
+            set_threads(cpu_backend, GGML_DEFAULT_N_THREADS);
+
+            if (branch_ok) {
+                const double base_total_per_layer =
+                    baseline->wall_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS;
+                const double base_branch_per_layer =
+                    base_total_per_layer - baseline_attn_ms;
+                const double test_branch_per_layer =
+                    test_branch.wall_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS;
+                const double test_total_per_layer =
+                    test_attn_ms + test_branch_per_layer;
+                LLAMA_LOG_INFO(
+                    "[CPU_PROFILE_THREAD_DIAG] status=OK "
+                    "tokens=64 layers=%d base_threads=%d test_threads=%d "
+                    "base_attn_ms=%.3f test_attn_ms=%.3f "
+                    "base_branch_per_layer_ms=%.3f test_branch_per_layer_ms=%.3f "
+                    "base_total_per_layer_ms=%.3f test_total_per_layer_ms=%.3f "
+                    "test_over_base=%.4f "
+                    "profile_pool=standalone scoring_unchanged=1\n",
+                    LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
+                    GGML_DEFAULT_N_THREADS, test_threads,
+                    baseline_attn_ms, test_attn_ms,
+                    base_branch_per_layer, test_branch_per_layer,
+                    base_total_per_layer, test_total_per_layer,
+                    base_total_per_layer > 0.0 ?
+                        test_total_per_layer / base_total_per_layer : 0.0);
+            } else {
+                LLAMA_LOG_WARN(
+                    "[CPU_PROFILE_THREAD_DIAG] status=PROBE_FAILED "
+                    "base_threads=%d test_threads=%d scoring_unchanged=1\n",
+                    GGML_DEFAULT_N_THREADS, test_threads);
+            }
+        } else {
+            LLAMA_LOG_WARN(
+                "[CPU_PROFILE_THREAD_DIAG] status=UNAVAILABLE "
+                "base_threads=%d test_threads=%d "
+                "has_baseline=%d has_thread_setter=%d\n",
+                GGML_DEFAULT_N_THREADS, test_threads,
+                has_baseline ? 1 : 0, set_threads != nullptr ? 1 : 0);
         }
     }
 
