@@ -4390,6 +4390,7 @@ static bool llama_hybrid_coarse_plan_score(
         const llama_hybrid_plan &    plan,
         double                       gpu_lane_ms,
         double                       phone_boundary_ms,
+        bool                         allow_overlap,
         double &                     result_ms) {
     const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
     if (cpu_layers < 0 || plan.tensor_layers < 0 || plan.phone_layers < 0) {
@@ -4431,7 +4432,7 @@ static bool llama_hybrid_coarse_plan_score(
         downstream_ms += phone_boundary_ms;
     }
 
-    if (plan.gpu_pc_layers > 0 && downstream_ms > 0.0) {
+    if (allow_overlap && plan.gpu_pc_layers > 0 && downstream_ms > 0.0) {
         result_ms = std::max(gpu_lane_ms, downstream_ms);
     } else {
         result_ms = gpu_lane_ms + downstream_ms;
@@ -4518,6 +4519,8 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
         constraints.target_ubatch_tokens :
         (profile.reference_tokens > 0 ? profile.reference_tokens : LLAMA_HYBRID_REFERENCE_TOKENS);
 
+    const char * stageq = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
+    const bool t0_coarse_overlap = profile.stage_queue_arch_supported && stageq != nullptr && std::atoi(stageq) != 0;
     bool allow_tensor_pc_primary = true;
     // V1 Phone-primary Tensor runtime is being introduced for MoE first.
     // Other architectures keep the legacy Tensor path until their graph
@@ -4752,7 +4755,9 @@ std::vector<llama_hybrid_plan> llama_hybrid_enumerate_feasible_plans(const llama
                             double coarse_ms = 0.0;
                             if (!llama_hybrid_coarse_plan_score(
                                     coarse_model, plan, gpu_lane_ms,
-                                    phone_boundary_ms, coarse_ms)) {
+                                    phone_boundary_ms,
+                            plan.tensor_layers > 0 || t0_coarse_overlap,
+                            coarse_ms)) {
                                 continue;
                             }
                             ++coarse_scoreable;
@@ -5076,21 +5081,52 @@ struct llama_hybrid_sim_result {
     std::string schedule;
 };
 
+// Mirror the ordinary vertical Stage Queue eligibility in llama-context.cpp.
+static bool llama_hybrid_t0_stage_queue_eligible(
+        const llama_hybrid_profile & profile, const llama_hybrid_plan & plan, int tokens) {
+    const char * stageq = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
+    if (plan.tensor_layers != 0 || !profile.stage_queue_arch_supported ||
+        stageq == nullptr || std::atoi(stageq) == 0 ||
+        plan.gpu_pc_layers <= 0 || plan.gpu_chunk_tokens <= 0 ||
+        tokens <= plan.gpu_chunk_tokens) {
+        return false;
+    }
+    const int cpu = plan.pc_layers - plan.gpu_pc_layers;
+    if (cpu < 0 || (cpu == 0 && plan.phone_layers == 0)) {
+        return false;
+    }
+    if (cpu > 0 && (plan.cpu_chunk_tokens <= 0 || plan.gpu_chunk_tokens < plan.cpu_chunk_tokens)) {
+        return false;
+    }
+    if (plan.phone_layers > 0 &&
+        (plan.phone_chunk_tokens <= 0 || plan.gpu_chunk_tokens < plan.phone_chunk_tokens)) {
+        return false;
+    }
+    if (cpu > 0 && plan.phone_layers > 0) {
+        const int larger = std::max(plan.cpu_chunk_tokens, plan.phone_chunk_tokens);
+        const int smaller = std::min(plan.cpu_chunk_tokens, plan.phone_chunk_tokens);
+        if (plan.gpu_chunk_tokens % larger || larger % smaller) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::vector<llama_hybrid_sim_stage> llama_hybrid_sim_stages(const llama_hybrid_plan & plan) {
     std::vector<llama_hybrid_sim_stage> stages;
-    const int cpu_layers = plan.pc_layers - plan.gpu_pc_layers;
-
-    if (plan.gpu_pc_layers <= 0 || plan.tensor_layers <= 0) {
+    const int cpu = plan.pc_layers - plan.gpu_pc_layers;
+    if (plan.gpu_pc_layers <= 0 || (plan.tensor_layers <= 0 && cpu <= 0 && plan.phone_layers <= 0)) {
         return stages;
     }
-
-    int upstream_macro = plan.gpu_chunk_tokens;
-    stages.push_back({ llama_hybrid_sim_stage_kind::GPU, plan.gpu_pc_layers, upstream_macro });
-    if (cpu_layers > 0) {
-        upstream_macro = plan.cpu_chunk_tokens;
-        stages.push_back({ llama_hybrid_sim_stage_kind::CPU, cpu_layers, upstream_macro });
+    int macro = plan.gpu_chunk_tokens;
+    stages.push_back({ llama_hybrid_sim_stage_kind::GPU, plan.gpu_pc_layers, macro });
+    if (cpu > 0) {
+        macro = plan.cpu_chunk_tokens;
+        stages.push_back({ llama_hybrid_sim_stage_kind::CPU, cpu, macro });
     }
-    stages.push_back({ llama_hybrid_sim_stage_kind::TENSOR, plan.tensor_layers, upstream_macro });
+    if (plan.tensor_layers > 0) {
+        stages.push_back({ llama_hybrid_sim_stage_kind::TENSOR, plan.tensor_layers, macro });
+    }
     if (plan.phone_layers > 0) {
         stages.push_back({ llama_hybrid_sim_stage_kind::PHONE, plan.phone_layers, plan.phone_chunk_tokens });
     }
@@ -5119,10 +5155,15 @@ static bool llama_hybrid_sim_stage_cost(
     } else {
         blocks = llama_hybrid_plan_boundary(
             job_tokens, stages[stage_index - 1].macro_tokens, stage.macro_tokens);
-        if (blocks.empty() || std::any_of(
-                blocks.begin(), blocks.end(), [](const llama_hybrid_boundary_block & block) {
-                    return block.action == llama_hybrid_boundary_action::ACCUMULATE;
-                })) {
+        if (blocks.empty()) {
+            return false;
+        }
+        const bool allow_accumulate = plan.tensor_layers == 0 &&
+            stage.kind == llama_hybrid_sim_stage_kind::PHONE &&
+            stages[stage_index - 1].kind == llama_hybrid_sim_stage_kind::CPU;
+        if (std::any_of(blocks.begin(), blocks.end(), [&](const llama_hybrid_boundary_block & block) {
+                return block.action == llama_hybrid_boundary_action::ACCUMULATE && !allow_accumulate;
+            })) {
             return false;
         }
     }
@@ -5222,7 +5263,8 @@ static bool llama_hybrid_simulate_prefill(
     const auto stages = llama_hybrid_sim_stages(plan);
     if (stages.size() < 2 || stages.front().kind != llama_hybrid_sim_stage_kind::GPU ||
         (stages.back().kind != llama_hybrid_sim_stage_kind::TENSOR &&
-         stages.back().kind != llama_hybrid_sim_stage_kind::PHONE) ||
+         stages.back().kind != llama_hybrid_sim_stage_kind::PHONE &&
+         stages.back().kind != llama_hybrid_sim_stage_kind::CPU) ||
         tokens <= 0 || profile.n_embd <= 0) {
         return false;
     }
@@ -5251,8 +5293,16 @@ static bool llama_hybrid_simulate_prefill(
         }
     }
 
+    const char * no_phone_async = std::getenv("LLAMA_HYBRID_DISABLE_PHONE_ASYNC");
+    const bool phone_async = plan.tensor_layers == 0 && stages.size() == 3 &&
+        stages[1].kind == llama_hybrid_sim_stage_kind::CPU &&
+        stages[2].kind == llama_hybrid_sim_stage_kind::PHONE &&
+        !(no_phone_async != nullptr && std::atoi(no_phone_async) != 0);
     double host_ms = 0.0;
     double gpu_finish_ms = 0.0;
+    double phone_finish_ms = 0.0;
+    bool phone_pending = false;
+    size_t phone_pending_bytes = 0;
     bool gpu_pending = false;
     llama_hybrid_sim_job gpu_job;
     std::deque<llama_hybrid_sim_job> cpu_q;
@@ -5288,7 +5338,7 @@ static bool llama_hybrid_simulate_prefill(
                 break;
             case llama_hybrid_sim_stage_kind::PHONE:
                 phone_bytes += job.bytes;
-                result.phone_peak_bytes = std::max(result.phone_peak_bytes, phone_bytes);
+                result.phone_peak_bytes = std::max(result.phone_peak_bytes, phone_bytes + phone_pending_bytes);
                 phone_q.push_back(std::move(job));
                 break;
             case llama_hybrid_sim_stage_kind::GPU:
@@ -5298,7 +5348,7 @@ static bool llama_hybrid_simulate_prefill(
     };
 
     const auto has_ready = [&]() {
-        return !cpu_q.empty() || !tensor_q.empty() || !phone_q.empty();
+        return !cpu_q.empty() || !tensor_q.empty() || !phone_q.empty() || phone_pending;
     };
 
     const auto run_stage = [&](llama_hybrid_sim_job job, llama_hybrid_sim_stage_kind kind) {
@@ -5308,6 +5358,18 @@ static bool llama_hybrid_simulate_prefill(
                 job.tokens, kv_tokens,
                 constraints.max_tensor_chunks, stage_ms)) {
             return false;
+        }
+        if (phone_async && kind == llama_hybrid_sim_stage_kind::PHONE) {
+            if (phone_pending || job.stage_index + 1 != stages.size()) {
+                return false;
+            }
+            phone_finish_ms = std::max(host_ms, phone_finish_ms) + stage_ms;
+            phone_pending = true;
+            phone_pending_bytes = job.bytes;
+            result.phone_peak_bytes = std::max(result.phone_peak_bytes, phone_bytes + phone_pending_bytes);
+            result.downstream_ms += stage_ms;
+            append_event('P', job.id);
+            return true;
         }
         host_ms += stage_ms;
         result.downstream_ms += stage_ms;
@@ -5322,6 +5384,32 @@ static bool llama_hybrid_simulate_prefill(
             return true;
         }
 
+        if (phone_async) {
+            if (!phone_pending && !phone_q.empty()) {
+                auto job = std::move(phone_q.front());
+                phone_q.pop_front();
+                phone_bytes -= job.bytes;
+                return run_stage(std::move(job), llama_hybrid_sim_stage_kind::PHONE);
+            }
+            if (phone_pending && phone_bytes >= phone_limit) {
+                host_ms = std::max(host_ms, phone_finish_ms);
+                phone_pending = false;
+                phone_pending_bytes = 0;
+                return true;
+            }
+            if (!cpu_q.empty()) {
+                auto job = std::move(cpu_q.front());
+                cpu_q.pop_front();
+                return run_stage(std::move(job), llama_hybrid_sim_stage_kind::CPU);
+            }
+            if (phone_pending) {
+                host_ms = std::max(host_ms, phone_finish_ms);
+                phone_pending = false;
+                phone_pending_bytes = 0;
+                return true;
+            }
+            return tensor_q.empty();
+        }
         if (phone_bytes >= phone_limit && !phone_q.empty()) {
             auto job = std::move(phone_q.front());
             phone_q.pop_front();
@@ -5638,8 +5726,11 @@ bool llama_hybrid_score_plan(const llama_hybrid_profile &     profile,
         candidate.predicted_tensor_peak_bytes = 0;
         candidate.predicted_phone_peak_bytes = 0;
 
-        if (!candidate.tensor_phone_primary &&
-            !llama_hybrid_sim_stages(candidate).empty()) {
+        const bool t0_stage_queue = candidate.tensor_layers == 0 &&
+            llama_hybrid_t0_stage_queue_eligible(profile, candidate, work_tokens);
+        const bool tensor_stage_queue = candidate.tensor_layers > 0 &&
+            !candidate.tensor_phone_primary && !llama_hybrid_sim_stages(candidate).empty();
+        if (t0_stage_queue || tensor_stage_queue) {
             llama_hybrid_sim_result sim;
             if (!llama_hybrid_simulate_prefill(
                     profile, constraints, candidate, work_tokens, false, sim)) {
@@ -8466,6 +8557,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
+    profile.stage_queue_arch_supported = ml.get_arch() == LLM_ARCH_QWEN2 || is_qwen3_moe;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
         moe_desc.n_embd : ffn_desc.n_embd);
@@ -8662,6 +8754,20 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     if (!found) {
         LLAMA_LOG_ERROR("%s: no scoreable hybrid plans\n", __func__);
     } else {
+        if (best_plan.tensor_layers == 0) {
+            const double serial_ms = best_plan.predicted_pc_gpu_ms + best_plan.predicted_pc_cpu_ms +
+                best_plan.predicted_phone_ms + best_plan.predicted_handoff_ms;
+            const int tokens = constraints.target_ubatch_tokens > 0 ?
+                constraints.target_ubatch_tokens : profile.reference_tokens;
+            const bool queued = llama_hybrid_t0_stage_queue_eligible(profile, best_plan, tokens);
+            LLAMA_LOG_ERROR(
+                "[HYBRID_T0_SELECTED] mode=%s P=%d C=%d G=%d XG=%d XC=%d XP=%d "
+                "serial_ms=%.3f predicted_ms=%.3f overlap_saved_ms=%.3f\n",
+                queued ? "STAGE_QUEUE" : "SERIAL", best_plan.phone_layers, best_plan.pc_layers,
+                best_plan.gpu_pc_layers, best_plan.gpu_chunk_tokens, best_plan.cpu_chunk_tokens,
+                best_plan.phone_chunk_tokens, serial_ms, best_plan.predicted_ms,
+                std::max(0.0, serial_ms - best_plan.predicted_ms));
+        }
         {
             std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
             g_llama_hybrid_runtime_profile = profile;
