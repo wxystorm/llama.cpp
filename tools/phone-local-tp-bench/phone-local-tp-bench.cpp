@@ -25,15 +25,17 @@ using clk = std::chrono::steady_clock;
 static double ms(clk::time_point t) { return std::chrono::duration<double,std::milli>(clk::now()-t).count(); }
 static void check(bool x,const std::string & msg) { if(!x) throw std::runtime_error(msg); }
 static double med(std::vector<double> x){std::sort(x.begin(),x.end());return x[x.size()/2];}
-struct Opt {std::string model;int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_opencl=false;bool full_layer=false;};
+struct Opt {std::string model;std::string gpu_backend="auto";int layer=0,layers=2,tokens=400,topk=8,threads=4,runs=5,warmup=2;double cpu_ratio=0.25;bool probe_gpu=false;bool list_devices=false;bool full_layer=false;};
 static Opt options(int argc,char **argv) {
- Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_opencl=true;continue;}if(a=="--full-layer"){o.full_layer=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
+ Opt o;for(int i=1;i<argc;i++){std::string a=argv[i];if(a=="--probe-opencl"){o.probe_gpu=true;o.gpu_backend="opencl";continue;}if(a=="--probe-gpu"){o.probe_gpu=true;continue;}if(a=="--list-devices"){o.list_devices=true;continue;}if(a=="--full-layer"){o.full_layer=true;continue;}check(i+1<argc,"missing argument for "+a);std::string v=argv[++i];
  if(a=="-m")o.model=v;else if(a=="--layer")o.layer=std::stoi(v);else if(a=="--layers")o.layers=std::stoi(v);
  else if(a=="--tokens")o.tokens=std::stoi(v);else if(a=="--topk")o.topk=std::stoi(v);
  else if(a=="--threads")o.threads=std::stoi(v);else if(a=="--runs")o.runs=std::stoi(v);
- else if(a=="--warmup")o.warmup=std::stoi(v);else if(a=="--cpu-ratio")o.cpu_ratio=std::stod(v);
+ else if(a=="--warmup")o.warmup=std::stoi(v);else if(a=="--cpu-ratio")o.cpu_ratio=std::stod(v);else if(a=="--gpu-backend")o.gpu_backend=v;
  else throw std::runtime_error("unknown option "+a);}
- check((!o.model.empty()||o.probe_opencl)&&o.layer>=0&&o.layers>0&&o.tokens>0&&o.topk>0&&o.threads>0&&o.runs>0&&o.warmup>=0&&o.cpu_ratio>=0&&o.cpu_ratio<1,"invalid benchmark options");return o;
+ check((!o.model.empty()||o.probe_gpu||o.list_devices)&&o.layer>=0&&o.layers>0&&o.tokens>0&&o.topk>0&&o.threads>0&&o.runs>0&&o.warmup>=0&&o.cpu_ratio>=0&&o.cpu_ratio<1&&
+       (o.gpu_backend=="auto"||o.gpu_backend=="cuda"||o.gpu_backend=="opencl"),
+       "invalid benchmark options: --gpu-backend must be auto, cuda or opencl");return o;
 }
 struct File {
  gguf_context *uf=nullptr;ggml_context *ctx=nullptr;std::ifstream f;size_t data=0;
@@ -137,11 +139,37 @@ static std::unique_ptr<Graph> build(File&f,int layer,ggml_backend_t backend,int6
 }
 static double compute(Graph &b){auto t=clk::now();check(ggml_backend_graph_compute(b.backend,b.gf)==GGML_STATUS_SUCCESS,"graph_compute failed");ggml_backend_synchronize(b.backend);return ms(t);}
 static std::vector<float> output(Graph &b){std::vector<float> x((size_t)ggml_nelements(b.out));ggml_backend_tensor_get(b.out,x.data(),0,x.size()*sizeof(float));return x;}
-static ggml_backend_dev_t device(bool gpu){
- for(size_t i=0;i<ggml_backend_dev_count();i++){auto d=ggml_backend_dev_get(i);std::string name=ggml_backend_dev_name(d);
- if(gpu&&name.find("OpenCL")!=std::string::npos)return d;
- if(!gpu&&ggml_backend_dev_type(d)==GGML_BACKEND_DEVICE_TYPE_CPU)return d;
- }throw std::runtime_error(gpu?"OpenCL GPU device unavailable":"CPU device unavailable");
+// CUDA on the PC and OpenCL on the phone share the graph and FFN tests.
+static ggml_backend_dev_t device(bool gpu,const std::string &backend="auto"){
+ ggml_backend_dev_t cuda=nullptr,opencl=nullptr;
+ for(size_t i=0;i<ggml_backend_dev_count();i++){
+  auto d=ggml_backend_dev_get(i);
+  const std::string name=ggml_backend_dev_name(d);
+  const auto type=ggml_backend_dev_type(d);
+  if(!gpu && type==GGML_BACKEND_DEVICE_TYPE_CPU)return d;
+  if(!gpu || type!=GGML_BACKEND_DEVICE_TYPE_GPU)continue;
+  if(name.find("CUDA")!=std::string::npos && cuda==nullptr)cuda=d;
+  if(name.find("OpenCL")!=std::string::npos && opencl==nullptr)opencl=d;
+ }
+ if(!gpu)throw std::runtime_error("GGML CPU device unavailable");
+ if(backend=="cuda" && cuda)return cuda;
+ if(backend=="opencl" && opencl)return opencl;
+ if(backend=="auto"){
+  if(cuda)return cuda;
+  if(opencl)return opencl;
+ }
+ throw std::runtime_error("Requested GPU backend ("+backend+") unavailable; run --list-devices");
+}
+static int list_devices(){
+ ggml_backend_load_all();
+ for(size_t i=0;i<ggml_backend_dev_count();i++){
+  auto d=ggml_backend_dev_get(i);
+  std::cout<<"[LOCAL_DEVICE] index="<<i
+           <<" name="<<ggml_backend_dev_name(d)
+           <<" type="<<static_cast<int>(ggml_backend_dev_type(d))
+           <<" description="<<ggml_backend_dev_description(d)<<"\n";
+ }
+ return 0;
 }
 static void threads(ggml_backend_t b,int count){auto d=ggml_backend_get_device(b);auto r=ggml_backend_dev_backend_reg(d);
  if(r){auto fn=(ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(r,"ggml_backend_set_n_threads");if(fn)fn(b,count);}}
@@ -154,17 +182,17 @@ static int run(const Opt&o){
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=backend_load_begin\n");
  ggml_backend_load_all();
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=backend_load_ok\n");
- auto gpu_device=device(true);
+ auto gpu_device=device(true,o.gpu_backend);
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_init_begin device=%s\n",ggml_backend_dev_name(gpu_device));
  auto gpu=ggml_backend_dev_init(gpu_device,nullptr);
  check(gpu!=nullptr,"GPU backend init failed");
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=gpu_init_ok\n");
- auto cpu_device=device(false);
+ auto cpu_device=device(false,o.gpu_backend);
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=cpu_init_begin device=%s\n",ggml_backend_dev_name(cpu_device));
  auto cpu=ggml_backend_dev_init(cpu_device,nullptr);
  check(cpu!=nullptr,"CPU backend init failed");threads(cpu,o.threads);
  std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=cpu_init_ok\n");
- if(o.probe_opencl){
+ if(o.probe_gpu){
   std::fprintf(stderr,"[PHONE_LOCAL_BOOT] phase=opencl_probe_alloc_begin size=4096\n");
   ggml_backend_buffer_t probe=ggml_backend_alloc_buffer(gpu,4096);
   check(probe!=nullptr,"OpenCL probe allocation failed");
@@ -390,7 +418,7 @@ static std::unique_ptr<Prefix> make_prefix(
  for(int i=0;i<ggml_graph_n_nodes(p->graph);++i){
   auto *node=ggml_graph_node(p->graph,i);
   check(ggml_backend_supports_op(gpu,node),
-        std::string("OpenCL cannot execute full-layer op: ")+ggml_op_name(node->op));
+        std::string("Selected GPU cannot execute full-layer op: ")+ggml_op_name(node->op));
  }
  std::fprintf(stderr,"[PHONE_LAYER_BOOT] layer=%d phase=gpu_attn_router_alloc_begin\n",layer);
  p->buffer=ggml_backend_alloc_ctx_tensors(c,gpu);
@@ -790,14 +818,14 @@ static bool full_report_layer_checks(
 static int run_full(const Opt&o) {
  check(o.cpu_ratio>0,"--full-layer requires --cpu-ratio > 0 for a comparison");
  ggml_backend_load_all();
- auto gpu=ggml_backend_dev_init(device(true),nullptr);
- auto cpu=ggml_backend_dev_init(device(false),nullptr);
+ auto gpu=ggml_backend_dev_init(device(true,o.gpu_backend),nullptr);
+ auto cpu=ggml_backend_dev_init(device(false,o.gpu_backend),nullptr);
  check(gpu&&cpu,"GPU/CPU backend init failed");
  threads(cpu,o.threads);
  std::cout<<std::fixed<<std::setprecision(3);
  std::fprintf(stderr,
-  "[PHONE_FULL_CONFIG] first_layer=%d layers=%d tokens=%d topk=%d cpu_ratio_request=%.4f threads=%d warmup=%d runs=%d attn=causal_nonflash router=real_gguf_weights input=synthetic\n",
-  o.layer,o.layers,o.tokens,o.topk,o.cpu_ratio,o.threads,o.warmup,o.runs);
+  "[PHONE_FULL_CONFIG] first_layer=%d layers=%d tokens=%d topk=%d cpu_ratio_request=%.4f threads=%d warmup=%d runs=%d gpu_backend=%s gpu_device=%s attn=causal_nonflash router=real_gguf_weights input=synthetic\n",
+  o.layer,o.layers,o.tokens,o.topk,o.cpu_ratio,o.threads,o.warmup,o.runs,o.gpu_backend.c_str(),ggml_backend_name(gpu));
  int status=0;
  {
   File f(o.model);
@@ -883,5 +911,5 @@ static int run_full(const Opt&o) {
  return status;
 }
 
-int main(int argc,char **argv){try{const Opt o=options(argc,argv);return o.full_layer?run_full(o):run(o);}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
+int main(int argc,char **argv){try{const Opt o=options(argc,argv);if(o.list_devices)return list_devices();return o.full_layer?run_full(o):run(o);}catch(const std::exception&e){std::cerr<<"[PHONE_LOCAL_ERROR] "<<e.what()<<"\n";return 1;}}
 
