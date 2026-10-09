@@ -5186,6 +5186,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     actual_per_layer_ms,
                     cpu_prediction.total_ms,
                     compute_ratio);
+
+                // Diagnostic only: this reports precisely the two components
+                // used by the Planner's existing CPU compute score. No
+                // calibration is applied to candidate scoring or execution.
+                LLAMA_LOG_DEBUG(
+                    "[CPU_COST_BREAKDOWN] ub=%d tokens=%d layers=%d XC=%d "
+                    "profile_depth=%d score_kv_tokens=%d "
+                    "layer_base_ms=%.3f kv_correction_ms=%.3f "
+                    "predicted_ms=%.3f actual_compute_ms=%.3f "
+                    "pred_minus_actual_ms=%.3f reconcile_ms=%.6f\n",
+                    job.ubatch_id,
+                    cpu_prediction.tokens,
+                    cpu_prediction.cpu_layers,
+                    cpu_prediction.cpu_chunk_tokens,
+                    cpu_prediction.profile_max_layers,
+                    cpu_prediction.kv_tokens,
+                    cpu_prediction.layer_base_ms,
+                    cpu_prediction.kv_correction_ms,
+                    cpu_prediction.total_ms,
+                    actual_compute_ms,
+                    cpu_prediction.total_ms - actual_compute_ms,
+                    cpu_prediction.total_ms -
+                        (cpu_prediction.layer_base_ms + cpu_prediction.kv_correction_ms));
             }
         }
 

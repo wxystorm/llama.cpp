@@ -236,6 +236,11 @@ struct llama_hybrid_cpu_compute_prediction {
 
     double per_layer_ms = 0.0;
     double total_ms     = 0.0;
+
+    // The profiled complete-layer baseline at KV == query tokens, plus the
+    // effective KV/Attention correction. Their sum equals total_ms.
+    double layer_base_ms    = 0.0;
+    double kv_correction_ms = 0.0;
 };
 
 struct llama_hybrid_tensor_compute_prediction {

@@ -3148,7 +3148,9 @@ static bool llama_hybrid_layer_region_cost(
         int                                                    chunk_tokens,
         int                                                    kv_tokens,
         bool                                                   use_compute_est,
-        double &                                               result_ms);
+        double &                                               result_ms,
+        double *                                               layer_base_ms = nullptr,
+        double *                                               kv_correction_ms = nullptr);
 
 bool llama_hybrid_runtime_predict_full_prefill(
         int tokens, llama_hybrid_full_prefill_prediction & prediction) {
@@ -4907,8 +4909,16 @@ static bool llama_hybrid_layer_region_cost(
         int                                                    chunk_tokens,
         int                                                    kv_tokens,
         bool                                                   use_compute_est,
-        double &                                               result_ms) {
+        double &                                               result_ms,
+        double *                                               layer_base_ms,
+        double *                                               kv_correction_ms) {
     result_ms = 0.0;
+    if (layer_base_ms != nullptr) {
+        *layer_base_ms = 0.0;
+    }
+    if (kv_correction_ms != nullptr) {
+        *kv_correction_ms = 0.0;
+    }
     if (layers == 0) {
         return true;
     }
@@ -4931,10 +4941,20 @@ static bool llama_hybrid_layer_region_cost(
                 attn_points, tokens, kv_tokens, attn_kv)) {
             return false;
         }
-        result_ms += std::max(
-            0.0,
-            layer_block_total +
-            layers * (attn_kv - attn_base));
+        // Keep the score identical to the existing estimator. The layer
+        // baseline already includes Attention with KV == query tokens.
+        // The correction adjusts only the modeled Attention KV length.
+        const double chunk_ms = std::max(
+            0.0, layer_block_total + layers * (attn_kv - attn_base));
+        result_ms += chunk_ms;
+        if (layer_base_ms != nullptr) {
+            *layer_base_ms += layer_block_total;
+        }
+        if (kv_correction_ms != nullptr) {
+            // Include any original nonnegative clamp in the effective
+            // correction, so the two displayed components sum to result_ms.
+            *kv_correction_ms += chunk_ms - layer_block_total;
+        }
     }
     return std::isfinite(result_ms);
 }
@@ -4978,10 +4998,12 @@ bool llama_hybrid_runtime_predict_cpu_compute(
     }
 
     double total_ms = 0.0;
+    double layer_base_ms = 0.0;
+    double kv_correction_ms = 0.0;
     if (!llama_hybrid_layer_region_cost(
             profile, profile.cpu_layer_blocks, profile.cpu_attn,
             cpu_layers, tokens, plan.cpu_chunk_tokens, kv_tokens,
-            false, total_ms)) {
+            false, total_ms, &layer_base_ms, &kv_correction_ms)) {
         return false;
     }
 
@@ -5044,9 +5066,13 @@ bool llama_hybrid_runtime_predict_cpu_compute(
     prediction.total_ms                     = total_ms;
     prediction.per_layer_ms                 =
         cpu_layers > 0 ? total_ms / cpu_layers : 0.0;
+    prediction.layer_base_ms                = layer_base_ms;
+    prediction.kv_correction_ms             = kv_correction_ms;
 
     return std::isfinite(prediction.total_ms) &&
-           std::isfinite(prediction.per_layer_ms);
+           std::isfinite(prediction.per_layer_ms) &&
+           std::isfinite(prediction.layer_base_ms) &&
+           std::isfinite(prediction.kv_correction_ms);
 }
 
 enum class llama_hybrid_sim_stage_kind {
