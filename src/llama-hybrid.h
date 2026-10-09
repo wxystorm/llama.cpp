@@ -139,6 +139,8 @@ struct llama_hybrid_attn_desc {
 
 struct llama_hybrid_profile {
     bool is_moe = false;
+    // Matches the generalized vertical Stage Queue architecture gate in llama-context.cpp.
+    bool stage_queue_arch_supported = false;
 
     int probe_tokens           = 0;
     int reference_tokens       = 0;
