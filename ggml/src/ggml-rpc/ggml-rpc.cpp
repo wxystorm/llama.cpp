@@ -1720,6 +1720,38 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+
+    // Optional correctness test: read a few completely uploaded Q4_0
+    // weight tensors back through the backend's inverse repack path. Q4_0
+    // repack is lossless, so a byte mismatch indicates transport/repack
+    // corruption, not an expected quantization rounding difference.
+    if (std::getenv("GGML_RPC_VERIFY_Q4") != nullptr &&
+        tensor->type == GGML_TYPE_Q4_0 &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        static size_t seen = 0;
+        static size_t verified = 0;
+        const size_t full_size = ggml_nbytes(tensor);
+        if (seen++ < 12) {
+            GGML_LOG_ERROR("[RPC_Q4_UPLOAD] name=%s offset=%zu size=%zu total=%zu extra=%p\\n",
+                           tensor->name, (size_t) offset, size, full_size, tensor->extra);
+        }
+        if (verified < 4 && offset == 0 && size == full_size &&
+            full_size > 0 && full_size <= 16 * 1024 * 1024) {
+            ++verified;
+            std::vector<uint8_t> check(full_size);
+            ggml_backend_tensor_get(tensor, check.data(), 0, full_size);
+            const uint8_t * expected = static_cast<const uint8_t *>(data);
+            size_t first_bad = full_size;
+            for (size_t i = 0; i < full_size; ++i) {
+                if (check[i] != expected[i]) {
+                    first_bad = i;
+                    break;
+                }
+            }
+            GGML_LOG_ERROR("[RPC_Q4_VERIFY] name=%s bytes=%zu match=%d first_bad=%zu\\n",
+                           tensor->name, full_size, first_bad == full_size, first_bad);
+        }
+    }
     return true;
 }
 
@@ -2136,6 +2168,38 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         if (graph->nodes[i] != nullptr) {
             const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+        }
+    }
+    // Audit remote scheduling assumptions without changing the execution.
+    // The RPC client currently advertises MUL_MAT/GET_ROWS unconditionally
+    // in its diagnostic mode, but Hexagon has additional shape and VTCM
+    // restrictions that only the real backend can evaluate.
+    if (std::getenv("GGML_RPC_AUDIT_OPS") != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[device]);
+        const char * description = ggml_backend_dev_description(dev);
+        if (description && strcmp(description, "Hexagon") == 0) {
+            size_t checked = 0;
+            size_t unsupported = 0;
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                const ggml_tensor * node = graph->nodes[i];
+                if (!node || (node->op != GGML_OP_MUL_MAT &&
+                              node->op != GGML_OP_GET_ROWS &&
+                              node->op != GGML_OP_SET_ROWS)) {
+                    continue;
+                }
+                ++checked;
+                if (!ggml_backend_dev_supports_op(dev, node)) {
+                    ++unsupported;
+                    if (unsupported <= 16) {
+                        GGML_LOG_ERROR("[RPC_HEX_UNSUPPORTED] op=%s name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\\n",
+                                       ggml_op_name(node->op), node->name,
+                                       ggml_type_name(node->type),
+                                       node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                    }
+                }
+            }
+            GGML_LOG_ERROR("[RPC_HEX_OP_AUDIT] uid=%" PRIu64 " checked=%zu unsupported=%zu\\n",
+                           uid, checked, unsupported);
         }
     }
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
