@@ -1996,11 +1996,9 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
 }
 
 static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    // should we query the remote server for the actual size
-    bool rpc_get = false;
-
-    // See comments in init_tensor.
-    rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
+    // Quantized backends such as Hexagon may expand their weight layout
+    // even when ne[0] is 512-aligned. Query the actual remote buffer size.
+    bool rpc_get = ggml_is_quantized(tensor->type) && tensor->view_src == nullptr;
 
     // ops that require additional memory for fleeting data on certain backends
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
@@ -2087,6 +2085,18 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             sizeof(response));
         const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
         RPC_STATUS_ASSERT(status);
+
+        // Keep cached sizes safe and diagnose backend-specific expansion.
+        const size_t logical_size = ggml_nbytes(tensor);
+        const size_t remote_size = response.alloc_size;
+        response.alloc_size = std::max<size_t>(remote_size, logical_size);
+        if (std::getenv("GGML_RPC_ALLOC_DEBUG") != nullptr && remote_size != logical_size) {
+            GGML_LOG_INFO(
+                "[RPC_ALLOC_SIZE] name=%s type=%s ne=[%" PRId64 ",%" PRId64 "] raw=%zu remote=%zu chosen=%zu\n",
+                tensor->name, ggml_type_name(tensor->type),
+                tensor->ne[0], tensor->ne[1],
+                logical_size, remote_size, response.alloc_size);
+        }
 
         if (cache_enabled) {
             std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_cache_mutex);
