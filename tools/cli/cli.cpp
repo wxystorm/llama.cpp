@@ -88,6 +88,46 @@ static bool cli_rpc_trace_tensor(ggml_tensor * t, bool ask, void *) {
         sample(0), sample(31), sample(32), sample(255), sample(nrows-1));
 
     if (strcmp(name, "result_output") == 0) {
+        const ggml_tensor * weight = t->src[0];
+        const ggml_tensor * input  = t->src[1];
+        const ggml_backend_buffer_t wbuf = weight ? (weight->view_src ? weight->view_src->buffer : weight->buffer) : nullptr;
+        fprintf(stderr,
+            "[CLI_LMHEAD_INFO] weight=%s type=%s ne0=%" PRId64 " ne1=%" PRId64
+            " wbytes=%zu buffer=%s usage=%d input=%s input_type=%s input_ne1=%" PRId64 "\n",
+            weight ? ggml_get_name(weight) : "(null)",
+            weight ? ggml_type_name(weight->type) : "(null)",
+            weight ? weight->ne[0] : 0, weight ? weight->ne[1] : 0,
+            weight ? ggml_nbytes(weight) : 0,
+            wbuf ? ggml_backend_buffer_name(wbuf) : "(none)",
+            wbuf ? (int) ggml_backend_buffer_get_usage(wbuf) : -1,
+            input ? ggml_get_name(input) : "(null)",
+            input ? ggml_type_name(input->type) : "(null)",
+            input ? input->ne[1] : 0);
+
+        size_t first_bad = nrows, last_bad = nrows, first_huge = nrows, last_huge = nrows;
+        size_t num_nan = 0, num_inf = 0, num_huge = 0, first_bad_sample = 0;
+        std::array<size_t, 8> bad_indices = {};
+        for (size_t i = 0; i < nrows; ++i) {
+            const float x = last[i];
+            if (!std::isfinite(x)) {
+                if (first_bad == nrows) first_bad = i;
+                last_bad = i;
+                if (first_bad_sample < bad_indices.size()) bad_indices[first_bad_sample++] = i;
+                if (std::isnan(x)) ++num_nan; else ++num_inf;
+            } else if (std::fabs((double) x) > 1000.0) {
+                ++num_huge;
+                if (first_huge == nrows) first_huge = i;
+                last_huge = i;
+            }
+        }
+        fprintf(stderr,
+            "[CLI_LOGITS_DIAG] ne0=%zu nan=%zu inf=%zu huge_gt_1000=%zu first_bad=%zu last_bad=%zu first_huge=%zu last_huge=%zu bad_samples=",
+            nrows, num_nan, num_inf, num_huge,
+            first_bad, last_bad, first_huge, last_huge);
+        for (size_t i = 0; i < first_bad_sample; ++i) {
+            fprintf(stderr, "%s%zu", i ? "," : "", bad_indices[i]);
+        }
+        fprintf(stderr, "\n");
         std::array<double, 5> top;
         std::array<size_t, 5> ids = {};
         top.fill(-std::numeric_limits<double>::infinity());
