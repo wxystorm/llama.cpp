@@ -3,6 +3,16 @@
 #include "log.h"
 
 #include "cli-context.h"
+#include "ggml-backend.h"
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
 
 #include <signal.h>
 
@@ -27,6 +37,80 @@ static void signal_handler(int) {
 }
 #endif
 
+// Opt-in CPU/RPC checkpoint trace (slower: the scheduler synchronizes nodes).
+static bool cli_rpc_trace_tensor(ggml_tensor * t, bool ask, void *) {
+    if (!t) return false;
+    const char * name = ggml_get_name(t);
+    if (!name || !*name) return false;
+
+    const bool output = strcmp(name, "result_norm") == 0 || strcmp(name, "result_output") == 0;
+    const char * dash = strrchr(name, '-');
+    const int layer = dash && dash[1] >= '0' && dash[1] <= '9' ? atoi(dash + 1) : -1;
+    const bool chosen_layer = layer == 0 || (layer >= 0 && layer % 4 == 3);
+    const bool chosen_name =
+        strncmp(name, "attn_norm-", 10) == 0 ||
+        strncmp(name, "Qcur-", 5) == 0 ||
+        strncmp(name, "Kcur-", 5) == 0 ||
+        strncmp(name, "attn_out-", 9) == 0 ||
+        strncmp(name, "ffn_inp-", 8) == 0 ||
+        strncmp(name, "ffn_norm-", 9) == 0 ||
+        strncmp(name, "ffn_up-", 7) == 0 ||
+        strncmp(name, "ffn_out-", 8) == 0 ||
+        strncmp(name, "l_out-", 6) == 0;
+
+    const bool selected = (output || (chosen_layer && chosen_name)) &&
+        t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+        t->ne[0] > 0 && t->ne[1] > 0 && t->ne[2] == 1 && t->ne[3] == 1 &&
+        ggml_nbytes(t) <= 8*1024*1024;
+    if (ask) return selected;
+    if (!selected) return true;
+    if (!t->buffer && !(t->view_src && t->view_src->buffer)) return true;
+
+    const size_t nrows = (size_t) t->ne[0];
+    const size_t tok = (size_t) t->ne[1] - 1;
+    std::vector<float> v((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+    const float * last = v.data() + nrows*tok;
+    double sum = 0, sumsq = 0, maxabs = 0;
+    size_t bad = 0;
+    for (size_t i = 0; i < nrows; ++i) {
+        const double val = last[i];
+        if (!std::isfinite(val)) { ++bad; continue; }
+        sum += val;
+        sumsq += val*val;
+        maxabs = (std::max)(maxabs, std::fabs(val));
+    }
+    auto sample = [&](size_t i) { return i < nrows ? (double) last[i] : 0.0; };
+    fprintf(stderr,
+        "[CLI_TENSOR_TRACE] name=%s op=%s ne0=%zu ne1=%" PRId64 " token=%zu mean=%.9g rms=%.9g maxabs=%.9g nonfinite=%zu v0=%.9g v31=%.9g v32=%.9g v255=%.9g vlast=%.9g\n",
+        name, ggml_op_name(t->op), nrows, t->ne[1], tok,
+        sum/nrows, std::sqrt(sumsq/nrows), maxabs, bad,
+        sample(0), sample(31), sample(32), sample(255), sample(nrows-1));
+
+    if (strcmp(name, "result_output") == 0) {
+        std::array<double, 5> top;
+        std::array<size_t, 5> ids = {};
+        top.fill(-std::numeric_limits<double>::infinity());
+        for (size_t i = 0; i < nrows; ++i) {
+            const double x = last[i];
+            if (!std::isfinite(x) || x <= top[4]) continue;
+            int pos = 4;
+            while (pos > 0 && x > top[(size_t) pos-1]) {
+                top[(size_t) pos] = top[(size_t) pos-1];
+                ids[(size_t) pos] = ids[(size_t) pos-1];
+                --pos;
+            }
+            top[(size_t) pos] = x;
+            ids[(size_t) pos] = i;
+        }
+        fprintf(stderr,
+            "[CLI_LOGITS_TOP] token=%zu top0=%zu:%.9g top1=%zu:%.9g top2=%zu:%.9g top3=%zu:%.9g top4=%zu:%.9g\n",
+            tok, ids[0], top[0], ids[1], top[1], ids[2], top[2],
+            ids[3], top[3], ids[4], top[4]);
+    }
+    return true;
+}
+
 // satisfies -Wmissing-declarations
 int llama_cli(int argc, char ** argv);
 
@@ -39,6 +123,12 @@ int llama_cli(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
+    }
+
+    if (std::getenv("GGML_RPC_TENSOR_TRACE") != nullptr) {
+        params.cb_eval = cli_rpc_trace_tensor;
+        params.cb_eval_user_data = nullptr;
+        fprintf(stderr, "[CLI_TENSOR_TRACE_ENABLED] CPU/RPC checkpoints active\n");
     }
 
     llama_backend_init();
