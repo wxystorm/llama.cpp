@@ -2835,10 +2835,9 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     // Diagnostic only: the RPC protocol currently has no remote supports_op
-    // query. Under this opt-in mode, keep only large matrix operations and
-    // embedding lookups on RPC, allowing the CPU to handle the rest. This
-    // helps distinguish an unsupported Hexagon op from corrupted weight
-    // transfer/repacking. It is NOT a complete capability implementation.
+    // query. Keep matmul and embedding lookups on RPC, with SET_ROWS required
+    // for KV-cache writes into pre-allocated remote buffers. Other ops may
+    // run on CPU. This is NOT a complete capability implementation.
     if (std::getenv("GGML_RPC_MATMUL_ONLY") != nullptr) {
         switch (op->op) {
             case GGML_OP_NONE:
@@ -2848,6 +2847,9 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
             case GGML_OP_TRANSPOSE:
             case GGML_OP_MUL_MAT:
             case GGML_OP_GET_ROWS:
+            // cache_k_l* and cache_v_l* are pinned to RPC buffers: SET_ROWS
+            // cannot fall back to CPU without relocating the KV cache.
+            case GGML_OP_SET_ROWS:
                 return true;
             default:
                 return false;
