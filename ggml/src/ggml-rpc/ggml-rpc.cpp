@@ -2210,9 +2210,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // produced by another node in the same split. This avoids snapshots of
     // stale inputs while allowing harmless view ops in the split.
     ggml_tensor * cmp_dst = nullptr;
-    std::array<double, 8> cmp_ref = {};
+    std::array<double, 32> cmp_ref = {};
+    std::array<int64_t, 32> cmp_sample_rows = {};
+    std::array<int64_t, 32> cmp_sample_tokens = {};
     int cmp_count = 0;
-    int64_t cmp_rows = 0;
     if (std::getenv("GGML_RPC_COMPARE_MATMUL") && graph->n_nodes > 0) {
         static int compared = 0;
         static int scanned = 0;
@@ -2236,7 +2237,15 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 break;
             }
         }
-        if (compared < 4 && y && w && x && !input_created_in_split &&
+        const char * suffix = y ? strrchr(y->name, '-') : nullptr;
+        const int layer = suffix && suffix[1] >= '0' && suffix[1] <= '9' ? atoi(suffix + 1) : -1;
+        const bool sample_layer = layer == 0 || (layer >= 0 && layer % 4 == 3);
+        const bool sample_kind = y && (
+                strncmp(y->name, "Qcur-", 5) == 0 ||
+                strncmp(y->name, "attn_out-", 9) == 0 ||
+                strncmp(y->name, "ffn_up-", 7) == 0);
+        if (compared < 20 && sample_layer && sample_kind &&
+            y && w && x && !input_created_in_split &&
             y->op == GGML_OP_MUL_MAT && y->type == GGML_TYPE_F32 &&
             w->type == GGML_TYPE_Q4_0 && x->type == GGML_TYPE_F32 &&
             w->buffer && x->buffer && y->buffer &&
@@ -2257,10 +2266,27 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             ggml_backend_tensor_get(x, xdata.data(), 0, xdata.size() * sizeof(float));
 
             const int64_t k = w->ne[0];
-            cmp_rows = (std::min)(int64_t(4), w->ne[1]);
-            const int64_t n_tokens = (std::min)(int64_t(2), x->ne[1]);
-            for (int64_t t = 0; t < n_tokens; ++t) {
-                for (int64_t row = 0; row < cmp_rows; ++row) {
+            // Cover the first tile, 32-row tile boundaries, distant rows,
+            // and the last output row; compare the first and final tokens.
+            // Testing only rows 0..3 can conceal tiled-layout corruption.
+            const std::array<int64_t, 12> rows = {
+                0, 1, 15, 31, 32, 33, 63, 64, 127, 255, 511, w->ne[1] - 1
+            };
+            const std::array<int64_t, 2> tokens = { 0, x->ne[1] - 1 };
+            for (int ti = 0; ti < 2; ++ti) {
+                const int64_t t = tokens[ti];
+                if (ti == 1 && t == tokens[0]) continue;
+                for (int64_t row : rows) {
+                    if (row < 0 || row >= w->ne[1]) continue;
+                    bool duplicate = false;
+                    for (int j = 0; j < cmp_count; ++j) {
+                        if (cmp_sample_rows[j] == row && cmp_sample_tokens[j] == t) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) continue;
+                    GGML_ASSERT(cmp_count < (int) cmp_ref.size());
                     const uint8_t * weights = wdata.data() + (size_t) row * w->nb[1];
                     const float * activations = xdata.data() + t * k;
                     double dot = 0.0;
@@ -2276,13 +2302,15 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                             dot += scale * (double((v >> 4)) - 8.0) * activations[block * 32 + 16 + j];
                         }
                     }
-                    cmp_ref[(size_t) (t * cmp_rows + row)] = dot;
+                    cmp_sample_rows[cmp_count] = row;
+                    cmp_sample_tokens[cmp_count] = t;
+                    cmp_ref[cmp_count] = dot;
                     ++cmp_count;
                 }
             }
             cmp_dst = y;
-            GGML_LOG_INFO("[RPC_MATMUL_REF] uid=%" PRIu64 " tensor=%s rows=%" PRId64 " tokens=%" PRId64 "\n",
-                          uid, y->name, cmp_rows, n_tokens);
+            GGML_LOG_INFO("[RPC_MATMUL_REF] uid=%" PRIu64 " tensor=%s layer=%d samples=%d last_token=%" PRId64 "\n",
+                          uid, y->name, layer, cmp_count, x->ne[1] - 1);
         }
     }
 
@@ -2298,8 +2326,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         double ref_sq = 0.0;
         int nonfinite = 0;
         for (int i = 0; i < cmp_count; ++i) {
-            const int64_t row = i % cmp_rows;
-            const int64_t tok = i / cmp_rows;
+            const int64_t row = cmp_sample_rows[i];
+            const int64_t tok = cmp_sample_tokens[i];
             const double expected = cmp_ref[(size_t) i];
             const double actual = computed[(size_t) (tok * cmp_dst->ne[0] + row)];
             if (!std::isfinite(actual) || !std::isfinite(expected)) {
