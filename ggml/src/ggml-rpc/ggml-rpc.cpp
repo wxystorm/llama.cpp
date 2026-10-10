@@ -2834,9 +2834,28 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // Diagnostic only: the RPC protocol currently has no remote supports_op
+    // query. Under this opt-in mode, keep only large matrix operations and
+    // embedding lookups on RPC, allowing the CPU to handle the rest. This
+    // helps distinguish an unsupported Hexagon op from corrupted weight
+    // transfer/repacking. It is NOT a complete capability implementation.
+    if (std::getenv("GGML_RPC_MATMUL_ONLY") != nullptr) {
+        switch (op->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_GET_ROWS:
+                return true;
+            default:
+                return false;
+        }
+    }
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
+    // TODO: query the remote backend's actual supports_op.
     return true;
 }
 
