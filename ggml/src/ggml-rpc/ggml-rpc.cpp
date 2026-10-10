@@ -975,11 +975,13 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
 }
 
 static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    // should we query the remote server for the actual size
-    bool rpc_get = false;
-
-    // See comments in init_tensor.
-    rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
+    // Quantized tensors can use expanded backend-specific layouts (Hexagon
+    // Q6_K, Q4_K, Q5_K, etc.). The old ne[0] % 512 CUDA padding heuristic
+    // silently under-allocated tensors whose logical K happened to be
+    // 512-aligned. For example, token_embd.weight [2048, 128256] Q6_K needs
+    // 229834752 bytes on Hexagon, not its 215470080-byte GGUF size.
+    // Always query the remote buffer type for quantized allocation sizes.
+    bool rpc_get = ggml_is_quantized(tensor->type) && tensor->view_src == nullptr;
 
     // [TAG_ALLOC_SIZE_EXPAND]
     // ops that may require additional memory for fleeting data on certain backends
@@ -1053,7 +1055,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             cache[cache_hash] = response.alloc_size;
         }
 
-        return std::max<size_t>(response.alloc_size, min_size);
+        const size_t alloc_size = std::max<size_t>(response.alloc_size, min_size);
+        if (std::getenv("GGML_RPC_ALLOC_DEBUG") && alloc_size != min_size) {
+            GGML_LOG_INFO("[RPC_ALLOC_SIZE] name=%s type=%s ne=[%" PRId64 ",%" PRId64 "] raw=%zu remote=%zu extra=%zu\n",
+                tensor->name, ggml_type_name(tensor->type), tensor->ne[0], tensor->ne[1],
+                min_size, alloc_size, alloc_size - min_size);
+        }
+        return alloc_size;
     }
 
     return ggml_nbytes(tensor);
