@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -2202,8 +2203,101 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                            uid, checked, unsupported);
         }
     }
+    // Compare selected Q4_0 matmuls with a scalar CPU reference using the
+    // very same remote weights and activation input. Unlike an op support
+    // query or a weight readback, this tests the arithmetic result itself.
+    // Only isolated single-node matmuls are considered, so the source values
+    // cannot be produced earlier within the same graph.
+    ggml_tensor * cmp_dst = nullptr;
+    std::array<double, 8> cmp_ref = {};
+    int cmp_count = 0;
+    int64_t cmp_rows = 0;
+    if (std::getenv("GGML_RPC_COMPARE_MATMUL") && graph->n_nodes == 1) {
+        static int compared = 0;
+        ggml_tensor * y = graph->nodes[0];
+        const ggml_tensor * w = y ? y->src[0] : nullptr;
+        const ggml_tensor * x = y ? y->src[1] : nullptr;
+        if (compared < 4 && y && w && x &&
+            y->op == GGML_OP_MUL_MAT && y->type == GGML_TYPE_F32 &&
+            w->type == GGML_TYPE_Q4_0 && x->type == GGML_TYPE_F32 &&
+            w->buffer && x->buffer && y->buffer &&
+            ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(y) &&
+            w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+            w->ne[0] == x->ne[0] && w->ne[0] % 32 == 0 &&
+            y->ne[0] == w->ne[1] && y->ne[1] == x->ne[1] &&
+            ggml_type_size(GGML_TYPE_Q4_0) == 18 &&
+            ggml_nbytes(w) <= 16 * 1024 * 1024 &&
+            ggml_nbytes(x) <= 16 * 1024 * 1024) {
+            ++compared;
+            // Ensure the input tensors contain the results of the preceding
+            // RPC graph before taking their snapshot.
+            sync_all_backends();
+            std::vector<uint8_t> wdata(ggml_nbytes(w));
+            std::vector<float> xdata((size_t) ggml_nelements(x));
+            ggml_backend_tensor_get(w, wdata.data(), 0, wdata.size());
+            ggml_backend_tensor_get(x, xdata.data(), 0, xdata.size() * sizeof(float));
+
+            const int64_t k = w->ne[0];
+            cmp_rows = (std::min)(int64_t(4), w->ne[1]);
+            const int64_t n_tokens = (std::min)(int64_t(2), x->ne[1]);
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                for (int64_t row = 0; row < cmp_rows; ++row) {
+                    const uint8_t * weights = wdata.data() + (size_t) row * w->nb[1];
+                    const float * activations = xdata.data() + t * k;
+                    double dot = 0.0;
+                    for (int64_t block = 0; block < k / 32; ++block) {
+                        const uint8_t * q4 = weights + block * 18;
+                        ggml_fp16_t fp16;
+                        memcpy(&fp16, q4, sizeof(fp16));
+                        const double scale = ggml_fp16_to_fp32(fp16);
+                        const uint8_t * qs = q4 + 2;
+                        for (int j = 0; j < 16; ++j) {
+                            const uint8_t v = qs[j];
+                            dot += scale * (double((v & 0x0F)) - 8.0) * activations[block * 32 + j];
+                            dot += scale * (double((v >> 4)) - 8.0) * activations[block * 32 + 16 + j];
+                        }
+                    }
+                    cmp_ref[(size_t) (t * cmp_rows + row)] = dot;
+                    ++cmp_count;
+                }
+            }
+            cmp_dst = y;
+            GGML_LOG_INFO("[RPC_MATMUL_REF] uid=%" PRIu64 " tensor=%s rows=%" PRId64 " tokens=%" PRId64 "\n",
+                          uid, y->name, cmp_rows, n_tokens);
+        }
+    }
+
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    if (cmp_dst) {
+        sync_all_backends();
+        std::vector<float> computed((size_t) ggml_nelements(cmp_dst));
+        ggml_backend_tensor_get(cmp_dst, computed.data(), 0, computed.size() * sizeof(float));
+        double max_abs = 0.0;
+        double diff_sq = 0.0;
+        double ref_sq = 0.0;
+        int nonfinite = 0;
+        for (int i = 0; i < cmp_count; ++i) {
+            const int64_t row = i % cmp_rows;
+            const int64_t tok = i / cmp_rows;
+            const double expected = cmp_ref[(size_t) i];
+            const double actual = computed[(size_t) (tok * cmp_dst->ne[0] + row)];
+            if (!std::isfinite(actual) || !std::isfinite(expected)) {
+                ++nonfinite;
+                continue;
+            }
+            const double delta = actual - expected;
+            max_abs = (std::max)(max_abs, std::fabs(delta));
+            diff_sq += delta * delta;
+            ref_sq += expected * expected;
+            GGML_LOG_INFO("[RPC_MATMUL_SAMPLE] uid=%" PRIu64 " tensor=%s row=%" PRId64 " token=%" PRId64 " cpu=%.8g npu=%.8g abs=%.8g\n",
+                          uid, cmp_dst->name, row, tok, expected, actual, std::fabs(delta));
+        }
+        GGML_LOG_INFO("[RPC_MATMUL_COMPARE] uid=%" PRIu64 " tensor=%s samples=%d nonfinite=%d max_abs=%.8g rel_l2=%.8g\n",
+                      uid, cmp_dst->name, cmp_count, nonfinite, max_abs,
+                      ref_sq > 0.0 ? std::sqrt(diff_sq / ref_sq) : std::sqrt(diff_sq));
+    }
     sg.graph = graph;
     return true;
 }
