@@ -2206,18 +2206,37 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // Compare selected Q4_0 matmuls with a scalar CPU reference using the
     // very same remote weights and activation input. Unlike an op support
     // query or a weight readback, this tests the arithmetic result itself.
-    // Only isolated single-node matmuls are considered, so the source values
-    // cannot be produced earlier within the same graph.
+    // Select the last computing node, provided that its inputs are not
+    // produced by another node in the same split. This avoids snapshots of
+    // stale inputs while allowing harmless view ops in the split.
     ggml_tensor * cmp_dst = nullptr;
     std::array<double, 8> cmp_ref = {};
     int cmp_count = 0;
     int64_t cmp_rows = 0;
-    if (std::getenv("GGML_RPC_COMPARE_MATMUL") && graph->n_nodes == 1) {
+    if (std::getenv("GGML_RPC_COMPARE_MATMUL") && graph->n_nodes > 0) {
         static int compared = 0;
-        ggml_tensor * y = graph->nodes[0];
+        static int scanned = 0;
+        if (scanned++ < 8) {
+            const ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
+            GGML_LOG_INFO("[RPC_MATMUL_SCAN] uid=%" PRIu64 " n_nodes=%d last_op=%s\n",
+                          uid, graph->n_nodes, last ? ggml_op_name(last->op) : "NULL");
+        }
+        int last_compute = graph->n_nodes - 1;
+        while (last_compute >= 0 &&
+               (!graph->nodes[last_compute] || ggml_op_is_empty(graph->nodes[last_compute]->op))) {
+            --last_compute;
+        }
+        ggml_tensor * y = last_compute >= 0 ? graph->nodes[last_compute] : nullptr;
         const ggml_tensor * w = y ? y->src[0] : nullptr;
         const ggml_tensor * x = y ? y->src[1] : nullptr;
-        if (compared < 4 && y && w && x &&
+        bool input_created_in_split = false;
+        for (int i = 0; i < last_compute; ++i) {
+            if (graph->nodes[i] == w || graph->nodes[i] == x) {
+                input_created_in_split = true;
+                break;
+            }
+        }
+        if (compared < 4 && y && w && x && !input_created_in_split &&
             y->op == GGML_OP_MUL_MAT && y->type == GGML_TYPE_F32 &&
             w->type == GGML_TYPE_Q4_0 && x->type == GGML_TYPE_F32 &&
             w->buffer && x->buffer && y->buffer &&
