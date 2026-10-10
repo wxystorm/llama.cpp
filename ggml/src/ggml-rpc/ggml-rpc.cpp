@@ -1732,7 +1732,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         static size_t verified = 0;
         const size_t full_size = ggml_nbytes(tensor);
         if (seen++ < 12) {
-            GGML_LOG_ERROR("[RPC_Q4_UPLOAD] name=%s offset=%zu size=%zu total=%zu extra=%p\\n",
+            GGML_LOG_ERROR("[RPC_Q4_UPLOAD] name=%s offset=%zu size=%zu total=%zu extra=%p\n",
                            tensor->name, (size_t) offset, size, full_size, tensor->extra);
         }
         if (verified < 4 && offset == 0 && size == full_size &&
@@ -1748,7 +1748,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
                     break;
                 }
             }
-            GGML_LOG_ERROR("[RPC_Q4_VERIFY] name=%s bytes=%zu match=%d first_bad=%zu\\n",
+            GGML_LOG_ERROR("[RPC_Q4_VERIFY] name=%s bytes=%zu match=%d first_bad=%zu\n",
                            tensor->name, full_size, first_bad == full_size, first_bad);
         }
     }
@@ -2191,14 +2191,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 if (!ggml_backend_dev_supports_op(dev, node)) {
                     ++unsupported;
                     if (unsupported <= 16) {
-                        GGML_LOG_ERROR("[RPC_HEX_UNSUPPORTED] op=%s name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\\n",
+                        GGML_LOG_ERROR("[RPC_HEX_UNSUPPORTED] op=%s name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
                                        ggml_op_name(node->op), node->name,
                                        ggml_type_name(node->type),
                                        node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
                     }
                 }
             }
-            GGML_LOG_ERROR("[RPC_HEX_OP_AUDIT] uid=%" PRIu64 " checked=%zu unsupported=%zu\\n",
+            GGML_LOG_ERROR("[RPC_HEX_OP_AUDIT] uid=%" PRIu64 " checked=%zu unsupported=%zu\n",
                            uid, checked, unsupported);
         }
     }
