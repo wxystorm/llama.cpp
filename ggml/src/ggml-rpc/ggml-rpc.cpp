@@ -1655,6 +1655,36 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(result->buffer->buft);
         const bool hexagon = dev && strcmp(ggml_backend_dev_description(dev), "Hexagon") == 0;
+        // Inverse-repacked GGUF bytes and the backend's actual tiled
+        // allocation have different sizes for several K-quant types. The
+        // general ggml_nbytes bounds check above cannot detect a short
+        // remote allocation. Refuse it *before* Hexagon repacks weights.
+        if (hexagon &&
+            tensor->buffer_usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_is_quantized(result->type) && tensor->view_src == 0) {
+            const uint64_t needed = ggml_backend_buft_get_alloc_size(result->buffer->buft, result);
+            const uint64_t start = reinterpret_cast<uint64_t>(ggml_backend_buffer_get_base(result->buffer));
+            const uint64_t bytes = ggml_backend_buffer_get_size(result->buffer);
+            const uint64_t data = tensor->data;
+            if (data < start || needed > bytes || data - start > bytes - needed) {
+                GGML_LOG_ERROR("[RPC_HEX_ALLOC_OOB] tensor=%s type=%s raw=%zu tiled=%" PRIu64
+                               " offset=%" PRIu64 " buffer_size=%" PRIu64 "\n",
+                               tensor->name, ggml_type_name(result->type), ggml_nbytes(result),
+                               needed, data >= start ? data - start : UINT64_MAX, bytes);
+                return nullptr;
+            }
+            if (std::getenv("GGML_RPC_ALLOC_DEBUG") &&
+                strcmp(tensor->name, "token_embd.weight") == 0) {
+                static bool printed = false;
+                if (!printed) {
+                    printed = true;
+                    GGML_LOG_INFO("[RPC_HEX_ALLOC_OK] tensor=%s type=%s raw=%zu tiled=%" PRIu64
+                                  " offset=%" PRIu64 " buffer_size=%" PRIu64 "\n",
+                                  tensor->name, ggml_type_name(result->type), ggml_nbytes(result),
+                                  needed, data - start, bytes);
+                }
+            }
+        }
         if (hexagon && result->buffer->iface.init_tensor) {
             tensor_key key = { result->buffer, tensor->data, tensor->type, {} };
             for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) key.ne[i] = tensor->ne[i];
