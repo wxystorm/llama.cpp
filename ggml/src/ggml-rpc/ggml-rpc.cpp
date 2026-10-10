@@ -8499,9 +8499,29 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // Diagnostic only: RPC has no remote supports_op query. Restrict most
+    // operations to the local fallback backend while keeping matmul on RPC.
+    // The metadata and KV-related ops below are needed for scheduler routing.
+    if (std::getenv("GGML_RPC_MATMUL_ONLY") != nullptr) {
+        switch (op->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_GET_ROWS:
+            // Keep SET_ROWS on RPC for remotely allocated KV-cache tensors.
+            case GGML_OP_SET_ROWS:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
+    // TODO: query the remote backend and cache the results
     return true;
 }
 
