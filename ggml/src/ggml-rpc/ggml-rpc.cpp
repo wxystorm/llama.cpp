@@ -54,6 +54,8 @@ struct rpc_tensor {
     char name[GGML_MAX_NAME];
 
     int32_t use_count;
+    uint32_t buffer_usage;
+    uint32_t reserved;
 };
 
 static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 8");
@@ -753,6 +755,8 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const rpc_dispatc
     // Avoid sending uninitialized data over the wire
     memset(result.name, 0, sizeof(result.name));
     result.use_count = 0;
+    result.buffer_usage = tensor->buffer ? (uint32_t) ggml_backend_buffer_get_usage(tensor->buffer) : GGML_BACKEND_BUFFER_USAGE_ANY;
+    result.reserved = 0;
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
@@ -1363,6 +1367,30 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    // A remote tensor is reconstructed for each RPC request. Hexagon requires
+    // persistent per-tensor repack state, owned by the underlying buffer.
+    struct tensor_key {
+        ggml_backend_buffer_t buffer;
+        uint64_t data;
+        uint32_t type;
+        std::array<uint32_t, GGML_MAX_DIMS> ne;
+        bool operator==(const tensor_key & o) const {
+            return buffer == o.buffer && data == o.data && type == o.type && ne == o.ne;
+        }
+    };
+    struct tensor_key_hash {
+        size_t operator()(const tensor_key & k) const {
+            size_t h = std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(k.buffer));
+            auto mix = [&h](uint64_t v) {
+                h ^= std::hash<uint64_t>{}(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(k.data);
+            mix(k.type);
+            for (uint32_t v : k.ne) mix(v);
+            return h;
+        }
+    };
+    std::unordered_map<tensor_key, void *, tensor_key_hash> tensor_extras;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::vector<comm_state> comm_states;
@@ -1487,6 +1515,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
             sg.second.graph = nullptr;
         }
     }
+    for (auto it = tensor_extras.begin(); it != tensor_extras.end(); ) {
+        it = it->first.buffer == buffer ? tensor_extras.erase(it) : std::next(it);
+    }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -1604,6 +1635,34 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
     ggml_set_name(result, tensor->name);
+
+    if (result->buffer) {
+        if (tensor->buffer_usage > GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            GGML_LOG_ERROR("[rpc] invalid buffer usage %u\n", tensor->buffer_usage);
+            return nullptr;
+        }
+        if (tensor->buffer_usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            ggml_backend_buffer_set_usage(result->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(result->buffer->buft);
+        const bool hexagon = dev && strcmp(ggml_backend_dev_description(dev), "Hexagon") == 0;
+        if (hexagon && result->buffer->iface.init_tensor) {
+            tensor_key key = { result->buffer, tensor->data, tensor->type, {} };
+            for (uint32_t i = 0; i < GGML_MAX_DIMS; ++i) key.ne[i] = tensor->ne[i];
+            auto it = tensor_extras.find(key);
+            if (it == tensor_extras.end()) {
+                const ggml_status status = result->buffer->iface.init_tensor(result->buffer, result);
+                if (status != GGML_STATUS_SUCCESS || !result->extra) {
+                    GGML_LOG_ERROR("[rpc] Hexagon tensor init failed: %s\n", result->name);
+                    return nullptr;
+                }
+                tensor_extras.emplace(key, result->extra);
+                LOG_DBG("[RPC_HEX_TENSOR_INIT] name=%s extra=%p\n", result->name, result->extra);
+            } else {
+                result->extra = it->second;
+            }
+        }
+    }
     return result;
 }
 
@@ -1804,21 +1863,17 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p\n", __func__, (void*)tensor->buffer, tensor->data);
-    // Call the backend's buffer_init_tensor function
+    // Hexagon metadata is initialized and retained by deserialize_tensor.
+    // Preserve the explicit tensor initialization for other backends.
     ggml_backend_buffer_t buffer = tensor->buffer;
-    if (buffer && buffer->iface.init_tensor) {
-        buffer->iface.init_tensor(buffer, tensor);
-    } else {
-        if (!buffer) {
-            GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
-        }
-    }
-
-    if (tensor->extra != nullptr) {
-        // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
-        // Currently unimplemented.
-        GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
+    if (!buffer) {
+        GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
         return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buffer->buft);
+    const bool hexagon = dev && strcmp(ggml_backend_dev_description(dev), "Hexagon") == 0;
+    if (!hexagon && buffer->iface.init_tensor) {
+        return buffer->iface.init_tensor(buffer, tensor) == GGML_STATUS_SUCCESS;
     }
 
     return true;
