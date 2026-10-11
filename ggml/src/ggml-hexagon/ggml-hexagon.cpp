@@ -19,6 +19,8 @@
 #include <regex>
 #include <queue>
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 #ifdef _WIN32
 #    include <sal.h>
@@ -78,6 +80,7 @@ static int opt_opqueue  = 16;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
+static bool opt_k14_diag = false; // opt-in layer-14 K matmul diagnostic
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -102,6 +105,76 @@ static const char * status_to_str(uint32_t status) {
 }
 
 // ** debug helpers
+
+// Targeted layer-14 K-projection fingerprints from host-visible Hexagon buffers.
+// This does not inspect the DSP's internal VTCM / DMA data.
+static uint64_t ggml_hexagon_k14_fnv64(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static const char * ggml_hexagon_k14_kernel_name(int32_t kernel) {
+    switch (kernel) {
+        case HTP_MM_KERNEL_HMX_2D:               return "HMX_2D";
+        case HTP_MM_KERNEL_HMX_F16_BATCHED:      return "HMX_F16_BATCHED";
+        case HTP_MM_KERNEL_HVX_QUANT_BLOCK:      return "HVX_QUANT_BLOCK";
+        case HTP_MM_KERNEL_HVX_QUANT_ROW:        return "HVX_QUANT_ROW";
+        case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT:   return "HVX_QUANT_ROW_FLAT";
+        default:                                 return "OTHER";
+    }
+}
+
+static void ggml_hexagon_k14_dump_tensor(
+        const char * phase, const char * role, uint64_t seq, const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr ||
+        !ggml_is_contiguous(tensor)) {
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64 " phase=%s role=%s status=SKIP reason=NO_CONTIGUOUS_BUFFER\n",
+                      seq, phase, role);
+        return;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    if (bytes == 0 || bytes > (8u << 20)) {
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64 " phase=%s role=%s status=SKIP bytes=%zu\n",
+                      seq, phase, role, bytes);
+        return;
+    }
+    // Q4_0 get_tensor reconstructs the original logical GGUF weight layout.
+    std::vector<uint8_t> readback(bytes);
+    ggml_backend_tensor_get(tensor, readback.data(), 0, bytes);
+    const uint64_t hash = ggml_hexagon_k14_fnv64(readback.data(), bytes);
+    if (tensor->type == GGML_TYPE_F32) {
+        const size_t count = bytes / sizeof(float);
+        float sample0 = 0.0f, sample1 = 0.0f;
+        if (count > 0) memcpy(&sample0, readback.data(), sizeof(float));
+        if (count > 1) memcpy(&sample1, readback.data() + sizeof(float), sizeof(float));
+        size_t nonfinite = 0;
+        for (size_t i = 0; i < count; ++i) {
+            float value;
+            memcpy(&value, readback.data() + i * sizeof(float), sizeof(float));
+            if (!std::isfinite(value)) ++nonfinite;
+        }
+        GGML_LOG_INFO("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s view=HOST_SHARED name=%s type=%s"
+                      " ne0=%" PRId64 " ne1=%" PRId64
+                      " bytes=%zu fnv64=%016" PRIx64
+                      " nonfinite=%zu sample0=%.9g sample1=%.9g\n",
+                      seq, phase, role, tensor->name, ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], bytes, hash,
+                      nonfinite, sample0, sample1);
+    } else {
+        GGML_LOG_INFO("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s view=HOST_SHARED name=%s type=%s"
+                      " ne0=%" PRId64 " ne1=%" PRId64
+                      " bytes=%zu fnv64=%016" PRIx64 " encoding=LOGICAL\n",
+                      seq, phase, role, tensor->name, ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], bytes, hash);
+    }
+}
 
 static void ggml_hexagon_dump_op_exec(const std::string &sess_name, const htp_opnode & node, const uint32_t req_flags) {
     if (!opt_verbose) return;
@@ -912,6 +985,25 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         default:
             memcpy((char *) tensor->data + offset, data, size);
             break;
+    }
+
+    // Confirm the Q4_0 tiling step round-trips the original K14 weight bytes.
+    if (opt_k14_diag && tensor->type == GGML_TYPE_Q4_0 &&
+        strcmp(tensor->name, "blk.14.attn_k.weight") == 0 &&
+        offset == 0 && size == ggml_nbytes(tensor)) {
+        std::vector<uint8_t> logical(size);
+        repack_tiled_q4_0(logical.data(), tensor, size);
+        const size_t first_bad = std::mismatch(
+            static_cast<const uint8_t *>(data),
+            static_cast<const uint8_t *>(data) + size,
+            logical.data()).first - static_cast<const uint8_t *>(data);
+        GGML_LOG_INFO("[HEX_K14_WEIGHT_LOAD] name=%s bytes=%zu"
+                      " raw_fnv64=%016" PRIx64 " roundtrip_fnv64=%016" PRIx64
+                      " roundtrip=%s first_bad=%zu\n",
+                      tensor->name, size,
+                      ggml_hexagon_k14_fnv64(data, size),
+                      ggml_hexagon_k14_fnv64(logical.data(), size),
+                      first_bad == size ? "OK" : "MISMATCH", first_bad);
     }
 }
 
@@ -3669,6 +3761,46 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
+    // Observe only the K14 matmul, including cached graphs. Keep OPFUSION=0
+    // while diagnosing to avoid a fused QKV op replacing the standalone matmul.
+    struct k14_diag_entry {
+        const ggml_tensor * output;
+        uint64_t seq;
+    };
+    std::vector<k14_diag_entry> k14_entries;
+    if (opt_k14_diag) {
+        static std::atomic<uint64_t> k14_seq{0};
+        for (const auto & node : *nodes_ptr) {
+            const ggml_tensor * matmul = node.node;
+            if (node.opcode != HTP_OP_MUL_MAT || matmul == nullptr ||
+                matmul->src[0] == nullptr || matmul->src[1] == nullptr ||
+                strcmp(matmul->src[0]->name, "blk.14.attn_k.weight") != 0) {
+                continue;
+            }
+            const ggml_tensor * weight = matmul->src[0];
+            const ggml_tensor * input  = matmul->src[1];
+            const uint64_t seq = k14_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto * mm = reinterpret_cast<const htp_mm_kernel_params *>(node.kernel_params);
+            GGML_LOG_INFO("[HEX_K14_PLAN] seq=%" PRIu64 " graph_uid=%" PRIu64 " cache_hit=%d"
+                          " input=%s weight=%s output=%s"
+                          " m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                          " weight_type=%s kernel=%s kernel_id=%d"
+                          " hvx_threads=%u hmx=%u kernel_threads=%d"
+                          " n_prefetch=%d src1_row_size=%d vtcm=%d repacked=%d\n",
+                          seq, graph->uid, cache_hit ? 1 : 0,
+                          input->name, weight->name, matmul->name,
+                          input->ne[1], weight->ne[1], weight->ne[0],
+                          ggml_type_name(weight->type),
+                          ggml_hexagon_k14_kernel_name(mm->kernel_type), mm->kernel_type,
+                          sess->n_threads, sess->n_hmx, mm->n_threads,
+                          mm->n_prefetch, mm->src1_row_size, mm->vtcm_size,
+                          ggml_backend_buffer_is_hexagon_repack(weight->buffer) ? 1 : 0);
+            ggml_hexagon_k14_dump_tensor("PRE", "weight", seq, weight);
+            ggml_hexagon_k14_dump_tensor("PRE", "input", seq, input);
+            k14_entries.push_back({ matmul, seq });
+        }
+    }
+
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
         for (const auto & node : *nodes_ptr) {
@@ -3678,6 +3810,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     // Wait until all pending ops complete
     sess->flush();
+
+    for (const auto & entry : k14_entries) {
+        ggml_hexagon_k14_dump_tensor("POST", "output", entry.seq, entry.output);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4335,6 +4471,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+    const char * str_k14_diag = getenv("GGML_HEXAGON_K14_DIAG");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4379,6 +4516,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 128);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+    opt_k14_diag = str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
