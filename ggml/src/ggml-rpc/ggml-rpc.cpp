@@ -8523,7 +8523,7 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
                      op->src[1]->type == GGML_TYPE_I64) &&
                     op->type == GGML_TYPE_F32;
                 if (!supported && std::getenv("GGML_RPC_GET_ROWS_DEBUG") != nullptr) {
-                    GGML_LOG_INFO("[RPC_GET_ROWS_FALLBACK] name=%s src_type=%s dst_type=%s\n",
+                    GGML_LOG_ERROR("[RPC_GET_ROWS_FALLBACK] name=%s src_type=%s dst_type=%s\n",
                         op->name,
                         op->src[0] ? ggml_type_name(op->src[0]->type) : "null",
                         ggml_type_name(op->type));
