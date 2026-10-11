@@ -4940,6 +4940,20 @@ bool rpc_server::set_tensor_direct(
         return false;
     }
 
+    // Debug only: fingerprint the exact F32 payload received from the PC
+    // for layer-14 attention input. The hash is computed before HTP writes it,
+    // so this part does not synchronize or read back device memory.
+    if (std::getenv("GGML_RPC_ATTN14_INPUT_DIAG") != nullptr &&
+        tensor->type == GGML_TYPE_F32 &&
+        std::strstr(tensor->name, "attn_norm-14") != nullptr &&
+        offset == 0 && size == ggml_nbytes(tensor)) {
+        const uint64_t digest = fnv_hash(static_cast<const uint8_t *>(data), size);
+        std::fprintf(stderr,
+            "[RPC_ATTN14_INPUT_RECEIVE] name=%s bytes=%zu fnv64=%016" PRIx64 "\n",
+            tensor->name, size, digest);
+        std::fflush(stderr);
+    }
+
     ggml_backend_tensor_set(tensor, data, offset, size);
 
     if (debug_k_quant) {
@@ -6631,6 +6645,63 @@ bool rpc_server::set_tensor_graph_compute(
     return ok;
 }
 
+// Debug only: read back the actual remote operand supplied to the
+// blk.14 Q-projection immediately before HTP executes the graph. The PC-side
+// attn_norm-14 callback sees the source tensor before the RPC transfer, so it
+// cannot establish whether the remote device received those bytes.
+// Device readback may change synchronization/timing; do not use for profiling.
+static void rpc_diag_attn14_input_before_compute(
+        const ggml_cgraph * graph, uint64_t graph_uid) {
+    if (std::getenv("GGML_RPC_ATTN14_INPUT_DIAG") == nullptr) {
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT ||
+            node->src[0] == nullptr ||
+            std::strcmp(node->src[0]->name, "blk.14.attn_q.weight") != 0) {
+            continue;
+        }
+
+        const ggml_tensor * input = node->src[1];
+        if (input == nullptr || input->buffer == nullptr ||
+            input->type != GGML_TYPE_F32 || !ggml_is_contiguous(input)) {
+            std::fprintf(stderr,
+                "[RPC_ATTN14_INPUT_DEVICE] uid=%" PRIu64 " status=SKIP reason=UNSUPPORTED_INPUT\n",
+                graph_uid);
+            continue;
+        }
+
+        const size_t bytes = ggml_nbytes(input);
+        if (bytes == 0 || bytes > (1ULL << 20)) {
+            std::fprintf(stderr,
+                "[RPC_ATTN14_INPUT_DEVICE] uid=%" PRIu64 " status=SKIP bytes=%zu\n",
+                graph_uid, bytes);
+            continue;
+        }
+
+        std::vector<uint8_t> readback(bytes);
+        ggml_backend_tensor_get(input, readback.data(), 0, bytes);
+        const uint64_t digest = fnv_hash(readback.data(), bytes);
+        float sample0 = 0.0f;
+        float sample1 = 0.0f;
+        if (bytes >= sizeof(float)) {
+            std::memcpy(&sample0, readback.data(), sizeof(float));
+        }
+        if (bytes >= 2 * sizeof(float)) {
+            std::memcpy(&sample1, readback.data() + sizeof(float), sizeof(float));
+        }
+        std::fprintf(stderr,
+            "[RPC_ATTN14_INPUT_DEVICE] uid=%" PRIu64
+            " name=%s ne0=%" PRId64 " ne1=%" PRId64
+            " bytes=%zu fnv64=%016" PRIx64
+            " sample0=%.9g sample1=%.9g\n",
+            graph_uid, input->name, input->ne[0], input->ne[1],
+            bytes, digest, sample0, sample1);
+        std::fflush(stderr);
+    }
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -6699,6 +6770,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+    rpc_diag_attn14_input_before_compute(graph, graph_uid);
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
@@ -6740,6 +6812,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
+    rpc_diag_attn14_input_before_compute(graph, request.graph_uid);
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
