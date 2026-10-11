@@ -129,24 +129,33 @@ static const char * ggml_hexagon_k14_kernel_name(int32_t kernel) {
     }
 }
 
-static void ggml_hexagon_k14_dump_tensor(
-        const char * phase, const char * role, uint64_t seq, const ggml_tensor * tensor) {
+// Returns the host-visible fingerprint if available. This is deliberately
+// read-only: the diagnostic must not modify model execution or memory contents.
+static bool ggml_hexagon_k14_dump_tensor(
+        const char * phase, const char * role, uint64_t seq,
+        const ggml_tensor * tensor, uint64_t * digest_out = nullptr) {
     if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr ||
         !ggml_is_contiguous(tensor)) {
-        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64 " phase=%s role=%s status=SKIP reason=NO_CONTIGUOUS_BUFFER\n",
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s status=SKIP reason=NO_CONTIGUOUS_BUFFER\n",
                       seq, phase, role);
-        return;
+        return false;
     }
     const size_t bytes = ggml_nbytes(tensor);
     if (bytes == 0 || bytes > (8u << 20)) {
-        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64 " phase=%s role=%s status=SKIP bytes=%zu\n",
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s status=SKIP bytes=%zu\n",
                       seq, phase, role, bytes);
-        return;
+        return false;
     }
     // Q4_0 get_tensor reconstructs the original logical GGUF weight layout.
+    // For F32, the backend copies the host-visible shared allocation.
     std::vector<uint8_t> readback(bytes);
     ggml_backend_tensor_get(tensor, readback.data(), 0, bytes);
-    const uint64_t hash = ggml_hexagon_k14_fnv64(readback.data(), bytes);
+    const uint64_t digest = ggml_hexagon_k14_fnv64(readback.data(), bytes);
+    if (digest_out != nullptr) {
+        *digest_out = digest;
+    }
     if (tensor->type == GGML_TYPE_F32) {
         const size_t count = bytes / sizeof(float);
         float sample0 = 0.0f, sample1 = 0.0f;
@@ -164,7 +173,7 @@ static void ggml_hexagon_k14_dump_tensor(
                       " bytes=%zu fnv64=%016" PRIx64
                       " nonfinite=%zu sample0=%.9g sample1=%.9g\n",
                       seq, phase, role, tensor->name, ggml_type_name(tensor->type),
-                      tensor->ne[0], tensor->ne[1], bytes, hash,
+                      tensor->ne[0], tensor->ne[1], bytes, digest,
                       nonfinite, sample0, sample1);
     } else {
         GGML_LOG_INFO("[HEX_K14_TENSOR] seq=%" PRIu64
@@ -172,8 +181,9 @@ static void ggml_hexagon_k14_dump_tensor(
                       " ne0=%" PRId64 " ne1=%" PRId64
                       " bytes=%zu fnv64=%016" PRIx64 " encoding=LOGICAL\n",
                       seq, phase, role, tensor->name, ggml_type_name(tensor->type),
-                      tensor->ne[0], tensor->ne[1], bytes, hash);
+                      tensor->ne[0], tensor->ne[1], bytes, digest);
     }
+    return true;
 }
 
 static void ggml_hexagon_dump_op_exec(const std::string &sess_name, const htp_opnode & node, const uint32_t req_flags) {
@@ -1528,6 +1538,32 @@ struct ggml_hexagon_opqueue {
         GGML_ASSERT(rsp.id < op_cache.size());
 
         done.push(rsp.id);
+
+        // Report the real DSP batch acknowledgement for the K14 matmul.
+        // This is a batch-level status, not proof that the output was updated.
+        if (opt_k14_diag) {
+            const auto & completed_ops = op_cache[rsp.id];
+            size_t k14_count = 0;
+            for (const auto & op : completed_ops) {
+                const ggml_tensor * tensor = op.node;
+                if (op.opcode == HTP_OP_MUL_MAT && tensor != nullptr &&
+                    tensor->src[0] != nullptr &&
+                    strcmp(tensor->src[0]->name, "blk.14.attn_k.weight") == 0) {
+                    ++k14_count;
+                }
+            }
+            if (k14_count > 0) {
+                GGML_LOG_INFO("[HEX_K14_DSP_RESPONSE] batch_id=%u"
+                              " status_code=%u status=%s queued_ops=%zu response_ops=%u"
+                              " k14_ops=%zu elapsed_us=%" PRIu64
+                              " opstage=%u compute_enabled=%d\n",
+                              rsp.id, (unsigned) rsp.status, status_to_str(rsp.status),
+                              completed_ops.size(), rsp.n_ops, k14_count,
+                              ggml_time_us() - start_usec[rsp.id],
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            }
+        }
 
         const size_t b_size = sizeof(htp_buf_desc)  * rsp.n_bufs;
         const size_t t_size = sizeof(htp_tensor)    * rsp.n_tensors;
@@ -3766,6 +3802,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     struct k14_diag_entry {
         const ggml_tensor * output;
         uint64_t seq;
+        uint64_t before_fnv64;
+        bool before_valid;
     };
     std::vector<k14_diag_entry> k14_entries;
     if (opt_k14_diag) {
@@ -3786,7 +3824,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                           " m=%" PRId64 " n=%" PRId64 " k=%" PRId64
                           " weight_type=%s kernel=%s kernel_id=%d"
                           " hvx_threads=%u hmx=%u kernel_threads=%d"
-                          " n_prefetch=%d src1_row_size=%d vtcm=%d repacked=%d\n",
+                          " n_prefetch=%d src1_row_size=%d vtcm=%d repacked=%d"
+                          " opstage=%u compute_enabled=%d\n",
                           seq, graph->uid, cache_hit ? 1 : 0,
                           input->name, weight->name, matmul->name,
                           input->ne[1], weight->ne[1], weight->ne[0],
@@ -3794,10 +3833,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                           ggml_hexagon_k14_kernel_name(mm->kernel_type), mm->kernel_type,
                           sess->n_threads, sess->n_hmx, mm->n_threads,
                           mm->n_prefetch, mm->src1_row_size, mm->vtcm_size,
-                          ggml_backend_buffer_is_hexagon_repack(weight->buffer) ? 1 : 0);
+                          ggml_backend_buffer_is_hexagon_repack(weight->buffer) ? 1 : 0,
+                          (unsigned) opt_opstage,
+                          (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
             ggml_hexagon_k14_dump_tensor("PRE", "weight", seq, weight);
             ggml_hexagon_k14_dump_tensor("PRE", "input", seq, input);
-            k14_entries.push_back({ matmul, seq });
+            uint64_t before_fnv64 = 0;
+            const bool before_valid = ggml_hexagon_k14_dump_tensor(
+                "BEFORE", "output", seq, matmul, &before_fnv64);
+            k14_entries.push_back({ matmul, seq, before_fnv64, before_valid });
         }
     }
 
@@ -3812,7 +3856,20 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     sess->flush();
 
     for (const auto & entry : k14_entries) {
-        ggml_hexagon_k14_dump_tensor("POST", "output", entry.seq, entry.output);
+        uint64_t after_fnv64 = 0;
+        const bool after_valid = ggml_hexagon_k14_dump_tensor(
+            "POST", "output", entry.seq, entry.output, &after_fnv64);
+        const bool can_compare = entry.before_valid && after_valid;
+        GGML_LOG_INFO("[HEX_K14_OUTPUT_DELTA] seq=%" PRIu64
+                      " m=%" PRId64 " output_data=%p output_buffer=%p"
+                      " before_valid=%d after_valid=%d"
+                      " before_fnv64=%016" PRIx64 " after_fnv64=%016" PRIx64
+                      " changed=%d view=HOST_SHARED\n",
+                      entry.seq, entry.output->ne[1],
+                      entry.output->data, (void *) entry.output->buffer,
+                      entry.before_valid ? 1 : 0, after_valid ? 1 : 0,
+                      entry.before_fnv64, after_fnv64,
+                      can_compare ? (entry.before_fnv64 != after_fnv64 ? 1 : 0) : -1);
     }
 
     return GGML_STATUS_SUCCESS;
