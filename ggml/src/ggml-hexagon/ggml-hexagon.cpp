@@ -3917,7 +3917,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     if (opt_k14_diag) {
         static std::atomic<uint64_t> k14_seq{0};
         for (const auto & node : *nodes_ptr) {
-            const ggml_tensor * matmul = node.node;
+            ggml_tensor * matmul = node.node;
             if (node.opcode != HTP_OP_MUL_MAT || matmul == nullptr ||
                 matmul->src[0] == nullptr || matmul->src[1] == nullptr ||
                 strcmp(matmul->src[0]->name, "blk.14.attn_k.weight") != 0) {
