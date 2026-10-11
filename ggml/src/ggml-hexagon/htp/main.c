@@ -838,7 +838,49 @@ static void htp_k14_diag_tensor(uint32_t seq, const char * phase,
          sample0, sample1);
 }
 
-static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+// Optional K14 DSP -> host diagnostic piggybacked on htp_opbatch_rsp.
+//
+// When the DSP profiler is disabled, rsp.n_traces[] is unused. We encode
+// four DSP-observed FNV64 digests there, plus flags, status and a valid mask.
+// rsp.pad[0..3] is 'K14D' and pad[4..7] carries the K14 seq. This avoids
+// depending on device-specific FARF/logcat routing and does not change ABI.
+// A profiled/trace run deliberately does not send this side-channel data.
+struct htp_k14_rsp_probe {
+    uint32_t seq;
+    uint32_t input_flags;
+    uint32_t valid_mask;
+    int      status;
+    bool     present;
+    uint64_t hash[4]; // input, output_before, output_after, output_after_flush
+};
+
+static bool htp_k14_probe_hash_tensor(
+        const struct htp_tensor * tensor, uint64_t * out_hash) {
+    if (tensor == NULL || tensor->data == 0 || tensor->type != HTP_TYPE_F32 ||
+        tensor->size == 0 || tensor->size > (1u << 20) ||
+        tensor->nb[0] != sizeof(float) ||
+        tensor->size % sizeof(float) != 0) {
+        return false;
+    }
+    *out_hash = htp_k14_diag_fnv64(
+        (const void *) (uintptr_t) tensor->data, tensor->size);
+    return true;
+}
+
+static void htp_k14_rsp_probe_sample(struct htp_k14_rsp_probe * probe,
+                                     unsigned slot, const struct htp_tensor * tensor) {
+    if (probe == NULL || !probe->present || slot >= 4) {
+        return;
+    }
+    uint64_t hash = 0;
+    if (htp_k14_probe_hash_tensor(tensor, &hash)) {
+        probe->hash[slot] = hash;
+        probe->valid_mask |= 1u << slot;
+    }
+}
+
+static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op,
+                       struct htp_k14_rsp_probe * k14_probe) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
@@ -848,6 +890,11 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
                           op->opcode == HTP_OP_MUL_MAT;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
                              ((uint32_t) op->pad[1] << 16);
+    if (k14_diag && k14_probe != NULL) {
+        memset(k14_probe, 0, sizeof(*k14_probe));
+        k14_probe->present = true;
+        k14_probe->seq = k14_seq;
+    }
 
     FARF(HIGH, "proc-op #%u: opcode %u flags 0x%x", idx, octx->op, octx->flags);
 
@@ -885,6 +932,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
              input ? (unsigned) input->bi : 0xffffu,
              (unsigned) op->dst[0]);
         // Read after the backend's existing input-cache handling.
+        if (k14_probe != NULL) {
+            k14_probe->input_flags = input_flags;
+            htp_k14_rsp_probe_sample(k14_probe, 0, input);
+        }
         htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "input", input);
     }
 
@@ -903,12 +954,17 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     }
 
     if (k14_diag) {
+        htp_k14_rsp_probe_sample(k14_probe, 1, octx->dsts[0]);
         htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "output", octx->dsts[0]);
     }
 
     int status = execute_op(octx);
 
     if (k14_diag) {
+        if (k14_probe != NULL) {
+            k14_probe->status = status;
+        }
+        htp_k14_rsp_probe_sample(k14_probe, 2, octx->dsts[0]);
         htp_k14_diag_tensor(k14_seq, "POST_EXEC", "output", octx->dsts[0]);
         FARF(ALWAYS, "[HTP_K14_EXEC_STATUS] seq=%u status=%d", k14_seq, status);
     }
@@ -932,6 +988,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     }
 
     if (k14_diag) {
+        htp_k14_rsp_probe_sample(k14_probe, 3, octx->dsts[0]);
         htp_k14_diag_tensor(k14_seq, "POST_FLUSH", "output", octx->dsts[0]);
     }
 
@@ -1028,6 +1085,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         }
 
         int      op_status = HTP_STATUS_OK;
+        struct htp_k14_rsp_probe k14_probe = {0};
         uint32_t op_wakeup = n_ops / 2; // half-way throgh the batch
 
         hmx_queue_wakeup(ctx->hmx_queue);
@@ -1041,7 +1099,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
-            op_status = proc_op_req(octx, tens, i, &ops[i]);
+            op_status = proc_op_req(octx, tens, i, &ops[i], &k14_probe);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -1075,6 +1133,19 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
             }
         } else {
             memset(rsp.n_traces, 0, sizeof(rsp.n_traces));
+        }
+
+        if (ctx->profiler == HTP_PROF_DISABLED && k14_probe.present) {
+            const uint32_t magic = 0x4b313444u; // ASCII 'K14D'
+            memcpy(rsp.pad, &magic, sizeof(magic));
+            memcpy(rsp.pad + sizeof(magic), &k14_probe.seq, sizeof(k14_probe.seq));
+            for (unsigned i = 0; i < 4; ++i) {
+                rsp.n_traces[2 * i]     = (uint32_t) k14_probe.hash[i];
+                rsp.n_traces[2 * i + 1] = (uint32_t) (k14_probe.hash[i] >> 32);
+            }
+            rsp.n_traces[8]  = k14_probe.input_flags;
+            rsp.n_traces[9]  = (uint32_t) k14_probe.status;
+            rsp.n_traces[10] = k14_probe.valid_mask;
         }
 
         dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
