@@ -84,6 +84,8 @@ static int opt_opfusion = 1;    // enable/disable op fusion
 static bool opt_k14_diag = false; // opt-in layer-14 K matmul diagnostic
 static bool opt_k14_sentinel = false; // destructive diagnostic, M=1 only
 static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache experiment
+static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
+static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1520,6 +1522,19 @@ struct ggml_hexagon_opbatch {
             }
         }
 
+        // The SET_ROWS ggml tensor is a view of cache_k_l14. Its src[0]
+        // contains F32 values, src[1] indices, and src[2] the F16 cache.
+        // The DSP has no tensor names, so tag this exact operation on host.
+        if (opt_kv14_set_rows_diag && node.opcode == HTP_OP_SET_ROWS &&
+            node.node != nullptr && node.node->src[0] != nullptr &&
+            node.node->src[1] != nullptr && node.node->src[2] != nullptr &&
+            strncmp(node.node->src[2]->name, "cache_k_l14", sizeof("cache_k_l14") - 1) == 0) {
+            o.flags |= HTP_OPFLAGS_DIAG_KV14_SET_ROWS;
+            if (opt_kv14_set_rows_force_input_flush) {
+                o.flags |= HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH;
+            }
+        }
+
         if (!(opt_opstage & HTP_OPSTAGE_COMPUTE)) {
             o.flags |= HTP_OPFLAGS_SKIP_COMPUTE;
         }
@@ -1534,6 +1549,19 @@ struct ggml_hexagon_opbatch {
         auto outputs = node.get_outputs();
         for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
             o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
+        }
+
+        if ((o.flags & HTP_OPFLAGS_DIAG_KV14_SET_ROWS) != 0 &&
+            o.src[0] != 0xffff && o.src[1] != 0xffff) {
+            const htp_tensor & values = h_tens[o.src[0]];
+            const htp_tensor & idxs   = h_tens[o.src[1]];
+            GGML_LOG_WARN("[HEX_KV14_SET_ROWS_TAG] cache=%s values=%s"
+                          " rows=%u width=%u bytes=%u values_flags=0x%x"
+                          " idx_type=%u idx_bytes=%u op_flags=0x%x\n",
+                          node.node->src[2]->name, node.node->src[0]->name,
+                          (unsigned) values.ne[1], (unsigned) values.ne[0],
+                          (unsigned) values.size, (unsigned) values.flags,
+                          (unsigned) idxs.type, (unsigned) idxs.size, (unsigned) o.flags);
         }
 
         if ((o.flags & HTP_OPFLAGS_DIAG_K14) &&
@@ -4755,6 +4783,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_k14_diag = getenv("GGML_HEXAGON_K14_DIAG");
     const char * str_k14_sentinel = getenv("GGML_HEXAGON_K14_SENTINEL");
     const char * str_k14_force_input_flush = getenv("GGML_HEXAGON_K14_FORCE_INPUT_FLUSH");
+    const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
+    const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4807,6 +4837,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                    (str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0);
     opt_k14_sentinel = opt_k14_diag && str_k14_sentinel != nullptr &&
                        strcmp(str_k14_sentinel, "1") == 0;
+
+    opt_kv14_set_rows_force_input_flush = str_kv14_set_rows_force_input_flush != nullptr &&
+                                          strcmp(str_kv14_set_rows_force_input_flush, "1") == 0;
+    opt_kv14_set_rows_diag = opt_kv14_set_rows_force_input_flush ||
+                             (str_kv14_set_rows_diag != nullptr &&
+                              strcmp(str_kv14_set_rows_diag, "1") == 0);
+    if (opt_kv14_set_rows_diag) {
+        GGML_LOG_WARN("[HEX_KV14_SET_ROWS_DIAG] enabled=1 scope=cache_k_l14"
+                      " force_input_flush=%d diagnostic_only=1\n",
+                      opt_kv14_set_rows_force_input_flush ? 1 : 0);
+    }
     if (opt_k14_force_input_flush) {
         GGML_LOG_WARN("[HEX_K14_INPUT_FORCE_FLUSH] enabled=1"
                       " scope=K14_MUL_MAT_SRC1 mode=DSP_CLEAN_INVALIDATE"
