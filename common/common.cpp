@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -16,12 +17,14 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1599,6 +1602,104 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// Optional, per-node CPU vs RPC/NPU numerical diagnostics. This deliberately
+// uses the existing scheduler evaluation callback so that tensors are sampled
+// after the producing backend has finished, before their allocations are reused.
+// It is a correctness probe: enabling it changes graph split boundaries and is
+// not suitable for performance measurements.
+struct common_tensor_compare_dump_state {
+    std::filesystem::path directory;
+    std::regex filter;
+    std::ofstream manifest;
+    std::mutex mutex;
+    uint64_t next_id = 0;
+
+    common_tensor_compare_dump_state(const char * dir, const char * pattern)
+        : directory(dir), filter(pattern) {
+        std::filesystem::create_directories(directory);
+        manifest.open(directory / "manifest.tsv", std::ios::out | std::ios::trunc);
+        if (!manifest) {
+            throw std::runtime_error("cannot create tensor comparison manifest");
+        }
+        manifest << "id\tname\top\ttype\tne0\tne1\tne2\tne3\tbytes\tfile\n";
+        manifest.flush();
+    }
+};
+
+static bool common_tensor_compare_eval(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * dump = static_cast<common_tensor_compare_dump_state *>(user_data);
+    if (tensor == nullptr || dump == nullptr) {
+        return !ask;
+    }
+
+    const bool selected = tensor->op != GGML_OP_NONE &&
+        (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16) &&
+        std::regex_match(tensor->name, dump->filter);
+
+    if (ask) {
+        return selected;
+    }
+    if (!selected) {
+        return true;
+    }
+
+    // Raw dense F32/F16 values are required by the comparison script.
+    if (!ggml_is_contiguous(tensor) || tensor->buffer == nullptr) {
+        LOG_ERR("[TENSOR_COMPARE_SKIP] name=%s reason=%s\n", tensor->name,
+            !ggml_is_contiguous(tensor) ? "NONCONTIGUOUS" : "NO_BUFFER");
+        return true;
+    }
+
+    try {
+        const size_t nbytes = ggml_nbytes(tensor);
+        if (nbytes == 0 || nbytes > (64ULL << 20)) {
+            LOG_ERR("[TENSOR_COMPARE_SKIP] name=%s bytes=%zu reason=SIZE_LIMIT\n",
+                tensor->name, nbytes);
+            return true;
+        }
+
+        std::vector<uint8_t> data(nbytes);
+        // The scheduler synchronizes the producing backend before invoking
+        // the observer. tensor_get also handles RPC and device-only buffers.
+        ggml_backend_tensor_get(tensor, data.data(), 0, nbytes);
+
+        std::lock_guard<std::mutex> lock(dump->mutex);
+        const uint64_t id = dump->next_id++;
+        const std::string filename = "tensor_" + std::to_string(id) + ".bin";
+        std::ofstream output(dump->directory / filename, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char *>(data.data()), nbytes);
+        output.close();
+        if (!output) {
+            LOG_ERR("[TENSOR_COMPARE_ERROR] name=%s reason=WRITE_FAILED\n", tensor->name);
+            return false;
+        }
+
+        dump->manifest << id << '\t' << tensor->name << '\t'
+                       << ggml_op_name(tensor->op) << '\t'
+                       << ggml_type_name(tensor->type);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            dump->manifest << '\t' << tensor->ne[i];
+        }
+        dump->manifest << '\t' << nbytes << '\t' << filename << '\n';
+        dump->manifest.flush();
+        if (!dump->manifest) {
+            LOG_ERR("[TENSOR_COMPARE_ERROR] name=%s reason=MANIFEST_WRITE_FAILED\n",
+                tensor->name);
+            return false;
+        }
+        LOG_INF("[TENSOR_COMPARE_DUMP] id=%llu name=%s type=%s ne=%lld,%lld bytes=%zu\n",
+            static_cast<unsigned long long>(id), tensor->name,
+            ggml_type_name(tensor->type),
+            static_cast<long long>(tensor->ne[0]),
+            static_cast<long long>(tensor->ne[1]), nbytes);
+    } catch (const std::exception & e) {
+        LOG_ERR("[TENSOR_COMPARE_ERROR] name=%s error=%s\n", tensor->name, e.what());
+        return false;
+    }
+
+    return true;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1625,6 +1726,27 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // LLAMA_TENSOR_COMPARE_DIR enables precise F32/F16 snapshots on the PC
+    // process for identical CPU and NPU runs. Keep all ordinary runs unchanged.
+    const char * compare_dir = std::getenv("LLAMA_TENSOR_COMPARE_DIR");
+    if (compare_dir != nullptr && compare_dir[0] != '\0') {
+        if (cparams.cb_eval != nullptr) {
+            LOG_ERR("[TENSOR_COMPARE] existing evaluation callback; dump not installed\n");
+        } else {
+            const char * pattern = std::getenv("LLAMA_TENSOR_COMPARE_REGEX");
+            if (pattern == nullptr || pattern[0] == '\0') {
+                pattern = "^(attn_norm|Qcur|Qcur_normed|Kcur|Kcur_normed|Vcur|"
+                          "attn_out|ffn_inp|ffn_norm|ffn_up|ffn_gate|"
+                          "ffn_swiglu|ffn_down|ffn_out|l_out)-(13|14|15)$";
+            }
+            static common_tensor_compare_dump_state dump(compare_dir, pattern);
+            cparams.cb_eval = common_tensor_compare_eval;
+            cparams.cb_eval_user_data = &dump;
+            LOG_INF("[TENSOR_COMPARE] dump_dir=%s filter=%s (debug-only; graph splits change)\n",
+                compare_dir, pattern);
+        }
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
