@@ -1502,6 +1502,19 @@ struct ggml_hexagon_opbatch {
         memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
         o.opcode = node.opcode;
         o.flags  = 0;
+        o.pad[0] = 0;
+        o.pad[1] = 0;
+
+        // Exact host-side identity check; the DSP wire format does not include
+        // tensor names. Mark only this K14 MatMul, never arbitrary 2048x512 ops.
+        if (opt_k14_diag && node.diag_k14_seq != 0 &&
+            node.opcode == HTP_OP_MUL_MAT && node.node != nullptr &&
+            node.node->src[0] != nullptr &&
+            strcmp(node.node->src[0]->name, "blk.14.attn_k.weight") == 0) {
+            o.flags |= HTP_OPFLAGS_DIAG_K14;
+            o.pad[0] = static_cast<uint16_t>(node.diag_k14_seq & 0xffffu);
+            o.pad[1] = static_cast<uint16_t>(node.diag_k14_seq >> 16);
+        }
 
         if (!(opt_opstage & HTP_OPSTAGE_COMPUTE)) {
             o.flags |= HTP_OPFLAGS_SKIP_COMPUTE;
@@ -1517,6 +1530,20 @@ struct ggml_hexagon_opbatch {
         auto outputs = node.get_outputs();
         for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
             o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
+        }
+
+        if ((o.flags & HTP_OPFLAGS_DIAG_K14) &&
+            o.src[1] != 0xffff && o.dst[0] != 0xffff) {
+            const htp_tensor & input = h_tens[o.src[1]];
+            const htp_tensor & output = h_tens[o.dst[0]];
+            GGML_LOG_INFO("[HEX_K14_DSP_TAG] seq=%u op_flags=0x%x"
+                          " input_flags=0x%x output_flags=0x%x"
+                          " input_bytes=%u output_bytes=%u"
+                          " input_bi=%u output_bi=%u"
+                          " input_offset=%u output_offset=%u\n",
+                          node.diag_k14_seq, o.flags, input.flags, output.flags,
+                          input.size, output.size, (unsigned) input.bi,
+                          (unsigned) output.bi, input.data, output.data);
         }
     }
 };
@@ -3975,6 +4002,18 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
         for (const auto & node : *nodes_ptr) {
+            if (opt_k14_diag) {
+                const auto it = std::find_if(
+                    k14_entries.begin(), k14_entries.end(),
+                    [&](const k14_diag_entry & e) { return e.output == node.node; });
+                if (it != k14_entries.end()) {
+                    // Tag the enqueue copy rather than mutating cached graph nodes.
+                    htp_opnode tagged_node = node;
+                    tagged_node.diag_k14_seq = static_cast<uint32_t>(it->seq);
+                    sess->enqueue_op(tagged_node);
+                    continue;
+                }
+            }
             sess->enqueue_op(node);
         }
     }
