@@ -2141,6 +2141,15 @@ static bool ggml_sched_kv14_tensor_ready(const struct ggml_tensor * t) {
     return base->buffer != nullptr;
 }
 
+static uint64_t ggml_sched_kv14_fnv64(const uint8_t * data, size_t size) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
 static std::vector<ggml_sched_kv14_readback> ggml_sched_kv14_capture(
         ggml_backend_t backend, const struct ggml_backend_sched_split * split) {
     std::vector<ggml_sched_kv14_readback> captures;
@@ -2206,6 +2215,19 @@ static std::vector<ggml_sched_kv14_readback> ggml_sched_kv14_capture(
         p.indices.resize(indices_bytes);
         ggml_backend_tensor_get(values, p.values.data(), 0, values_bytes);
         ggml_backend_tensor_get(indices, p.indices.data(), 0, indices_bytes);
+
+        uint32_t sample0 = 0;
+        uint32_t sample1 = 0;
+        memcpy(&sample0, p.values.data(), sizeof(sample0));
+        if (p.values.size() >= 2 * sizeof(sample1)) {
+            memcpy(&sample1, p.values.data() + sizeof(sample0), sizeof(sample1));
+        }
+        GGML_LOG_WARN("[KV14_SET_ROWS_SOURCE] backend=%s cache=%c rows=%" PRId64
+                      " width=%" PRId64 " bytes=%zu values_fnv64=%016" PRIx64
+                      " sample0_bits=%08x sample1_bits=%08x\n",
+                      ggml_backend_name(backend), p.kind, p.rows, p.width,
+                      p.values.size(), ggml_sched_kv14_fnv64(p.values.data(), p.values.size()),
+                      sample0, sample1);
     }
 
     return captures;
