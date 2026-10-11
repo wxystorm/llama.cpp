@@ -895,6 +895,9 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
                             (op->flags & HTP_OPFLAGS_DIAG_KV14_SET_ROWS) != 0;
     const bool kv14_set_rows_force_input_flush = kv14_set_rows_diag &&
                             (op->flags & HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH) != 0;
+    const bool sync_set_rows_host_inputs = op->opcode == HTP_OP_SET_ROWS &&
+                            (op->flags & HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT) != 0 &&
+                            (op->flags & HTP_OPFLAGS_SKIP_COMPUTE) == 0;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
                              ((uint32_t) op->pad[1] << 16);
     if (k14_diag && k14_probe != NULL) {
@@ -927,8 +930,30 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         const bool kv14_force_flush = kv14_set_rows_force_input_flush && i == 0 &&
                                       src->type == HTP_TYPE_F32 && src->data != 0 &&
                                       src->size > 0 && src->size <= (1u << 20);
-        if (force_flush || kv14_force_flush || regular_flush) {
+        // Host / RPC-produced inputs are not necessarily marked COMPUTE by
+        // GGML. The old regular_flush predicate misses these updates. This
+        // experimental path applies the same flush used in the K14 probe to
+        // all SET_ROWS F32 values and I32/I64 indices while leaving the
+        // destination (src[2]) untouched.
+        const bool sync_external_set_rows_src =
+            sync_set_rows_host_inputs && !(src->flags & HTP_TENSOR_COMPUTE) &&
+            src->data != 0 && src->size > 0 && src->size <= (16u << 20) &&
+            ((i == 0 && src->type == HTP_TYPE_F32) ||
+             (i == 1 && (src->type == HTP_TYPE_I32 ||
+                          src->type == HTP_TYPE_I64)));
+        if (sync_set_rows_host_inputs && !(src->flags & HTP_TENSOR_COMPUTE) &&
+            (i == 0 || i == 1) && src->size > (16u << 20)) {
+            FARF(ALWAYS, "[HTP_SET_ROWS_HOST_SYNC] status=SKIP"
+                 " reason=SOURCE_TOO_LARGE bytes=%u input=%u", src->size, i);
+        }
+        if (force_flush || kv14_force_flush || sync_external_set_rows_src || regular_flush) {
             hex_l2flush((void *) (uintptr_t) src->data, src->size);
+        }
+        if (sync_external_set_rows_src) {
+            FARF(HIGH, "[HTP_SET_ROWS_HOST_SYNC] status=FLUSH"
+                 " input=%u bytes=%u type=%u flags=0x%x",
+                 i, (unsigned) src->size, (unsigned) src->type,
+                 (unsigned) src->flags);
         }
         if (force_flush && k14_probe != NULL) {
             k14_probe->input_force_flush_done = true;
