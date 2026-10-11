@@ -1670,6 +1670,42 @@ struct ggml_hexagon_opqueue {
 
         done.push(rsp.id);
 
+        // The DSP optionally returns four K14 fingerprints in n_traces[]
+        // when profiling is disabled. The magic/sequence are in rsp.pad.
+        // No FARF forwarding or logcat access is required.
+        if (opt_k14_diag) {
+            uint32_t magic = 0, seq = 0;
+            memcpy(&magic, rsp.pad, sizeof(magic));
+            memcpy(&seq, rsp.pad + sizeof(magic), sizeof(seq));
+            if (magic == 0x4b313444u && opt_profile == 0) {
+                const uint32_t valid = rsp.n_traces[10];
+                const uint64_t input_hash = (uint64_t(rsp.n_traces[1]) << 32) | rsp.n_traces[0];
+                const uint64_t pre_hash   = (uint64_t(rsp.n_traces[3]) << 32) | rsp.n_traces[2];
+                const uint64_t post_hash  = (uint64_t(rsp.n_traces[5]) << 32) | rsp.n_traces[4];
+                const uint64_t flush_hash = (uint64_t(rsp.n_traces[7]) << 32) | rsp.n_traces[6];
+                GGML_LOG_INFO("[HEX_K14_DSP_PROBE] seq=%u batch_id=%u status=%s"
+                              " input_flags=0x%x exec_status=%u valid_mask=0x%x"
+                              " input_fnv64=%016" PRIx64
+                              " output_pre_fnv64=%016" PRIx64
+                              " output_post_fnv64=%016" PRIx64
+                              " output_flush_fnv64=%016" PRIx64 "\n",
+                              seq, rsp.id, status_to_str(rsp.status),
+                              rsp.n_traces[8], rsp.n_traces[9], valid,
+                              input_hash, pre_hash, post_hash, flush_hash);
+            } else if (opt_profile == 0) {
+                const auto & completed = op_cache[rsp.id];
+                bool has_k14 = false;
+                for (const auto & op : completed) {
+                    if (op.diag_k14_seq != 0) { has_k14 = true; break; }
+                }
+                if (has_k14) {
+                    GGML_LOG_WARN("[HEX_K14_DSP_PROBE] batch_id=%u status=MISSING"
+                                  " magic=0x%08x reason=DSP_PROBE_NOT_RETURNED"
+                                  " (check DSP library deployment)\n", rsp.id, magic);
+                }
+            }
+        }
+
         // Report the real DSP batch acknowledgement for the K14 matmul.
         // This is a batch-level status, not proof that the output was updated.
         if (opt_k14_diag) {
