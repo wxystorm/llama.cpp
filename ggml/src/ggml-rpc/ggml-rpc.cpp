@@ -3835,7 +3835,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    const bool cacheable = cgraph->uid != 0;
+    // Correctness diagnostic: always serialize and send the graph instead of
+    // issuing GRAPH_RECOMPUTE for a cached UID. In particular, this helps
+    // distinguish stale RPC graph metadata from a Hexagon kernel error when
+    // identical token shapes recur across ubatches.
+    // The server still receives the normal graph UID, but reconstructs the
+    // graph from the full serialized tensor descriptors on every call.
+    const bool disable_graph_cache = std::getenv("GGML_RPC_DISABLE_GRAPH_CACHE") != nullptr;
+    const bool cacheable = cgraph->uid != 0 && !disable_graph_cache;
     bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     //新的
     //reuse = false;
