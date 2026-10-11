@@ -849,6 +849,7 @@ struct htp_k14_rsp_probe {
     uint32_t seq;
     uint32_t input_flags;
     uint32_t valid_mask;
+    bool     input_force_flush_done;
     int      status;
     bool     present;
     uint64_t hash[4]; // input, output_before, output_after, output_after_flush
@@ -888,6 +889,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
 
     const bool k14_diag = (op->flags & HTP_OPFLAGS_DIAG_K14) != 0 &&
                           op->opcode == HTP_OP_MUL_MAT;
+    const bool k14_force_input_flush = k14_diag &&
+                          (op->flags & HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH) != 0;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
                              ((uint32_t) op->pad[1] << 16);
     if (k14_diag && k14_probe != NULL) {
@@ -905,9 +908,20 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         octx->src[i] = src;
         if (!src) continue;
 
-        if (!(src->flags & HTP_TENSOR_FLUSHED) && (src->flags & HTP_TENSOR_COMPUTE)) {
-            // flush compute buffers on input
-            hex_l2flush((void *) src->data, src->size);
+        const bool regular_flush = !(src->flags & HTP_TENSOR_FLUSHED) &&
+                                   (src->flags & HTP_TENSOR_COMPUTE);
+        // Debug experiment: bypass the COMPUTE/FLUSHED usage predicate ONLY
+        // for the host-tagged K14 MatMul's F32 src[1]. Flush before hashing
+        // or invoking the kernel. This tests DSP-side cache maintenance; it
+        // cannot clean dirty Android CPU cache lines.
+        const bool force_flush = k14_force_input_flush && i == 1 &&
+                                 src->type == HTP_TYPE_F32 && src->data != 0 &&
+                                 src->size > 0 && src->size <= (1u << 20);
+        if (force_flush || regular_flush) {
+            hex_l2flush((void *) (uintptr_t) src->data, src->size);
+        }
+        if (force_flush && k14_probe != NULL) {
+            k14_probe->input_force_flush_done = true;
         }
 
         FARF(HIGH, "prep-src #%u: data %p size %u : %u:%u:%u:%u", op->src[i], (void*) src->data, src->size,
@@ -924,11 +938,13 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         FARF(ALWAYS, "[HTP_K14_META] seq=%u op=%u op_flags=0x%x"
              " weight_type=%u weight_flags=0x%x"
              " input_flags=0x%x normal_input_flush=%u"
+             " forced_input_flush=%u"
              " input_bi=%u output_idx=%u",
              k14_seq, op->opcode, op->flags,
              weight ? (unsigned) weight->type : 0xffffu,
              weight ? (unsigned) weight->flags : 0u,
              (unsigned) input_flags, normal_input_flush ? 1u : 0u,
+             k14_probe && k14_probe->input_force_flush_done ? 1u : 0u,
              input ? (unsigned) input->bi : 0xffffu,
              (unsigned) op->dst[0]);
         // Read after the backend's existing input-cache handling.
@@ -1145,7 +1161,10 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
             }
             rsp.n_traces[8]  = k14_probe.input_flags;
             rsp.n_traces[9]  = (uint32_t) k14_probe.status;
-            rsp.n_traces[10] = k14_probe.valid_mask;
+            // Bit 4 acknowledges that the DSP actually called hex_l2flush
+            // on K14 src[1]. Bits 0..3 keep the existing hash-valid mask.
+            rsp.n_traces[10] = k14_probe.valid_mask |
+                    (k14_probe.input_force_flush_done ? 0x10u : 0u);
         }
 
         dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
