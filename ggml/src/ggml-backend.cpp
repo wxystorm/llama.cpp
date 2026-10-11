@@ -2120,6 +2120,205 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     return GGML_STATUS_SUCCESS;
 }
 
+// Diagnostic-only remote KV-cache check. Capture the SET_ROWS inputs before
+// execution (so graph buffer reuse cannot change the expected values), then
+// synchronize and read the remote cache after the RPC split completes.
+// This intentionally changes timing and must never be enabled for benchmarks.
+struct ggml_sched_kv14_readback {
+    struct ggml_tensor * cache;
+    char kind;
+    int64_t rows;
+    int64_t width;
+    std::vector<uint8_t> values;
+    std::vector<uint8_t> indices;
+};
+
+static bool ggml_sched_kv14_tensor_ready(const struct ggml_tensor * t) {
+    if (!t || !t->data) {
+        return false;
+    }
+    const struct ggml_tensor * base = t->view_src ? t->view_src : t;
+    return base->buffer != nullptr;
+}
+
+static uint64_t ggml_sched_kv14_fnv64(const uint8_t * data, size_t size) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static std::vector<ggml_sched_kv14_readback> ggml_sched_kv14_capture(
+        ggml_backend_t backend, const struct ggml_backend_sched_split * split) {
+    std::vector<ggml_sched_kv14_readback> captures;
+
+    const char * enabled = getenv("GGML_SCHED_KV14_READBACK");
+    if (!enabled || strcmp(enabled, "1") != 0 || strncmp(ggml_backend_name(backend), "RPC", 3) != 0) {
+        return captures;
+    }
+
+    constexpr size_t max_probe_bytes = 4u * 1024u * 1024u;
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        struct ggml_tensor * node = split->graph.nodes[i];
+        if (node->op != GGML_OP_SET_ROWS || !node->src[0] || !node->src[1] || !node->src[2]) {
+            continue;
+        }
+
+        struct ggml_tensor * values  = node->src[0];
+        struct ggml_tensor * indices = node->src[1];
+        struct ggml_tensor * cache   = node->src[2];
+
+        const bool is_k = strncmp(cache->name, "cache_k_l14", strlen("cache_k_l14")) == 0;
+        const bool is_v = strncmp(cache->name, "cache_v_l14", strlen("cache_v_l14")) == 0;
+        if (!is_k && !is_v) {
+            continue;
+        }
+
+        const size_t values_bytes = ggml_nbytes(values);
+        const size_t indices_bytes = ggml_nbytes(indices);
+        const size_t cache_bytes = ggml_nbytes(cache);
+        const bool layout_ok = values->type == GGML_TYPE_F32 &&
+                               (indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) &&
+                               cache->type == GGML_TYPE_F16 &&
+                               values->ne[0] == cache->ne[0] &&
+                               values->ne[1] == indices->ne[0] &&
+                               values->ne[2] == 1 && values->ne[3] == 1 &&
+                               indices->ne[1] == 1 && indices->ne[2] == 1 && indices->ne[3] == 1 &&
+                               cache->ne[2] == 1 && cache->ne[3] == 1 &&
+                               ggml_is_contiguous(values) && ggml_is_contiguous(indices) &&
+                               ggml_is_contiguous(cache) &&
+                               ggml_sched_kv14_tensor_ready(values) &&
+                               ggml_sched_kv14_tensor_ready(indices) &&
+                               ggml_sched_kv14_tensor_ready(cache) &&
+                               values_bytes > 0 && indices_bytes > 0 && cache_bytes > 0 &&
+                               values_bytes <= max_probe_bytes && indices_bytes <= max_probe_bytes &&
+                               cache_bytes <= max_probe_bytes;
+        if (!layout_ok) {
+            GGML_LOG_WARN("[KV14_SET_ROWS_READBACK] cache=%c status=SKIP reason=layout_or_buffer "
+                          "values_type=%s indices_type=%s cache_type=%s values_ne=%" PRId64 "x%" PRId64
+                          " cache_ne=%" PRId64 "x%" PRId64 " bytes=%zu/%zu/%zu\n",
+                          is_k ? 'K' : 'V', ggml_type_name(values->type), ggml_type_name(indices->type),
+                          ggml_type_name(cache->type), values->ne[0], values->ne[1],
+                          cache->ne[0], cache->ne[1], values_bytes, indices_bytes, cache_bytes);
+            continue;
+        }
+
+        captures.emplace_back();
+        ggml_sched_kv14_readback & p = captures.back();
+        p.cache = cache;
+        p.kind = is_k ? 'K' : 'V';
+        p.rows = values->ne[1];
+        p.width = values->ne[0];
+        p.values.resize(values_bytes);
+        p.indices.resize(indices_bytes);
+        ggml_backend_tensor_get(values, p.values.data(), 0, values_bytes);
+        ggml_backend_tensor_get(indices, p.indices.data(), 0, indices_bytes);
+
+        uint32_t sample0 = 0;
+        uint32_t sample1 = 0;
+        memcpy(&sample0, p.values.data(), sizeof(sample0));
+        if (p.values.size() >= 2 * sizeof(sample1)) {
+            memcpy(&sample1, p.values.data() + sizeof(sample0), sizeof(sample1));
+        }
+        GGML_LOG_WARN("[KV14_SET_ROWS_SOURCE] backend=%s cache=%c rows=%" PRId64
+                      " width=%" PRId64 " bytes=%zu values_fnv64=%016" PRIx64
+                      " sample0_bits=%08x sample1_bits=%08x\n",
+                      ggml_backend_name(backend), p.kind, p.rows, p.width,
+                      p.values.size(), ggml_sched_kv14_fnv64(p.values.data(), p.values.size()),
+                      sample0, sample1);
+    }
+
+    return captures;
+}
+
+static void ggml_sched_kv14_verify(
+        ggml_backend_t backend, int split_id, const std::vector<ggml_sched_kv14_readback> & captures) {
+    if (captures.empty()) {
+        return;
+    }
+
+    // Synchronize only in diagnostic mode, after the split's SET_ROWS operations.
+    ggml_backend_synchronize(backend);
+
+    for (const ggml_sched_kv14_readback & p : captures) {
+        std::vector<uint8_t> cache_bytes(ggml_nbytes(p.cache));
+        ggml_backend_tensor_get(p.cache, cache_bytes.data(), 0, cache_bytes.size());
+
+        const size_t idx_size = p.indices.size() / (size_t) p.rows;
+        const size_t src_stride = (size_t) p.width * sizeof(float);
+        const size_t dst_stride = (size_t) p.width * sizeof(ggml_fp16_t);
+        if ((idx_size != sizeof(int32_t) && idx_size != sizeof(int64_t)) ||
+            p.values.size() != src_stride * (size_t) p.rows ||
+            p.cache->nb[0] != sizeof(ggml_fp16_t) ||
+            p.cache->nb[1] != dst_stride) {
+            GGML_LOG_WARN("[KV14_SET_ROWS_READBACK] split=%d cache=%c status=SKIP reason=strides\n",
+                          split_id, p.kind);
+            continue;
+        }
+
+        size_t checked = 0, bad_fp16 = 0, bad_tol = 0, invalid_rows = 0;
+        double sum_sq = 0.0, max_abs = 0.0;
+        int64_t first_row = -1, first_slot = -1, first_col = -1;
+        float first_expected = 0.0f, first_actual = 0.0f;
+
+        for (int64_t row = 0; row < p.rows; ++row) {
+            int64_t slot = -1;
+            if (idx_size == sizeof(int64_t)) {
+                memcpy(&slot, p.indices.data() + (size_t) row * idx_size, sizeof(int64_t));
+            } else {
+                int32_t slot32;
+                memcpy(&slot32, p.indices.data() + (size_t) row * idx_size, sizeof(slot32));
+                slot = slot32;
+            }
+            if (slot < 0 || slot >= p.cache->ne[1]) {
+                ++invalid_rows;
+                continue;
+            }
+
+            for (int64_t col = 0; col < p.width; ++col) {
+                float v;
+                memcpy(&v, p.values.data() + (size_t) row * src_stride + (size_t) col * sizeof(float), sizeof(v));
+                const ggml_fp16_t expected_f16 = ggml_fp32_to_fp16(v);
+
+                ggml_fp16_t actual_f16;
+                memcpy(&actual_f16,
+                       cache_bytes.data() + (size_t) slot * dst_stride + (size_t) col * sizeof(actual_f16),
+                       sizeof(actual_f16));
+                const float expected = ggml_fp16_to_fp32(expected_f16);
+                const float actual = ggml_fp16_to_fp32(actual_f16);
+                const double err = std::fabs((double) expected - (double) actual);
+                ++checked;
+                sum_sq += err * err;
+                max_abs = std::max(max_abs, err);
+                if (memcmp(&expected_f16, &actual_f16, sizeof(actual_f16)) != 0) {
+                    ++bad_fp16;
+                }
+                if (!std::isfinite(err) || err > 0.001 + 0.001 * std::fabs((double) expected)) {
+                    ++bad_tol;
+                    if (first_row < 0) {
+                        first_row = row;
+                        first_slot = slot;
+                        first_col = col;
+                        first_expected = expected;
+                        first_actual = actual;
+                    }
+                }
+            }
+        }
+
+        GGML_LOG_WARN("[KV14_SET_ROWS_READBACK] split=%d cache=%c status=%s rows=%" PRId64
+                      " width=%" PRId64 " checked=%zu invalid_rows=%zu bad_fp16=%zu bad_tol=%zu"
+                      " max_abs=%.9g rmse=%.9g first_row=%" PRId64 " first_slot=%" PRId64
+                      " first_col=%" PRId64 " expected=%.9g actual=%.9g\n",
+                      split_id, p.kind, invalid_rows == 0 && bad_tol == 0 ? "PASS" : "FAIL",
+                      p.rows, p.width, checked, invalid_rows, bad_fp16, bad_tol, max_abs,
+                      checked ? std::sqrt(sum_sq / checked) : 0.0,
+                      first_row, first_slot, first_col, first_expected, first_actual);
+    }
+}
+
 enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
@@ -2127,6 +2326,14 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
     struct ggml_backend_sched_split * split            = &sched->splits[split_id];
     int                               split_backend_id = split->backend_id;
     ggml_backend_t                    split_backend    = sched->backends[split_backend_id];
+
+    // Snapshot staged RPC SET_ROWS inputs before the RPC split executes.
+    // Enabled only by GGML_SCHED_KV14_READBACK=1.
+    const auto kv14_captures = ggml_sched_kv14_capture(split_backend, split);
+    if (!kv14_captures.empty()) {
+        GGML_LOG_WARN("[KV14_SET_ROWS_READBACK] split=%d phase=PRE_CAPTURE count=%zu "
+                      "note=diagnostic_sync_changes_timing\n", split_id, kv14_captures.size());
+    }
 
     if (!sched->callback_eval) {
         enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2183,6 +2390,8 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
             break;
         }
     }
+
+    ggml_sched_kv14_verify(split_backend, split_id, kv14_captures);
 
     // record the event of this copy
     if (split->n_inputs > 0) {
