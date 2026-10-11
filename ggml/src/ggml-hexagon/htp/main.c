@@ -795,11 +795,59 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
+// Host-tagged K14 MatMul diagnostics. The DSP has no GGML tensor names,
+// so htp_op_desc.flags marks only the K14 op selected on the host.
+// FNV-1a matches the host ggml_hexagon_k14_fnv64 byte-for-byte.
+// Volatile loads ensure the DSP observes the mapped data for each invocation;
+// this tracing itself can perturb cache state and must not be used for timing.
+static uint64_t htp_k14_diag_fnv64(const void * data, uint32_t size) {
+    const volatile uint8_t * p = (const volatile uint8_t *) data;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (uint32_t i = 0; i < size; ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static void htp_k14_diag_tensor(uint32_t seq, const char * phase,
+                                const char * role, const struct htp_tensor * t) {
+    if (!t || !t->data || t->type != HTP_TYPE_F32 ||
+        !t->size || t->size > (1u << 20) ||
+        t->nb[0] != sizeof(float) || (t->size % sizeof(float)) != 0) {
+        FARF(ALWAYS, "[HTP_K14_TENSOR] seq=%u phase=%s role=%s status=SKIP"
+             " type=%u bytes=%u", seq, phase, role,
+             t ? (unsigned) t->type : 0xffffu, t ? t->size : 0u);
+        return;
+    }
+
+    const uint8_t * p = (const uint8_t *)(uintptr_t) t->data;
+    const uint64_t hash = htp_k14_diag_fnv64(p, t->size);
+    uint32_t sample0 = 0, sample1 = 0;
+    memcpy(&sample0, p, sizeof(sample0));
+    if (t->size >= 2 * sizeof(float)) {
+        memcpy(&sample1, p + sizeof(sample0), sizeof(sample1));
+    }
+    FARF(ALWAYS, "[HTP_K14_TENSOR] seq=%u phase=%s role=%s"
+         " ptr=%p type=%u flags=0x%x bi=%u bytes=%u ne0=%u ne1=%u"
+         " fnv64=%08x%08x sample0_bits=%08x sample1_bits=%08x",
+         seq, phase, role, (void *) p, (unsigned) t->type,
+         (unsigned) t->flags, (unsigned) t->bi, (unsigned) t->size,
+         (unsigned) t->ne[0], (unsigned) t->ne[1],
+         (unsigned) (hash >> 32), (unsigned) hash,
+         sample0, sample1);
+}
+
 static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
+
+    const bool k14_diag = (op->flags & HTP_OPFLAGS_DIAG_K14) != 0 &&
+                          op->opcode == HTP_OP_MUL_MAT;
+    const uint32_t k14_seq = (uint32_t) op->pad[0] |
+                             ((uint32_t) op->pad[1] << 16);
 
     FARF(HIGH, "proc-op #%u: opcode %u flags 0x%x", idx, octx->op, octx->flags);
 
@@ -819,6 +867,27 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             src->ne[0], src->ne[1], src->ne[3], src->ne[3]);
     }
 
+    if (k14_diag) {
+        const struct htp_tensor * input = octx->src[1];
+        const struct htp_tensor * weight = octx->src[0];
+        const uint32_t input_flags = input ? input->flags : 0u;
+        const bool normal_input_flush = input != NULL &&
+                !(input_flags & HTP_TENSOR_FLUSHED) &&
+                (input_flags & HTP_TENSOR_COMPUTE);
+        FARF(ALWAYS, "[HTP_K14_META] seq=%u op=%u op_flags=0x%x"
+             " weight_type=%u weight_flags=0x%x"
+             " input_flags=0x%x normal_input_flush=%u"
+             " input_bi=%u output_idx=%u",
+             k14_seq, op->opcode, op->flags,
+             weight ? (unsigned) weight->type : 0xffffu,
+             weight ? (unsigned) weight->flags : 0u,
+             (unsigned) input_flags, normal_input_flush ? 1u : 0u,
+             input ? (unsigned) input->bi : 0xffffu,
+             (unsigned) op->dst[0]);
+        // Read after the backend's existing input-cache handling.
+        htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "input", input);
+    }
+
     // Prep output tensors
     for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
         uint16_t dst_idx = op->dst[i];
@@ -833,7 +902,16 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
+    if (k14_diag) {
+        htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "output", octx->dsts[0]);
+    }
+
     int status = execute_op(octx);
+
+    if (k14_diag) {
+        htp_k14_diag_tensor(k14_seq, "POST_EXEC", "output", octx->dsts[0]);
+        FARF(ALWAYS, "[HTP_K14_EXEC_STATUS] seq=%u status=%d", k14_seq, status);
+    }
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
@@ -851,6 +929,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             FARF(HIGH, "post-dst[%u] #%u: data %p size %u : %u:%u:%u:%u", i, op->dst[i], (void*) dst->data, dst->size,
                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
         }
+    }
+
+    if (k14_diag) {
+        htp_k14_diag_tensor(k14_seq, "POST_FLUSH", "output", octx->dsts[0]);
     }
 
     return status;
