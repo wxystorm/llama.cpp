@@ -145,6 +145,7 @@ enum htp_op_flags {
     HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH = (1U << 2), // Debug-only K14 src[1] DSP cache flush before execution
     HTP_OPFLAGS_DIAG_KV14_SET_ROWS = (1U << 3), // Debug-only K14 cache SET_ROWS input digest
     HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH = (1U << 4), // Debug-only K14 cache SET_ROWS src[0] flush
+    HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT = (1U << 5), // Opt-in: sync externally staged SET_ROWS F32 data and indices
 };
 
 // Op descriptor
