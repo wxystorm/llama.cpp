@@ -20,6 +20,7 @@
 #include <queue>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #ifdef _WIN32
@@ -81,6 +82,7 @@ static int opt_optrace  = 0;    // trace buffer size per thread (0 means default
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
 static bool opt_k14_diag = false; // opt-in layer-14 K matmul diagnostic
+static bool opt_k14_sentinel = false; // destructive diagnostic, M=1 only
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -184,6 +186,108 @@ static bool ggml_hexagon_k14_dump_tensor(
                       tensor->ne[0], tensor->ne[1], bytes, digest);
     }
     return true;
+}
+
+
+// Debug-only sentinel poisoning for standalone, single-token K14 matmul.
+// The output is overwritten before HTP execution, never in normal execution.
+// The experiment intentionally perturbs memory/cache state; it is not a fix.
+static bool ggml_hexagon_k14_sentinel_write(
+        ggml_tensor * output, const ggml_tensor * input,
+        const ggml_tensor * weight, uint64_t seq,
+        float * sentinel_value, uint64_t * sentinel_hash) {
+    const int64_t count = output ? ggml_nelements(output) : 0;
+    const size_t bytes = output ? ggml_nbytes(output) : 0;
+    if (output == nullptr || output->type != GGML_TYPE_F32 ||
+        output->buffer == nullptr || output->data == nullptr ||
+        output->ne[1] != 1 || !ggml_is_contiguous(output) ||
+        count <= 0 || bytes > (1u << 20) ||
+        static_cast<size_t>(count) * sizeof(float) != bytes) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                      " reason=UNSUPPORTED_OUTPUT\n", seq);
+        return false;
+    }
+
+    // Avoid corrupting either matmul operand if a graph unexpectedly aliases
+    // output and input storage.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data) {
+            return false;
+        }
+        const uintptr_t aa = reinterpret_cast<uintptr_t>(a->data);
+        const uintptr_t bb = reinterpret_cast<uintptr_t>(b->data);
+        const size_t na = ggml_nbytes(a);
+        const size_t nb = ggml_nbytes(b);
+        return aa <= UINTPTR_MAX - na && bb <= UINTPTR_MAX - nb &&
+               aa < bb + nb && bb < aa + na;
+    };
+    if (overlaps(output, input) || overlaps(output, weight)) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                      " reason=ALIASED_OPERAND\n", seq);
+        return false;
+    }
+
+    // Exact F32 integers far outside the expected K projection range.
+    const float value = -16384.0f - static_cast<float>(seq % 4096);
+    std::vector<float> fill(static_cast<size_t>(count), value);
+    const uint64_t expected = ggml_hexagon_k14_fnv64(fill.data(), bytes);
+
+    ggml_backend_tensor_set(output, fill.data(), 0, bytes);
+
+    // Confirm the sentinel is visible via the very same backend readback path
+    // used by the existing BEFORE and POST diagnostics.
+    uint64_t observed = 0;
+    const bool readable = ggml_hexagon_k14_dump_tensor(
+        "SENTINEL", "output", seq, output, &observed);
+    const bool verified = readable && observed == expected;
+    GGML_LOG_INFO("[HEX_K14_SENTINEL] stage=WRITE seq=%" PRIu64
+                  " value=%.1f elements=%" PRId64
+                  " expected_fnv64=%016" PRIx64 " observed_fnv64=%016" PRIx64
+                  " verified=%d view=HOST_SHARED\n",
+                  seq, value, count, expected, observed, verified ? 1 : 0);
+
+    *sentinel_value = value;
+    *sentinel_hash = expected;
+    return verified;
+}
+
+static void ggml_hexagon_k14_sentinel_check(
+        const ggml_tensor * output, uint64_t seq, float value,
+        uint64_t original_hash, uint64_t sentinel_hash, uint64_t after_hash) {
+    if (!output || output->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(output) || output->buffer == nullptr ||
+        output->data == nullptr) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                      " status=SKIP reason=UNSUPPORTED_OUTPUT\n", seq);
+        return;
+    }
+    const size_t bytes = ggml_nbytes(output);
+    if (bytes == 0 || bytes > (1u << 20) || bytes % sizeof(float) != 0) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                      " status=SKIP bytes=%zu\n", seq, bytes);
+        return;
+    }
+    std::vector<uint8_t> data(bytes);
+    ggml_backend_tensor_get(output, data.data(), 0, bytes);
+    size_t survivors = 0;
+    for (size_t i = 0; i < bytes / sizeof(float); i++) {
+        float observed;
+        memcpy(&observed, data.data() + i * sizeof(float), sizeof(float));
+        if (observed == value) {
+            ++survivors;
+        }
+    }
+    const size_t total = bytes / sizeof(float);
+    GGML_LOG_INFO("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                  " value=%.1f survivors=%zu total=%zu"
+                  " original_fnv64=%016" PRIx64
+                  " sentinel_fnv64=%016" PRIx64
+                  " after_fnv64=%016" PRIx64
+                  " untouched=%d restored_original=%d view=HOST_SHARED\n",
+                  seq, value, survivors, total, original_hash,
+                  sentinel_hash, after_hash,
+                  after_hash == sentinel_hash ? 1 : 0,
+                  after_hash == original_hash ? 1 : 0);
 }
 
 static void ggml_hexagon_dump_op_exec(const std::string &sess_name, const htp_opnode & node, const uint32_t req_flags) {
@@ -3804,6 +3908,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         uint64_t seq;
         uint64_t before_fnv64;
         bool before_valid;
+        bool sentinel_applied;
+        uint64_t original_fnv64;
+        uint64_t sentinel_fnv64;
+        float sentinel_value;
     };
     std::vector<k14_diag_entry> k14_entries;
     if (opt_k14_diag) {
@@ -3838,10 +3946,29 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                           (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
             ggml_hexagon_k14_dump_tensor("PRE", "weight", seq, weight);
             ggml_hexagon_k14_dump_tensor("PRE", "input", seq, input);
+            uint64_t original_fnv64 = 0;
+            uint64_t sentinel_fnv64 = 0;
+            float sentinel_value = 0.0f;
+            bool sentinel_applied = false;
+            if (opt_k14_sentinel && matmul->ne[1] == 1) {
+                ggml_hexagon_k14_dump_tensor(
+                    "BEFORE_ORIGINAL", "output", seq, matmul, &original_fnv64);
+                if (nodes_ptr->size() != 1) {
+                    GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                                  " reason=NOT_STANDALONE ops=%zu\n",
+                                  seq, nodes_ptr->size());
+                } else {
+                    sentinel_applied = ggml_hexagon_k14_sentinel_write(
+                        matmul, input, weight, seq,
+                        &sentinel_value, &sentinel_fnv64);
+                }
+            }
             uint64_t before_fnv64 = 0;
             const bool before_valid = ggml_hexagon_k14_dump_tensor(
                 "BEFORE", "output", seq, matmul, &before_fnv64);
-            k14_entries.push_back({ matmul, seq, before_fnv64, before_valid });
+            k14_entries.push_back({ matmul, seq, before_fnv64, before_valid,
+                                    sentinel_applied, original_fnv64,
+                                    sentinel_fnv64, sentinel_value });
         }
     }
 
@@ -3870,6 +3997,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                       entry.before_valid ? 1 : 0, after_valid ? 1 : 0,
                       entry.before_fnv64, after_fnv64,
                       can_compare ? (entry.before_fnv64 != after_fnv64 ? 1 : 0) : -1);
+        if (entry.sentinel_applied && after_valid) {
+            ggml_hexagon_k14_sentinel_check(
+                entry.output, entry.seq, entry.sentinel_value,
+                entry.original_fnv64, entry.sentinel_fnv64, after_fnv64);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -4529,6 +4661,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_k14_diag = getenv("GGML_HEXAGON_K14_DIAG");
+    const char * str_k14_sentinel = getenv("GGML_HEXAGON_K14_SENTINEL");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4574,6 +4707,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
     opt_k14_diag = str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0;
+    opt_k14_sentinel = opt_k14_diag && str_k14_sentinel != nullptr &&
+                       strcmp(str_k14_sentinel, "1") == 0;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
