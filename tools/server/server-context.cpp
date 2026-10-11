@@ -3811,7 +3811,7 @@ private:
                         stderr,
                         "top[%zu]: token=%d logit=%.9f piece=%s\n",
                         i, token, logits[ids[i]],
-                        json(common_token_to_piece(vocab, token, true)).dump().c_str());
+                        json(common_token_to_piece(vocab, token, true)).dump(-1, ' ', false, json::error_handler_t::replace).c_str());
                 }
 
                 if (n_top >= 2) {
@@ -3838,7 +3838,7 @@ private:
                         "[CLI_LOGITS_CHOSEN] step=%d decoded_before_sample=%d"
                         " selected_token=%d piece=%s\n",
                         slot.n_decoded + 1, slot.n_decoded, id,
-                        json(common_token_to_piece(vocab, id, true)).dump().c_str());
+                        json(common_token_to_piece(vocab, id, true)).dump(-1, ' ', false, json::error_handler_t::replace).c_str());
             }
             slot.i_batch = -1;
 
