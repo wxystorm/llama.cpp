@@ -21,6 +21,10 @@ struct htp_opnode {
 
     htp_op_code opcode = HTP_OP_INVALID;
 
+    // Host-only sequence for an explicitly tagged K14 op. Copied into the
+    // existing htp_op_desc.pad words during serialization (no ABI change).
+    uint32_t diag_k14_seq = 0;
+
     std::vector<ggml_tensor *> extra_dsts;
 
     int32_t kernel_params[HTP_OP_MAX_KERN_PARAMS] = {0};
