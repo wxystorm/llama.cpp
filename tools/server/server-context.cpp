@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <numeric>
@@ -40,6 +41,24 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// How many generation steps (1-based) to print raw Top-10 logits for.
+// Defaults to 3 to preserve the existing debug output. Set
+// LLAMA_CLI_LOGITS_FIRST_N=6 to include the fifth generation decision.
+// A zero disables this verbose diagnostic; values are capped at 64.
+static int server_cli_logits_first_n() {
+    static const int first_n = []() {
+        const char * value = std::getenv("LLAMA_CLI_LOGITS_FIRST_N");
+        if (value == nullptr || *value == '\0') {
+            return 3;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end != value && *end == '\0' && parsed >= 0 && parsed <= 64 ?
+            static_cast<int>(parsed) : 3;
+    }();
+    return first_n;
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -3733,8 +3752,14 @@ private:
             */
            const int tok_idx = slot.i_batch - off;
 
-            // Inspect the first few generated tokens, including the decode path.
-            if (slot.n_decoded == 0 || slot.n_decoded == 1 || slot.n_decoded == 2) {
+            // Log the raw scores BEFORE sampling. A generated-token step is
+            // slot.n_decoded + 1: step=5 is n_decoded=4, not 5.
+            const bool log_cli_logits = slot.n_decoded < server_cli_logits_first_n();
+            if (log_cli_logits) {
+                // The context can still have asynchronous backend work here.
+                // Synchronize before reading the raw logits, just as the normal
+                // common_sampler_sample path does.
+                llama_synchronize(slot.ctx_tgt);
                 const float * sampled_logits = llama_get_sampled_logits_ith(slot.ctx_tgt, tok_idx);
                 const float * logits = sampled_logits ? sampled_logits : llama_get_logits_ith(slot.ctx_tgt, tok_idx);
                 const llama_token * candidate_ids = sampled_logits ?
@@ -3774,8 +3799,9 @@ private:
 
                 fprintf(stderr,
                     "\n========== TOKEN LOGITS TOP 10 ==========\n"
-                    "decoded=%d source=%s count=%zu zero=%zu nonfinite=%zu\n",
-                    slot.n_decoded, sampled_logits ? "backend_candidates" : "full_vocab",
+                    "step=%d decoded_before_sample=%d source=%s count=%zu zero=%zu nonfinite=%zu\n",
+                    slot.n_decoded + 1, slot.n_decoded,
+                    sampled_logits ? "backend_candidates" : "full_vocab",
                     n_logits, n_zero, n_nonfinite);
 
                 for (size_t i = 0; i < n_top; ++i) {
@@ -3783,12 +3809,15 @@ private:
 
                     fprintf(
                         stderr,
-                        "top[%zu]: token=%d logit=%.9f\n",
-                        i,
-                        token,
-                        logits[ids[i]]);
+                        "top[%zu]: token=%d logit=%.9f piece=%s\n",
+                        i, token, logits[ids[i]],
+                        json(common_token_to_piece(vocab, token, true)).dump().c_str());
                 }
 
+                if (n_top >= 2) {
+                    fprintf(stderr, "top1_top2_raw_margin=%.9f\n",
+                            logits[ids[0]] - logits[ids[1]]);
+                }
                 fprintf(stderr,
                     "========================================\n");
             }
@@ -3801,6 +3830,15 @@ private:
                     slot.smpl.get(),
                     slot.ctx_tgt,
                     tok_idx);
+            }
+            if (log_cli_logits) {
+                const llama_vocab * vocab =
+                    llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
+                fprintf(stderr,
+                        "[CLI_LOGITS_CHOSEN] step=%d decoded_before_sample=%d"
+                        " selected_token=%d piece=%s\n",
+                        slot.n_decoded + 1, slot.n_decoded, id,
+                        json(common_token_to_piece(vocab, id, true)).dump().c_str());
             }
             slot.i_batch = -1;
 
