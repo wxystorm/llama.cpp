@@ -83,6 +83,7 @@ static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
 static bool opt_k14_diag = false; // opt-in layer-14 K matmul diagnostic
 static bool opt_k14_sentinel = false; // destructive diagnostic, M=1 only
+static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache experiment
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1514,6 +1515,9 @@ struct ggml_hexagon_opbatch {
             o.flags |= HTP_OPFLAGS_DIAG_K14;
             o.pad[0] = static_cast<uint16_t>(node.diag_k14_seq & 0xffffu);
             o.pad[1] = static_cast<uint16_t>(node.diag_k14_seq >> 16);
+            if (opt_k14_force_input_flush) {
+                o.flags |= HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH;
+            }
         }
 
         if (!(opt_opstage & HTP_OPSTAGE_COMPUTE)) {
@@ -1540,10 +1544,12 @@ struct ggml_hexagon_opbatch {
                           " input_flags=0x%x output_flags=0x%x"
                           " input_bytes=%u output_bytes=%u"
                           " input_bi=%u output_bi=%u"
-                          " input_offset=%u output_offset=%u\n",
+                          " input_offset=%u output_offset=%u"
+                          " force_input_flush_requested=%d\n",
                           node.diag_k14_seq, o.flags, input.flags, output.flags,
                           input.size, output.size, (unsigned) input.bi,
-                          (unsigned) output.bi, input.data, output.data);
+                          (unsigned) output.bi, input.data, output.data,
+                          (o.flags & HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH) ? 1 : 0);
         }
     }
 };
@@ -1678,20 +1684,31 @@ struct ggml_hexagon_opqueue {
             memcpy(&magic, rsp.pad, sizeof(magic));
             memcpy(&seq, rsp.pad + sizeof(magic), sizeof(seq));
             if (magic == 0x4b313444u && opt_profile == 0) {
-                const uint32_t valid = rsp.n_traces[10];
+                // Low four bits remain the fingerprint-valid mask. Bit 4 is
+                // an acknowledgement written only after the DSP flush call.
+                const uint32_t valid = rsp.n_traces[10] & 0x0fu;
+                const bool force_ack = (rsp.n_traces[10] & 0x10u) != 0;
                 const uint64_t input_hash = (uint64_t(rsp.n_traces[1]) << 32) | rsp.n_traces[0];
                 const uint64_t pre_hash   = (uint64_t(rsp.n_traces[3]) << 32) | rsp.n_traces[2];
                 const uint64_t post_hash  = (uint64_t(rsp.n_traces[5]) << 32) | rsp.n_traces[4];
                 const uint64_t flush_hash = (uint64_t(rsp.n_traces[7]) << 32) | rsp.n_traces[6];
                 GGML_LOG_INFO("[HEX_K14_DSP_PROBE] seq=%u batch_id=%u status=%s"
                               " input_flags=0x%x exec_status=%u valid_mask=0x%x"
+                              " force_input_flush_requested=%d force_input_flush_ack=%d"
                               " input_fnv64=%016" PRIx64
                               " output_pre_fnv64=%016" PRIx64
                               " output_post_fnv64=%016" PRIx64
                               " output_flush_fnv64=%016" PRIx64 "\n",
                               seq, rsp.id, status_to_str(rsp.status),
                               rsp.n_traces[8], rsp.n_traces[9], valid,
+                              opt_k14_force_input_flush ? 1 : 0,
+                              force_ack ? 1 : 0,
                               input_hash, pre_hash, post_hash, flush_hash);
+                if (opt_k14_force_input_flush && !force_ack) {
+                    GGML_LOG_WARN("[HEX_K14_INPUT_FORCE_FLUSH] seq=%u"
+                                  " status=NO_DSP_ACK (check DSP library version"
+                                  " and input tensor validity)\n", seq);
+                }
             } else if (opt_profile == 0) {
                 const auto & completed = op_cache[rsp.id];
                 bool has_k14 = false;
@@ -4737,6 +4754,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_k14_diag = getenv("GGML_HEXAGON_K14_DIAG");
     const char * str_k14_sentinel = getenv("GGML_HEXAGON_K14_SENTINEL");
+    const char * str_k14_force_input_flush = getenv("GGML_HEXAGON_K14_FORCE_INPUT_FLUSH");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4781,9 +4799,19 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 128);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
-    opt_k14_diag = str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0;
+    opt_k14_force_input_flush = str_k14_force_input_flush != nullptr &&
+                                strcmp(str_k14_force_input_flush, "1") == 0;
+    // Force-flush automatically enables K14 tagging so the DSP receives the
+    // flag even if GGML_HEXAGON_K14_DIAG was not set independently.
+    opt_k14_diag = opt_k14_force_input_flush ||
+                   (str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0);
     opt_k14_sentinel = opt_k14_diag && str_k14_sentinel != nullptr &&
                        strcmp(str_k14_sentinel, "1") == 0;
+    if (opt_k14_force_input_flush) {
+        GGML_LOG_WARN("[HEX_K14_INPUT_FORCE_FLUSH] enabled=1"
+                      " scope=K14_MUL_MAT_SRC1 mode=DSP_CLEAN_INVALIDATE"
+                      " diagnostic_only=1\n");
+    }
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
