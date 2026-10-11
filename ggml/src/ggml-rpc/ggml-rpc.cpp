@@ -8510,7 +8510,26 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
             case GGML_OP_MUL_MAT:
-            case GGML_OP_GET_ROWS:
+                return true;
+            case GGML_OP_GET_ROWS: {
+                // Older Hexagon supports GET_ROWS only for F32 embeddings
+                // with I32/I64 indices. In particular, quantized token
+                // embeddings must fall back to a local backend.
+                const bool supported =
+                    op->src[0] != nullptr &&
+                    op->src[1] != nullptr &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    (op->src[1]->type == GGML_TYPE_I32 ||
+                     op->src[1]->type == GGML_TYPE_I64) &&
+                    op->type == GGML_TYPE_F32;
+                if (!supported && std::getenv("GGML_RPC_GET_ROWS_DEBUG") != nullptr) {
+                    GGML_LOG_INFO("[RPC_GET_ROWS_FALLBACK] name=%s src_type=%s dst_type=%s\n",
+                        op->name,
+                        op->src[0] ? ggml_type_name(op->src[0]->type) : "null",
+                        ggml_type_name(op->type));
+                }
+                return supported;
+            }
             // Keep SET_ROWS on RPC for remotely allocated KV-cache tensors.
             case GGML_OP_SET_ROWS:
                 return true;
