@@ -8509,8 +8509,54 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
-            case GGML_OP_MUL_MAT:
                 return true;
+            case GGML_OP_MUL_MAT: {
+                // RPC cannot query the server's supports_op yet. When
+                // GGML_RPC_MATMUL_ONLY is enabled for Hexagon diagnostics,
+                // mirror its conservative MUL_MAT type/shape checks instead
+                // of forwarding every matmul to HTP. In particular, Q6_K
+                // (often a tied token_embd.weight / LM head) is unsupported.
+                // This check is also used by the model loader to choose the
+                // weight buffer, before any graph is executed.
+                const ggml_tensor * w = op->src[0];
+                const ggml_tensor * x = op->src[1];
+                bool supported = false;
+                if (w && x && op->type == GGML_TYPE_F32 &&
+                    (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16)) {
+                    switch (w->type) {
+                        case GGML_TYPE_Q4_0:
+                        case GGML_TYPE_Q4_1:
+                        case GGML_TYPE_Q8_0:
+                        case GGML_TYPE_IQ4_NL:
+                        case GGML_TYPE_MXFP4:
+                            supported = w->ne[0] % 32 == 0 &&
+                                        w->ne[1] <= 32768 &&
+                                        x->ne[2] == 1 &&
+                                        x->ne[3] == 1;
+                            break;
+                        case GGML_TYPE_F16:
+                            supported = w->nb[1] >= w->nb[0] &&
+                                        x->ne[2] >= w->ne[2] &&
+                                        x->ne[3] >= w->ne[3];
+                            break;
+                        case GGML_TYPE_F32:
+                            supported = x->type == GGML_TYPE_F32 &&
+                                        w->nb[1] >= w->nb[0] &&
+                                        x->ne[2] >= w->ne[2] &&
+                                        x->ne[3] >= w->ne[3];
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (!supported && std::getenv("GGML_RPC_MATMUL_DEBUG") != nullptr) {
+                    GGML_LOG_WARN("[RPC_MUL_MAT_FALLBACK] name=%s weight_type=%s input_type=%s\n",
+                        op->name,
+                        w ? ggml_type_name(w->type) : "null",
+                        x ? ggml_type_name(x->type) : "null");
+                }
+                return supported;
+            }
             case GGML_OP_GET_ROWS: {
                 // Older Hexagon supports GET_ROWS only for F32 embeddings
                 // with I32/I64 indices. In particular, quantized token
