@@ -21,6 +21,7 @@ import sys
 @dataclass(frozen=True)
 class Snapshot:
     folder: Path
+    capture_id: int
     name: str
     shape: tuple
     occurrence: int
@@ -48,7 +49,7 @@ def load_manifest(folder):
             occurrence = counts[base]
             counts[base] += 1
             snap = Snapshot(
-                folder=folder, name=name, shape=shape,
+                folder=folder, capture_id=int(row["id"]), name=name, shape=shape,
                 occurrence=occurrence, dtype=row["type"], op=row["op"],
                 filename=row["file"], nbytes=int(row["bytes"]),
             )
@@ -154,10 +155,14 @@ def main():
 
     cpu = load_manifest(args.cpu)
     npu = load_manifest(args.npu)
-    shared = sorted(set(cpu) & set(npu), key=graph_order)
-    only_cpu = sorted(set(cpu) - set(npu), key=graph_order)
-    only_npu = sorted(set(npu) - set(cpu), key=graph_order)
+    # Preserve real execution order of the CPU baseline. Sorting by layer and
+    # tensor shape incorrectly reports late 1-token decode divergence before
+    # an earlier 2-token prefill error at a higher-numbered layer.
+    shared = sorted(set(cpu) & set(npu), key=lambda key: cpu[key].capture_id)
+    only_cpu = sorted(set(cpu) - set(npu), key=lambda key: cpu[key].capture_id)
+    only_npu = sorted(set(npu) - set(cpu), key=lambda key: npu[key].capture_id)
     print(f"CPU tensors: {len(cpu)} | NPU tensors: {len(npu)} | comparable: {len(shared)}")
+    print("Rows ordered by CPU manifest capture ID, not by layer/shape.")
     print(f"Only CPU: {len(only_cpu)} | Only NPU: {len(only_npu)}")
     if only_cpu:
         print("  CPU-only examples:", ", ".join(k[0] for k in only_cpu[:8]))
@@ -187,7 +192,8 @@ def main():
 
     if first_bad is not None:
         cs, ns, ref, actual, stat = first_bad
-        print(f"\nFirst divergent tensor in layer/stage order: {cs.name}")
+        print(f"\nFirst tolerance mismatch in CPU capture order: {cs.name}")
+        print(f"CPU capture ID: {cs.capture_id}, NPU capture ID: {ns.capture_id}")
         print(f"Shape: {cs.shape}, occurrence: {cs.occurrence}, CPU op: {cs.op}, NPU op: {ns.op}")
         print(f"Mismatch: {stat['bad']}/{stat['n']}, nonfinite: {stat['nonfinite']}, "
               f"max_abs: {stat['max_abs']:.7g}, MAE: {stat['mae']:.7g}, RMSE: {stat['rmse']:.7g}")
@@ -201,6 +207,7 @@ def main():
         print("\nAll compared tensors passed the requested tolerances.")
     print("\nNote: callback-based capture changes scheduler graph boundaries.")
     print("If the problem disappears with capture enabled, capture-free boundary probes are needed.")
+    print("If generated token IDs differ between runs, later 1-token states cannot be compared directly.")
 
 
 if __name__ == "__main__":
