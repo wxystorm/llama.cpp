@@ -8615,7 +8615,11 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
                                         x->ne[3] == 1;
                             break;
                         case GGML_TYPE_F16:
-                            supported = w->nb[1] >= w->nb[0] &&
+                            // Diagnostic: keep quantized model matmuls on RPC, but
+                            // force F16 attention matmuls to a local backend to
+                            // isolate errors involving a remote KV cache.
+                            supported = std::getenv("GGML_RPC_DISABLE_F16_MATMUL") == nullptr &&
+                                        w->nb[1] >= w->nb[0] &&
                                         x->ne[2] >= w->ne[2] &&
                                         x->ne[3] >= w->ne[3];
                             break;
