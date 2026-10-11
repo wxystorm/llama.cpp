@@ -142,6 +142,7 @@ struct htp_buf_desc {
 enum htp_op_flags {
     HTP_OPFLAGS_SKIP_COMPUTE  = (1U << 0), // Skip actual computation (used for profiling)
     HTP_OPFLAGS_DIAG_K14     = (1U << 1), // Host-tagged K14 input/output fingerprint diagnostic
+    HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH = (1U << 2), // Debug-only K14 src[1] DSP cache flush before execution
 };
 
 // Op descriptor
