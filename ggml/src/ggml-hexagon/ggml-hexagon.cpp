@@ -86,6 +86,7 @@ static bool opt_k14_sentinel = false; // destructive diagnostic, M=1 only
 static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache experiment
 static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
 static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
+static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1532,6 +1533,35 @@ struct ggml_hexagon_opbatch {
             o.flags |= HTP_OPFLAGS_DIAG_KV14_SET_ROWS;
             if (opt_kv14_set_rows_force_input_flush) {
                 o.flags |= HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH;
+            }
+        }
+
+        // Phase-1 coherency fix: generalize the known-good K14 experiment
+        // to every SET_ROWS op, without relying on tensor names. Input tensors
+        // on buffers with usage != COMPUTE may have been updated by RPC / the
+        // Android CPU since the DSP cached their previous contents. Usage is
+        // a placement hint, not a cache-coherency marker.
+        //
+        // Do not sync the destination cache (src[2]); it is in/out storage
+        // whose DSP-side contents must be preserved.
+        if (opt_set_rows_host_input_sync && node.opcode == HTP_OP_SET_ROWS &&
+            node.node != nullptr && node.node->src[0] != nullptr &&
+            node.node->src[1] != nullptr &&
+            node.node->src[0]->type == GGML_TYPE_F32 &&
+            (node.node->src[1]->type == GGML_TYPE_I32 ||
+             node.node->src[1]->type == GGML_TYPE_I64)) {
+            o.flags |= HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT;
+
+            const char * cache_name = node.node->src[2] ? node.node->src[2]->name : "(none)";
+            if (opt_verbose || strncmp(cache_name, "cache_k_l14", sizeof("cache_k_l14") - 1) == 0) {
+                GGML_LOG_INFO("[HEX_SET_ROWS_HOST_SYNC_TAG] cache=%s values=%s"
+                              " width=%" PRId64 " rows=%" PRId64
+                              " values_usage=%d idx_usage=%d op_flags=0x%x\n",
+                              cache_name, node.node->src[0]->name,
+                              node.node->src[0]->ne[0], node.node->src[0]->ne[1],
+                              (int) ggml_backend_buffer_get_usage(node.node->src[0]->buffer),
+                              (int) ggml_backend_buffer_get_usage(node.node->src[1]->buffer),
+                              (unsigned) o.flags);
             }
         }
 
@@ -4785,6 +4815,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_k14_force_input_flush = getenv("GGML_HEXAGON_K14_FORCE_INPUT_FLUSH");
     const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
     const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
+    const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4843,6 +4874,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_kv14_set_rows_diag = opt_kv14_set_rows_force_input_flush ||
                              (str_kv14_set_rows_diag != nullptr &&
                               strcmp(str_kv14_set_rows_diag, "1") == 0);
+    opt_set_rows_host_input_sync = str_set_rows_host_input_sync != nullptr &&
+                                   strcmp(str_set_rows_host_input_sync, "1") == 0;
+    if (opt_set_rows_host_input_sync) {
+        GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
+                      " scope=all_SET_ROWS_external_F32_values_and_indices"
+                      " max_source_bytes=16777216 experimental=1\n");
+    }
     if (opt_kv14_set_rows_diag) {
         GGML_LOG_WARN("[HEX_KV14_SET_ROWS_DIAG] enabled=1 scope=cache_k_l14"
                       " force_input_flush=%d diagnostic_only=1\n",
