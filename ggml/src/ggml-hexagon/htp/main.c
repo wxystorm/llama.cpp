@@ -891,6 +891,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
                           op->opcode == HTP_OP_MUL_MAT;
     const bool k14_force_input_flush = k14_diag &&
                           (op->flags & HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH) != 0;
+    const bool kv14_set_rows_diag = op->opcode == HTP_OP_SET_ROWS &&
+                            (op->flags & HTP_OPFLAGS_DIAG_KV14_SET_ROWS) != 0;
+    const bool kv14_set_rows_force_input_flush = kv14_set_rows_diag &&
+                            (op->flags & HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH) != 0;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
                              ((uint32_t) op->pad[1] << 16);
     if (k14_diag && k14_probe != NULL) {
@@ -917,11 +921,46 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         const bool force_flush = k14_force_input_flush && i == 1 &&
                                  src->type == HTP_TYPE_F32 && src->data != 0 &&
                                  src->size > 0 && src->size <= (1u << 20);
-        if (force_flush || regular_flush) {
+        // K14 cache SET_ROWS src[0] is the F32 data that CPU RoPE sent
+        // back over RPC. Bypass the COMPUTE/FLUSHED predicate only if the
+        // diagnostic force switch is on, to test stale DSP cache lines.
+        const bool kv14_force_flush = kv14_set_rows_force_input_flush && i == 0 &&
+                                      src->type == HTP_TYPE_F32 && src->data != 0 &&
+                                      src->size > 0 && src->size <= (1u << 20);
+        if (force_flush || kv14_force_flush || regular_flush) {
             hex_l2flush((void *) (uintptr_t) src->data, src->size);
         }
         if (force_flush && k14_probe != NULL) {
             k14_probe->input_force_flush_done = true;
+        }
+
+        if (kv14_set_rows_diag && i == 0) {
+            const bool readable = src->type == HTP_TYPE_F32 &&
+                                  src->data != 0 && src->size > 0 &&
+                                  src->size <= (1u << 20) &&
+                                  src->nb[0] == sizeof(float);
+            uint64_t hash = readable ?
+                htp_k14_diag_fnv64((const void *) (uintptr_t) src->data, src->size) : 0;
+            uint32_t sample0 = 0, sample1 = 0;
+            if (readable && src->size >= sizeof(sample0)) {
+                memcpy(&sample0, (const void *) (uintptr_t) src->data, sizeof(sample0));
+            }
+            if (readable && src->size >= 2u * sizeof(sample1)) {
+                memcpy(&sample1,
+                       (const void *) (uintptr_t) (src->data + sizeof(sample0)),
+                       sizeof(sample1));
+            }
+            FARF(ALWAYS, "[HTP_KV14_SET_ROWS_SOURCE]"
+                 " opcode=%u flags=0x%x src_type=%u src_flags=0x%x"
+                 " bytes=%u ne0=%u ne1=%u regular_flush=%u forced_flush=%u"
+                 " readable=%u values_fnv64=%08x%08x"
+                 " sample0_bits=%08x sample1_bits=%08x",
+                 (unsigned) op->opcode, (unsigned) op->flags,
+                 (unsigned) src->type, (unsigned) src->flags,
+                 (unsigned) src->size, (unsigned) src->ne[0], (unsigned) src->ne[1],
+                 regular_flush ? 1u : 0u, kv14_force_flush ? 1u : 0u,
+                 readable ? 1u : 0u,
+                 (unsigned) (hash >> 32), (unsigned) hash, sample0, sample1);
         }
 
         FARF(HIGH, "prep-src #%u: data %p size %u : %u:%u:%u:%u", op->src[i], (void*) src->data, src->size,
@@ -975,6 +1014,13 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     }
 
     int status = execute_op(octx);
+
+    if (kv14_set_rows_diag) {
+        FARF(ALWAYS, "[HTP_KV14_SET_ROWS_EXEC] status=%d op_flags=0x%x"
+             " src0_index=%u src1_index=%u dst_index=%u",
+             status, (unsigned) op->flags,
+             (unsigned) op->src[0], (unsigned) op->src[1], (unsigned) op->dst[0]);
+    }
 
     if (k14_diag) {
         if (k14_probe != NULL) {
