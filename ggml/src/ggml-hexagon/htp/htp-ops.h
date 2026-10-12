@@ -147,6 +147,7 @@ enum htp_op_flags {
     HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH = (1U << 4), // Debug-only K14 cache SET_ROWS src[0] flush
     HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT = (1U << 5), // Opt-in: sync externally staged SET_ROWS F32 data and indices
     HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC = (1U << 6), // Opt-in: measure source sync in DSP per-op profiler
+    HTP_OPFLAGS_PROFILE_L2 = (1U << 7), // Opt-in: measure existing DSP L2 flushes without changing flush policy
 };
 
 // Op descriptor
@@ -212,6 +213,18 @@ struct htp_prof_desc {
     uint32_t sync_input_bytes;
     uint32_t sync_input_calls;
     uint32_t sync_global_flush_calls;
+
+    // Optional L2-maintenance accounting. Populated only when
+    // HTP_OPFLAGS_PROFILE_L2 is set for the op. These fields describe the
+    // existing flush path; profiling must not add or remove any flush.
+    uint32_t l2_input_us;
+    uint32_t l2_input_bytes;
+    uint32_t l2_input_calls;
+    uint32_t l2_input_global_flush_calls;
+    uint32_t l2_output_us;
+    uint32_t l2_output_bytes;
+    uint32_t l2_output_calls;
+    uint32_t l2_output_global_flush_calls;
 };
 
 struct htp_opbatch_req {
