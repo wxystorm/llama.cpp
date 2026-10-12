@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hash the exact captured K13 F32 MatMul output bytes for DSP/host/PC comparison.
+r"""Hash the exact captured K13 F32 MatMul output bytes for DSP/host/PC comparison.
 
 Read-only: uses existing LLAMA_TENSOR_COMPARE_DIR manifests and dump files.
 Run from the repository root on Windows:
