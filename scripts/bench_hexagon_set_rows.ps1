@@ -1,8 +1,12 @@
 # C-NPU performance test, with all PC tensor dumps/readbacks disabled.
 # -Mode labels the run. It does not change the phone RPC server environment!
-# Compare k14 vs generic for correctness-preserving throughput.
+# Compare k14, generic, and combined for correctness-preserving throughput.
+# The k14 mode enables extra DSP hashing/logging. To isolate incremental
+# generic-sync cost while retaining the same diagnostic overhead, compare
+# k14 against combined (both special K14 and generic flags enabled).
+# For production-like throughput without K14 SET_ROWS diagnostics, use generic.
 param(
-    [ValidateSet("k14", "generic", "generic-profile")]
+    [ValidateSet("k14", "generic", "combined", "generic-profile")]
     [string] $Mode = "generic",
     [ValidateRange(1, 50)] [int] $Runs = 3,
     [ValidateRange(0, 10)] [int] $WarmupRuns = 1,
@@ -54,6 +58,13 @@ switch ($Mode) {
         Write-Host "PHONE: GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC=1"
         Write-Host "PHONE: GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH unset"
         Write-Host "PHONE: GGML_HEXAGON_PROFILE and GGML_HEXAGON_SET_ROWS_SYNC_TIMING unset"
+    }
+    "combined" {
+        Write-Host "PHONE: GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH=1"
+        Write-Host "PHONE: GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC=1"
+        Write-Host "PHONE: GGML_HEXAGON_PROFILE and GGML_HEXAGON_SET_ROWS_SYNC_TIMING unset"
+        Write-Host "K14 diagnostic hashing/logging remains enabled, matching k14 mode."
+        Write-Host "Overlapping K14 SET_ROWS input is flushed only once by DSP."
     }
     "generic-profile" {
         Write-Host "PHONE: GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC=1"
