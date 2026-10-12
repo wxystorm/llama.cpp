@@ -45,6 +45,7 @@ def summarize(reference: Path, candidate: Path, case: str, out: Path,
         cosine = stat["cosine"]
 
         severe = (stat["nonfinite"] > 0 or
+                  (stat["bad"] > 0 and not math.isfinite(cosine)) or
                   (math.isfinite(cosine) and cosine < min_cosine) or
                   (stage in ATTENTION_OUTPUT_STAGES and
                    stat["rmse"] > max_attention_rmse))
