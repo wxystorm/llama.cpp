@@ -25,6 +25,57 @@ CHECK_STAGES = frozenset({
     "ffn_swiglu", "ffn_down", "ffn_out", "l_out",
 })
 OUTPUT_STAGES = frozenset({"attn_out", "ffn_out", "l_out"})
+RE_SINGLE_CASE = re.compile(r"^(?P<layer>\d+)-(?P<role>output|gate|up|down|ffn)$")
+STAGE_ORDER = [
+    "attn_norm", "Qcur", "Kcur", "Vcur", "kq", "kq_soft_max",
+    "kqv", "kqv_out", "attn_out", "ffn_inp", "ffn_norm",
+    "ffn_up", "ffn_gate", "ffn_swiglu", "ffn_down", "ffn_out", "l_out",
+]
+STAGE_INDEX = {name: index for index, name in enumerate(STAGE_ORDER)}
+
+
+def resolve_target(case, expected_layers, focus_layer):
+    # Control run: same baseline weights twice, so ALL changed values are
+    # suspicious run-to-run drift rather than effects of a migrated MatMul.
+    if case == "baseline-control":
+        if focus_layer is not None:
+            raise ValueError("--focus-layer is not valid for baseline-control")
+        return [], max(expected_layers) + 1, "control", "attn_out"
+
+    match = RE_SINGLE_CASE.fullmatch(case)
+    if match:
+        layer = int(match.group("layer"))
+        if layer not in expected_layers:
+            raise ValueError(f"case layer {layer} is outside {expected_layers}")
+        if focus_layer is not None and focus_layer != layer:
+            raise ValueError("--focus-layer must equal the target case layer")
+        return [layer], layer, match.group("role"), {
+            "output": "attn_out", "gate": "ffn_gate", "up": "ffn_up",
+            "down": "ffn_out", "ffn": "ffn_up",
+        }[match.group("role")]
+
+    if case not in ("all-output", "all-ffn"):
+        raise ValueError(f"unknown case: {case}")
+    first = min(expected_layers)
+    if focus_layer is not None and focus_layer != first:
+        raise ValueError("--focus-layer for all-* must be the first changed layer")
+    role = "output" if case == "all-output" else "ffn"
+    return list(expected_layers), first, role, (
+        "attn_out" if role == "output" else "ffn_up")
+
+
+def region_of(layer, stage, changed_layers, first, direct_stage, role):
+    if layer < first or (
+        layer == first and
+        STAGE_INDEX.get(stage, 1000000) < STAGE_INDEX[direct_stage]
+    ):
+        return "UPSTREAM"
+    if layer in changed_layers and (
+        stage == direct_stage or
+        (role == "ffn" and stage == "ffn_gate")
+    ):
+        return "TARGET"
+    return "DOWNSTREAM"
 
 
 def safe(value):
@@ -35,7 +86,9 @@ def safe(value):
 
 def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
             atol: float, rtol: float, min_cosine: float,
-            max_normalized_rmse: float, expected_layers):
+            max_normalized_rmse: float, expected_layers, focus_layer=None):
+    changed_layers, first_layer, role, direct_stage = resolve_target(
+        case, expected_layers, focus_layer)
     ref = load_manifest(ref_dir)
     npu = load_manifest(npu_dir)
     shared = sorted(ref.keys() & npu.keys(), key=lambda k: ref[k].capture_id)
@@ -55,6 +108,8 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         stage = match["stage"] if match else a.name
         layer = int(match["layer"]) if match else -1
         cosine = stats["cosine"]
+        region = region_of(layer, stage, changed_layers,
+                           first_layer, direct_stage, role)
 
         severe = (stats["nonfinite"] != 0 or
                   (stats["bad"] != 0 and not math.isfinite(cosine)) or
@@ -62,7 +117,8 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
                   (stage in CHECK_STAGES and nrmse > max_normalized_rmse))
         level = "CRITICAL" if severe else ("DIFF" if stats["bad"] else "OK")
         rows.append({
-            "case": case, "cpu_capture": a.capture_id, "npu_capture": b.capture_id,
+            "case": case, "region": region,
+            "cpu_capture": a.capture_id, "npu_capture": b.capture_id,
             "layer": layer, "name": a.name, "stage": stage,
             "shape": "x".join(str(v) for v in a.shape),
             "occurrence": a.occurrence, "dtype": a.dtype,
@@ -77,7 +133,7 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         })
 
     output.mkdir(parents=True, exist_ok=True)
-    fields = ["case", "cpu_capture", "npu_capture", "layer", "name", "stage",
+    fields = ["case", "region", "cpu_capture", "npu_capture", "layer", "name", "stage",
               "shape", "occurrence", "dtype", "cpu_op", "npu_op",
               "status", "bad", "total", "nonfinite", "max_abs",
               "rmse", "reference_rms", "normalized_rmse", "cosine"]
@@ -100,10 +156,36 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         for stage in mandatory_stages
         if (layer, stage) not in captured_stages
     )
+    # Require the output of the actual newly moved MatMul (or its first
+    # visible consumer), not merely a collection of unrelated captures.
+    target_required = ["%s-%d" % (direct_stage, layer)
+                       for layer in changed_layers]
+    if role == "ffn":
+        target_required += ["ffn_gate-%d" % layer for layer in changed_layers]
+    missing_stages = sorted(set(missing_stages) |
+                            {label for label in target_required
+                             if (int(label.rsplit("-", 1)[1]),
+                                 label.rsplit("-", 1)[0]) not in captured_stages})
+
+    upstream = [r for r in rows if r["region"] == "UPSTREAM"]
+    target   = [r for r in rows if r["region"] == "TARGET"]
+    downstream = [r for r in rows if r["region"] == "DOWNSTREAM"]
+    upstream_diff = [r for r in upstream if r["bad"] > 0]
+    upstream_critical = [r for r in upstream if r["status"] == "CRITICAL"]
+    target_critical = [r for r in target if r["status"] == "CRITICAL"]
+    downstream_critical = [r for r in downstream if r["status"] == "CRITICAL"]
+
+    # CAPTURE_MISMATCH strictly describes absent snapshots/stages.
+    # Differences before the first migrated MatMul must not be dismissed as
+    # downstream propagation: they indicate a non-identical starting state.
     if not shared or missing_ref or missing_npu or missing_stages:
         verdict = "CAPTURE_MISMATCH"
-    elif critical:
-        verdict = "CRITICAL"
+    elif upstream_diff:
+        verdict = "UPSTREAM_DIVERGENCE"
+    elif target_critical:
+        verdict = "TARGET_CRITICAL"
+    elif downstream_critical:
+        verdict = "DOWNSTREAM_CRITICAL"
     else:
         verdict = "NUMERICALLY_CLOSE"
 
@@ -112,8 +194,34 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
                 and r["normalized_rmse"] is not None]
         return max(pool, key=lambda r: r["normalized_rmse"], default=None)
 
+    def region_summary(subset):
+        return {
+            "compared": len(subset),
+            "diff": sum(r["bad"] > 0 for r in subset),
+            "critical": sum(r["status"] == "CRITICAL" for r in subset),
+            "first_diff": next((r for r in subset if r["bad"] > 0), None),
+            "worst": max(
+                (r for r in subset if r["normalized_rmse"] is not None),
+                key=lambda r: r["normalized_rmse"], default=None),
+        }
+
+    region_counts = {
+        "upstream": region_summary(upstream),
+        "target": region_summary(target),
+        "downstream": region_summary(downstream),
+    }
+
     result = {
         "case": case,
+        "focus_layer": first_layer,
+        "changed_layers": changed_layers,
+        "target_stage": direct_stage,
+        "target_role": role,
+        "region_counts": region_counts,
+        "worst_upstream": region_counts["upstream"]["worst"],
+        "worst_target": region_counts["target"]["worst"],
+        "worst_downstream": region_counts["downstream"]["worst"],
+        "first_upstream_diff": upstream_diff[0] if upstream_diff else None,
         "status": verdict,
         "cpu_captures": len(ref),
         "npu_captures": len(npu),
@@ -134,8 +242,11 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         "worst_output_stage": worst(OUTPUT_STAGES),
         "first_critical": critical[0] if critical else None,
         "critical_examples": critical[:10],
-        "note": ("This is an exploratory numerical smoke test; passing requires "
-                 "the target weight's HTP audit line and capture-free decode."),
+        "note": ("UPSTREAM differences indicate input/run drift, not causal "
+                 "propagation from a later migrated MatMul. Downstream changes "
+                 "are tracked but separated from direct target error. "
+                 "A passing capture comparison still needs HTP audit and "
+                 "capture-free decode."),
     }
     with (output / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, allow_nan=False)
@@ -145,8 +256,19 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
           "only_cpu=%d only_npu=%d critical=%d diff=%d" %
           (case, verdict, len(shared), len(missing_ref),
            len(missing_npu), len(critical), len(diff)))
+    print("  target=%s layers=%s focus=%d"
+          % (direct_stage, changed_layers, first_layer))
     if missing_stages:
         print("  required stages not captured:", ", ".join(missing_stages))
+    for region, info in region_counts.items():
+        item = info["first_diff"]
+        print("  %s compared=%d diff=%d critical=%d first_diff=%s" %
+              (region, info["compared"], info["diff"], info["critical"],
+               item["name"] if item else "none"))
+    if upstream_diff:
+        x = upstream_diff[0]
+        print("  UPSTREAM_ALERT first=%s occurrence=%s nrmse=%s" %
+              (x["name"], x["occurrence"], x["normalized_rmse"]))
     for layer in sorted(set(row["layer"] for row in rows)):
         local = [r for r in rows if r["layer"] == layer]
         targets = [r for r in local if r["stage"] in CHECK_STAGES]
@@ -176,6 +298,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--expected-layers", required=True,
                         help="Comma-separated layer indices, e.g. 13,14,15")
+    parser.add_argument("--focus-layer", type=int,
+                        help="Target layer to diagnose; defaults to case layer.")
     parser.add_argument("--atol", type=float, default=0.001)
     parser.add_argument("--rtol", type=float, default=0.001)
     parser.add_argument("--min-cosine", type=float, default=0.95)
@@ -186,9 +310,10 @@ def main():
         parser.error("--expected-layers must include at least one layer")
     result = compare(args.reference, args.candidate, args.case, args.output,
                      args.atol, args.rtol, args.min_cosine,
-                     args.max_normalized_rmse, expected)
-    return {"NUMERICALLY_CLOSE": 0, "CRITICAL": 2,
-            "CAPTURE_MISMATCH": 3}[result["status"]]
+                     args.max_normalized_rmse, expected, args.focus_layer)
+    return {"NUMERICALLY_CLOSE": 0, "TARGET_CRITICAL": 2,
+            "DOWNSTREAM_CRITICAL": 2, "CAPTURE_MISMATCH": 3,
+            "UPSTREAM_DIVERGENCE": 4}[result["status"]]
 
 
 if __name__ == "__main__":
