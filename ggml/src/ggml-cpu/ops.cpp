@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <cfloat>
