@@ -87,6 +87,7 @@ static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache exp
 static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
 static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
 static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
+static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1551,6 +1552,9 @@ struct ggml_hexagon_opbatch {
             (node.node->src[1]->type == GGML_TYPE_I32 ||
              node.node->src[1]->type == GGML_TYPE_I64)) {
             o.flags |= HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT;
+            if (opt_set_rows_sync_timing) {
+                o.flags |= HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC;
+            }
 
             const char * cache_name = node.node->src[2] ? node.node->src[2]->name : "(none)";
             if (opt_verbose || strncmp(cache_name, "cache_k_l14", sizeof("cache_k_l14") - 1) == 0) {
@@ -1855,8 +1859,28 @@ struct ggml_hexagon_opqueue {
                 }
             }
 
+            uint64_t sync_us = 0;
+            uint64_t sync_bytes = 0;
+            uint64_t sync_calls = 0;
+            uint64_t global_flush_calls = 0;
+            uint64_t set_rows_total_us = 0;
+            uint32_t set_rows_ops = 0;
+
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
+
+                if (opt_set_rows_sync_timing &&
+                    ops[i].opcode == HTP_OP_SET_ROWS &&
+                    (pd[i].sync_input_calls != 0 ||
+                     pd[i].sync_input_bytes != 0 ||
+                     pd[i].sync_global_flush_calls != 0)) {
+                    ++set_rows_ops;
+                    set_rows_total_us += pd[i].usecs;
+                    sync_us += pd[i].sync_input_us;
+                    sync_bytes += pd[i].sync_input_bytes;
+                    sync_calls += pd[i].sync_input_calls;
+                    global_flush_calls += pd[i].sync_global_flush_calls;
+                }
 
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i]);
 
@@ -1882,6 +1906,19 @@ struct ggml_hexagon_opqueue {
                         }
                     }
                 }
+            }
+
+            if (opt_set_rows_sync_timing && set_rows_ops > 0) {
+                GGML_LOG_INFO("[HEX_SET_ROWS_SYNC_PROFILE]"
+                              " batch_id=%u set_rows_ops=%u"
+                              " flush_calls=%" PRIu64 " flush_bytes=%" PRIu64
+                              " flush_us=%" PRIu64 " global_flushes=%" PRIu64
+                              " set_rows_total_us=%" PRIu64
+                              " dsp_ops_total_us=%u batch_wall_us=%" PRIu64
+                              " note=profiling_overhead_included\n",
+                              rsp.id, set_rows_ops,
+                              sync_calls, sync_bytes, sync_us, global_flush_calls,
+                              set_rows_total_us, htp_usec, batch_usec);
             }
 
             char evt_str[256] = "";
@@ -4816,6 +4853,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
     const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
     const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
+    const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4876,6 +4914,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                               strcmp(str_kv14_set_rows_diag, "1") == 0);
     opt_set_rows_host_input_sync = str_set_rows_host_input_sync != nullptr &&
                                    strcmp(str_set_rows_host_input_sync, "1") == 0;
+    opt_set_rows_sync_timing = str_set_rows_sync_timing != nullptr &&
+                               strcmp(str_set_rows_sync_timing, "1") == 0;
     if (opt_set_rows_host_input_sync) {
         GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
                       " scope=all_SET_ROWS_external_F32_values_and_indices"
@@ -4926,6 +4966,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
     }
 
+    if (opt_set_rows_sync_timing) {
+        if (!opt_set_rows_host_input_sync || opt_profile != 1) {
+            GGML_LOG_WARN("[HEX_SET_ROWS_SYNC_TIMING] status=DISABLED"
+                          " requires=GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC=1"
+                          ",GGML_HEXAGON_PROFILE=1\n");
+            opt_set_rows_sync_timing = false;
+        } else {
+            GGML_LOG_WARN("[HEX_SET_ROWS_SYNC_TIMING] enabled=1"
+                          " profiling=basic measurement=extra_DSP_input_flush"
+                          " changes_timing=1\n");
+        }
+    }
     reg->context = new ggml_hexagon_registry(reg);
 }
 
