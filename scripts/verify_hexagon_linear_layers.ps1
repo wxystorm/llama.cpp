@@ -74,7 +74,7 @@ function Get-EnabledWeights([string] $caseName) {
     if ($Stage -eq "attn") {
         if ($caseName -eq "all-output") {
             foreach ($layer in $layerRange) {
-                $enabled["$layer-output"] = $true
+                $enabled["${layer}-output"] = $true
             }
             return $enabled
         }
@@ -87,14 +87,14 @@ function Get-EnabledWeights([string] $caseName) {
         if ($layer -lt $StartLayer -or $layer -gt $EndLayer) {
             throw "Case '$caseName' outside selected layers $StartLayer..$EndLayer"
         }
-        $enabled["$layer-$role"] = $true
+        $enabled["${layer}-${role}"] = $true
         return $enabled
     }
 
     if ($caseName -eq "all-ffn") {
         foreach ($layer in $layerRange) {
             foreach ($role in @("gate", "up", "down")) {
-                $enabled["$layer-$role"] = $true
+                $enabled["${layer}-${role}"] = $true
             }
         }
         return $enabled
@@ -110,7 +110,7 @@ function Get-EnabledWeights([string] $caseName) {
     }
     foreach ($role in @("gate", "up", "down")) {
         if ($kind -eq "ffn" -or $kind -eq $role) {
-            $enabled["$layer-$role"] = $true
+            $enabled["${layer}-${role}"] = $true
         }
     }
     return $enabled
@@ -118,7 +118,7 @@ function Get-EnabledWeights([string] $caseName) {
 
 if ($Cases.Count -eq 0) {
     if ($Stage -eq "attn") {
-        $Cases = @($layerRange | ForEach-Object { "$_-output" })
+        $Cases = @($layerRange | ForEach-Object { "$($_)-output" })
         $Cases += "all-output"
     } else {
         $Cases = @("$StartLayer-gate", "$StartLayer-up", "$StartLayer-down",
@@ -129,10 +129,10 @@ if ($All) {
     $Cases = @()
     foreach ($layer in $layerRange) {
         if ($Stage -eq "attn") {
-            $Cases += "$layer-output"
+            $Cases += "${layer}-output"
         } else {
             foreach ($role in @("gate", "up", "down", "ffn")) {
-                $Cases += "$layer-$role"
+                $Cases += "${layer}-${role}"
             }
         }
     }
@@ -208,7 +208,7 @@ function Run-Capture([string] $caseName) {
         }
     })
     $baselineExpected = @($layerRange | ForEach-Object {
-        "blk.$_.attn_output.weight"
+        "blk.$($_).attn_output.weight"
     })
     $info = @(
         "case=$caseName",
