@@ -24,6 +24,8 @@ param(
     [switch] $BaselineControl,
     [ValidateRange(-1, 127)] [int] $FocusLayer = -1,
     [ValidateRange(-1, 127)] [int] $PinQCpuLayer = -1,
+    [ValidateRange(-1, 127)] [int] $PinKCpuLayer = -1,
+    [ValidateRange(-1, 127)] [int] $PinVCpuLayer = -1,
     [string] $Exe = ".\build-hexagon-pc\bin\Release\llama-cli.exe",
     [string] $Model = "D:\model\Llama-3.2-1B-Instruct-Q4_0.gguf",
     [string] $Rpc = "10.39.52.114:50052",
@@ -166,12 +168,21 @@ if ($Cases.Count -eq 0) { throw "No cases to run" }
 if ($FocusLayer -ge 0 -and $Cases.Count -ne 1) {
     throw "-FocusLayer requires exactly one selected case; otherwise each case determines its own target layer."
 }
-if ($PinQCpuLayer -ge 0 -and
-    ($PinQCpuLayer -lt $StartLayer -or $PinQCpuLayer -gt $EndLayer)) {
-    throw "-PinQCpuLayer must be inside tested [$StartLayer,$EndLayer]"
+$pins = @{
+    q = $PinQCpuLayer
+    k = $PinKCpuLayer
+    v = $PinVCpuLayer
 }
-if ($RecompareOnly -and $PinQCpuLayer -ge 0) {
-    throw "-PinQCpuLayer needs a new CLI capture; it has no effect on existing saved snapshots."
+foreach ($role in @("q", "k", "v")) {
+    $layer = $pins[$role]
+    if ($layer -ge 0 -and
+        ($layer -lt $StartLayer -or $layer -gt $EndLayer)) {
+        throw "CPU pin for $role must be inside [$StartLayer,$EndLayer]"
+    }
+}
+if ($RecompareOnly -and ($PinQCpuLayer -ge 0 -or
+                         $PinKCpuLayer -ge 0 -or $PinVCpuLayer -ge 0)) {
+    throw "CPU pinning needs a new CLI capture; it has no effect on saved snapshots."
 }
 if ($BaselineControl -and $RecompareOnly -and
     -not (Test-Path -LiteralPath (Join-Path $OutDir "baseline-repeat\manifest.tsv"))) {
@@ -196,7 +207,9 @@ $settings = @(
     "prompt=$Prompt", "filter=$env:LLAMA_TENSOR_COMPARE_REGEX",
     "cases=$($Cases -join ',')",
     "pin_q_cpu_layer=$PinQCpuLayer",
-    "baseline=QKV_NPU;ATTN_OUTPUT_CPU+FFN_CPU if attn, ATTN_OUTPUT_NPU+FFN_CPU if ffn",
+    "pin_k_cpu_layer=$PinKCpuLayer",
+    "pin_v_cpu_layer=$PinVCpuLayer",
+    "baseline=QKV_NPU_unless_pinned;ATTN_OUTPUT_CPU+FFN_CPU if attn, ATTN_OUTPUT_NPU+FFN_CPU if ffn",
     "GGML_RPC_MATMUL_ONLY=$env:GGML_RPC_MATMUL_ONLY",
     "GGML_RPC_DISABLE_F16_MATMUL=$env:GGML_RPC_DISABLE_F16_MATMUL",
     "phone_needs_GGML_HEXAGON_LINEAR_AUDIT=1",
@@ -236,11 +249,14 @@ function Run-Capture([string] $caseName) {
             }
         }
     }
-    if ($PinQCpuLayer -ge 0) {
-        # Pin the same Q projection to CPU in BOTH baseline and candidate.
-        # Isolates whether the apparent 42-token single-column zero is tied
-        # to the HTP Q projection or triggered elsewhere by graph placement.
-        $rules += ('blk\.{0}\.attn_q\.weight=CPU' -f $PinQCpuLayer)
+    # Pin the specified Q/K/V weights in BOTH baseline and candidate.
+    # Each controlled experiment changes only the candidate's attention
+    # output placement, not which QKV weight is pinned between runs.
+    foreach ($role in @("q", "k", "v")) {
+        $layer = $pins[$role]
+        if ($layer -ge 0) {
+            $rules += ('blk\.{0}\.attn_{1}\.weight=CPU' -f $layer, $role)
+        }
     }
     $env:LLAMA_ARG_OVERRIDE_TENSOR = $rules -join ","
     if (-not $env:LLAMA_ARG_OVERRIDE_TENSOR) {
@@ -261,8 +277,10 @@ function Run-Capture([string] $caseName) {
         "case=$caseName",
         "stage=$Stage",
         "target_NPU_weights=$($expected -join ',')",
-        "QKV_weights_all_target_layers=RPC_except_optional_Q_pin",
+        "QKV_weights_all_target_layers=RPC_except_explicit_CPU_pins",
         "pin_q_cpu_layer=$PinQCpuLayer",
+        "pin_k_cpu_layer=$PinKCpuLayer",
+        "pin_v_cpu_layer=$PinVCpuLayer",
         "attn_output_expected_on_HTP_baseline=$($Stage -eq 'ffn')",
         "attn_output_weights=$($baselineExpected -join ',')",
         "override_tensor=$env:LLAMA_ARG_OVERRIDE_TENSOR",
