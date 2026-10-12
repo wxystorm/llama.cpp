@@ -165,8 +165,8 @@ if ($Cases.Count -eq 0) { throw "No cases to run" }
 if ($FocusLayer -ge 0 -and $Cases.Count -ne 1) {
     throw "-FocusLayer requires exactly one selected case; otherwise each case determines its own target layer."
 }
-if ($BaselineControl -and $RecompareOnly -and -not
-    (Test-Path -LiteralPath (Join-Path $OutDir "baseline-repeat\manifest.tsv"))) {
+if ($BaselineControl -and $RecompareOnly -and
+    -not (Test-Path -LiteralPath (Join-Path $OutDir "baseline-repeat\manifest.tsv"))) {
     throw "Saved baseline-repeat/manifest.tsv missing. -BaselineControl with -RecompareOnly needs an existing control capture."
 }
 
@@ -347,7 +347,6 @@ try {
             first_upstream_nrmse = $report.first_upstream_diff.normalized_rmse
             worst_target_name = $report.worst_target.name
             worst_target_nrmse = $report.worst_target.normalized_rmse
-            compared = $report.compared
             only_baseline = $report.only_cpu
             only_candidate = $report.only_npu
             critical = $report.critical
