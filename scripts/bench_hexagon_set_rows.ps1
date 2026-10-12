@@ -11,18 +11,31 @@ param(
     [string] $Model = "D:\model\Llama-3.2-1B-Instruct-Q4_0.gguf",
     [string] $Rpc = "10.39.52.114:50052",
     [string] $Prompt = "Explain what a computer is.",
-    [string] $OutDir = ".\bench-hexagon-sync"
+    [string] $OutDir = ".\bench-hexagon-sync",
+    [switch] $ReparseOnly
 )
 
 $ErrorActionPreference = "Stop"
-if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "CLI not found: $Exe" }
-if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) { throw "Model not found: $Model" }
-$Exe = (Resolve-Path -LiteralPath $Exe).Path
-$Model = (Resolve-Path -LiteralPath $Model).Path
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+if (-not $ReparseOnly) {
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "CLI not found: $Exe" }
+    if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) { throw "Model not found: $Model" }
+    $Exe = (Resolve-Path -LiteralPath $Exe).Path
+    $Model = (Resolve-Path -LiteralPath $Model).Path
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+} elseif (-not (Test-Path -LiteralPath $OutDir -PathType Container)) {
+    throw "Benchmark output directory not found: $OutDir"
+}
 $ModeDir = Join-Path (Resolve-Path -LiteralPath $OutDir).Path $Mode
-New-Item -ItemType Directory -Force -Path $ModeDir | Out-Null
+if ($ReparseOnly) {
+    if (-not (Test-Path -LiteralPath $ModeDir -PathType Container)) {
+        throw "Saved logs not found for mode $Mode in $ModeDir"
+    }
+    Write-Host "Reparsing saved logs in $ModeDir (no CLI or RPC server needed)"
+} else {
+    New-Item -ItemType Directory -Force -Path $ModeDir | Out-Null
+}
 
+if (-not $ReparseOnly) {
 $env:GGML_RPC_MATMUL_ONLY = "1"
 $env:GGML_RPC_DISABLE_F16_MATMUL = "1"
 $env:LLAMA_ARG_OVERRIDE_TENSOR = 'blk\.(14|15)\.(attn_output|ffn_(gate|up|down))\.weight=CPU,blk\.14\.attn_(q|v)\.weight=CPU,blk\.15\.attn_(q|k|v)\.weight=CPU'
@@ -52,6 +65,7 @@ switch ($Mode) {
 Write-Host "ALL MODES on phone: GGML_HEXAGON_K14_FORCE_INPUT_FLUSH=1, GGML_HEXAGON_OPFUSION=0"
 Write-Host "The phone RPC server must be restarted after changing its env vars."
 Write-Host "Mode=$Mode RPC=$Rpc measured=$Runs warmups=$WarmupRuns tokens=$Tokens"
+}
 
 $cliArgs = @(
     "-m", $Model,
@@ -61,7 +75,7 @@ $cliArgs = @(
     "-c", "512", "-n", "$Tokens", "-t", "8",
     "--ignore-eos", "--no-warmup", "--single-turn",
     "--no-conversation", "--temp", "0", "--seed", "1234",
-    "-lv", "3", "-p", $Prompt
+    "--perf", "-lv", "3", "-p", $Prompt
 )
 $records = @()
 
@@ -71,18 +85,26 @@ for ($i = 1; $i -le ($WarmupRuns + $Runs); $i++) {
     $kind = if ($warm) { "warmup" } else { "run" }
     $logPath = Join-Path $ModeDir ("{0}-{1:D2}.log" -f $kind, $sequence)
 
-    Write-Host "--- $Mode $kind $sequence ---"
-    # Native STDERR in Windows PowerShell 5.1 can be wrapped in ErrorRecords.
-    $ErrorActionPreference = "Continue"
-    & $Exe @cliArgs 2>&1 | Tee-Object -FilePath $logPath
-    $exitCode = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
-    if ($exitCode -ne 0) {
-        throw "Run failed (exit=$exitCode). See $logPath"
+    if ($ReparseOnly) {
+        if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
+            Write-Warning "Saved log not found: $logPath"
+            continue
+        }
+        Write-Host "--- Reparsing $logPath ---"
+    } else {
+        Write-Host "--- $Mode $kind $sequence ---"
+        # Native STDERR in Windows PowerShell 5.1 can be wrapped in ErrorRecords.
+        $ErrorActionPreference = "Continue"
+        & $Exe @cliArgs 2>&1 | Tee-Object -FilePath $logPath
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($exitCode -ne 0) {
+            throw "Run failed (exit=$exitCode). See $logPath"
+        }
     }
     $raw = Get-Content -LiteralPath $logPath -Raw
-    $p = [regex]::Matches($raw, 'prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*tokens?\s*\(\s*([0-9.]+)\s*tokens per second\s*\)')
-    $d = [regex]::Matches($raw, '(?<!prompt )eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*runs?\s*\(\s*([0-9.]+)\s*tokens per second\s*\)')
+    $p = [regex]::Matches($raw, '\bprompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*tokens?\s*\(\s*(?:[^\r\n)]*?,\s*)?([0-9.]+)\s*tokens per second\s*\)')
+    $d = [regex]::Matches($raw, '(?<!prompt )\beval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*(?:runs?|tokens?)\s*\(\s*(?:[^\r\n)]*?,\s*)?([0-9.]+)\s*tokens per second\s*\)')
     $pMs = $null; $pTps = $null; $dMs = $null; $dTps = $null
     if ($p.Count -gt 0) {
         $m = $p[$p.Count - 1]
@@ -96,6 +118,12 @@ for ($i = 1; $i -le ($WarmupRuns + $Runs); $i++) {
     }
     if ($null -eq $pTps -or $null -eq $dTps) {
         Write-Warning "Could not parse prompt/decode perf stats in $logPath"
+        $timingLines = @($raw -split "`r?`n" | Where-Object { $_ -match 'eval time|total time|load time' } | Select-Object -Last 5)
+        if ($timingLines.Count -gt 0) {
+            Write-Warning ("Observed timing lines: " + ($timingLines -join " | "))
+        } else {
+            Write-Warning "No llama timing lines found; ensure --perf, -lv 3 and normal CLI shutdown."
+        }
     }
     if (-not $warm) {
         $records += [pscustomobject]@{
@@ -108,6 +136,9 @@ for ($i = 1; $i -le ($WarmupRuns + $Runs); $i++) {
             logfile    = $logPath
         }
     }
+}
+if ($records.Count -eq 0) {
+    throw "No measured log records found for mode $Mode in $ModeDir"
 }
 $csv = Join-Path $ModeDir "results.csv"
 $records | Export-Csv -NoTypeInformation -Path $csv -Encoding UTF8
