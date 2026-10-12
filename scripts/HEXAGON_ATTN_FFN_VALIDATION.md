@@ -4,6 +4,59 @@
 
 之前的 `all-qkv` 在带 Tensor Dump 的 84 个张量上数值接近 CPU；尚未看到上一轮用户无 Dump 的最终 64-token Decode 报告，不能假定无 Dump 已通过。
 
+## 2026-10-12 Attention Output 测试问题与修正
+
+已获得 HTP Batch OK 且 compute_enabled=1 的 blk.13.attn_output.weight、blk.15.attn_output.weight 审计。**这仅证明投影实际提交 HTP，不代表数值通过。**
+
+前一轮 overview 结果：
+
+| case | compared | only_baseline | only_candidate | critical | min_cosine | max_RMSE | worst_output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 13-output | 120 | 0 | 0 | 13 | -0.795295 | 0.316798 | attn_out-14 |
+| 15-output | 120 | 0 | 0 | 11 | 0.944009 | 2.232093 | attn_out-13 |
+
+**注意 1：** CAPTURE_MISMATCH 的含义是预期的某些阶段未被捕获，并不代表两组的 manifest key 集合不同（它们的 only count 均为 0）。必须检查报告中的 missing_stages。
+
+**注意 2：** 仅迁移 15-output，却在 attn_out-13 发现明显差异，是目标层**之前**的运行不一致，不是后续层误差传播。不能简单只检查目标层、删除其余差异。
+
+修正后的比较器把张量划为三个区域：UPSTREAM（目标算子之前）、TARGET（被迁移算子第一个可见输出）、DOWNSTREAM（同层消费者和后续层）。每个区域独立给出 diff、critical、首次差异和 worst NRMSE，保留 missing_stages 名单。可能状态包括 CAPTURE_MISMATCH、UPSTREAM_DIVERGENCE、TARGET_CRITICAL、DOWNSTREAM_CRITICAL、NUMERICALLY_CLOSE。
+
+### 不重新运行模型，直接分析此前已有 Dump
+
+在 PC 的对应分支更新：
+
+```powershell
+git pull --ff-only
+
+# 使用已有 ./hexagon-linear-validation/attn/baseline,13-output,15-output
+.\scripts\verify_hexagon_linear_layers.ps1 `
+  -Stage attn -RecompareOnly `
+  -Cases @("13-output","15-output")
+
+# 聚焦 15-output，但不会隐藏它之前的差异
+.\scripts\verify_hexagon_linear_layers.ps1 `
+  -Stage attn -RecompareOnly `
+  -Cases @("15-output") -FocusLayer 15
+```
+
+重新生成 attn/overview.csv 与 compare/summary.json、tensor_metrics.csv；不会清理原始 manifest 或重复执行 CLI。关注 missing_stages、upstream_diff、first_upstream_name、worst_target_name、worst_target_nrmse。
+
+### 复现时加 baseline 对照，识别跨次运行漂移
+
+如果此前 15-output 仍表现为 UPSTREAM_DIVERGENCE：
+
+```powershell
+# 使用新目录而不是覆盖旧 Dump
+.\scripts\verify_hexagon_linear_layers.ps1 `
+  -Stage attn -Ngl 4 -Tokens 1 `
+  -Cases @("15-output") -FocusLayer 15 -BaselineControl `
+  -OutDir ".\hexagon-linear-attn-control"
+```
+
+顺序是 baseline → 15-output → baseline-repeat。脚本会额外比较 baseline vs baseline-repeat，生成 baseline-control 行，并独立报告运行漂移。如果 baseline-control 都不一致，优先检查 RPC 缓存状态、调度、图回调和设备生命周期；如果 baseline-control 一致但 candidate 在 Layer 13 就分叉，检查目标权重放置或是否改变了执行图，使上游执行路径变化。
+
+后续 FFN 阶段必须等到 Attention Output 真正数值可信、无 Dump Decode 稳定后再进行。
+
 ## 实验设计
 
 本阶段固定 16-layer Llama 3.2 1B Q4_0、`-ngl 4`、`-fa off`、`--kv-offload`、K/V F16。`ngl=4` 包含 Layer 13, 14, 15 和输出层。
