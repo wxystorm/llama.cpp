@@ -356,7 +356,15 @@ struct htp_opformat {
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT) {
                 path = "hvx-flat";
             }
-            snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
+            snprintf(str, max_size,
+                     "%s vtcm %d m_chunk %d n_chunk %d threads %d act_threads %d pipeline %d",
+                     path,
+                     (int) kparams->vtcm_size,
+                     (int) kparams->m_chunk,
+                     (int) kparams->n_chunk,
+                     (int) kparams->n_threads,
+                     (int) kparams->n_act_threads,
+                     (int) kparams->pipeline);
         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
             const auto * kparams = (const struct htp_fa_kernel_params *) node.kernel_params;
             const char * path = "unknown";
