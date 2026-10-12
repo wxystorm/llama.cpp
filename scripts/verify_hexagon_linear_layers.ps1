@@ -263,7 +263,7 @@ try {
     foreach ($caseName in $Cases) {
         $candidate = Run-Capture $caseName
         $output = Join-Path $candidate "compare"
-        & py -3 $summaryScript $baseline $candidate --case $caseName --output $output
+        & py -3 $summaryScript $baseline $candidate --case $caseName --output $output --expected-layers ($layerRange -join ",")
         $code = $LASTEXITCODE
         if ($code -notin @(0, 2, 3)) {
             throw "Comparator error=$code for $caseName"
