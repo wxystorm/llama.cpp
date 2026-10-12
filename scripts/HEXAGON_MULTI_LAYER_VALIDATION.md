@@ -9,7 +9,7 @@
 - 一个候选用例：仅释放一个投影（`L-q` / `L-k` / `L-v`）、释放整层 QKV（`L-qkv`），或释放范围内所有层 QKV（`all-qkv`）给 `-ngl` 所选 RPC/HTP 后端。其他投影均固定 CPU，FFN 和 attention output 权重固定 CPU。
 - PC `LLAMA_TENSOR_COMPARE_DIR` 回调采集 layer 13–15 的 `Qcur/Kcur/Vcur/kq/kq_soft_max/kqv/kqv_out/attn_out/l_out`。
 - Python `summarize_hexagon_qkv_layers.py` 用名称、四维形状、出现次数匹配；按 CPU 的 capture ID 顺序比较；输出 `tensor_metrics.csv` 和 `summary.json`。
-- 手机的 `GGML_HEXAGON_QKV_AUDIT=1` 为已完成的 DSP opbatch 输出 `[HEX_QKV_AUDIT]`，核实目标 QKV 权重确实参与 HTP 提交和 batch ACK。这个标记不等于逐算子独立数值证明。
+- 手机的 `GGML_HEXAGON_QKV_AUDIT=1` 为已完成的 DSP opbatch 输出 `[HEX_QKV_AUDIT]`（QKV MatMul）和 `[HEX_KV_AUDIT]`（对应层 K/V SET_ROWS），核实实际 HTP 路径与 batch ACK。这些标记不等于逐算子独立数值证明。
 
 ## 手机端部署
 
@@ -37,13 +37,14 @@ unset GGML_HEXAGON_SET_ROWS_SYNC_TIMING
 检查设备日志（或在测试完成后）：
 
 ```bash
-grep 'HEX_QKV_AUDIT' rpc-multilayer.log
+grep -E 'HEX_QKV_AUDIT|HEX_KV_AUDIT' rpc-multilayer.log
 ```
 
 成功的 NPU 投影应出现类似：
 
 ```text
 [HEX_QKV_AUDIT] session=... batch_id=... batch_status=OK weight=blk.14.attn_k.weight ... compute_enabled=1
+[HEX_KV_AUDIT] session=... batch_id=... batch_status=OK cache=cache_k_l14 ... compute_enabled=1
 ```
 
 如果 PC 比较显示正确，但对应的 Q/K/V 权重始终没有该类记录，不能声称 HTP 实际执行了此算子；先检查实际的 RPC/CPU 放置、日志级别、是否部署新库以及 `GGML_HEXAGON_OPFUSION`。
