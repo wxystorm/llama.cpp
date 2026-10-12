@@ -9,6 +9,8 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cfloat>
 #include <cmath>
 
@@ -5627,6 +5629,29 @@ static void ggml_compute_forward_clamp_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    const bool moe_diag =
+        getenv("GGML_MOE_SPLIT_DIAG") != NULL &&
+        src0 != NULL &&
+        strstr(src0->name, "ffn_moe_weights_sum") != NULL;
+
+    if (moe_diag && params->ith == 0) {
+        GGML_LOG_INFO(
+            "[MOE_SPLIT_DIAG] stage=CLAMP_BEGIN "
+            "dst=%s dst_ptr=%p dst_data=%p src=%s src_ptr=%p src_data=%p "
+            "src_type=%s src_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "src_nb=[%zu,%zu,%zu,%zu]\n",
+            dst->name,
+            (void *) dst,
+            dst->data,
+            src0->name,
+            (void *) src0,
+            src0->data,
+            ggml_type_name(src0->type),
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+        fflush(stderr);
+    }
+
     float min;
     float max;
     memcpy(&min, (float *) dst->op_params + 0, sizeof(float));
@@ -5654,6 +5679,19 @@ static void ggml_compute_forward_clamp_f32(
         for (int i = 0; i < nc; i++) {
             dst_ptr[i] = MAX(MIN(src0_ptr[i], max), min);
         }
+    }
+
+    if (moe_diag && params->ith == 0) {
+        GGML_LOG_INFO(
+            "[MOE_SPLIT_DIAG] stage=CLAMP_DONE "
+            "dst=%s dst_data=%p src=%s src_data=%p nc=%d rows=%d\n",
+            dst->name,
+            dst->data,
+            src0->name,
+            src0->data,
+            nc,
+            n);
+        fflush(stderr);
     }
 }
 

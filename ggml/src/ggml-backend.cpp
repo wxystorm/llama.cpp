@@ -1963,6 +1963,15 @@ static void ggml_backend_sched_debug_tensor(
         n > 6 ? data[6] : 0.0f, n > 7 ? data[7] : 0.0f);
 }
 
+static bool ggml_moe_split_diag_enabled() {
+    return getenv("GGML_MOE_SPLIT_DIAG") != NULL;
+}
+
+static bool ggml_moe_split_diag_tensor(const struct ggml_tensor * t) {
+    return t != NULL &&
+           strstr(t->name, "ffn_moe_weights_sum") != NULL;
+}
+
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
@@ -1980,6 +1989,34 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
         ggml_backend_t       input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
         struct ggml_tensor * input         = split->inputs[input_id];
         struct ggml_tensor * input_cpy     = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+        const bool moe_diag =
+            ggml_moe_split_diag_enabled() &&
+            ggml_moe_split_diag_tensor(input);
+        if (moe_diag) {
+            GGML_LOG_INFO(
+                "[MOE_SPLIT_DIAG] stage=COPY_BEGIN split=%d input_id=%d "
+                "tensor=%s src_backend=%s dst_backend=%s "
+                "src=%p src_data=%p src_buf=%p dst=%p dst_data=%p dst_buf=%p "
+                "type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                split_id,
+                input_id,
+                input->name,
+                input_backend ? ggml_backend_name(input_backend) : "(null)",
+                ggml_backend_name(split_backend),
+                (void *) input,
+                input->data,
+                (void *) input->buffer,
+                (void *) input_cpy,
+                input_cpy ? input_cpy->data : NULL,
+                input_cpy ? (void *) input_cpy->buffer : NULL,
+                ggml_type_name(input->type),
+                input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+                input->nb[0], input->nb[1], input->nb[2], input->nb[3],
+                ggml_nbytes(input));
+            fflush(stderr);
+        }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2095,6 +2132,18 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                     ggml_backend_tensor_copy(input, input_cpy);
                 }
             }
+        }
+
+        if (moe_diag) {
+            GGML_LOG_INFO(
+                "[MOE_SPLIT_DIAG] stage=COPY_DONE split=%d input_id=%d "
+                "tensor=%s dst_data=%p bytes=%zu\n",
+                split_id,
+                input_id,
+                input->name,
+                input_cpy ? input_cpy->data : NULL,
+                ggml_nbytes(input));
+            fflush(stderr);
         }
     }
 
@@ -2335,10 +2384,50 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
                       "note=diagnostic_sync_changes_timing\n", split_id, kv14_captures.size());
     }
 
+    bool moe_compute_diag = false;
+    if (ggml_moe_split_diag_enabled()) {
+        for (int j = 0; j < split->graph.n_nodes; ++j) {
+            ggml_tensor * n = split->graph.nodes[j];
+            if (ggml_moe_split_diag_tensor(n) ||
+                (n != NULL && n->src[0] != NULL &&
+                 ggml_moe_split_diag_tensor(n->src[0]))) {
+                moe_compute_diag = true;
+                break;
+            }
+        }
+    }
+
+    if (moe_compute_diag) {
+        ggml_tensor * n0 = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
+        GGML_LOG_INFO(
+            "[MOE_SPLIT_DIAG] stage=COMPUTE_BEGIN split=%d backend=%s "
+            "nodes=%d first_node=%s first_op=%s first_dst=%p first_dst_data=%p "
+            "first_src0=%s first_src0_ptr=%p first_src0_data=%p\n",
+            split_id,
+            ggml_backend_name(split_backend),
+            split->graph.n_nodes,
+            n0 ? n0->name : "(null)",
+            n0 ? ggml_op_name(n0->op) : "(null)",
+            (void *) n0,
+            n0 ? n0->data : NULL,
+            (n0 && n0->src[0]) ? n0->src[0]->name : "(null)",
+            (n0 && n0->src[0]) ? (void *) n0->src[0] : NULL,
+            (n0 && n0->src[0]) ? n0->src[0]->data : NULL);
+        fflush(stderr);
+    }
+
     if (!sched->callback_eval) {
         enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
+        }
+        if (moe_compute_diag) {
+            GGML_LOG_INFO(
+                "[MOE_SPLIT_DIAG] stage=COMPUTE_SUBMITTED split=%d backend=%s status=%d\n",
+                split_id,
+                ggml_backend_name(split_backend),
+                (int) ec);
+            fflush(stderr);
         }
     } else {
         // similar to ggml_backend_compare_graph_backend
@@ -2392,6 +2481,20 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
     }
 
     ggml_sched_kv14_verify(split_backend, split_id, kv14_captures);
+
+    if (moe_compute_diag) {
+        GGML_LOG_INFO(
+            "[MOE_SPLIT_DIAG] stage=SYNC_BEGIN split=%d backend=%s\n",
+            split_id,
+            ggml_backend_name(split_backend));
+        fflush(stderr);
+        ggml_backend_synchronize(split_backend);
+        GGML_LOG_INFO(
+            "[MOE_SPLIT_DIAG] stage=SYNC_DONE split=%d backend=%s\n",
+            split_id,
+            ggml_backend_name(split_backend));
+        fflush(stderr);
+    }
 
     // record the event of this copy
     if (split->n_inputs > 0) {
