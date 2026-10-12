@@ -81,8 +81,8 @@ for ($i = 1; $i -le ($WarmupRuns + $Runs); $i++) {
         throw "Run failed (exit=$exitCode). See $logPath"
     }
     $raw = Get-Content -LiteralPath $logPath -Raw
-    $p = [regex]::Matches($raw, 'prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*tokens?\s*\(([0-9.]+)\s*tokens per second\)')
-    $d = [regex]::Matches($raw, '(?<!prompt )eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*runs?\s*\(([0-9.]+)\s*tokens per second\)')
+    $p = [regex]::Matches($raw, 'prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*tokens?\s*\(\s*([0-9.]+)\s*tokens per second\s*\)')
+    $d = [regex]::Matches($raw, '(?<!prompt )eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*(\d+)\s*runs?\s*\(\s*([0-9.]+)\s*tokens per second\s*\)')
     $pMs = $null; $pTps = $null; $dMs = $null; $dTps = $null
     if ($p.Count -gt 0) {
         $m = $p[$p.Count - 1]
