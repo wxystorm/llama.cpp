@@ -1793,6 +1793,24 @@ struct ggml_hexagon_opqueue {
         if (opt_qkv_audit) {
             const auto & completed_ops = op_cache[rsp.id];
             for (const auto & queued : completed_ops) {
+                // Audit remote KV-cache writes separately from Q/K/V projection
+                // MatMuls, including layers other than K14. Batch ACK is
+                // necessary but not sufficient evidence of correct KV values.
+                if (queued.opcode == HTP_OP_SET_ROWS && queued.node != nullptr &&
+                    queued.node->src[0] != nullptr && queued.node->src[2] != nullptr) {
+                    const ggml_tensor * values = queued.node->src[0];
+                    const ggml_tensor * cache  = queued.node->src[2];
+                    if (strncmp(cache->name, "cache_k_l", 9) == 0 ||
+                        strncmp(cache->name, "cache_v_l", 9) == 0) {
+                        GGML_LOG_INFO("[HEX_KV_AUDIT] session=%s batch_id=%u"
+                                      " batch_status=%s cache=%s values=%s"
+                                      " values_bytes=%zu compute_enabled=%d\n",
+                                      shm_buf->sess->c_name(), rsp.id,
+                                      status_to_str(rsp.status), cache->name,
+                                      values->name, ggml_nbytes(values),
+                                      (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+                    }
+                }
                 if (queued.opcode != HTP_OP_MUL_MAT &&
                     queued.opcode != HTP_OP_MUL_MAT_ADD &&
                     queued.opcode != HTP_OP_MUL_MAT_QKV) {
