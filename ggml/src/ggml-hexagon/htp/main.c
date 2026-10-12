@@ -889,9 +889,21 @@ struct htp_set_rows_sync_stats {
     uint32_t global_flush_calls;
 };
 
+struct htp_l2_profile_stats {
+    uint64_t input_qtimer_ticks;
+    uint64_t output_qtimer_ticks;
+    uint64_t input_bytes;
+    uint64_t output_bytes;
+    uint32_t input_calls;
+    uint32_t output_calls;
+    uint32_t input_global_flush_calls;
+    uint32_t output_global_flush_calls;
+};
+
 static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op,
                        struct htp_k14_rsp_probe * k14_probe,
-                       struct htp_set_rows_sync_stats * sync_stats) {
+                       struct htp_set_rows_sync_stats * sync_stats,
+                       struct htp_l2_profile_stats * l2_stats) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
@@ -910,6 +922,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
                             (op->flags & HTP_OPFLAGS_SKIP_COMPUTE) == 0;
     const bool profile_set_rows_sync = sync_set_rows_host_inputs &&
                             (op->flags & HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC) != 0;
+    const bool profile_l2 = (op->flags & HTP_OPFLAGS_PROFILE_L2) != 0;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
                              ((uint32_t) op->pad[1] << 16);
     if (k14_diag && k14_probe != NULL) {
@@ -959,19 +972,33 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
                  " reason=SOURCE_TOO_LARGE bytes=%u input=%u", src->size, i);
         }
         if (force_flush || kv14_force_flush || sync_external_set_rows_src || regular_flush) {
-            // One flush even if multiple sync reasons are active. Profile the
-            // extra host/RPC coherency path, not the legacy COMPUTE flushes.
-            if (profile_set_rows_sync && sync_external_set_rows_src && sync_stats) {
-                const uint64_t start = HAP_perf_get_qtimer_count();
-                hex_l2flush((void *) (uintptr_t) src->data, src->size);
-                sync_stats->flush_qtimer_ticks += HAP_perf_get_qtimer_count() - start;
+            // One flush even if multiple sync reasons are active. L2 profiling
+            // measures this existing call only; it never adds a new flush.
+            const bool time_l2 = profile_l2 && l2_stats != NULL;
+            const bool time_set_rows =
+                profile_set_rows_sync && sync_external_set_rows_src && sync_stats != NULL;
+            const bool time_flush = time_l2 || time_set_rows;
+            const uint64_t start = time_flush ? HAP_perf_get_qtimer_count() : 0;
+
+            hex_l2flush((void *) (uintptr_t) src->data, src->size);
+
+            const uint64_t elapsed =
+                time_flush ? HAP_perf_get_qtimer_count() - start : 0;
+            if (time_l2) {
+                l2_stats->input_qtimer_ticks += elapsed;
+                l2_stats->input_bytes += src->size;
+                l2_stats->input_calls++;
+                if (src->size > HEX_L2_FLUSH_SIZE) {
+                    l2_stats->input_global_flush_calls++;
+                }
+            }
+            if (time_set_rows) {
+                sync_stats->flush_qtimer_ticks += elapsed;
                 sync_stats->bytes += src->size;
                 sync_stats->calls++;
                 if (src->size > HEX_L2_FLUSH_SIZE) {
                     sync_stats->global_flush_calls++;
                 }
-            } else {
-                hex_l2flush((void *) (uintptr_t) src->data, src->size);
             }
         }
         if (sync_external_set_rows_src) {
@@ -1091,7 +1118,20 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
         if (octx->dsts[i]) {
             struct htp_tensor *dst = (struct htp_tensor *)octx->dsts[i];
+            const bool time_l2 = profile_l2 && l2_stats != NULL;
+            const uint64_t start = time_l2 ? HAP_perf_get_qtimer_count() : 0;
+
             hex_l2flush((void *) dst->data, dst->size);
+
+            if (time_l2) {
+                l2_stats->output_qtimer_ticks +=
+                    HAP_perf_get_qtimer_count() - start;
+                l2_stats->output_bytes += dst->size;
+                l2_stats->output_calls++;
+                if (dst->size > HEX_L2_FLUSH_SIZE) {
+                    l2_stats->output_global_flush_calls++;
+                }
+            }
             dst->flags |= HTP_TENSOR_FLUSHED;
 
             FARF(HIGH, "post-dst[%u] #%u: data %p size %u : %u:%u:%u:%u", i, op->dst[i], (void*) dst->data, dst->size,
@@ -1205,6 +1245,9 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         for (uint32_t i=0; i < n_ops; i++) {
             struct profile_data prof;
             struct htp_set_rows_sync_stats sync_stats = {0};
+            struct htp_l2_profile_stats l2_stats = {0};
+
+            memset(&pds[i], 0, sizeof(pds[i]));
 
             if (i == op_wakeup) {
                 dspqueue_write_early_wakeup_noblock(queue, 0, 0);
@@ -1212,7 +1255,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
-            op_status = proc_op_req(octx, tens, i, &ops[i], &k14_probe, &sync_stats);
+            op_status = proc_op_req(octx, tens, i, &ops[i], &k14_probe, &sync_stats, &l2_stats);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -1233,6 +1276,21 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                 for (int j = 0; j < HEX_NUM_PMU_COUNTERS; j++) {
                     pds[i].pmu[j] = prof.pmu_counters[j];
                 }
+            }
+
+            if ((ops[i].flags & HTP_OPFLAGS_PROFILE_L2) != 0) {
+                pds[i].l2_input_us =
+                    (uint32_t) HAP_perf_qtimer_count_to_us(l2_stats.input_qtimer_ticks);
+                pds[i].l2_input_bytes = (uint32_t) l2_stats.input_bytes;
+                pds[i].l2_input_calls = l2_stats.input_calls;
+                pds[i].l2_input_global_flush_calls =
+                    l2_stats.input_global_flush_calls;
+                pds[i].l2_output_us =
+                    (uint32_t) HAP_perf_qtimer_count_to_us(l2_stats.output_qtimer_ticks);
+                pds[i].l2_output_bytes = (uint32_t) l2_stats.output_bytes;
+                pds[i].l2_output_calls = l2_stats.output_calls;
+                pds[i].l2_output_global_flush_calls =
+                    l2_stats.output_global_flush_calls;
             }
         }
 
