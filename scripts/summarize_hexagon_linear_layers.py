@@ -35,7 +35,7 @@ def safe(value):
 
 def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
             atol: float, rtol: float, min_cosine: float,
-            max_normalized_rmse: float):
+            max_normalized_rmse: float, expected_layers):
     ref = load_manifest(ref_dir)
     npu = load_manifest(npu_dir)
     shared = sorted(ref.keys() & npu.keys(), key=lambda k: ref[k].capture_id)
@@ -90,11 +90,16 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
 
     critical = [r for r in rows if r["status"] == "CRITICAL"]
     diff = [r for r in rows if r["status"] == "DIFF"]
-    stages_present = {r["stage"] for r in rows}
-    # Llama 3.2 source (src/models/llama.cpp) always has these callbacks.
-    # ffn_down does not necessarily exist as a callback without down bias.
+    captured_stages = {(r["layer"], r["stage"]) for r in rows}
+    # Llama3.2 src/models/llama.cpp emits these callbacks at each layer.
+    # ffn_down's callback may be missing on down-bias-free models.
     mandatory_stages = {"attn_out", "ffn_out", "l_out"}
-    missing_stages = sorted(mandatory_stages - stages_present)
+    missing_stages = sorted(
+        "%s-%d" % (stage, layer)
+        for layer in expected_layers
+        for stage in mandatory_stages
+        if (layer, stage) not in captured_stages
+    )
     if not shared or missing_ref or missing_npu or missing_stages:
         verdict = "CAPTURE_MISMATCH"
     elif critical:
@@ -169,14 +174,19 @@ def main():
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--case", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--expected-layers", required=True,
+                        help="Comma-separated layer indices, e.g. 13,14,15")
     parser.add_argument("--atol", type=float, default=0.001)
     parser.add_argument("--rtol", type=float, default=0.001)
     parser.add_argument("--min-cosine", type=float, default=0.95)
     parser.add_argument("--max-normalized-rmse", type=float, default=0.05)
     args = parser.parse_args()
+    expected = [int(x) for x in args.expected_layers.split(",") if x.strip()]
+    if not expected:
+        parser.error("--expected-layers must include at least one layer")
     result = compare(args.reference, args.candidate, args.case, args.output,
                      args.atol, args.rtol, args.min_cosine,
-                     args.max_normalized_rmse)
+                     args.max_normalized_rmse, expected)
     return {"NUMERICALLY_CLOSE": 0, "CRITICAL": 2,
             "CAPTURE_MISMATCH": 3}[result["status"]]
 
