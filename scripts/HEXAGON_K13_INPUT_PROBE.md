@@ -63,6 +63,46 @@ PC:
 
 Compare both A and B using the existing diagnose_hexagon_token_columns.py, with --tokens 42 and name regex ^(attn_norm|Qcur|Kcur|Vcur)-13$. Check whether Kcur-13 token column 2 is all zero in each run and check overview.csv.
 
+## MM_SELECT=2 experiment: the next comparison must cross DSP, Android host and PC
+
+The user set `GGML_HEXAGON_MM_SELECT=2`. The K13 plan confirms `HVX_QUANT_ROW` (`kernel_id=9`) replaced `HVX_QUANT_ROW_FLAT` (`kernel_id=11`). At 42 tokens, DSP input FNV is identical across modes (`581aae06bf58a4cf`). The two kernels naturally return different full output FNVs:
+
+| Kernel | K13 42-token DSP post-flush FNV across baseline / candidate / baseline-repeat |
+| --- | --- |
+| FLAT (11) | `4ea315c0e250df06` on seq 3/7/11 |
+| ROW (9) | `008627493bc28585` on seq 3/7/11 |
+
+The important observation is **within each kernel**, DSP's full output hash is the same across all three cases, despite the previously verified PC candidate K13 column-2 zero in the FLAT experiment. This is evidence to localize a possible **post-DSP output movement or capture issue**. But it does not prove the ROW mode PC capture is correct, and it cannot rule out a consistently faulty DSP result. Flush POST==FLUSH only compares DSP-visible bytes at two stages; it does not certify Android host or PC tensor readback.
+
+For each experiment, compare these three exact hashes for the same 42-token MatMul:
+
+1. `HEX_K13_DSP_PROBE output_flush_fnv64` for seq 3,7,11.
+2. Android-host readback: the helper still prints `[HEX_K14_TENSOR] seq=3 phase=POST role=output ... fnv64=...` (also 7 and 11) for K13 because the old generic helper name was reused. Use:
+
+```bash
+grep -E '\[HEX_K14_TENSOR\] seq=(3|7|11) phase=POST role=output' rpc-k13-mm2.log
+```
+
+3. PC raw dumped `Kcur-13` F32 `512x42` from the existing folders, using the newly added script:
+
+```powershell
+git pull --ff-only
+py -3 .\scripts\hash_hexagon_k13_snapshots.py `
+    .\hexagon-k13-mm2\attn `
+    --tensor Kcur-13 --ne0 512 --tokens 42 --column 2
+```
+
+Replace `hexagon-k13-mm2` with the actual OutDir used for the ROW test (no model rerun required). The script reads `baseline`, `15-output`, and `baseline-repeat` manifests, computes FNV64 over the exact whole `512x42xf32` binary, and shows whether token column 2 was zero.
+
+Interpretation:
+
+- DSP hashes equal, Android-host POST hashes equal, PC Dump hashes differ: investigate RPC tensor_get/transport, callback capture time, or PC buffer ownership/overwrites.
+- DSP hashes equal, Android-host POST hashes differ: inspect DSP-to-host shared-buffer cache coherence or reused aliases.
+- DSP hashes and PC hashes equal across all cases: ROW path may no longer show this problem, but verify per-token numerical accuracy against the expected K output before concluding anything.
+- The FLAT/ROW hashes differ by kernel choice; **do not** compare FLAT DSP digest directly to ROW PC digest as if they should match.
+
+Finally, changing `MM_SELECT` may alter prefetch, VTCM and timing. Do not claim it fixed the bug from phone-only batch ACKs; require matching PC capture and per-column evidence.
+
 ## Probe logs and caveats
 
 ```bash
