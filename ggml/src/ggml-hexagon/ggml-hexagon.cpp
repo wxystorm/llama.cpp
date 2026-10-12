@@ -95,6 +95,7 @@ static std::unordered_set<std::string> opt_qkv_force_input_flush_weights;
 static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
 static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
 static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
+static bool opt_matmul_input_sync = false; // debug-only: force DSP cache sync for every MUL_MAT src[1]
 static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
 static bool opt_qkv_audit = false; // opt-in per-batch QKV DSP execution acknowledgement
 static bool opt_linear_audit = false; // opt-in per-batch attn output/FFN MatMul execution acknowledgement
@@ -1569,6 +1570,17 @@ struct ggml_hexagon_opbatch {
             if (opt_kv14_set_rows_force_input_flush) {
                 o.flags |= HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH;
             }
+        }
+
+        // Controlled correctness experiment: force every standalone MUL_MAT
+        // activation input (src[1]) through the DSP cache-sync path. This
+        // intentionally ignores HTP_TENSOR_COMPUTE/FLUSHED so we can test
+        // whether RPC-produced activations are being misclassified as ANY.
+        if (opt_matmul_input_sync && node.opcode == HTP_OP_MUL_MAT &&
+            node.node != nullptr && node.node->src[1] != nullptr &&
+            (node.node->src[1]->type == GGML_TYPE_F32 ||
+             node.node->src[1]->type == GGML_TYPE_F16)) {
+            o.flags |= HTP_OPFLAGS_SYNC_MUL_MAT_INPUT;
         }
 
         // Phase-1 coherency fix: generalize the known-good K14 experiment
@@ -5045,6 +5057,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
     const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
     const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
+    const char * str_matmul_input_sync = getenv("GGML_HEXAGON_MATMUL_INPUT_SYNC");
     const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
     const char * str_qkv_audit = getenv("GGML_HEXAGON_QKV_AUDIT");
     const char * str_linear_audit = getenv("GGML_HEXAGON_LINEAR_AUDIT");
@@ -5158,6 +5171,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                               strcmp(str_kv14_set_rows_diag, "1") == 0);
     opt_set_rows_host_input_sync = str_set_rows_host_input_sync != nullptr &&
                                    strcmp(str_set_rows_host_input_sync, "1") == 0;
+    opt_matmul_input_sync = str_matmul_input_sync != nullptr &&
+                            strcmp(str_matmul_input_sync, "1") == 0;
     opt_set_rows_sync_timing = str_set_rows_sync_timing != nullptr &&
                                strcmp(str_set_rows_sync_timing, "1") == 0;
     opt_qkv_audit = str_qkv_audit != nullptr &&
@@ -5177,6 +5192,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
                       " scope=all_SET_ROWS_external_F32_values_and_indices"
                       " max_source_bytes=16777216 experimental=1\n");
+    }
+    if (opt_matmul_input_sync) {
+        GGML_LOG_WARN("[HEX_MATMUL_INPUT_SYNC] enabled=1"
+                      " scope=all_MUL_MAT_src1_F32_F16"
+                      " mode=DSP_CLEAN_INVALIDATE diagnostic_only=1\n");
     }
     if (opt_kv14_set_rows_diag) {
         GGML_LOG_WARN("[HEX_KV14_SET_ROWS_DIAG] enabled=1 scope=cache_k_l14"
