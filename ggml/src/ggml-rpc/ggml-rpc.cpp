@@ -1346,8 +1346,9 @@ static void rpc_alloc_size_normalize_tensor(rpc_tensor & tensor) {
     tensor.view_src = tensor.view_src != 0 ? 1 : 0;
 
     // Tensor names do not affect backend allocation requirements.
+    // Keep buffer_usage: it is no longer padding and may affect backend
+    // behavior, so it must remain part of the normalized allocation key.
     memset(tensor.name, 0, sizeof(tensor.name));
-    memset(tensor.padding, 0, sizeof(tensor.padding));
 }
 
 static std::string rpc_alloc_size_structural_key(
