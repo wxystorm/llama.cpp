@@ -78,7 +78,12 @@ function Get-EnabledWeights([string] $caseName) {
         }
         return $enabled
     }
-    if ($caseName -match '^(\d+)-(qkv|q|k|v)
+    if ($caseName -match '^(\d+)-(qkv|q|k|v)$') {
+        $layer = [int] $Matches[1]
+        $selection = $Matches[2]
+    } else {
+        throw "Invalid case '$caseName'. Use L-q, L-k, L-v, L-qkv or all-qkv."
+    }
     if ($layer -lt $StartLayer -or $layer -gt $EndLayer) {
         throw "Case '$caseName' is outside [$StartLayer,$EndLayer]."
     }
