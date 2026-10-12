@@ -145,6 +145,8 @@ enum htp_op_flags {
     HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH = (1U << 2), // Debug-only K14 src[1] DSP cache flush before execution
     HTP_OPFLAGS_DIAG_KV14_SET_ROWS = (1U << 3), // Debug-only K14 cache SET_ROWS input digest
     HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH = (1U << 4), // Debug-only K14 cache SET_ROWS src[0] flush
+    HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT = (1U << 5), // Opt-in: sync externally staged SET_ROWS F32 data and indices
+    HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC = (1U << 6), // Opt-in: measure source sync in DSP per-op profiler
 };
 
 // Op descriptor
@@ -204,6 +206,12 @@ struct htp_prof_desc {
     uint32_t cycles_start;           // Start cycle counter
     uint32_t cycles_stop;            // Stop cycle counter
     uint32_t pmu[HTP_PROF_PMU_NCNT]; // PMU counters
+    // Only nonzero for opt-in profiling of SET_ROWS host-input coherency.
+    // Four uint32 fields keep sizeof(htp_prof_desc) divisible by 8.
+    uint32_t sync_input_us;
+    uint32_t sync_input_bytes;
+    uint32_t sync_input_calls;
+    uint32_t sync_global_flush_calls;
 };
 
 struct htp_opbatch_req {
