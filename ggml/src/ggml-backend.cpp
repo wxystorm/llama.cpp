@@ -1554,7 +1554,42 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     cur_backend_id));
                         }
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    struct ggml_tensor * local_src =
+                        tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+
+                    // Some in-place ops are represented as views of their input
+                    // (for example GGML_OP_CLAMP via ggml_view_tensor()). When
+                    // that input crosses a backend boundary, replacing only
+                    // src[j] leaves view_src pointing at the original backend.
+                    // The destination would then alias the remote/device address
+                    // even though the op itself executes on the local backend.
+                    //
+                    // Rebind only the direct in-place/view case. Keep view_offs
+                    // unchanged, but clear the previously initialized borrowed
+                    // buffer/data so ggml_backend_view_init() can attach the
+                    // output to the local copy during graph allocation.
+                    if (node->view_src == src) {
+                        if (ggml_moe_split_diag_enabled()) {
+                            GGML_LOG_INFO(
+                                "[MOE_SPLIT_DIAG] stage=VIEW_SRC_REBIND "
+                                "node=%s op=%s old_view=%s old_data=%p "
+                                "new_view=%s new_data=%p backend=%s\n",
+                                node->name,
+                                ggml_op_name(node->op),
+                                src->name,
+                                node->data,
+                                local_src->name,
+                                local_src->data,
+                                ggml_backend_name(sched->backends[cur_backend_id]));
+                            fflush(stderr);
+                        }
+
+                        node->view_src = local_src;
+                        node->buffer = NULL;
+                        node->data = NULL;
+                    }
+
+                    node->src[j] = local_src;
                 }
             }
         }
