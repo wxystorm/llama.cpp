@@ -59,6 +59,11 @@ def compare_columns(baseline, candidate, tokens, selected, atol, rtol):
             stat = metrics(left, right, atol, rtol)
             rms = math.sqrt(sum(float(v)**2 for v in left if math.isfinite(v)) /
                             len(left))
+            candidate_rms = math.sqrt(
+                sum(float(v)**2 for v in right if math.isfinite(v)) /
+                len(right))
+            ref_zero = sum(v == 0 for v in left)
+            candidate_zero = sum(v == 0 for v in right)
             nr = stat["rmse"] / max(rms, 1e-6)
             per_name.append({
                 "name": a.name,
@@ -71,6 +76,11 @@ def compare_columns(baseline, candidate, tokens, selected, atol, rtol):
                 "nonfinite": stat["nonfinite"],
                 "rmse": stat["rmse"],
                 "normalized_rmse": nr,
+                "reference_rms": rms,
+                "candidate_rms": candidate_rms,
+                "reference_zero": ref_zero,
+                "candidate_zero": candidate_zero,
+                "candidate_all_zero": candidate_zero == len(right),
                 "cosine": stat["cosine"],
             })
         found.append(per_name)
@@ -110,9 +120,13 @@ def main():
                   f"/{args.tokens} bad_elements={sum(r['bad'] for r in group)}")
             for row in order[:args.top]:
                 print("  token_col=%d bad=%d/%d rmse=%.6g nrmse=%.5g "
-                      "cosine=%.6g" %
+                      "cosine=%.6g ref_rms=%.6g candidate_rms=%.6g "
+                      "ref_zeros=%d candidate_zeros=%d all_zero=%s" %
                       (row["token_column"], row["bad"], row["total"],
-                       row["rmse"], row["normalized_rmse"], row["cosine"]))
+                       row["rmse"], row["normalized_rmse"], row["cosine"],
+                       row["reference_rms"], row["candidate_rms"],
+                       row["reference_zero"], row["candidate_zero"],
+                       row["candidate_all_zero"]))
         else:
             print(f"{group[0]['name']} capture={group[0]['capture_id']} "
                   f"shape={group[0]['shape']} all token columns match")
