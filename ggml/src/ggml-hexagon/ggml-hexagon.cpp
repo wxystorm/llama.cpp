@@ -98,6 +98,7 @@ static bool opt_set_rows_host_input_sync = false; // opt-in generic externally s
 static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
 static bool opt_qkv_audit = false; // opt-in per-batch QKV DSP execution acknowledgement
 static bool opt_linear_audit = false; // opt-in per-batch attn output/FFN MatMul execution acknowledgement
+static bool opt_l2_profile = false; // opt-in timing/accounting of existing DSP L2 flushes
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1608,6 +1609,10 @@ struct ggml_hexagon_opbatch {
             }
         }
 
+        if (opt_l2_profile) {
+            o.flags |= HTP_OPFLAGS_PROFILE_L2;
+        }
+
         if (!(opt_opstage & HTP_OPSTAGE_COMPUTE)) {
             o.flags |= HTP_OPFLAGS_SKIP_COMPUTE;
         }
@@ -1666,6 +1671,16 @@ struct ggml_hexagon_opqueue {
     std::vector<opvec>          op_cache;       // per batch op cache
     std::vector<uint64_t>       start_usec;     // per batch start time
 
+    uint64_t l2_profile_batches = 0;
+    uint64_t l2_input_us = 0;
+    uint64_t l2_input_bytes = 0;
+    uint64_t l2_input_calls = 0;
+    uint64_t l2_input_global_flush_calls = 0;
+    uint64_t l2_output_us = 0;
+    uint64_t l2_output_bytes = 0;
+    uint64_t l2_output_calls = 0;
+    uint64_t l2_output_global_flush_calls = 0;
+
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
         size_t n_bufs    = HTP_OP_MAX_BUFS;
         size_t n_ops     = batch_size;
@@ -1697,6 +1712,22 @@ struct ggml_hexagon_opqueue {
     }
 
     ~ggml_hexagon_opqueue() {
+        if (opt_l2_profile && l2_profile_batches > 0) {
+            GGML_LOG_INFO("[HEX_L2_PROFILE_SUM]"
+                          " session=%s batches=%" PRIu64
+                          " input_calls=%" PRIu64 " input_bytes=%" PRIu64
+                          " input_us=%" PRIu64 " input_global_flushes=%" PRIu64
+                          " output_calls=%" PRIu64 " output_bytes=%" PRIu64
+                          " output_us=%" PRIu64 " output_global_flushes=%" PRIu64
+                          " total_flush_us=%" PRIu64
+                          " note=qtimer_overhead_included\n",
+                          shm_buf->sess->c_name(), l2_profile_batches,
+                          l2_input_calls, l2_input_bytes,
+                          l2_input_us, l2_input_global_flush_calls,
+                          l2_output_calls, l2_output_bytes,
+                          l2_output_us, l2_output_global_flush_calls,
+                          l2_input_us + l2_output_us);
+        }
         delete shm_buf;
     }
 
@@ -2011,7 +2042,7 @@ struct ggml_hexagon_opqueue {
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
 
-        if (opt_profile && rsp.n_ops > 0) {
+        if ((opt_profile || opt_l2_profile) && rsp.n_ops > 0) {
             auto & ops = op_cache[rsp.id];
 
             uint64_t batch_usec = ggml_time_us() - start_usec[rsp.id];
@@ -2044,8 +2075,30 @@ struct ggml_hexagon_opqueue {
             uint64_t set_rows_total_us = 0;
             uint32_t set_rows_ops = 0;
 
+            uint64_t batch_l2_input_us = 0;
+            uint64_t batch_l2_input_bytes = 0;
+            uint64_t batch_l2_input_calls = 0;
+            uint64_t batch_l2_input_global_flushes = 0;
+            uint64_t batch_l2_output_us = 0;
+            uint64_t batch_l2_output_bytes = 0;
+            uint64_t batch_l2_output_calls = 0;
+            uint64_t batch_l2_output_global_flushes = 0;
+
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
+
+                if (opt_l2_profile) {
+                    batch_l2_input_us += pd[i].l2_input_us;
+                    batch_l2_input_bytes += pd[i].l2_input_bytes;
+                    batch_l2_input_calls += pd[i].l2_input_calls;
+                    batch_l2_input_global_flushes +=
+                        pd[i].l2_input_global_flush_calls;
+                    batch_l2_output_us += pd[i].l2_output_us;
+                    batch_l2_output_bytes += pd[i].l2_output_bytes;
+                    batch_l2_output_calls += pd[i].l2_output_calls;
+                    batch_l2_output_global_flushes +=
+                        pd[i].l2_output_global_flush_calls;
+                }
 
                 if (opt_set_rows_sync_timing &&
                     ops[i].opcode == HTP_OP_SET_ROWS &&
@@ -2084,6 +2137,34 @@ struct ggml_hexagon_opqueue {
                         }
                     }
                 }
+            }
+
+            if (opt_l2_profile) {
+                ++l2_profile_batches;
+                l2_input_us += batch_l2_input_us;
+                l2_input_bytes += batch_l2_input_bytes;
+                l2_input_calls += batch_l2_input_calls;
+                l2_input_global_flush_calls += batch_l2_input_global_flushes;
+                l2_output_us += batch_l2_output_us;
+                l2_output_bytes += batch_l2_output_bytes;
+                l2_output_calls += batch_l2_output_calls;
+                l2_output_global_flush_calls += batch_l2_output_global_flushes;
+
+                GGML_LOG_INFO("[HEX_L2_PROFILE]"
+                              " batch_id=%u n_ops=%u"
+                              " input_calls=%" PRIu64 " input_bytes=%" PRIu64
+                              " input_us=%" PRIu64 " input_global_flushes=%" PRIu64
+                              " output_calls=%" PRIu64 " output_bytes=%" PRIu64
+                              " output_us=%" PRIu64 " output_global_flushes=%" PRIu64
+                              " total_flush_us=%" PRIu64
+                              " batch_wall_us=%" PRIu64 "\n",
+                              rsp.id, rsp.n_ops,
+                              batch_l2_input_calls, batch_l2_input_bytes,
+                              batch_l2_input_us, batch_l2_input_global_flushes,
+                              batch_l2_output_calls, batch_l2_output_bytes,
+                              batch_l2_output_us, batch_l2_output_global_flushes,
+                              batch_l2_input_us + batch_l2_output_us,
+                              batch_usec);
             }
 
             if (opt_set_rows_sync_timing && set_rows_ops > 0) {
@@ -5053,6 +5134,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
     const char * str_qkv_audit = getenv("GGML_HEXAGON_QKV_AUDIT");
     const char * str_linear_audit = getenv("GGML_HEXAGON_LINEAR_AUDIT");
+    const char * str_l2_profile = getenv("GGML_HEXAGON_L2_PROFILE");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -5173,6 +5255,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     opt_linear_audit = str_linear_audit != nullptr &&
                        strcmp(str_linear_audit, "1") == 0;
+    opt_l2_profile = str_l2_profile != nullptr &&
+                     strcmp(str_l2_profile, "1") == 0;
+    if (opt_l2_profile) {
+        GGML_LOG_WARN("[HEX_L2_PROFILE] enabled=1"
+                      " mode=measure_existing_flushes_only"
+                      " note=qtimer_overhead_included_no_flush_policy_change\n");
+    }
     if (opt_linear_audit) {
         GGML_LOG_WARN("[HEX_LINEAR_AUDIT] enabled=1"
                       " scope=attn_output,ffn_gate,ffn_up,ffn_down"
