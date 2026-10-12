@@ -88,6 +88,10 @@ static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache exp
 // explicitly requested. The DSP checks the flags and opcode, not weight name.
 static bool opt_k13_diag = false;
 static bool opt_k13_force_input_flush = false;
+// Exact per-weight QKV diagnostic targets; a force target also enables a
+// probe target. Both reuse deployed DSP K14 flags: host library only.
+static std::unordered_set<std::string> opt_qkv_probe_weights;
+static std::unordered_set<std::string> opt_qkv_force_input_flush_weights;
 static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
 static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
 static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
@@ -1516,31 +1520,39 @@ struct ggml_hexagon_opbatch {
         o.pad[0] = 0;
         o.pad[1] = 0;
 
-        // Both experiments use the existing DSP K14 probe/flush flags:
-        // the DSP validates the opcode and flags, not the tensor name. The
-        // host tags only an exact projection weight (K13 or K14), never
-        // arbitrary MatMuls with similar dimensions. No HTP ABI changes.
-        if ((opt_k14_diag || opt_k13_diag) && node.diag_k14_seq != 0 &&
-            node.opcode == HTP_OP_MUL_MAT && node.node != nullptr &&
-            node.node->src[0] != nullptr) {
+        // Per-weight QKV probes reuse the existing K14 diagnostic/flush flags.
+        // The deployed DSP decides only by opcode and flags, not the tensor name.
+        if ((opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) &&
+            node.diag_k14_seq != 0 && node.opcode == HTP_OP_MUL_MAT &&
+            node.node != nullptr && node.node->src[0] != nullptr) {
             const char * weight_name = node.node->src[0]->name;
             const bool is_k13 = opt_k13_diag &&
                                  strcmp(weight_name, "blk.13.attn_k.weight") == 0;
             const bool is_k14 = opt_k14_diag &&
                                  strcmp(weight_name, "blk.14.attn_k.weight") == 0;
-            if (is_k13 || is_k14) {
+            const bool selected_qkv =
+                    opt_qkv_probe_weights.count(weight_name) != 0;
+            if (is_k13 || is_k14 || selected_qkv) {
                 o.flags |= HTP_OPFLAGS_DIAG_K14;
                 o.pad[0] = static_cast<uint16_t>(node.diag_k14_seq & 0xffffu);
                 o.pad[1] = static_cast<uint16_t>(node.diag_k14_seq >> 16);
-                if ((is_k13 && opt_k13_force_input_flush) ||
-                    (is_k14 && opt_k14_force_input_flush)) {
+                const bool force_flush =
+                        (is_k13 && opt_k13_force_input_flush) ||
+                        (is_k14 && opt_k14_force_input_flush) ||
+                        opt_qkv_force_input_flush_weights.count(weight_name) != 0;
+                if (force_flush) {
                     o.flags |= HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH;
                 }
-                if (is_k13) {
+                if (selected_qkv) {
+                    GGML_LOG_INFO("[HEX_QKV_INPUT_PROBE] stage=HTP_TAG"
+                                  " seq=%u weight=%s flags=0x%x force_flush=%d\n",
+                                  node.diag_k14_seq, weight_name,
+                                  (unsigned) o.flags, force_flush ? 1 : 0);
+                } else if (is_k13) {
                     GGML_LOG_INFO("[HEX_K13_INPUT_PROBE] stage=HTP_TAG"
-                                  " seq=%u weight=%s flags=0x%x"
-                                  " force_flush=%d\n",
-                                  node.diag_k14_seq, weight_name, (unsigned) o.flags,
+                                  " seq=%u weight=%s flags=0x%x force_flush=%d\n",
+                                  node.diag_k14_seq, weight_name,
+                                  (unsigned) o.flags,
                                   opt_k13_force_input_flush ? 1 : 0);
                 }
             }
@@ -1763,7 +1775,7 @@ struct ggml_hexagon_opqueue {
         // The DSP optionally returns four K14 fingerprints in n_traces[]
         // when profiling is disabled. The magic/sequence are in rsp.pad.
         // No FARF forwarding or logcat access is required.
-        if (opt_k14_diag || opt_k13_diag) {
+        if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
             uint32_t magic = 0, seq = 0;
             memcpy(&magic, rsp.pad, sizeof(magic));
             memcpy(&seq, rsp.pad + sizeof(magic), sizeof(seq));
@@ -1776,11 +1788,21 @@ struct ggml_hexagon_opqueue {
                     });
             };
             const auto result_probe = probe_for_seq(seq);
-            const bool response_is_k13 = result_probe != batch_nodes.end() &&
-                                        strcmp(result_probe->node->src[0]->name,
-                                               "blk.13.attn_k.weight") == 0;
-            const bool requested_force = response_is_k13 ?
-                    opt_k13_force_input_flush : opt_k14_force_input_flush;
+            const char * reply_weight =
+                    result_probe == batch_nodes.end() ? "(unmatched)" :
+                    result_probe->node->src[0]->name;
+            const bool response_is_k13 =
+                    strcmp(reply_weight, "blk.13.attn_k.weight") == 0 &&
+                    opt_k13_diag;
+            const bool response_is_k14 =
+                    strcmp(reply_weight, "blk.14.attn_k.weight") == 0 &&
+                    opt_k14_diag;
+            const bool response_is_qkv =
+                    opt_qkv_probe_weights.count(reply_weight) != 0;
+            const bool requested_force =
+                    (response_is_k13 && opt_k13_force_input_flush) ||
+                    (response_is_k14 && opt_k14_force_input_flush) ||
+                    opt_qkv_force_input_flush_weights.count(reply_weight) != 0;
             // Legacy K14 DSP reply stores only one probe per batch.
             // Multiple tagged MatMuls can execute correctly even though
             // the response only acknowledges the last diagnostic probe.
@@ -1790,8 +1812,8 @@ struct ggml_hexagon_opqueue {
                     ++tagged_in_batch;
                 }
             }
-            if (tagged_in_batch > 1 && opt_k13_diag) {
-                GGML_LOG_WARN("[HEX_K13_DSP_PROBE] batch_id=%u"
+            if (tagged_in_batch > 1 && (opt_k13_diag || !opt_qkv_probe_weights.empty())) {
+                GGML_LOG_WARN("[HEX_QKV_DSP_PROBE] batch_id=%u"
                               " status=MULTIPLE_TAGGED_OPS count=%zu"
                               " note=last_probe_only_in_batch_response\n",
                               rsp.id, tagged_in_batch);
@@ -1805,16 +1827,18 @@ struct ggml_hexagon_opqueue {
                 const uint64_t pre_hash   = (uint64_t(rsp.n_traces[3]) << 32) | rsp.n_traces[2];
                 const uint64_t post_hash  = (uint64_t(rsp.n_traces[5]) << 32) | rsp.n_traces[4];
                 const uint64_t flush_hash = (uint64_t(rsp.n_traces[7]) << 32) | rsp.n_traces[6];
-                const char * probe_tag = response_is_k13 ?
-                        "[HEX_K13_DSP_PROBE]" : "[HEX_K14_DSP_PROBE]";
-                GGML_LOG_INFO("%s seq=%u batch_id=%u status=%s"
+                const char * probe_tag = response_is_qkv ?
+                        "[HEX_QKV_DSP_PROBE]" :
+                        (response_is_k13 ? "[HEX_K13_DSP_PROBE]" :
+                         "[HEX_K14_DSP_PROBE]");
+                GGML_LOG_INFO("%s seq=%u weight=%s batch_id=%u status=%s"
                               " input_flags=0x%x exec_status=%u valid_mask=0x%x"
                               " force_input_flush_requested=%d force_input_flush_ack=%d"
                               " input_fnv64=%016" PRIx64
                               " output_pre_fnv64=%016" PRIx64
                               " output_post_fnv64=%016" PRIx64
                               " output_flush_fnv64=%016" PRIx64 "\n",
-                              probe_tag, seq, rsp.id, status_to_str(rsp.status),
+                              probe_tag, seq, reply_weight, rsp.id, status_to_str(rsp.status),
                               rsp.n_traces[8], rsp.n_traces[9], valid,
                               requested_force ? 1 : 0,
                               force_ack ? 1 : 0,
@@ -1823,10 +1847,10 @@ struct ggml_hexagon_opqueue {
                     GGML_LOG_WARN("%s weight=%s seq=%u"
                                   " status=NO_DSP_ACK"
                                   " (check DSP library version and input tensor validity)\n",
-                                  response_is_k13 ? "[HEX_K13_INPUT_FORCE_FLUSH]" :
-                                                    "[HEX_K14_INPUT_FORCE_FLUSH]",
-                                  response_is_k13 ? "blk.13.attn_k.weight" :
-                                                    "blk.14.attn_k.weight", seq);
+                                  response_is_qkv ? "[HEX_QKV_INPUT_FORCE_FLUSH]" :
+                                  (response_is_k13 ? "[HEX_K13_INPUT_FORCE_FLUSH]" :
+                                                     "[HEX_K14_INPUT_FORCE_FLUSH]"),
+                                  reply_weight, seq);
                 }
             } else if (opt_profile == 0) {
                 bool has_target = false;
@@ -4231,6 +4255,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         const ggml_tensor * output;
         uint64_t seq;
         bool is_k13;
+        bool is_qkv;
         uint64_t before_fnv64;
         bool before_valid;
         bool sentinel_applied;
@@ -4239,7 +4264,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         float sentinel_value;
     };
     std::vector<k14_diag_entry> k14_entries;
-    if (opt_k14_diag || opt_k13_diag) {
+    if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
         static std::atomic<uint64_t> k14_seq{0};
         for (const auto & node : *nodes_ptr) {
             ggml_tensor * matmul = node.node;
@@ -4251,7 +4276,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     strcmp(matmul->src[0]->name, "blk.13.attn_k.weight") == 0;
             const bool is_k14 = opt_k14_diag &&
                     strcmp(matmul->src[0]->name, "blk.14.attn_k.weight") == 0;
-            if (!is_k13 && !is_k14) {
+            const bool is_qkv =
+                    opt_qkv_probe_weights.count(matmul->src[0]->name) != 0;
+            if (!is_k13 && !is_k14 && !is_qkv) {
                 continue;
             }
             const ggml_tensor * weight = matmul->src[0];
@@ -4265,7 +4292,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                           " hvx_threads=%u hmx=%u kernel_threads=%d"
                           " n_prefetch=%d src1_row_size=%d vtcm=%d repacked=%d"
                           " opstage=%u compute_enabled=%d\n",
-                          is_k13 ? "[HEX_K13_PLAN]" : "[HEX_K14_PLAN]",
+                          is_qkv ? "[HEX_QKV_PLAN]" :
+                          (is_k13 ? "[HEX_K13_PLAN]" : "[HEX_K14_PLAN]"),
                           seq, graph->uid, cache_hit ? 1 : 0,
                           input->name, weight->name, matmul->name,
                           input->ne[1], weight->ne[1], weight->ne[0],
@@ -4298,7 +4326,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             uint64_t before_fnv64 = 0;
             const bool before_valid = ggml_hexagon_k14_dump_tensor(
                 "BEFORE", "output", seq, matmul, &before_fnv64);
-            k14_entries.push_back({ matmul, seq, is_k13, before_fnv64,
+            k14_entries.push_back({ matmul, seq, is_k13, is_qkv, before_fnv64,
                                     before_valid, sentinel_applied, original_fnv64,
                                     sentinel_fnv64, sentinel_value });
         }
@@ -4307,7 +4335,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
         for (const auto & node : *nodes_ptr) {
-            if (opt_k14_diag || opt_k13_diag) {
+            if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
                 const auto it = std::find_if(
                     k14_entries.begin(), k14_entries.end(),
                     [&](const k14_diag_entry & e) { return e.output == node.node; });
@@ -4336,8 +4364,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                       " before_valid=%d after_valid=%d"
                       " before_fnv64=%016" PRIx64 " after_fnv64=%016" PRIx64
                       " changed=%d view=HOST_SHARED\n",
-                      entry.is_k13 ? "[HEX_K13_OUTPUT_DELTA]" :
-                                     "[HEX_K14_OUTPUT_DELTA]",
+                      entry.is_qkv ? "[HEX_QKV_OUTPUT_DELTA]" :
+                      (entry.is_k13 ? "[HEX_K13_OUTPUT_DELTA]" :
+                                      "[HEX_K14_OUTPUT_DELTA]"),
                       entry.seq, entry.output->ne[1],
                       entry.output->data, (void *) entry.output->buffer,
                       entry.before_valid ? 1 : 0, after_valid ? 1 : 0,
@@ -5011,6 +5040,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_k14_force_input_flush = getenv("GGML_HEXAGON_K14_FORCE_INPUT_FLUSH");
     const char * str_k13_diag = getenv("GGML_HEXAGON_K13_DIAG");
     const char * str_k13_force_input_flush = getenv("GGML_HEXAGON_K13_FORCE_INPUT_FLUSH");
+    const char * str_qkv_probe_weights = getenv("GGML_HEXAGON_QKV_PROBE_WEIGHTS");
+    const char * str_qkv_force_weights = getenv("GGML_HEXAGON_QKV_FORCE_INPUT_FLUSH_WEIGHTS");
     const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
     const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
     const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
@@ -5076,6 +5107,46 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                       " weight=blk.13.attn_k.weight force_input_flush=%d"
                       " note=reuses_K14_DSP_diag_flags_without_ABI_change\n",
                       opt_k13_force_input_flush ? 1 : 0);
+    }
+    // A force target also receives the same diagnostic probes as a probe-only
+    // target. The only intended A/B difference is the additional DSP flush.
+    opt_qkv_probe_weights.clear();
+    opt_qkv_force_input_flush_weights.clear();
+    static const std::regex qkv_weight_name_re(
+            R"(blk\.[0-9]+\.attn_[qkv]\.weight)");
+    auto parse_qkv_names = [&](const char * raw, const char * var_name,
+                               std::unordered_set<std::string> & out) {
+        if (raw == nullptr || raw[0] == '\0') {
+            return;
+        }
+        std::stringstream stream(raw);
+        std::string name;
+        while (std::getline(stream, name, ',')) {
+            const size_t first = name.find_first_not_of(" \t");
+            if (first == std::string::npos) {
+                continue;
+            }
+            const size_t last = name.find_last_not_of(" \t");
+            name = name.substr(first, last - first + 1);
+            if (!std::regex_match(name, qkv_weight_name_re)) {
+                GGML_LOG_WARN("[HEX_QKV_PROBE_CONFIG] status=SKIP"
+                              " env=%s invalid_weight=%s\n", var_name, name.c_str());
+                continue;
+            }
+            out.insert(name);
+        }
+    };
+    parse_qkv_names(str_qkv_probe_weights, "GGML_HEXAGON_QKV_PROBE_WEIGHTS",
+                    opt_qkv_probe_weights);
+    parse_qkv_names(str_qkv_force_weights, "GGML_HEXAGON_QKV_FORCE_INPUT_FLUSH_WEIGHTS",
+                    opt_qkv_force_input_flush_weights);
+    for (const auto & name : opt_qkv_force_input_flush_weights) {
+        opt_qkv_probe_weights.insert(name);
+    }
+    for (const auto & name : opt_qkv_probe_weights) {
+        GGML_LOG_WARN("[HEX_QKV_PROBE_CONFIG] weight=%s probe=1 force_flush=%d"
+                      " note=reuses_existing_K14_DSP_flags\n", name.c_str(),
+                      opt_qkv_force_input_flush_weights.count(name) != 0 ? 1 : 0);
     }
     opt_k14_sentinel = opt_k14_diag && str_k14_sentinel != nullptr &&
                        strcmp(str_k14_sentinel, "1") == 0;
