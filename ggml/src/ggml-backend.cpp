@@ -996,6 +996,22 @@ static bool ggml_moe_split_diag_tensor(const struct ggml_tensor * t) {
            strstr(t->name, "ffn_moe_weights_sum") != NULL;
 }
 
+static bool ggml_moe_clamp_profile_enabled() {
+    const char * env = getenv("GGML_MOE_CLAMP_PROFILE");
+    return env != NULL && atoi(env) != 0;
+}
+
+static bool ggml_moe_clamp_profile_split(const struct ggml_backend_sched_split * split) {
+    if (split == NULL || split->graph.n_nodes != 1) {
+        return false;
+    }
+
+    const ggml_tensor * node = split->graph.nodes[0];
+    return node != NULL &&
+           node->op == GGML_OP_CLAMP &&
+           strstr(node->name, "ffn_moe_weights_sum_clamped-") != NULL;
+}
+
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
     for (int i = 0; i < sched->n_backends; i++) {
@@ -2549,15 +2565,75 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
 
     const bool split_timing =
         getenv("GGML_SCHED_SPLIT_TIMING") != NULL;
+    const bool clamp_profile = ggml_moe_clamp_profile_enabled();
+
+    bool have_pending_clamp = false;
+    int pending_clamp_split = -1;
+    const ggml_tensor * pending_clamp_node = NULL;
+    int64_t pending_clamp_prepare_us = 0;
+    int64_t pending_clamp_compute_us = 0;
 
     for (int split_id = first_split; split_id < last_split; ++split_id) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
-        const int64_t split_begin_us = split_timing ? ggml_time_us() : 0;
+        const bool is_moe_clamp =
+            clamp_profile && ggml_moe_clamp_profile_split(split);
+        const bool after_moe_clamp =
+            clamp_profile && have_pending_clamp;
+        const bool measure_split =
+            split_timing || is_moe_clamp || after_moe_clamp;
 
-        const int64_t prepare_begin_us = split_timing ? ggml_time_us() : 0;
+        const int64_t split_begin_us = measure_split ? ggml_time_us() : 0;
+
+        const int64_t prepare_begin_us = measure_split ? ggml_time_us() : 0;
         enum ggml_status status = ggml_backend_sched_prepare_split(sched, split_id);
         const int64_t prepare_us =
-            split_timing ? ggml_time_us() - prepare_begin_us : 0;
+            measure_split ? ggml_time_us() - prepare_begin_us : 0;
+
+        if (after_moe_clamp) {
+            const ggml_tensor * return_input =
+                split->n_inputs > 0 ? split->inputs[0] : NULL;
+            const int64_t handoff_total_us =
+                pending_clamp_prepare_us +
+                pending_clamp_compute_us +
+                prepare_us;
+
+            GGML_LOG_INFO(
+                "[MOE_CLAMP_PROFILE] "
+                "clamp_split=%d return_split=%d "
+                "clamp_backend=CPU return_backend=%s "
+                "node=%s "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "bytes=%zu "
+                "rpc_to_cpu_prepare_us=%" PRId64 " "
+                "clamp_compute_us=%" PRId64 " "
+                "cpu_to_rpc_prepare_us=%" PRId64 " "
+                "handoff_total_us=%" PRId64 " "
+                "return_input=%s return_bytes=%zu "
+                "prepare_status=%d\n",
+                pending_clamp_split,
+                split_id,
+                ggml_backend_name(sched->backends[split->backend_id]),
+                pending_clamp_node ? pending_clamp_node->name : "(null)",
+                pending_clamp_node ? pending_clamp_node->ne[0] : 0,
+                pending_clamp_node ? pending_clamp_node->ne[1] : 0,
+                pending_clamp_node ? pending_clamp_node->ne[2] : 0,
+                pending_clamp_node ? pending_clamp_node->ne[3] : 0,
+                pending_clamp_node ? ggml_nbytes(pending_clamp_node) : 0,
+                pending_clamp_prepare_us,
+                pending_clamp_compute_us,
+                prepare_us,
+                handoff_total_us,
+                return_input ? return_input->name : "(none)",
+                return_input ? ggml_nbytes(return_input) : 0,
+                (int) status);
+
+            have_pending_clamp = false;
+            pending_clamp_split = -1;
+            pending_clamp_node = NULL;
+            pending_clamp_prepare_us = 0;
+            pending_clamp_compute_us = 0;
+        }
+
         if (status != GGML_STATUS_SUCCESS) {
             if (split_timing) {
                 GGML_LOG_DEBUG(
@@ -2577,10 +2653,45 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
             return status;
         }
 
-        const int64_t compute_begin_us = split_timing ? ggml_time_us() : 0;
+        const int64_t compute_begin_us = measure_split ? ggml_time_us() : 0;
         status = ggml_backend_sched_compute_split(sched, split_id);
         const int64_t compute_us =
-            split_timing ? ggml_time_us() - compute_begin_us : 0;
+            measure_split ? ggml_time_us() - compute_begin_us : 0;
+
+        if (is_moe_clamp) {
+            const ggml_tensor * node =
+                split->graph.n_nodes == 1 ? split->graph.nodes[0] : NULL;
+
+            GGML_LOG_INFO(
+                "[MOE_CLAMP_PROFILE] "
+                "phase=CPU_CLAMP split=%d/%d backend=%s "
+                "node=%s "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "bytes=%zu prepare_us=%" PRId64 " "
+                "compute_us=%" PRId64 " total_us=%" PRId64 " status=%d\n",
+                split_id,
+                sched->n_splits,
+                ggml_backend_name(sched->backends[split->backend_id]),
+                node ? node->name : "(null)",
+                node ? node->ne[0] : 0,
+                node ? node->ne[1] : 0,
+                node ? node->ne[2] : 0,
+                node ? node->ne[3] : 0,
+                node ? ggml_nbytes(node) : 0,
+                prepare_us,
+                compute_us,
+                ggml_time_us() - split_begin_us,
+                (int) status);
+
+            if (status == GGML_STATUS_SUCCESS) {
+                have_pending_clamp = true;
+                pending_clamp_split = split_id;
+                pending_clamp_node = node;
+                pending_clamp_prepare_us = prepare_us;
+                pending_clamp_compute_us = compute_us;
+            }
+        }
+
         if (split_timing) {
             GGML_LOG_DEBUG(
                 "[SCHED_SPLIT_TIMING] split=%d/%d backend_id=%d backend=%s "
