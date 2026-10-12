@@ -121,8 +121,8 @@ if ($Cases.Count -eq 0) {
         $Cases = @($layerRange | ForEach-Object { "$($_)-output" })
         $Cases += "all-output"
     } else {
-        $Cases = @("$StartLayer-gate", "$StartLayer-up", "$StartLayer-down",
-                   "$StartLayer-ffn", "all-ffn")
+        $Cases = @("${StartLayer}-gate", "${StartLayer}-up", "${StartLayer}-down",
+                   "${StartLayer}-ffn", "all-ffn")
     }
 }
 if ($All) {
@@ -185,12 +185,12 @@ function Run-Capture([string] $caseName) {
         # Stage 'ffn' intentionally leaves ALL attn_output weights on HTP,
         # so FFN differences are isolated against that exact baseline.
         if ($Stage -eq "attn" -and
-            -not $enabled.ContainsKey("$layer-output")) {
+            -not $enabled.ContainsKey("${layer}-output")) {
             $rules += ('blk\.{0}\.attn_output\.weight=CPU' -f $layer)
         }
         foreach ($role in @("gate", "up", "down")) {
             if ($Stage -eq "attn" -or
-                -not $enabled.ContainsKey("$layer-$role")) {
+                -not $enabled.ContainsKey("${layer}-${role}")) {
                 $rules += ('blk\.{0}\.ffn_{1}\.weight=CPU' -f $layer, $role)
             }
         }
