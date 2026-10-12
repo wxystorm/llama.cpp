@@ -223,7 +223,11 @@ struct rpc_tensor {
     uint64_t data;
     char name[GGML_MAX_NAME];
 
-    char padding[4]; //填充字段
+    // Preserve the original wire size by reusing the former 4-byte padding.
+    // The client-side scheduler assigns COMPUTE/WEIGHTS usage after allocating
+    // an RPC buffer, but the remote backend otherwise only sees the default
+    // ANY usage. Hexagon uses this value for cache coherency decisions.
+    uint32_t buffer_usage;
 };
 
 static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 8");
@@ -1268,11 +1272,13 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
+    result.buffer_usage = GGML_BACKEND_BUFFER_USAGE_ANY;
     if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
         ggml_backend_buffer_t buffer = tensor->buffer;
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
         result.data = reinterpret_cast<uint64_t>(tensor->data);
+        result.buffer_usage = (uint32_t) ggml_backend_buffer_get_usage(buffer);
     } else {
         result.buffer = 0;
         result.data   = 0;
@@ -1294,7 +1300,6 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     // Avoid sending uninitialized data over the wire
     memset(result.name, 0, sizeof(result.name));
-    memset(result.padding, 0, sizeof(result.padding));
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
@@ -4832,6 +4837,21 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     if (result->buffer) {
+        // rpc_tensor previously ended with four zero padding bytes, so an old
+        // client naturally decodes as ANY here. New clients propagate the
+        // scheduler's real buffer usage without changing the wire size.
+        if (tensor->buffer_usage <= (uint32_t) GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            ggml_backend_buffer_set_usage(
+                result->buffer,
+                (enum ggml_backend_buffer_usage) tensor->buffer_usage);
+        } else {
+            GGML_LOG_WARN(
+                "[RPC_BUFFER_USAGE] invalid usage=%u for tensor=%s; keeping usage=%d\n",
+                tensor->buffer_usage,
+                tensor->name,
+                (int) ggml_backend_buffer_get_usage(result->buffer));
+        }
+
         // require that the tensor data does not go beyond the buffer end
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
