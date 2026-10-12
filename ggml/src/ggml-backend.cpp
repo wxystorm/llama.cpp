@@ -2044,6 +2044,25 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
         const bool moe_diag =
             ggml_moe_split_diag_enabled() &&
             ggml_moe_split_diag_tensor(input);
+
+        const bool clamp_profile = ggml_moe_clamp_profile_enabled();
+        const bool profile_rpc_to_cpu =
+            clamp_profile &&
+            ggml_moe_clamp_profile_split(split) &&
+            ggml_moe_split_diag_tensor(input);
+        const bool profile_cpu_to_rpc =
+            clamp_profile &&
+            split_id > 0 &&
+            ggml_moe_clamp_profile_split(&sched->splits[split_id - 1]) &&
+            ggml_moe_split_diag_tensor(input);
+        const bool profile_xfer = profile_rpc_to_cpu || profile_cpu_to_rpc;
+        const int64_t xfer_begin_us = profile_xfer ? ggml_time_us() : 0;
+        int64_t wait_dst_us  = 0;
+        int64_t async_try_us = 0;
+        int64_t src_sync_us  = 0;
+        int64_t dst_sync_us  = 0;
+        int64_t copy_us      = 0;
+        bool copied_async    = false;
         if (moe_diag) {
             GGML_LOG_INFO(
                 "[MOE_SPLIT_DIAG] stage=COPY_BEGIN split=%d input_id=%d "
@@ -2079,10 +2098,14 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             ggml_backend_tensor_copy(input, input_cpy);
         } else {
             // wait for the split backend to finish using the input before overwriting it
+            const int64_t wait_dst_begin_us = profile_xfer ? ggml_time_us() : 0;
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(split_backend);
+            }
+            if (profile_xfer) {
+                wait_dst_us = ggml_time_us() - wait_dst_begin_us;
             }
 
             // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2172,17 +2195,57 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             } else {
                 // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                if (!split_backend->iface.cpy_tensor_async ||
-                    !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                if (split_backend->iface.cpy_tensor_async) {
+                    const int64_t async_begin_us = profile_xfer ? ggml_time_us() : 0;
+                    copied_async =
+                        split_backend->iface.cpy_tensor_async(
+                            input_backend, split_backend, input, input_cpy);
+                    if (profile_xfer) {
+                        async_try_us = ggml_time_us() - async_begin_us;
+                    }
+                }
+
+                if (!copied_async) {
+                    const int64_t src_sync_begin_us = profile_xfer ? ggml_time_us() : 0;
                     ggml_backend_synchronize(input_backend);
+                    if (profile_xfer) {
+                        src_sync_us = ggml_time_us() - src_sync_begin_us;
+                    }
+
+                    const int64_t dst_sync_begin_us = profile_xfer ? ggml_time_us() : 0;
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     } else {
                         ggml_backend_synchronize(split_backend);
                     }
+                    if (profile_xfer) {
+                        dst_sync_us = ggml_time_us() - dst_sync_begin_us;
+                    }
+
+                    const int64_t copy_begin_us = profile_xfer ? ggml_time_us() : 0;
                     ggml_backend_tensor_copy(input, input_cpy);
+                    if (profile_xfer) {
+                        copy_us = ggml_time_us() - copy_begin_us;
+                    }
                 }
             }
+        }
+
+        if (profile_xfer) {
+            GGML_LOG_INFO(
+                "[MOE_CLAMP_XFER] dir=%s split=%d bytes=%zu "
+                "wait_dst=%" PRId64 " async_try=%" PRId64 " async=%d "
+                "src_sync=%" PRId64 " dst_sync=%" PRId64 " copy=%" PRId64 " total=%" PRId64 "\n",
+                profile_rpc_to_cpu ? "R2C" : "C2R",
+                split_id,
+                ggml_nbytes(input),
+                wait_dst_us,
+                async_try_us,
+                copied_async ? 1 : 0,
+                src_sync_us,
+                dst_sync_us,
+                copy_us,
+                ggml_time_us() - xfer_begin_us);
         }
 
         if (moe_diag) {
@@ -2682,6 +2745,14 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
                 compute_us,
                 ggml_time_us() - split_begin_us,
                 (int) status);
+
+            GGML_LOG_INFO(
+                "[MOE_CLAMP_CORE] split=%d bytes=%zu prep=%" PRId64 " compute=%" PRId64 " total=%" PRId64 "\n",
+                split_id,
+                node ? ggml_nbytes(node) : 0,
+                prepare_us,
+                compute_us,
+                ggml_time_us() - split_begin_us);
 
             if (status == GGML_STATUS_SUCCESS) {
                 have_pending_clamp = true;
