@@ -202,6 +202,54 @@ foreach ($case in @('13-output','14-output','all-output')) {
 
 Need to inspect which graph evaluation (2-token vs 42-token) first becomes severe, each `attn_out-N` target's RMSE/NRMSE/cosine, and `l_out-N` for residual propagation. Also validate fresh `[HEX_LINEAR_AUDIT]` records (correct weights, `batch_status=OK`, `compute_enabled=1`) from the **expanded test run**, not a prior K13-force log. Do not proceed to FFN until these errors are understood.
 
+
+## Attention Output 13/14: small target error, catastrophic next-layer QKV
+
+Fresh metrics from `hexagon-attn-expanded/attn` (un-pinned QKV on HTP, 2-token graph evaluation 0):
+
+| Case | Target | target NRMSE | target cosine | first strongly divergent later projections |
+| --- | --- | ---: | ---: | --- |
+| 13-output | attn_out-13 | 0.010992 | 0.999940 | Qcur-14 NRMSE 1.074514 cosine -0.221969; Vcur-14 NRMSE 1.544102 cosine 0.000756 |
+| 14-output | attn_out-14 | 0.007811 | 0.999971 | Qcur-15 NRMSE 1.021794 cosine 0.015517; Kcur-15 NRMSE 1.015586 cosine 0.016509; Vcur-15 NRMSE 1.316972 cosine -0.045330 |
+| all-output | attn_out-13 | 0.010992 | 0.999940 | Qcur-14 same as 13-output; attn_out-14 NRMSE 1.316241 cosine -0.044907; attn_out-15 NRMSE 1.318228 cosine 0.043320 |
+
+`13-output` downstream `attn_out-14` NRMSE 1.316644 cosine -0.045389 even though the layer14 attention output remained CPU; consequently, `all-output` Layer14 target critical is already explained *in large part* by prior layer13 input divergence, not necessarily a new independent attn-output kernel failure.
+
+All three cases have upstream_diff=0, reentry_diff=0; baseline-control 120/120 strict identical. The earliest **CRITICAL** row being Qcur-14 or Qcur-15 does not mean it is the earliest **different** row. The printed filter omitted non-critical intermediary tensors. Need to first localize divergence between `attn_out-L` and next-layer QKV with saved CSV.
+
+This is tested with `-sm layer`, so the custom tensor-split chunked FFN / cross-layer prepared QKV graph in `src/models/llama.cpp` is not enabled (its guard requires `LLAMA_SPLIT_MODE_TENSOR`). Inspect the ordinary FFN residual/RMS norm/backend hand-off first.
+
+### Read-only first-evaluation chain extraction
+
+```powershell
+$root = ".\hexagon-attn-expanded\attn"
+foreach ($case in @("13-output", "14-output")) {
+    $layer = if ($case -eq "13-output") { 13 } else { 14 }
+    $next = $layer + 1
+    $names = @(
+        "attn_out-$layer", "ffn_inp-$layer", "ffn_norm-$layer",
+        "ffn_gate-$layer", "ffn_up-$layer", "ffn_swiglu-$layer",
+        "ffn_down-$layer", "ffn_out-$layer", "l_out-$layer",
+        "attn_norm-$next", "Qcur-$next", "Kcur-$next", "Vcur-$next"
+    )
+    Write-Host "==== $case : Layer $layer -> $next, evaluation 0 ===="
+    Import-Csv "$root\$case\compare\tensor_metrics.csv" |
+        Where-Object { $_.evaluation -eq "0" -and $names -contains $_.name } |
+        Sort-Object { [int] $_.cpu_capture } |
+        Select-Object cpu_capture,name,shape,status,bad,rmse,normalized_rmse,cosine |
+        Format-Table -AutoSize
+}
+```
+
+Interpretation:
+- If `ffn_inp-L` is near target, but `ffn_gate/up/swiglu` or `l_out-L` first jumps: investigate FFN and residual after changed attention output.
+- If `l_out-L` and `attn_norm-(L+1)` remain close but next `Qcur/Kcur/Vcur` jumps to NRMSE `1 with cosine near 0, investigate HTP next-layer QKV src1 buffer visibility, RPC scheduler hand-off and backend storage. **Do not attribute this to numerical amplification.**
+- If `l_out-L` already differs severely, then next-layer projections may be correct for a badly different input: localize earliest pre-QKV discontinuity.
+- For separate causal test, pin next layer's Q/K/V to CPU on both baseline and candidate, compare results; but note CPU pin changes graph layout, so do this only after reading existing CSV.
+
+Current evidence does not establish which case holds. Verify corresponding run's `[HEX_LINEAR_AUDIT]` to establish the intended actual HTP MatMul.
+
+
 ## Probe logs and caveats
 
 ```bash
