@@ -61,7 +61,7 @@ $cliArgs = @(
     "-c", "512", "-n", "$Tokens", "-t", "8",
     "--ignore-eos", "--no-warmup", "--single-turn",
     "--no-conversation", "--temp", "0", "--seed", "1234",
-    "-lv", "2", "-p", $Prompt
+    "-lv", "3", "-p", $Prompt
 )
 $records = @()
 
