@@ -150,6 +150,29 @@ py -3 .\scripts\hash_hexagon_k13_snapshots.py `
 Also check `[HEX_LINEAR_AUDIT]` for `blk.15.attn_output.weight` to ensure the newly enabled projection actually ran on the HTP.
 
 
+## No K13 diagnostics or force flush: another passing retest
+
+User additionally ran `hexagon-k13-flat-noprobe` with both `GGML_HEXAGON_K13_DIAG` and `GGML_HEXAGON_K13_FORCE_INPUT_FLUSH` unset, with the same Q13/V13 pinned CPU and K13 on HTP:
+
+- Candidate `15-output`: `NUMERICALLY_CLOSE`, 120 matched snapshots, first-evaluation upstream difference 0, reentry difference 0.
+- `baseline-control`: `NUMERICALLY_CLOSE`, all 120 tensors bit-identical, diff=0 and critical=0.
+- PC K13 output `(512,42,1,1)` F32 full FNV64 for baseline/candidate/baseline-repeat: `e2e5cf4e374b1def` in all three. Token column 2 zeros=0/512, RMS=2.0578412.
+
+**Corrected causal conclusion:** In this new build/placement/run setup, neither K13 extra DSP input flush nor K13 diagnostic readback is necessary for the candidate to pass. Neither `HVX_QUANT_ROW_FLAT` nor the absence of a flush is established as intrinsically erroneous. The earlier FLAT single-column zero remains *unexplained and currently non-reproducible*. Host library rebuild, execution scheduling, allocator layout, process restarts, other environment variables or other unrecorded differences may be relevant. Different historical complete output hashes (`4ea315c0e250df06` versus `e2e5cf4e374b1def`) cannot be analyzed as same-input kernel output inconsistencies without validating both runs' exact input/weight digests and selected kernels. For no-probe runs there is no K13 PLAN diagnostic, so do not infer the kernel solely from the output folder name.
+
+### Move to the more representative unpinned QKV test
+
+Keep the same phone build and runtime settings, with `GGML_HEXAGON_K13_DIAG`, `GGML_HEXAGON_K13_FORCE_INPUT_FLUSH`, `GGML_HEXAGON_MM_SELECT` unset. Run the same test with **no CPU pins** so Q13/K13/V13 all remain on HTP:
+
+```powershell
+.\scripts\verify_hexagon_linear_layers.ps1 `
+    -Stage attn -Ngl 4 -Tokens 1 `
+    -Cases @("15-output") -FocusLayer 15 -BaselineControl `
+    -OutDir ".\hexagon-attn-original-qkv-retest"
+```
+
+Inspect `overview.csv`, `15-output/compare/summary.json`, and `placement.txt` to ensure there are **no** `blk.13.attn_q/k/v.weight=CPU` overrides. Verify the phone `[HEX_LINEAR_AUDIT]` indicates `blk.15.attn_output.weight` actually executed on HTP with `batch_status=OK`; a numerical pass without offload is not an offload correctness pass. If unpinned all-HTP QKV candidate is now clean, test `-Cases @("13-output", "14-output", "15-output", "all-output")` without `-FocusLayer` and preserve separate logs. Do not attribute root-cause resolution to the diagnostic patch without repeatable failing baseline/reproduction.
+
 ## Probe logs and caveats
 
 ```bash
