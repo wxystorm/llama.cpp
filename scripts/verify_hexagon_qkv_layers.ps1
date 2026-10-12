@@ -20,7 +20,7 @@
 param(
     [ValidateRange(1, 512)] [int] $Tokens = 1,
     [ValidateRange(1, 128)] [int] $ModelLayers = 16,
-    [ValidateRange(1, 128)] [int] $Ngl = 3,
+    [ValidateRange(1, 128)] [int] $Ngl = 4,
     [ValidateRange(0, 127)] [int] $StartLayer = 13,
     [ValidateRange(0, 127)] [int] $EndLayer = 15,
     [string[]] $Cases = @("13-k", "14-k", "15-k", "14-qkv", "all-qkv"),
@@ -38,8 +38,12 @@ $ErrorActionPreference = "Stop"
 if ($StartLayer -gt $EndLayer) { throw "StartLayer must be <= EndLayer" }
 if ($EndLayer -ge $ModelLayers) { throw "EndLayer must be below ModelLayers" }
 if ($Ngl -gt $ModelLayers) { throw "Ngl must be <= ModelLayers" }
-if ($StartLayer -lt ($ModelLayers - $Ngl)) {
-    throw "Layer $StartLayer may be CPU: -ngl $Ngl offloads only the last $Ngl of $ModelLayers layers. Raise -Ngl or -StartLayer."
+# In this llama-model.cpp, -ngl includes the output layer in the budget.
+# First block on RPC = ModelLayers + 1 - Ngl (not ModelLayers - Ngl).
+$firstRemoteLayer = [Math]::Max(0, $ModelLayers + 1 - $Ngl)
+if ($StartLayer -lt $firstRemoteLayer) {
+    $requiredNgl = $ModelLayers + 1 - $StartLayer
+    throw "Layer $StartLayer is CPU at -ngl $Ngl. The first remote layer is $firstRemoteLayer; use at least -ngl $requiredNgl (includes output layer)."
 }
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Cannot find CLI: $Exe" }
 if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) { throw "Cannot find model: $Model" }
@@ -54,6 +58,7 @@ $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 
 $layerRange = @($StartLayer..$EndLayer)
 $layerRegex = $layerRange -join "|"
+Write-Host "[QKV_OFFLOAD_RANGE] ngl=$Ngl model_layers=$ModelLayers first_remote_layer=$firstRemoteLayer test_range=$StartLayer..$EndLayer"
 
 if ($All) {
     $Cases = @()
