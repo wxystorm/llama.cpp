@@ -103,6 +103,53 @@ Interpretation:
 
 Finally, changing `MM_SELECT` may alter prefetch, VTCM and timing. Do not claim it fixed the bug from phone-only batch ACKs; require matching PC capture and per-column evidence.
 
+## FLAT retest result: zero column disappears when K13 probing/flush remains enabled
+
+User repeated the original controlled placement (Q13/V13 on CPU, K13 on HTP, only candidate 15-output on HTP) in `hexagon-k13-flat-retest` after the ROW kernel comparison. This test's Android PLAN log has **not yet been supplied**, so the actual kernel for this particular retest should still be checked: `[HEX_K13_PLAN] ... kernel=HVX_QUANT_ROW_FLAT kernel_id=11`.
+
+Results:
+
+- `15-output` status `NUMERICALLY_CLOSE`, `compared=120`, `upstream_diff=0`, `reentry_diff=0`, no missing stages.
+- `baseline-control` also `NUMERICALLY_CLOSE` with `diff=0`, `critical=0` across 120 snapshots, meaning the two identical baseline captures are strictly equal.
+- PC 42-token `Kcur-13` exact F32 output hashes match across all cases: `e2e5cf4e374b1def` for baseline, candidate and baseline-repeat.
+- Token column 2 zeros = 0/512, RMS=2.0578412 for all three cases.
+
+This shows no single-column regression *in this new configuration*, even if the kernel has indeed reverted to FLAT. It disproves the claim that FLAT must fail for `m=42`. It does **not** yet identify the mechanism, because both K13 diagnostic host readback and the K13 forced-input flush can affect execution and cache state; absence of a flaw is not proof that the forced flush alone fixed it. The earlier FLAT DSP hash `4ea315c0e250df06` and the newest PC `e2e5cf4e374b1def` belong to different runs and must not be interpreted as equal-input controlled comparisons without checking exact plan/input hashes.
+
+### Next experiment: exact same FLAT kernel, diagnostics ON, force-input flush OFF
+
+Phone (preserve other variables and restart the RPC server):
+
+```bash
+unset GGML_HEXAGON_MM_SELECT
+export GGML_HEXAGON_K13_DIAG=1
+unset GGML_HEXAGON_K13_FORCE_INPUT_FLUSH
+
+./bin/ggml-rpc-server --device HTP0 --host 0.0.0.0 --port 50052 2>&1 | tee rpc-k13-flat-diag-only.log
+```
+
+PC (new output directory):
+
+```powershell
+.\scripts\verify_hexagon_linear_layers.ps1 `
+  -Stage attn -Ngl 4 -Tokens 1 `
+  -Cases @("15-output") -FocusLayer 15 -BaselineControl `
+  -PinQCpuLayer 13 -PinVCpuLayer 13 `
+  -OutDir ".\hexagon-k13-flat-diag-only"
+py -3 .\scripts\hash_hexagon_k13_snapshots.py `
+  .\hexagon-k13-flat-diag-only\attn `
+  --tokens 42 --column 2
+```
+
+**Verify** `[HEX_K13_PLAN] kernel_id=11` and `[HEX_K13_INPUT_PROBE] force_flush=0`, `[HEX_K13_DSP_PROBE] force_input_flush_requested=0`; the diagnostic's own pre/post tensor reads still occur.
+
+- Probe-only FAIL, forced-flush PASS on same FLAT shape/config: strengthens cache visibility hypothesis, though the flush may also change timing.
+- Probe-only PASS: probe logging/readbacks alone may perturb the bug; then repeat no-probe/no-flush original configuration to establish that failure still reproduces (fresh output directory), before attributing causation.
+- Neither PASS consistently: consider repeating each configuration at least three times under identical binary/flags.
+
+Also check `[HEX_LINEAR_AUDIT]` for `blk.15.attn_output.weight` to ensure the newly enabled projection actually ran on the HTP.
+
+
 ## Probe logs and caveats
 
 ```bash
