@@ -6653,7 +6653,36 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
+    const bool local_copy_profile =
+        std::getenv("GGML_RPC_LOCAL_COPY_PROFILE") != nullptr;
+
+    const int64_t copy_begin_us =
+        local_copy_profile ? ggml_time_us() : 0;
+
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
+
+    if (local_copy_profile) {
+        ggml_backend_dev_t src_dev =
+            src->buffer != nullptr && src->buffer->buft != nullptr
+                ? src->buffer->buft->device
+                : nullptr;
+        ggml_backend_dev_t dst_dev =
+            dst->buffer != nullptr && dst->buffer->buft != nullptr
+                ? dst->buffer->buft->device
+                : nullptr;
+
+        GGML_LOG_INFO(
+            "[RPC_LOCAL_COPY] src=%s dst=%s "
+            "src_tensor=%s dst_tensor=%s "
+            "bytes=%" PRIu64 " us=%" PRId64 " result=%d\n",
+            src_dev ? ggml_backend_dev_name(src_dev) : "(unknown)",
+            dst_dev ? ggml_backend_dev_name(dst_dev) : "(unknown)",
+            src->name,
+            dst->name,
+            src_size,
+            ggml_time_us() - copy_begin_us,
+            response.result ? 1 : 0);
+    }
 
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
