@@ -118,7 +118,7 @@ for ($i = 1; $i -le ($WarmupRuns + $Runs); $i++) {
     }
     if ($null -eq $pTps -or $null -eq $dTps) {
         Write-Warning "Could not parse prompt/decode perf stats in $logPath"
-        $timingLines = @($raw -split "`r?`n" | Where-Object { $_ -match 'eval time|total time|load time' } | Select-Object -Last 5)
+        $timingLines = @($raw -split '\r?\n' | Where-Object { $_ -match 'eval time|total time|load time' } | Select-Object -Last 5)
         if ($timingLines.Count -gt 0) {
             Write-Warning ("Observed timing lines: " + ($timingLines -join " | "))
         } else {
