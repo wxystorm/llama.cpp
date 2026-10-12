@@ -78,11 +78,156 @@ function Get-EnabledWeights([string] $caseName) {
         }
         return $enabled
     }
-    if ($caseName -notmatch '^(\d+)-(q|k|v|qkv)$') {
+    if ($caseName -match '^(\d+)-(qkv|q|k|v)
+    if ($layer -lt $StartLayer -or $layer -gt $EndLayer) {
+        throw "Case '$caseName' is outside [$StartLayer,$EndLayer]."
+    }
+    foreach ($role in @("q", "k", "v")) {
+        if ($selection -eq "qkv" -or $selection -eq $role) {
+            $enabled["$layer-$role"] = $true
+        }
+    }
+    return $enabled
+}
+
+# Validate case list before launching a potentially expensive model.
+foreach ($caseName in $Cases) {
+    $null = Get-EnabledWeights $caseName
+}
+
+$env:GGML_RPC_MATMUL_ONLY = "1"
+$env:GGML_RPC_DISABLE_F16_MATMUL = "1"
+Remove-Item Env:GGML_SCHED_KV14_READBACK -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_TENSOR_COMPARE_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_TENSOR_COMPARE_REGEX -ErrorAction SilentlyContinue
+
+$stagePattern = 'Qcur|Kcur|Vcur|kq|kq_soft_max|kqv|kqv_out|attn_out|l_out'
+if ($IncludeFFN) {
+    $stagePattern += '|ffn_inp|ffn_norm|ffn_up|ffn_gate|ffn_swiglu|ffn_down|ffn_out'
+}
+$env:LLAMA_TENSOR_COMPARE_REGEX = '^(' + $stagePattern + ')-(' + $layerRegex + ')$'
+
+$settings = @(
+    "model=$Model", "exe=$Exe", "rpc=$Rpc", "model_layers=$ModelLayers",
+    "ngl=$Ngl", "range=$StartLayer..$EndLayer", "tokens=$Tokens",
+    "prompt=$Prompt", "regex=$env:LLAMA_TENSOR_COMPARE_REGEX",
+    "GGML_RPC_MATMUL_ONLY=$env:GGML_RPC_MATMUL_ONLY",
+    "GGML_RPC_DISABLE_F16_MATMUL=$env:GGML_RPC_DISABLE_F16_MATMUL",
+    "CAUTION=Phone configuration must be checked independently; this script cannot change phone env."
+)
+Set-Content -LiteralPath (Join-Path $OutDir "settings.txt") -Value $settings -Encoding UTF8
+
+function Run-Capture([string] $caseName) {
+    $enabled = Get-EnabledWeights $caseName
+    $folder = Join-Path $OutDir $caseName
+    if (Test-Path -LiteralPath $folder) {
+        if (-not $Overwrite) {
+            throw "Output $folder exists. Use -Overwrite to replace existing snapshots."
+        }
+        Remove-Item -LiteralPath $folder -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    $env:LLAMA_TENSOR_COMPARE_DIR = $folder
+
+    $rules = @(
+        ('blk\.({0})\.(attn_output|ffn_(gate|up|down))\.weight=CPU' -f $layerRegex)
+    )
+    foreach ($layer in $layerRange) {
+        foreach ($role in @("q", "k", "v")) {
+            if (-not $enabled.ContainsKey("$layer-$role")) {
+                $rules += ('blk\.{0}\.attn_{1}\.weight=CPU' -f $layer, $role)
+            }
+        }
+    }
+    $env:LLAMA_ARG_OVERRIDE_TENSOR = $rules -join ","
+
+    $expected = @($enabled.Keys | Sort-Object | ForEach-Object {
+        $pieces = $_ -split "-"
+        "blk.$($pieces[0]).attn_$($pieces[1]).weight"
+    })
+    $notes = @(
+        "case=$caseName",
+        "target_NPU_weights=$($expected -join ',')",
+        "override_tensor=$env:LLAMA_ARG_OVERRIDE_TENSOR",
+        "filter=$env:LLAMA_TENSOR_COMPARE_REGEX",
+        "NOTE=Check [HEX_QKV_AUDIT] phone log to confirm NPU execution."
+    )
+    Set-Content -LiteralPath (Join-Path $folder "placement.txt") -Value $notes -Encoding UTF8
+
+    Write-Host "--- Case: $caseName ---"
+    Write-Host "Expected HTP QKV weights: $($expected -join ', ')"
+    $log = Join-Path $folder "run.log"
+    $cliArgs = @(
+        "-m", $Model, "--rpc", $Rpc, "--device", "RPC0",
+        "-sm", "layer", "-ngl", "$Ngl", "-fa", "off",
+        "--kv-offload", "--cache-type-k", "f16", "--cache-type-v", "f16",
+        "-c", "512", "-n", "$Tokens", "-t", "8",
+        "--no-warmup", "--single-turn", "--no-conversation",
+        "--temp", "0", "--seed", "1234",
+        "--perf", "-lv", "3", "-p", $Prompt
+    )
+    $ErrorActionPreference = "Continue"
+    # Consume the pipeline so Run-Capture returns only the folder path.
+    & $Exe @cliArgs 2>&1 | Tee-Object -FilePath $log | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($exit -ne 0) { throw "$caseName exit code $exit; see $log" }
+
+    $manifest = Join-Path $folder "manifest.tsv"
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw "$caseName did not create manifest.tsv. Check run.log for TENSOR_COMPARE."
+    }
+    $snapshots = @((Import-Csv -LiteralPath $manifest -Delimiter ([char] 9)))
+    if ($snapshots.Count -eq 0) {
+        throw "$caseName created an empty tensor manifest: $manifest"
+    }
+    Write-Host "$caseName captures=$($snapshots.Count)"
+    return $folder
+}
+
+$cpu = Run-Capture "cpu"
+$overview = @()
+$summaryScript = Join-Path $PSScriptRoot "summarize_hexagon_qkv_layers.py"
+if (-not (Test-Path -LiteralPath $summaryScript)) {
+    throw "Missing script $summaryScript (update the branch before running)."
+}
+foreach ($caseName in $Cases) {
+    $candidate = Run-Capture $caseName
+    $output = Join-Path $candidate "compare"
+    Write-Host "--- Comparing $caseName with CPU reference ---"
+    & py -3 $summaryScript $cpu $candidate --case $caseName --output $output
+    $compareExit = $LASTEXITCODE
+    if ($compareExit -ne 0 -and $compareExit -ne 2 -and $compareExit -ne 3) {
+        throw "Python summarizer exited with $compareExit for $caseName"
+    }
+    $report = Get-Content -LiteralPath (Join-Path $output "summary.json") -Raw | ConvertFrom-Json
+    $overview += [pscustomobject]@{
+        case = $caseName
+        status = $report.status
+        compared = $report.compared
+        only_cpu = $report.only_cpu
+        only_npu = $report.only_npu
+        critical = $report.critical
+        diff = $report.diff
+        min_cosine = $report.min_cosine
+        max_rmse = $report.max_rmse
+    }
+}
+
+$path = Join-Path $OutDir "overview.csv"
+$overview | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+Write-Host "===== Multi-layer QKV results ====="
+$overview | Format-Table -AutoSize
+Write-Host "Overview CSV: $path"
+Write-Host "Each case has tensor_metrics.csv, summary.json and placement.txt."
+Write-Host "CRITICAL or CAPTURE_MISMATCH must be investigated, not treated as success."
+Write-Host "NUMERICALLY_CLOSE requires confirming expected HTP weight execution in phone [HEX_QKV_AUDIT] logs."
+) {
+        $layer = [int] $Matches[1]
+        $selection = $Matches[2]
+    } else {
         throw "Invalid case '$caseName'. Use L-q, L-k, L-v, L-qkv or all-qkv."
     }
-    $layer = [int] $Matches[1]
-    $selection = $Matches[2]
     if ($layer -lt $StartLayer -or $layer -gt $EndLayer) {
         throw "Case '$caseName' is outside [$StartLayer,$EndLayer]."
     }
