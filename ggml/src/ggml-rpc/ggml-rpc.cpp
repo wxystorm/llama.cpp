@@ -9096,6 +9096,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_ex") == 0) {
+        return (void *)ggml_backend_rpc_start_server_ex;
+    }
     if (std::strcmp(
             name,
             GGML_BACKEND_RPC_SET_LOCAL_2D_PROC) == 0) {

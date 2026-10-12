@@ -619,8 +619,36 @@ tensor_source.get_info  = llama_rpc_get_local_tensor_info;
 tensor_source.read      = llama_rpc_read_local_tensor;
 
 // 4. 获取新启动函数
-    ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
-                                     local_loader ? &tensor_source : nullptr,
-                                     params.model_path.c_str(), params.tp_rank, params.tp_world_size);
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        fprintf(stderr, "Failed to find RPC backend\n");
+        return 1;
+    }
+
+    using ggml_backend_rpc_start_server_ex_t = void (*)(
+        const char * endpoint,
+        const char * cache_dir,
+        size_t n_threads,
+        size_t n_devices,
+        ggml_backend_dev_t * devices,
+        const ggml_rpc_local_tensor_source * tensor_source,
+        const char * model_path,
+        int tp_rank,
+        int tp_world_size);
+
+    auto start_server_ex =
+        reinterpret_cast<ggml_backend_rpc_start_server_ex_t>(
+            ggml_backend_reg_get_proc_address(
+                rpc_reg,
+                "ggml_backend_rpc_start_server_ex"));
+
+    if (start_server_ex == nullptr) {
+        fprintf(stderr, "RPC backend does not expose ggml_backend_rpc_start_server_ex\n");
+        return 1;
+    }
+
+    start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
+                    local_loader ? &tensor_source : nullptr,
+                    params.model_path.c_str(), params.tp_rank, params.tp_world_size);
     return 0;
 }
