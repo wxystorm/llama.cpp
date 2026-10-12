@@ -20,6 +20,9 @@ param(
     [string[]] $Cases = @(),
     [switch] $All,
     [switch] $Overwrite,
+    [switch] $RecompareOnly,
+    [switch] $BaselineControl,
+    [ValidateRange(-1, 127)] [int] $FocusLayer = -1,
     [string] $Exe = ".\build-hexagon-pc\bin\Release\llama-cli.exe",
     [string] $Model = "D:\model\Llama-3.2-1B-Instruct-Q4_0.gguf",
     [string] $Rpc = "10.39.52.114:50052",
@@ -43,23 +46,35 @@ if ($StartLayer -lt $firstRemoteLayer) {
 if ($StartLayer -gt $firstRemoteLayer) {
     Write-Warning "Layers $firstRemoteLayer..$($StartLayer-1) are on RPC but not controlled by this script."
 }
-if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
-    throw "llama-cli not found: $Exe"
-}
-if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) {
-    throw "Model not found: $Model"
+if (-not $RecompareOnly) {
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        throw "llama-cli not found: $Exe"
+    }
+    if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) {
+        throw "Model not found: $Model"
+    }
+    $Exe = (Resolve-Path -LiteralPath $Exe).Path
+    $Model = (Resolve-Path -LiteralPath $Model).Path
 }
 if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
     throw "Missing Python launcher (py -3)."
 }
-
-$Exe = (Resolve-Path -LiteralPath $Exe).Path
-$Model = (Resolve-Path -LiteralPath $Model).Path
 $layerRange = @($StartLayer..$EndLayer)
 $layerRegex = $layerRange -join "|"
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+if ($RecompareOnly -and -not (Test-Path -LiteralPath $OutDir -PathType Container)) {
+    throw "Existing output directory not found for recompare: $OutDir"
+}
+if (-not $RecompareOnly) {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+}
 $OutDir = Join-Path (Resolve-Path -LiteralPath $OutDir).Path $Stage
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+if ($RecompareOnly) {
+    if (-not (Test-Path -LiteralPath $OutDir -PathType Container)) {
+        throw "Existing stage directory not found: $OutDir"
+    }
+} else {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+}
 $summaryScript = Join-Path $PSScriptRoot "summarize_hexagon_linear_layers.py"
 if (-not (Test-Path -LiteralPath $summaryScript -PathType Leaf)) {
     throw "Summarizer missing: $summaryScript"
@@ -69,7 +84,7 @@ if (-not (Test-Path -LiteralPath $summaryScript -PathType Leaf)) {
 # are no CPU-vs-NPU QKV changes within the same Stage.
 function Get-EnabledWeights([string] $caseName) {
     $enabled = @{}
-    if ($caseName -eq "baseline") { return $enabled }
+    if ($caseName -in @("baseline", "baseline-repeat")) { return $enabled }
 
     if ($Stage -eq "attn") {
         if ($caseName -eq "all-output") {
@@ -116,6 +131,12 @@ function Get-EnabledWeights([string] $caseName) {
     return $enabled
 }
 
+if ($RecompareOnly -and $Cases.Count -eq 0) {
+    $Cases = @(Get-ChildItem -LiteralPath $OutDir -Directory |
+                Where-Object { $_.Name -ne "baseline" -and
+                               $_.Name -ne "baseline-repeat" } |
+                ForEach-Object { $_.Name })
+}
 if ($Cases.Count -eq 0) {
     if ($Stage -eq "attn") {
         $Cases = @($layerRange | ForEach-Object { "$($_)-output" })
@@ -141,7 +162,15 @@ if ($All) {
 $Cases = @($Cases | Select-Object -Unique)
 foreach ($caseName in $Cases) { $null = Get-EnabledWeights $caseName }
 if ($Cases.Count -eq 0) { throw "No cases to run" }
+if ($FocusLayer -ge 0 -and $Cases.Count -ne 1) {
+    throw "-FocusLayer requires exactly one selected case; otherwise each case determines its own target layer."
+}
+if ($BaselineControl -and $RecompareOnly -and -not
+    (Test-Path -LiteralPath (Join-Path $OutDir "baseline-repeat\manifest.tsv"))) {
+    throw "Saved baseline-repeat/manifest.tsv missing. -BaselineControl with -RecompareOnly needs an existing control capture."
+}
 
+if (-not $RecompareOnly) {
 $env:GGML_RPC_MATMUL_ONLY = "1"
 $env:GGML_RPC_DISABLE_F16_MATMUL = "1"
 Remove-Item Env:GGML_SCHED_KV14_READBACK -ErrorAction SilentlyContinue
@@ -168,6 +197,9 @@ Set-Content -LiteralPath (Join-Path $OutDir "settings.txt") -Value $settings -En
 Write-Host "[HEX_LINEAR_TEST] stage=$Stage ngl=$Ngl first_remote=$firstRemoteLayer layers=$StartLayer..$EndLayer"
 Write-Host "Baseline: QKV is on RPC/HTP (all stages). Attention output is on CPU only during 'attn' stage."
 Write-Host "Validate [HEX_LINEAR_AUDIT] on phone for every target weight."
+} else {
+    Write-Host "[HEX_LINEAR_RECOMPARE] Reusing saved tensor snapshots in $OutDir; no CLI/RPC run"
+}
 
 function Run-Capture([string] $caseName) {
     $enabled = Get-EnabledWeights $caseName
@@ -259,13 +291,35 @@ function Run-Capture([string] $caseName) {
 
 $overview = @()
 try {
-    $baseline = Run-Capture "baseline"
+    $baseline = if ($RecompareOnly) {
+        Join-Path $OutDir "baseline"
+    } else {
+        Run-Capture "baseline"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $baseline "manifest.tsv"))) {
+        throw "Baseline snapshot not found: $baseline"
+    }
     foreach ($caseName in $Cases) {
-        $candidate = Run-Capture $caseName
+        $candidate = if ($RecompareOnly) {
+            Join-Path $OutDir $caseName
+        } else {
+            Run-Capture $caseName
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $candidate "manifest.tsv"))) {
+            throw "Candidate snapshot not found: $candidate"
+        }
         $output = Join-Path $candidate "compare"
-        & py -3 $summaryScript $baseline $candidate --case $caseName --output $output --expected-layers ($layerRange -join ",")
+        $compareArgs = @(
+            $summaryScript, $baseline, $candidate,
+            "--case", $caseName, "--output", $output,
+            "--expected-layers", ($layerRange -join ",")
+        )
+        if ($FocusLayer -ge 0) {
+            $compareArgs += @("--focus-layer", "$FocusLayer")
+        }
+        & py -3 @compareArgs
         $code = $LASTEXITCODE
-        if ($code -notin @(0, 2, 3)) {
+        if ($code -notin @(0, 2, 3, 4)) {
             throw "Comparator error=$code for $caseName"
         }
         $report = Get-Content -LiteralPath (Join-Path $output "summary.json") -Raw | ConvertFrom-Json
@@ -279,6 +333,20 @@ try {
             stage = $Stage
             case = $caseName
             status = $report.status
+            focus_layer = $report.focus_layer
+            target_stage = $report.target_stage
+            compared = $report.compared
+            missing_stages = ($report.missing_stages -join ";")
+            upstream_diff = $report.region_counts.upstream.diff
+            upstream_critical = $report.region_counts.upstream.critical
+            target_diff = $report.region_counts.target.diff
+            target_critical = $report.region_counts.target.critical
+            downstream_diff = $report.region_counts.downstream.diff
+            downstream_critical = $report.region_counts.downstream.critical
+            first_upstream_name = $report.first_upstream_diff.name
+            first_upstream_nrmse = $report.first_upstream_diff.normalized_rmse
+            worst_target_name = $report.worst_target.name
+            worst_target_nrmse = $report.worst_target.normalized_rmse
             compared = $report.compared
             only_baseline = $report.only_cpu
             only_candidate = $report.only_npu
@@ -291,6 +359,48 @@ try {
             worst_output_nrmse = $worstOutputNRMSE
         }
     }
+    if ($BaselineControl) {
+        $repeatFolder = if ($RecompareOnly) {
+            Join-Path $OutDir "baseline-repeat"
+        } else {
+            Run-Capture "baseline-repeat"
+        }
+        $repeatOutput = Join-Path $repeatFolder "compare"
+        & py -3 $summaryScript $baseline $repeatFolder --case "baseline-control" --output $repeatOutput --expected-layers ($layerRange -join ",")
+        $controlExit = $LASTEXITCODE
+        if ($controlExit -notin @(0, 2, 3, 4)) {
+            throw "Baseline control compare failed: $controlExit"
+        }
+        $control = Get-Content -LiteralPath (Join-Path $repeatOutput "summary.json") -Raw | ConvertFrom-Json
+        $overview += [pscustomobject]@{
+            stage = $Stage
+            case = "baseline-control"
+            status = $control.status
+            focus_layer = $control.focus_layer
+            target_stage = "-"
+            compared = $control.compared
+            missing_stages = ($control.missing_stages -join ";")
+            upstream_diff = $control.region_counts.upstream.diff
+            upstream_critical = $control.region_counts.upstream.critical
+            target_diff = 0
+            target_critical = 0
+            downstream_diff = 0
+            downstream_critical = 0
+            first_upstream_name = $control.first_upstream_diff.name
+            first_upstream_nrmse = $control.first_upstream_diff.normalized_rmse
+            worst_target_name = $null
+            worst_target_nrmse = $null
+            only_baseline = $control.only_cpu
+            only_candidate = $control.only_npu
+            critical = $control.critical
+            diff = $control.diff
+            min_cosine = $control.min_cosine
+            max_rmse = $control.max_rmse
+            max_normalized_rmse = $control.max_normalized_rmse
+            worst_output_name = $control.worst_output_stage.name
+            worst_output_nrmse = $control.worst_output_stage.normalized_rmse
+        }
+    }
     $reportPath = Join-Path $OutDir "overview.csv"
     if ($overview.Count -gt 0) {
         $overview | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
@@ -301,7 +411,9 @@ try {
     Write-Host "Next gate: verify each target weight in PHONE [HEX_LINEAR_AUDIT] batch_status=OK."
     Write-Host "Then rerun with no Tensor Dump before interpreting real throughput."
 } finally {
-    Remove-Item Env:LLAMA_TENSOR_COMPARE_DIR -ErrorAction SilentlyContinue
-    Remove-Item Env:LLAMA_TENSOR_COMPARE_REGEX -ErrorAction SilentlyContinue
-    Remove-Item Env:LLAMA_ARG_OVERRIDE_TENSOR -ErrorAction SilentlyContinue
+    if (-not $RecompareOnly) {
+        Remove-Item Env:LLAMA_TENSOR_COMPARE_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:LLAMA_TENSOR_COMPARE_REGEX -ErrorAction SilentlyContinue
+        Remove-Item Env:LLAMA_ARG_OVERRIDE_TENSOR -ErrorAction SilentlyContinue
+    }
 }
