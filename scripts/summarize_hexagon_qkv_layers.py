@@ -90,10 +90,11 @@ def summarize(reference: Path, candidate: Path, case: str, out: Path,
         "min_cosine": min(
             (r["cosine"] for r in rows if math.isfinite(r["cosine"])),
             default=None),
-        "max_rmse": max((r["rmse"] for r in rows), default=None),
+        "max_rmse": max((r["rmse"] for r in rows if math.isfinite(r["rmse"])), default=None),
         "critical_examples": [
-            {k: r[k] for k in ("layer", "name", "shape", "bad",
-                              "total", "rmse", "cosine", "nonfinite")}
+            {k: (r[k] if not isinstance(r[k], float) or math.isfinite(r[k]) else None)
+             for k in ("layer", "name", "shape", "bad",
+                       "total", "rmse", "cosine", "nonfinite")}
             for r in critical_rows[:12]],
         "notes": [
             "NUMERICALLY_CLOSE is not bytewise identical and not a proof of full-model correctness.",
