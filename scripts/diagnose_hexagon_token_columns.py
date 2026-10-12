@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Locate error-concentrated token columns in saved llama.cpp tensor dumps.
+r"""Locate error-concentrated token columns in saved llama.cpp tensor dumps.
 
 Usage (from repository root on Windows):
   py -3 scripts/diagnose_hexagon_token_columns.py ^
