@@ -908,6 +908,9 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     const bool sync_set_rows_host_inputs = op->opcode == HTP_OP_SET_ROWS &&
                             (op->flags & HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT) != 0 &&
                             (op->flags & HTP_OPFLAGS_SKIP_COMPUTE) == 0;
+    const bool sync_matmul_input = op->opcode == HTP_OP_MUL_MAT &&
+                            (op->flags & HTP_OPFLAGS_SYNC_MUL_MAT_INPUT) != 0 &&
+                            (op->flags & HTP_OPFLAGS_SKIP_COMPUTE) == 0;
     const bool profile_set_rows_sync = sync_set_rows_host_inputs &&
                             (op->flags & HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC) != 0;
     const uint32_t k14_seq = (uint32_t) op->pad[0] |
@@ -929,6 +932,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
 
         const bool regular_flush = !(src->flags & HTP_TENSOR_FLUSHED) &&
                                    (src->flags & HTP_TENSOR_COMPUTE);
+        const bool sync_matmul_src =
+            sync_matmul_input && i == 1 &&
+            (src->type == HTP_TYPE_F32 || src->type == HTP_TYPE_F16) &&
+            src->data != 0 && src->size > 0;
         // Debug experiment: bypass the COMPUTE/FLUSHED usage predicate ONLY
         // for the host-tagged K14 MatMul's F32 src[1]. Flush before hashing
         // or invoking the kernel. This tests DSP-side cache maintenance; it
@@ -958,7 +965,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             FARF(ALWAYS, "[HTP_SET_ROWS_HOST_SYNC] status=SKIP"
                  " reason=SOURCE_TOO_LARGE bytes=%u input=%u", src->size, i);
         }
-        if (force_flush || kv14_force_flush || sync_external_set_rows_src || regular_flush) {
+        if (sync_matmul_src || force_flush || kv14_force_flush || sync_external_set_rows_src || regular_flush) {
             // One flush even if multiple sync reasons are active. Profile the
             // extra host/RPC coherency path, not the legacy COMPUTE flushes.
             if (profile_set_rows_sync && sync_external_set_rows_src && sync_stats) {
@@ -973,6 +980,12 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             } else {
                 hex_l2flush((void *) (uintptr_t) src->data, src->size);
             }
+        }
+        if (sync_matmul_src) {
+            FARF(HIGH, "[HTP_MATMUL_INPUT_SYNC] status=FLUSH"
+                 " bytes=%u type=%u flags=0x%x",
+                 (unsigned) src->size, (unsigned) src->type,
+                 (unsigned) src->flags);
         }
         if (sync_external_set_rows_src) {
             FARF(HIGH, "[HTP_SET_ROWS_HOST_SYNC] status=FLUSH"
