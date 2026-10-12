@@ -173,6 +173,35 @@ Keep the same phone build and runtime settings, with `GGML_HEXAGON_K13_DIAG`, `G
 
 Inspect `overview.csv`, `15-output/compare/summary.json`, and `placement.txt` to ensure there are **no** `blk.13.attn_q/k/v.weight=CPU` overrides. Verify the phone `[HEX_LINEAR_AUDIT]` indicates `blk.15.attn_output.weight` actually executed on HTP with `batch_status=OK`; a numerical pass without offload is not an offload correctness pass. If unpinned all-HTP QKV candidate is now clean, test `-Cases @("13-output", "14-output", "15-output", "all-output")` without `-FocusLayer` and preserve separate logs. Do not attribute root-cause resolution to the diagnostic patch without repeatable failing baseline/reproduction.
 
+## Attention Output expanded gate: 13/14 downstream critical, all-output target critical
+
+With CPU pins removed (Q13/K13/V13 intended HTP) and `-Stage attn -Ngl 4 -Cases @(13-output,14-output,all-output) -BaselineControl`:
+
+| case | reported status | compared | upstream_diff | reentry_diff |
+| --- | --- | ---: | ---: | ---: |
+| `13-output` | `DOWNSTREAM_CRITICAL` | 120 | 0 | 0 |
+| `14-output` | `DOWNSTREAM_CRITICAL` | 120 | 0 | 0 |
+| `all-output` | `TARGET_CRITICAL` | 120 | 0 | 0 |
+| `baseline-control` | `NUMERICALLY_CLOSE`, `critical=0`, `diff=0` | 120 | 0 | 0 |
+
+These are **not passes**. In the comparator, critical is raised if nonfinite, `cosine<0.95`, or `NRMSE>0.05` on the selected CHECK_STAGES (plus undefined-cosine with nonzero element mismatches). `DOWNSTREAM_CRITICAL` does *not* mean target `attn_out` is identical, only that none of its rows meet critical criteria. For `all-output`, `TARGET_CRITICAL` can be at layer 13, 14 or 15; a later target failure may be propagated from an earlier modified layer. `diff=0` is tolerance-based, not necessarily bytewise equality.
+
+Before modifying kernels or memory sync, extract exact target rows and first critical downstream rows from existing `tensor_metrics.csv` and `summary.json`. No rerun required:
+
+```powershell
+$root = '.\hexagon-attn-expanded\attn'
+foreach ($case in @('13-output','14-output','all-output')) {
+  $summary = Get-Content "$root\$case\compare\summary.json" -Raw | ConvertFrom-Json
+  Write-Host "===== $case / $($summary.status) ====="
+  Write-Host "target diff/critical=$($summary.region_counts.target.diff)/$($summary.region_counts.target.critical) downstream diff/critical=$($summary.region_counts.downstream.diff)/$($summary.region_counts.downstream.critical)"
+  $rows = Import-Csv "$root\$case\compare\tensor_metrics.csv"
+  $rows | Where-Object { $_.region -eq 'TARGET' -or $_.status -eq 'CRITICAL' } |
+    Select-Object -First 24 evaluation,region,name,status,bad,total,rmse,normalized_rmse,cosine | Format-Table -AutoSize
+}
+```
+
+Need to inspect which graph evaluation (2-token vs 42-token) first becomes severe, each `attn_out-N` target's RMSE/NRMSE/cosine, and `l_out-N` for residual propagation. Also validate fresh `[HEX_LINEAR_AUDIT]` records (correct weights, `batch_status=OK`, `compute_enabled=1`) from the **expanded test run**, not a prior K13-force log. Do not proceed to FFN until these errors are understood.
+
 ## Probe logs and caveats
 
 ```bash
