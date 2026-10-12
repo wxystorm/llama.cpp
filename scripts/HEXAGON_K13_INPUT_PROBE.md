@@ -288,6 +288,21 @@ If necessary, causal placement experiment: pin next-layer Q/V to CPU **in both**
 
 A pass there links failure to next-layer HTP projection or its memory/schedule dependency, but pinning changes graph placement, so it is not definitive proof of a specific cache or kernel defect. Do not start FFN target-offload tests while these errors persist.
 
+
+### Per-token confirmation: next-layer errors are nonzero on BOTH 2-token columns
+
+The latest saved-tensor ~diagnose_hexagon_token_columns.py --tokens 2~ comparison yields:
+
+- ~13-output~: ~attn_norm-14~ matches; ~Qcur-14~ column 0/1 both badly different (2035/2048 and 2036/2048 bad), candidate RMS ~0.0676 versus reference RMS ~0.2945, cosine ~-0.22; ~Vcur-14~ columns 0/1 both severely wrong (509 or 510/512 bad), cosine ~0.0005-0.001; ~Kcur-14~ has very small error (nRMSE ~0.0012-0.0014, cosine ~0.999999).
+- ~14-output~: ~attn_norm-15~ matches; Q15, K15 and V15 **both columns** badly diverge. Q15 candidate RMS ~0.059 versus reference ~0.261; K15 candidate ~0.069 versus reference ~0.355; V15 candidate ~0.0515 versus reference ~0.0634. No zeroed entire columns, and cosine generally near zero.
+
+This rules out the *same* single missing token-column signature that appeared in earlier 42-token Q/K/V runs, and strongly favors a problem between near-identical host-side norm tensors and selected HTP projection values.
+
+**A new useful conditional hypothesis**: The shared phone experiment env in this branch explicitly enables ~GGML_HEXAGON_K14_FORCE_INPUT_FLUSH=1~; its exact K14 input can be flushed before MatMul, while Q14/V14 and Q/K/V15 have no analogous targeted flush. This **could explain the selective K14 pass**, but is only a hypothesis until current-run phone logs confirm ~[HEX_K14_INPUT_FORCE_FLUSH] enabled=1~, a K14 tag and ~force_input_flush_ack=1~ for the actual 2-token evaluation. A K14 force flush also enables extra readbacks/probing, so correlation does not isolate flush from probe. Do not claim this is proved.
+
+Minimal targeted test on the **same host+DSP binaries**: keep ~GGML_HEXAGON_K14_DIAG=1~ (diagnostic readbacks retained), but ~unset GGML_HEXAGON_K14_FORCE_INPUT_FLUSH~ to test whether K14 ceases to be protected. Restart RPC server, run only ~13-output~ in a fresh directory, and inspect same Q/K/V14 metrics. It is also useful to pin only next layer Q14/V14 to CPU in BOTH baseline and candidate to test backend-dependent corruption without reassigning attention output. These tests mutate graph timing/placement and should be interpreted accordingly.
+
+
 ## Probe logs and caveats
 
 ```bash
