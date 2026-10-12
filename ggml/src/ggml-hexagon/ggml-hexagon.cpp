@@ -89,6 +89,7 @@ static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write
 static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
 static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
 static bool opt_qkv_audit = false; // opt-in per-batch QKV DSP execution acknowledgement
+static bool opt_linear_audit = false; // opt-in per-batch attn output/FFN MatMul execution acknowledgement
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1837,6 +1838,42 @@ struct ggml_hexagon_opqueue {
                               " opcode=%u opstage=%u compute_enabled=%d\n",
                               shm_buf->sess->c_name(), rsp.id,
                               status_to_str(rsp.status), name,
+                              output->name, (unsigned) queued.opcode,
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            }
+        }
+
+        // Correctness-only audit of newly enabled attention-output and FFN
+        // weight MatMul kernels. Only a finished HTP batch gets a record.
+        // No DSP protocol change; does not imply exact result equality.
+        if (opt_linear_audit) {
+            const auto & completed_ops = op_cache[rsp.id];
+            for (const auto & queued : completed_ops) {
+                if (queued.opcode != HTP_OP_MUL_MAT &&
+                    queued.opcode != HTP_OP_MUL_MAT_ADD &&
+                    queued.opcode != HTP_OP_MUL_MAT_QKV) {
+                    continue;
+                }
+                const ggml_tensor * output = queued.node;
+                const ggml_tensor * weight = output ? output->src[0] : nullptr;
+                if (weight == nullptr || strncmp(weight->name, "blk.", 4) != 0) {
+                    continue;
+                }
+                // Compare whole suffixes so unrelated weights are not counted.
+                const char * suffix = strchr(weight->name + 4, '.');
+                if (suffix == nullptr ||
+                    (strcmp(suffix, ".attn_output.weight") != 0 &&
+                     strcmp(suffix, ".ffn_gate.weight") != 0 &&
+                     strcmp(suffix, ".ffn_up.weight") != 0 &&
+                     strcmp(suffix, ".ffn_down.weight") != 0)) {
+                    continue;
+                }
+                GGML_LOG_INFO("[HEX_LINEAR_AUDIT] session=%s batch_id=%u"
+                              " batch_status=%s weight=%s output=%s"
+                              " opcode=%u opstage=%u compute_enabled=%d\n",
+                              shm_buf->sess->c_name(), rsp.id,
+                              status_to_str(rsp.status), weight->name,
                               output->name, (unsigned) queued.opcode,
                               (unsigned) opt_opstage,
                               (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
@@ -4913,6 +4950,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
     const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
     const char * str_qkv_audit = getenv("GGML_HEXAGON_QKV_AUDIT");
+    const char * str_linear_audit = getenv("GGML_HEXAGON_LINEAR_AUDIT");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4980,6 +5018,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     if (opt_qkv_audit) {
         GGML_LOG_WARN("[HEX_QKV_AUDIT] enabled=1"
                       " note=per_batch_HTP_ack_not_per_op_output_validation\n");
+    }
+    opt_linear_audit = str_linear_audit != nullptr &&
+                       strcmp(str_linear_audit, "1") == 0;
+    if (opt_linear_audit) {
+        GGML_LOG_WARN("[HEX_LINEAR_AUDIT] enabled=1"
+                      " scope=attn_output,ffn_gate,ffn_up,ffn_down"
+                      " note=HTP_batch_ack_not_matmul_numerical_proof\n");
     }
     if (opt_set_rows_host_input_sync) {
         GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
