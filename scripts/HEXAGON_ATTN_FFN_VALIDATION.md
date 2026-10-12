@@ -17,9 +17,9 @@
 
 **注意 1：** CAPTURE_MISMATCH 的含义是预期的某些阶段未被捕获，并不代表两组的 manifest key 集合不同（它们的 only count 均为 0）。必须检查报告中的 missing_stages。
 
-**注意 2：** 仅迁移 15-output，却在 attn_out-13 发现明显差异，是目标层**之前**的运行不一致，不是后续层误差传播。不能简单只检查目标层、删除其余差异。
+**注意 2：** 仅迁移 15-output，却在 attn_out-13 发现明显差异，**不能只按层号判断因果关系**。如果这个快照出现在当前轮 Layer15 的目标输出之前，它是异常的上游偏差；如果出现在此前 Layer15 已改变采样 token 的下一次 Decode 中，它可能是正常的跨 token 传播。脚本以 baseline 的 **first_target_capture_id** 为近似时间屏障，只有屏障之前的差异列为 UPSTREAM；之后的早层快照归入 DOWNSTREAM，不能简单忽略它们。捕获 ID 是 callback 的顺序，不是 DSP 精确执行时间戳，仍需确认输入 token 序列。
 
-修正后的比较器把张量划为三个区域：UPSTREAM（目标算子之前）、TARGET（被迁移算子第一个可见输出）、DOWNSTREAM（同层消费者和后续层）。每个区域独立给出 diff、critical、首次差异和 worst NRMSE，保留 missing_stages 名单。可能状态包括 CAPTURE_MISMATCH、UPSTREAM_DIVERGENCE、TARGET_CRITICAL、DOWNSTREAM_CRITICAL、NUMERICALLY_CLOSE。
+修正后的比较器把张量划为三个区域：UPSTREAM（首次目标输出被捕获之前）、TARGET（被迁移算子的输出）、DOWNSTREAM（首次目标输出之后其他输出，**包括后续 Decode 的较低层**）。每个区域独立给出 diff、critical、首次差异和 worst NRMSE，保留 missing_stages 名单。可能状态包括 CAPTURE_MISMATCH、UPSTREAM_DIVERGENCE、TARGET_CRITICAL、DOWNSTREAM_CRITICAL、NUMERICALLY_CLOSE。
 
 ### 不重新运行模型，直接分析此前已有 Dump
 
@@ -39,7 +39,7 @@ git pull --ff-only
   -Cases @("15-output") -FocusLayer 15
 ```
 
-重新生成 attn/overview.csv 与 compare/summary.json、tensor_metrics.csv；不会清理原始 manifest 或重复执行 CLI。关注 missing_stages、upstream_diff、first_upstream_name、worst_target_name、worst_target_nrmse。
+重新生成 attn/overview.csv 与 compare/summary.json、tensor_metrics.csv；不会清理原始 manifest 或重复执行 CLI。关注 missing_stages、upstream_diff、first_upstream_name、worst_target_name、worst_target_nrmse，并在 summary.json 查看 first_target_capture_id。若不同运行采样的 token 已经分叉，需要区分真实算子误差与后续输入不同。
 
 ### 复现时加 baseline 对照，识别跨次运行漂移
 
