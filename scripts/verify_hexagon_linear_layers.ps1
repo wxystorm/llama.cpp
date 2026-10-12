@@ -339,6 +339,10 @@ try {
             missing_stages = ($report.missing_stages -join ";")
             upstream_diff = $report.region_counts.upstream.diff
             upstream_critical = $report.region_counts.upstream.critical
+            reentry_diff = $report.region_counts.reentry_upstream.diff
+            reentry_critical = $report.region_counts.reentry_upstream.critical
+            first_reentry_name = $report.first_reentry_diff.name
+            first_reentry_nrmse = $report.first_reentry_diff.normalized_rmse
             target_diff = $report.region_counts.target.diff
             target_critical = $report.region_counts.target.critical
             downstream_diff = $report.region_counts.downstream.diff
@@ -381,6 +385,10 @@ try {
             missing_stages = ($control.missing_stages -join ";")
             upstream_diff = $control.region_counts.upstream.diff
             upstream_critical = $control.region_counts.upstream.critical
+            reentry_diff = $control.region_counts.reentry_upstream.diff
+            reentry_critical = $control.region_counts.reentry_upstream.critical
+            first_reentry_name = $control.first_reentry_diff.name
+            first_reentry_nrmse = $control.first_reentry_diff.normalized_rmse
             target_diff = 0
             target_critical = 0
             downstream_diff = 0
