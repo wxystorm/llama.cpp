@@ -1781,6 +1781,21 @@ struct ggml_hexagon_opqueue {
                                                "blk.13.attn_k.weight") == 0;
             const bool requested_force = response_is_k13 ?
                     opt_k13_force_input_flush : opt_k14_force_input_flush;
+            // Legacy K14 DSP reply stores only one probe per batch.
+            // Multiple tagged MatMuls can execute correctly even though
+            // the response only acknowledges the last diagnostic probe.
+            size_t tagged_in_batch = 0;
+            for (const auto & op : batch_nodes) {
+                if (op.diag_k14_seq != 0) {
+                    ++tagged_in_batch;
+                }
+            }
+            if (tagged_in_batch > 1 && opt_k13_diag) {
+                GGML_LOG_WARN("[HEX_K13_DSP_PROBE] batch_id=%u"
+                              " status=MULTIPLE_TAGGED_OPS count=%zu"
+                              " note=last_probe_only_in_batch_response\n",
+                              rsp.id, tagged_in_batch);
+            }
             if (magic == 0x4b313444u && opt_profile == 0) {
                 // Low four bits remain the fingerprint-valid mask. Bit 4 is
                 // an acknowledgement written only after the DSP flush call.
@@ -1805,9 +1820,11 @@ struct ggml_hexagon_opqueue {
                               force_ack ? 1 : 0,
                               input_hash, pre_hash, post_hash, flush_hash);
                 if (requested_force && !force_ack) {
-                    GGML_LOG_WARN("[HEX_INPUT_FORCE_FLUSH] weight=%s seq=%u"
+                    GGML_LOG_WARN("%s weight=%s seq=%u"
                                   " status=NO_DSP_ACK"
                                   " (check DSP library version and input tensor validity)\n",
+                                  response_is_k13 ? "[HEX_K13_INPUT_FORCE_FLUSH]" :
+                                                    "[HEX_K14_INPUT_FORCE_FLUSH]",
                                   response_is_k13 ? "blk.13.attn_k.weight" :
                                                     "blk.14.attn_k.weight", seq);
                 }
