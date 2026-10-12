@@ -1213,6 +1213,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         struct htp_tensor*   tens = (struct htp_tensor*)    m_ptr; m_ptr += t_size;
         struct htp_op_desc*   ops = (struct htp_op_desc*)   m_ptr; m_ptr += o_size;
         struct htp_prof_desc* pds = (struct htp_prof_desc*) m_ptr;
+        memset(pds, 0, p_size);
 
         prep_op_bufs(ctx, bufs, n_bufs);
         prep_tensors(ctx, bufs, tens, n_tens);
