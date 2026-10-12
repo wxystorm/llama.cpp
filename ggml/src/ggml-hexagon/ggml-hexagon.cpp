@@ -2157,14 +2157,20 @@ struct ggml_hexagon_opqueue {
                               " output_calls=%" PRIu64 " output_bytes=%" PRIu64
                               " output_us=%" PRIu64 " output_global_flushes=%" PRIu64
                               " total_flush_us=%" PRIu64
-                              " batch_wall_us=%" PRIu64 "\n",
+                              " batch_wall_us=%" PRIu64
+                              " cumulative_batches=%" PRIu64
+                              " cumulative_input_us=%" PRIu64
+                              " cumulative_output_us=%" PRIu64
+                              " cumulative_total_flush_us=%" PRIu64 "\n",
                               rsp.id, rsp.n_ops,
                               batch_l2_input_calls, batch_l2_input_bytes,
                               batch_l2_input_us, batch_l2_input_global_flushes,
                               batch_l2_output_calls, batch_l2_output_bytes,
                               batch_l2_output_us, batch_l2_output_global_flushes,
                               batch_l2_input_us + batch_l2_output_us,
-                              batch_usec);
+                              batch_usec,
+                              l2_profile_batches, l2_input_us, l2_output_us,
+                              l2_input_us + l2_output_us);
             }
 
             if (opt_set_rows_sync_timing && set_rows_ops > 0) {
