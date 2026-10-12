@@ -1,5 +1,50 @@
 # Hexagon HTP: 从 QKV 扩展到 Attention Output / FFN
 
+## 2026-10-12 baseline-repeat 实测与二次修正
+
+用户新的 `-Cases 15-output -FocusLayer 15 -BaselineControl` 结果表明：
+
+- `baseline-control`：120/120 张量一一对应，120 个全零差异，所有 RMSE=0、cosine=1。这次实验中**相同放置运行两次严格一致**，不能再把异常解释成普通的随机波动。
+- `15-output`：120/120 一一对应（两个侧的 only 均为 0），首个 2-token `attn_out-15` RMSE=0.000142 / NRMSE=0.003881；第二次 42-token `attn_out-15` RMSE=0.010720 / NRMSE=0.089886 / cosine=0.995966。
+- 第二次 42-token `attn_out-13` RMSE=0.017045 / NRMSE=0.345685，超差元素 2038/86016，接近 *一个完整 token 列* 的 2048 元素；`ffn_gate-13` 也有 8168/344064 个超差，接近一个 8192 元素列。应定位具体 token 列、当次计算的上游张量和输入 token ID。
+- 旧比较器错误要求 `ffn_out-13/14/15`。实际这三者在两个侧都没有捕获；已将 `ffn_out` 标记为可选，而仍要求每层 `attn_out` 与 `l_out`。同时 FFN down 的直接可观测输出改为 `l_out`。
+- 旧比较器仅按整次运行最早的目标输出 ID=53 判断因果。实际基线有两组捕获：第 1 次 ne1=2，第 2 次 ne1=42。新版本按各次独立的 `attn_norm-13` 起点识别图计算组，分别检查该组 Layer15 的目标输出之前和之后的差异。
+
+新报告新增 `REENTRY_UPSTREAM` 区域与 `REENTRY_UPSTREAM_DIVERGENCE` 状态。这不是“Layer 15 影响了同次计算的 Layer 13”，而是**下一次图计算在到达 Layer15 前已经与基线不同**。可能与上一轮状态、token 序列、KV cache 或 graph reuse 有关；无法单从两个 summary.json 证明具体原因。
+
+### 再次离线重算原来的 Dump（不重跑模型）
+
+```powershell
+git pull --ff-only
+py -3 .\scripts\test_hexagon_linear_focus.py
+
+.\scripts\verify_hexagon_linear_layers.ps1 `
+    -Stage attn -RecompareOnly `
+    -Cases @("15-output") -FocusLayer 15 `
+    -OutDir ".\hexagon-linear-attn-control"
+```
+
+重点是结果中的 `graph_evaluation_starts`、`target_capture_ids_by_evaluation`、`reentry_diff`、`first_reentry_name`、`worst_target_nrmse`、`missing_stages`。预计 baseline-control 在修正后不再被误判 CAPTURE_MISMATCH；需要把该组也一起离线重算时，附加 `-BaselineControl`。
+
+### 进一步确认是否只有某一个 token 列不同
+
+```powershell
+py -3 .\scripts\diagnose_hexagon_token_columns.py `
+  .\hexagon-linear-attn-control\attn\baseline `
+  .\hexagon-linear-attn-control\attn\15-output `
+  --tokens 42 --top 5 `
+  --csv .\hexagon-linear-attn-control\attn\token_columns_42.csv
+```
+
+`token_columns_42.csv` 按张量名、token 列下标给出 bad/total、RMSE、NRMSE、cosine，可直接区分：
+
+1. `attn_norm-13` 和 `Qcur-13` 在某个 token 列已经不同 → 进入第 13 层前的输入不同或跨次状态变化；先查两个 PC 日志的 token ID、KV seq/pos。
+2. 第 13 层前后输出不同但输入完全一致 → 检查 RPC 图执行、缓存和 K/V 张量同步。
+3. `kqv_out-15` 两侧接近但 `attn_out-15` 显著不同 → 针对被迁移的 `attn_output` MatMul kernel/输入可见性继续隔离。
+
+**禁止**仅凭通过的 batch ACK 或第一轮 2-token 低误差直接宣布 Attention Output 正确，FFN 阶段仍需等待这些问题解释清楚。
+
+
 分支：`test/hexagon-attn-ffn-20261012`；基于已经通过有限数值对照的 `test/hexagon-multilayer-qkv-20261012`。
 
 之前的 `all-qkv` 在带 Tensor Dump 的 84 个张量上数值接近 CPU；尚未看到上一轮用户无 Dump 的最终 64-token Decode 报告，不能假定无 Dump 已通过。
