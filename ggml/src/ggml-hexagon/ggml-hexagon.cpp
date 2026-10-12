@@ -1457,7 +1457,11 @@ struct ggml_hexagon_opbatch {
         }
 
         h.flags = 0;
-        if (ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        // Match the upstream Hexagon coherency model: RPC/host-staged
+        // activations may arrive on buffers whose usage is ANY. Only explicit
+        // WEIGHTS are immutable inputs; every other tensor participates in
+        // compute cache maintenance.
+        if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             h.flags |= HTP_TENSOR_COMPUTE;
         }
 
