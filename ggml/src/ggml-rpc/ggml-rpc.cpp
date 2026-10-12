@@ -264,6 +264,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_FFN_MARK_READY,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
+    RPC_CMD_SUPPORTS_OP,
     RPC_CMD_COUNT,
 };
 
@@ -285,6 +286,7 @@ static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must
 static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SUPPORTS_OP == 34, "RPC_CMD_SUPPORTS_OP must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -312,6 +314,16 @@ struct rpc_msg_get_alloc_size_req {
 
 struct rpc_msg_get_alloc_size_rsp {
     uint64_t alloc_size;
+};
+
+struct rpc_msg_supports_op_req {
+    uint32_t   device;
+    rpc_tensor op;
+    rpc_tensor srcs[GGML_MAX_SRC];
+};
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t supported;
 };
 
 struct rpc_msg_init_tensor_req {
@@ -620,6 +632,13 @@ struct ggml_backend_rpc_device_context {
     rpc_pending_fused_ffn_input fused_ffn;
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
+
+    // Remote supports_op() is queried only on structural cache misses. This is
+    // critical for decode: graph splitting may ask the same capability
+    // questions every token, while an RPC roundtrip can cost milliseconds.
+    std::mutex supports_op_cache_mutex;
+    std::unordered_map<std::string, bool> supports_op_cache;
+
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
 };
@@ -1358,6 +1377,33 @@ static std::string rpc_alloc_size_structural_key(
 static bool rpc_alloc_size_cache_enabled() {
     const char * value = std::getenv("GGML_RPC_ALLOC_SIZE_CACHE");
     return value == nullptr || strcmp(value, "0") != 0;
+}
+
+static constexpr size_t RPC_SUPPORTS_OP_CACHE_MAX = 16384;
+
+static void rpc_supports_op_normalize_tensor(rpc_tensor & tensor) {
+    // Keep the structural information used by backend supports_op() checks,
+    // but remove graph-local pointer identities. Preserve only whether a
+    // concrete remote buffer/data address exists.
+    tensor.id     = 0;
+    tensor.buffer = tensor.buffer != 0 ? 1 : 0;
+    tensor.data   = tensor.data   != 0 ? 1 : 0;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        tensor.src[i] = 0;
+    }
+    tensor.view_src = tensor.view_src != 0 ? 1 : 0;
+}
+
+static std::string rpc_supports_op_structural_key(
+        const rpc_msg_supports_op_req & request) {
+    rpc_msg_supports_op_req normalized = request;
+    rpc_supports_op_normalize_tensor(normalized.op);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        rpc_supports_op_normalize_tensor(normalized.srcs[i]);
+    }
+    return std::string(
+        reinterpret_cast<const char *>(&normalized),
+        sizeof(normalized));
 }
 
 static void rpc_alloc_size_cache_log_locked(
@@ -4283,6 +4329,7 @@ public:
         const rpc_msg_init_zero_tensor_req & request,
         rpc_msg_init_zero_tensor_rsp & response);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
     struct stored_graph {
@@ -4717,6 +4764,58 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     }
 
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+
+    return true;
+}
+
+bool rpc_server::supports_op(
+        const rpc_msg_supports_op_req & request,
+        rpc_msg_supports_op_rsp & response) {
+    const uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (1 + GGML_MAX_SRC),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * op = deserialize_tensor(ctx, &request.op);
+    if (op == nullptr) {
+        GGML_LOG_ERROR("[RPC_SUPPORTS_OP] failed to deserialize op\n");
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (request.srcs[i].id == 0) {
+            continue;
+        }
+        op->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+        if (op->src[i] == nullptr) {
+            GGML_LOG_ERROR(
+                "[RPC_SUPPORTS_OP] failed to deserialize src[%d] for op=%s\n",
+                i, op->name);
+            return false;
+        }
+    }
+
+    response.supported =
+        ggml_backend_supports_op(backends[dev_id], op) ? 1 : 0;
+
+    if (std::getenv("GGML_RPC_SUPPORTS_OP_DEBUG") != nullptr) {
+        GGML_LOG_INFO(
+            "[RPC_SUPPORTS_OP_SERVER] device=%u op=%s type=%s supported=%u\n",
+            dev_id,
+            ggml_op_name(op->op),
+            ggml_type_name(op->type),
+            (unsigned) response.supported);
+    }
 
     return true;
 }
@@ -7439,6 +7538,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response {};
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_ALIGNMENT: {
                 rpc_msg_get_alignment_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -7699,6 +7812,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 rpc_msg_get_alloc_size_rsp response;
                 if (!server.get_alloc_size(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response {};
+                if (!server.supports_op(request, response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
@@ -8578,100 +8705,183 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
-static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    // Diagnostic only: RPC has no remote supports_op query. Restrict most
-    // operations to the local fallback backend while keeping matmul on RPC.
-    // The metadata and KV-related ops below are needed for scheduler routing.
+static bool ggml_backend_rpc_device_supports_op_conservative(
+        const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+
+        case GGML_OP_MUL_MAT: {
+            const ggml_tensor * w = op->src[0];
+            const ggml_tensor * x = op->src[1];
+            bool supported = false;
+            if (w && x && op->type == GGML_TYPE_F32 &&
+                (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16)) {
+                switch (w->type) {
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_MXFP4:
+                        supported = w->ne[0] % 32 == 0 &&
+                                    w->ne[1] <= 32768 &&
+                                    x->ne[2] == 1 &&
+                                    x->ne[3] == 1;
+                        break;
+                    case GGML_TYPE_F16:
+                        supported =
+                            std::getenv("GGML_RPC_DISABLE_F16_MATMUL") == nullptr &&
+                            w->nb[1] >= w->nb[0] &&
+                            x->ne[2] >= w->ne[2] &&
+                            x->ne[3] >= w->ne[3];
+                        break;
+                    case GGML_TYPE_F32:
+                        supported = x->type == GGML_TYPE_F32 &&
+                                    w->nb[1] >= w->nb[0] &&
+                                    x->ne[2] >= w->ne[2] &&
+                                    x->ne[3] >= w->ne[3];
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (!supported &&
+                std::getenv("GGML_RPC_MATMUL_DEBUG") != nullptr) {
+                GGML_LOG_WARN(
+                    "[RPC_MUL_MAT_FALLBACK] name=%s weight_type=%s input_type=%s\n",
+                    op->name,
+                    w ? ggml_type_name(w->type) : "null",
+                    x ? ggml_type_name(x->type) : "null");
+            }
+            return supported;
+        }
+
+        case GGML_OP_GET_ROWS: {
+            const bool supported =
+                op->src[0] != nullptr &&
+                op->src[1] != nullptr &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                (op->src[1]->type == GGML_TYPE_I32 ||
+                 op->src[1]->type == GGML_TYPE_I64) &&
+                op->type == GGML_TYPE_F32;
+            if (!supported &&
+                std::getenv("GGML_RPC_GET_ROWS_DEBUG") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[RPC_GET_ROWS_FALLBACK] name=%s src_type=%s dst_type=%s\n",
+                    op->name,
+                    op->src[0] ? ggml_type_name(op->src[0]->type) : "null",
+                    ggml_type_name(op->type));
+            }
+            return supported;
+        }
+
+        // Required for remotely allocated KV-cache tensors.
+        case GGML_OP_SET_ROWS:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool ggml_backend_rpc_device_supports_op(
+        ggml_backend_dev_t dev,
+        const struct ggml_tensor * op) {
+    // Keep the old restricted path as an explicit diagnostic override.
     if (std::getenv("GGML_RPC_MATMUL_ONLY") != nullptr) {
-        switch (op->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                return true;
-            case GGML_OP_MUL_MAT: {
-                // RPC cannot query the server's supports_op yet. When
-                // GGML_RPC_MATMUL_ONLY is enabled for Hexagon diagnostics,
-                // mirror its conservative MUL_MAT type/shape checks instead
-                // of forwarding every matmul to HTP. In particular, Q6_K
-                // (often a tied token_embd.weight / LM head) is unsupported.
-                // This check is also used by the model loader to choose the
-                // weight buffer, before any graph is executed.
-                const ggml_tensor * w = op->src[0];
-                const ggml_tensor * x = op->src[1];
-                bool supported = false;
-                if (w && x && op->type == GGML_TYPE_F32 &&
-                    (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16)) {
-                    switch (w->type) {
-                        case GGML_TYPE_Q4_0:
-                        case GGML_TYPE_Q4_1:
-                        case GGML_TYPE_Q8_0:
-                        case GGML_TYPE_IQ4_NL:
-                        case GGML_TYPE_MXFP4:
-                            supported = w->ne[0] % 32 == 0 &&
-                                        w->ne[1] <= 32768 &&
-                                        x->ne[2] == 1 &&
-                                        x->ne[3] == 1;
-                            break;
-                        case GGML_TYPE_F16:
-                            // Diagnostic: keep quantized model matmuls on RPC, but
-                            // force F16 attention matmuls to a local backend to
-                            // isolate errors involving a remote KV cache.
-                            supported = std::getenv("GGML_RPC_DISABLE_F16_MATMUL") == nullptr &&
-                                        w->nb[1] >= w->nb[0] &&
-                                        x->ne[2] >= w->ne[2] &&
-                                        x->ne[3] >= w->ne[3];
-                            break;
-                        case GGML_TYPE_F32:
-                            supported = x->type == GGML_TYPE_F32 &&
-                                        w->nb[1] >= w->nb[0] &&
-                                        x->ne[2] >= w->ne[2] &&
-                                        x->ne[3] >= w->ne[3];
-                            break;
-                        default:
-                            break;
-                    }
-                }
-                if (!supported && std::getenv("GGML_RPC_MATMUL_DEBUG") != nullptr) {
-                    GGML_LOG_WARN("[RPC_MUL_MAT_FALLBACK] name=%s weight_type=%s input_type=%s\n",
-                        op->name,
-                        w ? ggml_type_name(w->type) : "null",
-                        x ? ggml_type_name(x->type) : "null");
-                }
-                return supported;
-            }
-            case GGML_OP_GET_ROWS: {
-                // Older Hexagon supports GET_ROWS only for F32 embeddings
-                // with I32/I64 indices. In particular, quantized token
-                // embeddings must fall back to a local backend.
-                const bool supported =
-                    op->src[0] != nullptr &&
-                    op->src[1] != nullptr &&
-                    op->src[0]->type == GGML_TYPE_F32 &&
-                    (op->src[1]->type == GGML_TYPE_I32 ||
-                     op->src[1]->type == GGML_TYPE_I64) &&
-                    op->type == GGML_TYPE_F32;
-                if (!supported && std::getenv("GGML_RPC_GET_ROWS_DEBUG") != nullptr) {
-                    GGML_LOG_ERROR("[RPC_GET_ROWS_FALLBACK] name=%s src_type=%s dst_type=%s\n",
-                        op->name,
-                        op->src[0] ? ggml_type_name(op->src[0]->type) : "null",
-                        ggml_type_name(op->type));
-                }
-                return supported;
-            }
-            // Keep SET_ROWS on RPC for remotely allocated KV-cache tensors.
-            case GGML_OP_SET_ROWS:
-                return true;
-            default:
-                return false;
+        return ggml_backend_rpc_device_supports_op_conservative(op);
+    }
+
+    auto * ctx =
+        static_cast<ggml_backend_rpc_device_context *>(dev->context);
+
+    rpc_msg_supports_op_req request {};
+    request.device = ctx->device;
+    request.op = serialize_tensor(op);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        request.srcs[i] = serialize_tensor(op->src[i]);
+    }
+
+    const std::string key = rpc_supports_op_structural_key(request);
+    {
+        std::lock_guard<std::mutex> lock(ctx->supports_op_cache_mutex);
+        auto it = ctx->supports_op_cache.find(key);
+        if (it != ctx->supports_op_cache.end()) {
+            return it->second;
         }
     }
 
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    // TODO: query the remote backend and cache the results
-    return true;
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    // RPC_CMD_SUPPORTS_OP was introduced in protocol patch 16. Older servers
+    // are kept usable through the conservative local capability mirror rather
+    // than falling back to the previous unsafe "return true" behavior.
+    const uint8_t remote_patch =
+        rpc_get_remote_patch(ctx->endpoint + "_compute");
+
+    bool supported = false;
+    if (remote_patch < 16) {
+        supported = ggml_backend_rpc_device_supports_op_conservative(op);
+
+        static std::mutex warn_mutex;
+        static std::unordered_set<std::string> warned_endpoints;
+        std::lock_guard<std::mutex> warn_lock(warn_mutex);
+        if (warned_endpoints.insert(ctx->endpoint).second) {
+            GGML_LOG_WARN(
+                "[RPC_SUPPORTS_OP] remote %s uses protocol patch %u; "
+                "using conservative local capability fallback\n",
+                ctx->endpoint.c_str(),
+                (unsigned) remote_patch);
+        }
+    } else {
+        rpc_msg_supports_op_rsp response {};
+        const bool status = send_rpc_cmd(
+            sock,
+            RPC_CMD_SUPPORTS_OP,
+            &request,
+            sizeof(request),
+            &response,
+            sizeof(response));
+
+        if (!status) {
+            GGML_LOG_ERROR(
+                "[RPC_SUPPORTS_OP] remote query failed endpoint=%s device=%u op=%s\n",
+                ctx->endpoint.c_str(),
+                ctx->device,
+                ggml_op_name(op->op));
+            return false;
+        }
+        supported = response.supported != 0;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->supports_op_cache_mutex);
+        if (ctx->supports_op_cache.size() >= RPC_SUPPORTS_OP_CACHE_MAX) {
+            ctx->supports_op_cache.clear();
+        }
+        ctx->supports_op_cache.emplace(key, supported);
+    }
+
+    if (std::getenv("GGML_RPC_SUPPORTS_OP_DEBUG") != nullptr) {
+        GGML_LOG_INFO(
+            "[RPC_SUPPORTS_OP_CLIENT] endpoint=%s device=%u op=%s "
+            "type=%s supported=%d patch=%u\n",
+            ctx->endpoint.c_str(),
+            ctx->device,
+            ggml_op_name(op->op),
+            ggml_type_name(op->type),
+            supported ? 1 : 0,
+            (unsigned) remote_patch);
+    }
+
+    return supported;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
