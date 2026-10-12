@@ -64,11 +64,12 @@ def resolve_target(case, expected_layers, focus_layer):
         "attn_out" if role == "output" else "ffn_up")
 
 
-def region_of(layer, stage, changed_layers, first, direct_stage, role):
-    if layer < first or (
-        layer == first and
-        STAGE_INDEX.get(stage, 1000000) < STAGE_INDEX[direct_stage]
-    ):
+def region_of(capture_id, layer, stage, changed_layers,
+              direct_stage, role, first_target_capture):
+    # A lower layer in a LATER decode iteration may depend on the token
+    # sampled after a higher-layer MatMul in the PREVIOUS iteration.
+    # Spatial layer numbers alone cannot establish causal upstream drift.
+    if first_target_capture is None or capture_id < first_target_capture:
         return "UPSTREAM"
     if layer in changed_layers and (
         stage == direct_stage or
@@ -95,6 +96,18 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
     missing_ref = sorted(ref.keys() - npu.keys(), key=lambda k: ref[k].capture_id)
     missing_npu = sorted(npu.keys() - ref.keys(), key=lambda k: npu[k].capture_id)
 
+    # First captured target output is the temporal analysis barrier.
+    # Its CPU capture ID is the reference ordering of callbacks, not a
+    # true DSP execution timestamp; interpret async scheduling cautiously.
+    target_capture_ids = []
+    for snap in ref.values():
+        match = RE_LAYER.fullmatch(snap.name)
+        if (match is not None and int(match["layer"]) in changed_layers and
+            (match["stage"] == direct_stage or
+             (role == "ffn" and match["stage"] == "ffn_gate"))):
+            target_capture_ids.append(snap.capture_id)
+    first_target_capture = min(target_capture_ids) if target_capture_ids else None
+
     rows = []
     for key in shared:
         a, b = ref[key], npu[key]
@@ -108,8 +121,8 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         stage = match["stage"] if match else a.name
         layer = int(match["layer"]) if match else -1
         cosine = stats["cosine"]
-        region = region_of(layer, stage, changed_layers,
-                           first_layer, direct_stage, role)
+        region = region_of(a.capture_id, layer, stage, changed_layers,
+                           direct_stage, role, first_target_capture)
 
         severe = (stats["nonfinite"] != 0 or
                   (stats["bad"] != 0 and not math.isfinite(cosine)) or
@@ -214,6 +227,7 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
     result = {
         "case": case,
         "focus_layer": first_layer,
+        "first_target_capture_id": first_target_capture,
         "changed_layers": changed_layers,
         "target_stage": direct_stage,
         "target_role": role,
@@ -246,10 +260,12 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         "worst_output_stage": worst(OUTPUT_STAGES),
         "first_critical": critical[0] if critical else None,
         "critical_examples": critical[:10],
-        "note": ("UPSTREAM differences indicate input/run drift, not causal "
-                 "propagation from a later migrated MatMul. Downstream changes "
-                 "are tracked but separated from direct target error. "
-                 "A passing capture comparison still needs HTP audit and "
+        "note": ("UPSTREAM means before the first captured target output, "
+                 "based on baseline capture IDs. A lower layer in a later "
+                 "decode iteration may be temporally downstream of the "
+                 "migrated higher-layer MatMul via token sampling. "
+                 "Captured graph order is not a true DSP timing trace. "
+                 "A passing comparison still needs HTP audit and "
                  "capture-free decode."),
     }
     with (output / "summary.json").open("w", encoding="utf-8") as f:
@@ -260,8 +276,9 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
           "only_cpu=%d only_npu=%d critical=%d diff=%d" %
           (case, verdict, len(shared), len(missing_ref),
            len(missing_npu), len(critical), len(diff)))
-    print("  target=%s layers=%s focus=%d"
-          % (direct_stage, changed_layers, first_layer))
+    print("  target=%s layers=%s focus=%d first_target_capture_id=%s"
+          % (direct_stage, changed_layers, first_layer,
+             first_target_capture))
     if missing_stages:
         print("  required stages not captured:", ", ".join(missing_stages))
     for region, info in region_counts.items():
