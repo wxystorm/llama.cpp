@@ -229,6 +229,10 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         "only_cpu": len(missing_ref),
         "only_npu": len(missing_npu),
         "missing_stages": missing_stages,
+        "only_baseline_examples": [str(k) for k in missing_ref[:8]],
+        "only_candidate_examples": [str(k) for k in missing_npu[:8]],
+        "captured_stages": sorted("%s-%d" % (stage, layer)
+                                  for layer, stage in captured_stages),
         "critical": len(critical),
         "diff": len(diff),
         "min_cosine": min((r["cosine"] for r in rows if r["cosine"] is not None),
@@ -274,13 +278,14 @@ def compare(ref_dir: Path, npu_dir: Path, case: str, output: Path,
         targets = [r for r in local if r["stage"] in CHECK_STAGES]
         if not targets:
             continue
-        w = max(targets, key=lambda r: r["normalized_rmse"] or 0.0)
+        w = max(targets, key=lambda r: (
+            r["normalized_rmse"] if r["normalized_rmse"] is not None else -1))
         print("  layer=%d checked=%d critical=%d worst=%s "
-              "rmse=%.6g nrmse=%.6g cosine=%s" %
+              "rmse=%s nrmse=%s cosine=%s" %
               (layer, len(targets),
                sum(r["status"] == "CRITICAL" for r in targets),
-               w["name"], w["rmse"] or 0.0,
-               w["normalized_rmse"] or 0.0, str(w["cosine"])))
+               w["name"], str(w["rmse"]),
+               str(w["normalized_rmse"]), str(w["cosine"])))
     if critical:
         f = critical[0]
         print("  first CRITICAL in reference execution order: %s "
