@@ -882,32 +882,87 @@ static thread_local rpc_cmd_roundtrip_profile *
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     rpc_cmd_roundtrip_profile * const profile =
         rpc_cmd_roundtrip_profile_active;
+    const bool get_diag =
+        cmd == RPC_CMD_GET_TENSOR &&
+        std::getenv("GGML_RPC_GET_DIAG") != nullptr;
 
     const int64_t request_send_begin_us =
         profile != nullptr ? ggml_time_us() : 0;
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_CLIENT] stage=request_send_begin "
+            "input=%p input_size=%zu output=%p output_size=%zu\n",
+            input, input_size, output, output_size);
+        std::fflush(stderr);
+    }
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+        if (get_diag) {
+            GGML_LOG_ERROR("[RPC_GET_DIAG_CLIENT] stage=request_send_failed\n");
+            std::fflush(stderr);
+        }
         return false;
+    }
+    if (get_diag) {
+        GGML_LOG_INFO("[RPC_GET_DIAG_CLIENT] stage=request_send_done\n");
+        std::fflush(stderr);
     }
     const int64_t request_send_done_us =
         profile != nullptr ? ggml_time_us() : 0;
 
-    uint64_t out_size;
+    uint64_t out_size = 0;
     const int64_t response_header_begin_us =
         profile != nullptr ? ggml_time_us() : 0;
+    if (get_diag) {
+        GGML_LOG_INFO("[RPC_GET_DIAG_CLIENT] stage=response_header_wait\n");
+        std::fflush(stderr);
+    }
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        if (get_diag) {
+            GGML_LOG_ERROR("[RPC_GET_DIAG_CLIENT] stage=response_header_failed\n");
+            std::fflush(stderr);
+        }
         return false;
+    }
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_CLIENT] stage=response_header_done "
+            "wire_size=%" PRIu64 " expected=%zu\n",
+            out_size, output_size);
+        std::fflush(stderr);
     }
     const int64_t response_header_done_us =
         profile != nullptr ? ggml_time_us() : 0;
 
     if (out_size != output_size) {
+        if (get_diag) {
+            GGML_LOG_ERROR(
+                "[RPC_GET_DIAG_CLIENT] stage=response_size_mismatch "
+                "wire_size=%" PRIu64 " expected=%zu\n",
+                out_size, output_size);
+            std::fflush(stderr);
+        }
         return false;
     }
 
     const int64_t response_body_begin_us =
         profile != nullptr ? ggml_time_us() : 0;
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_CLIENT] stage=response_body_begin "
+            "dst=%p bytes=%zu\n",
+            output, output_size);
+        std::fflush(stderr);
+    }
     if (!sock->recv_data(output, output_size)) {
+        if (get_diag) {
+            GGML_LOG_ERROR("[RPC_GET_DIAG_CLIENT] stage=response_body_failed\n");
+            std::fflush(stderr);
+        }
         return false;
+    }
+    if (get_diag) {
+        GGML_LOG_INFO("[RPC_GET_DIAG_CLIENT] stage=response_body_done\n");
+        std::fflush(stderr);
     }
     const int64_t response_body_done_us =
         profile != nullptr ? ggml_time_us() : 0;
@@ -1887,7 +1942,33 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
     request.size = size;
-    GGML_LOG_INFO("ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n", sizeof(request));
+
+    const bool get_diag =
+        std::getenv("GGML_RPC_GET_DIAG") != nullptr;
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_CLIENT] stage=begin "
+            "tensor=%s type=%d ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] tensor_data=0x%" PRIx64 " "
+            "dst=%p offset=%zu size=%zu remote_base=0x%" PRIx64 " "
+            "remote_buffer_size=%zu device=%u endpoint=%s request_bytes=%zu\n",
+            tensor->name,
+            (int) tensor->type,
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+            request.tensor.data,
+            data, offset, size,
+            ctx->remote_ptr,
+            ggml_backend_buffer_get_size(buffer),
+            ctx->device,
+            ctx->endpoint.c_str(),
+            sizeof(request));
+        std::fflush(stderr);
+    } else {
+        GGML_LOG_INFO(
+            "ggml_backend_rpc_buffer_get_tensor: sent %zu bytes\n",
+            sizeof(request));
+    }
 
     bool status;
     if (rpc_stage_ready_callback != nullptr) {
@@ -5665,6 +5746,29 @@ bool rpc_server::get_tensor_into(
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
+    const bool get_diag =
+        std::getenv("GGML_RPC_GET_DIAG") != nullptr;
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_SERVER] stage=deserialized "
+            "tensor=%s type=%d ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] tensor_data=%p request_data=0x%" PRIx64 " "
+            "offset=%" PRIu64 " size=%" PRIu64 " response=%p "
+            "buffer_base=%p buffer_size=%zu\n",
+            tensor->name,
+            (int) tensor->type,
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+            tensor->data,
+            request.tensor.data,
+            request.offset,
+            request.size,
+            response_data,
+            ggml_backend_buffer_get_base(tensor->buffer),
+            ggml_backend_buffer_get_size(tensor->buffer));
+        std::fflush(stderr);
+    }
+
     if (!ensure_opencl_tensor_extra(tensor)) {
         GGML_LOG_ERROR(
             "[%s] failed to initialize OpenCL tensor state for '%s'\n",
@@ -5686,6 +5790,14 @@ bool rpc_server::get_tensor_into(
         }
     }
 
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_SERVER] stage=backend_get_begin "
+            "tensor=%s response=%p offset=%" PRIu64 " size=%" PRIu64 "\n",
+            tensor->name, response_data, request.offset, request.size);
+        std::fflush(stderr);
+    }
+
     const int64_t t0 = ggml_time_us();
     ggml_backend_tensor_get(
         tensor,
@@ -5693,6 +5805,14 @@ bool rpc_server::get_tensor_into(
         request.offset,
         request.size);
     const int64_t get_us = ggml_time_us() - t0;
+
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_SERVER] stage=backend_get_done "
+            "tensor=%s size=%" PRIu64 " elapsed_ms=%.3f\n",
+            tensor->name, request.size, get_us / 1000.0);
+        std::fflush(stderr);
+    }
 
     if (RPC_DEBUG) {
         GGML_LOG_INFO(

@@ -18,6 +18,7 @@
 #  include <unistd.h>
 #endif
 #include <cstdlib>
+#include <cinttypes>
 #include <mutex>
 #include <optional>
 
@@ -37,6 +38,59 @@ typedef int sockfd_t;
 #endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+
+#ifdef _WIN32
+static bool rpc_win32_writeable_range(void * data, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (data == nullptr) {
+        return false;
+    }
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(data);
+    const uintptr_t end = begin + size;
+    if (end < begin) {
+        return false;
+    }
+
+    uintptr_t cur = begin;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi {};
+        if (VirtualQuery(
+                reinterpret_cast<const void *>(cur),
+                &mbi,
+                sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT ||
+            (mbi.Protect & PAGE_GUARD) != 0 ||
+            (mbi.Protect & PAGE_NOACCESS) != 0) {
+            return false;
+        }
+
+        const DWORD prot = mbi.Protect & 0xff;
+        const bool writeable =
+            prot == PAGE_READWRITE ||
+            prot == PAGE_WRITECOPY ||
+            prot == PAGE_EXECUTE_READWRITE ||
+            prot == PAGE_EXECUTE_WRITECOPY;
+        if (!writeable) {
+            return false;
+        }
+
+        const uintptr_t region_begin =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t region_end =
+            region_begin + mbi.RegionSize;
+        if (region_end <= cur) {
+            return false;
+        }
+        cur = std::min(end, region_end);
+    }
+    return true;
+}
+#endif
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -480,9 +534,39 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
 }
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
+    const bool get_diag =
+        std::getenv("GGML_RPC_GET_DIAG") != nullptr;
+
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_TRANSPORT] stage=recv_begin "
+            "dst=%p size=%zu use_rdma=%d\n",
+            data, size, use_rdma ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+#ifdef _WIN32
+    if (get_diag && !rpc_win32_writeable_range(data, size)) {
+        GGML_LOG_ERROR(
+            "[RPC_GET_DIAG_TRANSPORT] stage=invalid_write_range "
+            "dst=%p size=%zu\n",
+            data, size);
+        std::fflush(stderr);
+        return false;
+    }
+#endif
+
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
-        return rdma_recv(data, size);
+        const bool ok = rdma_recv(data, size);
+        if (get_diag) {
+            GGML_LOG_INFO(
+                "[RPC_GET_DIAG_TRANSPORT] stage=recv_done "
+                "dst=%p size=%zu ok=%d mode=rdma\n",
+                data, size, ok ? 1 : 0);
+            std::fflush(stderr);
+        }
+        return ok;
     }
 #endif
     size_t bytes_recv = 0;
@@ -491,7 +575,27 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     size_t first_recv_bytes = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        if (get_diag) {
+            GGML_LOG_INFO(
+                "[RPC_GET_DIAG_TRANSPORT] stage=recv_chunk_begin "
+                "dst=%p offset=%zu chunk=%zu total=%zu\n",
+                static_cast<char *>(data) + bytes_recv,
+                bytes_recv,
+                size_to_recv,
+                size);
+            std::fflush(stderr);
+        }
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
+        if (get_diag) {
+            GGML_LOG_INFO(
+                "[RPC_GET_DIAG_TRANSPORT] stage=recv_chunk_done "
+                "dst=%p offset=%zu requested=%zu got=%" PRId64 "\n",
+                static_cast<char *>(data) + bytes_recv,
+                bytes_recv,
+                size_to_recv,
+                static_cast<int64_t>(n));
+            std::fflush(stderr);
+        }
         if (n < 0) {
             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
                            bytes_recv, size_to_recv);
@@ -514,6 +618,13 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
             (first_recv_done_us - recv_start_us) / 1000.0,
             (recv_done_us - first_recv_done_us) / 1000.0,
             (recv_done_us - recv_start_us) / 1000.0);
+    if (get_diag) {
+        GGML_LOG_INFO(
+            "[RPC_GET_DIAG_TRANSPORT] stage=recv_done "
+            "dst=%p size=%zu ok=1 mode=tcp\n",
+            data, size);
+        std::fflush(stderr);
+    }
     return true;
 }
 
