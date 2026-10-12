@@ -1382,9 +1382,9 @@ static bool rpc_alloc_size_cache_enabled() {
 static constexpr size_t RPC_SUPPORTS_OP_CACHE_MAX = 16384;
 
 static void rpc_supports_op_normalize_tensor(rpc_tensor & tensor) {
-    // Keep the structural information used by backend supports_op() checks,
-    // but remove graph-local pointer identities. Preserve only whether a
-    // concrete remote buffer/data address exists.
+    // Keep only properties that can affect backend supports_op(). Tensor
+    // identity, names, and exact addresses are graph/layer-local and would
+    // otherwise turn structurally identical ops into separate RPC misses.
     tensor.id     = 0;
     tensor.buffer = tensor.buffer != 0 ? 1 : 0;
     tensor.data   = tensor.data   != 0 ? 1 : 0;
@@ -1392,6 +1392,8 @@ static void rpc_supports_op_normalize_tensor(rpc_tensor & tensor) {
         tensor.src[i] = 0;
     }
     tensor.view_src = tensor.view_src != 0 ? 1 : 0;
+    memset(tensor.name, 0, sizeof(tensor.name));
+    memset(tensor.padding, 0, sizeof(tensor.padding));
 }
 
 static std::string rpc_supports_op_structural_key(
