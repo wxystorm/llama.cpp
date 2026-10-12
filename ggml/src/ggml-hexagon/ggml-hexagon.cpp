@@ -88,6 +88,7 @@ static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS 
 static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
 static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
 static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
+static bool opt_qkv_audit = false; // opt-in per-batch QKV DSP execution acknowledgement
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -1782,6 +1783,45 @@ struct ggml_hexagon_opqueue {
                                   " magic=0x%08x reason=DSP_PROBE_NOT_RETURNED"
                                   " (check DSP library deployment)\n", rsp.id, magic);
                 }
+            }
+        }
+
+        // Correctness-only audit: report Q/K/V weight MatMul operations
+        // carried by a completed HTP batch. The DSP batch ACK proves that
+        // the batch returned OK, but not that each tensor matches CPU values.
+        // A separate PC tensor dump comparison provides numerical evidence.
+        if (opt_qkv_audit) {
+            const auto & completed_ops = op_cache[rsp.id];
+            for (const auto & queued : completed_ops) {
+                if (queued.opcode != HTP_OP_MUL_MAT &&
+                    queued.opcode != HTP_OP_MUL_MAT_ADD &&
+                    queued.opcode != HTP_OP_MUL_MAT_QKV) {
+                    continue;
+                }
+                const ggml_tensor * output = queued.node;
+                const ggml_tensor * weight = output ? output->src[0] : nullptr;
+                if (weight == nullptr) {
+                    continue;
+                }
+                const char * name = weight->name;
+                if (strncmp(name, "blk.", 4) != 0) {
+                    continue;
+                }
+                const char * attn = strstr(name + 4, ".attn_");
+                if (attn == nullptr ||
+                    (strcmp(attn, ".attn_q.weight") != 0 &&
+                     strcmp(attn, ".attn_k.weight") != 0 &&
+                     strcmp(attn, ".attn_v.weight") != 0)) {
+                    continue;
+                }
+                GGML_LOG_INFO("[HEX_QKV_AUDIT] session=%s batch_id=%u"
+                              " batch_status=%s weight=%s output=%s"
+                              " opcode=%u opstage=%u compute_enabled=%d\n",
+                              shm_buf->sess->c_name(), rsp.id,
+                              status_to_str(rsp.status), name,
+                              output->name, (unsigned) queued.opcode,
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
             }
         }
 
@@ -4854,6 +4894,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
     const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
     const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
+    const char * str_qkv_audit = getenv("GGML_HEXAGON_QKV_AUDIT");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4916,6 +4957,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                                    strcmp(str_set_rows_host_input_sync, "1") == 0;
     opt_set_rows_sync_timing = str_set_rows_sync_timing != nullptr &&
                                strcmp(str_set_rows_sync_timing, "1") == 0;
+    opt_qkv_audit = str_qkv_audit != nullptr &&
+                    strcmp(str_qkv_audit, "1") == 0;
+    if (opt_qkv_audit) {
+        GGML_LOG_WARN("[HEX_QKV_AUDIT] enabled=1"
+                      " note=per_batch_HTP_ack_not_per_op_output_validation\n");
+    }
     if (opt_set_rows_host_input_sync) {
         GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
                       " scope=all_SET_ROWS_external_F32_values_and_indices"
