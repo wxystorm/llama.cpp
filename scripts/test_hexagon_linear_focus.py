@@ -15,7 +15,7 @@ import unittest
 from summarize_hexagon_linear_layers import compare, resolve_target
 
 LAYERS = (13, 14, 15)
-STAGES = ("attn_out", "ffn_out", "l_out")
+STAGES = ("attn_norm", "attn_out", "ffn_out", "l_out")
 HEADER = ("id", "name", "ne0", "ne1", "ne2", "ne3",
           "type", "op", "file", "bytes")
 BASE = (1.0, 2.0, 3.0)
@@ -81,20 +81,28 @@ class FocusComparatorTests(unittest.TestCase):
                        "UPSTREAM_DIVERGENCE")
         self.assertEqual(r["first_upstream_diff"]["name"], "attn_out-13")
 
-    def test_after_first_target_can_be_later_decode(self):
-        # Same lower layer (13) but in step 2, after 15-output in step 1:
-        # this is temporally downstream, possibly via a sampled token.
+    def test_before_target_in_later_evaluation_is_reentry(self):
+        # Second graph evaluation has its own target barrier. The lower
+        # layer 13 is BEFORE its 15-output, but may inherit prior state.
         r = self.check("15-output", {(1, "attn_out-13"): CHANGED},
-                       "DOWNSTREAM_CRITICAL")
+                       "REENTRY_UPSTREAM_DIVERGENCE")
         self.assertEqual(r["region_counts"]["upstream"]["diff"], 0)
-        self.assertEqual(r["region_counts"]["downstream"]["critical"], 1)
+        self.assertEqual(r["region_counts"]["reentry_upstream"]["critical"], 1)
+        self.assertEqual(len(r["graph_evaluation_starts"]), 2)
+        self.assertEqual(len(r["target_capture_ids_by_evaluation"]), 2)
 
-    def test_omitted_stage_both_sides_is_capture_mismatch(self):
+    def test_omitted_required_stage_both_sides_is_capture_mismatch(self):
         r = self.check("15-output", expected="CAPTURE_MISMATCH",
-                       omit_both={"ffn_out-14"})
+                       omit_both={"l_out-14"})
         self.assertEqual(r["only_cpu"], 0)
         self.assertEqual(r["only_npu"], 0)
-        self.assertIn("ffn_out-14", r["missing_stages"])
+        self.assertIn("l_out-14", r["missing_stages"])
+
+    def test_ffn_out_callback_is_optional(self):
+        r = self.check("15-output", omit_both={
+            "ffn_out-13", "ffn_out-14", "ffn_out-15"})
+        self.assertEqual(r["missing_stages"], [])
+        self.assertEqual(r["compared"], 18)
 
     def test_identical_repeat_is_clean(self):
         r = self.check("baseline-control")
