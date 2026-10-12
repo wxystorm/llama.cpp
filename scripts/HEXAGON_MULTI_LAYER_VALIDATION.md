@@ -49,6 +49,16 @@ grep -E 'HEX_QKV_AUDIT|HEX_KV_AUDIT' rpc-multilayer.log
 
 如果 PC 比较显示正确，但对应的 Q/K/V 权重始终没有该类记录，不能声称 HTP 实际执行了此算子；先检查实际的 RPC/CPU 放置、日志级别、是否部署新库以及 `GGML_HEXAGON_OPFUSION`。
 
+## 重要修正：-ngl 包括输出层
+
+当前分支 `src/llama-model.cpp` 使用 `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`。对于 16 个 Transformer 层的模型：
+
+- `-ngl 3`：第 14、15 层和输出层在 RPC，**第 13 层仍在 CPU**。
+- `-ngl 4`：第 13、14、15 层和输出层在 RPC。
+- `-ngl 7`：第 10～15 层和输出层在 RPC。
+
+验证脚本已经把默认值改为 `-Ngl 4`，并对层起点与 `-ngl` 是否相符进行检查。此前 `-ngl 3` 的 `13-k` 结果与 CPU **完全一致**，并不证明第 13 层 NPU 正确。即使显示 `NUMERICALLY_CLOSE`，仍须对照手机 `[HEX_QKV_AUDIT]` 确认目标 K MatMul 确实在 HTP 上执行。
+
 ## PC 运行
 
 确认已经取到分支，PC 可以复用前一次构建的 `llama-cli.exe`（本阶段没有修改 PC 代码）。
@@ -66,7 +76,7 @@ git switch test/hexagon-multilayer-qkv-20261012
 ```powershell
 .\scripts\verify_hexagon_qkv_layers.ps1 `
     -Cases @("13-k", "15-k") `
-    -Tokens 1 -Overwrite
+    -Ngl 4 -Tokens 1 -Overwrite
 ```
 
 一次完整覆盖三层所有 Q/K/V：
@@ -77,13 +87,13 @@ git switch test/hexagon-multilayer-qkv-20261012
 
 当单 token Prefill 检查通过时，`-Tokens 8` 进一步验证 Decode，但注意：生成 token 若因极小数值差异发生采样分叉，后续张量差异不能直接视作错误。默认 `-Tokens 1` 是更清楚的首轮对照。
 
-如要继续推广到 10–15 层，先改 `-ngl 6`、层范围和测试用例，再生成**新的** CPU 基线：
+如要继续推广到 10–15 层，先改 `-ngl 7`（6 个 Transformer 层 + 输出层）、层范围和测试用例，再生成**新的** CPU 基线：
 
 ```powershell
 .\scripts\verify_hexagon_qkv_layers.ps1 `
-    -Ngl 6 -ModelLayers 16 -StartLayer 10 -EndLayer 15 `
+    -Ngl 7 -ModelLayers 16 -StartLayer 10 -EndLayer 15 `
     -Cases @("10-k","11-k","12-k","all-qkv") `
-    -OutDir ".\hexagon-qkv-ngl6"
+    -OutDir ".\hexagon-qkv-ngl7"
 ```
 
 不建议在同一输出目录混合不同 `ngl`、模型或源代码版本的 Dump；旧目录存在时脚本默认拒绝覆盖，明确使用 `-Overwrite` 才覆盖。
