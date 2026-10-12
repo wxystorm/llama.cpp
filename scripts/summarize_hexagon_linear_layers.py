@@ -52,7 +52,7 @@ def resolve_target(case, expected_layers, focus_layer):
             raise ValueError("--focus-layer must equal the target case layer")
         return [layer], layer, match.group("role"), {
             "output": "attn_out", "gate": "ffn_gate", "up": "ffn_up",
-            "down": "ffn_out", "ffn": "ffn_up",
+            "down": "l_out", "ffn": "ffn_up",
         }[match.group("role")]
 
     if case not in ("all-output", "all-ffn"):
