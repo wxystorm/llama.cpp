@@ -987,6 +987,15 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+static bool ggml_moe_split_diag_enabled() {
+    return getenv("GGML_MOE_SPLIT_DIAG") != NULL;
+}
+
+static bool ggml_moe_split_diag_tensor(const struct ggml_tensor * t) {
+    return t != NULL &&
+           strstr(t->name, "ffn_moe_weights_sum") != NULL;
+}
+
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
     for (int i = 0; i < sched->n_backends; i++) {
@@ -1996,15 +2005,6 @@ static void ggml_backend_sched_debug_tensor(
         tag, tensor->name, n, sum, std::sqrt(l2), max_abs, n > 0 ? data[0] : 0.0f, n > 1 ? data[1] : 0.0f,
         n > 2 ? data[2] : 0.0f, n > 3 ? data[3] : 0.0f, n > 4 ? data[4] : 0.0f, n > 5 ? data[5] : 0.0f,
         n > 6 ? data[6] : 0.0f, n > 7 ? data[7] : 0.0f);
-}
-
-static bool ggml_moe_split_diag_enabled() {
-    return getenv("GGML_MOE_SPLIT_DIAG") != NULL;
-}
-
-static bool ggml_moe_split_diag_tensor(const struct ggml_tensor * t) {
-    return t != NULL &&
-           strstr(t->name, "ffn_moe_weights_sum") != NULL;
 }
 
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
