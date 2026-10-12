@@ -250,6 +250,44 @@ Interpretation:
 Current evidence does not establish which case holds. Verify corresponding run's `[HEX_LINEAR_AUDIT]` to establish the intended actual HTP MatMul.
 
 
+### Concrete break: next-layer RMSNorm nearly identical, Q/K/V abruptly diverge
+
+User printed previously hidden intermediate rows from 13-output and 14-output on the initial 2-token evaluation:
+
+| Case | target attn_out NRMSE | own l_out NRMSE | next attn_norm NRMSE | next Q NRMSE/cos | next K NRMSE/cos | next V NRMSE/cos |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| `13-output` | 0.010992 | 0.0000705 | 0.000298 | 1.074514 / -0.221969 | 0.001312 / 0.999999 | 1.544102 / 0.000756 |
+| `14-output` | 0.007811 | 0.0000709 | 0.0002218 | 1.021794 / 0.015517 | 1.015586 / 0.016509 | 1.316972 / -0.045330 |
+
+`ffn_inp`, `ffn_norm`, `ffn_gate`, `ffn_up`, `ffn_swiglu`, `l_out`, and next `attn_norm` are close; thus there is no critical jump in CPU FFN or interlayer RMSNorm. The first **large** numerical jump is in next-layer **Q/K/V HTP projection outputs**, in the 2-token eval. In 13-output K14 remains close while Q14/V14 are nearly unrelated to baseline, which is strong evidence against simple small numerical differences growing proportionally through the shared norm input. Physical DSP input visibility, opcode execution and buffer alias remain hypotheses, not confirmed mechanisms.
+
+Next read-only gate from saved snapshots: per-token columns (2 tokens, not the older 42-token index-2 zero):
+
+```powershell
+$root = '.\hexagon-attn-expanded\attn'
+foreach ($case in @('13-output','14-output')) {
+  $next = if ($case -eq '13-output') { 14 } else { 15 }
+  py -3 .\scripts\diagnose_hexagon_token_columns.py `
+    "$root\baseline" "$root\$case" `
+    --tokens 2 --top 2 `
+    --name-regex "^(attn_norm|Qcur|Kcur|Vcur)-$next$"
+}
+```
+
+Also verify same-run phone `[HEX_LINEAR_AUDIT]` for attention output L and `[HEX_QKV_AUDIT]` for next-layer Q/K/V; each must have `batch_status=OK`, `compute_enabled=1`, noting ACK alone does not validate values. Differentiate full/partial zero tokens from nonzero unrelated vectors.
+
+If necessary, causal placement experiment: pin next-layer Q/V to CPU **in both** baseline and candidate for `13-output`, leaving K14 HTP:
+
+```powershell
+.\scripts\verify_hexagon_linear_layers.ps1 `
+    -Stage attn -Ngl 4 -Cases @('13-output') `
+    -FocusLayer 13 -BaselineControl `
+    -PinQCpuLayer 14 -PinVCpuLayer 14 `
+    -OutDir '.\hexagon-attn13-qv14-cpu-control'
+```
+
+A pass there links failure to next-layer HTP projection or its memory/schedule dependency, but pinning changes graph placement, so it is not definitive proof of a specific cache or kernel defect. Do not start FFN target-offload tests while these errors persist.
+
 ## Probe logs and caveats
 
 ```bash
