@@ -12706,6 +12706,52 @@ auto prefill_norm_sg_has_prework =
                     if (gate_status == GGML_STATUS_SUCCESS &&
                             has_pending_phone_prefill_pc_for_layer(
                                 predecessor_layer)) {
+                        if (xlayer_boundary_diag) {
+                            size_t pending_pred_branches = 0;
+                            size_t ready_pred_pc = 0;
+                            size_t ready_pred_return = 0;
+
+                            for (const auto & branch :
+                                    pending_phone_prefill_pc_branches) {
+                                if (branch.layer != predecessor_layer) {
+                                    continue;
+                                }
+                                ++pending_pred_branches;
+
+                                if (branch.pc_worker != nullptr &&
+                                        branch.pc_worker->is_completed(
+                                            branch.pc_task)) {
+                                    ++ready_pred_pc;
+                                }
+
+                                if (branch.return_task != 0 &&
+                                        branch.return_lane <
+                                            ggml_backend_meta_context::
+                                                PREFILL_RETURN_LANES) {
+                                    auto * return_worker =
+                                        backend_ctx->prefill_return_workers[
+                                            branch.return_lane];
+                                    if (return_worker != nullptr &&
+                                            return_worker->is_completed(
+                                                branch.return_task)) {
+                                        ++ready_pred_return;
+                                    }
+                                }
+                            }
+
+                            GGML_LOG_ERROR(
+                                "[XLAYER_FFN_GATE_FENCE_ARM] "
+                                "pred_layer=%d next_layer=%d next_chunk=%d "
+                                "pending_pred=%zu pc_ready=%zu "
+                                "return_ready=%zu action=DRAIN_PHONE_LAYER\n",
+                                predecessor_layer,
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                pending_pred_branches,
+                                ready_pred_pc,
+                                ready_pred_return);
+                        }
+
                         gate_status =
                             drain_phone_prefill_pc_layer(
                                 predecessor_layer);
