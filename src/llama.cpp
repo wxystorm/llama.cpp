@@ -191,6 +191,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+            const bool phone_npu_role_requested =
+                std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
+            LLAMA_LOG_INFO(
+                "[PHONE_NPU_ROLE_CONFIG] requested=%d active=%d n_devices=%zu "
+                "expected_layout={PC,PhoneGPU,PhoneNPU}\n",
+                phone_npu_role_requested ? 1 : 0,
+                phone_npu_role_requested && devs.size() == 3 ? 1 : 0,
+                devs.size());
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
             }
