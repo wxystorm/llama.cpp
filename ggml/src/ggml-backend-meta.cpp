@@ -14036,88 +14036,6 @@ auto prefill_norm_sg_has_prework =
             }
 
             uint64_t ring_reduce_task = 0;
-            if (phone_primary_chunk_ring_active &&
-                    return_task != 0) {
-                GGML_ASSERT(phone_return_stage != nullptr);
-                GGML_ASSERT(
-                    return_lane <
-                    ggml_backend_meta_context::PREFILL_RETURN_LANES);
-                ggml_backend_meta_transfer_worker * return_worker =
-                    backend_ctx->prefill_return_workers[return_lane];
-                GGML_ASSERT(return_worker != nullptr);
-
-                if (backend_ctx->phone_prefill_ring_reduce_worker ==
-                        nullptr) {
-                    backend_ctx->phone_prefill_ring_reduce_worker =
-                        new ggml_backend_meta_transfer_worker();
-                }
-                ggml_backend_meta_transfer_worker * reduce_worker =
-                    backend_ctx->phone_prefill_ring_reduce_worker;
-
-                // Allocate/build the tiny ADD graph on the main Meta thread.
-                // The reducer thread only submits this immutable graph, so it
-                // never races the main-thread aux graph/node allocators.
-                ggml_cgraph * ring_add_graph =
-                    prepare_phone_prefill_staged_add_graph(
-                        i,
-                        prefill_down_layer,
-                        prefill_down_chunk,
-                        phone_return_stage);
-
-                ring_reduce_task = reduce_worker->enqueue(
-                    [return_worker,
-                     return_task,
-                     phone_backend,
-                     ring_add_graph,
-                     return_timing,
-                     prefill_down_layer,
-                     prefill_down_chunk,
-                     i,
-                     pipeline_debug,
-                     tensor_phone_stage_profile]
-                    (uint64_t task_id) -> ggml_status {
-                        const int64_t wait_begin_us = ggml_time_us();
-                        const ggml_status return_status =
-                            return_worker->wait(return_task);
-                        const int64_t return_wait_us =
-                            ggml_time_us() - wait_begin_us;
-                        if (return_status != GGML_STATUS_SUCCESS) {
-                            return return_status;
-                        }
-
-                        const int64_t add_begin_us = ggml_time_us();
-                        if (return_timing != nullptr) {
-                            return_timing->add_submit_begin_us =
-                                add_begin_us;
-                        }
-                        const ggml_status add_status =
-                            ggml_backend_graph_compute_async(
-                                phone_backend,
-                                ring_add_graph);
-                        const int64_t add_end_us = ggml_time_us();
-                        if (return_timing != nullptr) {
-                            return_timing->add_submit_end_us =
-                                add_end_us;
-                        }
-
-                        if (pipeline_debug ||
-                                tensor_phone_stage_profile) {
-                            printf(
-                                "[CHUNK_RING_REDUCE] "
-                                "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " return_wait_ms=%.3f "
-                                "add_submit_ms=%.3f status=%d\n",
-                                prefill_down_layer,
-                                prefill_down_chunk,
-                                i,
-                                task_id,
-                                return_wait_us / 1000.0,
-                                (add_end_us - add_begin_us) / 1000.0,
-                                (int) add_status);
-                        }
-                        return add_status;
-                    });
-            }
 
             const bool defer_local_phone_ffn =
                 !phone_prefill_producer_route &&
@@ -14197,6 +14115,91 @@ auto prefill_norm_sg_has_prework =
 
             if (xlayer_direct_bound) {
                 phone_graph->uid = saved_phone_ffn_uid;
+            }
+
+            // Only a direct-bound Phone partial has a stable lifetime across
+            // later chunk/layer submissions. Build the tiny ADD graph after
+            // that binding is installed, then let one dedicated ATT-side
+            // worker wait for the remote return and enqueue the reduction.
+            if (phone_primary_chunk_ring_active &&
+                    xlayer_direct_bound &&
+                    return_task != 0) {
+                GGML_ASSERT(phone_return_stage != nullptr);
+                GGML_ASSERT(
+                    return_lane <
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                ggml_backend_meta_transfer_worker * return_worker =
+                    backend_ctx->prefill_return_workers[return_lane];
+                GGML_ASSERT(return_worker != nullptr);
+
+                if (backend_ctx->phone_prefill_ring_reduce_worker ==
+                        nullptr) {
+                    backend_ctx->phone_prefill_ring_reduce_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+                ggml_backend_meta_transfer_worker * reduce_worker =
+                    backend_ctx->phone_prefill_ring_reduce_worker;
+
+                ggml_cgraph * ring_add_graph =
+                    prepare_phone_prefill_staged_add_graph(
+                        i,
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        phone_return_stage);
+
+                ring_reduce_task = reduce_worker->enqueue(
+                    [return_worker,
+                     return_task,
+                     phone_backend,
+                     ring_add_graph,
+                     return_timing,
+                     prefill_down_layer,
+                     prefill_down_chunk,
+                     i,
+                     pipeline_debug,
+                     tensor_phone_stage_profile]
+                    (uint64_t task_id) -> ggml_status {
+                        const int64_t wait_begin_us = ggml_time_us();
+                        const ggml_status return_status =
+                            return_worker->wait(return_task);
+                        const int64_t return_wait_us =
+                            ggml_time_us() - wait_begin_us;
+                        if (return_status != GGML_STATUS_SUCCESS) {
+                            return return_status;
+                        }
+
+                        const int64_t add_begin_us = ggml_time_us();
+                        if (return_timing != nullptr) {
+                            return_timing->add_submit_begin_us =
+                                add_begin_us;
+                        }
+                        const ggml_status add_status =
+                            ggml_backend_graph_compute_async(
+                                phone_backend,
+                                ring_add_graph);
+                        const int64_t add_end_us = ggml_time_us();
+                        if (return_timing != nullptr) {
+                            return_timing->add_submit_end_us =
+                                add_end_us;
+                        }
+
+                        if (pipeline_debug ||
+                                tensor_phone_stage_profile) {
+                            printf(
+                                "[CHUNK_RING_REDUCE] "
+                                "layer=%d chunk=%d sg=%zu task=%" PRIu64
+                                " return_wait_ms=%.3f "
+                                "add_submit_ms=%.3f status=%d\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                i,
+                                task_id,
+                                return_wait_us / 1000.0,
+                                (add_end_us - add_begin_us) / 1000.0,
+                                (int) add_status);
+                        }
+                        return add_status;
+                    });
             }
 
             pending_phone_prefill_pc_branches.push_back({
