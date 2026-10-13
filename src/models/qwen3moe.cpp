@@ -685,9 +685,36 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             wave_layer);
                     }
 
+                    ggml_tensor * ffn_hidden = ffn_norm;
+                    ggml_tensor * ffn_topk = phone_routing.selected_experts;
+                    ggml_tensor * ffn_weights = phone_routing.weights;
+                    const bool phone_npu_stage =
+                        phone_primary_wavefront &&
+                        std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
+                    if (phone_npu_stage) {
+                        ffn_hidden = ggml_dup_tensor(ctx0, ffn_norm);
+                        ffn_topk = ggml_dup_tensor(
+                            ctx0, phone_routing.selected_experts);
+                        ffn_weights = ggml_dup_tensor(
+                            ctx0, phone_routing.weights);
+
+                        const std::string npu_hidden_name =
+                            "phone_npu_ffn_hidden_chunk_" +
+                            std::to_string(ci);
+                        const std::string npu_topk_name =
+                            "phone_npu_route_topk_chunk_" +
+                            std::to_string(ci);
+                        const std::string npu_weights_name =
+                            "phone_npu_route_weights_chunk_" +
+                            std::to_string(ci);
+                        cb(ffn_hidden, npu_hidden_name.c_str(), wave_layer);
+                        cb(ffn_topk, npu_topk_name.c_str(), wave_layer);
+                        cb(ffn_weights, npu_weights_name.c_str(), wave_layer);
+                    }
+
                     ggml_tensor * down =
                         build_moe_ffn(
-                            ffn_norm,
+                            ffn_hidden,
                             model.layers[wave_layer].ffn_gate_inp,
                             model.layers[wave_layer].ffn_up_exps,
                             model.layers[wave_layer].ffn_gate_exps,
@@ -702,10 +729,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             model.layers[wave_layer].ffn_up_exps_s,
                             model.layers[wave_layer].ffn_gate_exps_s,
                             model.layers[wave_layer].ffn_down_exps_s,
-                            phone_routing.selected_experts,
+                            ffn_topk,
                             1,
                             nullptr,
-                            phone_routing.weights);
+                            ffn_weights);
                     const std::string down_name =
                         "prefill_ffn_down_chunk_" +
                         std::to_string(ci);
@@ -965,9 +992,33 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     cb(phone_routing.weights, route_weights_name.c_str(), il);
                 }
 
+                ggml_tensor * ffn_hidden = norm_chunk;
+                ggml_tensor * ffn_topk = phone_routing.selected_experts;
+                ggml_tensor * ffn_weights = phone_routing.weights;
+                const bool phone_npu_stage =
+                    phone_primary_router &&
+                    std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
+                if (phone_npu_stage) {
+                    ffn_hidden = ggml_dup_tensor(ctx0, norm_chunk);
+                    ffn_topk = ggml_dup_tensor(
+                        ctx0, phone_routing.selected_experts);
+                    ffn_weights = ggml_dup_tensor(
+                        ctx0, phone_routing.weights);
+
+                    const std::string npu_hidden_name =
+                        "phone_npu_ffn_hidden_chunk_" + std::to_string(i);
+                    const std::string npu_topk_name =
+                        "phone_npu_route_topk_chunk_" + std::to_string(i);
+                    const std::string npu_weights_name =
+                        "phone_npu_route_weights_chunk_" + std::to_string(i);
+                    cb(ffn_hidden, npu_hidden_name.c_str(), il);
+                    cb(ffn_topk, npu_topk_name.c_str(), il);
+                    cb(ffn_weights, npu_weights_name.c_str(), il);
+                }
+
                 ggml_tensor * moe_chunk =
                     build_moe_ffn(
-                        norm_chunk,
+                        ffn_hidden,
                         model.layers[il].ffn_gate_inp,
                         model.layers[il].ffn_up_exps,
                         model.layers[il].ffn_gate_exps,
@@ -982,10 +1033,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         model.layers[il].ffn_up_exps_s,
                         model.layers[il].ffn_gate_exps_s,
                         model.layers[il].ffn_down_exps_s,
-                        phone_routing.selected_experts,
+                        ffn_topk,
                         1,
                         nullptr,
-                        phone_routing.weights);
+                        ffn_weights);
                 const std::string down_name =
                     "prefill_ffn_down_chunk_" + std::to_string(i);
                 cb(moe_chunk, down_name.c_str(), il);
@@ -1017,8 +1068,25 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 cb(phone_routing.weights, "phone_moe_route_weights", il);
             }
 
+            ggml_tensor * ffn_hidden = cur;
+            ggml_tensor * ffn_topk = phone_routing.selected_experts;
+            ggml_tensor * ffn_weights = phone_routing.weights;
+            const bool phone_npu_stage =
+                phone_primary_router &&
+                std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
+            if (phone_npu_stage) {
+                ffn_hidden = ggml_dup_tensor(ctx0, cur);
+                ffn_topk = ggml_dup_tensor(
+                    ctx0, phone_routing.selected_experts);
+                ffn_weights = ggml_dup_tensor(
+                    ctx0, phone_routing.weights);
+                cb(ffn_hidden, "phone_npu_ffn_hidden", il);
+                cb(ffn_topk, "phone_npu_route_topk", il);
+                cb(ffn_weights, "phone_npu_route_weights", il);
+            }
+
             ggml_tensor * moe_out =
-                build_moe_ffn(cur,
+                build_moe_ffn(ffn_hidden,
                         model.layers[il].ffn_gate_inp,
                         model.layers[il].ffn_up_exps,
                         model.layers[il].ffn_gate_exps,
@@ -1033,10 +1101,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         model.layers[il].ffn_up_exps_s,
                         model.layers[il].ffn_gate_exps_s,
                         model.layers[il].ffn_down_exps_s,
-                        phone_routing.selected_experts,
+                        ffn_topk,
                         use_decode_chunked_moe ? n_decode_chunks : 1,
                         use_decode_chunked_moe ? &decode_down_chunks : nullptr,
-                        phone_routing.weights);
+                        ffn_weights);
 
             if (use_decode_chunked_moe) {
                 GGML_ASSERT(
