@@ -1867,6 +1867,86 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
+    // A role-separated tensor can still carry an AXIS_0/AXIS_1 split state
+    // even when all of its elements belong to exactly one child backend:
+    //
+    //   ATT : { PC=0, PhoneGPU=full, PhoneNPU=0 }
+    //   FFN : { PC=0, PhoneGPU=0,    PhoneNPU=full }
+    //
+    // Do not feed such tensors through the generic 2D split uploader. In
+    // particular, quantized OpenCL set_tensor is not a safe incremental row
+    // write primitive. When this call covers the full logical tensor, the
+    // single child tensor has the same shape/layout as the logical tensor, so
+    // upload it once as a normal full tensor.
+    if (split_state.axis >= 0 &&
+            split_state.axis < GGML_MAX_DIMS &&
+            offset == 0 &&
+            size == ggml_nbytes(tensor)) {
+        size_t owner = n_bufs;
+        bool single_owner = true;
+
+        for (size_t j = 0; j < n_bufs; ++j) {
+            int64_t ne_j = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                ne_j +=
+                    split_state.ne[is*n_bufs + j] *
+                    split_state.nr[is];
+            }
+
+            if (ne_j == 0) {
+                continue;
+            }
+
+            if (owner != n_bufs) {
+                single_owner = false;
+                break;
+            }
+            owner = j;
+        }
+
+        if (single_owner && owner < n_bufs) {
+            int64_t owner_ne = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                owner_ne +=
+                    split_state.ne[is*n_bufs + owner] *
+                    split_state.nr[is];
+            }
+
+            if (owner_ne == tensor->ne[split_state.axis]) {
+                ggml_tensor * simple_tensor =
+                    ggml_backend_meta_buffer_simple_tensor(
+                        tensor,
+                        owner);
+                GGML_ASSERT(simple_tensor != nullptr);
+                GGML_ASSERT(
+                    ggml_nbytes(simple_tensor) ==
+                    ggml_nbytes(tensor));
+
+                const bool trace_single_owner =
+                    std::getenv("GGML_META_SINGLE_OWNER_SET_TRACE") != nullptr ||
+                    std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
+
+                if (trace_single_owner) {
+                    GGML_LOG_ERROR(
+                        "[META_SINGLE_OWNER_SET] tensor=%s axis=%d "
+                        "owner=%zu bytes=%zu type=%d\n",
+                        tensor->name,
+                        split_state.axis,
+                        owner,
+                        size,
+                        (int) tensor->type);
+                }
+
+                ggml_backend_tensor_set(
+                    simple_tensor,
+                    data,
+                    0,
+                    size);
+                return;
+            }
+        }
+    }
+
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
