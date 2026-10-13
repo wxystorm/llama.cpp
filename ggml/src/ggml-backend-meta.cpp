@@ -2551,6 +2551,10 @@ struct ggml_backend_meta_context {
     std::mutex prefill_pc_compute_mutex;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
+    // Chunk Ring: one lightweight completion worker owned by the Phone/ATT
+    // side. It waits for each remote FFN partial and only submits the local
+    // ADD/reduce; heavy ATT/FFN work remains on the backend queues.
+    ggml_backend_meta_transfer_worker * phone_prefill_ring_reduce_worker = nullptr;
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
         prefill_pc_return_host_payloads;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES> prefill_reduce_workers { nullptr,
@@ -3141,6 +3145,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
+    delete phone_prefill_ring_reduce_worker;
     for (auto * worker : prefill_reduce_workers) {
         delete worker;
     }
@@ -4472,6 +4477,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint64_t return_task = 0;
         size_t return_lane = 0;
         uint64_t phone_ffn_seq = 0;
+        uint64_t ring_reduce_task = 0;
         ggml_tensor * return_stage = nullptr;
         std::shared_ptr<phone_prefill_return_timing> timing;
     };
@@ -5791,6 +5797,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_ORDERED_RETURN") != nullptr;
     const bool phone_prefill_chunk_join =
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
+    const bool phone_primary_chunk_ring =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_RING") != nullptr;
     const bool phone_prefill_critical_return =
         std::getenv("GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
     const bool phone_prefill_route_lane_swap =
@@ -6024,6 +6032,34 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_producer_route &&
         phone_prefill_async_return_active &&
         phone_prefill_chunk_join_active;
+
+    // Chunk Ring deliberately reuses the proven V2 storage/dependency
+    // machinery, but removes the one-chunk-ahead throttle and moves the
+    // return->ADD completion onto a dedicated Phone-side worker.
+    const bool phone_primary_chunk_ring_active =
+        phone_primary_chunk_ring &&
+        n_backends == 2 &&
+        phone_primary_xlayer_wave &&
+        phone_prefill_chunk_pipeline &&
+        phone_prefill_producer_route &&
+        phone_prefill_async_return_active &&
+        phone_prefill_ordered_return_active &&
+        phone_prefill_chunk_join_active;
+
+    if ((pipeline_debug || tensor_phone_stage_profile ||
+         xlayer_wave_trace) &&
+            phone_primary_chunk_ring) {
+        printf(
+            "[CHUNK_RING_CAP] requested=1 active=%d "
+            "chunk_pipeline=%d producer_route=%d async_return=%d "
+            "ordered_return=%d chunk_join=%d\n",
+            phone_primary_chunk_ring_active ? 1 : 0,
+            phone_prefill_chunk_pipeline ? 1 : 0,
+            phone_prefill_producer_route ? 1 : 0,
+            phone_prefill_async_return_active ? 1 : 0,
+            phone_prefill_ordered_return_active ? 1 : 0,
+            phone_prefill_chunk_join_active ? 1 : 0);
+    }
 
     if ((pipeline_debug || tensor_phone_stage_profile ||
          xlayer_wave_trace) &&
@@ -6286,7 +6322,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto bind_phone_prefill_down_direct =
         [&](int layer, int chunk, ggml_cgraph * phone_graph) -> bool {
-            if (!phone_primary_xlayer_ffn_ahead_v2_active ||
+            if (!(phone_primary_xlayer_ffn_ahead_v2_active ||
+                   phone_primary_chunk_ring_active) ||
                     layer < phone_primary_xlayer_first_layer ||
                     layer >= phone_primary_xlayer_last_layer ||
                     chunk < 0 ||
@@ -6897,11 +6934,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return GGML_STATUS_SUCCESS;
         };
 
-    auto submit_phone_prefill_staged_add =
+    auto prepare_phone_prefill_staged_add_graph =
         [&](size_t sg,
             int layer,
             int chunk,
-            ggml_tensor * return_stage) -> ggml_status {
+            ggml_tensor * return_stage) -> ggml_cgraph * {
             constexpr size_t j_dst = 1;
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
             ggml_cgraph * phone_graph =
@@ -6934,6 +6971,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_cgraph * add_graph = get_cgraph_aux();
             add_graph->nodes[0] = node_red;
             add_graph->n_nodes = 1;
+            return add_graph;
+        };
+
+    auto submit_phone_prefill_staged_add =
+        [&](size_t sg,
+            int layer,
+            int chunk,
+            ggml_tensor * return_stage) -> ggml_status {
+            constexpr size_t j_dst = 1;
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+            ggml_cgraph * add_graph =
+                prepare_phone_prefill_staged_add_graph(
+                    sg, layer, chunk, return_stage);
 
             const int64_t submit_begin_us = ggml_time_us();
             const ggml_status status =
@@ -6942,7 +6992,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     add_graph);
             const int64_t submit_us =
                 ggml_time_us() - submit_begin_us;
-            record_reduce_add(submit_us, true);
+            record_reduce_add(
+                submit_us,
+                status == GGML_STATUS_SUCCESS);
 
             if (tensor_phone_stage_profile) {
                 auto & stage =
@@ -7005,64 +7057,85 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool return_ready_before =
                 return_worker->is_completed(
                     branch_it->return_task);
+            const bool ring_reduce =
+                branch_it->ring_reduce_task != 0;
+            ggml_backend_meta_transfer_worker * ring_reduce_worker =
+                ring_reduce ?
+                    backend_ctx->phone_prefill_ring_reduce_worker :
+                    nullptr;
+            GGML_ASSERT(!ring_reduce ||
+                        ring_reduce_worker != nullptr);
+            const bool completion_ready_before =
+                ring_reduce ?
+                    ring_reduce_worker->is_completed(
+                        branch_it->ring_reduce_task) :
+                    return_ready_before;
 
-            // Normal chunk boundaries are opportunistic only.  If the return
-            // has not completed, leave this branch pending and let the next
-            // Phone chunk run instead of turning the per-chunk dependency into
-            // a host-side barrier.  The last chunk of the layer calls this
-            // helper with wait_for_return=true and drains every residual
-            // branch before the next layer is allowed to start.
-            if (!wait_for_return && !return_ready_before) {
+            // Opportunistic chunk boundaries never block. In Chunk Ring mode
+            // "complete" means return + Phone ADD has been submitted by the
+            // dedicated reducer, not merely that the network return finished.
+            if (!wait_for_return && !completion_ready_before) {
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
                     printf(
                         "[PHONE_PREFILL_CHUNK_JOIN_DEFER] "
                         "layer=%d chunk=%d sg=%zu seq=%" PRIu64
-                        " pc_ready=%d return_ready=0\n",
+                        " pc_ready=%d return_ready=%d reduce_ready=%d\n",
                         branch_it->layer,
                         branch_it->chunk,
                         branch_it->sg,
                         branch_it->phone_ffn_seq,
-                        pc_ready_before ? 1 : 0);
+                        pc_ready_before ? 1 : 0,
+                        return_ready_before ? 1 : 0,
+                        completion_ready_before ? 1 : 0);
                 }
                 return GGML_STATUS_SUCCESS;
             }
 
             const int64_t join_wait_begin_us = ggml_time_us();
-            const ggml_status return_status =
-                return_worker->wait(
-                    branch_it->return_task);
+            const ggml_status completion_status =
+                ring_reduce ?
+                    ring_reduce_worker->wait(
+                        branch_it->ring_reduce_task) :
+                    return_worker->wait(
+                        branch_it->return_task);
             const int64_t join_wait_us =
                 ggml_time_us() - join_wait_begin_us;
-            if (return_status != GGML_STATUS_SUCCESS) {
-                return return_status;
+            if (completion_status != GGML_STATUS_SUCCESS) {
+                return completion_status;
             }
 
-            // The return ACK is emitted only after the Phone server has seen
-            // this chunk's FFN-ready seq and enqueued the PC-partial write.
-            // Submit ADD immediately for this chunk.  It goes to the same
-            // ordered Phone compute socket/queue, so write -> ADD is ordered
-            // without a host fence.
-            const int64_t add_begin_us = ggml_time_us();
-            if (branch_it->timing != nullptr) {
-                branch_it->timing->add_submit_begin_us =
-                    add_begin_us;
-            }
-            const ggml_status add_status =
-                submit_phone_prefill_staged_add(
-                    branch_it->sg,
-                    branch_it->layer,
-                    branch_it->chunk,
-                    branch_it->return_stage);
-            const int64_t add_end_us = ggml_time_us();
-            const int64_t add_us =
-                add_end_us - add_begin_us;
-            if (branch_it->timing != nullptr) {
-                branch_it->timing->add_submit_end_us =
-                    add_end_us;
-            }
-            if (add_status != GGML_STATUS_SUCCESS) {
-                return add_status;
+            int64_t add_us = 0;
+            if (!ring_reduce) {
+                // Legacy/V2 path: return ACK means the write is queued; the
+                // main graph thread submits the ordered Phone ADD here.
+                const int64_t add_begin_us = ggml_time_us();
+                if (branch_it->timing != nullptr) {
+                    branch_it->timing->add_submit_begin_us =
+                        add_begin_us;
+                }
+                const ggml_status add_status =
+                    submit_phone_prefill_staged_add(
+                        branch_it->sg,
+                        branch_it->layer,
+                        branch_it->chunk,
+                        branch_it->return_stage);
+                const int64_t add_end_us = ggml_time_us();
+                add_us = add_end_us - add_begin_us;
+                if (branch_it->timing != nullptr) {
+                    branch_it->timing->add_submit_end_us =
+                        add_end_us;
+                }
+                if (add_status != GGML_STATUS_SUCCESS) {
+                    return add_status;
+                }
+            } else if (branch_it->timing != nullptr &&
+                       branch_it->timing->add_submit_begin_us != 0 &&
+                       branch_it->timing->add_submit_end_us >=
+                           branch_it->timing->add_submit_begin_us) {
+                add_us =
+                    branch_it->timing->add_submit_end_us -
+                    branch_it->timing->add_submit_begin_us;
             }
 
             if (pipeline_debug ||
@@ -7077,8 +7150,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     branch_it->chunk,
                     branch_it->sg,
                     branch_it->phone_ffn_seq,
-                    wait_for_return ?
-                        "LAYER_BARRIER" : "EAGER",
+                    ring_reduce ?
+                        "CHUNK_RING" :
+                        (wait_for_return ?
+                            "LAYER_BARRIER" : "EAGER"),
                     branch_it->return_lane,
                     pc_ready_before ? 1 : 0,
                     return_ready_before ? 1 : 0,
@@ -7333,8 +7408,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             it->return_lane];
                     GGML_ASSERT(return_worker != nullptr);
 
-                    if (return_worker->is_completed(
-                            it->return_task)) {
+                    const bool completed =
+                        it->ring_reduce_task != 0 ?
+                            (backend_ctx->phone_prefill_ring_reduce_worker !=
+                                 nullptr &&
+                             backend_ctx->phone_prefill_ring_reduce_worker->
+                                 is_completed(it->ring_reduce_task)) :
+                            return_worker->is_completed(
+                                it->return_task);
+                    if (completed) {
                         branch_it = it;
                         break;
                     }
@@ -7396,6 +7478,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto drain_phone_prefill_pc_layer =
         [&](int layer) -> ggml_status {
+            if (phone_primary_chunk_ring_active) {
+                // Ring branches already own return->ADD tasks. A forced drain
+                // only waits/reaps them; it must never submit a second ADD.
+                return reap_phone_prefill_pc_layer(layer, true);
+            }
+
             const bool has_layer_pc =
                 std::any_of(
                     pending_phone_prefill_pc_branches.begin(),
@@ -7979,7 +8067,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto open_phone_prefill_lane1_return_gate =
         [&](int layer, int chunk) {
-            if (!phone_prefill_chunk_join_active ||
+            if (phone_primary_chunk_ring_active ||
+                    !phone_prefill_chunk_join_active ||
                     !phone_prefill_producer_route ||
                     ggml_backend_meta_context::PREFILL_RETURN_LANES < 2) {
                 return;
@@ -12571,7 +12660,8 @@ auto prefill_norm_sg_has_prework =
                     prefill_down_layer - 1;
 
                 if (phone_primary_xlayer_wave &&
-                        phone_primary_xlayer_ffn_ahead_v2_active) {
+                        (phone_primary_xlayer_ffn_ahead_v2_active ||
+                         phone_primary_chunk_ring_active)) {
                     // Cross-layer V2: first satisfy the exact mathematical
                     // dependency (L-1,C). Stable per-chunk Phone FFN storage
                     // keeps unrelated predecessor chunks alive safely.
@@ -12623,16 +12713,17 @@ auto prefill_norm_sg_has_prework =
                     const int next_pred_chunk =
                         prefill_down_chunk + 1;
                     const bool has_next_pred_chunk =
-                        find_down_chunk(
+                        !phone_primary_chunk_ring_active &&
+                        (find_down_chunk(
                             0,
                             true,
                             predecessor_layer,
                             next_pred_chunk) != nullptr ||
-                        find_down_chunk(
+                         find_down_chunk(
                             1,
                             true,
                             predecessor_layer,
-                            next_pred_chunk) != nullptr;
+                            next_pred_chunk) != nullptr);
 
                     bool throttle_reduce_waited = false;
                     bool throttle_phone_waited = false;
@@ -13680,6 +13771,7 @@ auto prefill_norm_sg_has_prework =
                 std::shared_ptr<phone_prefill_lane1_return_gate>
                     lane1_return_gate;
                 if (use_chunk_join_return &&
+                        !phone_primary_chunk_ring_active &&
                         return_lane == 1) {
                     auto & gate =
                         phone_prefill_lane1_return_gates[
@@ -13943,6 +14035,90 @@ auto prefill_norm_sg_has_prework =
                     });
             }
 
+            uint64_t ring_reduce_task = 0;
+            if (phone_primary_chunk_ring_active &&
+                    return_task != 0) {
+                GGML_ASSERT(phone_return_stage != nullptr);
+                GGML_ASSERT(
+                    return_lane <
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                ggml_backend_meta_transfer_worker * return_worker =
+                    backend_ctx->prefill_return_workers[return_lane];
+                GGML_ASSERT(return_worker != nullptr);
+
+                if (backend_ctx->phone_prefill_ring_reduce_worker ==
+                        nullptr) {
+                    backend_ctx->phone_prefill_ring_reduce_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+                ggml_backend_meta_transfer_worker * reduce_worker =
+                    backend_ctx->phone_prefill_ring_reduce_worker;
+
+                // Allocate/build the tiny ADD graph on the main Meta thread.
+                // The reducer thread only submits this immutable graph, so it
+                // never races the main-thread aux graph/node allocators.
+                ggml_cgraph * ring_add_graph =
+                    prepare_phone_prefill_staged_add_graph(
+                        i,
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        phone_return_stage);
+
+                ring_reduce_task = reduce_worker->enqueue(
+                    [return_worker,
+                     return_task,
+                     phone_backend,
+                     ring_add_graph,
+                     return_timing,
+                     prefill_down_layer,
+                     prefill_down_chunk,
+                     i,
+                     pipeline_debug,
+                     tensor_phone_stage_profile]
+                    (uint64_t task_id) -> ggml_status {
+                        const int64_t wait_begin_us = ggml_time_us();
+                        const ggml_status return_status =
+                            return_worker->wait(return_task);
+                        const int64_t return_wait_us =
+                            ggml_time_us() - wait_begin_us;
+                        if (return_status != GGML_STATUS_SUCCESS) {
+                            return return_status;
+                        }
+
+                        const int64_t add_begin_us = ggml_time_us();
+                        if (return_timing != nullptr) {
+                            return_timing->add_submit_begin_us =
+                                add_begin_us;
+                        }
+                        const ggml_status add_status =
+                            ggml_backend_graph_compute_async(
+                                phone_backend,
+                                ring_add_graph);
+                        const int64_t add_end_us = ggml_time_us();
+                        if (return_timing != nullptr) {
+                            return_timing->add_submit_end_us =
+                                add_end_us;
+                        }
+
+                        if (pipeline_debug ||
+                                tensor_phone_stage_profile) {
+                            printf(
+                                "[CHUNK_RING_REDUCE] "
+                                "layer=%d chunk=%d sg=%zu task=%" PRIu64
+                                " return_wait_ms=%.3f "
+                                "add_submit_ms=%.3f status=%d\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                i,
+                                task_id,
+                                return_wait_us / 1000.0,
+                                (add_end_us - add_begin_us) / 1000.0,
+                                (int) add_status);
+                        }
+                        return add_status;
+                    });
+            }
+
             const bool defer_local_phone_ffn =
                 !phone_prefill_producer_route &&
                 phone_prefill_defer_phone_ffn &&
@@ -14032,6 +14208,7 @@ auto prefill_norm_sg_has_prework =
                 return_task,
                 return_lane,
                 phone_ffn_seq,
+                ring_reduce_task,
                 phone_return_stage,
                 return_timing,
             });
@@ -15130,6 +15307,20 @@ auto prefill_norm_sg_has_prework =
             meta_rebuild_us / 1000.0,
             meta_execute_us / 1000.0,
             meta_other_all_us / 1000.0);
+    }
+
+    if (runtime_profile_graph &&
+            phone_primary_chunk_ring) {
+        printf(
+            "[CHUNK_RING_SUM] active=%d pending=%zu "
+            "direct_bind_count=%" PRId64
+            " chunk_gate_count=%" PRId64
+            " chunk_gate_wait_ms=%.3f\n",
+            phone_primary_chunk_ring_active ? 1 : 0,
+            pending_phone_prefill_pc_branches.size(),
+            phone_xlayer_v2_direct_bind_count,
+            phone_xlayer_v2_chunk_gate_count,
+            phone_xlayer_v2_chunk_gate_wait_us / 1000.0);
     }
 
     if (runtime_profile_graph &&
