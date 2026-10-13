@@ -7653,39 +7653,34 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 -1.0;
 
                         GGML_LOG_ERROR(
-                            "[XLAYER_RETURN_CHUNK_DRAIN] "
-                            "pred_layer=%d next_layer=%d next_chunk=%d "
-                            "pred_chunk=%d sg=%zu lane=%zu "
-                            "ffn_seq=%" PRIu64
-                            " pc_ready_before=%d "
-                            "return_ready_before=%d "
-                            "return_ready_after_pc=%d "
-                            "main_pc_wait_ms=%.3f "
-                            "main_return_wait_ms=%.3f "
-                            "pc_done_rel_ms=%.3f "
-                            "send_begin_rel_ms=%.3f "
-                            "send_end_rel_ms=%.3f "
-                            "worker_pc_wait_ms=%.3f "
-                            "lane_gate_wait_ms=%.3f "
-                            "critical_gate_wait_ms=%.3f "
-                            "pc_compute_ms=%.3f "
-                            "pc_return_stage_ms=%.3f "
-                            "send_ms=%.3f\n",
+                            "[XRET_DRAIN_A] P=%d N=%d C=%d "
+                            "lane=%zu seq=%" PRIu64
+                            " pcr=%d rr=%d rap=%d\n",
                             layer,
                             xlayer_return_chunk_diag_next_layer,
-                            xlayer_return_chunk_diag_next_chunk,
                             branch.chunk,
-                            branch.sg,
                             branch.return_lane,
                             branch.phone_ffn_seq,
                             pc_ready_before_wait ? 1 : 0,
                             return_ready_before_wait ? 1 : 0,
-                            return_ready_after_pc_wait ? 1 : 0,
+                            return_ready_after_pc_wait ? 1 : 0);
+                        GGML_LOG_ERROR(
+                            "[XRET_DRAIN_B] P=%d C=%d "
+                            "pcw=%.3f rw=%.3f "
+                            "pcdone=%.3f sb=%.3f se=%.3f\n",
+                            layer,
+                            branch.chunk,
                             pc_wait_us / 1000.0,
                             return_wait_us / 1000.0,
                             pc_done_rel_ms,
                             send_begin_rel_ms,
-                            send_end_rel_ms,
+                            send_end_rel_ms);
+                        GGML_LOG_ERROR(
+                            "[XRET_DRAIN_C] P=%d C=%d "
+                            "wpc=%.3f lg=%.3f cg=%.3f "
+                            "comp=%.3f rstg=%.3f send=%.3f\n",
+                            layer,
+                            branch.chunk,
                             timing != nullptr ?
                                 timing->return_worker_pc_wait_us /
                                     1000.0 : -1.0,
@@ -12852,24 +12847,17 @@ auto prefill_norm_sg_has_prework =
                                 }
 
                                 GGML_LOG_ERROR(
-                                    "[XLAYER_RETURN_CHUNK_GATE] "
-                                    "pred_layer=%d next_layer=%d "
-                                    "next_chunk=%d pred_chunk=%d sg=%zu "
-                                    "lane=%zu ffn_seq=%" PRIu64
-                                    " pc_task=%" PRIu64
-                                    " return_task=%" PRIu64
-                                    " pc_ready=%d return_ready=%d\n",
+                                    "[XRET_GATE] P=%d N=%d C=%d "
+                                    "lane=%zu seq=%" PRIu64
+                                    " pcr=%d rr=%d sg=%zu\n",
                                     predecessor_layer,
                                     prefill_down_layer,
-                                    prefill_down_chunk,
                                     branch.chunk,
-                                    branch.sg,
                                     branch.return_lane,
                                     branch.phone_ffn_seq,
-                                    branch.pc_task,
-                                    branch.return_task,
                                     branch_pc_ready ? 1 : 0,
-                                    branch_return_ready ? 1 : 0);
+                                    branch_return_ready ? 1 : 0,
+                                    branch.sg);
                             }
 
                             GGML_LOG_ERROR(
@@ -13887,26 +13875,22 @@ auto prefill_norm_sg_has_prework =
                         if (xlayer_boundary_diag &&
                                 phone_primary_xlayer_wave) {
                             GGML_LOG_ERROR(
-                                "[XLAYER_RETURN_CHUNK_SEND] "
-                                "layer=%d chunk=%d sg=%zu lane=%zu "
-                                "ffn_seq=%" PRIu64
-                                " worker_pc_wait_ms=%.3f "
-                                "lane_gate_wait_ms=%.3f "
-                                "critical_gate_wait_ms=%.3f "
-                                "pc_route_wait_ms=%.3f "
-                                "pc_gate_wait_ms=%.3f "
-                                "pc_stage_copy_ms=%.3f "
-                                "pc_compute_ms=%.3f "
-                                "pc_return_stage_ms=%.3f "
-                                "send_ms=%.3f status=%d\n",
+                                "[XRET_SEND_A] L=%d C=%d lane=%zu "
+                                "seq=%" PRIu64
+                                " wpc=%.3f lg=%.3f cg=%.3f\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
-                                i,
                                 return_lane,
                                 phone_ffn_seq,
                                 pc_wait_us / 1000.0,
                                 lane_gate_wait_us / 1000.0,
-                                critical_gate_wait_us / 1000.0,
+                                critical_gate_wait_us / 1000.0);
+                            GGML_LOG_ERROR(
+                                "[XRET_SEND_B] L=%d C=%d "
+                                "route=%.3f pgate=%.3f copy=%.3f "
+                                "comp=%.3f rstg=%.3f\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
                                 return_timing->pc_route_wait_us /
                                     1000.0,
                                 return_timing->pc_gate_wait_us /
@@ -13916,9 +13900,15 @@ auto prefill_norm_sg_has_prework =
                                 return_timing->pc_compute_us /
                                     1000.0,
                                 return_timing->pc_return_stage_us /
-                                    1000.0,
+                                    1000.0);
+                            GGML_LOG_ERROR(
+                                "[XRET_SEND_C] L=%d C=%d "
+                                "send=%.3f status=%d sg=%zu\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
                                 send_us / 1000.0,
-                                sent ? 1 : 0);
+                                sent ? 1 : 0,
+                                i);
                         }
 
                         if (pipeline_debug ||
