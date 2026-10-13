@@ -908,8 +908,21 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         const bool tensor_split_layer =
             hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
             hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+        const bool phone_npu_ffn_roles =
+            std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr;
         const bool phone_primary_router =
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY ||
+            (phone_npu_ffn_roles &&
+             hybrid_mode == llama_hybrid_layer_mode::PHONE_ONLY);
+
+        if (phone_npu_ffn_roles &&
+                hybrid_mode == llama_hybrid_layer_mode::PHONE_ONLY &&
+                std::getenv("GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_NPU_GRAPH_ROLE] layer=%d mode=PHONE_ONLY "
+                "router=PHONE_GPU ffn=PHONE_NPU\n",
+                il);
+        }
         const bool use_decode_chunked_moe =
             n_tokens == 1 &&
             n_decode_chunks > 1 &&
