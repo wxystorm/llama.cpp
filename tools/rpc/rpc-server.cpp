@@ -15,6 +15,7 @@
 #  endif
 #endif
 #include <algorithm>
+#include <array>
 #include <clocale>
 #include <codecvt>
 #include <cstdint>
