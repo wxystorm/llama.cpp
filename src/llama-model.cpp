@@ -942,7 +942,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             force_to_device(0);
         }
     } else if (force_phone) {
-        GGML_ASSERT(ud->n_devices == 2);
+        // Legacy "Phone" means the first RPC child. This must remain valid
+        // when a second phone-local RPC device (HTP) is also exposed. The
+        // explicit GPU-ATT/NPU-FFN role mode above will redirect FFN to child
+        // 2; without that mode, preserve old semantics by keeping Phone on
+        // child 1 instead of asserting that only two Meta children exist.
+        GGML_ASSERT(ud->n_devices >= 2);
         force_to_device(1);
     } else if (force_primary) {
         force_to_device(0);
