@@ -1395,6 +1395,46 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+
+        // A source may still be unassigned when it was visited above while
+        // cur_backend_id was -1. This happens for OP_NONE staging leaves used
+        // through view/reshape consumers: the consumer gets its fallback
+        // backend only here, after the first source propagation pass.
+        //
+        // Revisit only still-unassigned sources now that the consumer backend
+        // is final. This preserves all explicit/pre-allocated assignments and
+        // prevents leaf_backend_ids[] from carrying -1 into ggml-gallocr.
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+
+            int * src_backend_id = &tensor_backend_id(src);
+            if (*src_backend_id != -1) {
+                continue;
+            }
+
+            if (src->view_src != NULL &&
+                    tensor_backend_id(src->view_src) != -1) {
+                *src_backend_id = tensor_backend_id(src->view_src);
+                SET_CAUSE(src, "4b.vsrc");
+            } else {
+                *src_backend_id = *cur_backend_id;
+                SET_CAUSE(src, "4b.cur");
+
+                if (getenv("GGML_META_PHONE_NPU_HANDOFF_TRACE") != NULL &&
+                        strncmp(src->name, "phone_npu_", 10) == 0) {
+                    GGML_LOG_ERROR(
+                        "[PHONE_NPU_STAGE_SCHED] tensor=%s consumer=%s "
+                        "backend_id=%d backend=%s action=REPAIR_SRC_BACKEND\n",
+                        src->name,
+                        node->name,
+                        *src_backend_id,
+                        ggml_backend_name(sched->backends[*src_backend_id]));
+                }
+            }
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
