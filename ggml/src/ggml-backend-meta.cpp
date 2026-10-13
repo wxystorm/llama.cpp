@@ -5749,6 +5749,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     std::map<int, xlayer_boundary_diag_stats>
         xlayer_boundary_diag_by_pred_layer;
 
+    // Scope the verbose per-chunk return diagnostics to the exact conservative
+    // cross-layer FFN gate that is about to drain its predecessor.  These
+    // fields are read only by the main Meta thread and never affect ordering.
+    bool xlayer_return_chunk_diag_active = false;
+    int xlayer_return_chunk_diag_pred_layer = -1;
+    int xlayer_return_chunk_diag_next_layer = -1;
+    int xlayer_return_chunk_diag_next_chunk = -1;
+
     int64_t return_wave_phone_credit_wait_count = 0;
     int64_t return_wave_phone_credit_wait_us    = 0;
     int64_t return_wave_phone_credit_wait_max_us = 0;
@@ -7565,8 +7573,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     GGML_ASSERT(branch.return_task != 0);
                     GGML_ASSERT(branch.return_stage != nullptr);
 
-                    const int64_t pc_wait_begin_us = ggml_time_us();
+                    const bool chunk_diag_active =
+                        xlayer_return_chunk_diag_active &&
+                        xlayer_return_chunk_diag_pred_layer == layer;
+
                     GGML_ASSERT(branch.pc_worker != nullptr);
+                    GGML_ASSERT(
+                        branch.return_lane <
+                        ggml_backend_meta_context::PREFILL_RETURN_LANES);
+                    ggml_backend_meta_transfer_worker * return_worker =
+                        backend_ctx->prefill_return_workers[
+                            branch.return_lane];
+                    GGML_ASSERT(return_worker != nullptr);
+
+                    const bool pc_ready_before_wait =
+                        chunk_diag_active &&
+                        branch.pc_worker->is_completed(
+                            branch.pc_task);
+                    const bool return_ready_before_wait =
+                        chunk_diag_active &&
+                        return_worker->is_completed(
+                            branch.return_task);
+
+                    const int64_t pc_wait_begin_us = ggml_time_us();
                     const ggml_status pc_status =
                         branch.pc_worker->wait(
                             branch.pc_task);
@@ -7577,13 +7606,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         return pc_status;
                     }
 
-                    GGML_ASSERT(
-                        branch.return_lane <
-                        ggml_backend_meta_context::PREFILL_RETURN_LANES);
-                    ggml_backend_meta_transfer_worker * return_worker =
-                        backend_ctx->prefill_return_workers[
-                            branch.return_lane];
-                    GGML_ASSERT(return_worker != nullptr);
+                    const bool return_ready_after_pc_wait =
+                        chunk_diag_active &&
+                        return_worker->is_completed(
+                            branch.return_task);
 
                     const int64_t return_wait_begin_us =
                         ggml_time_us();
@@ -7595,6 +7621,88 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return_wait_total_us += return_wait_us;
                     if (return_status != GGML_STATUS_SUCCESS) {
                         return return_status;
+                    }
+
+                    if (chunk_diag_active) {
+                        const auto & timing = branch.timing;
+                        const int64_t send_us =
+                            timing != nullptr &&
+                            timing->return_send_begin_us != 0 &&
+                            timing->return_send_end_us >=
+                                timing->return_send_begin_us ?
+                                timing->return_send_end_us -
+                                    timing->return_send_begin_us :
+                                -1;
+                        const double pc_done_rel_ms =
+                            timing != nullptr &&
+                            timing->pc_done_us != 0 ?
+                                (timing->pc_done_us -
+                                    tail_begin_us) / 1000.0 :
+                                -1.0;
+                        const double send_begin_rel_ms =
+                            timing != nullptr &&
+                            timing->return_send_begin_us != 0 ?
+                                (timing->return_send_begin_us -
+                                    tail_begin_us) / 1000.0 :
+                                -1.0;
+                        const double send_end_rel_ms =
+                            timing != nullptr &&
+                            timing->return_send_end_us != 0 ?
+                                (timing->return_send_end_us -
+                                    tail_begin_us) / 1000.0 :
+                                -1.0;
+
+                        GGML_LOG_ERROR(
+                            "[XLAYER_RETURN_CHUNK_DRAIN] "
+                            "pred_layer=%d next_layer=%d next_chunk=%d "
+                            "pred_chunk=%d sg=%zu lane=%zu "
+                            "ffn_seq=%" PRIu64
+                            " pc_ready_before=%d "
+                            "return_ready_before=%d "
+                            "return_ready_after_pc=%d "
+                            "main_pc_wait_ms=%.3f "
+                            "main_return_wait_ms=%.3f "
+                            "pc_done_rel_ms=%.3f "
+                            "send_begin_rel_ms=%.3f "
+                            "send_end_rel_ms=%.3f "
+                            "worker_pc_wait_ms=%.3f "
+                            "lane_gate_wait_ms=%.3f "
+                            "critical_gate_wait_ms=%.3f "
+                            "pc_compute_ms=%.3f "
+                            "pc_return_stage_ms=%.3f "
+                            "send_ms=%.3f\n",
+                            layer,
+                            xlayer_return_chunk_diag_next_layer,
+                            xlayer_return_chunk_diag_next_chunk,
+                            branch.chunk,
+                            branch.sg,
+                            branch.return_lane,
+                            branch.phone_ffn_seq,
+                            pc_ready_before_wait ? 1 : 0,
+                            return_ready_before_wait ? 1 : 0,
+                            return_ready_after_pc_wait ? 1 : 0,
+                            pc_wait_us / 1000.0,
+                            return_wait_us / 1000.0,
+                            pc_done_rel_ms,
+                            send_begin_rel_ms,
+                            send_end_rel_ms,
+                            timing != nullptr ?
+                                timing->return_worker_pc_wait_us /
+                                    1000.0 : -1.0,
+                            timing != nullptr ?
+                                timing->return_lane_gate_wait_us /
+                                    1000.0 : -1.0,
+                            timing != nullptr ?
+                                timing->return_critical_gate_wait_us /
+                                    1000.0 : -1.0,
+                            timing != nullptr ?
+                                timing->pc_compute_us /
+                                    1000.0 : -1.0,
+                            timing != nullptr ?
+                                timing->pc_return_stage_us /
+                                    1000.0 : -1.0,
+                            send_us >= 0 ?
+                                send_us / 1000.0 : -1.0);
                     }
 
                     if (pipeline_debug ||
@@ -12718,12 +12826,15 @@ auto prefill_norm_sg_has_prework =
                                 }
                                 ++pending_pred_branches;
 
-                                if (branch.pc_worker != nullptr &&
-                                        branch.pc_worker->is_completed(
-                                            branch.pc_task)) {
+                                const bool branch_pc_ready =
+                                    branch.pc_worker != nullptr &&
+                                    branch.pc_worker->is_completed(
+                                        branch.pc_task);
+                                if (branch_pc_ready) {
                                     ++ready_pred_pc;
                                 }
 
+                                bool branch_return_ready = false;
                                 if (branch.return_task != 0 &&
                                         branch.return_lane <
                                             ggml_backend_meta_context::
@@ -12731,12 +12842,34 @@ auto prefill_norm_sg_has_prework =
                                     auto * return_worker =
                                         backend_ctx->prefill_return_workers[
                                             branch.return_lane];
-                                    if (return_worker != nullptr &&
-                                            return_worker->is_completed(
-                                                branch.return_task)) {
+                                    branch_return_ready =
+                                        return_worker != nullptr &&
+                                        return_worker->is_completed(
+                                            branch.return_task);
+                                    if (branch_return_ready) {
                                         ++ready_pred_return;
                                     }
                                 }
+
+                                GGML_LOG_ERROR(
+                                    "[XLAYER_RETURN_CHUNK_GATE] "
+                                    "pred_layer=%d next_layer=%d "
+                                    "next_chunk=%d pred_chunk=%d sg=%zu "
+                                    "lane=%zu ffn_seq=%" PRIu64
+                                    " pc_task=%" PRIu64
+                                    " return_task=%" PRIu64
+                                    " pc_ready=%d return_ready=%d\n",
+                                    predecessor_layer,
+                                    prefill_down_layer,
+                                    prefill_down_chunk,
+                                    branch.chunk,
+                                    branch.sg,
+                                    branch.return_lane,
+                                    branch.phone_ffn_seq,
+                                    branch.pc_task,
+                                    branch.return_task,
+                                    branch_pc_ready ? 1 : 0,
+                                    branch_return_ready ? 1 : 0);
                             }
 
                             GGML_LOG_ERROR(
@@ -12752,9 +12885,26 @@ auto prefill_norm_sg_has_prework =
                                 ready_pred_return);
                         }
 
+                        if (xlayer_boundary_diag) {
+                            xlayer_return_chunk_diag_active = true;
+                            xlayer_return_chunk_diag_pred_layer =
+                                predecessor_layer;
+                            xlayer_return_chunk_diag_next_layer =
+                                prefill_down_layer;
+                            xlayer_return_chunk_diag_next_chunk =
+                                prefill_down_chunk;
+                        }
+
                         gate_status =
                             drain_phone_prefill_pc_layer(
                                 predecessor_layer);
+
+                        if (xlayer_boundary_diag) {
+                            xlayer_return_chunk_diag_active = false;
+                            xlayer_return_chunk_diag_pred_layer = -1;
+                            xlayer_return_chunk_diag_next_layer = -1;
+                            xlayer_return_chunk_diag_next_chunk = -1;
+                        }
                     }
                     if (gate_status != GGML_STATUS_SUCCESS) {
                         return gate_status;
@@ -13732,6 +13882,43 @@ auto prefill_norm_sg_has_prework =
                                 }
                             }
                             critical_return_state->cv.notify_all();
+                        }
+
+                        if (xlayer_boundary_diag &&
+                                phone_primary_xlayer_wave) {
+                            GGML_LOG_ERROR(
+                                "[XLAYER_RETURN_CHUNK_SEND] "
+                                "layer=%d chunk=%d sg=%zu lane=%zu "
+                                "ffn_seq=%" PRIu64
+                                " worker_pc_wait_ms=%.3f "
+                                "lane_gate_wait_ms=%.3f "
+                                "critical_gate_wait_ms=%.3f "
+                                "pc_route_wait_ms=%.3f "
+                                "pc_gate_wait_ms=%.3f "
+                                "pc_stage_copy_ms=%.3f "
+                                "pc_compute_ms=%.3f "
+                                "pc_return_stage_ms=%.3f "
+                                "send_ms=%.3f status=%d\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                i,
+                                return_lane,
+                                phone_ffn_seq,
+                                pc_wait_us / 1000.0,
+                                lane_gate_wait_us / 1000.0,
+                                critical_gate_wait_us / 1000.0,
+                                return_timing->pc_route_wait_us /
+                                    1000.0,
+                                return_timing->pc_gate_wait_us /
+                                    1000.0,
+                                return_timing->pc_stage_copy_us /
+                                    1000.0,
+                                return_timing->pc_compute_us /
+                                    1000.0,
+                                return_timing->pc_return_stage_us /
+                                    1000.0,
+                                send_us / 1000.0,
+                                sent ? 1 : 0);
                         }
 
                         if (pipeline_debug ||
