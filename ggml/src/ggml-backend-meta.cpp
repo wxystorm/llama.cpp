@@ -1603,8 +1603,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
-                        GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-                                                                 == sum * tensor->ne[split_state.axis]);
+                        const int64_t lhs =
+                            split_state.ne[j] * split_state.nr[0] *
+                            tensor->src[i]->ne[src_ss[i].axis];
+                        const int64_t rhs =
+                            sum * tensor->ne[split_state.axis];
+
+                        if (lhs != rhs) {
+                            GGML_LOG_ERROR(
+                                "[META_SPLIT_RATIO_MISMATCH] tensor=%s op=%s "
+                                "src_index=%zu src=%s src_axis=%s "
+                                "out_axis=%s child=%zu "
+                                "out_ne=%" PRId64 " out_nr=%u "
+                                "src_dim=%" PRId64 " src_sum=%" PRId64 " "
+                                "lhs=%" PRId64 " rhs=%" PRId64 "\n",
+                                tensor->name,
+                                ggml_op_name(tensor->op),
+                                i,
+                                tensor->src[i] != nullptr ? tensor->src[i]->name : "(null)",
+                                ggml_backend_meta_split_axis_name(src_ss[i].axis),
+                                ggml_backend_meta_split_axis_name(split_state.axis),
+                                j,
+                                split_state.ne[j],
+                                split_state.nr[0],
+                                tensor->src[i]->ne[src_ss[i].axis],
+                                sum,
+                                lhs,
+                                rhs);
+                        }
+
+                        GGML_ASSERT(lhs == rhs);
                     }
                 }
                 first_src_split_by_axis = false;
