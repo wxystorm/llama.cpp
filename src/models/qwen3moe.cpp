@@ -697,6 +697,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             ctx0, phone_routing.selected_experts);
                         ffn_weights = ggml_dup_tensor(
                             ctx0, phone_routing.weights);
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                            ffn_hidden->nb[d] = ffn_norm->nb[d];
+                            ffn_topk->nb[d] =
+                                phone_routing.selected_experts->nb[d];
+                            ffn_weights->nb[d] =
+                                phone_routing.weights->nb[d];
+                        }
 
                         const std::string npu_hidden_name =
                             "phone_npu_ffn_hidden_chunk_" +
@@ -1004,6 +1011,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         ctx0, phone_routing.selected_experts);
                     ffn_weights = ggml_dup_tensor(
                         ctx0, phone_routing.weights);
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        ffn_hidden->nb[d] = norm_chunk->nb[d];
+                        ffn_topk->nb[d] =
+                            phone_routing.selected_experts->nb[d];
+                        ffn_weights->nb[d] =
+                            phone_routing.weights->nb[d];
+                    }
 
                     const std::string npu_hidden_name =
                         "phone_npu_ffn_hidden_chunk_" + std::to_string(i);
@@ -1080,6 +1094,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ctx0, phone_routing.selected_experts);
                 ffn_weights = ggml_dup_tensor(
                     ctx0, phone_routing.weights);
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    ffn_hidden->nb[d] = cur->nb[d];
+                    ffn_topk->nb[d] =
+                        phone_routing.selected_experts->nb[d];
+                    ffn_weights->nb[d] =
+                        phone_routing.weights->nb[d];
+                }
                 cb(ffn_hidden, "phone_npu_ffn_hidden", il);
                 cb(ffn_topk, "phone_npu_route_topk", il);
                 cb(ffn_weights, "phone_npu_route_weights", il);
