@@ -370,6 +370,25 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+
+    // Experimental three-role phone layout:
+    // child 0 = PC, child 1 = Phone GPU ATT, child 2 = Phone NPU FFN.
+    // Requiring every child to support every op defeats role separation
+    // (e.g. HTP does not need to support an ATT-only op). The per-child Meta
+    // graph and zero-sized split ownership still decide which child executes
+    // the op. Keep the legacy all-of contract everywhere else.
+    const bool phone_npu_roles =
+        std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+        meta_dev_ctx->simple_devs.size() == 3;
+    if (phone_npu_roles) {
+        return std::any_of(
+            meta_dev_ctx->simple_devs.begin(),
+            meta_dev_ctx->simple_devs.end(),
+            [op](ggml_backend_dev_t simple_dev) {
+                return ggml_backend_dev_supports_op(simple_dev, op);
+            });
+    }
+
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
