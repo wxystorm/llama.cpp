@@ -809,7 +809,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             ud->n_devices != 3) {
         static bool warned_bad_phone_npu_layout = false;
         if (!warned_bad_phone_npu_layout) {
-            LLAMA_LOG_WARN(
+            LLAMA_LOG_INFO(
                 "[PHONE_NPU_ROLE] requested=1 active=0 n_devices=%zu "
                 "expected=3 layout={PC,PhoneGPU,PhoneNPU}\n",
                 ud->n_devices);
