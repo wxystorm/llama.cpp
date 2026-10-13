@@ -30,8 +30,6 @@
 #include <vector>
 #include <mutex>
 #include <memory>
-#include <numeric>
-#include <cmath>
 
 #if defined(__linux__)
 #include <sys/types.h>
@@ -195,10 +193,9 @@ struct rpc_server_params {
     int                      tp_world_size = 1;
 
     // Optional phone-local heterogeneous Meta device. The server still exposes
-    // one logical RPC device to the PC, while OpenCL GPU and Hexagon HTP are
-    // scheduled locally inside that device.
+    // one logical RPC device to the PC. V1 uses strict role separation:
+    // OpenCL GPU = ATT/Norm/Router, Hexagon HTP = Phone-side MoE FFN.
     bool                     phone_local_meta = false;
-    float                    phone_npu_ratio  = 0.50f;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -214,8 +211,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  --tp-rank <0|1>                  rank 0 is computer, rank 1 is mobile, default: 0\n");
     fprintf(stderr, "  --tp-world-size <n>            world size for tensor parallelism, default: 1\n");
     fprintf(stderr, "  --phone-local-meta             expose GPUOpenCL+HTP0 as one logical phone device\n");
-    fprintf(stderr, "  --phone-npu-ratio R            NPU share of the phone FFN shard, 0<R<1 (default: %.2f)\n",
-            params.phone_npu_ratio);
+    fprintf(stderr, "                                 GPU owns ATT/Norm/Router; HTP owns Phone FFN\n");
     fprintf(stderr, "\n");
 }
 
@@ -283,18 +279,6 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.tp_world_size = std::stoi(argv[i]);
         } else if (arg == "--phone-local-meta") {
             params.phone_local_meta = true;
-        } else if (arg == "--phone-npu-ratio") {
-            if (++i >= argc) {
-                return false;
-            }
-            params.phone_npu_ratio = std::stof(argv[i]);
-            if (!std::isfinite(params.phone_npu_ratio) ||
-                    params.phone_npu_ratio <= 0.0f ||
-                    params.phone_npu_ratio >= 1.0f) {
-                fprintf(stderr,
-                        "error: --phone-npu-ratio must satisfy 0 < R < 1\n");
-                return false;
-            }
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, params);
@@ -459,7 +443,8 @@ static void print_opencl_memory_info_if_selected(const std::vector<ggml_backend_
 
 
 struct phone_local_meta_split_context {
-    float npu_ratio = 0.50f;
+    size_t gpu_index = 0;
+    size_t npu_index = 1;
 };
 
 static bool phone_local_name_contains(
@@ -476,6 +461,8 @@ static ggml_backend_meta_split_state phone_local_meta_get_split_state(
         static_cast<phone_local_meta_split_context *>(userdata);
     GGML_ASSERT(tensor != nullptr);
     GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(ctx->gpu_index == 0);
+    GGML_ASSERT(ctx->npu_index == 1);
 
     ggml_backend_meta_split_state state {};
     state.nr[0] = 1;
@@ -490,59 +477,39 @@ static ggml_backend_meta_split_state phone_local_meta_get_split_state(
     const bool ffn_down =
         phone_local_name_contains(name, ".ffn_down_exps.weight");
 
-    // Qwen3-MoE expert matrices are the only tensors split inside the phone
-    // in V1. Gate/Up split their expert hidden width on axis 1; Down splits
-    // the matching input width on axis 0. This preserves the same shard width
-    // on both sides of the local GPU/NPU FFN.
+    // Strict role separation for Chunk Ring V1:
+    //   GPUOpenCL: ATT + Norm + Router only
+    //   HTP0:      the entire Phone-side expert FFN shard
+    //
+    // A Meta split state with {0, full} does not mean 50/50 TP. It means the
+    // expert matrix has zero width on child 0 (GPU) and full width on child 1
+    // (NPU). Gate/Up use axis 1 and Down uses the matching axis 0, exactly as
+    // the existing MoE tensor-parallel representation expects.
     if (ffn_gate || ffn_up || ffn_down) {
         const int axis = ffn_down ? 0 : 1;
-        state.axis = static_cast<ggml_backend_meta_split_axis>(axis);
-
-        const int64_t ne = tensor->ne[axis];
-        const int64_t block =
-            std::max<int64_t>(1, ggml_blck_size(tensor->type));
-        const int64_t granularity =
-            std::lcm<int64_t>(block, 128);
-
-        const double gpu_ratio =
-            1.0 - static_cast<double>(ctx->npu_ratio);
-        int64_t gpu_ne =
-            static_cast<int64_t>(
-                std::floor(ne * gpu_ratio));
-        gpu_ne -= gpu_ne % granularity;
-
-        // Keep both local workers non-empty in this experimental V1.
-        if (ne >= 2 * granularity) {
-            gpu_ne = std::clamp<int64_t>(
-                gpu_ne, granularity, ne - granularity);
-        } else {
-            gpu_ne = std::clamp<int64_t>(gpu_ne, 0, ne);
-        }
-
-        state.ne[0] = gpu_ne;
-        state.ne[1] = ne - gpu_ne;
+        state.axis =
+            static_cast<ggml_backend_meta_split_axis>(axis);
+        state.ne[ctx->gpu_index] = 0;
+        state.ne[ctx->npu_index] = tensor->ne[axis];
 
         if (std::getenv("GGML_PHONE_LOCAL_META_DEBUG") != nullptr) {
             fprintf(
                 stderr,
-                "[PHONE_LOCAL_META_SPLIT] tensor=%s axis=%d "
-                "ne=%" PRId64 " gpu=%" PRId64 " npu=%" PRId64
-                " npu_ratio=%.3f\n",
+                "[PHONE_LOCAL_META_OWNER] tensor=%s role=FFN owner=NPU "
+                "axis=%d ne=%" PRId64 " gpu=0 npu=%" PRId64 "\n",
                 name,
                 axis,
-                ne,
-                state.ne[0],
-                state.ne[1],
-                ctx->npu_ratio);
+                tensor->ne[axis],
+                state.ne[ctx->npu_index]);
         }
         return state;
     }
 
-    // Router is part of the ATT producer. Keep it entirely on the phone GPU.
+    // Router is part of the producer lane and must stay on the GPU.
     const bool router_weight =
         phone_local_name_contains(name, ".ffn_gate_inp.weight");
 
-    // Qwen3 attention ownership stays on the phone GPU in Chunk Ring V1.
+    // Qwen3 Attention matrices stay entirely on the GPU.
     const bool attn_qkv =
         phone_local_name_contains(name, ".attn_q.weight") ||
         phone_local_name_contains(name, ".attn_k.weight") ||
@@ -550,24 +517,35 @@ static ggml_backend_meta_split_state phone_local_meta_get_split_state(
         phone_local_name_contains(name, ".attn_qkv.weight");
     const bool attn_out =
         phone_local_name_contains(name, ".attn_output.weight");
-    const bool kv_cache =
-        name != nullptr &&
-        (std::strncmp(name, "cache_k_l", 9) == 0 ||
-         std::strncmp(name, "cache_v_l", 9) == 0);
 
-    if (router_weight || attn_qkv || attn_out || kv_cache) {
-        const int axis =
-            (attn_out || kv_cache) ? 0 : 1;
+    if (router_weight || attn_qkv || attn_out) {
+        // Q/K/V and Router project along axis 1. Attention output projects
+        // along axis 0. Giving the full extent to child 0 makes these GPU-only
+        // while preserving the split semantics used by handle_mul_mat().
+        const int axis = attn_out ? 0 : 1;
         state.axis =
             static_cast<ggml_backend_meta_split_axis>(axis);
-        state.ne[0] = tensor->ne[axis];
-        state.ne[1] = 0;
+        state.ne[ctx->gpu_index] = tensor->ne[axis];
+        state.ne[ctx->npu_index] = 0;
+
+        if (std::getenv("GGML_PHONE_LOCAL_META_DEBUG") != nullptr) {
+            fprintf(
+                stderr,
+                "[PHONE_LOCAL_META_OWNER] tensor=%s role=%s owner=GPU "
+                "axis=%d ne=%" PRId64 " gpu=%" PRId64 " npu=0\n",
+                name,
+                router_weight ? "ROUTER" : "ATT",
+                axis,
+                tensor->ne[axis],
+                state.ne[ctx->gpu_index]);
+        }
         return state;
     }
 
-    // Norms, routing indices/weights and small scalar metadata are mirrored.
-    // Their downstream split state is still driven by the GPU-only Attention
-    // stream or by the split expert matrices above.
+    // Small normalization/scalar tensors are mirrored. Their compute owner is
+    // inherited from the activation: before the FFN handoff that activation is
+    // GPU-owned, after the handoff the FFN chain is NPU-owned. Mirroring these
+    // tiny tensors avoids creating a second tensor-parallel path.
     state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     return state;
 }
@@ -609,8 +587,6 @@ static bool build_phone_local_meta_device(
         gpu,
         npu,
     };
-    split_ctx.npu_ratio = params.phone_npu_ratio;
-
     ggml_backend_dev_t meta_dev =
         ggml_backend_meta_device(
             local_devs.data(),
@@ -628,10 +604,9 @@ static bool build_phone_local_meta_device(
     fprintf(
         stderr,
         "[PHONE_LOCAL_META] active=1 gpu=%s npu=%s "
-        "npu_ratio=%.3f logical=%s\n",
+        "mode=GPU_ATTN_NPU_FFN logical=%s\n",
         ggml_backend_dev_name(gpu),
         ggml_backend_dev_name(npu),
-        split_ctx.npu_ratio,
         ggml_backend_dev_name(meta_dev));
     return true;
 }
