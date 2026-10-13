@@ -794,6 +794,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool tensor_phone_primary =
         mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+    const bool phone_npu_ffn_roles =
+        std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+        ud->n_devices == 3;
+
+    // Experimental role-separated phone layout:
+    //   device 0 = PC/CPU primary
+    //   device 1 = RPC0 Phone GPUOpenCL (ATT/Norm/Router)
+    //   device 2 = RPC1 Phone HTP0       (FFN)
+    //
+    // V1 intentionally does not balance FFN between PC/GPU/NPU. The goal is
+    // to validate a clean GPU->NPU->GPU pipeline before adding a planner.
+    if (std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+            ud->n_devices != 3) {
+        static bool warned_bad_phone_npu_layout = false;
+        if (!warned_bad_phone_npu_layout) {
+            LLAMA_LOG_WARN(
+                "[PHONE_NPU_ROLE] requested=1 active=0 n_devices=%zu "
+                "expected=3 layout={PC,PhoneGPU,PhoneNPU}\n",
+                ud->n_devices);
+            warned_bad_phone_npu_layout = true;
+        }
+    }
 
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
@@ -899,11 +921,49 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
     };
 
-    if (force_phone) {
+    if (phone_npu_ffn_roles &&
+            (mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY ||
+             mode == llama_hybrid_layer_mode::PHONE_ONLY)) {
+        // Strict ownership: GPU never computes FFN and NPU never computes
+        // Attention. FFN balancing/PC spill is deliberately deferred.
+        if (is_attention_tensor) {
+            force_to_device(1);
+        } else if (is_ffn_split_tensor) {
+            force_to_device(2);
+        } else if (force_primary) {
+            force_to_device(0);
+        }
+    } else if (force_phone) {
         GGML_ASSERT(ud->n_devices == 2);
         force_to_device(1);
     } else if (force_primary) {
         force_to_device(0);
+    }
+
+    if (phone_npu_ffn_roles &&
+            tensor_name.rfind("blk.0.", 0) == 0 &&
+            (is_attention_tensor || is_ffn_split_tensor)) {
+        std::string placement;
+        for (size_t j = 0; j < ud->n_devices; ++j) {
+            int64_t ne_device = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                ne_device +=
+                    split_state.ne[is*ud->n_devices + j] *
+                    split_state.nr[is];
+            }
+            placement +=
+                (j == 0 ? "" : ",") +
+                std::to_string(j) + ":" +
+                std::to_string(ne_device);
+        }
+        LLAMA_LOG_INFO(
+            "[PHONE_NPU_ROLE] active=1 tensor=%s role=%s "
+            "owner=%s axis=%d placement={%s}\n",
+            tensor_name.c_str(),
+            is_attention_tensor ? "ATT" : "FFN",
+            is_attention_tensor ? "PHONE_GPU" : "PHONE_NPU",
+            split_state.axis,
+            placement.c_str());
     }
 
     if (tensor_name.rfind("blk.0.", 0) == 0 &&
