@@ -9568,6 +9568,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3-30B-A3B phone GPU front-stage overlap probes.
+    // These are intentionally isolated perf cases for the first GPU/NPU
+    // concurrency experiment. They do not change Meta scheduling or model
+    // execution. With 32 Q heads / 4 KV heads and head_dim 128, nr23={8,1}
+    // models the GQA layout; nb=128 matches the current prefill chunk size.
+    // kv={128,256,384,512} covers the four causal chunks of a 512-token prompt.
+    for (int kv : {128, 256, 384, 512}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            128, 128, 4, {8, 1}, kv, 128,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // Representative GPU projection/router matmuls for the same chunk.
+    // They complement Flash Attention because the front stage also streams
+    // quantized weights while the NPU MoE FFN is active.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 128, 2048,
+        {1, 1}, {1, 1})); // Q projection
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 128, 2048,
+        {1, 1}, {1, 1})); // K/V-sized projection
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 128, 2048,
+        {1, 1}, {1, 1})); // router
+
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
