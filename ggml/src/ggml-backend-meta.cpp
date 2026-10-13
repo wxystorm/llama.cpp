@@ -1347,6 +1347,70 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // In the role-separated phone path Q/K/V can all be complete tensors
+        // on the Phone GPU while their split-state axis no longer matches the
+        // legacy distributed-attention AXIS_2 convention.  Treat this as a
+        // local FA only when all three data inputs are full single-owner on
+        // exactly the same child.  Auxiliary mask/sinks must be mirrored or
+        // live on that same child.
+        size_t q_owner = n_bufs;
+        size_t k_owner = n_bufs;
+        size_t v_owner = n_bufs;
+
+        const bool q_local = split_state_full_single_owner(
+            tensor->src[0], src_ss[0], &q_owner);
+        const bool k_local = split_state_full_single_owner(
+            tensor->src[1], src_ss[1], &k_owner);
+        const bool v_local = split_state_full_single_owner(
+            tensor->src[2], src_ss[2], &v_owner);
+
+        if (q_local && k_local && v_local &&
+                q_owner == k_owner && q_owner == v_owner) {
+            auto aux_is_local_or_mirrored =
+                [&](size_t src_index) -> bool {
+                    if (tensor->src[src_index] == nullptr) {
+                        return true;
+                    }
+                    if (src_ss[src_index].axis ==
+                            GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        return true;
+                    }
+                    size_t aux_owner = n_bufs;
+                    return split_state_full_single_owner(
+                               tensor->src[src_index],
+                               src_ss[src_index],
+                               &aux_owner) &&
+                           aux_owner == q_owner;
+                };
+
+            if (aux_is_local_or_mirrored(3) &&
+                    aux_is_local_or_mirrored(4)) {
+                ggml_backend_meta_split_state local = {
+                    GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1
+                };
+                local.ne[q_owner] = tensor->ne[0];
+                split_state_is_exact = true;
+
+                if (std::getenv(
+                        "GGML_META_SINGLE_OWNER_SPLIT_TRACE") != nullptr ||
+                        std::getenv(
+                        "GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+                    GGML_LOG_ERROR(
+                        "[META_SINGLE_OWNER_LOCAL_FLASH_ATTN] tensor=%s "
+                        "owner=%zu out_ne0=%" PRId64 " "
+                        "q_axis=%s k_axis=%s v_axis=%s exact=1\n",
+                        tensor->name,
+                        q_owner,
+                        tensor->ne[0],
+                        ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                        ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                        ggml_backend_meta_split_axis_name(src_ss[2].axis));
+                }
+
+                return local;
+            }
+        }
+
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
