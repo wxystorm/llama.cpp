@@ -1487,9 +1487,6 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
             0);
 
         RPC_STATUS_ASSERT(status);
-        rpc_fence_diag_record_graph(
-            rpc_ctx, graph_uid, cgraph,
-            "GRAPH_COMPUTE");
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -4115,6 +4112,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             n_tensors,
             input.size());
         RPC_STATUS_ASSERT(status);
+        rpc_fence_diag_record_graph(
+            rpc_ctx, graph_uid, cgraph,
+            "GRAPH_COMPUTE");
     }
     return GGML_STATUS_SUCCESS;
 }
