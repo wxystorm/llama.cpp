@@ -1,0 +1,4 @@
+﻿"mode","run","prompt_ms","prompt_tps","decode_ms","decode_tps","logfile"
+"k14","1","400.26","104.93","9473.31","6.76","E:\llama\llama-prefill-baseline\bench-hexagon-sync\k14\run-01.log"
+"k14","2","366.44","114.62","8719.64","7.34","E:\llama\llama-prefill-baseline\bench-hexagon-sync\k14\run-02.log"
+"k14","3","337.67","124.38","8231.95","7.77","E:\llama\llama-prefill-baseline\bench-hexagon-sync\k14\run-03.log"

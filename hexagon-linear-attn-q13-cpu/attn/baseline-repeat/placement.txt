@@ -1,0 +1,9 @@
+﻿case=baseline-repeat
+stage=attn
+target_NPU_weights=
+QKV_weights_all_target_layers=RPC_except_optional_Q_pin
+pin_q_cpu_layer=13
+attn_output_expected_on_HTP_baseline=False
+attn_output_weights=blk.13.attn_output.weight,blk.14.attn_output.weight,blk.15.attn_output.weight
+override_tensor=blk\.13\.attn_output\.weight=CPU,blk\.13\.ffn_gate\.weight=CPU,blk\.13\.ffn_up\.weight=CPU,blk\.13\.ffn_down\.weight=CPU,blk\.14\.attn_output\.weight=CPU,blk\.14\.ffn_gate\.weight=CPU,blk\.14\.ffn_up\.weight=CPU,blk\.14\.ffn_down\.weight=CPU,blk\.15\.attn_output\.weight=CPU,blk\.15\.ffn_gate\.weight=CPU,blk\.15\.ffn_up\.weight=CPU,blk\.15\.ffn_down\.weight=CPU,blk\.13\.attn_q\.weight=CPU
+attention_output_and_FFN_target_audit=[HEX_LINEAR_AUDIT]

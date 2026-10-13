@@ -1,0 +1,4 @@
+﻿"mode","run","prompt_ms","prompt_tps","decode_ms","decode_tps","logfile"
+"generic","1","425.83","98.63","11781.68","5.43","E:\llama\llama-prefill-baseline\bench-hexagon-sync\generic\run-01.log"
+"generic","2","435.8","96.37","11902.94","5.38","E:\llama\llama-prefill-baseline\bench-hexagon-sync\generic\run-02.log"
+"generic","3","428.97","97.91","12167.84","5.26","E:\llama\llama-prefill-baseline\bench-hexagon-sync\generic\run-03.log"

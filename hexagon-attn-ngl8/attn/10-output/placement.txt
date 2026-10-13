@@ -1,0 +1,11 @@
+﻿case=10-output
+stage=attn
+target_NPU_weights=blk.10.attn_output.weight
+QKV_weights_all_target_layers=RPC_except_explicit_CPU_pins
+pin_q_cpu_layer=-1
+pin_k_cpu_layer=-1
+pin_v_cpu_layer=-1
+attn_output_expected_on_HTP_baseline=False
+attn_output_weights=blk.9.attn_output.weight,blk.10.attn_output.weight,blk.11.attn_output.weight,blk.12.attn_output.weight,blk.13.attn_output.weight,blk.14.attn_output.weight,blk.15.attn_output.weight
+override_tensor=blk\.9\.attn_output\.weight=CPU,blk\.9\.ffn_gate\.weight=CPU,blk\.9\.ffn_up\.weight=CPU,blk\.9\.ffn_down\.weight=CPU,blk\.10\.ffn_gate\.weight=CPU,blk\.10\.ffn_up\.weight=CPU,blk\.10\.ffn_down\.weight=CPU,blk\.11\.attn_output\.weight=CPU,blk\.11\.ffn_gate\.weight=CPU,blk\.11\.ffn_up\.weight=CPU,blk\.11\.ffn_down\.weight=CPU,blk\.12\.attn_output\.weight=CPU,blk\.12\.ffn_gate\.weight=CPU,blk\.12\.ffn_up\.weight=CPU,blk\.12\.ffn_down\.weight=CPU,blk\.13\.attn_output\.weight=CPU,blk\.13\.ffn_gate\.weight=CPU,blk\.13\.ffn_up\.weight=CPU,blk\.13\.ffn_down\.weight=CPU,blk\.14\.attn_output\.weight=CPU,blk\.14\.ffn_gate\.weight=CPU,blk\.14\.ffn_up\.weight=CPU,blk\.14\.ffn_down\.weight=CPU,blk\.15\.attn_output\.weight=CPU,blk\.15\.ffn_gate\.weight=CPU,blk\.15\.ffn_up\.weight=CPU,blk\.15\.ffn_down\.weight=CPU
+attention_output_and_FFN_target_audit=[HEX_LINEAR_AUDIT]

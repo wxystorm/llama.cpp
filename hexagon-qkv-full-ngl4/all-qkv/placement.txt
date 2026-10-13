@@ -1,0 +1,5 @@
+﻿case=all-qkv
+target_NPU_weights=blk.13.attn_k.weight,blk.13.attn_q.weight,blk.13.attn_v.weight,blk.14.attn_k.weight,blk.14.attn_q.weight,blk.14.attn_v.weight,blk.15.attn_k.weight,blk.15.attn_q.weight,blk.15.attn_v.weight
+override_tensor=blk\.(13|14|15)\.(attn_output|ffn_(gate|up|down))\.weight=CPU
+filter=^(Qcur|Kcur|Vcur|kq|kq_soft_max|kqv|kqv_out|attn_out|l_out)-(13|14|15)$
+NOTE=Check [HEX_QKV_AUDIT] phone log to confirm NPU execution.

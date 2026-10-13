@@ -1,0 +1,7 @@
+﻿"mode","run","prompt_tokens","decode_runs","prompt_ms","prompt_tps","decode_ms","decode_tps","logfile"
+"all-qkv","1","42","64","530.75","79.13","10871.64","5.89","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\all-qkv-run-01.log"
+"cpu","1","42","64","434.45","96.67","8947.03","7.15","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\cpu-run-01.log"
+"cpu","2","42","64","401.1","104.71","9000.86","7.11","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\cpu-run-02.log"
+"all-qkv","2","42","64","542.4","77.43","12403.93","5.16","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\all-qkv-run-02.log"
+"all-qkv","3","42","64","441.38","95.16","14873.21","4.3","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\all-qkv-run-03.log"
+"cpu","3","42","64","380.54","110.37","9579.24","6.68","E:\llama\llama-prefill-baseline\hexagon-qkv-decode\cpu-run-03.log"

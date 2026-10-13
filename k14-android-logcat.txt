@@ -1,0 +1,152 @@
+﻿
+10-10 23:54:59.618 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,281547,0,30]
+10-11 00:52:06.470 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,2220483,0,30]
+10-11 02:02:06.400 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,66273,0,20]
+10-11 08:34:16.204 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,4535849,0,10]
+10-11 08:52:42.783 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,194623,0,10]
+10-11 09:12:00.120 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,37824,0,20]
+10-11 09:15:51.119 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,60570,0,10]
+10-11 09:18:33.182 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,159364,0,10]
+10-11 09:21:24.460 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,5364733,0,70]
+10-11 09:27:46.402 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,381950,0,110]
+10-11 09:27:46.402 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,553257,0,10]
+10-11 09:28:44.737 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,58346,0,60]
+10-11 09:32:46.515 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,241751,0,160]
+10-11 09:36:05.043 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,198560,0,50]
+10-11 10:22:47.603 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,2802553,0,10]
+10-11 10:27:47.754 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,300104,0,30]
+10-11 10:32:47.853 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,300131,0,100]
+10-11 10:32:47.854 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,2729670,0,10]
+10-11 10:36:19.280 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,211452,0,100]
+10-11 10:37:47.936 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,88646,0,20]
+10-11 11:02:48.471 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,946646,0,40]
+10-11 11:12:48.734 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,600226,0,10]
+10-11 11:12:48.734 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,2400863,0,10]
+10-11 15:42:51.039 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,12332782,0,10]
+10-11 15:42:51.040 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,16202329,0,10]
+10-11 15:47:51.117 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,300091,0,10]
+10-11 15:57:51.297 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,600170,0,20]
+10-11 15:57:51.297 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,900258,10,0]
+10-11 16:12:51.530 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,900235,0,10]
+10-11 16:12:51.530 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,900237,0,10]
+10-11 16:37:51.958 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,1500427,0,20]
+10-11 16:46:56.973 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,545011,0,20]
+10-11 16:47:52.100 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,2100571,0,10]
+10-11 17:27:52.770 I/am_cpu  ( 3049): [1450,0,glink-fastrpcglink-apps-dsp,967909,0,10]
+10-11 17:52:53.302 I/am_cpu  ( 3049): [2629,1000,cdsprpcd,2700849,0,10]
+10-11 18:10:42.856 I/auditd  (12728): type=1400 audit(0.0:55113): avc:  denied  { read } for  comm="binder:12728_3" name="fastrpc-cdsp-secure" dev="t
+mpfs" ino=1748 scontext=u:r:priv_app:s0:c512,c768 tcontext=u:object_r:vendor_xdsp_device:s0 tclass=chr_file permissive=0 app=com.xiaomi.aiservice
+10-11 19:20:58.436 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:336: Reading configuration file: ggml-rpc-server.de
+bugconfig
+10-11 19:20:58.436 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:367: fastrpc_config_init: Couldn't find file ggml-r
+pc-server.debugconfig, errno (No such file or directory) at /data/data/com.termux/files/home/hexagon-rpc/lib, /vendor/lib64/rfs/dsp, /vendor/lib/rfsa
+/adsp, 
+10-11 19:20:58.436 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4998: fastrpc_apps_user_init done  with default 
+domain:3 and &fastrpc_trace:0x6f85fb9640
+10-11 19:20:58.436 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:5112: multidsplib_env_init: libcdsprpc.so loaded
+10-11 19:20:58.436 W/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2603:Warning: remote_handle_control: Non-domain 
+usage of FastRPC will be deprecated, use domains to offload to DSP using FastRPC
+10-11 19:20:58.436 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:20:58.437 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:20:58.438 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3736: close_device_node: close device 7 thru HAL
+ on domain 3
+10-11 19:20:58.438 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:20:58.438 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2923: remote_session_control Unsigned PD enable 
+1 request for domain 3
+10-11 19:20:58.438 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:20:58.438 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3736: close_device_node: close device 7 thru HAL
+ on domain 3
+10-11 19:20:58.438 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:20:58.438 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:20:58.438 E/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3903: Error 0xd: open_shell failed for domain 3 
+search paths used are /usr/lib/dsp/, /vendor/dsp/, /vendor/dsp/xdsp/ (errno Permission denied)
+10-11 19:20:58.438 W/libc    (24809): Access denied finding property "persist.vendor.fastrpc.process.attrs"
+10-11 19:20:58.438 W/libc    (24809): Access denied finding property "persist.vendor.fastrpc.process.clockvote"
+10-11 19:20:58.441 I/cdsprpcd( 2629): vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1023: Successfully opened file /vendor/dsp/cdsp/fastrpc_shel
+l_unsigned_3
+10-11 19:20:58.465 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3983: Created user PD on domain 3, dbg_trace 0x0
+, enabled attr=> RPC timeout:0, Dbg Mode:N, CRC:N, Unsigned:Y, Signed:N, Adapt QOS:N, PD dump: (Config:N, Dbg:N), Perf: (Kernel:N, DSP:N), Iregion:N,
+ QTF:N, UAF:N userPD initmem len:0x500000, Log pkt: N
+10-11 19:20:58.466 E/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3938: Error 0xffffffff: fastrpc_enable_kernel_op
+timizations failed for domain 3 (Bad address)
+10-11 19:20:58.466 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_perf.c:292: fastrpc_perf_init: enabled systrace 0x0 and RPC 
+traces (kernel 0, dsp 0) with frequency 1000
+10-11 19:20:58.473 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1828: remote_handle64_open: opened handle 0xb400
+007196647a90 (remote 0x2d7740) for file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spawn time 2
+8324 us, load time 7063 us), refs 1
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2556: remote_handle_control_domain: requested QO
+S 1, latency 6 for domain 3 handle 0xb400007196647a90
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:98: fastrpc_latency_thread_handler started for QoS
+ with activity window 100 ms
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1828: remote_handle64_open: opened handle 0xb400
+007196647610 (remote 0x2d7540) for file:///libdspqueue_rpc_skel.so?dspqueue_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spaw
+n time 1 us, load time 167 us), refs 2
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:103: fastrpc_notif_domain_init: FastRPC notification
+ worker thread launched
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3059: remote_session_control Register PD status 
+notification request for domain 3
+10-11 19:20:58.474 I/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2246: get_remote_notif_response: received status
+ notification 0 for domain 3, session 0
+10-11 19:20:58.475 E/ggml-rpc-server(24809): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1481: Error 0x80000414: remote_handle64_invoke f
+ailed for handle 0xb400007196647610, interface libdspqueue_rpc_skel.so method 3 on domain 3 (sc 0x3010100) (errno Success) (user err 0x80000414)
+10-11 19:26:56.806 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:336: Reading configuration file: ggml-rpc-server.de
+bugconfig
+10-11 19:26:56.806 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_config.c:367: fastrpc_config_init: Couldn't find file ggml-r
+pc-server.debugconfig, errno (No such file or directory) at /data/data/com.termux/files/home/hexagon-rpc/lib, /vendor/lib64/rfs/dsp, /vendor/lib/rfsa
+/adsp, 
+10-11 19:26:56.806 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:4998: fastrpc_apps_user_init done  with default 
+domain:3 and &fastrpc_trace:0x6f7dff9640
+10-11 19:26:56.806 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:5112: multidsplib_env_init: libcdsprpc.so loaded
+10-11 19:26:56.806 W/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2603:Warning: remote_handle_control: Non-domain 
+usage of FastRPC will be deprecated, use domains to offload to DSP using FastRPC
+10-11 19:26:56.806 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:26:56.807 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:26:56.808 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3736: close_device_node: close device 7 thru HAL
+ on domain 3
+10-11 19:26:56.808 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:26:56.808 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2923: remote_session_control Unsigned PD enable 
+1 request for domain 3
+10-11 19:26:56.808 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:26:56.808 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3736: close_device_node: close device 7 thru HAL
+ on domain 3
+10-11 19:26:56.808 E/dsp-manager( 1805): DspManager.cpp (57): Error: close_fastrpc_dev: close dev 6 failed (Bad file descriptor)
+10-11 19:26:56.808 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3706: open_device_node: no access to default dev
+ice of domain 3, open thru HAL, (sess_id 0)
+10-11 19:26:56.808 E/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3903: Error 0xd: open_shell failed for domain 3 
+search paths used are /usr/lib/dsp/, /vendor/dsp/, /vendor/dsp/xdsp/ (errno Permission denied)
+10-11 19:26:56.808 W/libc    (25591): Access denied finding property "persist.vendor.fastrpc.process.attrs"
+10-11 19:26:56.808 W/libc    (25591): Access denied finding property "persist.vendor.fastrpc.process.clockvote"
+10-11 19:26:56.810 I/cdsprpcd( 2629): vendor/qcom/proprietary/adsprpc/src/apps_std_imp.c:1023: Successfully opened file /vendor/dsp/cdsp/fastrpc_shel
+l_unsigned_3
+10-11 19:26:56.835 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3983: Created user PD on domain 3, dbg_trace 0x0
+, enabled attr=> RPC timeout:0, Dbg Mode:N, CRC:N, Unsigned:Y, Signed:N, Adapt QOS:N, PD dump: (Config:N, Dbg:N), Perf: (Kernel:N, DSP:N), Iregion:N,
+ QTF:N, UAF:N userPD initmem len:0x500000, Log pkt: N
+10-11 19:26:56.835 E/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3938: Error 0xffffffff: fastrpc_enable_kernel_op
+timizations failed for domain 3 (Bad address)
+10-11 19:26:56.836 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_perf.c:292: fastrpc_perf_init: enabled systrace 0x0 and RPC 
+traces (kernel 0, dsp 0) with frequency 1000
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1828: remote_handle64_open: opened handle 0xb400
+0071d2080790 (remote 0x2d7740) for file:///libggml-htp-v79.so?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spawn time 2
+7856 us, load time 5952 us), refs 1
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_latency.c:98: fastrpc_latency_thread_handler started for QoS
+ with activity window 100 ms
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2556: remote_handle_control_domain: requested QO
+S 1, latency 6 for domain 3 handle 0xb4000071d2080790
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1828: remote_handle64_open: opened handle 0xb400
+0071d2080690 (remote 0x2d7540) for file:///libdspqueue_rpc_skel.so?dspqueue_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp&_session=0 on domain 3 (spaw
+n time 0 us, load time 115 us), refs 2
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_notif.c:103: fastrpc_notif_domain_init: FastRPC notification
+ worker thread launched
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:3059: remote_session_control Register PD status 
+notification request for domain 3
+10-11 19:26:56.842 I/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:2246: get_remote_notif_response: received status
+ notification 0 for domain 3, session 0
+10-11 19:26:56.844 E/ggml-rpc-server(25591): vendor/qcom/proprietary/adsprpc/src/fastrpc_apps_user.c:1481: Error 0x80000414: remote_handle64_invoke f
+ailed for handle 0xb4000071d2080690, interface libdspqueue_rpc_skel.so method 3 on domain 3 (sc 0x3010100) (errno Success) (user err 0x80000414)
+
+

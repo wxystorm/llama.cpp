@@ -1,0 +1,22 @@
+{
+  "case": "13-k",
+  "status": "NUMERICALLY_CLOSE",
+  "cpu_captures": 84,
+  "npu_captures": 84,
+  "compared": 84,
+  "only_cpu": 0,
+  "only_npu": 0,
+  "only_cpu_examples": [],
+  "only_npu_examples": [],
+  "critical": 0,
+  "diff": 0,
+  "min_cosine": 1.0,
+  "max_rmse": 0.0,
+  "critical_examples": [],
+  "notes": [
+    "NUMERICALLY_CLOSE is not bytewise identical and not a proof of full-model correctness.",
+    "Confirm the intended QKV weight executed on HTP via the phone [HEX_QKV_AUDIT] log.",
+    "Only same-input (before token divergence) snapshots are comparable.",
+    "The callback may alter scheduler split boundaries and timing."
+  ]
+}
