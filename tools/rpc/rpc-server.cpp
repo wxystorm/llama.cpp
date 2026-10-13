@@ -18,6 +18,8 @@
 #include <clocale>
 #include <codecvt>
 #include <cstdint>
+#include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <regex>
@@ -27,6 +29,8 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <numeric>
+#include <cmath>
 
 #if defined(__linux__)
 #include <sys/types.h>
@@ -188,6 +192,12 @@ struct rpc_server_params {
     std::string              model_path  = "";
     int                      tp_rank     = 0;
     int                      tp_world_size = 1;
+
+    // Optional phone-local heterogeneous Meta device. The server still exposes
+    // one logical RPC device to the PC, while OpenCL GPU and Hexagon HTP are
+    // scheduled locally inside that device.
+    bool                     phone_local_meta = false;
+    float                    phone_npu_ratio  = 0.50f;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -202,6 +212,9 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -m, --model MODEL_PATH             path to the model gguf file\n");
     fprintf(stderr, "  --tp-rank <0|1>                  rank 0 is computer, rank 1 is mobile, default: 0\n");
     fprintf(stderr, "  --tp-world-size <n>            world size for tensor parallelism, default: 1\n");
+    fprintf(stderr, "  --phone-local-meta             expose GPUOpenCL+HTP0 as one logical phone device\n");
+    fprintf(stderr, "  --phone-npu-ratio R            NPU share of the phone FFN shard, 0<R<1 (default: %.2f)\n",
+            params.phone_npu_ratio);
     fprintf(stderr, "\n");
 }
 
@@ -267,6 +280,20 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.tp_world_size = std::stoi(argv[i]);
+        } else if (arg == "--phone-local-meta") {
+            params.phone_local_meta = true;
+        } else if (arg == "--phone-npu-ratio") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.phone_npu_ratio = std::stof(argv[i]);
+            if (!std::isfinite(params.phone_npu_ratio) ||
+                    params.phone_npu_ratio <= 0.0f ||
+                    params.phone_npu_ratio >= 1.0f) {
+                fprintf(stderr,
+                        "error: --phone-npu-ratio must satisfy 0 < R < 1\n");
+                return false;
+            }
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, params);
@@ -429,6 +456,185 @@ static void print_opencl_memory_info_if_selected(const std::vector<ggml_backend_
 }
 #endif
 
+
+struct phone_local_meta_split_context {
+    float npu_ratio = 0.50f;
+};
+
+static bool phone_local_name_contains(
+        const char * name,
+        const char * needle) {
+    return name != nullptr &&
+        std::strstr(name, needle) != nullptr;
+}
+
+static ggml_backend_meta_split_state phone_local_meta_get_split_state(
+        const ggml_tensor * tensor,
+        void * userdata) {
+    auto * ctx =
+        static_cast<phone_local_meta_split_context *>(userdata);
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_backend_meta_split_state state {};
+    state.nr[0] = 1;
+    state.n_segments = 1;
+
+    const char * name = tensor->name;
+
+    const bool ffn_gate =
+        phone_local_name_contains(name, ".ffn_gate_exps.weight");
+    const bool ffn_up =
+        phone_local_name_contains(name, ".ffn_up_exps.weight");
+    const bool ffn_down =
+        phone_local_name_contains(name, ".ffn_down_exps.weight");
+
+    // Qwen3-MoE expert matrices are the only tensors split inside the phone
+    // in V1. Gate/Up split their expert hidden width on axis 1; Down splits
+    // the matching input width on axis 0. This preserves the same shard width
+    // on both sides of the local GPU/NPU FFN.
+    if (ffn_gate || ffn_up || ffn_down) {
+        const int axis = ffn_down ? 0 : 1;
+        state.axis = static_cast<ggml_backend_meta_split_axis>(axis);
+
+        const int64_t ne = tensor->ne[axis];
+        const int64_t block =
+            std::max<int64_t>(1, ggml_blck_size(tensor->type));
+        const int64_t granularity =
+            std::lcm<int64_t>(block, 128);
+
+        const double gpu_ratio =
+            1.0 - static_cast<double>(ctx->npu_ratio);
+        int64_t gpu_ne =
+            static_cast<int64_t>(
+                std::floor(ne * gpu_ratio));
+        gpu_ne -= gpu_ne % granularity;
+
+        // Keep both local workers non-empty in this experimental V1.
+        if (ne >= 2 * granularity) {
+            gpu_ne = std::clamp<int64_t>(
+                gpu_ne, granularity, ne - granularity);
+        } else {
+            gpu_ne = std::clamp<int64_t>(gpu_ne, 0, ne);
+        }
+
+        state.ne[0] = gpu_ne;
+        state.ne[1] = ne - gpu_ne;
+
+        if (std::getenv("GGML_PHONE_LOCAL_META_DEBUG") != nullptr) {
+            fprintf(
+                stderr,
+                "[PHONE_LOCAL_META_SPLIT] tensor=%s axis=%d "
+                "ne=%" PRId64 " gpu=%" PRId64 " npu=%" PRId64
+                " npu_ratio=%.3f\n",
+                name,
+                axis,
+                ne,
+                state.ne[0],
+                state.ne[1],
+                ctx->npu_ratio);
+        }
+        return state;
+    }
+
+    // Router is part of the ATT producer. Keep it entirely on the phone GPU.
+    const bool router_weight =
+        phone_local_name_contains(name, ".ffn_gate_inp.weight");
+
+    // Qwen3 attention ownership stays on the phone GPU in Chunk Ring V1.
+    const bool attn_qkv =
+        phone_local_name_contains(name, ".attn_q.weight") ||
+        phone_local_name_contains(name, ".attn_k.weight") ||
+        phone_local_name_contains(name, ".attn_v.weight") ||
+        phone_local_name_contains(name, ".attn_qkv.weight");
+    const bool attn_out =
+        phone_local_name_contains(name, ".attn_output.weight");
+    const bool kv_cache =
+        name != nullptr &&
+        (std::strncmp(name, "cache_k_l", 9) == 0 ||
+         std::strncmp(name, "cache_v_l", 9) == 0);
+
+    if (router_weight || attn_qkv || attn_out || kv_cache) {
+        const int axis =
+            (attn_out || kv_cache) ? 0 : 1;
+        state.axis =
+            static_cast<ggml_backend_meta_split_axis>(axis);
+        state.ne[0] = tensor->ne[axis];
+        state.ne[1] = 0;
+        return state;
+    }
+
+    // Norms, routing indices/weights and small scalar metadata are mirrored.
+    // Their downstream split state is still driven by the GPU-only Attention
+    // stream or by the split expert matrices above.
+    state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    return state;
+}
+
+static bool build_phone_local_meta_device(
+        const rpc_server_params & params,
+        std::vector<ggml_backend_dev_t> & devices,
+        phone_local_meta_split_context & split_ctx) {
+    if (!params.phone_local_meta) {
+        return true;
+    }
+
+    ggml_backend_dev_t gpu = nullptr;
+    ggml_backend_dev_t npu = nullptr;
+    for (ggml_backend_dev_t dev : devices) {
+        const char * name = ggml_backend_dev_name(dev);
+        const std::string device_name =
+            name != nullptr ? name : "";
+        if (gpu == nullptr &&
+                device_name.find("OpenCL") != std::string::npos) {
+            gpu = dev;
+        }
+        if (npu == nullptr &&
+                (device_name.find("HTP") != std::string::npos ||
+                 device_name.find("Hexagon") != std::string::npos)) {
+            npu = dev;
+        }
+    }
+
+    if (gpu == nullptr || npu == nullptr) {
+        fprintf(
+            stderr,
+            "error: --phone-local-meta requires one OpenCL device "
+            "and one HTP/Hexagon device\n");
+        return false;
+    }
+
+    std::array<ggml_backend_dev_t, 2> local_devs {
+        gpu,
+        npu,
+    };
+    split_ctx.npu_ratio = params.phone_npu_ratio;
+
+    ggml_backend_dev_t meta_dev =
+        ggml_backend_meta_device(
+            local_devs.data(),
+            local_devs.size(),
+            phone_local_meta_get_split_state,
+            &split_ctx);
+    if (meta_dev == nullptr) {
+        fprintf(stderr, "error: failed to create phone-local Meta device\n");
+        return false;
+    }
+
+    devices.clear();
+    devices.push_back(meta_dev);
+
+    fprintf(
+        stderr,
+        "[PHONE_LOCAL_META] active=1 gpu=%s npu=%s "
+        "npu_ratio=%.3f logical=%s\n",
+        ggml_backend_dev_name(gpu),
+        ggml_backend_dev_name(npu),
+        split_ctx.npu_ratio,
+        ggml_backend_dev_name(meta_dev));
+    return true;
+}
+
 static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & params) {
     std::vector<ggml_backend_dev_t> devices;
     if (!params.devices.empty()) {
@@ -572,6 +778,13 @@ int main(int argc, char * argv[]) {
 #if defined(__ANDROID__)
     print_opencl_memory_info_if_selected(devices);
 #endif
+
+    phone_local_meta_split_context phone_local_split_ctx {};
+    if (!build_phone_local_meta_device(
+            params, devices, phone_local_split_ctx)) {
+        return 1;
+    }
+
     std::string endpoint = params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
