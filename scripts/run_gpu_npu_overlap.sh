@@ -33,7 +33,7 @@ echo
 
 GPU_FA_RE='hsk=128.*hsv=128.*nh=4.*nr23=\[8,1\].*nb=128'
 GPU_MM_RE='type_a=q4_K.*type_b=f32.*n=128.*k=2048'
-NPU_FFN_RE='type_a=q4_K.*type_b=f32.*n_mats=128.*n_used=8.*m=768.*k=2048'
+NPU_FFN_RE='type_a=q4_0.*type_b=f32.*n_mats=128.*n_used=8.*m=768.*k=2048'
 
 echo "[1/5] Probe backend names/support"
 run_test support -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" > "$OUT_ABS/gpu-support.log" 2>&1 || true
@@ -42,7 +42,7 @@ run_test support -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" > "$OUT_ABS/np
 echo "[2/5] GPU solo: Flash Attention"
 run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output csv     > "$OUT_ABS/gpu-fa-solo.csv" 2> "$OUT_ABS/gpu-fa-solo.err"
 
-echo "[3/5] NPU solo: Qwen3 MoE FFN primitive"
+echo "[3/5] NPU solo: Qwen3-shaped MoE FFN primitive (Q4_0 HTP proxy)"
 run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv     > "$OUT_ABS/npu-ffn-solo.csv" 2> "$OUT_ABS/npu-ffn-solo.err"
 
 echo "[4/5] Concurrent: GPU Flash Attention + NPU FFN"
