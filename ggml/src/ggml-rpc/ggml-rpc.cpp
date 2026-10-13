@@ -1759,6 +1759,20 @@ static void ggml_backend_rpc_buffer_set_tensor(
         input.data(),
         input.size());
 
+    if (!status) {
+        GGML_LOG_ERROR(
+            "[RPC_SET_FAIL] endpoint=%s device=%u name=%s type=%d "
+            "offset=%zu size=%zu remote_buffer=0x%" PRIx64
+            " data=0x%" PRIx64 "\n",
+            ctx->endpoint.c_str(),
+            ctx->device,
+            tensor->name,
+            (int) tensor->type,
+            offset,
+            size,
+            serialized_tensor.buffer,
+            serialized_tensor.data);
+    }
     RPC_STATUS_ASSERT(status);
 
     if (rpc_opencl_extra_debug_enabled() &&
@@ -5055,7 +5069,32 @@ bool rpc_server::set_tensor_direct(
         return false;
     }
 
+    const bool set_trace =
+        std::getenv("GGML_RPC_SERVER_CMD_TRACE") != nullptr;
+    if (set_trace) {
+        GGML_LOG_ERROR(
+            "[RPC_SERVER_SET] event=BEGIN name=%s buft=%s type=%d "
+            "offset=%" PRIu64 " size=%zu buffer=%p data=%p\n",
+            tensor->name,
+            tensor->buffer != nullptr && tensor->buffer->buft != nullptr ?
+                ggml_backend_buft_name(tensor->buffer->buft) : "(null)",
+            (int) tensor->type,
+            offset,
+            size,
+            (void *) tensor->buffer,
+            tensor->data);
+    }
+
     ggml_backend_tensor_set(tensor, data, offset, size);
+
+    if (set_trace) {
+        GGML_LOG_ERROR(
+            "[RPC_SERVER_SET] event=END name=%s buft=%s size=%zu\n",
+            tensor->name,
+            tensor->buffer != nullptr && tensor->buffer->buft != nullptr ?
+                ggml_backend_buft_name(tensor->buffer->buft) : "(null)",
+            size);
+    }
 
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
