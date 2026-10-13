@@ -139,6 +139,46 @@ static bool ggml_backend_meta_parse_prefill_down_chunk(
     return name[n] == '\0';
 }
 
+// Three-role Phone NPU -> Phone GPU return boundary.
+// kind: 0 = prefill chunk, 1 = decode down-part chunk, 2 = whole FFN.
+static bool ggml_backend_meta_parse_phone_npu_down_boundary(
+        const char * name,
+        int & kind,
+        int & chunk,
+        int & layer) {
+    kind = -1;
+    chunk = -1;
+    layer = -1;
+
+    if (ggml_backend_meta_parse_prefill_down_chunk(
+            name, chunk, layer)) {
+        kind = 0;
+        return true;
+    }
+
+    if (ggml_backend_meta_parse_decode_ffn_chunk(
+            name, chunk, layer)) {
+        kind = 1;
+        return true;
+    }
+
+    if (name != nullptr) {
+        int n = 0;
+        if (std::sscanf(
+                name,
+                "ffn_moe_out-%d%n",
+                &layer,
+                &n) == 1 &&
+                name[n] == '\0') {
+            kind = 2;
+            chunk = -1;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool ggml_backend_meta_parse_phone_route_weights(
         const char * name,
         int & chunk,
@@ -1541,6 +1581,62 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     GGML_LOG_ERROR(
                         "[PHONE_NPU_STAGE_SPLIT] tensor=%s "
                         "owner=2 layer=%d chunk=%d ne0=%" PRId64 "\n",
+                        tensor->name,
+                        role_layer,
+                        role_chunk,
+                        tensor->ne[0]);
+                }
+                return stage;
+            }
+
+            // Consumer-side return staging for NPU FFN -> Phone GPU Reduce.
+            // These OP_NONE tensors are independent storage on child 1 and
+            // are filled explicitly at the FFN-down subgraph boundary.
+            role_chunk = -1;
+            role_layer = -1;
+            parsed = 0;
+            bool gpu_return_stage =
+                std::sscanf(
+                    tensor->name,
+                    "phone_gpu_ffn_down_chunk_%d-%d%n",
+                    &role_chunk,
+                    &role_layer,
+                    &parsed) == 2 &&
+                tensor->name[parsed] == '\0';
+
+            parsed = 0;
+            gpu_return_stage = gpu_return_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_gpu_ffn_down_part_%d-%d%n",
+                    &role_chunk,
+                    &role_layer,
+                    &parsed) == 2 &&
+                 tensor->name[parsed] == '\0');
+
+            parsed = 0;
+            gpu_return_stage = gpu_return_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_gpu_ffn_down-%d%n",
+                    &role_layer,
+                    &parsed) == 1 &&
+                 tensor->name[parsed] == '\0');
+
+            if (gpu_return_stage) {
+                ggml_backend_meta_split_state stage = {
+                    GGML_BACKEND_SPLIT_AXIS_0,
+                    {0},
+                    {1},
+                    1
+                };
+                stage.ne[1] = tensor->ne[0];
+
+                if (std::getenv(
+                        "GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+                    GGML_LOG_ERROR(
+                        "[PHONE_NPU_RETURN_STAGE_SPLIT] tensor=%s "
+                        "owner=1 layer=%d chunk=%d ne0=%" PRId64 "\n",
                         tensor->name,
                         role_layer,
                         role_chunk,
@@ -4468,6 +4564,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
+                int phone_npu_down_kind = -1;
+                int phone_npu_down_chunk = -1;
+                int phone_npu_down_layer = -1;
+                const bool is_phone_npu_down_boundary =
+                    std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+                    n_backends == 3 &&
+                    ggml_backend_meta_parse_phone_npu_down_boundary(
+                        node->name,
+                        phone_npu_down_kind,
+                        phone_npu_down_chunk,
+                        phone_npu_down_layer);
+
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -4489,6 +4597,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
+                    is_phone_npu_down_boundary ||
                     is_phone_primary_l_out;
                 if (!new_subgraph) {
                     continue;
@@ -8833,6 +8942,109 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     gpu_fence_us / 1000.0,
                     copy_submit_us / 1000.0,
                     npu_fence_us / 1000.0);
+
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
+        // Symmetric return edge for the three-role pipeline:
+        // expert FFN completes on child 2 (Phone NPU), while residual/reduce
+        // continues on child 1 (Phone GPU). The graph builder inserts a
+        // separate phone_gpu_ffn_down* OP_NONE stage, so copy the completed
+        // NPU tensor into that storage at the exact FFN-down boundary.
+        if (phone_npu_roles &&
+                active_count == 1 &&
+                active_backend == 2) {
+            int down_kind = -1;
+            int down_chunk = -1;
+            int down_layer = -1;
+
+            if (ggml_backend_meta_parse_phone_npu_down_boundary(
+                    nodes[2]->name,
+                    down_kind,
+                    down_chunk,
+                    down_layer)) {
+                char gpu_down_name[96];
+
+                if (down_kind == 0) {
+                    std::snprintf(
+                        gpu_down_name,
+                        sizeof(gpu_down_name),
+                        "phone_gpu_ffn_down_chunk_%d-%d",
+                        down_chunk,
+                        down_layer);
+                } else if (down_kind == 1) {
+                    std::snprintf(
+                        gpu_down_name,
+                        sizeof(gpu_down_name),
+                        "phone_gpu_ffn_down_part_%d-%d",
+                        down_chunk,
+                        down_layer);
+                } else {
+                    std::snprintf(
+                        gpu_down_name,
+                        sizeof(gpu_down_name),
+                        "phone_gpu_ffn_down-%d",
+                        down_layer);
+                }
+
+                ggml_tensor * src_down =
+                    find_exact_named_tensor(2, nodes[2]->name);
+                ggml_tensor * dst_down =
+                    find_exact_named_tensor(1, gpu_down_name);
+
+                GGML_ASSERT(src_down != nullptr);
+                GGML_ASSERT(dst_down != nullptr);
+                GGML_ASSERT(ggml_are_same_layout(src_down, dst_down));
+
+                auto fence_role_backend = [&](ggml_backend_t role_backend) {
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(role_backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(role_backend);
+                    } else {
+                        ggml_backend_synchronize(role_backend);
+                    }
+                };
+
+                auto & gpu_cfg = backend_ctx->backend_configs[1];
+                auto & npu_cfg = backend_ctx->backend_configs[2];
+
+                const int64_t npu_fence_begin_us = ggml_time_us();
+                fence_role_backend(npu_cfg.backend);
+                const int64_t npu_fence_us =
+                    ggml_time_us() - npu_fence_begin_us;
+
+                const int64_t copy_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    npu_cfg.backend,
+                    gpu_cfg.backend,
+                    src_down,
+                    dst_down);
+                const int64_t copy_submit_us =
+                    ggml_time_us() - copy_begin_us;
+
+                const int64_t gpu_fence_begin_us = ggml_time_us();
+                fence_role_backend(gpu_cfg.backend);
+                const int64_t gpu_fence_us =
+                    ggml_time_us() - gpu_fence_begin_us;
+
+                handled = true;
+
+                GGML_LOG_ERROR(
+                    "[PHONE_NPU_FFN_RETURN] layer=%d chunk=%d kind=%d "
+                    "down=%s->%s bytes=%zu "
+                    "npu_fence_ms=%.3f copy_submit_ms=%.3f "
+                    "gpu_fence_ms=%.3f\n",
+                    down_layer,
+                    down_chunk,
+                    down_kind,
+                    src_down->name,
+                    dst_down->name,
+                    ggml_nbytes(src_down),
+                    npu_fence_us / 1000.0,
+                    copy_submit_us / 1000.0,
+                    gpu_fence_us / 1000.0);
 
                 return GGML_STATUS_SUCCESS;
             }
