@@ -486,6 +486,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
+    static const std::regex pattern_ffn_router_weight ("blk\\.\\d*\\.ffn_gate_inp.weight");
     static const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
     static const std::regex pattern_ffn_up_gate_bias  ("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
@@ -592,6 +593,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+        }
+
+        // Router belongs to the Attention producer lane in the role-separated
+        // phone pipeline.
+        if (std::regex_match(tensor_name, pattern_ffn_router_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
 
         // FFN
@@ -884,6 +891,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
     //如果是q,k,v权重，打印切分信息
     const bool is_attention_tensor =
+        std::regex_match(tensor_name, pattern_ffn_router_weight) ||
         std::regex_match(tensor_name, pattern_q_weight) ||
         std::regex_match(tensor_name, pattern_kv_weight) ||
         std::regex_match(tensor_name, pattern_qkv_weight) ||
