@@ -748,7 +748,27 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         down_name.c_str(),
                         wave_layer);
 
+                    // The expert FFN result is produced on the Phone NPU.
+                    // Materialize it in the graph before replacing the
+                    // consumer-side edge with an explicit Phone-GPU stage.
                     ggml_build_forward_expand(gf, down);
+
+                    if (phone_npu_stage) {
+                        ggml_tensor * gpu_down =
+                            ggml_dup_tensor(ctx0, down);
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                            gpu_down->nb[d] = down->nb[d];
+                        }
+                        const std::string gpu_down_name =
+                            "phone_gpu_ffn_down_chunk_" +
+                            std::to_string(ci);
+                        cb(
+                            gpu_down,
+                            gpu_down_name.c_str(),
+                            wave_layer);
+                        down = gpu_down;
+                    }
+
                     pending_wave_down_chunks[ci] = down;
                     pending_wave_residual_chunks[ci] =
                         ffn_inp;
@@ -1067,6 +1087,23 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 const std::string down_name =
                     "prefill_ffn_down_chunk_" + std::to_string(i);
                 cb(moe_chunk, down_name.c_str(), il);
+
+                if (phone_npu_stage) {
+                    // Keep the NPU producer reachable even though the residual
+                    // path consumes the Phone-GPU staging tensor instead.
+                    ggml_build_forward_expand(gf, moe_chunk);
+
+                    ggml_tensor * gpu_down =
+                        ggml_dup_tensor(ctx0, moe_chunk);
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        gpu_down->nb[d] = moe_chunk->nb[d];
+                    }
+                    const std::string gpu_down_name =
+                        "phone_gpu_ffn_down_chunk_" + std::to_string(i);
+                    cb(gpu_down, gpu_down_name.c_str(), il);
+                    moe_chunk = gpu_down;
+                }
+
                 chunks.push_back(moe_chunk);
                 token_begin += token_count;
             }
@@ -1148,9 +1185,26 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 output_chunks.reserve(decode_down_chunks.size());
 
                 int64_t embd_begin = 0;
-                for (ggml_tensor * down_chunk : decode_down_chunks) {
+                for (size_t down_i = 0;
+                     down_i < decode_down_chunks.size();
+                     ++down_i) {
+                    ggml_tensor * down_chunk =
+                        decode_down_chunks[down_i];
                     const int64_t embd_count = down_chunk->ne[0];
                     GGML_ASSERT(embd_count > 0);
+
+                    if (phone_npu_stage) {
+                        ggml_tensor * gpu_down =
+                            ggml_dup_tensor(ctx0, down_chunk);
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                            gpu_down->nb[d] = down_chunk->nb[d];
+                        }
+                        const std::string gpu_down_name =
+                            "phone_gpu_ffn_down_part_" +
+                            std::to_string(down_i);
+                        cb(gpu_down, gpu_down_name.c_str(), il);
+                        down_chunk = gpu_down;
+                    }
 
                     ggml_tensor * residual_chunk =
                         ggml_view_2d(
@@ -1173,6 +1227,19 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 }
             } else {
                 cb(moe_out, "ffn_moe_out", il);
+
+                if (phone_npu_stage) {
+                    ggml_build_forward_expand(gf, moe_out);
+
+                    ggml_tensor * gpu_down =
+                        ggml_dup_tensor(ctx0, moe_out);
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        gpu_down->nb[d] = moe_out->nb[d];
+                    }
+                    cb(gpu_down, "phone_gpu_ffn_down", il);
+                    moe_out = gpu_down;
+                }
+
                 cur = ggml_add(ctx0, moe_out, ffn_inp);
             }
         }
