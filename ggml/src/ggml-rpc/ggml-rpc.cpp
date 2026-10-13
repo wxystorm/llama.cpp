@@ -6941,7 +6941,23 @@ bool rpc_server::graph_recompute_snapshot(
 }
 
 bool rpc_server::synchronize(uint32_t device) {
+    const bool server_cmd_trace =
+        std::getenv("GGML_RPC_SERVER_CMD_TRACE") != nullptr;
+    if (server_cmd_trace) {
+        std::fprintf(
+            stderr,
+            "[RPC_SERVER_SYNC] event=BEGIN device=%u backends=%zu\n",
+            device,
+            backends.size());
+        std::fflush(stderr);
+    }
     if (device >= backends.size()) {
+        std::fprintf(
+            stderr,
+            "[RPC_SERVER_SYNC] event=INVALID_DEVICE device=%u backends=%zu\n",
+            device,
+            backends.size());
+        std::fflush(stderr);
         return false;
     }
 
@@ -6962,6 +6978,15 @@ bool rpc_server::synchronize(uint32_t device) {
                 async_return_payloads.erase(it);
             }
         }
+    }
+
+    if (server_cmd_trace) {
+        std::fprintf(
+            stderr,
+            "[RPC_SERVER_SYNC] event=END device=%u released=%zu\n",
+            device,
+            released_payloads);
+        std::fflush(stderr);
     }
 
     if (released_payloads != 0 &&
@@ -7695,9 +7720,29 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+    const bool server_cmd_trace =
+        std::getenv("GGML_RPC_SERVER_CMD_TRACE") != nullptr;
+    uint64_t server_cmd_seq = 0;
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
+            if (server_cmd_trace) {
+                std::fprintf(
+                    stderr,
+                    "[RPC_SERVER_CMD] event=SOCKET_EOF seq=%" PRIu64 "\n",
+                    server_cmd_seq);
+                std::fflush(stderr);
+            }
             break;
+        }
+        ++server_cmd_seq;
+        if (server_cmd_trace) {
+            std::fprintf(
+                stderr,
+                "[RPC_SERVER_CMD] event=BEGIN seq=%" PRIu64
+                " cmd=%u\n",
+                server_cmd_seq,
+                (unsigned) cmd);
+            std::fflush(stderr);
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -8397,6 +8442,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
             }
+        }
+        if (server_cmd_trace) {
+            std::fprintf(
+                stderr,
+                "[RPC_SERVER_CMD] event=END seq=%" PRIu64
+                " cmd=%u\n",
+                server_cmd_seq,
+                (unsigned) cmd);
+            std::fflush(stderr);
         }
     }
 }
