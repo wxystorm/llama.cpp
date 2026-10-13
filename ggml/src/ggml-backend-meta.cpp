@@ -3142,10 +3142,12 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     for (auto * worker : prefill_pc_workers) {
         delete worker;
     }
+    // Ring reducer tasks may be blocked in return_worker->wait(), so drain
+    // and join the reducer while all return workers are still alive.
+    delete phone_prefill_ring_reduce_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
-    delete phone_prefill_ring_reduce_worker;
     for (auto * worker : prefill_reduce_workers) {
         delete worker;
     }
