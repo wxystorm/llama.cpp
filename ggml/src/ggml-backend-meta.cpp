@@ -1009,16 +1009,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (std::getenv("GGML_META_SINGLE_OWNER_SPLIT_TRACE") != nullptr) {
                 GGML_LOG_ERROR(
                     "[META_SINGLE_OWNER_PER_ROW] tensor=%s op=%s src=%s "
-                    "axis=%d owner=%zu full_single_owner=%d\n",
+                    "axis=%d owner=%zu full_single_owner=%d src_nr0=%u\n",
                     tensor->name,
                     ggml_op_name(tensor->op),
                     tensor->src[0] != nullptr ? tensor->src[0]->name : "(null)",
                     (int) src_ss[0].axis,
                     owner,
-                    full_single_owner ? 1 : 0);
+                    full_single_owner ? 1 : 0,
+                    src_ss[0].nr[0]);
             }
 
             GGML_ASSERT(full_single_owner);
+
+            // A reshape can encode a complete single-owner tensor as
+            // AXIS_0 with nr > 1, e.g. [1,K,T] -> [K,T] becomes
+            // ne[owner]=1,nr=K. Per-row reductions such as SUM_ROWS change
+            // axis 0 itself, so carrying that source nr into the result makes
+            // the generic ratio propagation divide by K twice. Re-canonicalize
+            // the result as one full tensor on the same owner.
+            ggml_backend_meta_split_state local = {
+                GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1
+            };
+            local.ne[owner] = tensor->ne[0];
+            return local;
         }
         return src_ss[0];
     };
