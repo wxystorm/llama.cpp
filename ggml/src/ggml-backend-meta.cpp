@@ -1302,15 +1302,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
 
-        // Three-role Phone pipeline boundary:
+        // Three-role Phone pipeline consumer stage:
         //   child 1 = Phone GPU (ATT / Norm / Router producer)
         //   child 2 = Phone NPU (expert FFN consumer)
         //
-        // The FFN-ready hidden state plus Top-K ids / routing weights must
-        // physically exist on the NPU before MUL_MAT_ID starts.  Represent
-        // these small/control boundary tensors as MIRRORED so Meta allocates a
-        // full simple tensor on the NPU.  Runtime communication below copies
-        // only GPU -> NPU; PC remains uninvolved in the role handoff.
+        // Producer tensors keep their real GPU ownership.  Qwen3-MoE creates
+        // separate OP_NONE staging tensors named phone_npu_* for the consumer
+        // side.  Force only those stage tensors to child 2 so physical storage
+        // and logical FFN ownership agree without pretending the producer is
+        // MIRRORED.
         const bool phone_npu_role_handoff =
             std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
             n_bufs == 3;
@@ -1318,41 +1318,84 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (phone_npu_role_handoff) {
             int role_chunk = -1;
             int role_layer = -1;
-            bool role_boundary =
-                ggml_backend_meta_parse_prefill_norm_chunk(
-                    tensor->name, role_chunk, role_layer) ||
-                ggml_backend_meta_parse_phone_route_topk(
-                    tensor->name, role_chunk, role_layer) ||
-                ggml_backend_meta_parse_phone_route_weights(
-                    tensor->name, role_chunk, role_layer);
+            int parsed = 0;
 
-            if (!role_boundary) {
-                int parsed = 0;
-                role_layer = -1;
-                role_boundary =
-                    std::sscanf(
-                        tensor->name,
-                        "ffn_norm-%d%n",
-                        &role_layer,
-                        &parsed) == 1 &&
-                    tensor->name[parsed] == '\0';
-            }
+            bool npu_stage =
+                std::sscanf(
+                    tensor->name,
+                    "phone_npu_ffn_hidden_chunk_%d-%d%n",
+                    &role_chunk,
+                    &role_layer,
+                    &parsed) == 2 &&
+                tensor->name[parsed] == '\0';
 
-            if (role_boundary) {
-                if (std::getenv("GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
-                    GGML_LOG_ERROR(
-                        "[PHONE_NPU_HANDOFF_SPLIT] tensor=%s "
-                        "state=MIRRORED layer=%d chunk=%d\n",
-                        tensor->name,
-                        role_layer,
-                        role_chunk);
-                }
-                return {
-                    GGML_BACKEND_SPLIT_AXIS_MIRRORED,
+            parsed = 0;
+            npu_stage = npu_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_npu_route_topk_chunk_%d-%d%n",
+                    &role_chunk,
+                    &role_layer,
+                    &parsed) == 2 &&
+                 tensor->name[parsed] == '\0');
+
+            parsed = 0;
+            npu_stage = npu_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_npu_route_weights_chunk_%d-%d%n",
+                    &role_chunk,
+                    &role_layer,
+                    &parsed) == 2 &&
+                 tensor->name[parsed] == '\0');
+
+            parsed = 0;
+            npu_stage = npu_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_npu_ffn_hidden-%d%n",
+                    &role_layer,
+                    &parsed) == 1 &&
+                 tensor->name[parsed] == '\0');
+
+            parsed = 0;
+            npu_stage = npu_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_npu_route_topk-%d%n",
+                    &role_layer,
+                    &parsed) == 1 &&
+                 tensor->name[parsed] == '\0');
+
+            parsed = 0;
+            npu_stage = npu_stage ||
+                (std::sscanf(
+                    tensor->name,
+                    "phone_npu_route_weights-%d%n",
+                    &role_layer,
+                    &parsed) == 1 &&
+                 tensor->name[parsed] == '\0');
+
+            if (npu_stage) {
+                ggml_backend_meta_split_state stage = {
+                    GGML_BACKEND_SPLIT_AXIS_0,
                     {0},
                     {1},
                     1
                 };
+                stage.ne[2] = tensor->ne[0];
+
+                if (std::getenv(
+                        "GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+                    GGML_LOG_ERROR(
+                        "[PHONE_NPU_STAGE_SPLIT] tensor=%s "
+                        "owner=2 layer=%d chunk=%d ne0=%" PRId64 "\n",
+                        tensor->name,
+                        role_layer,
+                        role_chunk,
+                        tensor->ne[0]);
+                }
+                return stage;
             }
         }
         if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
@@ -8479,6 +8522,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     route_layer)) {
                 char hidden_name[96];
                 char topk_name[96];
+                char npu_hidden_name[96];
+                char npu_topk_name[96];
+                char npu_weights_name[96];
 
                 if (route_chunk >= 0) {
                     std::snprintf(
@@ -8493,6 +8539,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "phone_prefill_route_topk_chunk_%d-%d",
                         route_chunk,
                         route_layer);
+                    std::snprintf(
+                        npu_hidden_name,
+                        sizeof(npu_hidden_name),
+                        "phone_npu_ffn_hidden_chunk_%d-%d",
+                        route_chunk,
+                        route_layer);
+                    std::snprintf(
+                        npu_topk_name,
+                        sizeof(npu_topk_name),
+                        "phone_npu_route_topk_chunk_%d-%d",
+                        route_chunk,
+                        route_layer);
+                    std::snprintf(
+                        npu_weights_name,
+                        sizeof(npu_weights_name),
+                        "phone_npu_route_weights_chunk_%d-%d",
+                        route_chunk,
+                        route_layer);
                 } else {
                     std::snprintf(
                         hidden_name,
@@ -8504,20 +8568,35 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         sizeof(topk_name),
                         "phone_moe_route_topk-%d",
                         route_layer);
+                    std::snprintf(
+                        npu_hidden_name,
+                        sizeof(npu_hidden_name),
+                        "phone_npu_ffn_hidden-%d",
+                        route_layer);
+                    std::snprintf(
+                        npu_topk_name,
+                        sizeof(npu_topk_name),
+                        "phone_npu_route_topk-%d",
+                        route_layer);
+                    std::snprintf(
+                        npu_weights_name,
+                        sizeof(npu_weights_name),
+                        "phone_npu_route_weights-%d",
+                        route_layer);
                 }
 
                 ggml_tensor * src_hidden =
                     find_exact_named_tensor(1, hidden_name);
                 ggml_tensor * dst_hidden =
-                    find_exact_named_tensor(2, hidden_name);
+                    find_exact_named_tensor(2, npu_hidden_name);
                 ggml_tensor * src_topk =
                     find_exact_named_tensor(1, topk_name);
                 ggml_tensor * dst_topk =
-                    find_exact_named_tensor(2, topk_name);
+                    find_exact_named_tensor(2, npu_topk_name);
                 ggml_tensor * src_weights =
                     find_exact_named_tensor(1, nodes[1]->name);
                 ggml_tensor * dst_weights =
-                    find_exact_named_tensor(2, nodes[1]->name);
+                    find_exact_named_tensor(2, npu_weights_name);
 
                 GGML_ASSERT(src_hidden != nullptr);
                 GGML_ASSERT(dst_hidden != nullptr);
@@ -8575,18 +8654,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 GGML_LOG_ERROR(
                     "[PHONE_NPU_ROUTE_HANDOFF] layer=%d chunk=%d "
-                    "hidden=%s hidden_bytes=%zu "
-                    "topk=%s topk_bytes=%zu "
-                    "weights=%s weights_bytes=%zu "
+                    "hidden=%s->%s hidden_bytes=%zu "
+                    "topk=%s->%s topk_bytes=%zu "
+                    "weights=%s->%s weights_bytes=%zu "
                     "gpu_fence_ms=%.3f copy_submit_ms=%.3f "
                     "npu_fence_ms=%.3f\n",
                     route_layer,
                     route_chunk,
                     src_hidden->name,
+                    dst_hidden->name,
                     ggml_nbytes(src_hidden),
                     src_topk->name,
+                    dst_topk->name,
                     ggml_nbytes(src_topk),
                     src_weights->name,
+                    dst_weights->name,
                     ggml_nbytes(src_weights),
                     gpu_fence_us / 1000.0,
                     copy_submit_us / 1000.0,
