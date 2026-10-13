@@ -882,6 +882,66 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
+        // Role-separated placement can encode complete tensors with different
+        // split axes even though they all live entirely on the same child.
+        // For example, MoE routing reaches GET_ROWS with:
+        //
+        //   probs            : full single-owner on PhoneGPU, AXIS_1
+        //   selected_experts : full single-owner on PhoneGPU, AXIS_0
+        //
+        // This is not a real split-state mismatch: the operation is fully
+        // local to one child backend. Collapse such inputs to a canonical
+        // full-single-owner output before applying the generic axis rules.
+        size_t local_owner = n_bufs;
+        bool saw_local_owner = false;
+        bool all_local_or_mirrored = true;
+
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                continue;
+            }
+
+            size_t src_owner = n_bufs;
+            if (!split_state_full_single_owner(
+                    tensor->src[i],
+                    src_ss[i],
+                    &src_owner)) {
+                all_local_or_mirrored = false;
+                break;
+            }
+
+            if (!saw_local_owner) {
+                local_owner = src_owner;
+                saw_local_owner = true;
+            } else if (local_owner != src_owner) {
+                all_local_or_mirrored = false;
+                break;
+            }
+        }
+
+        if (all_local_or_mirrored && saw_local_owner) {
+            ggml_backend_meta_split_state local = {
+                GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1
+            };
+            local.ne[local_owner] = tensor->ne[0];
+
+            if (std::getenv("GGML_META_SINGLE_OWNER_SPLIT_TRACE") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[META_SINGLE_OWNER_LOCAL_OP] tensor=%s op=%s "
+                    "owner=%zu out_axis=0 out_ne0=%" PRId64 "\n",
+                    tensor->name,
+                    ggml_op_name(tensor->op),
+                    local_owner,
+                    tensor->ne[0]);
+            }
+
+            return local;
+        }
+
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
