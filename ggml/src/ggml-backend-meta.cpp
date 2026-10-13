@@ -1075,6 +1075,62 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Role-separated execution can make all MUL_MAT / MUL_MAT_ID inputs
+        // complete tensors on the same child while their logical split axes
+        // differ, e.g. expert weights on AXIS_1 and staged hidden/top-k on
+        // AXIS_0.  This is a fully local matmul, not a distributed split.
+        size_t local_owner = n_bufs;
+        bool saw_local_owner = false;
+        bool all_local_or_mirrored = true;
+
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                continue;
+            }
+
+            size_t src_owner = n_bufs;
+            if (!split_state_full_single_owner(
+                    tensor->src[i],
+                    src_ss[i],
+                    &src_owner)) {
+                all_local_or_mirrored = false;
+                break;
+            }
+
+            if (!saw_local_owner) {
+                local_owner = src_owner;
+                saw_local_owner = true;
+            } else if (local_owner != src_owner) {
+                all_local_or_mirrored = false;
+                break;
+            }
+        }
+
+        if (all_local_or_mirrored && saw_local_owner) {
+            ggml_backend_meta_split_state local = {
+                GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1
+            };
+            local.ne[local_owner] = tensor->ne[0];
+            split_state_is_exact = true;
+
+            if (std::getenv("GGML_META_SINGLE_OWNER_SPLIT_TRACE") != nullptr ||
+                    std::getenv("GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[META_SINGLE_OWNER_LOCAL_MUL_MAT] tensor=%s op=%s "
+                    "owner=%zu out_ne0=%" PRId64 " exact=1\n",
+                    tensor->name,
+                    ggml_op_name(tensor->op),
+                    local_owner,
+                    tensor->ne[0]);
+            }
+
+            return local;
+        }
+
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
