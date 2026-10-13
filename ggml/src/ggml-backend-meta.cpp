@@ -5548,6 +5548,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (tensor != nullptr && std::strcmp(tensor->name, expected) == 0) {
                     return tensor;
                 }
+                if (tensor != nullptr) {
+                    for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                        ggml_tensor * input = tensor->src[src];
+                        if (input != nullptr &&
+                                std::strcmp(input->name, expected) == 0) {
+                            return input;
+                        }
+                    }
+                }
             }
             for (int k = graph->n_leafs - 1; k >= 0; --k) {
                 ggml_tensor * tensor = graph->leafs[k];
