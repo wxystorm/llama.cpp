@@ -1301,6 +1301,60 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+
+        // Three-role Phone pipeline boundary:
+        //   child 1 = Phone GPU (ATT / Norm / Router producer)
+        //   child 2 = Phone NPU (expert FFN consumer)
+        //
+        // The FFN-ready hidden state plus Top-K ids / routing weights must
+        // physically exist on the NPU before MUL_MAT_ID starts.  Represent
+        // these small/control boundary tensors as MIRRORED so Meta allocates a
+        // full simple tensor on the NPU.  Runtime communication below copies
+        // only GPU -> NPU; PC remains uninvolved in the role handoff.
+        const bool phone_npu_role_handoff =
+            std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+            n_bufs == 3;
+
+        if (phone_npu_role_handoff) {
+            int role_chunk = -1;
+            int role_layer = -1;
+            bool role_boundary =
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    tensor->name, role_chunk, role_layer) ||
+                ggml_backend_meta_parse_phone_route_topk(
+                    tensor->name, role_chunk, role_layer) ||
+                ggml_backend_meta_parse_phone_route_weights(
+                    tensor->name, role_chunk, role_layer);
+
+            if (!role_boundary) {
+                int parsed = 0;
+                role_layer = -1;
+                role_boundary =
+                    std::sscanf(
+                        tensor->name,
+                        "ffn_norm-%d%n",
+                        &role_layer,
+                        &parsed) == 1 &&
+                    tensor->name[parsed] == '\0';
+            }
+
+            if (role_boundary) {
+                if (std::getenv("GGML_META_PHONE_NPU_HANDOFF_TRACE") != nullptr) {
+                    GGML_LOG_ERROR(
+                        "[PHONE_NPU_HANDOFF_SPLIT] tensor=%s "
+                        "state=MIRRORED layer=%d chunk=%d\n",
+                        tensor->name,
+                        role_layer,
+                        role_chunk);
+                }
+                return {
+                    GGML_BACKEND_SPLIT_AXIS_MIRRORED,
+                    {0},
+                    {1},
+                    1
+                };
+            }
+        }
         if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -8402,6 +8456,143 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 ++active_count;
                 active_backend = j;
+            }
+        }
+
+        // In the three-role layout the Router is produced on child 1
+        // (Phone GPU), while expert MUL_MAT_ID executes on child 2 (Phone NPU).
+        // The graph builder already closes a subgraph at
+        // phone_*route_weights*, so this is the exact synchronization point to
+        // hand off the FFN-ready hidden state and the two routing tensors.
+        const bool phone_npu_roles =
+            std::getenv("LLAMA_HYBRID_PHONE_NPU_FFN") != nullptr &&
+            n_backends == 3;
+
+        if (phone_npu_roles &&
+                active_count == 1 &&
+                active_backend == 1) {
+            int route_chunk = -1;
+            int route_layer = -1;
+            if (ggml_backend_meta_parse_phone_route_weights(
+                    nodes[1]->name,
+                    route_chunk,
+                    route_layer)) {
+                char hidden_name[96];
+                char topk_name[96];
+
+                if (route_chunk >= 0) {
+                    std::snprintf(
+                        hidden_name,
+                        sizeof(hidden_name),
+                        "prefill_ffn_norm_chunk_%d-%d",
+                        route_chunk,
+                        route_layer);
+                    std::snprintf(
+                        topk_name,
+                        sizeof(topk_name),
+                        "phone_prefill_route_topk_chunk_%d-%d",
+                        route_chunk,
+                        route_layer);
+                } else {
+                    std::snprintf(
+                        hidden_name,
+                        sizeof(hidden_name),
+                        "ffn_norm-%d",
+                        route_layer);
+                    std::snprintf(
+                        topk_name,
+                        sizeof(topk_name),
+                        "phone_moe_route_topk-%d",
+                        route_layer);
+                }
+
+                ggml_tensor * src_hidden =
+                    find_exact_named_tensor(1, hidden_name);
+                ggml_tensor * dst_hidden =
+                    find_exact_named_tensor(2, hidden_name);
+                ggml_tensor * src_topk =
+                    find_exact_named_tensor(1, topk_name);
+                ggml_tensor * dst_topk =
+                    find_exact_named_tensor(2, topk_name);
+                ggml_tensor * src_weights =
+                    find_exact_named_tensor(1, nodes[1]->name);
+                ggml_tensor * dst_weights =
+                    find_exact_named_tensor(2, nodes[1]->name);
+
+                GGML_ASSERT(src_hidden != nullptr);
+                GGML_ASSERT(dst_hidden != nullptr);
+                GGML_ASSERT(src_topk != nullptr);
+                GGML_ASSERT(dst_topk != nullptr);
+                GGML_ASSERT(src_weights != nullptr);
+                GGML_ASSERT(dst_weights != nullptr);
+                GGML_ASSERT(ggml_are_same_layout(src_hidden, dst_hidden));
+                GGML_ASSERT(ggml_are_same_layout(src_topk, dst_topk));
+                GGML_ASSERT(ggml_are_same_layout(src_weights, dst_weights));
+
+                auto fence_role_backend = [&](ggml_backend_t role_backend) {
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(role_backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(role_backend);
+                    } else {
+                        ggml_backend_synchronize(role_backend);
+                    }
+                };
+
+                auto & gpu_cfg = backend_ctx->backend_configs[1];
+                auto & npu_cfg = backend_ctx->backend_configs[2];
+
+                const int64_t fence_begin_us = ggml_time_us();
+                fence_role_backend(gpu_cfg.backend);
+                const int64_t gpu_fence_us =
+                    ggml_time_us() - fence_begin_us;
+
+                const int64_t copy_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    gpu_cfg.backend,
+                    npu_cfg.backend,
+                    src_hidden,
+                    dst_hidden);
+                ggml_backend_tensor_copy_async(
+                    gpu_cfg.backend,
+                    npu_cfg.backend,
+                    src_topk,
+                    dst_topk);
+                ggml_backend_tensor_copy_async(
+                    gpu_cfg.backend,
+                    npu_cfg.backend,
+                    src_weights,
+                    dst_weights);
+                const int64_t copy_submit_us =
+                    ggml_time_us() - copy_begin_us;
+
+                const int64_t npu_fence_begin_us = ggml_time_us();
+                fence_role_backend(npu_cfg.backend);
+                const int64_t npu_fence_us =
+                    ggml_time_us() - npu_fence_begin_us;
+
+                handled = true;
+
+                GGML_LOG_ERROR(
+                    "[PHONE_NPU_ROUTE_HANDOFF] layer=%d chunk=%d "
+                    "hidden=%s hidden_bytes=%zu "
+                    "topk=%s topk_bytes=%zu "
+                    "weights=%s weights_bytes=%zu "
+                    "gpu_fence_ms=%.3f copy_submit_ms=%.3f "
+                    "npu_fence_ms=%.3f\n",
+                    route_layer,
+                    route_chunk,
+                    src_hidden->name,
+                    ggml_nbytes(src_hidden),
+                    src_topk->name,
+                    ggml_nbytes(src_topk),
+                    src_weights->name,
+                    ggml_nbytes(src_weights),
+                    gpu_fence_us / 1000.0,
+                    copy_submit_us / 1000.0,
+                    npu_fence_us / 1000.0);
+
+                return GGML_STATUS_SUCCESS;
             }
         }
 
