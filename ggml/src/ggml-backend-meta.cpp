@@ -838,6 +838,49 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    auto split_state_full_single_owner = [&](
+            const ggml_tensor * logical_tensor,
+            const ggml_backend_meta_split_state & state,
+            size_t * owner_out) -> bool {
+        if (logical_tensor == nullptr ||
+                state.axis < 0 ||
+                state.axis >= GGML_MAX_DIMS ||
+                state.n_segments == 0) {
+            return false;
+        }
+
+        size_t owner = n_bufs;
+        int64_t owner_ne = 0;
+
+        for (size_t j = 0; j < n_bufs; ++j) {
+            int64_t ne_j = 0;
+            for (size_t s = 0; s < state.n_segments; ++s) {
+                ne_j += state.ne[s*n_bufs + j] * state.nr[s];
+            }
+
+            if (ne_j == 0) {
+                continue;
+            }
+
+            if (owner != n_bufs) {
+                return false;
+            }
+
+            owner = j;
+            owner_ne = ne_j;
+        }
+
+        if (owner == n_bufs ||
+                owner_ne != logical_tensor->ne[state.axis]) {
+            return false;
+        }
+
+        if (owner_out != nullptr) {
+            *owner_out = owner;
+        }
+        return true;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -889,9 +932,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return ret;
     };
 
-    // Some ops process data on a per-row bases:
+    // Some ops process data on a per-row basis. A genuine AXIS_0 split is
+    // invalid because no child owns a complete row. Role-separated placement,
+    // however, can encode a full tensor as AXIS_0 with exactly one non-empty
+    // child, e.g. {PC=0, PhoneGPU=full, PhoneNPU=0}. That is not a real row
+    // split: the single owner has every element needed by the per-row op.
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            size_t owner = n_bufs;
+            const bool full_single_owner =
+                split_state_full_single_owner(
+                    tensor->src[0],
+                    src_ss[0],
+                    &owner);
+
+            if (std::getenv("GGML_META_SINGLE_OWNER_SPLIT_TRACE") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[META_SINGLE_OWNER_PER_ROW] tensor=%s op=%s src=%s "
+                    "axis=%d owner=%zu full_single_owner=%d\n",
+                    tensor->name,
+                    ggml_op_name(tensor->op),
+                    tensor->src[0] != nullptr ? tensor->src[0]->name : "(null)",
+                    (int) src_ss[0].axis,
+                    owner,
+                    full_single_owner ? 1 : 0);
+            }
+
+            GGML_ASSERT(full_single_owner);
+        }
         return src_ss[0];
     };
 
