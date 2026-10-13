@@ -668,7 +668,78 @@ struct ggml_backend_rpc_context {
     uint32_t    device;
     std::string name;
     rpc_graph_snapshot_context graph_snapshot;
+
+    // Diagnostic-only record of the most recent graph successfully submitted
+    // on this RPC backend.  Used by GGML_META_XLAYER_BOUNDARY_DIAG to tell
+    // whether a later coarse RPC fence is still draining the predecessor FFN
+    // or has also caught next-layer ahead work.  This state never participates
+    // in execution ordering or correctness.
+    std::mutex fence_diag_mutex;
+    uint64_t fence_diag_submit_seq = 0;
+    uint64_t fence_diag_graph_uid = 0;
+    int fence_diag_nodes = 0;
+    std::string fence_diag_cmd;
+    std::string fence_diag_first_node;
+    std::string fence_diag_marker_node;
+    std::string fence_diag_last_node;
 };
+
+static bool rpc_xlayer_boundary_diag_enabled() {
+    return std::getenv("GGML_META_XLAYER_BOUNDARY_DIAG") != nullptr;
+}
+
+static bool rpc_fence_diag_marker_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    return std::strstr(name, "prefill_wave_") != nullptr ||
+           std::strstr(name, "prefill_ffn_") != nullptr ||
+           std::strstr(name, "phone_prefill_route_") != nullptr ||
+           std::strstr(name, "ffn_moe_") != nullptr ||
+           std::strstr(name, "attn_") != nullptr;
+}
+
+static void rpc_fence_diag_record_graph(
+        ggml_backend_rpc_context * rpc_ctx,
+        uint64_t                   graph_uid,
+        const ggml_cgraph        * cgraph,
+        const char               * cmd) {
+    if (!rpc_xlayer_boundary_diag_enabled() ||
+            rpc_ctx == nullptr ||
+            cgraph == nullptr) {
+        return;
+    }
+
+    std::string first_node;
+    std::string marker_node;
+    std::string last_node;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr || node->name[0] == '\0') {
+            continue;
+        }
+
+        if (first_node.empty()) {
+            first_node = node->name;
+        }
+        last_node = node->name;
+
+        if (rpc_fence_diag_marker_name(node->name)) {
+            marker_node = node->name;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(rpc_ctx->fence_diag_mutex);
+    rpc_ctx->fence_diag_submit_seq += 1;
+    rpc_ctx->fence_diag_graph_uid = graph_uid;
+    rpc_ctx->fence_diag_nodes = cgraph->n_nodes;
+    rpc_ctx->fence_diag_cmd = cmd != nullptr ? cmd : "unknown";
+    rpc_ctx->fence_diag_first_node = std::move(first_node);
+    rpc_ctx->fence_diag_marker_node = std::move(marker_node);
+    rpc_ctx->fence_diag_last_node = std::move(last_node);
+}
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
@@ -1416,6 +1487,9 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
             0);
 
         RPC_STATUS_ASSERT(status);
+        rpc_fence_diag_record_graph(
+            rpc_ctx, graph_uid, cgraph,
+            "GRAPH_COMPUTE");
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -2151,18 +2225,67 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     rpc_msg_synchronize_req request {};
     request.device = rpc_ctx->device;
 
+    const bool fence_diag = rpc_xlayer_boundary_diag_enabled();
+    uint64_t diag_submit_seq = 0;
+    uint64_t diag_graph_uid = 0;
+    int diag_nodes = 0;
+    std::string diag_cmd;
+    std::string diag_first_node;
+    std::string diag_marker_node;
+    std::string diag_last_node;
+
+    if (fence_diag) {
+        std::lock_guard<std::mutex> lock(rpc_ctx->fence_diag_mutex);
+        diag_submit_seq = rpc_ctx->fence_diag_submit_seq;
+        diag_graph_uid = rpc_ctx->fence_diag_graph_uid;
+        diag_nodes = rpc_ctx->fence_diag_nodes;
+        diag_cmd = rpc_ctx->fence_diag_cmd;
+        diag_first_node = rpc_ctx->fence_diag_first_node;
+        diag_marker_node = rpc_ctx->fence_diag_marker_node;
+        diag_last_node = rpc_ctx->fence_diag_last_node;
+
+        GGML_LOG_ERROR(
+            "[RPC_PHONE_FENCE_DIAG] event=BEGIN endpoint=%s device=%u "
+            "last_submit_seq=%" PRIu64 " graph_uid=%" PRIu64 " cmd=%s "
+            "nodes=%d first=%s marker=%s last=%s\n",
+            rpc_ctx->endpoint.c_str(),
+            rpc_ctx->device,
+            diag_submit_seq,
+            diag_graph_uid,
+            diag_cmd.empty() ? "none" : diag_cmd.c_str(),
+            diag_nodes,
+            diag_first_node.empty() ? "none" : diag_first_node.c_str(),
+            diag_marker_node.empty() ? "none" : diag_marker_node.c_str(),
+            diag_last_node.empty() ? "none" : diag_last_node.c_str());
+    }
+
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
+    const int64_t fence_begin_us = fence_diag ? ggml_time_us() : 0;
     const bool status = send_rpc_cmd(
-    sock,
-    RPC_CMD_SYNCHRONIZE,
-    &request,
-    sizeof(request),
-    nullptr,
-    0);
+        sock,
+        RPC_CMD_SYNCHRONIZE,
+        &request,
+        sizeof(request),
+        nullptr,
+        0);
+    const int64_t fence_us =
+        fence_diag ? ggml_time_us() - fence_begin_us : 0;
 
-RPC_STATUS_ASSERT(status);
+    RPC_STATUS_ASSERT(status);
+
+    if (fence_diag) {
+        GGML_LOG_ERROR(
+            "[RPC_PHONE_FENCE_DIAG] event=END endpoint=%s device=%u "
+            "last_submit_seq=%" PRIu64 " graph_uid=%" PRIu64
+            " wait_ms=%.3f\n",
+            rpc_ctx->endpoint.c_str(),
+            rpc_ctx->device,
+            diag_submit_seq,
+            diag_graph_uid,
+            fence_us / 1000.0);
+    }
 }
 
 static bool ggml_backend_rpc_route_mark_ready(
@@ -3894,6 +4017,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 fused_input.packet.data(),
                 fused_input.packet.size());
             RPC_STATUS_ASSERT(status);
+            rpc_fence_diag_record_graph(
+                rpc_ctx, graph_uid, cgraph,
+                "SET_TENSOR_RECOMPUTE_SNAPSHOT");
 
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
@@ -3921,6 +4047,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
                 request);
             RPC_STATUS_ASSERT(status);
+            rpc_fence_diag_record_graph(
+                rpc_ctx, graph_uid, cgraph,
+                "GRAPH_RECOMPUTE_SNAPSHOT");
 
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
@@ -3948,6 +4077,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             cgraph->n_nodes,
             sizeof(request));
         RPC_STATUS_ASSERT(status);
+        rpc_fence_diag_record_graph(
+            rpc_ctx, graph_uid, cgraph,
+            "GRAPH_RECOMPUTE");
     } else {
         RPC_STATUS_ASSERT(rpc_flush_pending_fused_input(rpc_dev_ctx));
 
