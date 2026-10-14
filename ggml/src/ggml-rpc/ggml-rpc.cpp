@@ -409,6 +409,13 @@ struct rpc_msg_phone_ffn_mark_ready_req {
     uint64_t seq;
 };
 
+// A pre-compute marker used only by the Phone-primary Chunk Ring.  Meta sends
+// seq|ARM before the Phone FFN graph.  The normal unmodified seq is sent again
+// after the graph completes.  Keeping the mode in the seq avoids widening the
+// existing RPC command and preserves old clients/servers.
+static constexpr uint64_t RPC_PHONE_FFN_CPU_REDUCE_ARM =
+    UINT64_C(1) << 63;
+
 static constexpr uint64_t RPC_RETURN_WIRE_MAGIC =
     UINT64_C(0x4650313652455455);
 
@@ -4385,6 +4392,13 @@ struct rpc_phone_npu_ffn_cache {
     ggml_tensor * w_down = nullptr;
 };
 
+struct rpc_phone_npu_cpu_reduce_entry {
+    int layer = -1;
+    int chunk = -1;
+    ggml_tensor * down = nullptr;
+    std::vector<float> phone_partial;
+};
+
 static ggml_backend_buffer_type_t rpc_phone_npu_repack_buft(
         ggml_backend_t backend) {
     if (backend == nullptr) {
@@ -4912,7 +4926,8 @@ private:
         rpc_phone_npu_ffn_cache *& cache);
     bool run_phone_npu_ffn_stage(
         ggml_cgraph * graph,
-        const rpc_phone_npu_ffn_stage & stage);
+        const rpc_phone_npu_ffn_stage & stage,
+        std::vector<float> * host_output);
     ggml_status graph_compute_phone_npu_ffn(
         uint32_t device,
         uint64_t graph_uid,
@@ -4929,6 +4944,19 @@ private:
         int,
         std::unique_ptr<rpc_phone_npu_ffn_cache>>
         phone_npu_ffn_caches;
+
+    // Chunk Ring CPU-reduce ownership.  "armed" seqs are announced by Meta
+    // before a Phone FFN graph is submitted.  A completed private-HTP partial
+    // is then bound to that seq and kept in host memory until the matching PC
+    // partial arrives on SET_TENSOR_ASYNC_RETURN_WAIT.
+    std::mutex phone_npu_cpu_reduce_mutex;
+    std::unordered_map<uint32_t, std::deque<uint64_t>>
+        phone_npu_cpu_reduce_armed;
+    std::unordered_map<
+        uint32_t,
+        std::unordered_map<uint64_t, rpc_phone_npu_cpu_reduce_entry>>
+        phone_npu_cpu_reduce_pending;
+
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
 
@@ -5748,6 +5776,27 @@ bool rpc_server::phone_ffn_mark_ready(
         return false;
     }
 
+    if ((request.seq & RPC_PHONE_FFN_CPU_REDUCE_ARM) != 0) {
+        const uint64_t seq =
+            request.seq & ~RPC_PHONE_FFN_CPU_REDUCE_ARM;
+        if (seq == 0) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                phone_npu_cpu_reduce_mutex);
+            phone_npu_cpu_reduce_armed[request.device].
+                push_back(seq);
+        }
+
+        GGML_LOG_INFO(
+            "[CHUNK_RING_CPU_ARM] device=%u seq=%" PRIu64 "\n",
+            request.device,
+            seq);
+        return true;
+    }
+
     {
         std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
         phone_ffn_ready_seqs[request.device].insert(request.seq);
@@ -5851,6 +5900,105 @@ bool rpc_server::set_tensor_async_return_wait(
     }
     const int64_t wait_us = ggml_time_us() - wait_begin_us;
 
+    rpc_phone_npu_cpu_reduce_entry cpu_entry;
+    bool cpu_reduce = false;
+    {
+        std::lock_guard<std::mutex> lock(
+            phone_npu_cpu_reduce_mutex);
+        auto device_it =
+            phone_npu_cpu_reduce_pending.find(request.device);
+        if (device_it != phone_npu_cpu_reduce_pending.end()) {
+            auto entry_it =
+                device_it->second.find(request.phone_ffn_seq);
+            if (entry_it != device_it->second.end()) {
+                cpu_entry = std::move(entry_it->second);
+                device_it->second.erase(entry_it);
+                if (device_it->second.empty()) {
+                    phone_npu_cpu_reduce_pending.erase(device_it);
+                }
+                cpu_reduce = true;
+            }
+        }
+    }
+
+    const uint8_t * wire_data =
+        input.data() + header_size;
+
+    if (cpu_reduce) {
+        if (cpu_entry.down == nullptr ||
+                cpu_entry.down->type != GGML_TYPE_F32 ||
+                request.tensor.type !=
+                    static_cast<uint32_t>(GGML_TYPE_F32) ||
+                request.offset != 0 ||
+                original_size !=
+                    cpu_entry.phone_partial.size() *
+                        sizeof(float) ||
+                original_size !=
+                    ggml_nbytes(cpu_entry.down)) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_CPU_REDUCE] seq=%" PRIu64
+                " layer=%d chunk=%d status=FAIL "
+                "reason=shape_or_type bytes=%zu phone_bytes=%zu\n",
+                request.phone_ffn_seq,
+                cpu_entry.layer,
+                cpu_entry.chunk,
+                original_size,
+                cpu_entry.phone_partial.size() * sizeof(float));
+            return false;
+        }
+
+        std::vector<float> pc_partial(
+            cpu_entry.phone_partial.size());
+        if (wire_type == RPC_RETURN_WIRE_F16) {
+            ggml_fp16_to_fp32_row(
+                reinterpret_cast<const ggml_fp16_t *>(
+                    wire_data),
+                pc_partial.data(),
+                static_cast<int64_t>(
+                    pc_partial.size()));
+        } else if (original_size > 0) {
+            memcpy(
+                pc_partial.data(),
+                wire_data,
+                original_size);
+        }
+
+        const int64_t reduce_begin_us =
+            ggml_time_us();
+        for (size_t i = 0;
+             i < cpu_entry.phone_partial.size();
+             ++i) {
+            cpu_entry.phone_partial[i] +=
+                pc_partial[i];
+        }
+        const int64_t reduce_us =
+            ggml_time_us() - reduce_begin_us;
+
+        const int64_t upload_begin_us =
+            ggml_time_us();
+        ggml_backend_tensor_set(
+            cpu_entry.down,
+            cpu_entry.phone_partial.data(),
+            0,
+            original_size);
+        const int64_t upload_us =
+            ggml_time_us() - upload_begin_us;
+
+        GGML_LOG_INFO(
+            "[CHUNK_RING_CPU_REDUCE] "
+            "seq=%" PRIu64 " layer=%d chunk=%d bytes=%zu "
+            "ffn_wait_ms=%.3f reduce_ms=%.3f upload_ms=%.3f "
+            "status=OK\n",
+            request.phone_ffn_seq,
+            cpu_entry.layer,
+            cpu_entry.chunk,
+            original_size,
+            wait_us / 1000.0,
+            reduce_us / 1000.0,
+            upload_us / 1000.0);
+        return true;
+    }
+
     std::vector<uint8_t> legacy_input(
         sizeof(rpc_tensor) +
         sizeof(uint64_t) +
@@ -5867,8 +6015,6 @@ bool rpc_server::set_tensor_async_return_wait(
         sizeof(request.offset));
     cursor += sizeof(request.offset);
 
-    const uint8_t * wire_data =
-        input.data() + header_size;
     if (wire_type == RPC_RETURN_WIRE_F16) {
         const size_t n_elements =
             original_size / sizeof(float);
@@ -7404,7 +7550,8 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
 
 bool rpc_server::run_phone_npu_ffn_stage(
         ggml_cgraph * graph,
-        const rpc_phone_npu_ffn_stage & stage) {
+        const rpc_phone_npu_ffn_stage & stage,
+        std::vector<float> * host_output) {
     if (phone_npu_backend == nullptr || graph == nullptr ||
         stage.norm == nullptr || stage.topk == nullptr ||
         stage.route_weights == nullptr || stage.down == nullptr) {
@@ -7551,6 +7698,10 @@ bool rpc_server::run_phone_npu_ffn_stage(
     ggml_backend_tensor_set(
         stage.down, output.data(), 0, output_bytes);
 
+    if (host_output != nullptr) {
+        *host_output = std::move(output);
+    }
+
     GGML_LOG_INFO(
         "[PHONE_NPU_EXEC] layer=%d chunk=%d mode=%s tokens=%" PRId64 " status=OK\n",
         stage.layer, stage.chunk,
@@ -7578,8 +7729,43 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     std::vector<rpc_phone_npu_ffn_stage> stages =
         rpc_phone_npu_find_ffn_stages(graph);
 
+    uint64_t cpu_reduce_seq = 0;
+    {
+        std::lock_guard<std::mutex> join_lock(
+            phone_npu_cpu_reduce_mutex);
+        auto armed_it =
+            phone_npu_cpu_reduce_armed.find(device);
+        if (armed_it != phone_npu_cpu_reduce_armed.end() &&
+                !armed_it->second.empty()) {
+            cpu_reduce_seq = armed_it->second.front();
+            armed_it->second.pop_front();
+            if (armed_it->second.empty()) {
+                phone_npu_cpu_reduce_armed.erase(armed_it);
+            }
+        }
+    }
+
     if (stages.empty()) {
+        if (cpu_reduce_seq != 0) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+                " status=FAIL reason=armed_graph_has_no_htp_stage\n",
+                cpu_reduce_seq);
+            return GGML_STATUS_FAILED;
+        }
         return ggml_backend_graph_compute(gpu, graph);
+    }
+
+    // One ring seq describes one (layer, chunk) FFN completion.  Keep this
+    // invariant explicit before making the HTP worker asynchronous later.
+    if (cpu_reduce_seq != 0 &&
+            (stages.size() != 1 || !stages[0].prefill)) {
+        GGML_LOG_ERROR(
+            "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+            " status=FAIL reason=armed_graph_stage_count stages=%zu\n",
+            cpu_reduce_seq,
+            stages.size());
+        return GGML_STATUS_FAILED;
     }
 
     int cursor = 0;
@@ -7606,7 +7792,16 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             }
         }
 
-        if (!run_phone_npu_ffn_stage(graph, stage)) {
+        std::vector<float> ring_phone_partial;
+        const bool htp_ok =
+            run_phone_npu_ffn_stage(
+                graph,
+                stage,
+                cpu_reduce_seq != 0 ?
+                    &ring_phone_partial :
+                    nullptr);
+
+        if (!htp_ok) {
             GGML_LOG_ERROR(
                 "[PHONE_NPU_EXEC] graph_uid=%" PRIu64
                 " layer=%d chunk=%d mode=%s status=FALLBACK_GPU\n",
@@ -7621,6 +7816,72 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+
+            if (cpu_reduce_seq != 0) {
+                const size_t count =
+                    (size_t) ggml_nelements(stage.down);
+                const size_t bytes =
+                    count * sizeof(float);
+                if (stage.down->type != GGML_TYPE_F32 ||
+                        bytes != ggml_nbytes(stage.down)) {
+                    return GGML_STATUS_FAILED;
+                }
+                ring_phone_partial.resize(count);
+                ggml_backend_tensor_get(
+                    stage.down,
+                    ring_phone_partial.data(),
+                    0,
+                    bytes);
+            }
+        }
+
+        if (cpu_reduce_seq != 0) {
+            const size_t expected =
+                (size_t) ggml_nelements(stage.down);
+            if (stage.down->type != GGML_TYPE_F32 ||
+                    ring_phone_partial.size() != expected) {
+                GGML_LOG_ERROR(
+                    "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+                    " layer=%d chunk=%d status=FAIL "
+                    "reason=phone_partial_shape\n",
+                    cpu_reduce_seq,
+                    stage.layer,
+                    stage.chunk);
+                return GGML_STATUS_FAILED;
+            }
+
+            rpc_phone_npu_cpu_reduce_entry entry;
+            entry.layer = stage.layer;
+            entry.chunk = stage.chunk;
+            entry.down = stage.down;
+            entry.phone_partial =
+                std::move(ring_phone_partial);
+
+            {
+                std::lock_guard<std::mutex> join_lock(
+                    phone_npu_cpu_reduce_mutex);
+                auto & pending =
+                    phone_npu_cpu_reduce_pending[device];
+                if (pending.find(cpu_reduce_seq) !=
+                        pending.end()) {
+                    GGML_LOG_ERROR(
+                        "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+                        " status=FAIL reason=duplicate_seq\n",
+                        cpu_reduce_seq);
+                    return GGML_STATUS_FAILED;
+                }
+                pending.emplace(
+                    cpu_reduce_seq,
+                    std::move(entry));
+            }
+
+            GGML_LOG_INFO(
+                "[CHUNK_RING_CPU_NPU_READY] "
+                "seq=%" PRIu64 " layer=%d chunk=%d bytes=%zu\n",
+                cpu_reduce_seq,
+                stage.layer,
+                stage.chunk,
+                ggml_nbytes(stage.down));
         }
 
         cursor = stage.down_index + 1;
@@ -7902,6 +8163,12 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    {
+        std::lock_guard<std::mutex> lock(
+            phone_npu_cpu_reduce_mutex);
+        phone_npu_cpu_reduce_armed.clear();
+        phone_npu_cpu_reduce_pending.clear();
+    }
     phone_npu_ffn_caches.clear();
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
         const auto & stats = snapshot_breakdown[lane];
