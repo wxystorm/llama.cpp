@@ -7422,8 +7422,32 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
         gpu_down->ne[1] != stage.norm->ne[0] ||
         gpu_down->ne[2] != gpu_up->ne[2]) {
         GGML_LOG_ERROR(
-            "[PHONE_NPU_PRELOAD] layer=%d status=FAIL reason=weight_shape_or_type\n",
-            stage.layer);
+            "[PHONE_NPU_PRELOAD] layer=%d status=FAIL reason=weight_shape_or_type "
+            "norm={type:%d ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
+            "up={type:%d ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
+            "gate={type:%d ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
+            "down={type:%d ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]}\n",
+            stage.layer,
+            stage.norm != nullptr ? (int) stage.norm->type : -1,
+            stage.norm != nullptr ? stage.norm->ne[0] : -1,
+            stage.norm != nullptr ? stage.norm->ne[1] : -1,
+            stage.norm != nullptr ? stage.norm->ne[2] : -1,
+            stage.norm != nullptr ? stage.norm->ne[3] : -1,
+            gpu_up != nullptr ? (int) gpu_up->type : -1,
+            gpu_up != nullptr ? gpu_up->ne[0] : -1,
+            gpu_up != nullptr ? gpu_up->ne[1] : -1,
+            gpu_up != nullptr ? gpu_up->ne[2] : -1,
+            gpu_up != nullptr ? gpu_up->ne[3] : -1,
+            gpu_gate != nullptr ? (int) gpu_gate->type : -1,
+            gpu_gate != nullptr ? gpu_gate->ne[0] : -1,
+            gpu_gate != nullptr ? gpu_gate->ne[1] : -1,
+            gpu_gate != nullptr ? gpu_gate->ne[2] : -1,
+            gpu_gate != nullptr ? gpu_gate->ne[3] : -1,
+            gpu_down != nullptr ? (int) gpu_down->type : -1,
+            gpu_down != nullptr ? gpu_down->ne[0] : -1,
+            gpu_down != nullptr ? gpu_down->ne[1] : -1,
+            gpu_down != nullptr ? gpu_down->ne[2] : -1,
+            gpu_down != nullptr ? gpu_down->ne[3] : -1);
         return false;
     }
 
