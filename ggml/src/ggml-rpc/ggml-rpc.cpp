@@ -4569,6 +4569,64 @@ static ggml_tensor * rpc_phone_npu_find_named(
     return nullptr;
 }
 
+
+static void rpc_phone_npu_collect_named_rec(
+        ggml_tensor * tensor,
+        const char * layer_suffix,
+        std::unordered_set<ggml_tensor *> & seen,
+        std::vector<ggml_tensor *> & out) {
+    if (tensor == nullptr || !seen.insert(tensor).second) {
+        return;
+    }
+
+    if (tensor->name[0] != '\0') {
+        const bool interesting =
+            std::strstr(tensor->name, "ffn") != nullptr ||
+            std::strstr(tensor->name, "prefill") != nullptr ||
+            std::strstr(tensor->name, "route") != nullptr;
+        const bool target_layer =
+            layer_suffix != nullptr &&
+            std::strstr(tensor->name, layer_suffix) != nullptr;
+        if (interesting && target_layer) {
+            out.push_back(tensor);
+        }
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        rpc_phone_npu_collect_named_rec(
+            tensor->src[i], layer_suffix, seen, out);
+    }
+    rpc_phone_npu_collect_named_rec(
+        tensor->view_src, layer_suffix, seen, out);
+}
+
+static std::vector<ggml_tensor *>
+rpc_phone_npu_collect_named(
+        ggml_cgraph * graph,
+        int target_layer) {
+    std::vector<ggml_tensor *> out;
+    if (graph == nullptr || target_layer < 0) {
+        return out;
+    }
+
+    char suffix[32] = {};
+    std::snprintf(
+        suffix, sizeof(suffix), "-%d", target_layer);
+
+    std::unordered_set<ggml_tensor *> seen;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        rpc_phone_npu_collect_named_rec(
+            graph->nodes[i], suffix, seen, out);
+    }
+
+    std::sort(
+        out.begin(), out.end(),
+        [](const ggml_tensor * a, const ggml_tensor * b) {
+            return std::strcmp(a->name, b->name) < 0;
+        });
+    return out;
+}
+
 static int rpc_phone_npu_graph_node_index(
         const ggml_cgraph * graph,
         const ggml_tensor * tensor) {
@@ -7658,6 +7716,38 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         }
 
         if (log_match) {
+            const std::vector<ggml_tensor *> named =
+                rpc_phone_npu_collect_named(
+                    graph, target_layer);
+
+            if (stages.empty() && !named.empty()) {
+                std::string names;
+                for (size_t i = 0; i < named.size(); ++i) {
+                    if (i > 0) {
+                        names += ",";
+                    }
+                    names += named[i]->name;
+                    names += "@";
+                    const int node_index =
+                        rpc_phone_npu_graph_node_index(
+                            graph, named[i]);
+                    names += std::to_string(node_index);
+                    names += "/t";
+                    names += std::to_string(named[i]->ne[1]);
+                    names += "/c";
+                    names += ggml_is_contiguous(named[i]) ?
+                        "1" : "0";
+                }
+
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_NAMES] graph_uid=%" PRIu64
+                    " layer=%d nodes=%d tensors=%s\n",
+                    graph_uid,
+                    target_layer,
+                    graph->n_nodes,
+                    names.c_str());
+            }
+
             char name[GGML_MAX_NAME] = {};
 
             auto find = [&](const char * fmt) {
