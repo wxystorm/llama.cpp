@@ -6053,7 +6053,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_producer_route &&
         phone_prefill_async_return_active &&
         phone_prefill_ordered_return_active &&
-        phone_prefill_chunk_join_active;
+        phone_prefill_chunk_join_active &&
+        phone_prefill_ffn_mark_ready(
+            backend_ctx->backend_configs[1].backend,
+            PHONE_FFN_CPU_REDUCE_ARM);
 
     if ((pipeline_debug || tensor_phone_stage_profile ||
          xlayer_wave_trace) &&
@@ -14064,6 +14067,11 @@ auto prefill_norm_sg_has_prework =
                 phone_graph->uid = 0;
             }
 
+            const bool use_ring_cpu_reduce =
+                phone_primary_chunk_ring_active &&
+                xlayer_direct_bound &&
+                return_task != 0;
+
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             int64_t phone_wall_us = 0;
             if (defer_local_phone_ffn) {
@@ -14089,7 +14097,7 @@ auto prefill_norm_sg_has_prework =
                         pending_phone_prefill_phone_branches.size());
                 }
             } else {
-                if (phone_primary_chunk_ring_active) {
+                if (use_ring_cpu_reduce) {
                     GGML_ASSERT(phone_ffn_seq != 0);
                     GGML_ASSERT(phone_prefill_ffn_mark_ready != nullptr);
                     const bool armed =
@@ -14148,13 +14156,26 @@ auto prefill_norm_sg_has_prework =
                 phone_graph->uid = saved_phone_ffn_uid;
             }
 
+            if (phone_primary_chunk_ring_active &&
+                    !use_ring_cpu_reduce &&
+                    (pipeline_debug ||
+                     tensor_phone_stage_profile)) {
+                printf(
+                    "[CHUNK_RING_CPU_BYPASS] "
+                    "layer=%d chunk=%d sg=%zu direct_bound=%d "
+                    "return_task=%" PRIu64 "\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i,
+                    xlayer_direct_bound ? 1 : 0,
+                    return_task);
+            }
+
             // The return RPC now performs the join on the Phone CPU:
             // HTP partial + PC partial -> one write into the stable Phone
             // down-chunk buffer.  This worker is only the dependency bridge
             // that turns the return ACK into "next-layer ATT may consume it".
-            if (phone_primary_chunk_ring_active &&
-                    xlayer_direct_bound &&
-                    return_task != 0) {
+            if (use_ring_cpu_reduce) {
                 GGML_ASSERT(phone_return_stage != nullptr);
                 GGML_ASSERT(
                     return_lane <
