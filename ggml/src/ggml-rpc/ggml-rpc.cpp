@@ -7682,9 +7682,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     std::vector<rpc_phone_npu_ffn_stage> stages;
-    for (int layer = target.begin;
-         layer <= target.end;
-         ++layer) {
+    for (int layer = target.begin;; ++layer) {
         std::vector<rpc_phone_npu_ffn_stage> layer_stages =
             rpc_phone_npu_find_ffn_stages(
                 graph, layer);
@@ -7692,6 +7690,10 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             stages.end(),
             layer_stages.begin(),
             layer_stages.end());
+
+        if (layer == target.end) {
+            break;
+        }
     }
 
     std::sort(
