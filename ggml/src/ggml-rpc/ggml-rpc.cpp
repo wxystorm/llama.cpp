@@ -3510,9 +3510,24 @@ static bool ggml_backend_rpc_phone_ffn_mark_ready(
     }
 
     constexpr uint8_t RPC_PHONE_FFN_JOIN_MIN_PATCH = 11;
+    constexpr uint8_t RPC_PHONE_FFN_CPU_REDUCE_MIN_PATCH = 16;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
-    if (rpc_get_remote_patch(compute_key) <
-            RPC_PHONE_FFN_JOIN_MIN_PATCH) {
+    const uint8_t remote_patch =
+        rpc_get_remote_patch(compute_key);
+    if (remote_patch < RPC_PHONE_FFN_JOIN_MIN_PATCH) {
+        return false;
+    }
+
+    // ARM alone is a side-effect-free capability query used by Meta when
+    // deciding whether Chunk Ring CPU join may be activated.
+    if (seq == RPC_PHONE_FFN_CPU_REDUCE_ARM) {
+        return remote_patch >=
+            RPC_PHONE_FFN_CPU_REDUCE_MIN_PATCH;
+    }
+
+    if ((seq & RPC_PHONE_FFN_CPU_REDUCE_ARM) != 0 &&
+            remote_patch <
+                RPC_PHONE_FFN_CPU_REDUCE_MIN_PATCH) {
         return false;
     }
 
@@ -7719,15 +7734,6 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     ggml_backend_t gpu = backends[device];
-    if (phone_npu_backend == nullptr) {
-        return ggml_backend_graph_compute(gpu, graph);
-    }
-
-    // TENSOR_PHONE_PRIMARY is already encoded in the graph through the
-    // phone_* router markers, so every eligible Tensor FFN is discovered
-    // automatically.  No separate layer-range configuration is needed.
-    std::vector<rpc_phone_npu_ffn_stage> stages =
-        rpc_phone_npu_find_ffn_stages(graph);
 
     uint64_t cpu_reduce_seq = 0;
     {
@@ -7744,6 +7750,23 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             }
         }
     }
+
+    if (phone_npu_backend == nullptr) {
+        if (cpu_reduce_seq != 0) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+                " status=FAIL reason=no_private_htp\n",
+                cpu_reduce_seq);
+            return GGML_STATUS_FAILED;
+        }
+        return ggml_backend_graph_compute(gpu, graph);
+    }
+
+    // TENSOR_PHONE_PRIMARY is already encoded in the graph through the
+    // phone_* router markers, so every eligible Tensor FFN is discovered
+    // automatically.  No separate layer-range configuration is needed.
+    std::vector<rpc_phone_npu_ffn_stage> stages =
+        rpc_phone_npu_find_ffn_stages(graph);
 
     if (stages.empty()) {
         if (cpu_reduce_seq != 0) {
@@ -7773,6 +7796,19 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         if (stage.front_end < cursor ||
             stage.down_index < stage.front_end ||
             stage.down_index >= graph->n_nodes) {
+            if (cpu_reduce_seq != 0) {
+                GGML_LOG_ERROR(
+                    "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
+                    " layer=%d chunk=%d status=FAIL "
+                    "reason=invalid_stage_span front=%d down=%d nodes=%d\n",
+                    cpu_reduce_seq,
+                    stage.layer,
+                    stage.chunk,
+                    stage.front_end,
+                    stage.down_index,
+                    graph->n_nodes);
+                return GGML_STATUS_FAILED;
+            }
             return ggml_backend_graph_compute(gpu, graph);
         }
         cursor = stage.down_index + 1;
