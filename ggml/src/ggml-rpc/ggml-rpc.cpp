@@ -4436,16 +4436,46 @@ static bool rpc_phone_npu_read_dense(
         const ggml_tensor * tensor,
         std::vector<uint8_t> & dense) {
     if (tensor == nullptr || tensor->buffer == nullptr ||
-        ggml_blck_size(tensor->type) != 1 ||
-        !ggml_is_contiguous(tensor)) {
+        ggml_blck_size(tensor->type) != 1) {
         return false;
     }
 
-    const size_t bytes = ggml_nbytes(tensor);
-    dense.resize(bytes);
+    const size_t elem = ggml_type_size(tensor->type);
+    const size_t span = ggml_nbytes(tensor);
+    const size_t n = (size_t) ggml_nelements(tensor);
+
+    std::vector<uint8_t> raw(span);
     ggml_backend_tensor_get(
-        tensor, dense.data(), 0, bytes);
-    return true;
+        tensor, raw.data(), 0, raw.size());
+
+    dense.resize(n * elem);
+    size_t out = 0;
+
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0) {
+                    const size_t off =
+                        (size_t) i0 * tensor->nb[0] +
+                        (size_t) i1 * tensor->nb[1] +
+                        (size_t) i2 * tensor->nb[2] +
+                        (size_t) i3 * tensor->nb[3];
+
+                    if (off + elem > raw.size()) {
+                        return false;
+                    }
+
+                    memcpy(
+                        dense.data() + out * elem,
+                        raw.data() + off,
+                        elem);
+                    ++out;
+                }
+            }
+        }
+    }
+
+    return out == n;
 }
 
 static bool rpc_phone_npu_convert_q4k_to_q8(
@@ -4699,9 +4729,6 @@ static bool rpc_phone_npu_finalize_stage(
         stage.topk->type != GGML_TYPE_I32 ||
         stage.route_weights->type != GGML_TYPE_F32 ||
         stage.down->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(stage.norm) ||
-        !ggml_is_contiguous(stage.topk) ||
-        !ggml_is_contiguous(stage.route_weights) ||
         !ggml_is_contiguous(stage.down)) {
         return false;
     }
