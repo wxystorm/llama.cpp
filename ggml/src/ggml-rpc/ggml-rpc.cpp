@@ -7782,12 +7782,17 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     // One ring seq describes one (layer, chunk) FFN completion.  Keep this
     // invariant explicit before making the HTP worker asynchronous later.
     if (cpu_reduce_seq != 0 &&
-            (stages.size() != 1 || !stages[0].prefill)) {
+            (stages.size() != 1 ||
+             !stages[0].prefill ||
+             stages[0].down_index != graph->n_nodes - 1)) {
         GGML_LOG_ERROR(
             "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
-            " status=FAIL reason=armed_graph_stage_count stages=%zu\n",
+            " status=FAIL reason=armed_graph_shape "
+            "stages=%zu down=%d nodes=%d\n",
             cpu_reduce_seq,
-            stages.size());
+            stages.size(),
+            stages.empty() ? -1 : stages[0].down_index,
+            graph->n_nodes);
         return GGML_STATUS_FAILED;
     }
 
