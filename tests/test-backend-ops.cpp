@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <array>
 #include <cfloat>
 #include <cinttypes>
@@ -1570,6 +1571,46 @@ struct test_case {
             return false;
         }
 
+        // Optional cross-process barrier for overlap microbenchmarks.
+        // Each process reaches this point only after backend initialization,
+        // tensor allocation, graph construction, and one warmup compute.
+        if (const char * barrier_dir = std::getenv("GGML_TEST_PERF_BARRIER_DIR")) {
+            if (barrier_dir[0] != '\0') {
+                std::string backend_tag = ggml_backend_name(backend);
+                for (char & c : backend_tag) {
+                    if (!std::isalnum((unsigned char) c) && c != '-' && c != '_') {
+                        c = '_';
+                    }
+                }
+
+                const std::string ready_path = std::string(barrier_dir) + "/ready-" + backend_tag;
+                const std::string go_path    = std::string(barrier_dir) + "/go";
+
+                {
+                    std::ofstream ready_file(ready_path, std::ios::out | std::ios::trunc);
+                    if (!ready_file) {
+                        fprintf(stderr, "[PERF_BARRIER] failed to create %s\n", ready_path.c_str());
+                        return false;
+                    }
+                    ready_file << "ready\n";
+                }
+
+                fprintf(stderr, "[PERF_BARRIER] ready backend=%s path=%s\n",
+                        backend_tag.c_str(), ready_path.c_str());
+
+                const int64_t wait_start_us = ggml_time_us();
+                while (!std::ifstream(go_path).good()) {
+                    if (ggml_time_us() - wait_start_us > 60LL * 1000 * 1000) {
+                        fprintf(stderr, "[PERF_BARRIER] timeout waiting for %s\n", go_path.c_str());
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+                fprintf(stderr, "[PERF_BARRIER] go backend=%s\n", backend_tag.c_str());
+            }
+        }
+
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -1614,6 +1655,14 @@ struct test_case {
         }
 
         // run
+        int64_t perf_min_us = 1000LL * 1000;
+        if (const char * perf_min_us_env = std::getenv("GGML_TEST_PERF_MIN_US")) {
+            const int64_t requested = std::strtoll(perf_min_us_env, nullptr, 10);
+            if (requested > 0) {
+                perf_min_us = requested;
+            }
+        }
+
         int64_t total_time_us = 0;
         int64_t total_mem = 0;
         int total_runs = 0;
@@ -1629,7 +1678,7 @@ struct test_case {
             total_time_us += end_time - start_time;
             total_mem += mem;
             total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+        } while (total_time_us < perf_min_us);
 
         // Create test result
         double avg_time_us      = (double) total_time_us / total_runs;
