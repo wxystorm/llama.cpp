@@ -4385,61 +4385,6 @@ struct rpc_phone_npu_ffn_cache {
     ggml_tensor * w_down = nullptr;
 };
 
-struct rpc_phone_npu_ffn_layer_range {
-    int begin = -1;
-    int end = -1;
-};
-
-static bool rpc_phone_npu_parse_layer_env(
-        const char * name,
-        int default_value,
-        int min_value,
-        int & value) {
-    const char * env = std::getenv(name);
-    if (env == nullptr || env[0] == '\0') {
-        value = default_value;
-        return true;
-    }
-
-    char * end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0' ||
-        parsed < min_value || parsed > INT_MAX) {
-        return false;
-    }
-
-    value = (int) parsed;
-    return true;
-}
-
-static rpc_phone_npu_ffn_layer_range
-rpc_phone_npu_ffn_target_layers() {
-    rpc_phone_npu_ffn_layer_range range;
-
-    if (!rpc_phone_npu_parse_layer_env(
-            "GGML_PHONE_NPU_FFN_LAYER",
-            31, -1, range.begin)) {
-        return {};
-    }
-
-    if (range.begin < 0) {
-        return {};
-    }
-
-    if (!rpc_phone_npu_parse_layer_env(
-            "GGML_PHONE_NPU_FFN_LAYER_END",
-            range.begin, 0, range.end)) {
-        return {};
-    }
-
-    if (range.end < range.begin ||
-        range.end - range.begin > 255) {
-        return {};
-    }
-
-    return range;
-}
-
 static ggml_backend_buffer_type_t rpc_phone_npu_repack_buft(
         ggml_backend_t backend) {
     if (backend == nullptr) {
@@ -4677,115 +4622,6 @@ static bool rpc_phone_npu_is_ancestor(
 }
 
 
-static ggml_tensor * rpc_phone_npu_find_topk_rec(
-        ggml_tensor * tensor,
-        int64_t n_tokens,
-        std::unordered_set<ggml_tensor *> & seen) {
-    if (tensor == nullptr || !seen.insert(tensor).second) {
-        return nullptr;
-    }
-
-    if (tensor->op == GGML_OP_MUL_MAT_ID &&
-        tensor->src[2] != nullptr &&
-        tensor->src[2]->type == GGML_TYPE_I32 &&
-        tensor->src[2]->ne[0] > 0 &&
-        tensor->src[2]->ne[1] == n_tokens) {
-        return tensor->src[2];
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_tensor * found =
-                rpc_phone_npu_find_topk_rec(
-                    tensor->src[i], n_tokens, seen)) {
-            return found;
-        }
-    }
-    return rpc_phone_npu_find_topk_rec(
-        tensor->view_src, n_tokens, seen);
-}
-
-static ggml_tensor * rpc_phone_npu_find_route_weights_rec(
-        ggml_tensor * tensor,
-        int64_t n_embd,
-        int64_t n_expert_used,
-        int64_t n_tokens,
-        std::unordered_set<ggml_tensor *> & seen) {
-    if (tensor == nullptr || !seen.insert(tensor).second) {
-        return nullptr;
-    }
-
-    if (tensor->op == GGML_OP_MUL &&
-        tensor->ne[0] == n_embd &&
-        tensor->ne[1] == n_expert_used &&
-        tensor->ne[2] == n_tokens) {
-        for (int i = 0; i < 2; ++i) {
-            ggml_tensor * src = tensor->src[i];
-            ggml_tensor * other = tensor->src[1 - i];
-            if (src != nullptr &&
-                other != nullptr &&
-                src->type == GGML_TYPE_F32 &&
-                src->ne[0] == 1 &&
-                src->ne[1] == n_expert_used &&
-                src->ne[2] == n_tokens &&
-                other->ne[0] == n_embd &&
-                other->ne[1] == n_expert_used &&
-                other->ne[2] == n_tokens) {
-                return src;
-            }
-        }
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_tensor * found =
-                rpc_phone_npu_find_route_weights_rec(
-                    tensor->src[i],
-                    n_embd,
-                    n_expert_used,
-                    n_tokens,
-                    seen)) {
-            return found;
-        }
-    }
-    return rpc_phone_npu_find_route_weights_rec(
-        tensor->view_src,
-        n_embd,
-        n_expert_used,
-        n_tokens,
-        seen);
-}
-
-static bool rpc_phone_npu_infer_route_inputs(
-        rpc_phone_npu_ffn_stage & stage) {
-    if (stage.down == nullptr || stage.norm == nullptr) {
-        return false;
-    }
-
-    const int64_t n_tokens = stage.norm->ne[1];
-    const int64_t n_embd = stage.norm->ne[0];
-
-    if (stage.topk == nullptr) {
-        std::unordered_set<ggml_tensor *> seen;
-        stage.topk = rpc_phone_npu_find_topk_rec(
-            stage.down, n_tokens, seen);
-    }
-    if (stage.topk == nullptr) {
-        return false;
-    }
-
-    if (stage.route_weights == nullptr) {
-        std::unordered_set<ggml_tensor *> seen;
-        stage.route_weights =
-            rpc_phone_npu_find_route_weights_rec(
-                stage.down,
-                n_embd,
-                stage.topk->ne[0],
-                n_tokens,
-                seen);
-    }
-
-    return stage.route_weights != nullptr;
-}
-
 static bool rpc_phone_npu_finalize_stage(
         ggml_cgraph * graph,
         rpc_phone_npu_ffn_stage & stage) {
@@ -4838,10 +4674,9 @@ static bool rpc_phone_npu_finalize_stage(
 
 static std::vector<rpc_phone_npu_ffn_stage>
 rpc_phone_npu_find_ffn_stages(
-        ggml_cgraph * graph,
-        int target_layer) {
+        ggml_cgraph * graph) {
     std::vector<rpc_phone_npu_ffn_stage> result;
-    if (graph == nullptr || target_layer < 0) {
+    if (graph == nullptr) {
         return result;
     }
 
@@ -4859,8 +4694,7 @@ rpc_phone_npu_find_ffn_stages(
                 node->name,
                 "prefill_ffn_down_chunk_%d-%d%n",
                 &chunk, &layer, &parsed) == 2 &&
-            node->name[parsed] == '\0' &&
-            layer == target_layer) {
+            node->name[parsed] == '\0') {
             char name[GGML_MAX_NAME] = {};
 
             rpc_phone_npu_ffn_stage stage;
@@ -4890,7 +4724,13 @@ rpc_phone_npu_find_ffn_stages(
             stage.route_weights =
                 rpc_phone_npu_find_named(graph, name);
 
-            rpc_phone_npu_infer_route_inputs(stage);
+            // These explicit markers are emitted only for
+            // TENSOR_PHONE_PRIMARY layers.  This makes HTP ownership follow
+            // the planner's Tensor region automatically.
+            if (stage.topk == nullptr ||
+                stage.route_weights == nullptr) {
+                continue;
+            }
 
             if (rpc_phone_npu_finalize_stage(
                     graph, stage)) {
@@ -4905,8 +4745,7 @@ rpc_phone_npu_find_ffn_stages(
                 node->name,
                 "ffn_moe_out-%d%n",
                 &layer, &parsed) == 1 &&
-            node->name[parsed] == '\0' &&
-            layer == target_layer) {
+            node->name[parsed] == '\0') {
             char name[GGML_MAX_NAME] = {};
 
             std::snprintf(
@@ -4943,7 +4782,12 @@ rpc_phone_npu_find_ffn_stages(
             stage.route_weights =
                 rpc_phone_npu_find_named(graph, name);
 
-            rpc_phone_npu_infer_route_inputs(stage);
+            // PHONE_ONLY and PC-primary Tensor layers do not carry these
+            // phone_moe_route_* markers and remain on their existing path.
+            if (stage.topk == nullptr ||
+                stage.route_weights == nullptr) {
+                continue;
+            }
 
             if (rpc_phone_npu_finalize_stage(
                     graph, stage)) {
@@ -7724,35 +7568,15 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     ggml_backend_t gpu = backends[device];
-    const rpc_phone_npu_ffn_layer_range target =
-        rpc_phone_npu_ffn_target_layers();
-    if (phone_npu_backend == nullptr ||
-        target.begin < 0 ||
-        target.end < target.begin) {
+    if (phone_npu_backend == nullptr) {
         return ggml_backend_graph_compute(gpu, graph);
     }
 
-    std::vector<rpc_phone_npu_ffn_stage> stages;
-    for (int layer = target.begin;; ++layer) {
-        std::vector<rpc_phone_npu_ffn_stage> layer_stages =
-            rpc_phone_npu_find_ffn_stages(
-                graph, layer);
-        stages.insert(
-            stages.end(),
-            layer_stages.begin(),
-            layer_stages.end());
-
-        if (layer == target.end) {
-            break;
-        }
-    }
-
-    std::sort(
-        stages.begin(), stages.end(),
-        [](const rpc_phone_npu_ffn_stage & a,
-           const rpc_phone_npu_ffn_stage & b) {
-            return a.down_index < b.down_index;
-        });
+    // TENSOR_PHONE_PRIMARY is already encoded in the graph through the
+    // phone_* router markers, so every eligible Tensor FFN is discovered
+    // automatically.  No separate layer-range configuration is needed.
+    std::vector<rpc_phone_npu_ffn_stage> stages =
+        rpc_phone_npu_find_ffn_stages(graph);
 
     if (stages.empty()) {
         return ggml_backend_graph_compute(gpu, graph);
