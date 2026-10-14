@@ -40,23 +40,23 @@ run_test support -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" > "$OUT_ABS
 run_test support -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" > "$OUT_ABS/npu-support.log" 2>&1 || true
 
 echo "[2/5] GPU solo: Flash Attention"
-run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output csv     > "$OUT_ABS/gpu-fa-solo.csv" 2> "$OUT_ABS/gpu-fa-solo.err"
+run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output sql     > "$OUT_ABS/gpu-fa-solo.sql" 2> "$OUT_ABS/gpu-fa-solo.err"
 
 echo "[3/5] NPU solo: Qwen3-shaped MoE FFN primitive (Q4_0 HTP proxy)"
-run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv     > "$OUT_ABS/npu-ffn-solo.csv" 2> "$OUT_ABS/npu-ffn-solo.err"
+run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql     > "$OUT_ABS/npu-ffn-solo.sql" 2> "$OUT_ABS/npu-ffn-solo.err"
 
 echo "[4/5] Concurrent: pair each GPU FA KV length with NPU FFN (simultaneous launch)"
 for kv in 128 256 384 512; do
     GPU_FA_KV_RE="hsk=128.*hsv=128.*nh=4.*nr23=\\[8,1\\].*kv=$kv.*nb=128"
     echo "  concurrent pair: GPU kv=$kv + NPU n=128"
 
-    run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv \
-        > "$OUT_ABS/npu-ffn-concurrent-kv${kv}.csv" \
+    run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql \
+        > "$OUT_ABS/npu-ffn-concurrent-kv${kv}.sql" \
         2> "$OUT_ABS/npu-ffn-concurrent-kv${kv}.err" &
     NPU_PID=$!
 
-    run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_KV_RE" --output csv \
-        > "$OUT_ABS/gpu-fa-concurrent-kv${kv}.csv" \
+    run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_KV_RE" --output sql \
+        > "$OUT_ABS/gpu-fa-concurrent-kv${kv}.sql" \
         2> "$OUT_ABS/gpu-fa-concurrent-kv${kv}.err" &
     GPU_PID=$!
 
@@ -65,11 +65,11 @@ for kv in 128 256 384 512; do
 done
 
 echo "[5/5] Concurrent: GPU projection/router weight streaming + NPU FFN"
-run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv \
-    > "$OUT_ABS/npu-ffn-concurrent-mm.csv" 2> "$OUT_ABS/npu-ffn-concurrent-mm.err" &
+run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql \
+    > "$OUT_ABS/npu-ffn-concurrent-mm.sql" 2> "$OUT_ABS/npu-ffn-concurrent-mm.err" &
 NPU_PID=$!
-run_test perf -b "$GPU_BACKEND" -o MUL_MAT -p "$GPU_MM_RE" --output csv \
-    > "$OUT_ABS/gpu-mm-concurrent.csv" 2> "$OUT_ABS/gpu-mm-concurrent.err" &
+run_test perf -b "$GPU_BACKEND" -o MUL_MAT -p "$GPU_MM_RE" --output sql \
+    > "$OUT_ABS/gpu-mm-concurrent.sql" 2> "$OUT_ABS/gpu-mm-concurrent.err" &
 GPU_PID=$!
 
 wait "$GPU_PID"
@@ -78,9 +78,9 @@ wait "$NPU_PID"
 echo
 echo "Done. Results are in: $OUT_ABS"
 echo "Compare time_us for identical op_params between:"
-echo "  gpu-fa-solo.csv vs gpu-fa-concurrent-kv{128,256,384,512}.csv"
-echo "  npu-ffn-solo.csv vs npu-ffn-concurrent-kv{128,256,384,512}.csv"
-echo "  npu-ffn-solo.csv vs npu-ffn-concurrent-mm.csv"
+echo "  gpu-fa-solo.sql vs gpu-fa-concurrent-kv{128,256,384,512}.sql"
+echo "  npu-ffn-solo.sql vs npu-ffn-concurrent-kv{128,256,384,512}.sql"
+echo "  npu-ffn-solo.sql vs npu-ffn-concurrent-mm.sql"
 echo
 echo "Interpretation:"
 echo "  slowdown <= 10% : overlap looks promising"
