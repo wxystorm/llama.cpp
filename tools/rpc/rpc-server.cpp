@@ -538,11 +538,6 @@ static bool prepare_phone_npu_stage(
         return false;
     }
 
-    fprintf(
-        stderr,
-        "[PHONE_NPU_STAGE_CONFIG] active=1 visible=%s private=%s rpc_devices=1\n",
-        visible_name,
-        ggml_backend_dev_name(phone_npu_device));
     return true;
 }
 
