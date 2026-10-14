@@ -4346,12 +4346,6 @@ public:
         : backends(std::move(all_backends)),
           phone_npu_backend(phone_npu_backend),
           cache_dir(cache_dir) {
-        if (this->phone_npu_backend != nullptr) {
-            GGML_LOG_INFO(
-                "[PHONE_NPU_STAGE_SERVER] active=1 private_backend=%p visible_backends=%zu\n",
-                (void *) this->phone_npu_backend,
-                backends.size());
-        }
         stored_graphs.resize(backends.size());
         snapshot_devices.reserve(backends.size());
         route_snapshot_devices.reserve(backends.size());
@@ -8563,10 +8557,6 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
             return;
         }
 
-        printf(
-            "[PHONE_NPU_STAGE_INIT] active=1 private=%s rpc_visible_devices=%zu\n",
-            ggml_backend_dev_name(phone_npu_device),
-            n_devices);
     }
 
     std::string host;
