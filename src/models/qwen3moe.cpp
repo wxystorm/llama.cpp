@@ -208,15 +208,26 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         llama_hybrid_runtime_prefill_chunk_tokens();
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+    const bool phone_primary_chunk_ring_requested =
+        std::getenv(
+            "LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_RING") != nullptr;
     const char * phone_primary_wavefront_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
     const bool phone_primary_wavefront_requested =
-        phone_primary_wavefront_env != nullptr &&
-        std::atoi(phone_primary_wavefront_env) != 0;
+        phone_primary_chunk_ring_requested ||
+        (phone_primary_wavefront_env != nullptr &&
+         std::atoi(phone_primary_wavefront_env) != 0);
     const char * phone_primary_wave_max_layers_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVE_MAX_LAYERS");
-    int phone_primary_wave_max_layers = 2;
-    if (phone_primary_wave_max_layers_env != nullptr) {
+    // Chunk Ring is the production cross-layer mode: cover the complete
+    // contiguous TENSOR_PHONE_PRIMARY region.  The old small-prefix cap is
+    // retained only for the standalone wavefront experiment.
+    int phone_primary_wave_max_layers =
+        phone_primary_chunk_ring_requested ?
+            n_layer :
+            2;
+    if (!phone_primary_chunk_ring_requested &&
+            phone_primary_wave_max_layers_env != nullptr) {
         const int requested_max_layers =
             std::atoi(phone_primary_wave_max_layers_env);
         if (requested_max_layers > 0) {
