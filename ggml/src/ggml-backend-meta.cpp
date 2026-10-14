@@ -5801,6 +5801,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
     const bool phone_primary_chunk_ring =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_RING") != nullptr;
+    // Sent through the existing PHONE_FFN_MARK_READY RPC before Phone FFN
+    // execution.  The server consumes the arm bit and binds the plain seq to
+    // the private-HTP host result produced by that graph.
+    static constexpr uint64_t PHONE_FFN_CPU_REDUCE_ARM =
+        UINT64_C(1) << 63;
     const bool phone_prefill_critical_return =
         std::getenv("GGML_META_PHONE_PREFILL_CRITICAL_RETURN") != nullptr;
     const bool phone_prefill_route_lane_swap =
@@ -6036,8 +6041,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_chunk_join_active;
 
     // Chunk Ring deliberately reuses the proven V2 storage/dependency
-    // machinery, but removes the one-chunk-ahead throttle and moves the
-    // return->ADD completion onto a dedicated Phone-side worker.
+    // machinery, but removes the one-chunk-ahead throttle.  In the first
+    // formal implementation the private HTP and PC partials join on the
+    // Phone CPU; return completion therefore means the reduced chunk has
+    // already been written back once for the next Attention dependency.
     const bool phone_primary_chunk_ring_active =
         phone_primary_chunk_ring &&
         n_backends == 2 &&
@@ -7153,7 +7160,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     branch_it->sg,
                     branch_it->phone_ffn_seq,
                     ring_reduce ?
-                        "CHUNK_RING" :
+                        "CHUNK_RING_CPU" :
                         (wait_for_return ?
                             "LAYER_BARRIER" : "EAGER"),
                     branch_it->return_lane,
@@ -14082,6 +14089,28 @@ auto prefill_norm_sg_has_prework =
                         pending_phone_prefill_phone_branches.size());
                 }
             } else {
+                if (phone_primary_chunk_ring_active) {
+                    GGML_ASSERT(phone_ffn_seq != 0);
+                    GGML_ASSERT(phone_prefill_ffn_mark_ready != nullptr);
+                    const bool armed =
+                        phone_prefill_ffn_mark_ready(
+                            phone_backend,
+                            phone_ffn_seq |
+                                PHONE_FFN_CPU_REDUCE_ARM);
+                    GGML_ASSERT(armed);
+
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile) {
+                        printf(
+                            "[CHUNK_RING_CPU_ARM] "
+                            "layer=%d chunk=%d sg=%zu seq=%" PRIu64 "\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i,
+                            phone_ffn_seq);
+                    }
+                }
+
                 const int64_t phone_begin_us = ggml_time_us();
                 compute_workers.start(1, i);
                 phone_status = compute_workers.wait(1);
@@ -14119,10 +14148,10 @@ auto prefill_norm_sg_has_prework =
                 phone_graph->uid = saved_phone_ffn_uid;
             }
 
-            // Only a direct-bound Phone partial has a stable lifetime across
-            // later chunk/layer submissions. Build the tiny ADD graph after
-            // that binding is installed, then let one dedicated ATT-side
-            // worker wait for the remote return and enqueue the reduction.
+            // The return RPC now performs the join on the Phone CPU:
+            // HTP partial + PC partial -> one write into the stable Phone
+            // down-chunk buffer.  This worker is only the dependency bridge
+            // that turns the return ACK into "next-layer ATT may consume it".
             if (phone_primary_chunk_ring_active &&
                     xlayer_direct_bound &&
                     return_task != 0) {
@@ -14142,18 +14171,9 @@ auto prefill_norm_sg_has_prework =
                 ggml_backend_meta_transfer_worker * reduce_worker =
                     backend_ctx->phone_prefill_ring_reduce_worker;
 
-                ggml_cgraph * ring_add_graph =
-                    prepare_phone_prefill_staged_add_graph(
-                        i,
-                        prefill_down_layer,
-                        prefill_down_chunk,
-                        phone_return_stage);
-
                 ring_reduce_task = reduce_worker->enqueue(
                     [return_worker,
                      return_task,
-                     phone_backend,
-                     ring_add_graph,
                      return_timing,
                      prefill_down_layer,
                      prefill_down_chunk,
@@ -14166,41 +14186,26 @@ auto prefill_norm_sg_has_prework =
                             return_worker->wait(return_task);
                         const int64_t return_wait_us =
                             ggml_time_us() - wait_begin_us;
-                        if (return_status != GGML_STATUS_SUCCESS) {
-                            return return_status;
-                        }
 
-                        const int64_t add_begin_us = ggml_time_us();
                         if (return_timing != nullptr) {
-                            return_timing->add_submit_begin_us =
-                                add_begin_us;
-                        }
-                        const ggml_status add_status =
-                            ggml_backend_graph_compute_async(
-                                phone_backend,
-                                ring_add_graph);
-                        const int64_t add_end_us = ggml_time_us();
-                        if (return_timing != nullptr) {
-                            return_timing->add_submit_end_us =
-                                add_end_us;
+                            return_timing->add_submit_begin_us = 0;
+                            return_timing->add_submit_end_us = 0;
                         }
 
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
                             printf(
-                                "[CHUNK_RING_REDUCE] "
+                                "[CHUNK_RING_CPU_JOIN_WAIT] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " return_wait_ms=%.3f "
-                                "add_submit_ms=%.3f status=%d\n",
+                                " return_wait_ms=%.3f status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
                                 return_wait_us / 1000.0,
-                                (add_end_us - add_begin_us) / 1000.0,
-                                (int) add_status);
+                                (int) return_status);
                         }
-                        return add_status;
+                        return return_status;
                     });
             }
 
