@@ -6931,16 +6931,101 @@ static bool rpc_phone_npu_read_f32(
     return true;
 }
 
-static bool rpc_phone_npu_convert_q4k_to_q4_0(
+struct rpc_phone_npu_qual_format {
+    ggml_type type;
+    const char * name;
+};
+
+static const std::array<rpc_phone_npu_qual_format, 4> & rpc_phone_npu_qual_formats() {
+    static const std::array<rpc_phone_npu_qual_format, 4> formats {{
+        { GGML_TYPE_Q4_1,   "q4_1"   },
+        { GGML_TYPE_Q8_0,   "q8_0"   },
+        { GGML_TYPE_IQ4_NL, "iq4_nl" },
+        { GGML_TYPE_MXFP4,  "mxfp4"  },
+    }};
+    return formats;
+}
+
+static bool rpc_phone_npu_qual_format_enabled(const char * name) {
+    const char * env = std::getenv("GGML_PHONE_NPU_QUAL_FORMAT");
+    return env == nullptr || env[0] == '\0' ||
+        std::strcmp(env, "all") == 0 ||
+        std::strcmp(env, name) == 0;
+}
+
+static bool rpc_phone_npu_quantize_row(
+        ggml_type type,
+        const float * src,
+        void * dst,
+        int64_t k) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            quantize_row_q4_0_ref(
+                src, reinterpret_cast<block_q4_0 *>(dst), k);
+            return true;
+        case GGML_TYPE_Q4_1:
+            quantize_row_q4_1_ref(
+                src, reinterpret_cast<block_q4_1 *>(dst), k);
+            return true;
+        case GGML_TYPE_Q8_0:
+            quantize_row_q8_0_ref(
+                src, reinterpret_cast<block_q8_0 *>(dst), k);
+            return true;
+        case GGML_TYPE_IQ4_NL:
+            quantize_row_iq4_nl_ref(
+                src, reinterpret_cast<block_iq4_nl *>(dst), k);
+            return true;
+        case GGML_TYPE_MXFP4:
+            quantize_row_mxfp4_ref(
+                src, reinterpret_cast<block_mxfp4 *>(dst), k);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool rpc_phone_npu_dequantize_row(
+        ggml_type type,
+        const void * src,
+        float * dst,
+        int64_t k) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            dequantize_row_q4_0(
+                reinterpret_cast<const block_q4_0 *>(src), dst, k);
+            return true;
+        case GGML_TYPE_Q4_1:
+            dequantize_row_q4_1(
+                reinterpret_cast<const block_q4_1 *>(src), dst, k);
+            return true;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(
+                reinterpret_cast<const block_q8_0 *>(src), dst, k);
+            return true;
+        case GGML_TYPE_IQ4_NL:
+            dequantize_row_iq4_nl(
+                reinterpret_cast<const block_iq4_nl *>(src), dst, k);
+            return true;
+        case GGML_TYPE_MXFP4:
+            dequantize_row_mxfp4(
+                reinterpret_cast<const block_mxfp4 *>(src), dst, k);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool rpc_phone_npu_convert_q4k(
         const ggml_tensor * weight,
-        std::vector<uint8_t> & q4_0,
+        ggml_type dst_type,
+        std::vector<uint8_t> & converted,
         rpc_phone_npu_metrics & metrics) {
     if (weight == nullptr || weight->buffer == nullptr ||
         weight->type != GGML_TYPE_Q4_K ||
         !ggml_is_contiguous(weight) ||
         weight->ne[0] <= 0 ||
         weight->ne[0] % QK_K != 0 ||
-        weight->ne[0] % QK4_0 != 0) {
+        weight->ne[0] % ggml_blck_size(dst_type) != 0) {
         return false;
     }
 
@@ -6949,7 +7034,7 @@ static bool rpc_phone_npu_convert_q4k_to_q4_0(
     const size_t src_row =
         ggml_row_size(GGML_TYPE_Q4_K, row_elems);
     const size_t dst_row =
-        ggml_row_size(GGML_TYPE_Q4_0, row_elems);
+        ggml_row_size(dst_type, row_elems);
     const size_t src_bytes = src_row * (size_t) nrows;
 
     if (src_bytes != ggml_nbytes(weight)) {
@@ -6960,30 +7045,33 @@ static bool rpc_phone_npu_convert_q4k_to_q4_0(
     ggml_backend_tensor_get(
         weight, src.data(), 0, src.size());
 
-    q4_0.resize(dst_row * (size_t) nrows);
+    converted.resize(dst_row * (size_t) nrows);
 
     std::vector<float> deq_ref((size_t) row_elems);
-    std::vector<float> deq_q4_0((size_t) row_elems);
+    std::vector<float> deq_dst((size_t) row_elems);
 
     for (int64_t row = 0; row < nrows; ++row) {
         const auto * q4k_row =
             reinterpret_cast<const block_q4_K *>(
                 src.data() + (size_t) row * src_row);
-        auto * q40_row =
-            reinterpret_cast<block_q4_0 *>(
-                q4_0.data() + (size_t) row * dst_row);
+        void * dst_row_ptr =
+            converted.data() + (size_t) row * dst_row;
 
         dequantize_row_q4_K(
             q4k_row, deq_ref.data(), row_elems);
-        quantize_row_q4_0_ref(
-            deq_ref.data(), q40_row, row_elems);
-        dequantize_row_q4_0(
-            q40_row, deq_q4_0.data(), row_elems);
+        if (!rpc_phone_npu_quantize_row(
+                dst_type, deq_ref.data(),
+                dst_row_ptr, row_elems) ||
+            !rpc_phone_npu_dequantize_row(
+                dst_type, dst_row_ptr,
+                deq_dst.data(), row_elems)) {
+            return false;
+        }
 
         for (int64_t i = 0; i < row_elems; ++i) {
             metrics.add(
                 deq_ref[(size_t) i],
-                deq_q4_0[(size_t) i]);
+                deq_dst[(size_t) i]);
         }
     }
 
@@ -7102,20 +7190,23 @@ static ggml_tensor * rpc_phone_npu_find_flash_attn(
 }
 
 
-static bool rpc_phone_npu_q40_row_dot_f32(
+static bool rpc_phone_npu_quant_row_dot_f32(
+        ggml_type type,
         const uint8_t * row,
         int64_t k,
         const float * x,
         std::vector<float> & scratch,
         float & out) {
     if (row == nullptr || x == nullptr ||
-        k <= 0 || k % QK4_0 != 0) {
+        k <= 0 || k % ggml_blck_size(type) != 0) {
         return false;
     }
+
     scratch.resize((size_t) k);
-    dequantize_row_q4_0(
-        reinterpret_cast<const block_q4_0 *>(row),
-        scratch.data(), k);
+    if (!rpc_phone_npu_dequantize_row(
+            type, row, scratch.data(), k)) {
+        return false;
+    }
 
     double sum = 0.0;
     for (int64_t i = 0; i < k; ++i) {
@@ -7126,10 +7217,11 @@ static bool rpc_phone_npu_q40_row_dot_f32(
     return true;
 }
 
-static bool rpc_phone_npu_run_mm_q40_cpu(
+static bool rpc_phone_npu_run_mm_host_ref(
+        ggml_type type,
         const ggml_tensor * gpu_weight,
         const ggml_tensor * gpu_input,
-        const std::vector<uint8_t> & q4_0,
+        const std::vector<uint8_t> & converted,
         const std::vector<uint8_t> & input_dense,
         std::vector<float> & cpu_out,
         int64_t & compute_us) {
@@ -7146,13 +7238,13 @@ static bool rpc_phone_npu_run_mm_q40_cpu(
     const int64_t n = gpu_weight->ne[1];
     const int64_t m = gpu_input->ne[1];
     const size_t row_bytes =
-        ggml_row_size(GGML_TYPE_Q4_0, k);
+        ggml_row_size(type, k);
     const size_t expected_weight_bytes =
         row_bytes * (size_t) n;
     const size_t expected_input_bytes =
         (size_t) k * (size_t) m * sizeof(float);
 
-    if (q4_0.size() != expected_weight_bytes ||
+    if (converted.size() != expected_weight_bytes ||
         input_dense.size() != expected_input_bytes) {
         return false;
     }
@@ -7164,13 +7256,15 @@ static bool rpc_phone_npu_run_mm_q40_cpu(
     std::vector<float> scratch;
     const int64_t begin = ggml_time_us();
     for (int64_t im = 0; im < m; ++im) {
-        const float * x = input + (size_t) im * (size_t) k;
+        const float * x =
+            input + (size_t) im * (size_t) k;
         for (int64_t in = 0; in < n; ++in) {
             float value = 0.0f;
             const uint8_t * row =
-                q4_0.data() + (size_t) in * row_bytes;
-            if (!rpc_phone_npu_q40_row_dot_f32(
-                    row, k, x, scratch, value)) {
+                converted.data() + (size_t) in * row_bytes;
+            if (!rpc_phone_npu_quant_row_dot_f32(
+                    type, row, k, x,
+                    scratch, value)) {
                 return false;
             }
             cpu_out[(size_t) im * (size_t) n +
@@ -7181,12 +7275,13 @@ static bool rpc_phone_npu_run_mm_q40_cpu(
     return true;
 }
 
-static bool rpc_phone_npu_run_ffn_q40_cpu(
+static bool rpc_phone_npu_run_ffn_host_ref(
+        ggml_type type,
         int layer,
         const ggml_tensor * gpu_up_w,
         const ggml_tensor * gpu_gate_w,
         const ggml_tensor * gpu_down_w,
-        const std::array<std::vector<uint8_t>, 3> & q4_0,
+        const std::array<std::vector<uint8_t>, 3> & converted,
         const ggml_tensor * norm,
         const ggml_tensor * topk,
         const ggml_tensor * route_weights,
@@ -7230,16 +7325,16 @@ static bool rpc_phone_npu_run_ffn_q40_cpu(
     }
 
     const size_t up_row_bytes =
-        ggml_row_size(GGML_TYPE_Q4_0, hidden);
+        ggml_row_size(type, hidden);
     const size_t down_row_bytes =
-        ggml_row_size(GGML_TYPE_Q4_0, ff);
+        ggml_row_size(type, ff);
     const size_t up_expected =
         up_row_bytes * (size_t) ff * (size_t) experts;
     const size_t down_expected =
         down_row_bytes * (size_t) hidden * (size_t) experts;
-    if (q4_0[0].size() != up_expected ||
-        q4_0[1].size() != up_expected ||
-        q4_0[2].size() != down_expected) {
+    if (converted[0].size() != up_expected ||
+        converted[1].size() != up_expected ||
+        converted[2].size() != down_expected) {
         return false;
     }
 
@@ -7283,17 +7378,17 @@ static bool rpc_phone_npu_run_ffn_q40_cpu(
                 (size_t) expert * (size_t) ff * up_row_bytes;
             for (int64_t j = 0; j < ff; ++j) {
                 const uint8_t * up_row =
-                    q4_0[0].data() + expert_up_base +
+                    converted[0].data() + expert_up_base +
                     (size_t) j * up_row_bytes;
                 const uint8_t * gate_row =
-                    q4_0[1].data() + expert_up_base +
+                    converted[1].data() + expert_up_base +
                     (size_t) j * up_row_bytes;
 
-                if (!rpc_phone_npu_q40_row_dot_f32(
-                        up_row, hidden, x,
+                if (!rpc_phone_npu_quant_row_dot_f32(
+                        type, up_row, hidden, x,
                         row_scratch, up[(size_t) j]) ||
-                    !rpc_phone_npu_q40_row_dot_f32(
-                        gate_row, hidden, x,
+                    !rpc_phone_npu_quant_row_dot_f32(
+                        type, gate_row, hidden, x,
                         row_scratch, gate[(size_t) j])) {
                     return false;
                 }
@@ -7311,10 +7406,10 @@ static bool rpc_phone_npu_run_ffn_q40_cpu(
             for (int64_t o = 0; o < hidden; ++o) {
                 float value = 0.0f;
                 const uint8_t * down_row =
-                    q4_0[2].data() + expert_down_base +
+                    converted[2].data() + expert_down_base +
                     (size_t) o * down_row_bytes;
-                if (!rpc_phone_npu_q40_row_dot_f32(
-                        down_row, ff, act.data(),
+                if (!rpc_phone_npu_quant_row_dot_f32(
+                        type, down_row, ff, act.data(),
                         row_scratch, value)) {
                     return false;
                 }
@@ -7345,24 +7440,6 @@ static bool rpc_phone_npu_run_mm_shadow(
     ggml_tensor * gpu_weight = gpu_node->src[0];
     ggml_tensor * gpu_input = gpu_node->src[1];
 
-    const int64_t convert_begin = ggml_time_us();
-    std::vector<uint8_t> q4_0;
-    rpc_phone_npu_metrics conversion_metrics;
-    if (!rpc_phone_npu_convert_q4k_to_q4_0(
-            gpu_weight, q4_0, conversion_metrics)) {
-        GGML_LOG_INFO(
-            "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
-            "reason=weight_convert type=%s ne0=%" PRId64 "\n",
-            layer, stage,
-            ggml_type_name(gpu_weight->type),
-            gpu_weight->ne[0]);
-        return false;
-    }
-    const int64_t convert_us = ggml_time_us() - convert_begin;
-    rpc_phone_npu_log_metrics(
-        "PHONE_NPU_QUAL_CONVERT", stage, layer,
-        conversion_metrics);
-
     std::vector<uint8_t> input_dense;
     if (!rpc_phone_npu_read_dense(
             gpu_input, input_dense)) {
@@ -7375,126 +7452,167 @@ static bool rpc_phone_npu_run_mm_shadow(
         return false;
     }
 
-    ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
-    ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
-    if (!ctx_w || !ctx_a) {
-        return false;
-    }
-
-    ggml_tensor * w = ggml_new_tensor(
-        ctx_w.get(), GGML_TYPE_Q4_0,
-        ggml_n_dims(gpu_weight), gpu_weight->ne);
-    ggml_tensor * inp = ggml_new_tensor(
-        ctx_a.get(), gpu_input->type,
-        ggml_n_dims(gpu_input), gpu_input->ne);
-    ggml_tensor * out = ggml_mul_mat(
-        ctx_a.get(), w, inp);
-    ggml_set_name(w, "phone_npu_qual_weight");
-    ggml_set_name(inp, "phone_npu_qual_input");
-    ggml_set_name(out, "phone_npu_qual_mm_out");
-
     ggml_backend_buffer_type_t repack =
         rpc_phone_npu_repack_buft(npu);
     if (repack == nullptr) {
         return false;
     }
 
-    ggml_backend_buffer_t wbuf =
-        ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx_w.get(), repack);
-    if (wbuf == nullptr) {
-        return false;
-    }
-    ggml_backend_buffer_set_usage(
-        wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    ggml_backend_buffer_t abuf =
-        ggml_backend_alloc_ctx_tensors(
-            ctx_a.get(), npu);
-    if (abuf == nullptr) {
-        ggml_backend_buffer_free(wbuf);
-        return false;
-    }
-
-    const int64_t upload_begin = ggml_time_us();
-    ggml_backend_tensor_set(
-        w, q4_0.data(), 0, q4_0.size());
-    ggml_backend_tensor_set(
-        inp, input_dense.data(), 0, input_dense.size());
-    const int64_t upload_us = ggml_time_us() - upload_begin;
-
-    ggml_cgraph * gf =
-        ggml_new_graph_custom(ctx_a.get(), 128, false);
-    ggml_build_forward_expand(gf, out);
-
-    bool ok = rpc_phone_npu_graph_supported(
-        npu, gf, stage, layer);
-    int64_t compute_us = 0;
-    if (ok) {
-        const int64_t compute_begin = ggml_time_us();
-        ok = ggml_backend_graph_compute(npu, gf) ==
-            GGML_STATUS_SUCCESS;
-        compute_us = ggml_time_us() - compute_begin;
-    }
-
-    if (ok) {
-        std::vector<float> npu_out(
-            (size_t) ggml_nelements(out));
-        ggml_backend_tensor_get(
-            out, npu_out.data(), 0,
-            npu_out.size() * sizeof(float));
-
-        const rpc_phone_npu_metrics total_metrics =
-            rpc_phone_npu_compare_f32(
-                gpu_ref, npu_out);
-        rpc_phone_npu_log_metrics(
-            "PHONE_NPU_QUAL_OUTPUT_TOTAL",
-            stage, layer, total_metrics);
-
-        std::vector<float> cpu_out;
-        int64_t cpu_compute_us = 0;
-        if (rpc_phone_npu_run_mm_q40_cpu(
-                gpu_weight, gpu_input,
-                q4_0, input_dense,
-                cpu_out, cpu_compute_us)) {
-            const rpc_phone_npu_metrics conversion_output_metrics =
-                rpc_phone_npu_compare_f32(
-                    gpu_ref, cpu_out);
-            rpc_phone_npu_log_metrics(
-                "PHONE_NPU_QUAL_OUTPUT_CONVERT",
-                stage, layer,
-                conversion_output_metrics);
-
-            const rpc_phone_npu_metrics npu_only_metrics =
-                rpc_phone_npu_compare_f32(
-                    cpu_out, npu_out);
-            rpc_phone_npu_log_metrics(
-                "PHONE_NPU_QUAL_OUTPUT_NPU",
-                stage, layer,
-                npu_only_metrics);
-        } else {
-            GGML_LOG_INFO(
-                "[PHONE_NPU_QUAL_CPU] layer=%d stage=%s status=FAIL\n",
-                layer, stage);
+    bool any_ok = false;
+    for (const auto & format : rpc_phone_npu_qual_formats()) {
+        if (!rpc_phone_npu_qual_format_enabled(format.name)) {
+            continue;
         }
 
-        GGML_LOG_INFO(
-            "[PHONE_NPU_QUAL_TIME] layer=%d stage=%s "
-            "convert_ms=%.3f upload_ms=%.3f "
-            "npu_compute_ms=%.3f cpu_compute_ms=%.3f "
-            "weight_bytes=%zu input_bytes=%zu\n",
-            layer, stage,
-            convert_us / 1000.0,
-            upload_us / 1000.0,
-            compute_us / 1000.0,
-            cpu_compute_us / 1000.0,
-            q4_0.size(),
+        const std::string fmt_stage =
+            std::string(stage) + "/" + format.name;
+
+        const int64_t convert_begin = ggml_time_us();
+        std::vector<uint8_t> converted;
+        rpc_phone_npu_metrics conversion_metrics;
+        if (!rpc_phone_npu_convert_q4k(
+                gpu_weight, format.type,
+                converted, conversion_metrics)) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
+                "reason=weight_convert src=%s dst=%s ne0=%" PRId64 "\n",
+                layer, fmt_stage.c_str(),
+                ggml_type_name(gpu_weight->type),
+                format.name, gpu_weight->ne[0]);
+            continue;
+        }
+        const int64_t convert_us =
+            ggml_time_us() - convert_begin;
+        rpc_phone_npu_log_metrics(
+            "PHONE_NPU_QUAL_CONVERT",
+            fmt_stage.c_str(), layer,
+            conversion_metrics);
+
+        ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
+        ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
+        if (!ctx_w || !ctx_a) {
+            continue;
+        }
+
+        ggml_tensor * w = ggml_new_tensor(
+            ctx_w.get(), format.type,
+            ggml_n_dims(gpu_weight), gpu_weight->ne);
+        ggml_tensor * inp = ggml_new_tensor(
+            ctx_a.get(), gpu_input->type,
+            ggml_n_dims(gpu_input), gpu_input->ne);
+        ggml_tensor * out = ggml_mul_mat(
+            ctx_a.get(), w, inp);
+        ggml_set_name(w, "phone_npu_qual_weight");
+        ggml_set_name(inp, "phone_npu_qual_input");
+        ggml_set_name(out, "phone_npu_qual_mm_out");
+
+        ggml_backend_buffer_t wbuf =
+            ggml_backend_alloc_ctx_tensors_from_buft(
+                ctx_w.get(), repack);
+        if (wbuf == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_set_usage(
+            wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_backend_buffer_t abuf =
+            ggml_backend_alloc_ctx_tensors(
+                ctx_a.get(), npu);
+        if (abuf == nullptr) {
+            ggml_backend_buffer_free(wbuf);
+            continue;
+        }
+
+        const int64_t upload_begin = ggml_time_us();
+        ggml_backend_tensor_set(
+            w, converted.data(), 0, converted.size());
+        ggml_backend_tensor_set(
+            inp, input_dense.data(), 0,
             input_dense.size());
+        const int64_t upload_us =
+            ggml_time_us() - upload_begin;
+
+        ggml_cgraph * gf =
+            ggml_new_graph_custom(ctx_a.get(), 128, false);
+        ggml_build_forward_expand(gf, out);
+
+        bool ok = rpc_phone_npu_graph_supported(
+            npu, gf, fmt_stage.c_str(), layer);
+        int64_t npu_compute_us = 0;
+        if (ok) {
+            const int64_t begin = ggml_time_us();
+            ok = ggml_backend_graph_compute(npu, gf) ==
+                GGML_STATUS_SUCCESS;
+            npu_compute_us = ggml_time_us() - begin;
+        }
+
+        if (ok) {
+            std::vector<float> npu_out(
+                (size_t) ggml_nelements(out));
+            ggml_backend_tensor_get(
+                out, npu_out.data(), 0,
+                npu_out.size() * sizeof(float));
+
+            const rpc_phone_npu_metrics total_metrics =
+                rpc_phone_npu_compare_f32(
+                    gpu_ref, npu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_TOTAL",
+                fmt_stage.c_str(), layer,
+                total_metrics);
+
+            std::vector<float> host_out;
+            int64_t host_compute_us = 0;
+            if (rpc_phone_npu_run_mm_host_ref(
+                    format.type,
+                    gpu_weight, gpu_input,
+                    converted, input_dense,
+                    host_out, host_compute_us)) {
+                const rpc_phone_npu_metrics convert_output =
+                    rpc_phone_npu_compare_f32(
+                        gpu_ref, host_out);
+                rpc_phone_npu_log_metrics(
+                    "PHONE_NPU_QUAL_OUTPUT_CONVERT",
+                    fmt_stage.c_str(), layer,
+                    convert_output);
+
+                const rpc_phone_npu_metrics npu_only =
+                    rpc_phone_npu_compare_f32(
+                        host_out, npu_out);
+                rpc_phone_npu_log_metrics(
+                    "PHONE_NPU_QUAL_OUTPUT_NPU",
+                    fmt_stage.c_str(), layer,
+                    npu_only);
+            } else {
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_QUAL_CPU] layer=%d stage=%s status=FAIL\n",
+                    layer, fmt_stage.c_str());
+            }
+
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_TIME] layer=%d stage=%s "
+                "convert_ms=%.3f upload_ms=%.3f "
+                "npu_compute_ms=%.3f host_compute_ms=%.3f "
+                "weight_bytes=%zu input_bytes=%zu\n",
+                layer, fmt_stage.c_str(),
+                convert_us / 1000.0,
+                upload_us / 1000.0,
+                npu_compute_us / 1000.0,
+                host_compute_us / 1000.0,
+                converted.size(),
+                input_dense.size());
+            any_ok = true;
+        } else {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_FORMAT_DONE] layer=%d stage=%s status=FAIL\n",
+                layer, fmt_stage.c_str());
+        }
+
+        ggml_backend_buffer_free(abuf);
+        ggml_backend_buffer_free(wbuf);
     }
 
-    ggml_backend_buffer_free(abuf);
-    ggml_backend_buffer_free(wbuf);
-    return ok;
+    return any_ok;
 }
 
 static bool rpc_phone_npu_run_ffn_shadow(
@@ -7519,42 +7637,6 @@ static bool rpc_phone_npu_run_ffn_shadow(
         return false;
     }
 
-    struct converted_weight {
-        const char * role;
-        ggml_tensor * gpu;
-        std::vector<uint8_t> data;
-        rpc_phone_npu_metrics metrics;
-        int64_t convert_us = 0;
-    };
-
-    std::array<converted_weight, 3> weights {{
-        { "ffn_up", gpu_up_w, {}, {}, 0 },
-        { "ffn_gate", gpu_gate_w, {}, {}, 0 },
-        { "ffn_down", gpu_down_w, {}, {}, 0 },
-    }};
-
-    for (auto & weight : weights) {
-        const int64_t begin = ggml_time_us();
-        if (!rpc_phone_npu_convert_q4k_to_q4_0(
-                weight.gpu, weight.data,
-                weight.metrics)) {
-            GGML_LOG_INFO(
-                "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
-                "reason=weight_convert type=%s "
-                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                layer, weight.role,
-                ggml_type_name(weight.gpu->type),
-                weight.gpu->ne[0],
-                weight.gpu->ne[1],
-                weight.gpu->ne[2]);
-            return false;
-        }
-        weight.convert_us = ggml_time_us() - begin;
-        rpc_phone_npu_log_metrics(
-            "PHONE_NPU_QUAL_CONVERT",
-            weight.role, layer, weight.metrics);
-    }
-
     std::vector<uint8_t> hidden_dense;
     std::vector<uint8_t> topk_dense;
     std::vector<uint8_t> route_dense;
@@ -7573,195 +7655,252 @@ static bool rpc_phone_npu_run_ffn_shadow(
     const int64_t n_tokens = norm->ne[1];
     const int64_t n_expert_used = topk->ne[0];
 
-    ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
-    ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
-    if (!ctx_w || !ctx_a) {
-        return false;
-    }
-
-    ggml_tensor * w_up = ggml_new_tensor(
-        ctx_w.get(), GGML_TYPE_Q4_0,
-        ggml_n_dims(gpu_up_w), gpu_up_w->ne);
-    ggml_tensor * w_gate = ggml_new_tensor(
-        ctx_w.get(), GGML_TYPE_Q4_0,
-        ggml_n_dims(gpu_gate_w), gpu_gate_w->ne);
-    ggml_tensor * w_down = ggml_new_tensor(
-        ctx_w.get(), GGML_TYPE_Q4_0,
-        ggml_n_dims(gpu_down_w), gpu_down_w->ne);
-
-    ggml_tensor * hidden = ggml_new_tensor_2d(
-        ctx_a.get(), GGML_TYPE_F32,
-        n_embd, n_tokens);
-    ggml_tensor * ids = ggml_new_tensor_2d(
-        ctx_a.get(), GGML_TYPE_I32,
-        n_expert_used, n_tokens);
-    ggml_tensor * rweights = ggml_new_tensor_3d(
-        ctx_a.get(), GGML_TYPE_F32,
-        1, n_expert_used, n_tokens);
-
-    ggml_tensor * cur = ggml_reshape_3d(
-        ctx_a.get(), hidden, n_embd, 1, n_tokens);
-    ggml_tensor * up = ggml_mul_mat_id(
-        ctx_a.get(), w_up, cur, ids);
-    ggml_tensor * gate = ggml_mul_mat_id(
-        ctx_a.get(), w_gate, cur, ids);
-    ggml_tensor * act = ggml_swiglu_split(
-        ctx_a.get(), gate, up);
-    ggml_tensor * down = ggml_mul_mat_id(
-        ctx_a.get(), w_down, act, ids);
-    ggml_tensor * weighted = ggml_mul(
-        ctx_a.get(), down, rweights);
-
-    std::vector<ggml_tensor *> expert_views;
-    expert_views.reserve((size_t) n_expert_used);
-    for (int64_t e = 0; e < n_expert_used; ++e) {
-        ggml_tensor * view = ggml_view_2d(
-            ctx_a.get(), weighted,
-            n_embd, n_tokens,
-            weighted->nb[2],
-            (size_t) e * weighted->nb[1]);
-        expert_views.push_back(view);
-    }
-
-    ggml_tensor * out = expert_views[0];
-    for (int64_t e = 1; e < n_expert_used; ++e) {
-        out = ggml_add(
-            ctx_a.get(), out,
-            expert_views[(size_t) e]);
-    }
-
-    ggml_set_name(out, "phone_npu_qual_ffn_out");
-
     ggml_backend_buffer_type_t repack =
         rpc_phone_npu_repack_buft(npu);
     if (repack == nullptr) {
         return false;
     }
 
-    ggml_backend_buffer_t wbuf =
-        ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx_w.get(), repack);
-    if (wbuf == nullptr) {
-        return false;
-    }
-    ggml_backend_buffer_set_usage(
-        wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    ggml_backend_buffer_t abuf =
-        ggml_backend_alloc_ctx_tensors(
-            ctx_a.get(), npu);
-    if (abuf == nullptr) {
-        ggml_backend_buffer_free(wbuf);
-        return false;
-    }
-
-    const int64_t upload_begin = ggml_time_us();
-    ggml_backend_tensor_set(
-        w_up, weights[0].data.data(), 0,
-        weights[0].data.size());
-    ggml_backend_tensor_set(
-        w_gate, weights[1].data.data(), 0,
-        weights[1].data.size());
-    ggml_backend_tensor_set(
-        w_down, weights[2].data.data(), 0,
-        weights[2].data.size());
-    ggml_backend_tensor_set(
-        hidden, hidden_dense.data(), 0,
-        hidden_dense.size());
-    ggml_backend_tensor_set(
-        ids, topk_dense.data(), 0,
-        topk_dense.size());
-    ggml_backend_tensor_set(
-        rweights, route_dense.data(), 0,
-        route_dense.size());
-    const int64_t upload_us = ggml_time_us() - upload_begin;
-
-    ggml_cgraph * gf =
-        ggml_new_graph_custom(ctx_a.get(), 2048, false);
-    ggml_build_forward_expand(gf, out);
-
-    bool ok = rpc_phone_npu_graph_supported(
-        npu, gf, "ffn", layer);
-    int64_t compute_us = 0;
-    if (ok) {
-        const int64_t begin = ggml_time_us();
-        ok = ggml_backend_graph_compute(npu, gf) ==
-            GGML_STATUS_SUCCESS;
-        compute_us = ggml_time_us() - begin;
-    }
-
-    if (ok) {
-        std::vector<float> npu_out(
-            (size_t) ggml_nelements(out));
-        ggml_backend_tensor_get(
-            out, npu_out.data(), 0,
-            npu_out.size() * sizeof(float));
-
-        const rpc_phone_npu_metrics total_metrics =
-            rpc_phone_npu_compare_f32(
-                gpu_ref, npu_out);
-        rpc_phone_npu_log_metrics(
-            "PHONE_NPU_QUAL_OUTPUT_TOTAL",
-            "ffn", layer, total_metrics);
-
-        std::array<std::vector<uint8_t>, 3> cpu_weights {
-            weights[0].data,
-            weights[1].data,
-            weights[2].data,
-        };
-        std::vector<float> cpu_out;
-        int64_t cpu_compute_us = 0;
-        if (rpc_phone_npu_run_ffn_q40_cpu(
-                layer,
-                gpu_up_w, gpu_gate_w, gpu_down_w,
-                cpu_weights,
-                norm, topk, route_weights,
-                hidden_dense, topk_dense, route_dense,
-                cpu_out, cpu_compute_us)) {
-            const rpc_phone_npu_metrics conversion_output_metrics =
-                rpc_phone_npu_compare_f32(
-                    gpu_ref, cpu_out);
-            rpc_phone_npu_log_metrics(
-                "PHONE_NPU_QUAL_OUTPUT_CONVERT",
-                "ffn", layer,
-                conversion_output_metrics);
-
-            const rpc_phone_npu_metrics npu_only_metrics =
-                rpc_phone_npu_compare_f32(
-                    cpu_out, npu_out);
-            rpc_phone_npu_log_metrics(
-                "PHONE_NPU_QUAL_OUTPUT_NPU",
-                "ffn", layer,
-                npu_only_metrics);
-        } else {
-            GGML_LOG_INFO(
-                "[PHONE_NPU_QUAL_CPU] layer=%d stage=ffn status=FAIL\n",
-                layer);
+    bool any_ok = false;
+    for (const auto & format : rpc_phone_npu_qual_formats()) {
+        if (!rpc_phone_npu_qual_format_enabled(format.name)) {
+            continue;
         }
 
-        GGML_LOG_INFO(
-            "[PHONE_NPU_QUAL_TIME] layer=%d stage=ffn "
-            "convert_ms=%.3f upload_ms=%.3f "
-            "npu_compute_ms=%.3f cpu_compute_ms=%.3f "
-            "tokens=%" PRId64 " phone_ff=%" PRId64
-            " weight_bytes=%zu\n",
-            layer,
-            (weights[0].convert_us +
-             weights[1].convert_us +
-             weights[2].convert_us) / 1000.0,
-            upload_us / 1000.0,
-            compute_us / 1000.0,
-            cpu_compute_us / 1000.0,
-            n_tokens,
-            gpu_up_w->ne[1],
-            weights[0].data.size() +
-            weights[1].data.size() +
+        const std::string fmt_stage =
+            std::string("ffn/") + format.name;
+
+        struct converted_weight {
+            const char * role;
+            ggml_tensor * gpu;
+            std::vector<uint8_t> data;
+            rpc_phone_npu_metrics metrics;
+            int64_t convert_us = 0;
+        };
+
+        std::array<converted_weight, 3> weights {{
+            { "ffn_up", gpu_up_w, {}, {}, 0 },
+            { "ffn_gate", gpu_gate_w, {}, {}, 0 },
+            { "ffn_down", gpu_down_w, {}, {}, 0 },
+        }};
+
+        bool converted_ok = true;
+        for (auto & weight : weights) {
+            const int64_t begin = ggml_time_us();
+            if (!rpc_phone_npu_convert_q4k(
+                    weight.gpu, format.type,
+                    weight.data, weight.metrics)) {
+                converted_ok = false;
+                break;
+            }
+            weight.convert_us = ggml_time_us() - begin;
+            const std::string weight_stage =
+                std::string(weight.role) + "/" + format.name;
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_CONVERT",
+                weight_stage.c_str(), layer,
+                weight.metrics);
+        }
+        if (!converted_ok) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
+                "reason=weight_convert\n",
+                layer, fmt_stage.c_str());
+            continue;
+        }
+
+        ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
+        ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
+        if (!ctx_w || !ctx_a) {
+            continue;
+        }
+
+        ggml_tensor * w_up = ggml_new_tensor(
+            ctx_w.get(), format.type,
+            ggml_n_dims(gpu_up_w), gpu_up_w->ne);
+        ggml_tensor * w_gate = ggml_new_tensor(
+            ctx_w.get(), format.type,
+            ggml_n_dims(gpu_gate_w), gpu_gate_w->ne);
+        ggml_tensor * w_down = ggml_new_tensor(
+            ctx_w.get(), format.type,
+            ggml_n_dims(gpu_down_w), gpu_down_w->ne);
+
+        ggml_tensor * hidden = ggml_new_tensor_2d(
+            ctx_a.get(), GGML_TYPE_F32,
+            n_embd, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(
+            ctx_a.get(), GGML_TYPE_I32,
+            n_expert_used, n_tokens);
+        ggml_tensor * rweights = ggml_new_tensor_3d(
+            ctx_a.get(), GGML_TYPE_F32,
+            1, n_expert_used, n_tokens);
+
+        ggml_tensor * cur = ggml_reshape_3d(
+            ctx_a.get(), hidden, n_embd, 1, n_tokens);
+        ggml_tensor * up = ggml_mul_mat_id(
+            ctx_a.get(), w_up, cur, ids);
+        ggml_tensor * gate = ggml_mul_mat_id(
+            ctx_a.get(), w_gate, cur, ids);
+        ggml_tensor * act = ggml_swiglu_split(
+            ctx_a.get(), gate, up);
+        ggml_tensor * down = ggml_mul_mat_id(
+            ctx_a.get(), w_down, act, ids);
+        ggml_tensor * weighted = ggml_mul(
+            ctx_a.get(), down, rweights);
+
+        std::vector<ggml_tensor *> expert_views;
+        expert_views.reserve((size_t) n_expert_used);
+        for (int64_t e = 0; e < n_expert_used; ++e) {
+            ggml_tensor * view = ggml_view_2d(
+                ctx_a.get(), weighted,
+                n_embd, n_tokens,
+                weighted->nb[2],
+                (size_t) e * weighted->nb[1]);
+            expert_views.push_back(view);
+        }
+
+        ggml_tensor * out = expert_views[0];
+        for (int64_t e = 1; e < n_expert_used; ++e) {
+            out = ggml_add(
+                ctx_a.get(), out,
+                expert_views[(size_t) e]);
+        }
+        ggml_set_name(out, "phone_npu_qual_ffn_out");
+
+        ggml_backend_buffer_t wbuf =
+            ggml_backend_alloc_ctx_tensors_from_buft(
+                ctx_w.get(), repack);
+        if (wbuf == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_set_usage(
+            wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_backend_buffer_t abuf =
+            ggml_backend_alloc_ctx_tensors(
+                ctx_a.get(), npu);
+        if (abuf == nullptr) {
+            ggml_backend_buffer_free(wbuf);
+            continue;
+        }
+
+        const int64_t upload_begin = ggml_time_us();
+        ggml_backend_tensor_set(
+            w_up, weights[0].data.data(), 0,
+            weights[0].data.size());
+        ggml_backend_tensor_set(
+            w_gate, weights[1].data.data(), 0,
+            weights[1].data.size());
+        ggml_backend_tensor_set(
+            w_down, weights[2].data.data(), 0,
             weights[2].data.size());
+        ggml_backend_tensor_set(
+            hidden, hidden_dense.data(), 0,
+            hidden_dense.size());
+        ggml_backend_tensor_set(
+            ids, topk_dense.data(), 0,
+            topk_dense.size());
+        ggml_backend_tensor_set(
+            rweights, route_dense.data(), 0,
+            route_dense.size());
+        const int64_t upload_us =
+            ggml_time_us() - upload_begin;
+
+        ggml_cgraph * gf =
+            ggml_new_graph_custom(ctx_a.get(), 2048, false);
+        ggml_build_forward_expand(gf, out);
+
+        bool ok = rpc_phone_npu_graph_supported(
+            npu, gf, fmt_stage.c_str(), layer);
+        int64_t npu_compute_us = 0;
+        if (ok) {
+            const int64_t begin = ggml_time_us();
+            ok = ggml_backend_graph_compute(npu, gf) ==
+                GGML_STATUS_SUCCESS;
+            npu_compute_us = ggml_time_us() - begin;
+        }
+
+        if (ok) {
+            std::vector<float> npu_out(
+                (size_t) ggml_nelements(out));
+            ggml_backend_tensor_get(
+                out, npu_out.data(), 0,
+                npu_out.size() * sizeof(float));
+
+            const rpc_phone_npu_metrics total_metrics =
+                rpc_phone_npu_compare_f32(
+                    gpu_ref, npu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_TOTAL",
+                fmt_stage.c_str(), layer,
+                total_metrics);
+
+            std::array<std::vector<uint8_t>, 3> host_weights {
+                weights[0].data,
+                weights[1].data,
+                weights[2].data,
+            };
+            std::vector<float> host_out;
+            int64_t host_compute_us = 0;
+            if (rpc_phone_npu_run_ffn_host_ref(
+                    format.type,
+                    layer,
+                    gpu_up_w, gpu_gate_w, gpu_down_w,
+                    host_weights,
+                    norm, topk, route_weights,
+                    hidden_dense, topk_dense, route_dense,
+                    host_out, host_compute_us)) {
+                const rpc_phone_npu_metrics convert_output =
+                    rpc_phone_npu_compare_f32(
+                        gpu_ref, host_out);
+                rpc_phone_npu_log_metrics(
+                    "PHONE_NPU_QUAL_OUTPUT_CONVERT",
+                    fmt_stage.c_str(), layer,
+                    convert_output);
+
+                const rpc_phone_npu_metrics npu_only =
+                    rpc_phone_npu_compare_f32(
+                        host_out, npu_out);
+                rpc_phone_npu_log_metrics(
+                    "PHONE_NPU_QUAL_OUTPUT_NPU",
+                    fmt_stage.c_str(), layer,
+                    npu_only);
+            } else {
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_QUAL_CPU] layer=%d stage=%s status=FAIL\n",
+                    layer, fmt_stage.c_str());
+            }
+
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_TIME] layer=%d stage=%s "
+                "convert_ms=%.3f upload_ms=%.3f "
+                "npu_compute_ms=%.3f host_compute_ms=%.3f "
+                "tokens=%" PRId64 " phone_ff=%" PRId64
+                " weight_bytes=%zu\n",
+                layer, fmt_stage.c_str(),
+                (weights[0].convert_us +
+                 weights[1].convert_us +
+                 weights[2].convert_us) / 1000.0,
+                upload_us / 1000.0,
+                npu_compute_us / 1000.0,
+                host_compute_us / 1000.0,
+                n_tokens,
+                gpu_up_w->ne[1],
+                weights[0].data.size() +
+                weights[1].data.size() +
+                weights[2].data.size());
+            any_ok = true;
+        } else {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_FORMAT_DONE] layer=%d stage=%s status=FAIL\n",
+                layer, fmt_stage.c_str());
+        }
+
+        ggml_backend_buffer_free(abuf);
+        ggml_backend_buffer_free(wbuf);
     }
 
-    ggml_backend_buffer_free(abuf);
-    ggml_backend_buffer_free(wbuf);
-    return ok;
+    return any_ok;
 }
 
 static bool rpc_phone_npu_run_flash_shadow(
