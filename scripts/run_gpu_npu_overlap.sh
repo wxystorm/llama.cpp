@@ -33,7 +33,7 @@ echo
 
 GPU_FA_RE='hsk=128.*hsv=128.*nh=4.*nr23=\[8,1\].*nb=128'
 GPU_MM_RE='type_a=q4_K.*type_b=f32.*n=128.*k=2048'
-NPU_FFN_RE='type_a=q4_0.*type_b=f32.*n_mats=128.*n_used=8.*m=768.*k=2048'
+NPU_FFN_RE='type_a=q4_0.*type_b=f32.*n_mats=128.*n_used=8.*m=768.*n=128.*k=2048'
 
 echo "[1/5] Probe backend names/support"
 run_test support -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" > "$OUT_ABS/gpu-support.log" 2>&1 || true
@@ -45,23 +45,31 @@ run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output csv  
 echo "[3/5] NPU solo: Qwen3-shaped MoE FFN primitive (Q4_0 HTP proxy)"
 run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv     > "$OUT_ABS/npu-ffn-solo.csv" 2> "$OUT_ABS/npu-ffn-solo.err"
 
-echo "[4/5] Concurrent: GPU Flash Attention + NPU FFN"
-# Give HTP initialization a head start. Each matched perf set runs for multiple
-# seconds, so the timed compute windows overlap even if backend init latencies differ.
-run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv     > "$OUT_ABS/npu-ffn-concurrent.csv" 2> "$OUT_ABS/npu-ffn-concurrent.err" &
-NPU_PID=$!
-sleep 2
-run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output csv     > "$OUT_ABS/gpu-fa-concurrent.csv" 2> "$OUT_ABS/gpu-fa-concurrent.err" &
-GPU_PID=$!
+echo "[4/5] Concurrent: pair each GPU FA KV length with NPU FFN (simultaneous launch)"
+for kv in 128 256 384 512; do
+    GPU_FA_KV_RE="hsk=128.*hsv=128.*nh=4.*nr23=\\[8,1\\].*kv=$kv.*nb=128"
+    echo "  concurrent pair: GPU kv=$kv + NPU n=128"
 
-wait "$GPU_PID"
-wait "$NPU_PID"
+    run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv \
+        > "$OUT_ABS/npu-ffn-concurrent-kv${kv}.csv" \
+        2> "$OUT_ABS/npu-ffn-concurrent-kv${kv}.err" &
+    NPU_PID=$!
+
+    run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_KV_RE" --output csv \
+        > "$OUT_ABS/gpu-fa-concurrent-kv${kv}.csv" \
+        2> "$OUT_ABS/gpu-fa-concurrent-kv${kv}.err" &
+    GPU_PID=$!
+
+    wait "$GPU_PID"
+    wait "$NPU_PID"
+done
 
 echo "[5/5] Concurrent: GPU projection/router weight streaming + NPU FFN"
-run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv     > "$OUT_ABS/npu-ffn-concurrent-mm.csv" 2> "$OUT_ABS/npu-ffn-concurrent-mm.err" &
+run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output csv \
+    > "$OUT_ABS/npu-ffn-concurrent-mm.csv" 2> "$OUT_ABS/npu-ffn-concurrent-mm.err" &
 NPU_PID=$!
-sleep 2
-run_test perf -b "$GPU_BACKEND" -o MUL_MAT -p "$GPU_MM_RE" --output csv     > "$OUT_ABS/gpu-mm-concurrent.csv" 2> "$OUT_ABS/gpu-mm-concurrent.err" &
+run_test perf -b "$GPU_BACKEND" -o MUL_MAT -p "$GPU_MM_RE" --output csv \
+    > "$OUT_ABS/gpu-mm-concurrent.csv" 2> "$OUT_ABS/gpu-mm-concurrent.err" &
 GPU_PID=$!
 
 wait "$GPU_PID"
@@ -70,9 +78,9 @@ wait "$NPU_PID"
 echo
 echo "Done. Results are in: $OUT_ABS"
 echo "Compare time_us for identical op_params between:"
-echo "  gpu-fa-solo.csv          vs gpu-fa-concurrent.csv"
-echo "  npu-ffn-solo.csv         vs npu-ffn-concurrent.csv"
-echo "  npu-ffn-solo.csv         vs npu-ffn-concurrent-mm.csv"
+echo "  gpu-fa-solo.csv vs gpu-fa-concurrent-kv{128,256,384,512}.csv"
+echo "  npu-ffn-solo.csv vs npu-ffn-concurrent-kv{128,256,384,512}.csv"
+echo "  npu-ffn-solo.csv vs npu-ffn-concurrent-mm.csv"
 echo
 echo "Interpretation:"
 echo "  slowdown <= 10% : overlap looks promising"
