@@ -4400,6 +4400,9 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    void phone_npu_shadow_probe(
+        uint64_t graph_uid,
+        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -4439,6 +4442,7 @@ private:
     // the RPC-visible backend vector and therefore cannot become an Outer
     // Meta tensor-split participant.
     ggml_backend_t phone_npu_backend = nullptr;
+    std::atomic<bool> phone_npu_shadow_probe_done { false };
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
 
@@ -6762,6 +6766,158 @@ bool rpc_server::set_tensor_graph_compute(
     return ok;
 }
 
+void rpc_server::phone_npu_shadow_probe(
+        uint64_t graph_uid,
+        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map) {
+    if (phone_npu_backend == nullptr ||
+        std::getenv("GGML_PHONE_NPU_SHADOW_PROBE") == nullptr ||
+        phone_npu_shadow_probe_done.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    ggml_tensor * norm = nullptr;
+    int chunk = -1;
+    int layer = -1;
+
+    for (const auto & entry : tensor_map) {
+        ggml_tensor * tensor = entry.second;
+        if (tensor == nullptr || tensor->name[0] == '\0') {
+            continue;
+        }
+
+        int parsed = 0;
+        int candidate_chunk = -1;
+        int candidate_layer = -1;
+        if (std::sscanf(
+                tensor->name,
+                "prefill_ffn_norm_chunk_%d-%d%n",
+                &candidate_chunk,
+                &candidate_layer,
+                &parsed) == 2 &&
+            tensor->name[parsed] == '\0' &&
+            candidate_chunk == 0) {
+            norm = tensor;
+            chunk = candidate_chunk;
+            layer = candidate_layer;
+            break;
+        }
+    }
+
+    if (norm == nullptr) {
+        return;
+    }
+
+    char topk_name[GGML_MAX_NAME] = {};
+    char weights_name[GGML_MAX_NAME] = {};
+    char down_name[GGML_MAX_NAME] = {};
+    std::snprintf(
+        topk_name, sizeof(topk_name),
+        "phone_prefill_route_topk_chunk_%d-%d", chunk, layer);
+    std::snprintf(
+        weights_name, sizeof(weights_name),
+        "phone_prefill_route_weights_chunk_%d-%d", chunk, layer);
+    std::snprintf(
+        down_name, sizeof(down_name),
+        "prefill_ffn_down_chunk_%d-%d", chunk, layer);
+
+    auto find_tensor = [&](const char * name) -> ggml_tensor * {
+        for (const auto & entry : tensor_map) {
+            ggml_tensor * tensor = entry.second;
+            if (tensor != nullptr && std::strcmp(tensor->name, name) == 0) {
+                return tensor;
+            }
+        }
+        return nullptr;
+    };
+
+    ggml_tensor * topk = find_tensor(topk_name);
+    ggml_tensor * route_weights = find_tensor(weights_name);
+    ggml_tensor * down = find_tensor(down_name);
+
+    if (topk == nullptr || route_weights == nullptr || down == nullptr) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SHADOW_PROBE] graph_uid=%" PRIu64
+            " status=WAIT_BOUNDARIES layer=%d chunk=%d "
+            "norm=%d topk=%d weights=%d down=%d\n",
+            graph_uid, layer, chunk,
+            norm != nullptr ? 1 : 0,
+            topk != nullptr ? 1 : 0,
+            route_weights != nullptr ? 1 : 0,
+            down != nullptr ? 1 : 0);
+        return;
+    }
+
+    auto log_tensor = [&](const char * role, const ggml_tensor * tensor) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SHADOW_TENSOR] graph_uid=%" PRIu64
+            " layer=%d chunk=%d role=%s name=%s type=%s "
+            "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "bytes=%zu buffer=%s\n",
+            graph_uid, layer, chunk, role, tensor->name,
+            ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            ggml_nbytes(tensor),
+            tensor->buffer != nullptr ?
+                ggml_backend_buffer_name(tensor->buffer) : "<null>");
+    };
+
+    log_tensor("norm", norm);
+    log_tensor("topk", topk);
+    log_tensor("route_weights", route_weights);
+    log_tensor("gpu_down", down);
+
+    const char * suffixes[] = {
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    };
+
+    bool have_all_weights = local_tensor_source.get_info != nullptr;
+    for (const char * suffix : suffixes) {
+        char name[GGML_MAX_NAME] = {};
+        std::snprintf(name, sizeof(name), "blk.%d.%s", layer, suffix);
+
+        ggml_rpc_local_tensor_info info {};
+        const bool found =
+            local_tensor_source.get_info != nullptr &&
+            local_tensor_source.get_info(
+                local_tensor_source.user_data, name, &info);
+
+        have_all_weights = have_all_weights && found;
+
+        const ggml_type type =
+            found ? static_cast<ggml_type>(info.type) : GGML_TYPE_COUNT;
+        const bool htp_weight_supported =
+            found &&
+            (type == GGML_TYPE_Q4_0 ||
+             type == GGML_TYPE_Q4_1 ||
+             type == GGML_TYPE_Q8_0 ||
+             type == GGML_TYPE_IQ4_NL ||
+             type == GGML_TYPE_MXFP4);
+
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SHADOW_WEIGHT] layer=%d name=%s found=%d "
+            "type=%s bytes=%" PRIu64
+            " ne=[%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "] "
+            "htp_mul_mat_id_weight_supported=%d\n",
+            layer, name, found ? 1 : 0,
+            found ? ggml_type_name(type) : "<missing>",
+            found ? info.nbytes : 0,
+            found ? info.ne[0] : 0,
+            found ? info.ne[1] : 0,
+            found ? info.ne[2] : 0,
+            found ? info.ne[3] : 0,
+            htp_weight_supported ? 1 : 0);
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_SHADOW_PROBE] graph_uid=%" PRIu64
+        " status=READY layer=%d chunk=%d local_weights=%d\n",
+        graph_uid, layer, chunk, have_all_weights ? 1 : 0);
+
+    phone_npu_shadow_probe_done.store(true, std::memory_order_release);
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -6845,6 +7001,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         graph,
         t1 - t0,
         0);
+
+    phone_npu_shadow_probe(graph_uid, tensor_map);
 
     if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
