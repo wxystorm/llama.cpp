@@ -7229,12 +7229,11 @@ bool rpc_server::set_tensor_from_local_file(
                 name.c_str(),
                 &info)) {
 
-            GGML_LOG_WARN(
-                "[RPC_LOCAL_FILE_FALLBACK] reason=tensor_not_found "
-                "name='%s'\n",
+            GGML_LOG_ERROR(
+                "[%s] local tensor '%s' not found\n",
+                __func__,
                 name.c_str());
-            response.result = 0;
-            return true;
+            return false;
         }
 
         if (!range_2d_fits(
@@ -7244,21 +7243,21 @@ bool rpc_server::set_tensor_from_local_file(
                 request.src_stride,
                 info.nbytes)) {
 
-            GGML_LOG_WARN(
-                "[RPC_LOCAL_FILE_FALLBACK] reason=source_range "
+            GGML_LOG_ERROR(
+                "[%s] source 2D range is out of bounds: "
                 "name='%s', src_offset=%" PRIu64
                 ", copy_size=%" PRIu64
                 ", n_copies=%" PRIu64
                 ", src_stride=%" PRIu64
                 ", tensor_size=%" PRIu64 "\n",
+                __func__,
                 name.c_str(),
                 request.src_offset,
                 request.copy_size,
                 request.n_copies,
                 request.src_stride,
                 info.nbytes);
-            response.result = 0;
-            return true;
+            return false;
         }
     }
 
@@ -7327,17 +7326,17 @@ bool rpc_server::set_tensor_from_local_file(
                 staging.data() + (opencl_quantized ? static_cast<size_t>(dst_i) : 0),
                 static_cast<size_t>(request.copy_size))) {
 
-            GGML_LOG_WARN(
-                "[RPC_LOCAL_FILE_FALLBACK] reason=read_failed "
+            GGML_LOG_ERROR(
+                "[%s] failed to read local tensor: "
                 "name='%s', copy=%" PRIu64
                 ", src=%" PRIu64
                 ", size=%" PRIu64 "\n",
+                __func__,
                 name.c_str(),
                 i,
                 src_i,
                 request.copy_size);
-            response.result = 0;
-            return true;
+            return false;
         }
 
         /*
