@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-alloc.h"
 #include "ggml-opencl.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -24,6 +25,7 @@
 #include <functional>
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <limits>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
