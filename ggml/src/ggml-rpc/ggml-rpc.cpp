@@ -4411,7 +4411,8 @@ public:
     void phone_npu_qualify_graph(
         uint64_t graph_uid,
         ggml_cgraph * graph,
-        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map);
+        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map,
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -7190,6 +7191,337 @@ static ggml_tensor * rpc_phone_npu_find_flash_attn(
 }
 
 
+
+static bool rpc_phone_npu_snapshot_dense(
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots,
+        const ggml_tensor * tensor,
+        std::vector<uint8_t> & dense) {
+    auto it = snapshots.find(tensor);
+    if (it == snapshots.end()) {
+        return false;
+    }
+    dense = it->second;
+    return true;
+}
+
+static bool rpc_phone_npu_snapshot_f32(
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots,
+        const ggml_tensor * tensor,
+        std::vector<float> & values) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    auto it = snapshots.find(tensor);
+    if (it == snapshots.end() ||
+        it->second.size() % sizeof(float) != 0) {
+        return false;
+    }
+    values.resize(it->second.size() / sizeof(float));
+    memcpy(values.data(), it->second.data(), it->second.size());
+    return true;
+}
+
+struct rpc_phone_npu_capture {
+    ggml_context * tensor_ctx = nullptr;
+    ggml_context * graph_ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_cgraph * compute_graph = nullptr;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> dst;
+
+    void clear() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+        }
+        if (graph_ctx != nullptr) {
+            ggml_free(graph_ctx);
+            graph_ctx = nullptr;
+        }
+        if (tensor_ctx != nullptr) {
+            ggml_free(tensor_ctx);
+            tensor_ctx = nullptr;
+        }
+        compute_graph = nullptr;
+        dst.clear();
+    }
+
+    ~rpc_phone_npu_capture() {
+        clear();
+    }
+};
+
+static void rpc_phone_npu_capture_add_target(
+        std::unordered_set<ggml_tensor *> & targets,
+        ggml_tensor * tensor) {
+    if (tensor != nullptr &&
+        tensor->buffer != nullptr &&
+        tensor->type != GGML_TYPE_COUNT) {
+        targets.insert(tensor);
+    }
+}
+
+static bool rpc_phone_npu_prepare_capture(
+        ggml_backend_t backend,
+        ggml_cgraph * graph,
+        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map,
+        int layer,
+        rpc_phone_npu_capture & capture) {
+    if (backend == nullptr || graph == nullptr || layer < 0) {
+        return false;
+    }
+
+    std::unordered_set<ggml_tensor *> targets;
+
+    const char * attn_suffixes[] = {
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+    };
+    for (const char * suffix : attn_suffixes) {
+        const std::string name =
+            "blk." + std::to_string(layer) + "." + suffix;
+        ggml_tensor * node =
+            rpc_phone_npu_find_mm_by_weight(
+                graph, name.c_str());
+        if (node == nullptr) {
+            continue;
+        }
+        rpc_phone_npu_capture_add_target(
+            targets, node->src[1]);
+        rpc_phone_npu_capture_add_target(
+            targets, node);
+    }
+
+    char kqv_name[GGML_MAX_NAME] = {};
+    std::snprintf(
+        kqv_name, sizeof(kqv_name),
+        "kqv_out-%d", layer);
+    ggml_tensor * kqv =
+        rpc_phone_npu_find_exact(
+            tensor_map, kqv_name);
+    ggml_tensor * fa =
+        kqv != nullptr ?
+            rpc_phone_npu_find_flash_attn(
+                graph, kqv) : nullptr;
+    if (fa != nullptr) {
+        for (int i = 0; i < 5; ++i) {
+            rpc_phone_npu_capture_add_target(
+                targets, fa->src[i]);
+        }
+        rpc_phone_npu_capture_add_target(
+            targets, fa);
+    }
+
+    char norm_name[GGML_MAX_NAME] = {};
+    char topk_name[GGML_MAX_NAME] = {};
+    char route_name[GGML_MAX_NAME] = {};
+    char down_name[GGML_MAX_NAME] = {};
+    std::snprintf(
+        norm_name, sizeof(norm_name),
+        "prefill_ffn_norm_chunk_0-%d", layer);
+    std::snprintf(
+        topk_name, sizeof(topk_name),
+        "phone_prefill_route_topk_chunk_0-%d", layer);
+    std::snprintf(
+        route_name, sizeof(route_name),
+        "phone_prefill_route_weights_chunk_0-%d", layer);
+    std::snprintf(
+        down_name, sizeof(down_name),
+        "prefill_ffn_down_chunk_0-%d", layer);
+
+    rpc_phone_npu_capture_add_target(
+        targets,
+        rpc_phone_npu_find_exact(
+            tensor_map, norm_name));
+    rpc_phone_npu_capture_add_target(
+        targets,
+        rpc_phone_npu_find_exact(
+            tensor_map, topk_name));
+    rpc_phone_npu_capture_add_target(
+        targets,
+        rpc_phone_npu_find_exact(
+            tensor_map, route_name));
+    rpc_phone_npu_capture_add_target(
+        targets,
+        rpc_phone_npu_find_exact(
+            tensor_map, down_name));
+
+    if (targets.empty()) {
+        return false;
+    }
+
+    const size_t tensor_ctx_size =
+        ggml_tensor_overhead() *
+            (targets.size() * 3 + 32) +
+        4096;
+    ggml_init_params tensor_params {
+        /* .mem_size   = */ tensor_ctx_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    capture.tensor_ctx = ggml_init(tensor_params);
+    if (capture.tensor_ctx == nullptr) {
+        return false;
+    }
+
+    struct scheduled_copy {
+        int index = -1;
+        bool before = false;
+        ggml_tensor * op = nullptr;
+    };
+    std::vector<scheduled_copy> copies;
+    copies.reserve(targets.size());
+
+    for (ggml_tensor * target : targets) {
+        ggml_tensor * dst = ggml_new_tensor(
+            capture.tensor_ctx,
+            target->type,
+            ggml_n_dims(target),
+            target->ne);
+        ggml_format_name(
+            dst, "phone_npu_snap_%s",
+            target->name[0] != '\0' ?
+                target->name : "unnamed");
+
+        ggml_tensor * copy =
+            ggml_cpy(
+                capture.tensor_ctx,
+                target, dst);
+        capture.dst.emplace(target, dst);
+
+        int producer = -1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i] == target) {
+                producer = i;
+                break;
+            }
+        }
+        if (producer >= 0) {
+            copies.push_back({ producer, false, copy });
+            continue;
+        }
+
+        int consumer = -1;
+        for (int i = 0;
+             i < graph->n_nodes && consumer < 0; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            if (node == nullptr) {
+                continue;
+            }
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (node->src[j] == target) {
+                    consumer = i;
+                    break;
+                }
+            }
+        }
+        if (consumer < 0) {
+            capture.dst.erase(target);
+            continue;
+        }
+        copies.push_back({ consumer, true, copy });
+    }
+
+    if (copies.empty()) {
+        capture.clear();
+        return false;
+    }
+
+    capture.buffer =
+        ggml_backend_alloc_ctx_tensors(
+            capture.tensor_ctx, backend);
+    if (capture.buffer == nullptr) {
+        capture.clear();
+        return false;
+    }
+
+    const int capacity =
+        graph->n_nodes + (int) copies.size() + 8;
+    const size_t graph_ctx_size =
+        ggml_graph_overhead_custom(
+            capacity, false) + 4096;
+    ggml_init_params graph_params {
+        /* .mem_size   = */ graph_ctx_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    capture.graph_ctx = ggml_init(graph_params);
+    if (capture.graph_ctx == nullptr) {
+        capture.clear();
+        return false;
+    }
+
+    capture.compute_graph =
+        ggml_new_graph_custom(
+            capture.graph_ctx,
+            capacity, false);
+    if (capture.compute_graph == nullptr) {
+        capture.clear();
+        return false;
+    }
+
+    auto append = [&](ggml_tensor * node) {
+        GGML_ASSERT(
+            capture.compute_graph->n_nodes <
+            capture.compute_graph->size);
+        capture.compute_graph->nodes[
+            capture.compute_graph->n_nodes++] = node;
+    };
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        for (const auto & item : copies) {
+            if (item.before && item.index == i) {
+                append(item.op);
+            }
+        }
+
+        append(graph->nodes[i]);
+
+        for (const auto & item : copies) {
+            if (!item.before && item.index == i) {
+                append(item.op);
+            }
+        }
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_QUAL_CAPTURE_PLAN] layer=%d "
+        "original_nodes=%d capture_nodes=%zu augmented_nodes=%d\n",
+        layer, graph->n_nodes, copies.size(),
+        capture.compute_graph->n_nodes);
+    return true;
+}
+
+static void rpc_phone_npu_collect_capture(
+        const rpc_phone_npu_capture & capture,
+        std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
+    snapshots.clear();
+    snapshots.reserve(capture.dst.size());
+
+    for (const auto & entry : capture.dst) {
+        const ggml_tensor * src = entry.first;
+        ggml_tensor * dst = entry.second;
+        if (src == nullptr || dst == nullptr ||
+            dst->buffer == nullptr) {
+            continue;
+        }
+
+        const size_t bytes = ggml_nbytes(dst);
+        std::vector<uint8_t> data(bytes);
+        ggml_backend_tensor_get(
+            dst, data.data(), 0, bytes);
+        snapshots.emplace(src, std::move(data));
+
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_CAPTURE] tensor=%s "
+            "type=%s bytes=%zu\n",
+            src->name,
+            ggml_type_name(src->type),
+            bytes);
+    }
+}
+
 static bool rpc_phone_npu_quant_row_dot_f32(
         ggml_type type,
         const uint8_t * row,
@@ -7426,7 +7758,8 @@ static bool rpc_phone_npu_run_mm_shadow(
         ggml_backend_t npu,
         ggml_tensor * gpu_node,
         int layer,
-        const char * stage) {
+        const char * stage,
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
     if (npu == nullptr || gpu_node == nullptr ||
         gpu_node->op != GGML_OP_MUL_MAT ||
         gpu_node->src[0] == nullptr ||
@@ -7624,7 +7957,8 @@ static bool rpc_phone_npu_run_ffn_shadow(
         ggml_tensor * gpu_down,
         ggml_tensor * gpu_up_w,
         ggml_tensor * gpu_gate_w,
-        ggml_tensor * gpu_down_w) {
+        ggml_tensor * gpu_down_w,
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
     if (npu == nullptr ||
         norm == nullptr || topk == nullptr ||
         route_weights == nullptr || gpu_down == nullptr ||
@@ -7906,7 +8240,8 @@ static bool rpc_phone_npu_run_ffn_shadow(
 static bool rpc_phone_npu_run_flash_shadow(
         ggml_backend_t npu,
         ggml_tensor * gpu_fa,
-        int layer) {
+        int layer,
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
     if (npu == nullptr || gpu_fa == nullptr ||
         gpu_fa->op != GGML_OP_FLASH_ATTN_EXT ||
         gpu_fa->src[0] == nullptr ||
@@ -8190,7 +8525,8 @@ void rpc_server::phone_npu_shadow_probe(
 void rpc_server::phone_npu_qualify_graph(
         uint64_t graph_uid,
         ggml_cgraph * graph,
-        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map) {
+        const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map,
+        const std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
     const int layer = rpc_phone_npu_qualify_layer();
     if (phone_npu_backend == nullptr ||
         layer < 0 ||
