@@ -4519,11 +4519,18 @@ static bool rpc_phone_npu_read_dense(
     return out == n;
 }
 
-static bool rpc_phone_npu_convert_q4k_to_q8(
+static bool rpc_phone_npu_supported_k_quant(
+        enum ggml_type type) {
+    return type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K ||
+           type == GGML_TYPE_Q6_K;
+}
+
+static bool rpc_phone_npu_convert_k_to_q8(
         const ggml_tensor * weight,
         std::vector<uint8_t> & converted) {
     if (weight == nullptr || weight->buffer == nullptr ||
-        weight->type != GGML_TYPE_Q4_K ||
+        !rpc_phone_npu_supported_k_quant(weight->type) ||
         !ggml_is_contiguous(weight) ||
         weight->ne[0] <= 0 ||
         weight->ne[0] % QK_K != 0 ||
@@ -4534,7 +4541,7 @@ static bool rpc_phone_npu_convert_q4k_to_q8(
     const int64_t row_elems = weight->ne[0];
     const int64_t nrows = ggml_nelements(weight) / row_elems;
     const size_t src_row =
-        ggml_row_size(GGML_TYPE_Q4_K, row_elems);
+        ggml_row_size(weight->type, row_elems);
     const size_t dst_row =
         ggml_row_size(GGML_TYPE_Q8_0, row_elems);
     const size_t src_bytes = src_row * (size_t) nrows;
@@ -4551,15 +4558,35 @@ static bool rpc_phone_npu_convert_q4k_to_q8(
     std::vector<float> row((size_t) row_elems);
 
     for (int64_t i = 0; i < nrows; ++i) {
-        const auto * q4k_row =
-            reinterpret_cast<const block_q4_K *>(
-                src.data() + (size_t) i * src_row);
+        const uint8_t * src_row_data =
+            src.data() + (size_t) i * src_row;
         auto * q8_row =
             reinterpret_cast<block_q8_0 *>(
                 converted.data() + (size_t) i * dst_row);
 
-        dequantize_row_q4_K(
-            q4k_row, row.data(), row_elems);
+        switch (weight->type) {
+            case GGML_TYPE_Q4_K:
+                dequantize_row_q4_K(
+                    reinterpret_cast<const block_q4_K *>(
+                        src_row_data),
+                    row.data(), row_elems);
+                break;
+            case GGML_TYPE_Q5_K:
+                dequantize_row_q5_K(
+                    reinterpret_cast<const block_q5_K *>(
+                        src_row_data),
+                    row.data(), row_elems);
+                break;
+            case GGML_TYPE_Q6_K:
+                dequantize_row_q6_K(
+                    reinterpret_cast<const block_q6_K *>(
+                        src_row_data),
+                    row.data(), row_elems);
+                break;
+            default:
+                return false;
+        }
+
         quantize_row_q8_0_ref(
             row.data(), q8_row, row_elems);
     }
@@ -7411,9 +7438,9 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
 
     if (gpu_up == nullptr || gpu_gate == nullptr ||
         gpu_down == nullptr ||
-        gpu_up->type != GGML_TYPE_Q4_K ||
-        gpu_gate->type != GGML_TYPE_Q4_K ||
-        gpu_down->type != GGML_TYPE_Q4_K ||
+        !rpc_phone_npu_supported_k_quant(gpu_up->type) ||
+        !rpc_phone_npu_supported_k_quant(gpu_gate->type) ||
+        !rpc_phone_npu_supported_k_quant(gpu_down->type) ||
         gpu_up->ne[0] != stage.norm->ne[0] ||
         gpu_gate->ne[0] != stage.norm->ne[0] ||
         gpu_up->ne[1] != gpu_gate->ne[1] ||
@@ -7507,7 +7534,7 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
     size_t total_bytes = 0;
     for (const auto & weight : weights) {
         std::vector<uint8_t> converted;
-        if (!rpc_phone_npu_convert_q4k_to_q8(
+        if (!rpc_phone_npu_convert_k_to_q8(
                 weight.gpu, converted) ||
             converted.size() != ggml_nbytes(weight.npu)) {
             GGML_LOG_ERROR(
