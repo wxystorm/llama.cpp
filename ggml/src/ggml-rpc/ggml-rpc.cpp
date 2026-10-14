@@ -7774,14 +7774,22 @@ static bool rpc_phone_npu_run_mm_shadow(
     ggml_tensor * gpu_input = gpu_node->src[1];
 
     std::vector<uint8_t> input_dense;
-    if (!rpc_phone_npu_read_dense(
-            gpu_input, input_dense)) {
+    if (!rpc_phone_npu_snapshot_dense(
+            snapshots, gpu_input, input_dense)) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
+            "reason=missing_input_snapshot tensor=%s\n",
+            layer, stage, gpu_input->name);
         return false;
     }
 
     std::vector<float> gpu_ref;
-    if (!rpc_phone_npu_read_f32(
-            gpu_node, gpu_ref)) {
+    if (!rpc_phone_npu_snapshot_f32(
+            snapshots, gpu_node, gpu_ref)) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_SKIP] layer=%d stage=%s "
+            "reason=missing_output_snapshot tensor=%s\n",
+            layer, stage, gpu_node->name);
         return false;
     }
 
@@ -7974,14 +7982,26 @@ static bool rpc_phone_npu_run_ffn_shadow(
     std::vector<uint8_t> hidden_dense;
     std::vector<uint8_t> topk_dense;
     std::vector<uint8_t> route_dense;
-    if (!rpc_phone_npu_read_dense(norm, hidden_dense) ||
-        !rpc_phone_npu_read_dense(topk, topk_dense) ||
-        !rpc_phone_npu_read_dense(route_weights, route_dense)) {
+    if (!rpc_phone_npu_snapshot_dense(
+            snapshots, norm, hidden_dense) ||
+        !rpc_phone_npu_snapshot_dense(
+            snapshots, topk, topk_dense) ||
+        !rpc_phone_npu_snapshot_dense(
+            snapshots, route_weights, route_dense)) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_SKIP] layer=%d stage=ffn "
+            "reason=missing_input_snapshot\n",
+            layer);
         return false;
     }
 
     std::vector<float> gpu_ref;
-    if (!rpc_phone_npu_read_f32(gpu_down, gpu_ref)) {
+    if (!rpc_phone_npu_snapshot_f32(
+            snapshots, gpu_down, gpu_ref)) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_SKIP] layer=%d stage=ffn "
+            "reason=missing_output_snapshot\n",
+            layer);
         return false;
     }
 
@@ -8270,13 +8290,14 @@ static bool rpc_phone_npu_run_flash_shadow(
         if (srcs[i] == nullptr) {
             continue;
         }
-        if (!rpc_phone_npu_read_dense(
-                srcs[i], dense[i])) {
+        if (!rpc_phone_npu_snapshot_dense(
+                snapshots, srcs[i], dense[i])) {
             GGML_LOG_INFO(
                 "[PHONE_NPU_QUAL_SKIP] layer=%d stage=attn_fa "
-                "reason=input_dense index=%zu type=%s\n",
+                "reason=missing_input_snapshot index=%zu type=%s name=%s\n",
                 layer, i,
-                ggml_type_name(srcs[i]->type));
+                ggml_type_name(srcs[i]->type),
+                srcs[i]->name);
             return false;
         }
         inputs[i] = ggml_new_tensor(
@@ -8336,8 +8357,8 @@ static bool rpc_phone_npu_run_flash_shadow(
         std::vector<float> gpu_ref;
         std::vector<float> npu_out(
             (size_t) ggml_nelements(out));
-        if (!rpc_phone_npu_read_f32(
-                gpu_fa, gpu_ref)) {
+        if (!rpc_phone_npu_snapshot_f32(
+                snapshots, gpu_fa, gpu_ref)) {
             ok = false;
         } else {
             ggml_backend_tensor_get(
@@ -8585,7 +8606,8 @@ void rpc_server::phone_npu_qualify_graph(
 
         if (!rpc_phone_npu_run_mm_shadow(
                 phone_npu_backend,
-                node, layer, item.stage)) {
+                node, layer, item.stage,
+                snapshots)) {
             GGML_LOG_INFO(
                 "[PHONE_NPU_QUAL_DONE] layer=%d stage=%s status=FAIL\n",
                 layer, item.stage);
@@ -8613,7 +8635,8 @@ void rpc_server::phone_npu_qualify_graph(
                 " layer=%d stage=attn_fa\n",
                 graph_uid, layer);
             if (!rpc_phone_npu_run_flash_shadow(
-                    phone_npu_backend, fa, layer)) {
+                    phone_npu_backend, fa, layer,
+                    snapshots)) {
                 GGML_LOG_INFO(
                     "[PHONE_NPU_QUAL_DONE] layer=%d "
                     "stage=attn_fa status=FAIL\n",
@@ -8690,7 +8713,8 @@ void rpc_server::phone_npu_qualify_graph(
                 phone_npu_backend,
                 layer,
                 norm, topk, route, down,
-                up_w, gate_w, down_w)) {
+                up_w, gate_w, down_w,
+                snapshots)) {
             GGML_LOG_INFO(
                 "[PHONE_NPU_QUAL_DONE] layer=%d stage=ffn status=FAIL\n",
                 layer);
@@ -8770,14 +8794,39 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+    rpc_phone_npu_capture capture;
+    std::unordered_map<const ggml_tensor *, std::vector<uint8_t>>
+        qualification_snapshots;
+
+    ggml_cgraph * compute_graph = graph;
+    const int qualify_layer =
+        rpc_phone_npu_qualify_layer();
+    if (phone_npu_backend != nullptr &&
+        qualify_layer >= 0 &&
+        rpc_phone_npu_prepare_capture(
+            backends[device],
+            graph,
+            tensor_map,
+            qualify_layer,
+            capture)) {
+        compute_graph = capture.compute_graph;
+    }
+
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
         ggml_backend_graph_compute(
             backends[device],
-            graph);
+            compute_graph);
 
     const int64_t t1 = ggml_time_us();
+
+    if (status == GGML_STATUS_SUCCESS &&
+        compute_graph != graph) {
+        rpc_phone_npu_collect_capture(
+            capture,
+            qualification_snapshots);
+    }
 
     rpc_tensor_phone_log_graph_compute(
         "compute",
@@ -8788,7 +8837,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     phone_npu_shadow_probe(graph_uid, tensor_map);
     phone_npu_qualify_graph(
-        graph_uid, graph, tensor_map);
+        graph_uid, graph, tensor_map,
+        qualification_snapshots);
 
     if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
