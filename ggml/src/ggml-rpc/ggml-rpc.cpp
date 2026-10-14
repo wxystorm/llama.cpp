@@ -7101,6 +7101,234 @@ static ggml_tensor * rpc_phone_npu_find_flash_attn(
     return nullptr;
 }
 
+
+static ggml_backend_t rpc_phone_npu_init_cpu_backend() {
+    ggml_backend_t cpu =
+        ggml_backend_init_by_type(
+            GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_CPU] status=UNAVAILABLE\n");
+    }
+    return cpu;
+}
+
+static bool rpc_phone_npu_run_mm_q40_cpu(
+        const ggml_tensor * gpu_weight,
+        const ggml_tensor * gpu_input,
+        const std::vector<uint8_t> & q4_0,
+        const std::vector<uint8_t> & input_dense,
+        std::vector<float> & cpu_out,
+        int64_t & compute_us) {
+    ggml_backend_t cpu = rpc_phone_npu_init_cpu_backend();
+    if (cpu == nullptr) {
+        return false;
+    }
+
+    ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
+    ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
+    if (!ctx_w || !ctx_a) {
+        ggml_backend_free(cpu);
+        return false;
+    }
+
+    ggml_tensor * w = ggml_new_tensor(
+        ctx_w.get(), GGML_TYPE_Q4_0,
+        ggml_n_dims(gpu_weight), gpu_weight->ne);
+    ggml_tensor * inp = ggml_new_tensor(
+        ctx_a.get(), gpu_input->type,
+        ggml_n_dims(gpu_input), gpu_input->ne);
+    ggml_tensor * out = ggml_mul_mat(
+        ctx_a.get(), w, inp);
+
+    ggml_backend_buffer_t wbuf =
+        ggml_backend_alloc_ctx_tensors(
+            ctx_w.get(), cpu);
+    ggml_backend_buffer_t abuf =
+        ggml_backend_alloc_ctx_tensors(
+            ctx_a.get(), cpu);
+    if (wbuf == nullptr || abuf == nullptr) {
+        if (abuf != nullptr) {
+            ggml_backend_buffer_free(abuf);
+        }
+        if (wbuf != nullptr) {
+            ggml_backend_buffer_free(wbuf);
+        }
+        ggml_backend_free(cpu);
+        return false;
+    }
+
+    ggml_backend_buffer_set_usage(
+        wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(
+        w, q4_0.data(), 0, q4_0.size());
+    ggml_backend_tensor_set(
+        inp, input_dense.data(), 0, input_dense.size());
+
+    ggml_cgraph * gf =
+        ggml_new_graph_custom(ctx_a.get(), 128, false);
+    ggml_build_forward_expand(gf, out);
+
+    const int64_t begin = ggml_time_us();
+    const ggml_status status =
+        ggml_backend_graph_compute(cpu, gf);
+    compute_us = ggml_time_us() - begin;
+
+    bool ok = status == GGML_STATUS_SUCCESS;
+    if (ok) {
+        cpu_out.resize(
+            (size_t) ggml_nelements(out));
+        ggml_backend_tensor_get(
+            out, cpu_out.data(), 0,
+            cpu_out.size() * sizeof(float));
+    }
+
+    ggml_backend_buffer_free(abuf);
+    ggml_backend_buffer_free(wbuf);
+    ggml_backend_free(cpu);
+    return ok;
+}
+
+static bool rpc_phone_npu_run_ffn_q40_cpu(
+        int layer,
+        const ggml_tensor * gpu_up_w,
+        const ggml_tensor * gpu_gate_w,
+        const ggml_tensor * gpu_down_w,
+        const std::array<std::vector<uint8_t>, 3> & q4_0,
+        const ggml_tensor * norm,
+        const ggml_tensor * topk,
+        const ggml_tensor * route_weights,
+        const std::vector<uint8_t> & hidden_dense,
+        const std::vector<uint8_t> & topk_dense,
+        const std::vector<uint8_t> & route_dense,
+        std::vector<float> & cpu_out,
+        int64_t & compute_us) {
+    ggml_backend_t cpu = rpc_phone_npu_init_cpu_backend();
+    if (cpu == nullptr) {
+        return false;
+    }
+
+    ggml_context_ptr ctx_w = rpc_phone_npu_make_ctx();
+    ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
+    if (!ctx_w || !ctx_a) {
+        ggml_backend_free(cpu);
+        return false;
+    }
+
+    ggml_tensor * w_up = ggml_new_tensor(
+        ctx_w.get(), GGML_TYPE_Q4_0,
+        ggml_n_dims(gpu_up_w), gpu_up_w->ne);
+    ggml_tensor * w_gate = ggml_new_tensor(
+        ctx_w.get(), GGML_TYPE_Q4_0,
+        ggml_n_dims(gpu_gate_w), gpu_gate_w->ne);
+    ggml_tensor * w_down = ggml_new_tensor(
+        ctx_w.get(), GGML_TYPE_Q4_0,
+        ggml_n_dims(gpu_down_w), gpu_down_w->ne);
+
+    ggml_tensor * hidden = ggml_new_tensor_2d(
+        ctx_a.get(), GGML_TYPE_F32,
+        norm->ne[0], norm->ne[1]);
+    ggml_tensor * ids = ggml_new_tensor_2d(
+        ctx_a.get(), GGML_TYPE_I32,
+        topk->ne[0], topk->ne[1]);
+    ggml_tensor * rweights = ggml_new_tensor_3d(
+        ctx_a.get(), GGML_TYPE_F32,
+        1, route_weights->ne[1], route_weights->ne[2]);
+
+    ggml_tensor * cur = ggml_reshape_3d(
+        ctx_a.get(), hidden,
+        norm->ne[0], 1, norm->ne[1]);
+    ggml_tensor * up = ggml_mul_mat_id(
+        ctx_a.get(), w_up, cur, ids);
+    ggml_tensor * gate = ggml_mul_mat_id(
+        ctx_a.get(), w_gate, cur, ids);
+    ggml_tensor * act = ggml_swiglu_split(
+        ctx_a.get(), gate, up);
+    ggml_tensor * down = ggml_mul_mat_id(
+        ctx_a.get(), w_down, act, ids);
+    ggml_tensor * weighted = ggml_mul(
+        ctx_a.get(), down, rweights);
+
+    std::vector<ggml_tensor *> expert_views;
+    expert_views.reserve((size_t) topk->ne[0]);
+    for (int64_t e = 0; e < topk->ne[0]; ++e) {
+        expert_views.push_back(
+            ggml_view_2d(
+                ctx_a.get(), weighted,
+                norm->ne[0], norm->ne[1],
+                weighted->nb[2],
+                (size_t) e * weighted->nb[1]));
+    }
+
+    ggml_tensor * out = expert_views[0];
+    for (int64_t e = 1; e < topk->ne[0]; ++e) {
+        out = ggml_add(
+            ctx_a.get(), out,
+            expert_views[(size_t) e]);
+    }
+
+    ggml_backend_buffer_t wbuf =
+        ggml_backend_alloc_ctx_tensors(
+            ctx_w.get(), cpu);
+    ggml_backend_buffer_t abuf =
+        ggml_backend_alloc_ctx_tensors(
+            ctx_a.get(), cpu);
+    if (wbuf == nullptr || abuf == nullptr) {
+        if (abuf != nullptr) {
+            ggml_backend_buffer_free(abuf);
+        }
+        if (wbuf != nullptr) {
+            ggml_backend_buffer_free(wbuf);
+        }
+        ggml_backend_free(cpu);
+        return false;
+    }
+
+    ggml_backend_buffer_set_usage(
+        wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_backend_tensor_set(
+        w_up, q4_0[0].data(), 0, q4_0[0].size());
+    ggml_backend_tensor_set(
+        w_gate, q4_0[1].data(), 0, q4_0[1].size());
+    ggml_backend_tensor_set(
+        w_down, q4_0[2].data(), 0, q4_0[2].size());
+    ggml_backend_tensor_set(
+        hidden, hidden_dense.data(), 0, hidden_dense.size());
+    ggml_backend_tensor_set(
+        ids, topk_dense.data(), 0, topk_dense.size());
+    ggml_backend_tensor_set(
+        rweights, route_dense.data(), 0, route_dense.size());
+
+    ggml_cgraph * gf =
+        ggml_new_graph_custom(ctx_a.get(), 2048, false);
+    ggml_build_forward_expand(gf, out);
+
+    const int64_t begin = ggml_time_us();
+    const ggml_status status =
+        ggml_backend_graph_compute(cpu, gf);
+    compute_us = ggml_time_us() - begin;
+
+    bool ok = status == GGML_STATUS_SUCCESS;
+    if (ok) {
+        cpu_out.resize(
+            (size_t) ggml_nelements(out));
+        ggml_backend_tensor_get(
+            out, cpu_out.data(), 0,
+            cpu_out.size() * sizeof(float));
+    } else {
+        GGML_LOG_INFO(
+            "[PHONE_NPU_QUAL_CPU] layer=%d stage=ffn "
+            "status=COMPUTE_FAIL code=%d\n",
+            layer, (int) status);
+    }
+
+    ggml_backend_buffer_free(abuf);
+    ggml_backend_buffer_free(wbuf);
+    ggml_backend_free(cpu);
+    return ok;
+}
+
 static bool rpc_phone_npu_run_mm_shadow(
         ggml_backend_t npu,
         ggml_tensor * gpu_node,
@@ -7218,21 +7446,50 @@ static bool rpc_phone_npu_run_mm_shadow(
             out, npu_out.data(), 0,
             npu_out.size() * sizeof(float));
 
-        const rpc_phone_npu_metrics result_metrics =
+        const rpc_phone_npu_metrics total_metrics =
             rpc_phone_npu_compare_f32(
                 gpu_ref, npu_out);
         rpc_phone_npu_log_metrics(
-            "PHONE_NPU_QUAL_OUTPUT",
-            stage, layer, result_metrics);
+            "PHONE_NPU_QUAL_OUTPUT_TOTAL",
+            stage, layer, total_metrics);
+
+        std::vector<float> cpu_out;
+        int64_t cpu_compute_us = 0;
+        if (rpc_phone_npu_run_mm_q40_cpu(
+                gpu_weight, gpu_input,
+                q4_0, input_dense,
+                cpu_out, cpu_compute_us)) {
+            const rpc_phone_npu_metrics conversion_output_metrics =
+                rpc_phone_npu_compare_f32(
+                    gpu_ref, cpu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_CONVERT",
+                stage, layer,
+                conversion_output_metrics);
+
+            const rpc_phone_npu_metrics npu_only_metrics =
+                rpc_phone_npu_compare_f32(
+                    cpu_out, npu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_NPU",
+                stage, layer,
+                npu_only_metrics);
+        } else {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_CPU] layer=%d stage=%s status=FAIL\n",
+                layer, stage);
+        }
 
         GGML_LOG_INFO(
             "[PHONE_NPU_QUAL_TIME] layer=%d stage=%s "
             "convert_ms=%.3f upload_ms=%.3f "
-            "compute_ms=%.3f weight_bytes=%zu input_bytes=%zu\n",
+            "npu_compute_ms=%.3f cpu_compute_ms=%.3f "
+            "weight_bytes=%zu input_bytes=%zu\n",
             layer, stage,
             convert_us / 1000.0,
             upload_us / 1000.0,
             compute_us / 1000.0,
+            cpu_compute_us / 1000.0,
             q4_0.size(),
             input_dense.size());
     }
@@ -7442,16 +7699,52 @@ static bool rpc_phone_npu_run_ffn_shadow(
             out, npu_out.data(), 0,
             npu_out.size() * sizeof(float));
 
-        const rpc_phone_npu_metrics result_metrics =
+        const rpc_phone_npu_metrics total_metrics =
             rpc_phone_npu_compare_f32(
                 gpu_ref, npu_out);
         rpc_phone_npu_log_metrics(
-            "PHONE_NPU_QUAL_OUTPUT",
-            "ffn", layer, result_metrics);
+            "PHONE_NPU_QUAL_OUTPUT_TOTAL",
+            "ffn", layer, total_metrics);
+
+        std::array<std::vector<uint8_t>, 3> cpu_weights {
+            weights[0].data,
+            weights[1].data,
+            weights[2].data,
+        };
+        std::vector<float> cpu_out;
+        int64_t cpu_compute_us = 0;
+        if (rpc_phone_npu_run_ffn_q40_cpu(
+                layer,
+                gpu_up_w, gpu_gate_w, gpu_down_w,
+                cpu_weights,
+                norm, topk, route_weights,
+                hidden_dense, topk_dense, route_dense,
+                cpu_out, cpu_compute_us)) {
+            const rpc_phone_npu_metrics conversion_output_metrics =
+                rpc_phone_npu_compare_f32(
+                    gpu_ref, cpu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_CONVERT",
+                "ffn", layer,
+                conversion_output_metrics);
+
+            const rpc_phone_npu_metrics npu_only_metrics =
+                rpc_phone_npu_compare_f32(
+                    cpu_out, npu_out);
+            rpc_phone_npu_log_metrics(
+                "PHONE_NPU_QUAL_OUTPUT_NPU",
+                "ffn", layer,
+                npu_only_metrics);
+        } else {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_CPU] layer=%d stage=ffn status=FAIL\n",
+                layer);
+        }
 
         GGML_LOG_INFO(
             "[PHONE_NPU_QUAL_TIME] layer=%d stage=ffn "
-            "convert_ms=%.3f upload_ms=%.3f compute_ms=%.3f "
+            "convert_ms=%.3f upload_ms=%.3f "
+            "npu_compute_ms=%.3f cpu_compute_ms=%.3f "
             "tokens=%" PRId64 " phone_ff=%" PRId64
             " weight_bytes=%zu\n",
             layer,
@@ -7460,6 +7753,7 @@ static bool rpc_phone_npu_run_ffn_shadow(
              weights[2].convert_us) / 1000.0,
             upload_us / 1000.0,
             compute_us / 1000.0,
+            cpu_compute_us / 1000.0,
             n_tokens,
             gpu_up_w->ne[1],
             weights[0].data.size() +
@@ -7581,7 +7875,7 @@ static bool rpc_phone_npu_run_flash_shadow(
                 rpc_phone_npu_compare_f32(
                     gpu_ref, npu_out);
             rpc_phone_npu_log_metrics(
-                "PHONE_NPU_QUAL_OUTPUT",
+                "PHONE_NPU_QUAL_OUTPUT_TOTAL",
                 "attn_fa", layer, metrics);
             GGML_LOG_INFO(
                 "[PHONE_NPU_QUAL_TIME] layer=%d stage=attn_fa "
