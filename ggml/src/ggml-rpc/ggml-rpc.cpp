@@ -4339,6 +4339,31 @@ struct rpc_opencl_tensor_storage_entry {
     bool ambiguous = false;
 };
 
+static struct ggml_cgraph rpc_graph_view(
+        struct ggml_cgraph * cgraph0,
+        int i0,
+        int i1) {
+    GGML_ASSERT(cgraph0 != nullptr);
+    GGML_ASSERT(i0 >= 0);
+    GGML_ASSERT(i1 >= i0);
+    GGML_ASSERT(i1 <= cgraph0->n_nodes);
+
+    struct ggml_cgraph cgraph = {
+        /* .size             = */ 0,
+        /* .n_nodes          = */ i1 - i0,
+        /* .n_leafs          = */ 0,
+        /* .nodes            = */ cgraph0->nodes + i0,
+        /* .grads            = */ nullptr,
+        /* .grad_accs        = */ nullptr,
+        /* .leafs            = */ nullptr,
+        /* .use_counts       = */ cgraph0->use_counts,
+        /* .visited_hash_set = */ cgraph0->visited_hash_set,
+        /* .order            = */ cgraph0->order,
+        /* .uid              = */ 0,
+    };
+    return cgraph;
+}
+
 struct rpc_phone_npu_ffn_stage {
     int layer = -1;
     int chunk = -1;
@@ -7491,7 +7516,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     cursor = 0;
     for (const auto & stage : stages) {
         if (cursor < stage.front_end) {
-            ggml_cgraph front = ggml_graph_view(
+            ggml_cgraph front = rpc_graph_view(
                 graph, cursor, stage.front_end);
             const ggml_status status =
                 ggml_backend_graph_compute(gpu, &front);
@@ -7507,7 +7532,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
                 graph_uid, stage.layer, stage.chunk,
                 stage.prefill ? "prefill" : "decode");
 
-            ggml_cgraph fallback = ggml_graph_view(
+            ggml_cgraph fallback = rpc_graph_view(
                 graph, stage.front_end,
                 stage.down_index + 1);
             const ggml_status status =
@@ -7521,7 +7546,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     if (cursor < graph->n_nodes) {
-        ggml_cgraph tail = ggml_graph_view(
+        ggml_cgraph tail = rpc_graph_view(
             graph, cursor, graph->n_nodes);
         return ggml_backend_graph_compute(gpu, &tail);
     }
