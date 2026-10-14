@@ -4985,6 +4985,8 @@ private:
     // Meta tensor-split participant.
     ggml_backend_t phone_npu_backend = nullptr;
     std::mutex phone_npu_mutex;
+    std::mutex phone_npu_match_mutex;
+    std::unordered_set<uint64_t> phone_npu_match_logged;
     std::unordered_map<
         int,
         std::unique_ptr<rpc_phone_npu_ffn_cache>>
@@ -7613,6 +7615,102 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     const std::vector<rpc_phone_npu_ffn_stage> stages =
         rpc_phone_npu_find_ffn_stages(
             graph, target_layer);
+
+    {
+        const uint64_t match_key =
+            graph_uid != 0 ?
+                graph_uid :
+                (uint64_t) (uintptr_t) graph;
+        bool log_match = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                phone_npu_match_mutex);
+            log_match =
+                phone_npu_match_logged.insert(
+                    match_key).second;
+        }
+
+        if (log_match) {
+            char name[GGML_MAX_NAME] = {};
+
+            auto find = [&](const char * fmt) {
+                std::snprintf(
+                    name, sizeof(name),
+                    fmt, target_layer);
+                return rpc_phone_npu_find_named(
+                    graph, name);
+            };
+            auto idx = [&](ggml_tensor * tensor) {
+                return rpc_phone_npu_graph_node_index(
+                    graph, tensor);
+            };
+            auto contig = [&](ggml_tensor * tensor) {
+                return tensor != nullptr &&
+                    ggml_is_contiguous(tensor) ? 1 : 0;
+            };
+            auto tokens = [&](ggml_tensor * tensor) -> int64_t {
+                return tensor != nullptr ?
+                    tensor->ne[1] : -1;
+            };
+
+            ggml_tensor * p_norm =
+                find("prefill_ffn_norm_chunk_0-%d");
+            ggml_tensor * p_topk =
+                find("phone_prefill_route_topk_chunk_0-%d");
+            ggml_tensor * p_weights =
+                find("phone_prefill_route_weights_chunk_0-%d");
+            ggml_tensor * p_down =
+                find("prefill_ffn_down_chunk_0-%d");
+
+            ggml_tensor * r_norm =
+                find("ffn_norm-%d");
+            ggml_tensor * r_topk =
+                find("phone_moe_route_topk-%d");
+            ggml_tensor * r_weights =
+                find("phone_moe_route_weights-%d");
+            ggml_tensor * r_out =
+                find("ffn_moe_out-%d");
+
+            GGML_LOG_INFO(
+                "[PHONE_NPU_MATCH] graph_uid=%" PRIu64
+                " layer=%d nodes=%d stages=%zu "
+                "prefill={norm:%d/%d/c%d/t%" PRId64
+                ",topk:%d/%d/c%d,weights:%d/%d/c%d,down:%d/%d/c%d} "
+                "regular={norm:%d/%d/c%d/t%" PRId64
+                ",topk:%d/%d/c%d,weights:%d/%d/c%d,out:%d/%d/c%d}\n",
+                graph_uid,
+                target_layer,
+                graph->n_nodes,
+                stages.size(),
+                p_norm != nullptr ? 1 : 0,
+                idx(p_norm),
+                contig(p_norm),
+                tokens(p_norm),
+                p_topk != nullptr ? 1 : 0,
+                idx(p_topk),
+                contig(p_topk),
+                p_weights != nullptr ? 1 : 0,
+                idx(p_weights),
+                contig(p_weights),
+                p_down != nullptr ? 1 : 0,
+                idx(p_down),
+                contig(p_down),
+                r_norm != nullptr ? 1 : 0,
+                idx(r_norm),
+                contig(r_norm),
+                tokens(r_norm),
+                r_topk != nullptr ? 1 : 0,
+                idx(r_topk),
+                contig(r_topk),
+                r_weights != nullptr ? 1 : 0,
+                idx(r_weights),
+                contig(r_weights),
+                r_out != nullptr ? 1 : 0,
+                idx(r_out),
+                contig(r_out));
+        }
+    }
+
     if (stages.empty()) {
         return ggml_backend_graph_compute(gpu, graph);
     }
