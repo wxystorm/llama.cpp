@@ -260,7 +260,7 @@ static bool build_gpu_stage(
     }
 
     for (int slot = 0; slot < 2; ++slot) {
-        if (!fill_f32(s.residual[slot], 0.001f, 11 + slot)) {
+        if (!fill_f32(s.residual[slot], 0.001f, 11)) {
             return false;
         }
     }
@@ -838,8 +838,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<float> serial_ref =
-        read_f32(gpu_s.reduce_out[(chunks - 1) & 1]);
+    std::vector<float> serial_ref0 = read_f32(gpu_s.reduce_out[0]);
+    std::vector<float> serial_ref1 = read_f32(gpu_s.reduce_out[1]);
 
     stage_times pipeline_times;
     int64_t pipeline_wall_us = 0;
@@ -853,8 +853,8 @@ int main(int argc, char ** argv) {
     std::vector<float> pipe_out0 = read_f32(gpu_s.reduce_out[0]);
     std::vector<float> pipe_out1 = read_f32(gpu_s.reduce_out[1]);
 
-    const double diff0 = max_abs_diff(serial_ref, pipe_out0);
-    const double diff1 = max_abs_diff(serial_ref, pipe_out1);
+    const double diff0 = max_abs_diff(serial_ref0, pipe_out0);
+    const double diff1 = max_abs_diff(serial_ref1, pipe_out1);
     const double speedup =
         pipeline_wall_us > 0 ?
         (double) serial_wall_us / (double) pipeline_wall_us : 0.0;
