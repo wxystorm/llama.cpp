@@ -4338,8 +4338,20 @@ struct rpc_opencl_tensor_storage_entry {
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(
+            std::vector<ggml_backend_t> all_backends,
+            const char * cache_dir,
+            const ggml_rpc_local_tensor_source * tensor_source = nullptr,
+            ggml_backend_t phone_npu_backend = nullptr)
+        : backends(std::move(all_backends)),
+          phone_npu_backend(phone_npu_backend),
+          cache_dir(cache_dir) {
+        if (this->phone_npu_backend != nullptr) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_STAGE_SERVER] active=1 private_backend=%p visible_backends=%zu\n",
+                (void *) this->phone_npu_backend,
+                backends.size());
+        }
         stored_graphs.resize(backends.size());
         snapshot_devices.reserve(backends.size());
         route_snapshot_devices.reserve(backends.size());
@@ -4423,6 +4435,10 @@ private:
 
 
     std::vector<ggml_backend_t> backends;
+    // Private phone-local execution backend. It is deliberately not part of
+    // the RPC-visible backend vector and therefore cannot become an Outer
+    // Meta tensor-split participant.
+    ggml_backend_t phone_npu_backend = nullptr;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
 
@@ -8477,7 +8493,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
 void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir,
                                       size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
                                       const ggml_rpc_local_tensor_source * tensor_source,
-                                      const char * model_path, int tp_rank, int tp_world_size) {
+                                      const char * model_path, int tp_rank, int tp_world_size,
+                                      ggml_backend_dev_t phone_npu_device) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -8520,6 +8537,38 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         }
     }
 
+    ggml_backend_t phone_npu_backend = nullptr;
+    if (phone_npu_device != nullptr) {
+        for (size_t i = 0; i < n_devices; ++i) {
+            if (devices[i] == phone_npu_device) {
+                fprintf(
+                    stderr,
+                    "Invalid phone NPU stage configuration: private device is RPC-visible\n");
+                for (ggml_backend_t backend : backends) {
+                    ggml_backend_free(backend);
+                }
+                return;
+            }
+        }
+
+        phone_npu_backend = ggml_backend_dev_init(phone_npu_device, nullptr);
+        if (phone_npu_backend == nullptr) {
+            fprintf(
+                stderr,
+                "Failed to create private phone NPU backend for device %s\n",
+                ggml_backend_dev_name(phone_npu_device));
+            for (ggml_backend_t backend : backends) {
+                ggml_backend_free(backend);
+            }
+            return;
+        }
+
+        printf(
+            "[PHONE_NPU_STAGE_INIT] active=1 private=%s rpc_visible_devices=%zu\n",
+            ggml_backend_dev_name(phone_npu_device),
+            n_devices);
+    }
+
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -8540,7 +8589,8 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
-    auto shared_server = std::make_shared<rpc_server>(backends, cache_dir, tensor_source);
+    auto shared_server = std::make_shared<rpc_server>(
+        backends, cache_dir, tensor_source, phone_npu_backend);
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -8556,6 +8606,9 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         }).detach();
     }
     rpc_transport_shutdown();
+    if (phone_npu_backend != nullptr) {
+        ggml_backend_free(phone_npu_backend);
+    }
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
@@ -8564,7 +8617,7 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     ggml_backend_rpc_start_server_ex(endpoint, cache_dir, n_threads, n_devices, devices,
-                                     nullptr, nullptr, 0, 1);
+                                     nullptr, nullptr, 0, 1, nullptr);
 }
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;

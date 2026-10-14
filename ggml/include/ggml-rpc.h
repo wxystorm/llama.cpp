@@ -247,7 +247,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * end
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir, size_t n_threads,
         size_t n_devices, ggml_backend_dev_t * devices, const struct ggml_rpc_local_tensor_source * tensor_source,
-        const char * model_path, int tp_rank, int tp_world_size);
+        const char * model_path, int tp_rank, int tp_world_size, ggml_backend_dev_t phone_npu_device);
 
 #ifdef  __cplusplus
 }

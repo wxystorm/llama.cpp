@@ -188,6 +188,7 @@ struct rpc_server_params {
     std::string              model_path  = "";
     int                      tp_rank     = 0;
     int                      tp_world_size = 1;
+    bool                     phone_npu_stage = false;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -202,6 +203,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -m, --model MODEL_PATH             path to the model gguf file\n");
     fprintf(stderr, "  --tp-rank <0|1>                  rank 0 is computer, rank 1 is mobile, default: 0\n");
     fprintf(stderr, "  --tp-world-size <n>            world size for tensor parallelism, default: 1\n");
+    fprintf(stderr, "  --phone-npu-stage              keep one visible Phone GPU RPC device and initialize HTP privately\n");
     fprintf(stderr, "\n");
 }
 
@@ -267,6 +269,8 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.tp_world_size = std::stoi(argv[i]);
+        } else if (arg == "--phone-npu-stage") {
+            params.phone_npu_stage = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             print_usage(argc, argv, params);
@@ -470,6 +474,78 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 
     return devices;
 }
+
+static ggml_backend_dev_t find_phone_npu_device() {
+    ggml_backend_dev_t exact = ggml_backend_dev_by_name("HTP0");
+    if (exact != nullptr) {
+        return exact;
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char * name = ggml_backend_dev_name(dev);
+        if (name == nullptr) {
+            continue;
+        }
+
+        const std::string device_name(name);
+        if (device_name.find("HTP") != std::string::npos ||
+            device_name.find("Hexagon") != std::string::npos) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+static bool prepare_phone_npu_stage(
+        const rpc_server_params & params,
+        const std::vector<ggml_backend_dev_t> & visible_devices,
+        ggml_backend_dev_t & phone_npu_device) {
+    phone_npu_device = nullptr;
+    if (!params.phone_npu_stage) {
+        return true;
+    }
+
+    if (visible_devices.size() != 1) {
+        fprintf(
+            stderr,
+            "error: --phone-npu-stage requires exactly one visible RPC device; "
+            "run the phone server with --device GPUOpenCL\n");
+        return false;
+    }
+
+    const char * visible_name = ggml_backend_dev_name(visible_devices[0]);
+    if (visible_name == nullptr ||
+        std::string(visible_name).find("OpenCL") == std::string::npos) {
+        fprintf(
+            stderr,
+            "error: --phone-npu-stage requires the visible RPC device to be OpenCL "
+            "(got %s)\n",
+            visible_name != nullptr ? visible_name : "<null>");
+        return false;
+    }
+
+    phone_npu_device = find_phone_npu_device();
+    if (phone_npu_device == nullptr) {
+        fprintf(
+            stderr,
+            "error: --phone-npu-stage could not find an HTP/Hexagon device\n");
+        return false;
+    }
+    if (phone_npu_device == visible_devices[0]) {
+        fprintf(stderr, "error: private HTP device aliases the visible RPC device\n");
+        phone_npu_device = nullptr;
+        return false;
+    }
+
+    fprintf(
+        stderr,
+        "[PHONE_NPU_STAGE_CONFIG] active=1 visible=%s private=%s rpc_devices=1\n",
+        visible_name,
+        ggml_backend_dev_name(phone_npu_device));
+    return true;
+}
+
 struct llama_rpc_local_tensor_context {
     llama_model_loader * loader = nullptr;
     std::mutex mutex;
@@ -569,6 +645,11 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
+
+    ggml_backend_dev_t phone_npu_device = nullptr;
+    if (!prepare_phone_npu_stage(params, devices, phone_npu_device)) {
+        return 1;
+    }
 #if defined(__ANDROID__)
     print_opencl_memory_info_if_selected(devices);
 #endif
@@ -621,6 +702,7 @@ tensor_source.read      = llama_rpc_read_local_tensor;
 // 4. 获取新启动函数
     ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
                                      local_loader ? &tensor_source : nullptr,
-                                     params.model_path.c_str(), params.tp_rank, params.tp_world_size);
+                                     params.model_path.c_str(), params.tp_rank, params.tp_world_size,
+                                     phone_npu_device);
     return 0;
 }
