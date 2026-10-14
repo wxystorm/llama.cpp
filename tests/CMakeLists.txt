@@ -312,6 +312,7 @@ llama_test(test-hybrid)
 # GPUOpenCL <-> HTP handoff microbenchmark used by the heterogeneous overlap experiments.
 # Built on demand and intentionally not registered with ctest because it requires Snapdragon backends.
 llama_build(test-gpu-npu-handoff.cpp)
+llama_build(test-gpu-npu-pipeline.cpp)
 
 llama_build_and_test(test-hybrid-boundary.cpp)
 target_include_directories(test-hybrid-boundary PRIVATE ${PROJECT_SOURCE_DIR}/src)
