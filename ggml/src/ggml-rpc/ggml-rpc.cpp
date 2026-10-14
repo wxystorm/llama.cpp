@@ -4577,6 +4577,116 @@ static bool rpc_phone_npu_is_ancestor(
         root->view_src, needle, depth - 1, seen);
 }
 
+
+static ggml_tensor * rpc_phone_npu_find_topk_rec(
+        ggml_tensor * tensor,
+        int64_t n_tokens,
+        std::unordered_set<ggml_tensor *> & seen) {
+    if (tensor == nullptr || !seen.insert(tensor).second) {
+        return nullptr;
+    }
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID &&
+        tensor->src[2] != nullptr &&
+        tensor->src[2]->type == GGML_TYPE_I32 &&
+        tensor->src[2]->ne[0] > 0 &&
+        tensor->src[2]->ne[1] == n_tokens) {
+        return tensor->src[2];
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_tensor * found =
+                rpc_phone_npu_find_topk_rec(
+                    tensor->src[i], n_tokens, seen)) {
+            return found;
+        }
+    }
+    return rpc_phone_npu_find_topk_rec(
+        tensor->view_src, n_tokens, seen);
+}
+
+static ggml_tensor * rpc_phone_npu_find_route_weights_rec(
+        ggml_tensor * tensor,
+        int64_t n_embd,
+        int64_t n_expert_used,
+        int64_t n_tokens,
+        std::unordered_set<ggml_tensor *> & seen) {
+    if (tensor == nullptr || !seen.insert(tensor).second) {
+        return nullptr;
+    }
+
+    if (tensor->op == GGML_OP_MUL &&
+        tensor->ne[0] == n_embd &&
+        tensor->ne[1] == n_expert_used &&
+        tensor->ne[2] == n_tokens) {
+        for (int i = 0; i < 2; ++i) {
+            ggml_tensor * src = tensor->src[i];
+            ggml_tensor * other = tensor->src[1 - i];
+            if (src != nullptr &&
+                other != nullptr &&
+                src->type == GGML_TYPE_F32 &&
+                src->ne[0] == 1 &&
+                src->ne[1] == n_expert_used &&
+                src->ne[2] == n_tokens &&
+                other->ne[0] == n_embd &&
+                other->ne[1] == n_expert_used &&
+                other->ne[2] == n_tokens) {
+                return src;
+            }
+        }
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_tensor * found =
+                rpc_phone_npu_find_route_weights_rec(
+                    tensor->src[i],
+                    n_embd,
+                    n_expert_used,
+                    n_tokens,
+                    seen)) {
+            return found;
+        }
+    }
+    return rpc_phone_npu_find_route_weights_rec(
+        tensor->view_src,
+        n_embd,
+        n_expert_used,
+        n_tokens,
+        seen);
+}
+
+static bool rpc_phone_npu_infer_route_inputs(
+        rpc_phone_npu_ffn_stage & stage) {
+    if (stage.down == nullptr || stage.norm == nullptr) {
+        return false;
+    }
+
+    const int64_t n_tokens = stage.norm->ne[1];
+    const int64_t n_embd = stage.norm->ne[0];
+
+    if (stage.topk == nullptr) {
+        std::unordered_set<ggml_tensor *> seen;
+        stage.topk = rpc_phone_npu_find_topk_rec(
+            stage.down, n_tokens, seen);
+    }
+    if (stage.topk == nullptr) {
+        return false;
+    }
+
+    if (stage.route_weights == nullptr) {
+        std::unordered_set<ggml_tensor *> seen;
+        stage.route_weights =
+            rpc_phone_npu_find_route_weights_rec(
+                stage.down,
+                n_embd,
+                stage.topk->ne[0],
+                n_tokens,
+                seen);
+    }
+
+    return stage.route_weights != nullptr;
+}
+
 static bool rpc_phone_npu_finalize_stage(
         ggml_cgraph * graph,
         rpc_phone_npu_ffn_stage & stage) {
@@ -4684,6 +4794,8 @@ rpc_phone_npu_find_ffn_stages(
             stage.route_weights =
                 rpc_phone_npu_find_named(graph, name);
 
+            rpc_phone_npu_infer_route_inputs(stage);
+
             if (rpc_phone_npu_finalize_stage(
                     graph, stage)) {
                 result.push_back(stage);
@@ -4712,7 +4824,6 @@ rpc_phone_npu_find_ffn_stages(
             rpc_phone_npu_ffn_stage stage;
             stage.layer = layer;
             stage.chunk = 0;
-            stage.prefill = false;
             stage.down = node;
 
             std::snprintf(
@@ -4720,6 +4831,9 @@ rpc_phone_npu_find_ffn_stages(
                 "ffn_norm-%d", layer);
             stage.norm =
                 rpc_phone_npu_find_named(graph, name);
+            stage.prefill =
+                stage.norm != nullptr &&
+                stage.norm->ne[1] > 1;
 
             std::snprintf(
                 name, sizeof(name),
@@ -4732,6 +4846,8 @@ rpc_phone_npu_find_ffn_stages(
                 "phone_moe_route_weights-%d", layer);
             stage.route_weights =
                 rpc_phone_npu_find_named(graph, name);
+
+            rpc_phone_npu_infer_route_inputs(stage);
 
             if (rpc_phone_npu_finalize_stage(
                     graph, stage)) {
