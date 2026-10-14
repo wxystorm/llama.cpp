@@ -7221,33 +7221,9 @@ static bool rpc_phone_npu_snapshot_f32(
     return true;
 }
 
-struct rpc_phone_npu_capture {
-    ggml_context * tensor_ctx = nullptr;
-    ggml_context * graph_ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
-    ggml_cgraph * compute_graph = nullptr;
-    std::unordered_map<const ggml_tensor *, ggml_tensor *> dst;
-
-    void clear() {
-        if (buffer != nullptr) {
-            ggml_backend_buffer_free(buffer);
-            buffer = nullptr;
-        }
-        if (graph_ctx != nullptr) {
-            ggml_free(graph_ctx);
-            graph_ctx = nullptr;
-        }
-        if (tensor_ctx != nullptr) {
-            ggml_free(tensor_ctx);
-            tensor_ctx = nullptr;
-        }
-        compute_graph = nullptr;
-        dst.clear();
-    }
-
-    ~rpc_phone_npu_capture() {
-        clear();
-    }
+struct rpc_phone_npu_capture_plan {
+    std::vector<std::vector<ggml_tensor *>> at_boundary;
+    size_t target_count = 0;
 };
 
 static void rpc_phone_npu_capture_add_target(
@@ -7255,18 +7231,18 @@ static void rpc_phone_npu_capture_add_target(
         ggml_tensor * tensor) {
     if (tensor != nullptr &&
         tensor->buffer != nullptr &&
-        tensor->type != GGML_TYPE_COUNT) {
+        tensor->type != GGML_TYPE_COUNT &&
+        ggml_blck_size(tensor->type) == 1) {
         targets.insert(tensor);
     }
 }
 
-static bool rpc_phone_npu_prepare_capture(
-        ggml_backend_t backend,
+static bool rpc_phone_npu_build_capture_plan(
         ggml_cgraph * graph,
         const std::unordered_map<uint64_t, ggml_tensor *> & tensor_map,
         int layer,
-        rpc_phone_npu_capture & capture) {
-    if (backend == nullptr || graph == nullptr || layer < 0) {
+        rpc_phone_npu_capture_plan & plan) {
+    if (graph == nullptr || layer < 0) {
         return false;
     }
 
@@ -7351,175 +7327,210 @@ static bool rpc_phone_npu_prepare_capture(
         return false;
     }
 
-    const size_t tensor_ctx_size =
-        ggml_tensor_overhead() *
-            (targets.size() * 3 + 32) +
-        4096;
-    ggml_init_params tensor_params {
-        /* .mem_size   = */ tensor_ctx_size,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-    capture.tensor_ctx = ggml_init(tensor_params);
-    if (capture.tensor_ctx == nullptr) {
-        return false;
-    }
-
-    struct scheduled_copy {
-        int index = -1;
-        bool before = false;
-        ggml_tensor * op = nullptr;
-    };
-    std::vector<scheduled_copy> copies;
-    copies.reserve(targets.size());
+    // boundary b means: capture after nodes [0, b) have executed.
+    // b == 0 therefore captures a leaf immediately before node 0.
+    plan.at_boundary.assign(
+        (size_t) graph->n_nodes + 1, {});
+    plan.target_count = 0;
 
     for (ggml_tensor * target : targets) {
-        ggml_tensor * dst = ggml_new_tensor(
-            capture.tensor_ctx,
-            target->type,
-            ggml_n_dims(target),
-            target->ne);
-        ggml_format_name(
-            dst, "phone_npu_snap_%s",
-            target->name[0] != '\0' ?
-                target->name : "unnamed");
+        int boundary = -1;
 
-        ggml_tensor * copy =
-            ggml_cpy(
-                capture.tensor_ctx,
-                target, dst);
-        capture.dst.emplace(target, dst);
-
-        int producer = -1;
+        // If the tensor is produced by this graph, capture it
+        // immediately after its producer executes.
         for (int i = 0; i < graph->n_nodes; ++i) {
             if (graph->nodes[i] == target) {
-                producer = i;
+                boundary = i + 1;
                 break;
             }
         }
-        if (producer >= 0) {
-            copies.push_back({ producer, false, copy });
-            continue;
-        }
 
-        int consumer = -1;
-        for (int i = 0;
-             i < graph->n_nodes && consumer < 0; ++i) {
-            ggml_tensor * node = graph->nodes[i];
-            if (node == nullptr) {
-                continue;
-            }
-            for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                if (node->src[j] == target) {
-                    consumer = i;
-                    break;
+        // Otherwise it is a leaf/view from outside this graph.
+        // Capture it immediately before its first consumer.
+        if (boundary < 0) {
+            for (int i = 0;
+                 i < graph->n_nodes && boundary < 0; ++i) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node == nullptr) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j] == target) {
+                        boundary = i;
+                        break;
+                    }
                 }
             }
         }
-        if (consumer < 0) {
-            capture.dst.erase(target);
+
+        if (boundary < 0 ||
+            boundary > graph->n_nodes) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_CAPTURE_SKIP] layer=%d "
+                "tensor=%s reason=no_boundary\n",
+                layer, target->name);
             continue;
         }
-        copies.push_back({ consumer, true, copy });
+
+        plan.at_boundary[(size_t) boundary].
+            push_back(target);
+        ++plan.target_count;
     }
 
-    if (copies.empty()) {
-        capture.clear();
+    if (plan.target_count == 0) {
+        plan.at_boundary.clear();
         return false;
     }
 
-    capture.buffer =
-        ggml_backend_alloc_ctx_tensors(
-            capture.tensor_ctx, backend);
-    if (capture.buffer == nullptr) {
-        capture.clear();
-        return false;
-    }
-
-    const int capacity =
-        graph->n_nodes + (int) copies.size() + 8;
-    const size_t graph_ctx_size =
-        ggml_graph_overhead_custom(
-            capacity, false) + 4096;
-    ggml_init_params graph_params {
-        /* .mem_size   = */ graph_ctx_size,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-    capture.graph_ctx = ggml_init(graph_params);
-    if (capture.graph_ctx == nullptr) {
-        capture.clear();
-        return false;
-    }
-
-    capture.compute_graph =
-        ggml_new_graph_custom(
-            capture.graph_ctx,
-            capacity, false);
-    if (capture.compute_graph == nullptr) {
-        capture.clear();
-        return false;
-    }
-
-    auto append = [&](ggml_tensor * node) {
-        GGML_ASSERT(
-            capture.compute_graph->n_nodes <
-            capture.compute_graph->size);
-        capture.compute_graph->nodes[
-            capture.compute_graph->n_nodes++] = node;
-    };
-
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        for (const auto & item : copies) {
-            if (item.before && item.index == i) {
-                append(item.op);
-            }
-        }
-
-        append(graph->nodes[i]);
-
-        for (const auto & item : copies) {
-            if (!item.before && item.index == i) {
-                append(item.op);
-            }
+    size_t boundaries = 0;
+    for (const auto & items : plan.at_boundary) {
+        if (!items.empty()) {
+            ++boundaries;
         }
     }
 
     GGML_LOG_INFO(
         "[PHONE_NPU_QUAL_CAPTURE_PLAN] layer=%d "
-        "original_nodes=%d capture_nodes=%zu augmented_nodes=%d\n",
-        layer, graph->n_nodes, copies.size(),
-        capture.compute_graph->n_nodes);
+        "original_nodes=%d capture_tensors=%zu boundaries=%zu mode=SEGMENTED\n",
+        layer, graph->n_nodes,
+        plan.target_count, boundaries);
     return true;
 }
 
-static void rpc_phone_npu_collect_capture(
-        const rpc_phone_npu_capture & capture,
+static bool rpc_phone_npu_capture_boundary(
+        const std::vector<ggml_tensor *> & tensors,
+        int boundary,
         std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
-    snapshots.clear();
-    snapshots.reserve(capture.dst.size());
-
-    for (const auto & entry : capture.dst) {
-        const ggml_tensor * src = entry.first;
-        ggml_tensor * dst = entry.second;
-        if (src == nullptr || dst == nullptr ||
-            dst->buffer == nullptr) {
+    for (ggml_tensor * tensor : tensors) {
+        if (tensor == nullptr) {
             continue;
         }
 
-        const size_t bytes = ggml_nbytes(dst);
-        std::vector<uint8_t> data(bytes);
-        ggml_backend_tensor_get(
-            dst, data.data(), 0, bytes);
-        snapshots.emplace(src, std::move(data));
+        std::vector<uint8_t> dense;
+        if (!rpc_phone_npu_read_dense(
+                tensor, dense)) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_QUAL_CAPTURE_FAIL] boundary=%d "
+                "tensor=%s type=%s\n",
+                boundary, tensor->name,
+                ggml_type_name(tensor->type));
+            return false;
+        }
+
+        double absmax = 0.0;
+        size_t nonzero = 0;
+        if (tensor->type == GGML_TYPE_F32) {
+            const float * p =
+                reinterpret_cast<const float *>(dense.data());
+            const size_t n =
+                dense.size() / sizeof(float);
+            for (size_t i = 0; i < n; ++i) {
+                const double a = std::fabs((double) p[i]);
+                absmax = std::max(absmax, a);
+                if (p[i] != 0.0f) {
+                    ++nonzero;
+                }
+            }
+        } else if (tensor->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * p =
+                reinterpret_cast<const ggml_fp16_t *>(dense.data());
+            const size_t n =
+                dense.size() / sizeof(ggml_fp16_t);
+            for (size_t i = 0; i < n; ++i) {
+                const float v = GGML_FP16_TO_FP32(p[i]);
+                const double a = std::fabs((double) v);
+                absmax = std::max(absmax, a);
+                if (v != 0.0f) {
+                    ++nonzero;
+                }
+            }
+        } else if (tensor->type == GGML_TYPE_I32) {
+            const int32_t * p =
+                reinterpret_cast<const int32_t *>(dense.data());
+            const size_t n =
+                dense.size() / sizeof(int32_t);
+            for (size_t i = 0; i < n; ++i) {
+                absmax = std::max(
+                    absmax,
+                    std::fabs((double) p[i]));
+                if (p[i] != 0) {
+                    ++nonzero;
+                }
+            }
+        }
+
+        snapshots[tensor] = std::move(dense);
 
         GGML_LOG_INFO(
-            "[PHONE_NPU_QUAL_CAPTURE] tensor=%s "
-            "type=%s bytes=%zu\n",
-            src->name,
-            ggml_type_name(src->type),
-            bytes);
+            "[PHONE_NPU_QUAL_CAPTURE] boundary=%d "
+            "tensor=%s type=%s bytes=%zu "
+            "nonzero=%zu absmax=%.9g\n",
+            boundary, tensor->name,
+            ggml_type_name(tensor->type),
+            snapshots[tensor].size(),
+            nonzero, absmax);
     }
+    return true;
+}
+
+static ggml_status rpc_phone_npu_compute_with_capture(
+        ggml_backend_t backend,
+        ggml_cgraph * graph,
+        const rpc_phone_npu_capture_plan & plan,
+        std::unordered_map<const ggml_tensor *, std::vector<uint8_t>> & snapshots) {
+    if (backend == nullptr || graph == nullptr ||
+        plan.at_boundary.size() !=
+            (size_t) graph->n_nodes + 1) {
+        return GGML_STATUS_FAILED;
+    }
+
+    snapshots.clear();
+    snapshots.reserve(plan.target_count);
+
+    if (!rpc_phone_npu_capture_boundary(
+            plan.at_boundary[0], 0,
+            snapshots)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    int begin = 0;
+    for (int boundary = 1;
+         boundary <= graph->n_nodes;
+         ++boundary) {
+        if (plan.at_boundary[(size_t) boundary].empty()) {
+            continue;
+        }
+
+        if (begin < boundary) {
+            ggml_cgraph view =
+                ggml_graph_view(
+                    graph, begin, boundary);
+            const ggml_status status =
+                ggml_backend_graph_compute(
+                    backend, &view);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            begin = boundary;
+        }
+
+        if (!rpc_phone_npu_capture_boundary(
+                plan.at_boundary[(size_t) boundary],
+                boundary,
+                snapshots)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    if (begin < graph->n_nodes) {
+        ggml_cgraph view =
+            ggml_graph_view(
+                graph, begin, graph->n_nodes);
+        return ggml_backend_graph_compute(
+            backend, &view);
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static bool rpc_phone_npu_quant_row_dot_f32(
@@ -8794,39 +8805,34 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
-    rpc_phone_npu_capture capture;
+    rpc_phone_npu_capture_plan capture_plan;
     std::unordered_map<const ggml_tensor *, std::vector<uint8_t>>
         qualification_snapshots;
 
-    ggml_cgraph * compute_graph = graph;
     const int qualify_layer =
         rpc_phone_npu_qualify_layer();
-    if (phone_npu_backend != nullptr &&
+    const bool capture_active =
+        phone_npu_backend != nullptr &&
         qualify_layer >= 0 &&
-        rpc_phone_npu_prepare_capture(
-            backends[device],
+        rpc_phone_npu_build_capture_plan(
             graph,
             tensor_map,
             qualify_layer,
-            capture)) {
-        compute_graph = capture.compute_graph;
-    }
+            capture_plan);
 
     const int64_t t0 = ggml_time_us();
 
-    ggml_status status =
+    ggml_status status = capture_active ?
+        rpc_phone_npu_compute_with_capture(
+            backends[device],
+            graph,
+            capture_plan,
+            qualification_snapshots) :
         ggml_backend_graph_compute(
             backends[device],
-            compute_graph);
+            graph);
 
     const int64_t t1 = ggml_time_us();
-
-    if (status == GGML_STATUS_SUCCESS &&
-        compute_graph != graph) {
-        rpc_phone_npu_collect_capture(
-            capture,
-            qualification_snapshots);
-    }
 
     rpc_tensor_phone_log_graph_compute(
         "compute",
