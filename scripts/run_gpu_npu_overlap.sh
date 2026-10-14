@@ -5,6 +5,7 @@ BIN="${BIN:-./build/bin/test-backend-ops}"
 GPU_BACKEND="${GPU_BACKEND:-GPUOpenCL}"
 NPU_BACKEND="${NPU_BACKEND:-HTP0}"
 OUT="${OUT:-overlap-results}"
+PERF_MIN_US="${PERF_MIN_US:-3000000}"
 
 BIN_ABS="$(realpath "$BIN")"
 BACKEND_DIR="${BACKEND_DIR:-$(dirname "$BIN_ABS")}"
@@ -16,6 +17,7 @@ OUT_ABS="$(mkdir -p "$OUT" && cd "$OUT" && pwd)"
 # discovery path. Run every probe from BACKEND_DIR so a split bin/lib layout
 # works without copying plugins beside the executable.
 export LD_LIBRARY_PATH="$BACKEND_DIR:/vendor/lib64:$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GGML_TEST_PERF_MIN_US="$PERF_MIN_US"
 
 run_test() {
     (
@@ -45,11 +47,35 @@ run_test perf -b "$GPU_BACKEND" -o FLASH_ATTN_EXT -p "$GPU_FA_RE" --output sql  
 echo "[3/5] NPU solo: Qwen3-shaped MoE FFN primitive (Q4_0 HTP proxy)"
 run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql     > "$OUT_ABS/npu-ffn-solo.sql" 2> "$OUT_ABS/npu-ffn-solo.err"
 
-echo "[4/5] Concurrent: pair each GPU FA KV length with NPU FFN (simultaneous launch)"
+wait_for_pair_ready() {
+    local barrier_dir="$1"
+    local npu_pid="$2"
+    local gpu_pid="$3"
+
+    for _ in $(seq 1 600); do
+        local ready_count
+        ready_count=$(find "$barrier_dir" -maxdepth 1 -type f -name 'ready-*' 2>/dev/null | wc -l)
+        if [ "$ready_count" -ge 2 ]; then
+            touch "$barrier_dir/go"
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "[OVERLAP_PROBE] timeout waiting for both backends at perf barrier" >&2
+    kill "$npu_pid" "$gpu_pid" 2>/dev/null || true
+    return 1
+}
+
+echo "[4/5] Concurrent: pair each GPU FA KV length with NPU FFN (warmup barrier)"
 for kv in 128 256 384 512; do
     GPU_FA_KV_RE="hsk=128.*hsv=128.*nh=4.*nr23=\\[8,1\\].*kv=$kv.*nb=128"
-    echo "  concurrent pair: GPU kv=$kv + NPU n=128"
+    BARRIER_DIR="$OUT_ABS/barrier-kv$kv"
+    rm -rf "$BARRIER_DIR"
+    mkdir -p "$BARRIER_DIR"
+    export GGML_TEST_PERF_BARRIER_DIR="$BARRIER_DIR"
 
+    echo "  concurrent pair: GPU kv=$kv + NPU n=128"
     run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql \
         > "$OUT_ABS/npu-ffn-concurrent-kv${kv}.sql" \
         2> "$OUT_ABS/npu-ffn-concurrent-kv${kv}.err" &
@@ -60,11 +86,18 @@ for kv in 128 256 384 512; do
         2> "$OUT_ABS/gpu-fa-concurrent-kv${kv}.err" &
     GPU_PID=$!
 
+    wait_for_pair_ready "$BARRIER_DIR" "$NPU_PID" "$GPU_PID"
     wait "$GPU_PID"
     wait "$NPU_PID"
+    unset GGML_TEST_PERF_BARRIER_DIR
 done
 
 echo "[5/5] Concurrent: GPU projection/router weight streaming + NPU FFN"
+BARRIER_DIR="$OUT_ABS/barrier-mm"
+rm -rf "$BARRIER_DIR"
+mkdir -p "$BARRIER_DIR"
+export GGML_TEST_PERF_BARRIER_DIR="$BARRIER_DIR"
+
 run_test perf -b "$NPU_BACKEND" -o MUL_MAT_ID -p "$NPU_FFN_RE" --output sql \
     > "$OUT_ABS/npu-ffn-concurrent-mm.sql" 2> "$OUT_ABS/npu-ffn-concurrent-mm.err" &
 NPU_PID=$!
@@ -72,8 +105,10 @@ run_test perf -b "$GPU_BACKEND" -o MUL_MAT -p "$GPU_MM_RE" --output sql \
     > "$OUT_ABS/gpu-mm-concurrent.sql" 2> "$OUT_ABS/gpu-mm-concurrent.err" &
 GPU_PID=$!
 
+wait_for_pair_ready "$BARRIER_DIR" "$NPU_PID" "$GPU_PID"
 wait "$GPU_PID"
 wait "$NPU_PID"
+unset GGML_TEST_PERF_BARRIER_DIR
 
 echo
 echo "Done. Results are in: $OUT_ABS"
