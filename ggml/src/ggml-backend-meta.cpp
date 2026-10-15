@@ -4482,7 +4482,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint64_t ring_reduce_task = 0;
         ggml_tensor * return_stage = nullptr;
         std::shared_ptr<phone_prefill_return_timing> timing;
-        int64_t enqueue_us = 0;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
@@ -5720,12 +5719,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_ffn_gate_wait_max_us  = 0;
     int64_t phone_xlayer_v2_chunk_gate_count   = 0;
     int64_t phone_xlayer_v2_chunk_gate_wait_us = 0;
-    int64_t chunk_ring_gate_count              = 0;
-    int64_t chunk_ring_gate_wait_us            = 0;
-    int64_t chunk_ring_gate_wait_max_us        = 0;
-    int64_t chunk_ring_stage_exit_barrier_count = 0;
-    int64_t chunk_ring_stage_exit_barrier_wait_us = 0;
-    int64_t chunk_ring_stage_exit_barrier_wait_max_us = 0;
     int64_t phone_xlayer_v2_direct_bind_count  = 0;
     int64_t phone_xlayer_v2_throttle_count     = 0;
     int64_t phone_xlayer_v2_throttle_wait_us   = 0;
@@ -6059,19 +6052,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             backend_ctx->backend_configs[1].backend,
             PHONE_FFN_CPU_REDUCE_ARM);
 
-    const bool phone_primary_chunk_ring_has_tensor_range =
-        backend_ctx->tensor_phone_first_layer >= 0 &&
-        backend_ctx->tensor_phone_last_layer >
-            backend_ctx->tensor_phone_first_layer;
-
-    // Chunk Ring ownership comes from the actual TENSOR_PHONE_PRIMARY stage,
-    // not from legacy xlayer/wave markers.  The wave markers may still exist
-    // in the graph for the current staged builder, but they are no longer an
-    // activation prerequisite for Ring.
     const bool phone_primary_chunk_ring_active =
         phone_primary_chunk_ring &&
         n_backends == 2 &&
-        phone_primary_chunk_ring_has_tensor_range &&
+        phone_primary_xlayer_wave &&
         phone_prefill_chunk_pipeline &&
         phone_prefill_producer_route &&
         phone_prefill_async_return_active &&
@@ -6084,13 +6068,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_primary_chunk_ring) {
         GGML_LOG_INFO(
             "[CHUNK_RING_CAP] requested=1 active=%d "
-            "n_backends=%zu tensor_range=[%d,%d) xlayer_wave=%d arm_cap=%d "
+            "n_backends=%zu xlayer_wave=%d arm_cap=%d "
             "chunk_pipeline=%d producer_route=%d async_return=%d "
             "ordered_return=%d chunk_join=%d\n",
             phone_primary_chunk_ring_active ? 1 : 0,
             n_backends,
-            backend_ctx->tensor_phone_first_layer,
-            backend_ctx->tensor_phone_last_layer,
             phone_primary_xlayer_wave ? 1 : 0,
             phone_primary_chunk_ring_arm_cap ? 1 : 0,
             phone_prefill_chunk_pipeline ? 1 : 0,
@@ -6361,15 +6343,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto bind_phone_prefill_down_direct =
         [&](int layer, int chunk, ggml_cgraph * phone_graph) -> bool {
-            const bool ring_layer =
-                phone_primary_chunk_ring_active &&
-                layer_is_tensor_phone_primary(layer);
-            const bool legacy_v2_layer =
-                phone_primary_xlayer_ffn_ahead_v2_active &&
-                layer >= phone_primary_xlayer_first_layer &&
-                layer < phone_primary_xlayer_last_layer;
-
-            if (!(ring_layer || legacy_v2_layer) ||
+            if (!(phone_primary_xlayer_ffn_ahead_v2_active ||
+                   phone_primary_chunk_ring_active) ||
+                    layer < phone_primary_xlayer_first_layer ||
+                    layer >= phone_primary_xlayer_last_layer ||
                     chunk < 0 ||
                     phone_graph == nullptr ||
                     phone_graph->n_nodes <= 0) {
@@ -12475,19 +12452,12 @@ auto prefill_norm_sg_has_prework =
                     phone_primary_prefill_route_layer) ? 1 : 0);
             fflush(stderr);
         }
-        const bool chunk_ring_down_cross_layer =
-            phone_primary_chunk_ring_active &&
-            is_prefill_down_sg &&
-            layer_is_tensor_phone_primary(prefill_down_layer) &&
-            layer_is_tensor_phone_primary(prefill_down_layer - 1);
-
-        if (((legacy_return_wavefront_graph ||
-              phone_primary_xlayer_wave) &&
-                 (is_prefill_wave_attn_sg ||
-                  is_prefill_wave_l_out_sg ||
-                  is_prefill_norm_sg ||
-                  is_prefill_down_sg)) ||
-                chunk_ring_down_cross_layer) {
+        if ((legacy_return_wavefront_graph ||
+             phone_primary_xlayer_wave) &&
+                (is_prefill_wave_attn_sg ||
+                 is_prefill_wave_l_out_sg ||
+                 is_prefill_norm_sg ||
+                 is_prefill_down_sg)) {
             if (is_prefill_wave_l_out_sg &&
                     phone_prefill_chunk_join_active &&
                     layer_is_tensor_phone_primary(
@@ -12702,8 +12672,7 @@ auto prefill_norm_sg_has_prework =
                          !pending_phone_prefill_pc_branches.empty()) ? 1 : 0);
                 }
             } else if (is_prefill_down_sg &&
-                       (chunk_ring_down_cross_layer ||
-                        prefill_down_layer > active_wavefront_first_layer) &&
+                       prefill_down_layer > active_wavefront_first_layer &&
                        (has_pending_prefill_reduce_for_layer(
                             prefill_down_layer - 1) ||
                         has_pending_phone_prefill_pc_for_layer(
@@ -12711,18 +12680,12 @@ auto prefill_norm_sg_has_prework =
                 const int predecessor_layer =
                     prefill_down_layer - 1;
 
-                const bool chunk_ring_gate =
-                    chunk_ring_down_cross_layer;
-                const bool legacy_v2_gate =
-                    phone_primary_xlayer_wave &&
-                    phone_primary_xlayer_ffn_ahead_v2_active;
-
-                if (chunk_ring_gate || legacy_v2_gate) {
-                    // Chunk Ring owns the exact (L-1,C) dependency
-                    // independently of legacy xlayer markers. Legacy V2 keeps
-                    // the same wait semantics when explicitly enabled.
-                    // Stable per-chunk Phone FFN storage keeps unrelated
-                    // predecessor chunks alive safely.
+                if (phone_primary_xlayer_wave &&
+                        (phone_primary_xlayer_ffn_ahead_v2_active ||
+                         phone_primary_chunk_ring_active)) {
+                    // Cross-layer V2: first satisfy the exact mathematical
+                    // dependency (L-1,C). Stable per-chunk Phone FFN storage
+                    // keeps unrelated predecessor chunks alive safely.
                     const int64_t gate_begin_us = ggml_time_us();
 
                     bool reduce_waited = false;
@@ -12749,34 +12712,9 @@ auto prefill_norm_sg_has_prework =
 
                     const int64_t gate_wait_us =
                         ggml_time_us() - gate_begin_us;
-                    if (chunk_ring_gate) {
-                        ++chunk_ring_gate_count;
-                        chunk_ring_gate_wait_us += gate_wait_us;
-                        chunk_ring_gate_wait_max_us =
-                            std::max(
-                                chunk_ring_gate_wait_max_us,
-                                gate_wait_us);
-                    } else {
-                        ++phone_xlayer_v2_chunk_gate_count;
-                        phone_xlayer_v2_chunk_gate_wait_us +=
-                            gate_wait_us;
-                    }
-
-                    if ((pipeline_debug ||
-                         tensor_phone_stage_profile ||
-                         xlayer_wave_trace) &&
-                        chunk_ring_gate) {
-                        GGML_LOG_INFO(
-                            "[CHUNK_RING_GATE] layer=%d chunk=%d "
-                            "pred_layer=%d wait_ms=%.3f "
-                            "reduce_waited=%d phone_waited=%d\n",
-                            prefill_down_layer,
-                            prefill_down_chunk,
-                            predecessor_layer,
-                            gate_wait_us / 1000.0,
-                            reduce_waited ? 1 : 0,
-                            phone_waited ? 1 : 0);
-                    }
+                    ++phone_xlayer_v2_chunk_gate_count;
+                    phone_xlayer_v2_chunk_gate_wait_us +=
+                        gate_wait_us;
 
                     if (xlayer_boundary_diag) {
                         std::lock_guard<std::mutex> lock(
@@ -13110,8 +13048,7 @@ auto prefill_norm_sg_has_prework =
             // prework has already enforced the exact OUT dependency.
         } else if ((has_pending_prefill_reduce() ||
                     ((legacy_return_wavefront_graph ||
-                      phone_primary_xlayer_wave ||
-                      phone_primary_chunk_ring_active) &&
+                      phone_primary_xlayer_wave) &&
                      phone_prefill_chunk_join_active &&
                      !pending_phone_prefill_pc_branches.empty())) &&
                    !continues_prefill_layer) {
@@ -13153,120 +13090,6 @@ auto prefill_norm_sg_has_prework =
             }
 
             int last_lane = -1;
-
-            const bool chunk_ring_stage_exit_diag =
-                phone_primary_chunk_ring_active &&
-                layer_is_tensor_phone_primary(barrier_layer) &&
-                (pipeline_debug ||
-                 tensor_phone_stage_profile ||
-                 xlayer_wave_trace);
-            if (chunk_ring_stage_exit_diag) {
-                const int64_t diag_now_us = ggml_time_us();
-                for (const auto & branch :
-                        pending_phone_prefill_pc_branches) {
-                    if (branch.layer != barrier_layer) {
-                        continue;
-                    }
-
-                    const bool pc_ready =
-                        branch.pc_worker != nullptr &&
-                        branch.pc_task != 0 &&
-                        branch.pc_worker->is_completed(branch.pc_task);
-
-                    ggml_backend_meta_transfer_worker * return_worker =
-                        branch.return_lane <
-                                ggml_backend_meta_context::
-                                    PREFILL_RETURN_LANES ?
-                            backend_ctx->prefill_return_workers[
-                                branch.return_lane] :
-                            nullptr;
-                    const bool return_ready =
-                        return_worker != nullptr &&
-                        branch.return_task != 0 &&
-                        return_worker->is_completed(branch.return_task);
-
-                    ggml_backend_meta_transfer_worker * ring_worker =
-                        branch.ring_reduce_task != 0 ?
-                            backend_ctx->phone_prefill_ring_reduce_worker :
-                            nullptr;
-                    const bool reduce_ready =
-                        branch.ring_reduce_task == 0 ?
-                            return_ready :
-                            (ring_worker != nullptr &&
-                             ring_worker->is_completed(
-                                 branch.ring_reduce_task));
-
-                    const auto & timing = branch.timing;
-                    const double age_ms =
-                        branch.enqueue_us > 0 ?
-                            (diag_now_us - branch.enqueue_us) / 1000.0 :
-                            -1.0;
-                    const double pc_done_rel_ms =
-                        timing != nullptr &&
-                        timing->pc_done_us > 0 &&
-                        branch.enqueue_us > 0 ?
-                            (timing->pc_done_us -
-                             branch.enqueue_us) / 1000.0 :
-                            -1.0;
-                    const double send_begin_rel_ms =
-                        timing != nullptr &&
-                        timing->return_send_begin_us > 0 &&
-                        branch.enqueue_us > 0 ?
-                            (timing->return_send_begin_us -
-                             branch.enqueue_us) / 1000.0 :
-                            -1.0;
-                    const double send_end_rel_ms =
-                        timing != nullptr &&
-                        timing->return_send_end_us > 0 &&
-                        branch.enqueue_us > 0 ?
-                            (timing->return_send_end_us -
-                             branch.enqueue_us) / 1000.0 :
-                            -1.0;
-                    const double add_begin_rel_ms =
-                        timing != nullptr &&
-                        timing->add_submit_begin_us > 0 &&
-                        branch.enqueue_us > 0 ?
-                            (timing->add_submit_begin_us -
-                             branch.enqueue_us) / 1000.0 :
-                            -1.0;
-                    const double add_end_rel_ms =
-                        timing != nullptr &&
-                        timing->add_submit_end_us > 0 &&
-                        branch.enqueue_us > 0 ?
-                            (timing->add_submit_end_us -
-                             branch.enqueue_us) / 1000.0 :
-                            -1.0;
-
-                    printf(
-                        "[CHUNK_RING_STAGE_EXIT_PENDING] "
-                        "layer=%d chunk=%d sg=%zu seq=%" PRIu64
-                        " lane=%zu age_ms=%.3f "
-                        "pc_task=%" PRIu64 " pc_ready=%d "
-                        "return_task=%" PRIu64 " return_ready=%d "
-                        "ring_task=%" PRIu64 " reduce_ready=%d "
-                        "pc_done_rel_ms=%.3f "
-                        "send_begin_rel_ms=%.3f send_end_rel_ms=%.3f "
-                        "add_begin_rel_ms=%.3f add_end_rel_ms=%.3f\n",
-                        branch.layer,
-                        branch.chunk,
-                        branch.sg,
-                        branch.phone_ffn_seq,
-                        branch.return_lane,
-                        age_ms,
-                        branch.pc_task,
-                        pc_ready ? 1 : 0,
-                        branch.return_task,
-                        return_ready ? 1 : 0,
-                        branch.ring_reduce_task,
-                        reduce_ready ? 1 : 0,
-                        pc_done_rel_ms,
-                        send_begin_rel_ms,
-                        send_end_rel_ms,
-                        add_begin_rel_ms,
-                        add_end_rel_ms);
-                }
-            }
-
             const int64_t wait_start_us = ggml_time_us();
             ggml_status status = GGML_STATUS_SUCCESS;
             if (has_pending_prefill_reduce()) {
@@ -13274,8 +13097,7 @@ auto prefill_norm_sg_has_prework =
             }
             while (status == GGML_STATUS_SUCCESS &&
                    (legacy_return_wavefront_graph ||
-                    phone_primary_xlayer_wave ||
-                    phone_primary_chunk_ring_active) &&
+                    phone_primary_xlayer_wave) &&
                    phone_prefill_chunk_join_active &&
                    !pending_phone_prefill_pc_branches.empty()) {
                 const int pending_layer =
@@ -13286,30 +13108,6 @@ auto prefill_norm_sg_has_prework =
             const int64_t wait_us = ggml_time_us() - wait_start_us;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
-
-            const bool chunk_ring_stage_exit =
-                phone_primary_chunk_ring_active &&
-                layer_is_tensor_phone_primary(barrier_layer);
-            if (chunk_ring_stage_exit) {
-                ++chunk_ring_stage_exit_barrier_count;
-                chunk_ring_stage_exit_barrier_wait_us += wait_us;
-                chunk_ring_stage_exit_barrier_wait_max_us =
-                    std::max(
-                        chunk_ring_stage_exit_barrier_wait_max_us,
-                        wait_us);
-                if (pipeline_debug ||
-                        tensor_phone_stage_profile ||
-                        xlayer_wave_trace) {
-                    printf(
-                        "[CHUNK_RING_STAGE_EXIT_BARRIER] "
-                        "layer=%d pending=%zu wait_ms=%.3f last_lane=%d\n",
-                        barrier_layer,
-                        pending_lanes,
-                        wait_us / 1000.0,
-                        last_lane);
-                }
-            }
-
             if ((legacy_return_wavefront_graph ||
                  phone_primary_xlayer_wave) &&
                     barrier_layer >= active_wavefront_first_layer) {
@@ -14283,28 +14081,6 @@ auto prefill_norm_sg_has_prework =
                 xlayer_direct_bound &&
                 return_task != 0;
 
-            if ((pipeline_debug || tensor_phone_stage_profile) &&
-                    phone_primary_chunk_ring) {
-                GGML_LOG_INFO(
-                    "[CHUNK_RING_DECISION] "
-                    "layer=%d chunk=%d sg=%zu "
-                    "active=%d wave=%d range=[%d,%d] "
-                    "direct_bound=%d return_task=%" PRIu64
-                    " seq=%" PRIu64 " use_ring=%d defer_phone=%d\n",
-                    prefill_down_layer,
-                    prefill_down_chunk,
-                    i,
-                    phone_primary_chunk_ring_active ? 1 : 0,
-                    phone_primary_xlayer_wave ? 1 : 0,
-                    phone_primary_xlayer_first_layer,
-                    phone_primary_xlayer_last_layer,
-                    xlayer_direct_bound ? 1 : 0,
-                    return_task,
-                    phone_ffn_seq,
-                    use_ring_cpu_reduce ? 1 : 0,
-                    defer_local_phone_ffn ? 1 : 0);
-            }
-
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             int64_t phone_wall_us = 0;
             if (defer_local_phone_ffn) {
@@ -14475,7 +14251,6 @@ auto prefill_norm_sg_has_prework =
                 ring_reduce_task,
                 phone_return_stage,
                 return_timing,
-                ggml_time_us(),
             });
             deferred_phone_prefill_return_sgs[i] =
                 prefill_down_layer;
@@ -15667,26 +15442,6 @@ auto prefill_norm_sg_has_prework =
             layer_barrier_wait_count,
             layer_barrier_wait_us / 1000.0,
             layer_barrier_wait_max_us / 1000.0);
-    }
-
-    if ((pipeline_debug ||
-         tensor_phone_stage_profile ||
-         xlayer_wave_trace) &&
-            phone_primary_chunk_ring) {
-        printf(
-            "[CHUNK_RING_SUM] active=%d "
-            "gate_count=%" PRId64 " gate_wait_ms=%.3f "
-            "gate_wait_max_ms=%.3f "
-            "stage_exit_barrier_count=%" PRId64 " "
-            "stage_exit_barrier_wait_ms=%.3f "
-            "stage_exit_barrier_wait_max_ms=%.3f\n",
-            phone_primary_chunk_ring_active ? 1 : 0,
-            chunk_ring_gate_count,
-            chunk_ring_gate_wait_us / 1000.0,
-            chunk_ring_gate_wait_max_us / 1000.0,
-            chunk_ring_stage_exit_barrier_count,
-            chunk_ring_stage_exit_barrier_wait_us / 1000.0,
-            chunk_ring_stage_exit_barrier_wait_max_us / 1000.0);
     }
 
     debug_handoff_watch("BEFORE_META_RETURN");
