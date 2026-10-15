@@ -2535,6 +2535,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
 
+    // Correlate a stage's actual split Meta pointer with the owner-exit
+    // decision inside ggml-backend-meta.cpp, including nonterminal TENSOR
+    // graphs.  Keep this opt-in and synchronous for abort-time diagnostics.
+    if (std::getenv("GGML_META_ZERO_SHARD_TRACE") != nullptr &&
+            (stage.kind == llama_hybrid_runtime_stage_kind::TENSOR ||
+             stage.kind == llama_hybrid_runtime_stage_kind::PHONE)) {
+        fprintf(
+            stderr,
+            "[HYBRID_META_STAGE] ub=%d stage=%zu block=%zu "
+            "kind=%s layers=[%d,%d) outputs=%d "
+            "tokens=[%u,%u) splits=%d\n",
+            ubatch_id,
+            stage_index,
+            block_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            stage.layer_begin,
+            stage.layer_end,
+            block_outputs,
+            token_begin,
+            token_begin + block_tokens,
+            n_splits);
+        for (int split_id = 0; split_id < n_splits; ++split_id) {
+            ggml_backend_t split_backend =
+                ggml_backend_sched_get_split_backend(sched_use, split_id);
+            if (ggml_backend_is_meta(split_backend)) {
+                fprintf(
+                    stderr,
+                    "[HYBRID_META_STAGE_SPLIT] ub=%d stage=%zu "
+                    "block=%zu split=%d meta=%p name=%s\n",
+                    ubatch_id,
+                    stage_index,
+                    block_index,
+                    split_id,
+                    (void *) split_backend,
+                    ggml_backend_name(split_backend));
+            }
+        }
+        fflush(stderr);
+    }
+
     if (phone_resident_input) {
         ggml_tensor * stage_input_tensor =
             result->get_stage_input();
