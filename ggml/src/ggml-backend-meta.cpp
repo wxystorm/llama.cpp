@@ -12468,12 +12468,19 @@ auto prefill_norm_sg_has_prework =
                     phone_primary_prefill_route_layer) ? 1 : 0);
             fflush(stderr);
         }
-        if ((legacy_return_wavefront_graph ||
-             phone_primary_xlayer_wave) &&
-                (is_prefill_wave_attn_sg ||
-                 is_prefill_wave_l_out_sg ||
-                 is_prefill_norm_sg ||
-                 is_prefill_down_sg)) {
+        const bool chunk_ring_down_cross_layer =
+            phone_primary_chunk_ring_active &&
+            is_prefill_down_sg &&
+            layer_is_tensor_phone_primary(prefill_down_layer) &&
+            layer_is_tensor_phone_primary(prefill_down_layer - 1);
+
+        if (((legacy_return_wavefront_graph ||
+              phone_primary_xlayer_wave) &&
+                 (is_prefill_wave_attn_sg ||
+                  is_prefill_wave_l_out_sg ||
+                  is_prefill_norm_sg ||
+                  is_prefill_down_sg)) ||
+                chunk_ring_down_cross_layer) {
             if (is_prefill_wave_l_out_sg &&
                     phone_prefill_chunk_join_active &&
                     layer_is_tensor_phone_primary(
@@ -12688,7 +12695,8 @@ auto prefill_norm_sg_has_prework =
                          !pending_phone_prefill_pc_branches.empty()) ? 1 : 0);
                 }
             } else if (is_prefill_down_sg &&
-                       prefill_down_layer > active_wavefront_first_layer &&
+                       (chunk_ring_down_cross_layer ||
+                        prefill_down_layer > active_wavefront_first_layer) &&
                        (has_pending_prefill_reduce_for_layer(
                             prefill_down_layer - 1) ||
                         has_pending_phone_prefill_pc_for_layer(
@@ -12696,12 +12704,18 @@ auto prefill_norm_sg_has_prework =
                 const int predecessor_layer =
                     prefill_down_layer - 1;
 
-                if (phone_primary_xlayer_wave &&
-                        (phone_primary_xlayer_ffn_ahead_v2_active ||
-                         phone_primary_chunk_ring_active)) {
-                    // Cross-layer V2: first satisfy the exact mathematical
-                    // dependency (L-1,C). Stable per-chunk Phone FFN storage
-                    // keeps unrelated predecessor chunks alive safely.
+                const bool chunk_ring_gate =
+                    chunk_ring_down_cross_layer;
+                const bool legacy_v2_gate =
+                    phone_primary_xlayer_wave &&
+                    phone_primary_xlayer_ffn_ahead_v2_active;
+
+                if (chunk_ring_gate || legacy_v2_gate) {
+                    // Chunk Ring owns the exact (L-1,C) dependency
+                    // independently of legacy xlayer markers. Legacy V2 keeps
+                    // the same wait semantics when explicitly enabled.
+                    // Stable per-chunk Phone FFN storage keeps unrelated
+                    // predecessor chunks alive safely.
                     const int64_t gate_begin_us = ggml_time_us();
 
                     bool reduce_waited = false;
@@ -12731,6 +12745,22 @@ auto prefill_norm_sg_has_prework =
                     ++phone_xlayer_v2_chunk_gate_count;
                     phone_xlayer_v2_chunk_gate_wait_us +=
                         gate_wait_us;
+
+                    if ((pipeline_debug ||
+                         tensor_phone_stage_profile ||
+                         xlayer_wave_trace) &&
+                        chunk_ring_gate) {
+                        GGML_LOG_INFO(
+                            "[CHUNK_RING_GATE] layer=%d chunk=%d "
+                            "pred_layer=%d wait_ms=%.3f "
+                            "reduce_waited=%d phone_waited=%d\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            predecessor_layer,
+                            gate_wait_us / 1000.0,
+                            reduce_waited ? 1 : 0,
+                            phone_waited ? 1 : 0);
+                    }
 
                     if (xlayer_boundary_diag) {
                         std::lock_guard<std::mutex> lock(
