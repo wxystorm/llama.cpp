@@ -2493,12 +2493,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         stage.layer_end < (int) model.hparams.n_layer() &&
         model.hybrid_layer_mode(stage.layer_end) ==
             llama_hybrid_layer_mode::PHONE_ONLY;
-    // A terminal PHONE stage with no requested block/stage output only
-    // needs to commit its side effects (for example KV updates).  This is
-    // independent of whether its input arrived through the resident bridge.
-    // Keep all Phone-only scheduler splits local so Meta does not manufacture
-    // a transient Phone->CPU export of an internal Kcur/Vcur zero shard.
     const bool discard_phone_terminal_output =
+        resident_handoff_enabled &&
+        phone_resident_input &&
         stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
         stage.layer_end == (int) model.hparams.n_layer() &&
         stage_output == nullptr &&
