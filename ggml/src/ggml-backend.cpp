@@ -1557,27 +1557,60 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            if (getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != NULL &&
+                            const bool copy_layout_trace =
+                                getenv("GGML_BACKEND_COPY_LAYOUT_TRACE") != NULL;
+                            if ((getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != NULL ||
+                                 copy_layout_trace) &&
                                 strstr(src->name, "Vcur-") != NULL) {
-                                GGML_LOG_INFO(
-                                    "[SCHED_COPY_CREATE] backend=%s copy=%d "
-                                    "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
-                                    "dst_type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
-                                    ggml_backend_name(backend),
-                                    c,
-                                    src->name,
-                                    ggml_type_name(src->type),
-                                    src->ne[0], src->ne[1], src->ne[2], src->ne[3],
-                                    src->nb[0], src->nb[1], src->nb[2], src->nb[3],
-                                    ggml_nbytes(src),
-                                    ggml_type_name(tensor_copy->type),
-                                    tensor_copy->ne[0], tensor_copy->ne[1],
-                                    tensor_copy->ne[2], tensor_copy->ne[3],
-                                    tensor_copy->nb[0], tensor_copy->nb[1],
-                                    tensor_copy->nb[2], tensor_copy->nb[3],
-                                    ggml_nbytes(tensor_copy));
+                                if (copy_layout_trace) {
+                                    GGML_LOG_ERROR(
+                                        "[SCHED_COPY_CREATE] backend=%s copy=%d "
+                                        "src_ptr=%p src_view=%p src_view_name=%s "
+                                        "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+                                        "dst_ptr=%p dst_view=%p dst_view_name=%s "
+                                        "dst_type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                                        ggml_backend_name(backend),
+                                        c,
+                                        (void *) src,
+                                        (void *) src->view_src,
+                                        src->view_src != NULL ? src->view_src->name : "(null)",
+                                        src->name,
+                                        ggml_type_name(src->type),
+                                        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                        src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                                        ggml_nbytes(src),
+                                        (void *) tensor_copy,
+                                        (void *) tensor_copy->view_src,
+                                        tensor_copy->view_src != NULL ? tensor_copy->view_src->name : "(null)",
+                                        ggml_type_name(tensor_copy->type),
+                                        tensor_copy->ne[0], tensor_copy->ne[1],
+                                        tensor_copy->ne[2], tensor_copy->ne[3],
+                                        tensor_copy->nb[0], tensor_copy->nb[1],
+                                        tensor_copy->nb[2], tensor_copy->nb[3],
+                                        ggml_nbytes(tensor_copy));
+                                } else {
+                                    GGML_LOG_INFO(
+                                        "[SCHED_COPY_CREATE] backend=%s copy=%d "
+                                        "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+                                        "dst_type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                                        ggml_backend_name(backend),
+                                        c,
+                                        src->name,
+                                        ggml_type_name(src->type),
+                                        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                        src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                                        ggml_nbytes(src),
+                                        ggml_type_name(tensor_copy->type),
+                                        tensor_copy->ne[0], tensor_copy->ne[1],
+                                        tensor_copy->ne[2], tensor_copy->ne[3],
+                                        tensor_copy->nb[0], tensor_copy->nb[1],
+                                        tensor_copy->nb[2], tensor_copy->nb[3],
+                                        ggml_nbytes(tensor_copy));
+                                }
                             }
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
@@ -2035,30 +2068,65 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
         struct ggml_tensor * input         = split->inputs[input_id];
         struct ggml_tensor * input_cpy     = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-        if (getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != NULL &&
+        const bool copy_layout_trace =
+            getenv("GGML_BACKEND_COPY_LAYOUT_TRACE") != NULL;
+        if ((getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != NULL ||
+             copy_layout_trace) &&
             strstr(input->name, "Vcur-") != NULL &&
             input_cpy != NULL) {
-            GGML_LOG_INFO(
-                "[SCHED_COPY_EXEC] split=%d backend=%s copy=%d "
-                "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
-                "dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
-                split_id,
-                ggml_backend_name(split_backend),
-                sched->cur_copy,
-                input->name,
-                ggml_type_name(input->type),
-                input->ne[0], input->ne[1], input->ne[2], input->ne[3],
-                input->nb[0], input->nb[1], input->nb[2], input->nb[3],
-                ggml_nbytes(input),
-                input_cpy->name,
-                ggml_type_name(input_cpy->type),
-                input_cpy->ne[0], input_cpy->ne[1],
-                input_cpy->ne[2], input_cpy->ne[3],
-                input_cpy->nb[0], input_cpy->nb[1],
-                input_cpy->nb[2], input_cpy->nb[3],
-                ggml_nbytes(input_cpy));
+            if (copy_layout_trace) {
+                GGML_LOG_ERROR(
+                    "[SCHED_COPY_EXEC] split=%d backend=%s copy=%d "
+                    "src_ptr=%p src_view=%p src_view_name=%s "
+                    "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+                    "dst_ptr=%p dst_view=%p dst_view_name=%s "
+                    "dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                    split_id,
+                    ggml_backend_name(split_backend),
+                    sched->cur_copy,
+                    (void *) input,
+                    (void *) input->view_src,
+                    input->view_src != NULL ? input->view_src->name : "(null)",
+                    input->name,
+                    ggml_type_name(input->type),
+                    input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+                    input->nb[0], input->nb[1], input->nb[2], input->nb[3],
+                    ggml_nbytes(input),
+                    (void *) input_cpy,
+                    (void *) input_cpy->view_src,
+                    input_cpy->view_src != NULL ? input_cpy->view_src->name : "(null)",
+                    input_cpy->name,
+                    ggml_type_name(input_cpy->type),
+                    input_cpy->ne[0], input_cpy->ne[1],
+                    input_cpy->ne[2], input_cpy->ne[3],
+                    input_cpy->nb[0], input_cpy->nb[1],
+                    input_cpy->nb[2], input_cpy->nb[3],
+                    ggml_nbytes(input_cpy));
+            } else {
+                GGML_LOG_INFO(
+                    "[SCHED_COPY_EXEC] split=%d backend=%s copy=%d "
+                    "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+                    "dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                    split_id,
+                    ggml_backend_name(split_backend),
+                    sched->cur_copy,
+                    input->name,
+                    ggml_type_name(input->type),
+                    input->ne[0], input->ne[1], input->ne[2], input->ne[3],
+                    input->nb[0], input->nb[1], input->nb[2], input->nb[3],
+                    ggml_nbytes(input),
+                    input_cpy->name,
+                    ggml_type_name(input_cpy->type),
+                    input_cpy->ne[0], input_cpy->ne[1],
+                    input_cpy->ne[2], input_cpy->ne[3],
+                    input_cpy->nb[0], input_cpy->nb[1],
+                    input_cpy->nb[2], input_cpy->nb[3],
+                    ggml_nbytes(input_cpy));
+            }
         }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
