@@ -513,6 +513,12 @@ extern "C" {
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer);
+    // Marks the currently executing staged TENSOR graph as the authoritative
+    // Phone-primary Chunk Ring stage. Scheduler splits may not retain the
+    // wave marker tensor in every Meta slice, so execution must not infer
+    // Ring membership from local graph contents alone.
+    GGML_API bool ggml_backend_meta_set_phone_chunk_ring_stage(
+        ggml_backend_t backend, bool enabled);
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
