@@ -9899,6 +9899,46 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 !layer_handoff_to_pc &&
                 ggml_nbytes(nodes[1]) > 0 &&
                 ggml_nbytes(nodes[0]) == 0;
+            // Observe the exact Meta instance before a nonzero Phone shard
+            // can be copied to a zero-width PC shard.  This must be flushed
+            // synchronously: the layout assert aborts before queued logs drain.
+            const bool zero_pc_copy_candidate =
+                n_backends == 2 &&
+                active_backend == 1 &&
+                nodes[0] != nullptr &&
+                nodes[1] != nullptr &&
+                ggml_nbytes(nodes[1]) > 0 &&
+                ggml_nbytes(nodes[0]) == 0;
+            if (zero_pc_copy_candidate) {
+                fprintf(
+                    stderr,
+                    "[META_ZERO_SHARD_DECISION] "
+                    "uid=%" PRIu64 " meta=%p ctx=%p "
+                    "sg=%zu/%zu src=%s src_bytes=%zu "
+                    "dst=%s dst_bytes=%zu "
+                    "keep=%d discard=%d owner_exit=%d "
+                    "handoff=%d tp_context=%d ring=%d "
+                    "tp_range=[%d,%d)\n",
+                    cgraph->uid,
+                    (void *) backend,
+                    (void *) backend_ctx,
+                    i,
+                    backend_ctx->n_subgraphs,
+                    nodes[1]->name,
+                    ggml_nbytes(nodes[1]),
+                    nodes[0]->name,
+                    ggml_nbytes(nodes[0]),
+                    backend_ctx->phone_stage_terminal_keep_internal_active ? 1 : 0,
+                    backend_ctx->phone_stage_terminal_discard_active ? 1 : 0,
+                    phone_owner_exit ? 1 : 0,
+                    layer_handoff_to_pc ? 1 : 0,
+                    tp_layer_context ? 1 : 0,
+                    phone_primary_chunk_ring_active ? 1 : 0,
+                    backend_ctx->tensor_phone_first_layer,
+                    backend_ctx->tensor_phone_last_layer);
+                fflush(stderr);
+            }
+
             if (terminal_phone_internal_zero_shard) {
                 if (pipeline_debug || tensor_phone_stage_profile) {
                     printf(
