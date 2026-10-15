@@ -4482,6 +4482,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint64_t ring_reduce_task = 0;
         ggml_tensor * return_stage = nullptr;
         std::shared_ptr<phone_prefill_return_timing> timing;
+        int64_t enqueue_us = 0;
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
@@ -13152,6 +13153,120 @@ auto prefill_norm_sg_has_prework =
             }
 
             int last_lane = -1;
+
+            const bool chunk_ring_stage_exit_diag =
+                phone_primary_chunk_ring_active &&
+                layer_is_tensor_phone_primary(barrier_layer) &&
+                (pipeline_debug ||
+                 tensor_phone_stage_profile ||
+                 xlayer_wave_trace);
+            if (chunk_ring_stage_exit_diag) {
+                const int64_t diag_now_us = ggml_time_us();
+                for (const auto & branch :
+                        pending_phone_prefill_pc_branches) {
+                    if (branch.layer != barrier_layer) {
+                        continue;
+                    }
+
+                    const bool pc_ready =
+                        branch.pc_worker != nullptr &&
+                        branch.pc_task != 0 &&
+                        branch.pc_worker->is_completed(branch.pc_task);
+
+                    ggml_backend_meta_transfer_worker * return_worker =
+                        branch.return_lane <
+                                ggml_backend_meta_context::
+                                    PREFILL_RETURN_LANES ?
+                            backend_ctx->prefill_return_workers[
+                                branch.return_lane] :
+                            nullptr;
+                    const bool return_ready =
+                        return_worker != nullptr &&
+                        branch.return_task != 0 &&
+                        return_worker->is_completed(branch.return_task);
+
+                    ggml_backend_meta_transfer_worker * ring_worker =
+                        branch.ring_reduce_task != 0 ?
+                            backend_ctx->phone_prefill_ring_reduce_worker :
+                            nullptr;
+                    const bool reduce_ready =
+                        branch.ring_reduce_task == 0 ?
+                            return_ready :
+                            (ring_worker != nullptr &&
+                             ring_worker->is_completed(
+                                 branch.ring_reduce_task));
+
+                    const auto & timing = branch.timing;
+                    const double age_ms =
+                        branch.enqueue_us > 0 ?
+                            (diag_now_us - branch.enqueue_us) / 1000.0 :
+                            -1.0;
+                    const double pc_done_rel_ms =
+                        timing != nullptr &&
+                        timing->pc_done_us > 0 &&
+                        branch.enqueue_us > 0 ?
+                            (timing->pc_done_us -
+                             branch.enqueue_us) / 1000.0 :
+                            -1.0;
+                    const double send_begin_rel_ms =
+                        timing != nullptr &&
+                        timing->return_send_begin_us > 0 &&
+                        branch.enqueue_us > 0 ?
+                            (timing->return_send_begin_us -
+                             branch.enqueue_us) / 1000.0 :
+                            -1.0;
+                    const double send_end_rel_ms =
+                        timing != nullptr &&
+                        timing->return_send_end_us > 0 &&
+                        branch.enqueue_us > 0 ?
+                            (timing->return_send_end_us -
+                             branch.enqueue_us) / 1000.0 :
+                            -1.0;
+                    const double add_begin_rel_ms =
+                        timing != nullptr &&
+                        timing->add_submit_begin_us > 0 &&
+                        branch.enqueue_us > 0 ?
+                            (timing->add_submit_begin_us -
+                             branch.enqueue_us) / 1000.0 :
+                            -1.0;
+                    const double add_end_rel_ms =
+                        timing != nullptr &&
+                        timing->add_submit_end_us > 0 &&
+                        branch.enqueue_us > 0 ?
+                            (timing->add_submit_end_us -
+                             branch.enqueue_us) / 1000.0 :
+                            -1.0;
+
+                    printf(
+                        "[CHUNK_RING_STAGE_EXIT_PENDING] "
+                        "layer=%d chunk=%d sg=%zu seq=%" PRIu64
+                        " lane=%zu age_ms=%.3f "
+                        "pc_task=%" PRIu64 " pc_ready=%d "
+                        "return_task=%" PRIu64 " return_ready=%d "
+                        "ring_task=%" PRIu64 " reduce_ready=%d "
+                        "pc_done_rel_ms=%.3f "
+                        "send_begin_rel_ms=%.3f send_end_rel_ms=%.3f "
+                        "add_begin_rel_ms=%.3f add_end_rel_ms=%.3f\n",
+                        branch.layer,
+                        branch.chunk,
+                        branch.sg,
+                        branch.phone_ffn_seq,
+                        branch.return_lane,
+                        age_ms,
+                        branch.pc_task,
+                        pc_ready ? 1 : 0,
+                        branch.return_task,
+                        return_ready ? 1 : 0,
+                        branch.ring_reduce_task,
+                        reduce_ready ? 1 : 0,
+                        pc_done_rel_ms,
+                        send_begin_rel_ms,
+                        send_end_rel_ms,
+                        add_begin_rel_ms,
+                        add_end_rel_ms);
+                }
+            }
+
             const int64_t wait_start_us = ggml_time_us();
             ggml_status status = GGML_STATUS_SUCCESS;
             if (has_pending_prefill_reduce()) {
@@ -14360,6 +14475,7 @@ auto prefill_norm_sg_has_prework =
                 ring_reduce_task,
                 phone_return_stage,
                 return_timing,
+                ggml_time_us(),
             });
             deferred_phone_prefill_return_sgs[i] =
                 prefill_down_layer;
