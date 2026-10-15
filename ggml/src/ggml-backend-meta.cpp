@@ -2521,6 +2521,10 @@ struct ggml_backend_meta_context {
     uint64_t                    next_phone_prefill_ffn_seq = 1;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
+    // Explicitly armed by llama-context while a staged TENSOR_PHONE_PRIMARY
+    // block is executing. Outer scheduler splits do not necessarily preserve
+    // the wave marker node in every Meta graph slice.
+    bool                        phone_primary_chunk_ring_stage_active = false;
 
     struct phone_stage_bridge_state {
         ggml_backend_buffer_ptr buffer;
@@ -5487,6 +5491,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
     }
 
+    // A staged Chunk Ring spans multiple outer scheduler splits. Some split
+    // graphs contain only FFN/down work and therefore do not carry a
+    // prefill_wave_ffn_inp_* node locally. The stage arm from llama-context is
+    // the execution source of truth; normalize the local wave range to the
+    // stable model-policy TENSOR_PHONE_PRIMARY range for every split.
+    if (backend_ctx->phone_primary_chunk_ring_stage_active &&
+            backend_ctx->tensor_phone_first_layer >= 0 &&
+            backend_ctx->tensor_phone_last_layer >
+                backend_ctx->tensor_phone_first_layer) {
+        phone_primary_xlayer_wave = true;
+        phone_primary_xlayer_first_layer =
+            backend_ctx->tensor_phone_first_layer;
+        phone_primary_xlayer_last_layer =
+            backend_ctx->tensor_phone_last_layer - 1;
+    }
+
     const bool wave_detect_debug =
         std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr ||
         std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
@@ -6068,12 +6088,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_primary_chunk_ring) {
         GGML_LOG_INFO(
             "[CHUNK_RING_CAP] requested=1 active=%d "
-            "n_backends=%zu xlayer_wave=%d arm_cap=%d "
+            "n_backends=%zu xlayer_wave=%d stage_active=%d arm_cap=%d "
             "chunk_pipeline=%d producer_route=%d async_return=%d "
             "ordered_return=%d chunk_join=%d\n",
             phone_primary_chunk_ring_active ? 1 : 0,
             n_backends,
             phone_primary_xlayer_wave ? 1 : 0,
+            backend_ctx->phone_primary_chunk_ring_stage_active ? 1 : 0,
             phone_primary_chunk_ring_arm_cap ? 1 : 0,
             phone_prefill_chunk_pipeline ? 1 : 0,
             phone_prefill_producer_route ? 1 : 0,
@@ -6343,10 +6364,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto bind_phone_prefill_down_direct =
         [&](int layer, int chunk, ggml_cgraph * phone_graph) -> bool {
+            const bool direct_layer_in_range =
+                phone_primary_chunk_ring_active ?
+                    (backend_ctx->tensor_phone_first_layer >= 0 &&
+                     layer >= backend_ctx->tensor_phone_first_layer &&
+                     layer < backend_ctx->tensor_phone_last_layer) :
+                    (layer >= phone_primary_xlayer_first_layer &&
+                     layer < phone_primary_xlayer_last_layer);
+
             if (!(phone_primary_xlayer_ffn_ahead_v2_active ||
                    phone_primary_chunk_ring_active) ||
-                    layer < phone_primary_xlayer_first_layer ||
-                    layer >= phone_primary_xlayer_last_layer ||
+                    !direct_layer_in_range ||
                     chunk < 0 ||
                     phone_graph == nullptr ||
                     phone_graph->n_nodes <= 0) {
@@ -15978,6 +16006,18 @@ bool ggml_backend_meta_set_tensor_phone_primary_layers(
     }
     backend_ctx->tensor_phone_first_layer = first_layer;
     backend_ctx->tensor_phone_last_layer  = last_layer;
+    return true;
+}
+
+bool ggml_backend_meta_set_phone_chunk_ring_stage(
+        ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+
+    auto * backend_ctx =
+        static_cast<ggml_backend_meta_context *>(backend->context);
+    backend_ctx->phone_primary_chunk_ring_stage_active = enabled;
     return true;
 }
 
