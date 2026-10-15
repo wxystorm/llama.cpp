@@ -10064,6 +10064,59 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     source_fence_us = ggml_time_us() - source_fence_start_us;
                 }
 
+                const bool single_owner_copy_trace =
+                    std::getenv("GGML_META_SINGLE_OWNER_COPY_TRACE") != nullptr;
+                const bool suspicious_zero_dst =
+                    ggml_nbytes(nodes[active_backend]) != 0 &&
+                    ggml_nbytes(nodes[j_dst]) == 0;
+                if ((single_owner_copy_trace ||
+                     suspicious_zero_dst) &&
+                    (std::strstr(nodes[active_backend]->name, "Vcur-") != nullptr ||
+                     std::strstr(nodes[j_dst]->name, "Vcur-") != nullptr ||
+                     suspicious_zero_dst)) {
+                    GGML_LOG_ERROR(
+                        "[META_SINGLE_OWNER_COPY] sg=%zu active=%zu dst_backend=%zu "
+                        "src_backend=%s dst_backend_name=%s "
+                        "next_pc=%d next_phone=%d "
+                        "src=%s ptr=%p view=%p ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+                        "dst=%s ptr=%p view=%p ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                        "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                        i,
+                        active_backend,
+                        j_dst,
+                        ggml_backend_name(bcj_src.backend),
+                        ggml_backend_name(bcj_dst.backend),
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_pc(i + 1) : -1,
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_phone(i + 1) : -1,
+                        nodes[active_backend]->name,
+                        (void *) nodes[active_backend],
+                        (void *) nodes[active_backend]->view_src,
+                        nodes[active_backend]->ne[0],
+                        nodes[active_backend]->ne[1],
+                        nodes[active_backend]->ne[2],
+                        nodes[active_backend]->ne[3],
+                        nodes[active_backend]->nb[0],
+                        nodes[active_backend]->nb[1],
+                        nodes[active_backend]->nb[2],
+                        nodes[active_backend]->nb[3],
+                        ggml_nbytes(nodes[active_backend]),
+                        nodes[j_dst]->name,
+                        (void *) nodes[j_dst],
+                        (void *) nodes[j_dst]->view_src,
+                        nodes[j_dst]->ne[0],
+                        nodes[j_dst]->ne[1],
+                        nodes[j_dst]->ne[2],
+                        nodes[j_dst]->ne[3],
+                        nodes[j_dst]->nb[0],
+                        nodes[j_dst]->nb[1],
+                        nodes[j_dst]->nb[2],
+                        nodes[j_dst]->nb[3],
+                        ggml_nbytes(nodes[j_dst]));
+                }
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
