@@ -4777,6 +4777,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         phone_primary_wavefront_env != nullptr &&
         std::atoi(phone_primary_wavefront_env) != 0;
 
+    // Correctness A/B for Chunk Ring: split the PHONE_ONLY tail out of the
+    // combined Tensor suffix, using the staged runner's explicit hidden
+    // output/input boundary. This costs a host round trip, but avoids
+    // pretending that a terminal internal KV view is a stage output.
+    const char * chunk_ring_split_tail_env =
+        std::getenv("LLAMA_HYBRID_CHUNK_RING_SPLIT_PHONE_TAIL");
+    const bool chunk_ring_split_phone_tail =
+        phone_primary_chunk_ring_requested &&
+        chunk_ring_split_tail_env != nullptr &&
+        std::atoi(chunk_ring_split_tail_env) != 0;
+
     // Minimal cross-layer entry for the common P=0 Phone-primary layout:
     //
     //   GPU prefix -> full-ubatch TENSOR_PHONE_PRIMARY suffix
@@ -4850,8 +4861,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const int suffix_macro_tokens =
             std::max(1, (int) cparams.n_ubatch);
+        const bool isolate_phone_tail =
+            phone_primary_wavefront_requested ||
+            (chunk_ring_split_phone_tail &&
+             runtime_stages.size() > 3 &&
+             runtime_stages[3].kind ==
+                 llama_hybrid_runtime_stage_kind::PHONE);
         const int tensor_stage_end =
-            phone_primary_wavefront_requested ?
+            isolate_phone_tail ?
                 runtime_stages[2].layer_end :
                 (int) hparams.n_layer();
         phone_primary_cpu_chunk_stages.push_back({
@@ -4862,14 +4879,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             runtime_plan.tensor_chunk_tokens,
         });
 
-        // Correctness-first V1: when Phone-primary wavefront is enabled, keep
-        // the Tensor region isolated and run any PHONE_ONLY tail as a separate
-        // staged region. This avoids mixing T wavefront ownership with tail
-        // ownership until exact (layer, chunk) dependencies are stable.
-        if (phone_primary_wavefront_requested) {
+        // Keep the phone tail separate only in explicit opt-in modes.
+        // The Chunk Ring A/B uses the existing host hidden boundary,
+        // without enabling the legacy wavefront runtime.
+        if (isolate_phone_tail) {
             for (size_t i = 3; i < runtime_stages.size(); ++i) {
                 phone_primary_cpu_chunk_stages.push_back(runtime_stages[i]);
             }
+        }
+
+        if (chunk_ring_split_phone_tail &&
+                std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
+            LLAMA_LOG_INFO(
+                "[HYBRID_RING_SPLIT_TAIL] enabled=%d "
+                "tensor=[%d,%d) tail_begin=%d stages=%zu "
+                "boundary=HOST_HIDDEN\n",
+                isolate_phone_tail ? 1 : 0,
+                runtime_stages[2].layer_begin,
+                tensor_stage_end,
+                runtime_stages.size() > 3 ?
+                    runtime_stages[3].layer_begin : -1,
+                phone_primary_cpu_chunk_stages.size());
         }
 
         if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
@@ -4890,6 +4920,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
                 phone_primary_wavefront_requested ?
                     "PREFIX_STAGED_T_WAVEFRONT_SPLIT_TAIL" :
+                    isolate_phone_tail ?
+                    "PREFIX_STAGED_CHUNK_RING_SPLIT_TAIL" :
                     "PREFIX_STAGED_COMBINED_SUFFIX",
                 phone_primary_cpu_chunk_stages.size());
         }
