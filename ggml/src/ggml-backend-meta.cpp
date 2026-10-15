@@ -10017,6 +10017,131 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         force_phone_block_layer,
                         deferred_phone_exit_layer);
 
+                    // Synchronous diagnostic: the normal logger may still
+                    // have queued messages when the following backend copy
+                    // asserts.  Emit the minimal terminal-output state directly
+                    // to stderr and flush it before the verbose graph dump.
+                    int sync_probe_layer = -1;
+                    const bool sync_probe_layer_parsed =
+                        suspicious_zero_dst &&
+                        nodes[active_backend] != nullptr &&
+                        (std::sscanf(
+                             nodes[active_backend]->name,
+                             "Vcur-%d",
+                             &sync_probe_layer) == 1 ||
+                         std::sscanf(
+                             nodes[active_backend]->name,
+                             "Kcur-%d",
+                             &sync_probe_layer) == 1);
+                    if (sync_probe_layer_parsed) {
+                        char sync_expected[64];
+                        std::snprintf(
+                            sync_expected,
+                            sizeof(sync_expected),
+                            "l_out-%d",
+                            sync_probe_layer);
+
+                        int sync_output_index = -1;
+                        for (int probe_k = cgraph->n_nodes - 1;
+                             probe_k >= 0;
+                             --probe_k) {
+                            ggml_tensor * original = cgraph->nodes[probe_k];
+                            if (original != nullptr &&
+                                    std::strcmp(original->name, sync_expected) == 0) {
+                                sync_output_index = probe_k;
+                                break;
+                            }
+                        }
+
+                        fprintf(
+                            stderr,
+                            "[META_TERMINAL_OUTPUT_SYNC] sg=%zu layer=%d "
+                            "src=%s src_bytes=%zu dst=%s dst_bytes=%zu "
+                            "expected=%s index=%d cgraph_nodes=%d\n",
+                            i,
+                            sync_probe_layer,
+                            nodes[active_backend]->name,
+                            ggml_nbytes(nodes[active_backend]),
+                            nodes[j_dst]->name,
+                            ggml_nbytes(nodes[j_dst]),
+                            sync_expected,
+                            sync_output_index,
+                            cgraph->n_nodes);
+
+                        if (sync_output_index >= 0) {
+                            ggml_tensor * original =
+                                cgraph->nodes[sync_output_index];
+                            fprintf(
+                                stderr,
+                                "[META_TERMINAL_OUTPUT_SYNC_ORIGINAL] "
+                                "layer=%d name=%s op=%s flags=0x%x "
+                                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64
+                                ",%" PRId64 "] bytes=%zu\n",
+                                sync_probe_layer,
+                                original->name,
+                                ggml_op_name(original->op),
+                                original->flags,
+                                original->ne[0],
+                                original->ne[1],
+                                original->ne[2],
+                                original->ne[3],
+                                ggml_nbytes(original));
+
+                            for (size_t probe_backend = 0;
+                                 probe_backend < n_backends;
+                                 ++probe_backend) {
+                                ggml_tensor * probe_tensor =
+                                    backend_ctx->
+                                        backend_configs[probe_backend].
+                                        nodes[(size_t) sync_output_index];
+                                if (probe_tensor == nullptr) {
+                                    fprintf(
+                                        stderr,
+                                        "[META_TERMINAL_OUTPUT_SYNC_SHARD] "
+                                        "layer=%d backend=%zu backend_name=%s "
+                                        "tensor=null\n",
+                                        sync_probe_layer,
+                                        probe_backend,
+                                        ggml_backend_name(
+                                            backend_ctx->
+                                                backend_configs[probe_backend].
+                                                backend));
+                                    continue;
+                                }
+
+                                fprintf(
+                                    stderr,
+                                    "[META_TERMINAL_OUTPUT_SYNC_SHARD] "
+                                    "layer=%d backend=%zu backend_name=%s "
+                                    "name=%s op=%s flags=0x%x compute=%d "
+                                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64
+                                    ",%" PRId64 "] "
+                                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                                    sync_probe_layer,
+                                    probe_backend,
+                                    ggml_backend_name(
+                                        backend_ctx->
+                                            backend_configs[probe_backend].
+                                            backend),
+                                    probe_tensor->name,
+                                    ggml_op_name(probe_tensor->op),
+                                    probe_tensor->flags,
+                                    (probe_tensor->flags &
+                                     GGML_TENSOR_FLAG_COMPUTE) != 0,
+                                    probe_tensor->ne[0],
+                                    probe_tensor->ne[1],
+                                    probe_tensor->ne[2],
+                                    probe_tensor->ne[3],
+                                    probe_tensor->nb[0],
+                                    probe_tensor->nb[1],
+                                    probe_tensor->nb[2],
+                                    probe_tensor->nb[3],
+                                    ggml_nbytes(probe_tensor));
+                            }
+                        }
+                        fflush(stderr);
+                    }
+
                     for (size_t trace_backend = 0;
                          trace_backend < n_backends;
                          ++trace_backend) {
