@@ -2738,9 +2738,66 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
+    const bool chunk_ring_stage_requested =
+        std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_RING") != nullptr &&
+        stage.kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        stage.layer_begin >= 0 &&
+        stage.layer_end > stage.layer_begin &&
+        stage.layer_end <= (int) model.hparams.n_layer() &&
+        model.hybrid_layer_mode(stage.layer_begin) ==
+            llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY &&
+        model.hybrid_layer_mode(stage.layer_end - 1) ==
+            llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+
+    std::vector<ggml_backend_t> chunk_ring_meta_backends;
+    if (chunk_ring_stage_requested) {
+        const int n_backends =
+            ggml_backend_sched_get_n_backends(sched_use);
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t candidate =
+                ggml_backend_sched_get_backend(sched_use, i);
+            if (!ggml_backend_is_meta(candidate)) {
+                continue;
+            }
+            if (ggml_backend_meta_set_phone_chunk_ring_stage(
+                    candidate, true)) {
+                chunk_ring_meta_backends.push_back(candidate);
+            }
+        }
+
+        if (phone_cpu_chunk_stage_trace) {
+            LLAMA_LOG_DEBUG(
+                "[CHUNK_RING_STAGE_ARM] ub=%d stage=%zu block=%zu "
+                "layers=[%d,%d) meta_backends=%zu action=ARM\n",
+                ubatch_id,
+                stage_index,
+                block_index,
+                stage.layer_begin,
+                stage.layer_end,
+                chunk_ring_meta_backends.size());
+        }
+    }
+
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
     const int64_t compute_end_us = timing != nullptr ? ggml_time_us() : 0;
+
+    for (ggml_backend_t backend : chunk_ring_meta_backends) {
+        (void) ggml_backend_meta_set_phone_chunk_ring_stage(
+            backend, false);
+    }
+    if (chunk_ring_stage_requested && phone_cpu_chunk_stage_trace) {
+        LLAMA_LOG_DEBUG(
+            "[CHUNK_RING_STAGE_ARM] ub=%d stage=%zu block=%zu "
+            "layers=[%d,%d) meta_backends=%zu action=DISARM status=%d\n",
+            ubatch_id,
+            stage_index,
+            block_index,
+            stage.layer_begin,
+            stage.layer_end,
+            chunk_ring_meta_backends.size(),
+            (int) ret);
+    }
     struct ggml_cpu_stage_profile real_cpu_profile = {};
     const bool real_cpu_profile_ok = cpu_profile_armed &&
         cpu_profile_control(backend_cpu, 1, &real_cpu_profile);
