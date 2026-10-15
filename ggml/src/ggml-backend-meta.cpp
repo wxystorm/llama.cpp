@@ -10075,6 +10075,89 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                      std::strstr(nodes[j_dst]->name, "Vcur-") != nullptr ||
                      suspicious_zero_dst)) {
                     GGML_LOG_ERROR(
+                        "[META_SINGLE_OWNER_STATE] sg=%zu active_count=%zu active=%zu "
+                        "phone_owner_exit=%d tp_layer_context=%d "
+                        "phone_primary_tensor_sg=%d inferred_phone_primary_tensor=%d "
+                        "forced_phone_primary_tensor=%d internal_pc_handoff=%d "
+                        "external_backend_handoff=%d layer_handoff_to_pc=%d "
+                        "force_phone_block_exit=%d force_phone_block_layer=%d "
+                        "deferred_phone_exit_layer=%d\n",
+                        i,
+                        active_count,
+                        active_backend,
+                        phone_owner_exit ? 1 : 0,
+                        tp_layer_context ? 1 : 0,
+                        phone_primary_tensor_sg ? 1 : 0,
+                        inferred_phone_primary_tensor ? 1 : 0,
+                        forced_phone_primary_tensor ? 1 : 0,
+                        internal_pc_handoff ? 1 : 0,
+                        external_backend_handoff ? 1 : 0,
+                        layer_handoff_to_pc ? 1 : 0,
+                        force_phone_block_exit ? 1 : 0,
+                        force_phone_block_layer,
+                        deferred_phone_exit_layer);
+
+                    for (size_t trace_backend = 0;
+                         trace_backend < n_backends;
+                         ++trace_backend) {
+                        ggml_cgraph * trace_graph =
+                            backend_ctx->backend_configs[trace_backend].
+                                cgraphs[i].cgraph_main;
+                        if (trace_graph == nullptr) {
+                            GGML_LOG_ERROR(
+                                "[META_SINGLE_OWNER_GRAPH] sg=%zu backend=%zu "
+                                "graph=null\n",
+                                i,
+                                trace_backend);
+                            continue;
+                        }
+
+                        GGML_LOG_ERROR(
+                            "[META_SINGLE_OWNER_GRAPH] sg=%zu backend=%zu "
+                            "backend_name=%s n_nodes=%d\n",
+                            i,
+                            trace_backend,
+                            ggml_backend_name(
+                                backend_ctx->backend_configs[trace_backend].backend),
+                            trace_graph->n_nodes);
+
+                        const int trace_begin =
+                            std::max(0, trace_graph->n_nodes - 8);
+                        for (int trace_k = trace_begin;
+                             trace_k < trace_graph->n_nodes;
+                             ++trace_k) {
+                            ggml_tensor * trace_node =
+                                trace_graph->nodes[trace_k];
+                            GGML_LOG_ERROR(
+                                "[META_SINGLE_OWNER_NODE] sg=%zu backend=%zu "
+                                "k=%d/%d name=%s op=%s flags=0x%x "
+                                "compute=%d input=%d output=%d "
+                                "ptr=%p view=%p view_name=%s "
+                                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                                "bytes=%zu\n",
+                                i,
+                                trace_backend,
+                                trace_k,
+                                trace_graph->n_nodes,
+                                trace_node->name,
+                                ggml_op_name(trace_node->op),
+                                trace_node->flags,
+                                (trace_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0,
+                                (trace_node->flags & GGML_TENSOR_FLAG_INPUT) != 0,
+                                (trace_node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0,
+                                (void *) trace_node,
+                                (void *) trace_node->view_src,
+                                trace_node->view_src != nullptr ?
+                                    trace_node->view_src->name : "(null)",
+                                trace_node->ne[0],
+                                trace_node->ne[1],
+                                trace_node->ne[2],
+                                trace_node->ne[3],
+                                ggml_nbytes(trace_node));
+                        }
+                    }
+
+                    GGML_LOG_ERROR(
                         "[META_SINGLE_OWNER_COPY] sg=%zu active=%zu dst_backend=%zu "
                         "src_backend=%s dst_backend_name=%s "
                         "next_pc=%d next_phone=%d "
