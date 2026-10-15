@@ -4415,6 +4415,32 @@ struct rpc_phone_npu_cpu_reduce_entry {
     std::vector<float> phone_partial;
 };
 
+struct rpc_phone_npu_async_job {
+    uint32_t device = 0;
+    uint64_t seq = 0;
+    int layer = -1;
+    int chunk = -1;
+    bool prefill = false;
+
+    // Stable direct-bound destination owned by the Ring.  The NPU worker does
+    // not write it; CPU reduce writes the complete PC+NPU result once.
+    ggml_tensor * down = nullptr;
+
+    // Per-layer resident private-HTP weights.  The pointee remains stable even
+    // if the unordered_map holding the unique_ptr rehashes.
+    rpc_phone_npu_ffn_cache * cache = nullptr;
+
+    int64_t n_embd = 0;
+    int64_t n_tokens = 0;
+    int64_t n_expert_used = 0;
+
+    // GPU allocator-backed stage tensors must not escape graph_compute().
+    // Freeze all NPU inputs into host-owned storage before enqueueing.
+    std::vector<uint8_t> hidden_dense;
+    std::vector<uint8_t> topk_dense;
+    std::vector<uint8_t> route_dense;
+};
+
 static ggml_backend_buffer_type_t rpc_phone_npu_repack_buft(
         ggml_backend_t backend) {
     if (backend == nullptr) {
@@ -4944,6 +4970,17 @@ private:
         ggml_cgraph * graph,
         const rpc_phone_npu_ffn_stage & stage,
         std::vector<float> * host_output);
+    bool prepare_phone_npu_async_job(
+        uint32_t device,
+        uint64_t seq,
+        ggml_cgraph * graph,
+        const rpc_phone_npu_ffn_stage & stage,
+        rpc_phone_npu_async_job & job);
+    bool execute_phone_npu_async_job(
+        const rpc_phone_npu_async_job & job,
+        std::vector<float> & output);
+    void ensure_phone_npu_async_worker();
+    void phone_npu_async_loop();
     ggml_status graph_compute_phone_npu_ffn(
         uint32_t device,
         uint64_t graph_uid,
@@ -4972,6 +5009,19 @@ private:
         uint32_t,
         std::unordered_map<uint64_t, rpc_phone_npu_cpu_reduce_entry>>
         phone_npu_cpu_reduce_pending;
+    std::unordered_map<uint32_t, std::unordered_set<uint64_t>>
+        phone_npu_cpu_reduce_active;
+    std::unordered_map<uint32_t, std::unordered_set<uint64_t>>
+        phone_npu_cpu_reduce_failed;
+
+    // One private HTP execution lane.  GPU front graphs only freeze their
+    // inputs and enqueue here; this worker serializes HTP jobs while the RPC
+    // compute socket is free to submit later Attention chunks.
+    std::mutex phone_npu_async_mutex;
+    std::condition_variable phone_npu_async_cv;
+    std::deque<rpc_phone_npu_async_job> phone_npu_async_jobs;
+    bool phone_npu_async_stop = false;
+    std::thread phone_npu_async_thread;
 
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
