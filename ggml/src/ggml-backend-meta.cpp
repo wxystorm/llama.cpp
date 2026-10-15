@@ -4486,11 +4486,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::deque<phone_prefill_pc_branch> pending_phone_prefill_pc_branches;
 
-    // Diagnostic scope only. Set by the main Meta thread while draining the
-    // final TENSOR_PHONE_PRIMARY layer before entering PHONE_ONLY.
-    bool chunk_ring_stage_exit_drain_active = false;
-    int64_t chunk_ring_stage_exit_drain_begin_us = 0;
-
     struct phone_prefill_deferred_phone_branch {
         int layer = -1;
         int chunk = -1;
@@ -7208,81 +7203,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return_ready_before ? 1 : 0,
                     join_wait_us / 1000.0,
                     add_us / 1000.0);
-            }
-
-            if (chunk_ring_stage_exit_drain_active &&
-                    ring_reduce &&
-                    (pipeline_debug ||
-                     tensor_phone_stage_profile ||
-                     xlayer_wave_trace)) {
-                const auto & timing = branch_it->timing;
-                const int64_t now_us = ggml_time_us();
-                const double age_ms =
-                    branch_it->enqueue_us > 0 ?
-                        (now_us - branch_it->enqueue_us) / 1000.0 :
-                        -1.0;
-                const double drain_rel_ms =
-                    chunk_ring_stage_exit_drain_begin_us > 0 ?
-                        (now_us -
-                         chunk_ring_stage_exit_drain_begin_us) / 1000.0 :
-                        -1.0;
-                const double return_rpc_ms =
-                    timing != nullptr &&
-                    timing->return_send_begin_us > 0 &&
-                    timing->return_send_end_us >=
-                        timing->return_send_begin_us ?
-                        (timing->return_send_end_us -
-                         timing->return_send_begin_us) / 1000.0 :
-                        -1.0;
-                const double add_submit_ms =
-                    timing != nullptr &&
-                    timing->add_submit_begin_us > 0 &&
-                    timing->add_submit_end_us >=
-                        timing->add_submit_begin_us ?
-                        (timing->add_submit_end_us -
-                         timing->add_submit_begin_us) / 1000.0 :
-                        -1.0;
-
-                printf(
-                    "[CHUNK_RING_STAGE_EXIT_WAIT] "
-                    "layer=%d chunk=%d seq=%" PRIu64
-                    " lane=%zu join_wait_ms=%.3f "
-                    "drain_rel_ms=%.3f age_ms=%.3f "
-                    "pc_ready_before=%d return_ready_before=%d "
-                    "route_wait_ms=%.3f pc_gate_wait_ms=%.3f "
-                    "stage_copy_ms=%.3f pc_compute_ms=%.3f "
-                    "return_stage_ms=%.3f "
-                    "return_worker_pc_wait_ms=%.3f "
-                    "lane_gate_wait_ms=%.3f "
-                    "critical_gate_wait_ms=%.3f "
-                    "return_rpc_ms=%.3f add_submit_ms=%.3f\n",
-                    branch_it->layer,
-                    branch_it->chunk,
-                    branch_it->phone_ffn_seq,
-                    branch_it->return_lane,
-                    join_wait_us / 1000.0,
-                    drain_rel_ms,
-                    age_ms,
-                    pc_ready_before ? 1 : 0,
-                    return_ready_before ? 1 : 0,
-                    timing != nullptr ?
-                        timing->pc_route_wait_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->pc_gate_wait_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->pc_stage_copy_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->pc_compute_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->pc_return_stage_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->return_worker_pc_wait_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->return_lane_gate_wait_us / 1000.0 : -1.0,
-                    timing != nullptr ?
-                        timing->return_critical_gate_wait_us / 1000.0 : -1.0,
-                    return_rpc_ms,
-                    add_submit_ms);
             }
 
             const int joined_layer = branch_it->layer;
@@ -13484,10 +13404,6 @@ auto prefill_norm_sg_has_prework =
             }
 
             const int64_t wait_start_us = ggml_time_us();
-            chunk_ring_stage_exit_drain_active =
-                chunk_ring_stage_exit_diag;
-            chunk_ring_stage_exit_drain_begin_us =
-                chunk_ring_stage_exit_diag ? wait_start_us : 0;
             ggml_status status = GGML_STATUS_SUCCESS;
             if (has_pending_prefill_reduce()) {
                 status = wait_all_prefill_reduces(&last_lane);
@@ -13504,8 +13420,6 @@ auto prefill_norm_sg_has_prework =
                     pending_layer, true);
             }
             const int64_t wait_us = ggml_time_us() - wait_start_us;
-            chunk_ring_stage_exit_drain_active = false;
-            chunk_ring_stage_exit_drain_begin_us = 0;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
 
