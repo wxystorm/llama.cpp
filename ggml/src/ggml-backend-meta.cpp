@@ -9891,6 +9891,81 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 return GGML_STATUS_SUCCESS;
             }
+            // The Chunk Ring CPU-prefix staging path deliberately builds a
+            // combined TENSOR suffix that includes the PHONE_ONLY tail. It
+            // never arms terminal_phone_stage policies because its stage kind
+            // is TENSOR, not PHONE. The final Meta split can therefore end on
+            // a KV VIEW owned solely by Phone, with a valid zero-width PC
+            // shard. This VIEW is not a semantic stage output and cannot be
+            // mirrored to PC. Keep this separate from real l_out/logits
+            // handoffs and opt-in until output parity has been verified.
+            int terminal_kv_view_layer = -1;
+            const bool terminal_kv_view =
+                nodes[1] != nullptr &&
+                nodes[1]->op == GGML_OP_VIEW &&
+                nodes[1]->view_src != nullptr &&
+                (std::sscanf(
+                     nodes[1]->name,
+                     "Vcur-%d",
+                     &terminal_kv_view_layer) == 1 ||
+                 std::sscanf(
+                     nodes[1]->name,
+                     "Kcur-%d",
+                     &terminal_kv_view_layer) == 1);
+            const bool combined_suffix_terminal_kv =
+                phone_primary_chunk_ring_active &&
+                n_backends == 2 &&
+                active_backend == 1 &&
+                phone_owner_exit &&
+                !layer_handoff_to_pc &&
+                !tp_layer_context &&
+                i + 1 >= backend_ctx->n_subgraphs &&
+                backend_ctx->tensor_phone_last_layer >= 0 &&
+                terminal_kv_view &&
+                terminal_kv_view_layer ==
+                    backend_ctx->tensor_phone_last_layer &&
+                (nodes[1]->flags &
+                 (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0 &&
+                ggml_nbytes(nodes[1]) > 0 &&
+                ggml_nbytes(nodes[0]) == 0;
+            const char * terminal_kv_local_env =
+                std::getenv("GGML_META_TERMINAL_KV_LOCAL");
+            const bool terminal_kv_local_enabled =
+                terminal_kv_local_env != nullptr &&
+                std::atoi(terminal_kv_local_env) != 0;
+            if (combined_suffix_terminal_kv &&
+                    terminal_kv_local_enabled) {
+                // Preserve completion/ordering of Phone KV side effects
+                // without manufacturing an impossible nonzero->zero copy.
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                const int64_t fence_begin_us = ggml_time_us();
+                if (rpc_fence != nullptr) {
+                    rpc_fence(bcj_src.backend);
+                } else {
+                    ggml_backend_synchronize(bcj_src.backend);
+                }
+                const int64_t fence_us =
+                    ggml_time_us() - fence_begin_us;
+                fprintf(
+                    stderr,
+                    "[META_TERMINAL_KV_LOCAL] "
+                    "sg=%zu/%zu layer=%d node=%s "
+                    "phone_bytes=%zu pc_bytes=%zu "
+                    "fence_ms=%.3f rpc_fence=%d "
+                    "action=KEEP_PHONE_KV_VIEW\n",
+                    i,
+                    backend_ctx->n_subgraphs,
+                    terminal_kv_view_layer,
+                    nodes[1]->name,
+                    ggml_nbytes(nodes[1]),
+                    ggml_nbytes(nodes[0]),
+                    fence_us / 1000.0,
+                    rpc_fence != nullptr ? 1 : 0);
+                fflush(stderr);
+                return GGML_STATUS_SUCCESS;
+            }
+
             const bool terminal_phone_internal_zero_shard =
                 backend_ctx->phone_stage_terminal_keep_internal_active &&
                 n_backends == 2 &&
