@@ -5719,6 +5719,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t phone_xlayer_ffn_gate_wait_max_us  = 0;
     int64_t phone_xlayer_v2_chunk_gate_count   = 0;
     int64_t phone_xlayer_v2_chunk_gate_wait_us = 0;
+    int64_t chunk_ring_gate_count              = 0;
+    int64_t chunk_ring_gate_wait_us            = 0;
+    int64_t chunk_ring_gate_wait_max_us        = 0;
+    int64_t chunk_ring_stage_exit_barrier_count = 0;
+    int64_t chunk_ring_stage_exit_barrier_wait_us = 0;
+    int64_t chunk_ring_stage_exit_barrier_wait_max_us = 0;
     int64_t phone_xlayer_v2_direct_bind_count  = 0;
     int64_t phone_xlayer_v2_throttle_count     = 0;
     int64_t phone_xlayer_v2_throttle_wait_us   = 0;
@@ -12742,9 +12748,18 @@ auto prefill_norm_sg_has_prework =
 
                     const int64_t gate_wait_us =
                         ggml_time_us() - gate_begin_us;
-                    ++phone_xlayer_v2_chunk_gate_count;
-                    phone_xlayer_v2_chunk_gate_wait_us +=
-                        gate_wait_us;
+                    if (chunk_ring_gate) {
+                        ++chunk_ring_gate_count;
+                        chunk_ring_gate_wait_us += gate_wait_us;
+                        chunk_ring_gate_wait_max_us =
+                            std::max(
+                                chunk_ring_gate_wait_max_us,
+                                gate_wait_us);
+                    } else {
+                        ++phone_xlayer_v2_chunk_gate_count;
+                        phone_xlayer_v2_chunk_gate_wait_us +=
+                            gate_wait_us;
+                    }
 
                     if ((pipeline_debug ||
                          tensor_phone_stage_profile ||
@@ -13094,7 +13109,8 @@ auto prefill_norm_sg_has_prework =
             // prework has already enforced the exact OUT dependency.
         } else if ((has_pending_prefill_reduce() ||
                     ((legacy_return_wavefront_graph ||
-                      phone_primary_xlayer_wave) &&
+                      phone_primary_xlayer_wave ||
+                      phone_primary_chunk_ring_active) &&
                      phone_prefill_chunk_join_active &&
                      !pending_phone_prefill_pc_branches.empty())) &&
                    !continues_prefill_layer) {
@@ -13143,7 +13159,8 @@ auto prefill_norm_sg_has_prework =
             }
             while (status == GGML_STATUS_SUCCESS &&
                    (legacy_return_wavefront_graph ||
-                    phone_primary_xlayer_wave) &&
+                    phone_primary_xlayer_wave ||
+                    phone_primary_chunk_ring_active) &&
                    phone_prefill_chunk_join_active &&
                    !pending_phone_prefill_pc_branches.empty()) {
                 const int pending_layer =
@@ -13154,6 +13171,30 @@ auto prefill_norm_sg_has_prework =
             const int64_t wait_us = ggml_time_us() - wait_start_us;
             ++layer_barrier_wait_count;
             layer_barrier_wait_us += wait_us;
+
+            const bool chunk_ring_stage_exit =
+                phone_primary_chunk_ring_active &&
+                layer_is_tensor_phone_primary(barrier_layer);
+            if (chunk_ring_stage_exit) {
+                ++chunk_ring_stage_exit_barrier_count;
+                chunk_ring_stage_exit_barrier_wait_us += wait_us;
+                chunk_ring_stage_exit_barrier_wait_max_us =
+                    std::max(
+                        chunk_ring_stage_exit_barrier_wait_max_us,
+                        wait_us);
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile ||
+                        xlayer_wave_trace) {
+                    printf(
+                        "[CHUNK_RING_STAGE_EXIT_BARRIER] "
+                        "layer=%d pending=%zu wait_ms=%.3f last_lane=%d\n",
+                        barrier_layer,
+                        pending_lanes,
+                        wait_us / 1000.0,
+                        last_lane);
+                }
+            }
+
             if ((legacy_return_wavefront_graph ||
                  phone_primary_xlayer_wave) &&
                     barrier_layer >= active_wavefront_first_layer) {
@@ -15510,6 +15551,26 @@ auto prefill_norm_sg_has_prework =
             layer_barrier_wait_count,
             layer_barrier_wait_us / 1000.0,
             layer_barrier_wait_max_us / 1000.0);
+    }
+
+    if ((pipeline_debug ||
+         tensor_phone_stage_profile ||
+         xlayer_wave_trace) &&
+            phone_primary_chunk_ring) {
+        printf(
+            "[CHUNK_RING_SUM] active=%d "
+            "gate_count=%" PRId64 " gate_wait_ms=%.3f "
+            "gate_wait_max_ms=%.3f "
+            "stage_exit_barrier_count=%" PRId64 " "
+            "stage_exit_barrier_wait_ms=%.3f "
+            "stage_exit_barrier_wait_max_ms=%.3f\n",
+            phone_primary_chunk_ring_active ? 1 : 0,
+            chunk_ring_gate_count,
+            chunk_ring_gate_wait_us / 1000.0,
+            chunk_ring_gate_wait_max_us / 1000.0,
+            chunk_ring_stage_exit_barrier_count,
+            chunk_ring_stage_exit_barrier_wait_us / 1000.0,
+            chunk_ring_stage_exit_barrier_wait_max_us / 1000.0);
     }
 
     debug_handoff_watch("BEFORE_META_RETURN");
