@@ -6045,6 +6045,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // formal implementation the private HTP and PC partials join on the
     // Phone CPU; return completion therefore means the reduced chunk has
     // already been written back once for the next Attention dependency.
+    const bool phone_primary_chunk_ring_arm_cap =
+        n_backends == 2 &&
+        phone_prefill_ffn_mark_ready != nullptr &&
+        phone_prefill_ffn_mark_ready(
+            backend_ctx->backend_configs[1].backend,
+            PHONE_FFN_CPU_REDUCE_ARM);
+
     const bool phone_primary_chunk_ring_active =
         phone_primary_chunk_ring &&
         n_backends == 2 &&
@@ -6054,18 +6061,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_prefill_async_return_active &&
         phone_prefill_ordered_return_active &&
         phone_prefill_chunk_join_active &&
-        phone_prefill_ffn_mark_ready(
-            backend_ctx->backend_configs[1].backend,
-            PHONE_FFN_CPU_REDUCE_ARM);
+        phone_primary_chunk_ring_arm_cap;
 
     if ((pipeline_debug || tensor_phone_stage_profile ||
          xlayer_wave_trace) &&
             phone_primary_chunk_ring) {
         printf(
             "[CHUNK_RING_CAP] requested=1 active=%d "
+            "n_backends=%zu xlayer_wave=%d arm_cap=%d "
             "chunk_pipeline=%d producer_route=%d async_return=%d "
             "ordered_return=%d chunk_join=%d\n",
             phone_primary_chunk_ring_active ? 1 : 0,
+            n_backends,
+            phone_primary_xlayer_wave ? 1 : 0,
+            phone_primary_chunk_ring_arm_cap ? 1 : 0,
             phone_prefill_chunk_pipeline ? 1 : 0,
             phone_prefill_producer_route ? 1 : 0,
             phone_prefill_async_return_active ? 1 : 0,
