@@ -6052,10 +6052,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             backend_ctx->backend_configs[1].backend,
             PHONE_FFN_CPU_REDUCE_ARM);
 
+    const bool phone_primary_chunk_ring_has_tensor_range =
+        backend_ctx->tensor_phone_first_layer >= 0 &&
+        backend_ctx->tensor_phone_last_layer >
+            backend_ctx->tensor_phone_first_layer;
+
+    // Chunk Ring ownership comes from the actual TENSOR_PHONE_PRIMARY stage,
+    // not from legacy xlayer/wave markers.  The wave markers may still exist
+    // in the graph for the current staged builder, but they are no longer an
+    // activation prerequisite for Ring.
     const bool phone_primary_chunk_ring_active =
         phone_primary_chunk_ring &&
         n_backends == 2 &&
-        phone_primary_xlayer_wave &&
+        phone_primary_chunk_ring_has_tensor_range &&
         phone_prefill_chunk_pipeline &&
         phone_prefill_producer_route &&
         phone_prefill_async_return_active &&
@@ -6068,11 +6077,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_primary_chunk_ring) {
         GGML_LOG_INFO(
             "[CHUNK_RING_CAP] requested=1 active=%d "
-            "n_backends=%zu xlayer_wave=%d arm_cap=%d "
+            "n_backends=%zu tensor_range=[%d,%d) xlayer_wave=%d arm_cap=%d "
             "chunk_pipeline=%d producer_route=%d async_return=%d "
             "ordered_return=%d chunk_join=%d\n",
             phone_primary_chunk_ring_active ? 1 : 0,
             n_backends,
+            backend_ctx->tensor_phone_first_layer,
+            backend_ctx->tensor_phone_last_layer,
             phone_primary_xlayer_wave ? 1 : 0,
             phone_primary_chunk_ring_arm_cap ? 1 : 0,
             phone_prefill_chunk_pipeline ? 1 : 0,
@@ -6343,10 +6354,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto bind_phone_prefill_down_direct =
         [&](int layer, int chunk, ggml_cgraph * phone_graph) -> bool {
-            if (!(phone_primary_xlayer_ffn_ahead_v2_active ||
-                   phone_primary_chunk_ring_active) ||
-                    layer < phone_primary_xlayer_first_layer ||
-                    layer >= phone_primary_xlayer_last_layer ||
+            const bool ring_layer =
+                phone_primary_chunk_ring_active &&
+                layer_is_tensor_phone_primary(layer);
+            const bool legacy_v2_layer =
+                phone_primary_xlayer_ffn_ahead_v2_active &&
+                layer >= phone_primary_xlayer_first_layer &&
+                layer < phone_primary_xlayer_last_layer;
+
+            if (!(ring_layer || legacy_v2_layer) ||
                     chunk < 0 ||
                     phone_graph == nullptr ||
                     phone_graph->n_nodes <= 0) {
