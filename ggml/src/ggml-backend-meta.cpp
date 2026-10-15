@@ -5930,7 +5930,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 uint32_t(1) << static_cast<uint32_t>(selected);
 
             if (pipeline_debug || tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_ROUTE_LANE_PICK] "
                     "layer=%d chunk=%d wave=%d static=%zu "
                     "preferred=%zu selected=%zu idle=%d used_mask=0x%08x\n",
@@ -5948,18 +5948,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_single_lane >= 0) {
-        printf(
+        GGML_LOG_INFO(
             "[PHONE_PREFILL_ROUTE_LANE_MAP] single_lane=%d\n",
             phone_prefill_route_single_lane);
     } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_dynamic_lane) {
-        printf(
+        GGML_LOG_INFO(
             "[PHONE_PREFILL_ROUTE_LANE_MAP] "
             "dynamic=1 policy=distinct_rotating swap=%d\n",
             phone_prefill_route_lane_swap ? 1 : 0);
     } else if ((pipeline_debug || tensor_phone_stage_profile) &&
             phone_prefill_route_lane_swap) {
-        printf(
+        GGML_LOG_INFO(
             "[PHONE_PREFILL_ROUTE_LANE_MAP] swap=1 "
             "chunk_even=1 chunk_odd=0\n");
     }
@@ -6066,7 +6066,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     if ((pipeline_debug || tensor_phone_stage_profile ||
          xlayer_wave_trace) &&
             phone_primary_chunk_ring) {
-        printf(
+        GGML_LOG_INFO(
             "[CHUNK_RING_CAP] requested=1 active=%d "
             "n_backends=%zu xlayer_wave=%d arm_cap=%d "
             "chunk_pipeline=%d producer_route=%d async_return=%d "
@@ -6097,7 +6097,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     }
 
     if (pipeline_debug && phone_prefill_async_return) {
-        printf(
+        GGML_LOG_INFO(
             "[PHONE_PREFILL_ASYNC_RETURN_CAP] "
             "requested=1 active=%d ordered=%d chunk_join=%d "
             "critical_return=%d\n",
@@ -6617,7 +6617,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
-                            printf(
+                            GGML_LOG_INFO(
                                 "[PHONE_PREFILL_ROUTE_MAILBOX_READY] "
                                 "layer=%d chunk=%d lane=%zu "
                                 "seq=%" PRIu64 " task=%" PRIu64
@@ -6658,7 +6658,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_ROUTE_MAILBOX_ARM] "
                     "layer=%d chunk=%d lane=%zu seq=%" PRIu64
                     " task=%" PRIu64 " bytes=%zu\n",
@@ -6920,7 +6920,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 auto & stage = tensor_phone_stage_entry(layer, chunk, false);
                 stage.return_client_wall_us += wall_us;
                 stage.return_count += 1;
-                printf(
+                GGML_LOG_INFO(
                     "[TENSOR_PHONE_STAGE_COMM] stage=return_set_add "
                     "mode=prefill layer=%d chunk=%d sg=%zu wall_ms=%.3f "
                     "fused=%d fused_ms=%.3f copy_ms=%.3f "
@@ -6936,7 +6936,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (pipeline_debug) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_PIPE_RETURN] layer=%d chunk=%d sg=%zu "
                     "bytes=%zu fused=%d src_fence_ms=%.3f copy_ms=%.3f "
                     "dst_fence_ms=%.3f add_ms=%.3f add_fence_ms=%.3f\n",
@@ -7025,7 +7025,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (pipeline_debug || tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_ASYNC_ADD_SUBMIT] "
                     "layer=%d chunk=%d sg=%zu bytes=%zu submit_ms=%.3f "
                     "status=%d\n",
@@ -7098,7 +7098,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (!wait_for_return && !completion_ready_before) {
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_CHUNK_JOIN_DEFER] "
                         "layer=%d chunk=%d sg=%zu seq=%" PRIu64
                         " pc_ready=%d return_ready=%d reduce_ready=%d\n",
@@ -7161,7 +7161,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_CHUNK_JOIN] "
                     "layer=%d chunk=%d sg=%zu seq=%" PRIu64
                     " mode=%s return_lane=%zu pc_ready_before=%d "
@@ -7201,7 +7201,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_prefill_lane1_return_gates.erase(joined_layer);
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_CHUNK_JOIN_LAYER_READY] "
                         "layer=%d ready_after_chunk=%d mode=PER_CHUNK\n",
                         joined_layer,
@@ -7591,7 +7591,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 if (pipeline_debug) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_PHONE_DEFER_SUBMIT] "
                         "layer=%d chunk=%d sg=%zu "
                         "bind_ms=%.3f ffn_submit_ms=%.3f\n",
@@ -7631,7 +7631,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (pipeline_debug || tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_LAYER_FENCE] "
                     "layer=%d wait_ms=%.3f\n",
                     layer,
@@ -7811,7 +7811,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_ASYNC_DRAIN] "
                             "layer=%d chunk=%d sg=%zu "
                             "pc_wait_ms=%.3f return_wait_ms=%.3f\n",
@@ -7874,7 +7874,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_RETURN_OVERLAP] "
                         "layer=%d chunks=%zu ready_after_phone_fence=%zu "
                         "return_wait_ms=%.3f return_fence_ms=%.3f "
@@ -7944,7 +7944,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
 
                     if (pipeline_debug) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_PIPE_DRAIN] "
                             "layer=%d chunk=%d sg=%zu "
                             "pc_wait_ms=%.3f return_ms=%.3f\n",
@@ -7980,7 +7980,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (pipeline_debug || tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_PC_DRAIN] "
                     "layer=%d chunks=%zu ready_at_entry=%zu "
                     "ready_after_phone_fence=%zu "
@@ -8123,7 +8123,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             if (opened_now &&
                     (pipeline_debug ||
                      tensor_phone_stage_profile)) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_RETURN_LANE1_GATE_OPEN] "
                     "layer=%d chunk=%d reason=LAST_ROUTE_HANDOFF\n",
                     layer,
@@ -8185,7 +8185,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_RETURN_DEFER] "
                     "layer=%d chunk=%d sg=%zu last=%d "
                     "active=%zu\n",
@@ -8231,7 +8231,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_CHUNK_REAP] "
                         "layer=%d boundary_chunk=%d last=%d "
                         "pending_before=%zu pending_after=%zu "
@@ -8257,7 +8257,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_WAVE_LAYER_DEFER] "
                             "layer=%d last_chunk=%d pending=%zu\n",
                             deferred_layer_0,
@@ -8475,7 +8475,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     producer_route_it->second.producer_seq != 0) {
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_ROUTE_MAILBOX_HANDOFF] "
                         "layer=%d chunk=%d lane=%zu "
                         "seq=%" PRIu64 " task=%" PRIu64
@@ -8695,7 +8695,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const int64_t reuse_wait_us =
                         ggml_time_us() - reuse_wait_begin_us;
                     if (pipeline_debug) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_ROUTE_LANE_REUSE] lane=%zu "
                             "layer=%d chunk=%d wait_ms=%.3f\n",
                             lane,
@@ -8722,7 +8722,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_time_us() - producer_fence_begin_us;
 
                 if (pipeline_debug || tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_PRODUCER_FENCE] "
                         "layer=%d chunk=%d lane=%zu wait_ms=%.3f\n",
                         phone_route_layer,
@@ -8758,7 +8758,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     producer_seq = seq_it->second;
 
                     if (pipeline_debug) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_PHONE_DIRECT_STAGE] "
                             "layer=%d chunk=%d lane=%zu seq=%" PRIu64
                             " bytes=%zu copy_ms=0.000\n",
@@ -8868,7 +8868,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                             if (pipeline_debug ||
                                     tensor_phone_stage_profile) {
-                                printf(
+                                GGML_LOG_INFO(
                                     "[PHONE_PREFILL_ROUTE_READY] "
                                     "layer=%d chunk=%d lane=%zu "
                                     "task=%" PRIu64 " total_ms=%.3f\n",
@@ -8907,7 +8907,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 if (pipeline_debug ||
                         tensor_phone_stage_profile) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_ROUTE_ENQUEUE] "
                         "layer=%d chunk=%d lane=%zu task=%" PRIu64
                         " bytes=%zu\n",
@@ -9097,7 +9097,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_route_chunk < 0);
                 stage.route_handoff_us += route_handoff_wall_us;
                 stage.route_handoff_count += 1;
-                printf(
+                GGML_LOG_INFO(
                     "[TENSOR_PHONE_STAGE_COMM] stage=route_handoff "
                     "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
                     "batch=%d batch_ms=%.3f copy_ms=%.3f\n",
@@ -10270,7 +10270,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         layer, chunk, !is_prefill_down_chunk);
                     stage.return_client_wall_us += return_client_wall_us;
                     stage.return_count += 1;
-                    printf(
+                    GGML_LOG_INFO(
                         "[TENSOR_PHONE_STAGE_COMM] stage=return_set_add "
                         "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
                         "fused=%d fused_ms=%.3f copy_ms=%.3f "
@@ -13414,7 +13414,7 @@ auto prefill_norm_sg_has_prework =
                         prefill_down_chunk) :
                     0;
             if (pipeline_debug || tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_PC_WORKER_PICK] "
                     "layer=%d chunk=%d route_lane=%zu pc_lane=%zu "
                     "dynamic_route=%d\n",
@@ -13527,7 +13527,7 @@ auto prefill_norm_sg_has_prework =
                 return_payload = host_payload;
 
                 if (pipeline_debug) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_RETURN_STAGE_PREP] "
                         "layer=%d chunk=%d sg=%zu bytes=%zu stage=%p\n",
                         prefill_down_layer,
@@ -13746,7 +13746,7 @@ auto prefill_norm_sg_has_prework =
 
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
-                            printf(
+                            GGML_LOG_INFO(
                                 "[PHONE_PREFILL_PC_BRANCH] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " ready_sched=%d pc_lane=%zu "
@@ -14026,7 +14026,7 @@ auto prefill_norm_sg_has_prework =
 
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
-                            printf(
+                            GGML_LOG_INFO(
                                 "[PHONE_PREFILL_RETURN_ASYNC] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " pc_wait_ms=%.3f lane_gate_wait_ms=%.3f "
@@ -14097,7 +14097,7 @@ auto prefill_norm_sg_has_prework =
                 });
 
                 if (pipeline_debug) {
-                    printf(
+                    GGML_LOG_INFO(
                         "[PHONE_PREFILL_PHONE_DEFER] "
                         "layer=%d chunk=%d sg=%zu pending=%zu\n",
                         prefill_down_layer,
@@ -14118,7 +14118,7 @@ auto prefill_norm_sg_has_prework =
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[CHUNK_RING_CPU_ARM] "
                             "layer=%d chunk=%d sg=%zu seq=%" PRIu64 "\n",
                             prefill_down_layer,
@@ -14150,7 +14150,7 @@ auto prefill_norm_sg_has_prework =
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_PREFILL_FFN_JOIN_MARK] "
                             "layer=%d chunk=%d sg=%zu seq=%" PRIu64 "\n",
                             prefill_down_layer,
@@ -14169,7 +14169,7 @@ auto prefill_norm_sg_has_prework =
                     !use_ring_cpu_reduce &&
                     (pipeline_debug ||
                      tensor_phone_stage_profile)) {
-                printf(
+                GGML_LOG_INFO(
                     "[CHUNK_RING_CPU_BYPASS] "
                     "layer=%d chunk=%d sg=%zu direct_bound=%d "
                     "return_task=%" PRIu64 "\n",
@@ -14224,7 +14224,7 @@ auto prefill_norm_sg_has_prework =
 
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
-                            printf(
+                            GGML_LOG_INFO(
                                 "[CHUNK_RING_CPU_JOIN_WAIT] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
                                 " return_wait_ms=%.3f status=%d\n",
@@ -14257,7 +14257,7 @@ auto prefill_norm_sg_has_prework =
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_PHONE_BRANCH] "
                     "layer=%d chunk=%d sg=%zu route_stage_wait_ms=%.3f "
                     "phone_wall_ms=%.3f pc_task=%" PRIu64
@@ -14407,7 +14407,7 @@ auto prefill_norm_sg_has_prework =
             saved_norm_uid = norm_graph->uid;
             norm_graph->uid = 0;
             if (pipeline_debug) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_DIRECT_HIDDEN] "
                     "layer=%d sg=%zu bytes=%zu\n",
                     prefill_norm_layer,
@@ -14626,7 +14626,7 @@ auto prefill_norm_sg_has_prework =
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
-                printf(
+                GGML_LOG_INFO(
                     "[PHONE_PREFILL_ROUTE_PRODUCER_SEQ] "
                     "layer=%d chunk=%d seq=%" PRIu64
                     " mailbox=%d snapshot_ms=%.3f\n",
@@ -15200,7 +15200,7 @@ auto prefill_norm_sg_has_prework =
                 stage.pre_route_phone_worker_us += phone_compute_us;
                 stage.route_compute_count += 1;
 
-                printf(
+                GGML_LOG_INFO(
                     "[TENSOR_PHONE_STAGE_SG] stage=pre_route_compute "
                     "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
                     "pc_worker_ms=%.3f phone_worker_ms=%.3f\n",
@@ -15219,7 +15219,7 @@ auto prefill_norm_sg_has_prework =
                 stage.phone_ffn_worker_us += phone_compute_us;
                 stage.ffn_compute_count += 1;
 
-                printf(
+                GGML_LOG_INFO(
                     "[TENSOR_PHONE_STAGE_SG] stage=ffn_parallel_compute "
                     "mode=%s layer=%d chunk=%d sg=%zu wall_ms=%.3f "
                     "pc_worker_ms=%.3f phone_worker_ms=%.3f\n",
@@ -15351,7 +15351,7 @@ auto prefill_norm_sg_has_prework =
 
     if (runtime_profile_graph &&
             phone_primary_chunk_ring) {
-        printf(
+        GGML_LOG_INFO(
             "[CHUNK_RING_SUM] active=%d pending=%zu "
             "direct_bind_count=%" PRId64
             " chunk_gate_count=%" PRId64
@@ -15668,7 +15668,7 @@ auto prefill_norm_sg_has_prework =
                 stage.ffn_wall_us +
                 stage.return_client_wall_us;
 
-            printf(
+            GGML_LOG_INFO(
                 "[TENSOR_PHONE_STAGE] mode=%s layer=%d chunk=%d "
                 "pre_route_wall_ms=%.3f pre_route_pc_worker_ms=%.3f "
                 "pre_route_phone_worker_ms=%.3f route_handoff_ms=%.3f "
