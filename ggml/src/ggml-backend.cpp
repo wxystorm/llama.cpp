@@ -609,6 +609,22 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 // backend copy
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (!ggml_are_same_layout(src, dst)) {
+        GGML_LOG_ERROR(
+            "[BACKEND_COPY_LAYOUT_MISMATCH] mode=sync "
+            "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+            "dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+            src->name, ggml_type_name(src->type),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+            ggml_nbytes(src),
+            dst->name, ggml_type_name(dst->type),
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+            ggml_nbytes(dst));
+    }
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
@@ -632,6 +648,22 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 }
 
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (!ggml_are_same_layout(src, dst)) {
+        GGML_LOG_ERROR(
+            "[BACKEND_COPY_LAYOUT_MISMATCH] mode=async "
+            "src=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] bytes=%zu "
+            "dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+            src->name, ggml_type_name(src->type),
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+            ggml_nbytes(src),
+            dst->name, ggml_type_name(dst->type),
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+            ggml_nbytes(dst));
+    }
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
