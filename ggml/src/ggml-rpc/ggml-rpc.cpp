@@ -8290,36 +8290,6 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     const bool ring_npu_async =
         std::getenv("GGML_RPC_DISABLE_CHUNK_RING_NPU_ASYNC") == nullptr;
 
-    if (rpc_tensor_phone_stage_profile_enabled()) {
-        for (const auto & stage : stages) {
-            const char * path_reason =
-                cpu_reduce_seq == 0 ?
-                    "SYNC_NO_RING_SEQ" :
-                    (ring_npu_async ?
-                        "ASYNC_RING_SEQ" :
-                        "SYNC_ASYNC_DISABLED");
-            GGML_LOG_INFO(
-                "[CHUNK_RING_RPC_DECISION] "
-                "graph_uid=%" PRIu64 " device=%u "
-                "layer=%d chunk=%d prefill=%d "
-                "seq=%" PRIu64 " stages=%zu "
-                "front=%d down=%d nodes=%d "
-                "async_enabled=%d path=%s\n",
-                graph_uid,
-                device,
-                stage.layer,
-                stage.chunk,
-                stage.prefill ? 1 : 0,
-                cpu_reduce_seq,
-                stages.size(),
-                stage.front_end,
-                stage.down_index,
-                graph->n_nodes,
-                ring_npu_async ? 1 : 0,
-                path_reason);
-        }
-    }
-
     if (cpu_reduce_seq != 0 && ring_npu_async) {
         GGML_ASSERT(stages.size() == 1);
         const rpc_phone_npu_ffn_stage & stage = stages[0];
