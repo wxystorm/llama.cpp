@@ -9970,43 +9970,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 return GGML_STATUS_SUCCESS;
             }
-
-            // A terminal Phone-only scheduler split may end on an internal
-            // activation (for example Vcur) rather than on a materialized
-            // l_out handoff.  In Meta, the inactive PC simple shard for such
-            // Phone-owned tensors is legitimately zero-width.  Reaching the
-            // end of the subgraph list makes phone_owner_exit true, but that
-            // alone must not turn the internal activation into a generic
-            // Phone->PC mirror copy.
-            //
-            // A real layer exit is handled above through layer_handoff_to_pc
-            // and has a full-sized l_out destination.  Keep the terminal
-            // internal activation Phone-resident when the inactive PC shard is
-            // empty instead of attempting an impossible nonzero -> zero copy.
-            const bool terminal_phone_zero_pc_shard =
-                n_backends == 2 &&
-                active_backend == 1 &&
-                phone_owner_exit &&
-                !layer_handoff_to_pc &&
-                i + 1 >= backend_ctx->n_subgraphs &&
-                ggml_nbytes(nodes[1]) > 0 &&
-                ggml_nbytes(nodes[0]) == 0;
-            if (terminal_phone_zero_pc_shard) {
-                if (pipeline_debug ||
-                    tensor_phone_stage_profile ||
-                    std::getenv("GGML_META_SINGLE_OWNER_COPY_TRACE") != nullptr) {
-                    GGML_LOG_ERROR(
-                        "[META_TERMINAL_PHONE_KEEP] sg=%zu node=%s "
-                        "phone_bytes=%zu pc_bytes=%zu "
-                        "reason=TERMINAL_INTERNAL_ZERO_PC_SHARD\n",
-                        i,
-                        nodes[1]->name,
-                        ggml_nbytes(nodes[1]),
-                        ggml_nbytes(nodes[0]));
-                }
-                return GGML_STATUS_SUCCESS;
-            }
-
             GGML_ASSERT(ggml_is_contiguous(nodes[active_backend]));
             for (size_t j_dst = 0; j_dst < n_backends; ++j_dst) {
                 if (j_dst == active_backend) {
