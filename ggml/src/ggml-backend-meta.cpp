@@ -10077,6 +10077,126 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         }
                     }
 
+                    int terminal_probe_layer = -1;
+                    if (suspicious_zero_dst &&
+                            nodes[active_backend] != nullptr &&
+                            std::sscanf(
+                                nodes[active_backend]->name,
+                                "Vcur-%d",
+                                &terminal_probe_layer) == 1) {
+                        char terminal_expected[64];
+                        std::snprintf(
+                            terminal_expected,
+                            sizeof(terminal_expected),
+                            "l_out-%d",
+                            terminal_probe_layer);
+
+                        int terminal_output_index = -1;
+                        for (int probe_k = cgraph->n_nodes - 1;
+                             probe_k >= 0;
+                             --probe_k) {
+                            ggml_tensor * original = cgraph->nodes[probe_k];
+                            if (original != nullptr &&
+                                    std::strcmp(
+                                        original->name,
+                                        terminal_expected) == 0) {
+                                terminal_output_index = probe_k;
+                                break;
+                            }
+                        }
+
+                        GGML_LOG_ERROR(
+                            "[META_TERMINAL_OUTPUT_PROBE] sg=%zu layer=%d "
+                            "expected=%s index=%d cgraph_nodes=%d\n",
+                            i,
+                            terminal_probe_layer,
+                            terminal_expected,
+                            terminal_output_index,
+                            cgraph->n_nodes);
+
+                        if (terminal_output_index >= 0) {
+                            ggml_tensor * original =
+                                cgraph->nodes[terminal_output_index];
+                            GGML_LOG_ERROR(
+                                "[META_TERMINAL_OUTPUT_ORIGINAL] "
+                                "layer=%d name=%s op=%s flags=0x%x "
+                                "ptr=%p view=%p ne=[%" PRId64 ",%" PRId64
+                                ",%" PRId64 ",%" PRId64 "] bytes=%zu\n",
+                                terminal_probe_layer,
+                                original->name,
+                                ggml_op_name(original->op),
+                                original->flags,
+                                (void *) original,
+                                (void *) original->view_src,
+                                original->ne[0],
+                                original->ne[1],
+                                original->ne[2],
+                                original->ne[3],
+                                ggml_nbytes(original));
+
+                            for (size_t probe_backend = 0;
+                                 probe_backend < n_backends;
+                                 ++probe_backend) {
+                                ggml_tensor * probe_tensor =
+                                    backend_ctx->
+                                        backend_configs[probe_backend].
+                                        nodes[(size_t) terminal_output_index];
+                                if (probe_tensor == nullptr) {
+                                    GGML_LOG_ERROR(
+                                        "[META_TERMINAL_OUTPUT_SHARD] "
+                                        "layer=%d backend=%zu backend_name=%s "
+                                        "tensor=null\n",
+                                        terminal_probe_layer,
+                                        probe_backend,
+                                        ggml_backend_name(
+                                            backend_ctx->
+                                                backend_configs[probe_backend].
+                                                backend));
+                                    continue;
+                                }
+
+                                GGML_LOG_ERROR(
+                                    "[META_TERMINAL_OUTPUT_SHARD] "
+                                    "layer=%d backend=%zu backend_name=%s "
+                                    "name=%s op=%s flags=0x%x "
+                                    "compute=%d input=%d output=%d "
+                                    "ptr=%p view=%p view_name=%s "
+                                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64
+                                    ",%" PRId64 "] "
+                                    "nb=[%zu,%zu,%zu,%zu] bytes=%zu\n",
+                                    terminal_probe_layer,
+                                    probe_backend,
+                                    ggml_backend_name(
+                                        backend_ctx->
+                                            backend_configs[probe_backend].
+                                            backend),
+                                    probe_tensor->name,
+                                    ggml_op_name(probe_tensor->op),
+                                    probe_tensor->flags,
+                                    (probe_tensor->flags &
+                                     GGML_TENSOR_FLAG_COMPUTE) != 0,
+                                    (probe_tensor->flags &
+                                     GGML_TENSOR_FLAG_INPUT) != 0,
+                                    (probe_tensor->flags &
+                                     GGML_TENSOR_FLAG_OUTPUT) != 0,
+                                    (void *) probe_tensor,
+                                    (void *) probe_tensor->view_src,
+                                    probe_tensor->view_src != nullptr ?
+                                        probe_tensor->view_src->name :
+                                        "(null)",
+                                    probe_tensor->ne[0],
+                                    probe_tensor->ne[1],
+                                    probe_tensor->ne[2],
+                                    probe_tensor->ne[3],
+                                    probe_tensor->nb[0],
+                                    probe_tensor->nb[1],
+                                    probe_tensor->nb[2],
+                                    probe_tensor->nb[3],
+                                    ggml_nbytes(probe_tensor));
+                            }
+                        }
+                    }
+
                     GGML_LOG_ERROR(
                         "[META_SINGLE_OWNER_COPY] sg=%zu active=%zu dst_backend=%zu "
                         "src_backend=%s dst_backend_name=%s "
