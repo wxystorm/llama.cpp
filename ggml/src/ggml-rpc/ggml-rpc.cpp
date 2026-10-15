@@ -8313,6 +8313,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         }
 
         ensure_phone_npu_async_worker();
+        size_t queue_depth = 0;
         {
             std::lock_guard<std::mutex> async_lock(
                 phone_npu_async_mutex);
@@ -8321,6 +8322,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             }
             phone_npu_async_jobs.push_back(
                 std::move(job));
+            queue_depth = phone_npu_async_jobs.size();
         }
         phone_npu_async_cv.notify_one();
 
@@ -8332,7 +8334,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             stage.layer,
             stage.chunk,
             stage.norm->ne[1],
-            phone_npu_async_jobs.size());
+            queue_depth);
 
         // The Ring-owned FFN stage is terminal by construction.  Returning
         // here frees the compute socket so the next Attention chunk can run
@@ -8727,9 +8729,21 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 rpc_server::~rpc_server() {
     {
         std::lock_guard<std::mutex> lock(
+            phone_npu_async_mutex);
+        phone_npu_async_stop = true;
+    }
+    phone_npu_async_cv.notify_all();
+    if (phone_npu_async_thread.joinable()) {
+        phone_npu_async_thread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
             phone_npu_cpu_reduce_mutex);
         phone_npu_cpu_reduce_armed.clear();
         phone_npu_cpu_reduce_pending.clear();
+        phone_npu_cpu_reduce_active.clear();
+        phone_npu_cpu_reduce_failed.clear();
     }
     phone_npu_ffn_caches.clear();
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
