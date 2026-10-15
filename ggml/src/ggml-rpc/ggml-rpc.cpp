@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
+#include <deque>
 #include <optional>
 #include <string>
 #include <vector>
