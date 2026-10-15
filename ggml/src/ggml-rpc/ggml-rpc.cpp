@@ -4433,6 +4433,7 @@ struct rpc_phone_npu_async_job {
     int64_t n_embd = 0;
     int64_t n_tokens = 0;
     int64_t n_expert_used = 0;
+    int64_t enqueue_us = 0;
 
     // GPU allocator-backed stage tensors must not escape graph_compute().
     // Freeze all NPU inputs into host-owned storage before enqueueing.
@@ -7774,6 +7775,326 @@ bool rpc_server::run_phone_npu_ffn_stage(
         stage.prefill ? "prefill" : "decode",
         n_tokens);
     return true;
+}
+
+
+bool rpc_server::prepare_phone_npu_async_job(
+        uint32_t device,
+        uint64_t seq,
+        ggml_cgraph * graph,
+        const rpc_phone_npu_ffn_stage & stage,
+        rpc_phone_npu_async_job & job) {
+    if (phone_npu_backend == nullptr || graph == nullptr ||
+            seq == 0 ||
+            stage.norm == nullptr || stage.topk == nullptr ||
+            stage.route_weights == nullptr || stage.down == nullptr) {
+        return false;
+    }
+
+    rpc_phone_npu_ffn_cache * cache = nullptr;
+
+    // Cached weights are immutable after construction, so a hit does not need
+    // the HTP execution mutex.  A miss performs the one-time repack/upload
+    // under that mutex to avoid colliding with the running NPU job.
+    auto cache_it = phone_npu_ffn_caches.find(stage.layer);
+    if (cache_it != phone_npu_ffn_caches.end()) {
+        cache = cache_it->second.get();
+    } else {
+        std::lock_guard<std::mutex> npu_lock(phone_npu_mutex);
+        if (!prepare_phone_npu_ffn_cache(
+                graph, stage, cache)) {
+            return false;
+        }
+    }
+    if (cache == nullptr) {
+        return false;
+    }
+
+    const int64_t n_embd = stage.norm->ne[0];
+    const int64_t n_tokens = stage.norm->ne[1];
+    const int64_t n_expert_used = stage.topk->ne[0];
+
+    if (n_embd <= 0 || n_tokens <= 0 ||
+            n_expert_used <= 0 ||
+            stage.topk->ne[1] != n_tokens ||
+            stage.route_weights->ne[0] != 1 ||
+            stage.route_weights->ne[1] != n_expert_used ||
+            stage.route_weights->ne[2] != n_tokens ||
+            cache->w_up->ne[0] != n_embd ||
+            cache->w_down->ne[1] != n_embd ||
+            stage.down->type != GGML_TYPE_F32 ||
+            ggml_nbytes(stage.down) !=
+                (size_t) n_embd * (size_t) n_tokens *
+                    sizeof(float)) {
+        return false;
+    }
+
+    rpc_phone_npu_async_job prepared;
+    prepared.device = device;
+    prepared.seq = seq;
+    prepared.layer = stage.layer;
+    prepared.chunk = stage.chunk;
+    prepared.prefill = stage.prefill;
+    prepared.down = stage.down;
+    prepared.cache = cache;
+    prepared.n_embd = n_embd;
+    prepared.n_tokens = n_tokens;
+    prepared.n_expert_used = n_expert_used;
+
+    // This readback is the ownership boundary: after it returns, no
+    // allocator-backed stage tensor is referenced by the NPU worker.
+    if (!rpc_phone_npu_read_dense(
+            stage.norm, prepared.hidden_dense) ||
+        !rpc_phone_npu_read_dense(
+            stage.topk, prepared.topk_dense) ||
+        !rpc_phone_npu_read_dense(
+            stage.route_weights, prepared.route_dense)) {
+        return false;
+    }
+
+    if (prepared.hidden_dense.size() !=
+            (size_t) n_embd * (size_t) n_tokens *
+                sizeof(float) ||
+        prepared.topk_dense.size() !=
+            (size_t) n_expert_used * (size_t) n_tokens *
+                sizeof(int32_t) ||
+        prepared.route_dense.size() !=
+            (size_t) n_expert_used * (size_t) n_tokens *
+                sizeof(float)) {
+        return false;
+    }
+
+    prepared.enqueue_us = ggml_time_us();
+    job = std::move(prepared);
+    return true;
+}
+
+bool rpc_server::execute_phone_npu_async_job(
+        const rpc_phone_npu_async_job & job,
+        std::vector<float> & output) {
+    if (phone_npu_backend == nullptr ||
+            job.cache == nullptr ||
+            job.down == nullptr ||
+            job.n_embd <= 0 ||
+            job.n_tokens <= 0 ||
+            job.n_expert_used <= 0) {
+        return false;
+    }
+
+    ggml_context_ptr ctx_a = rpc_phone_npu_make_ctx();
+    if (!ctx_a) {
+        return false;
+    }
+
+    ggml_tensor * hidden = ggml_new_tensor_2d(
+        ctx_a.get(), GGML_TYPE_F32,
+        job.n_embd, job.n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(
+        ctx_a.get(), GGML_TYPE_I32,
+        job.n_expert_used, job.n_tokens);
+    ggml_tensor * rweights = ggml_new_tensor_3d(
+        ctx_a.get(), GGML_TYPE_F32,
+        1, job.n_expert_used, job.n_tokens);
+
+    ggml_tensor * cur = ggml_reshape_3d(
+        ctx_a.get(), hidden,
+        job.n_embd, 1, job.n_tokens);
+    ggml_tensor * up = ggml_mul_mat_id(
+        ctx_a.get(), job.cache->w_up, cur, ids);
+    ggml_tensor * gate = ggml_mul_mat_id(
+        ctx_a.get(), job.cache->w_gate, cur, ids);
+    ggml_tensor * act = ggml_swiglu_split(
+        ctx_a.get(), gate, up);
+    ggml_tensor * down = ggml_mul_mat_id(
+        ctx_a.get(), job.cache->w_down, act, ids);
+    ggml_tensor * weighted = ggml_mul(
+        ctx_a.get(), down, rweights);
+
+    std::vector<ggml_tensor *> expert_views;
+    expert_views.reserve((size_t) job.n_expert_used);
+    for (int64_t e = 0; e < job.n_expert_used; ++e) {
+        expert_views.push_back(
+            ggml_view_2d(
+                ctx_a.get(), weighted,
+                job.n_embd, job.n_tokens,
+                weighted->nb[2],
+                (size_t) e * weighted->nb[1]));
+    }
+
+    ggml_tensor * out = expert_views[0];
+    for (int64_t e = 1; e < job.n_expert_used; ++e) {
+        out = ggml_add(
+            ctx_a.get(), out,
+            expert_views[(size_t) e]);
+    }
+    ggml_set_name(out, "phone_npu_ffn_out_async");
+
+    ggml_backend_buffer_ptr abuf {
+        ggml_backend_alloc_ctx_tensors(
+            ctx_a.get(), phone_npu_backend)
+    };
+    if (!abuf) {
+        return false;
+    }
+
+    ggml_backend_tensor_set(
+        hidden,
+        job.hidden_dense.data(),
+        0,
+        job.hidden_dense.size());
+    ggml_backend_tensor_set(
+        ids,
+        job.topk_dense.data(),
+        0,
+        job.topk_dense.size());
+    ggml_backend_tensor_set(
+        rweights,
+        job.route_dense.data(),
+        0,
+        job.route_dense.size());
+
+    ggml_cgraph * gf =
+        ggml_new_graph_custom(ctx_a.get(), 2048, false);
+    ggml_build_forward_expand(gf, out);
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        if (!ggml_backend_supports_op(
+                phone_npu_backend, gf->nodes[i])) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_NPU_ASYNC] "
+                "seq=%" PRIu64 " layer=%d chunk=%d "
+                "status=FAIL unsupported=%s\n",
+                job.seq,
+                job.layer,
+                job.chunk,
+                ggml_op_desc(gf->nodes[i]));
+            return false;
+        }
+    }
+
+    if (ggml_backend_graph_compute(
+            phone_npu_backend, gf) !=
+            GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const size_t output_bytes =
+        (size_t) ggml_nelements(out) * sizeof(float);
+    if (output_bytes != ggml_nbytes(job.down)) {
+        return false;
+    }
+
+    output.resize((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(
+        out,
+        output.data(),
+        0,
+        output_bytes);
+    return true;
+}
+
+void rpc_server::ensure_phone_npu_async_worker() {
+    std::lock_guard<std::mutex> lock(phone_npu_async_mutex);
+    if (phone_npu_async_thread.joinable()) {
+        return;
+    }
+
+    phone_npu_async_stop = false;
+    phone_npu_async_thread =
+        std::thread([this]() {
+            phone_npu_async_loop();
+        });
+}
+
+void rpc_server::phone_npu_async_loop() {
+    for (;;) {
+        rpc_phone_npu_async_job job;
+        {
+            std::unique_lock<std::mutex> lock(
+                phone_npu_async_mutex);
+            phone_npu_async_cv.wait(
+                lock,
+                [&]() {
+                    return phone_npu_async_stop ||
+                        !phone_npu_async_jobs.empty();
+                });
+
+            if (phone_npu_async_stop &&
+                    phone_npu_async_jobs.empty()) {
+                return;
+            }
+
+            job = std::move(
+                phone_npu_async_jobs.front());
+            phone_npu_async_jobs.pop_front();
+        }
+
+        const int64_t start_us = ggml_time_us();
+        std::vector<float> output;
+        bool ok = false;
+        {
+            // The private HTP backend remains single-owner.  Only this worker
+            // uses it for Ring jobs; the mutex also protects legacy/decode
+            // synchronous calls.
+            std::lock_guard<std::mutex> npu_lock(
+                phone_npu_mutex);
+            ok = execute_phone_npu_async_job(
+                job, output);
+        }
+        const int64_t done_us = ggml_time_us();
+
+        {
+            std::lock_guard<std::mutex> join_lock(
+                phone_npu_cpu_reduce_mutex);
+
+            if (ok) {
+                rpc_phone_npu_cpu_reduce_entry entry;
+                entry.layer = job.layer;
+                entry.chunk = job.chunk;
+                entry.down = job.down;
+                entry.phone_partial = std::move(output);
+
+                auto & pending =
+                    phone_npu_cpu_reduce_pending[
+                        job.device];
+                if (pending.find(job.seq) !=
+                        pending.end()) {
+                    ok = false;
+                } else {
+                    pending.emplace(
+                        job.seq,
+                        std::move(entry));
+                }
+            }
+
+            if (!ok) {
+                phone_npu_cpu_reduce_failed[
+                    job.device].insert(job.seq);
+            }
+        }
+
+        // NPU completion, not the client-side post-graph marker, releases the
+        // PC return waiter for Ring-owned seqs.
+        {
+            std::lock_guard<std::mutex> ready_lock(
+                phone_ffn_ready_mutex);
+            phone_ffn_ready_seqs[
+                job.device].insert(job.seq);
+        }
+        phone_ffn_ready_cv.notify_all();
+
+        GGML_LOG_INFO(
+            "[CHUNK_RING_NPU_ASYNC_DONE] "
+            "seq=%" PRIu64 " layer=%d chunk=%d tokens=%" PRId64
+            " queue_ms=%.3f compute_ms=%.3f status=%s\n",
+            job.seq,
+            job.layer,
+            job.chunk,
+            job.n_tokens,
+            (start_us - job.enqueue_us) / 1000.0,
+            (done_us - start_us) / 1000.0,
+            ok ? "OK" : "FAIL");
+    }
 }
 
 ggml_status rpc_server::graph_compute_phone_npu_ffn(
