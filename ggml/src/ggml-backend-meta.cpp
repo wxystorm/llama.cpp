@@ -9901,6 +9901,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             // handoffs and opt-in until output parity has been verified.
             int terminal_kv_view_layer = -1;
             const bool terminal_kv_view =
+                n_backends == 2 &&
+                active_backend == 1 &&
                 nodes[1] != nullptr &&
                 nodes[1]->op == GGML_OP_VIEW &&
                 nodes[1]->view_src != nullptr &&
