@@ -9995,7 +9995,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "dst=%s dst_bytes=%zu "
                     "keep=%d discard=%d owner_exit=%d "
                     "handoff=%d tp_context=%d ring=%d "
-                    "tp_range=[%d,%d)\n",
+                    "tp_range=[%d,%d) "
+                    "kv_view=%d kv_layer=%d kv_candidate=%d kv_enabled=%d\n",
                     cgraph->uid,
                     (void *) backend,
                     (void *) backend_ctx,
@@ -10012,7 +10013,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     tp_layer_context ? 1 : 0,
                     phone_primary_chunk_ring_active ? 1 : 0,
                     backend_ctx->tensor_phone_first_layer,
-                    backend_ctx->tensor_phone_last_layer);
+                    backend_ctx->tensor_phone_last_layer,
+                    terminal_kv_view ? 1 : 0,
+                    terminal_kv_view_layer,
+                    combined_suffix_terminal_kv ? 1 : 0,
+                    terminal_kv_local_enabled ? 1 : 0);
                 fflush(stderr);
             }
 
