@@ -4643,16 +4643,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // builds the existing Phone-primary Meta graph (including the PHONE_ONLY
     // tail) over the complete token set.  This preserves XT/per-chunk join
     // semantics while making XC real.
+    const bool phone_primary_chunk_ring_requested =
+        std::getenv(
+            "LLAMA_HYBRID_PHONE_PRIMARY_CHUNK_RING") != nullptr;
+
     const char * phone_primary_cpu_chunk_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_CPU_CHUNK_STAGE");
     const bool phone_primary_cpu_chunk_requested =
-        phone_primary_cpu_chunk_env != nullptr &&
-        std::atoi(phone_primary_cpu_chunk_env) != 0;
+        phone_primary_chunk_ring_requested ||
+        (phone_primary_cpu_chunk_env != nullptr &&
+         std::atoi(phone_primary_cpu_chunk_env) != 0);
+
     const char * phone_primary_wavefront_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
     const bool phone_primary_wavefront_requested =
-        phone_primary_wavefront_env != nullptr &&
-        std::atoi(phone_primary_wavefront_env) != 0;
+        phone_primary_chunk_ring_requested ||
+        (phone_primary_wavefront_env != nullptr &&
+         std::atoi(phone_primary_wavefront_env) != 0);
 
     // Minimal cross-layer entry for the common P=0 Phone-primary layout:
     //
