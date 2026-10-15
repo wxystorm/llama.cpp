@@ -2493,15 +2493,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         stage.layer_end < (int) model.hparams.n_layer() &&
         model.hybrid_layer_mode(stage.layer_end) ==
             llama_hybrid_layer_mode::PHONE_ONLY;
-    const bool terminal_phone_stage =
-        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        stage.layer_end == (int) model.hparams.n_layer();
-
     // A terminal PHONE stage with no requested block/stage output only
     // needs to commit its side effects (for example KV updates).  This is
     // independent of whether its input arrived through the resident bridge.
+    // Keep all Phone-only scheduler splits local so Meta does not manufacture
+    // a transient Phone->CPU export of an internal Kcur/Vcur zero shard.
     const bool discard_phone_terminal_output =
-        terminal_phone_stage &&
+        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        stage.layer_end == (int) model.hparams.n_layer() &&
         stage_output == nullptr &&
         block_outputs == 0;
 
@@ -2533,47 +2532,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const bool phone_cpu_chunk_stage_trace =
         std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
-    const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
-
-    // Correlate a stage's actual split Meta pointer with the owner-exit
-    // decision inside ggml-backend-meta.cpp, including nonterminal TENSOR
-    // graphs.  Keep this opt-in and synchronous for abort-time diagnostics.
-    if (std::getenv("GGML_META_ZERO_SHARD_TRACE") != nullptr &&
-            (stage.kind == llama_hybrid_runtime_stage_kind::TENSOR ||
-             stage.kind == llama_hybrid_runtime_stage_kind::PHONE)) {
-        fprintf(
-            stderr,
-            "[HYBRID_META_STAGE] ub=%d stage=%zu block=%zu "
-            "kind=%s layers=[%d,%d) outputs=%d "
-            "tokens=[%u,%u) splits=%d\n",
-            ubatch_id,
-            stage_index,
-            block_index,
-            llama_hybrid_runtime_stage_name(stage.kind),
-            stage.layer_begin,
-            stage.layer_end,
-            block_outputs,
-            token_begin,
-            token_begin + block_tokens,
-            n_splits);
-        for (int split_id = 0; split_id < n_splits; ++split_id) {
-            ggml_backend_t split_backend =
-                ggml_backend_sched_get_split_backend(sched_use, split_id);
-            if (ggml_backend_is_meta(split_backend)) {
-                fprintf(
-                    stderr,
-                    "[HYBRID_META_STAGE_SPLIT] ub=%d stage=%zu "
-                    "block=%zu split=%d meta=%p name=%s\n",
-                    ubatch_id,
-                    stage_index,
-                    block_index,
-                    split_id,
-                    (void *) split_backend,
-                    ggml_backend_name(split_backend));
-            }
-        }
-        fflush(stderr);
-    }
 
     if (phone_resident_input) {
         ggml_tensor * stage_input_tensor =
@@ -2628,107 +2586,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
-    std::vector<ggml_backend_t> terminal_policy_meta_backends;
-    if (terminal_phone_stage) {
-        for (int split_id = 0; split_id < n_splits; ++split_id) {
+    ggml_backend_t terminal_discard_meta_backend = nullptr;
+    if (discard_phone_terminal_output) {
+        const int n_backends =
+            ggml_backend_sched_get_n_backends(sched_use);
+        for (int i = 0; i < n_backends; ++i) {
             ggml_backend_t candidate =
-                ggml_backend_sched_get_split_backend(
-                    sched_use, split_id);
-            if (!ggml_backend_is_meta(candidate)) {
-                continue;
-            }
-            if (std::find(
-                    terminal_policy_meta_backends.begin(),
-                    terminal_policy_meta_backends.end(),
-                    candidate) ==
-                terminal_policy_meta_backends.end()) {
-                terminal_policy_meta_backends.push_back(candidate);
+                ggml_backend_sched_get_backend(
+                    sched_use, i);
+            if (ggml_backend_is_meta(candidate)) {
+                terminal_discard_meta_backend =
+                    candidate;
+                break;
             }
         }
 
-        if (terminal_policy_meta_backends.empty()) {
+        if (terminal_discard_meta_backend == nullptr ||
+            !ggml_backend_meta_set_phone_stage_terminal_discard(
+                terminal_discard_meta_backend, true)) {
             LLAMA_LOG_ERROR(
-                "[PHONE_STAGE_TERMINAL_KEEP_INTERNAL] "
-                "ub=%d block=%zu action=ARM_FAILED reason=NO_META_SPLIT "
-                "tokens=[%u,%u) outputs=%d splits=%d\n",
+                "[PHONE_STAGE_TERMINAL_DISCARD] "
+                "ub=%d block=%zu action=ARM_FAILED "
+                "tokens=[%u,%u)\n",
                 ubatch_id,
                 block_index,
                 token_begin,
-                token_begin + block_tokens,
-                block_outputs,
-                n_splits);
+                token_begin + block_tokens);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        size_t armed_count = 0;
-        for (ggml_backend_t policy_backend :
-                terminal_policy_meta_backends) {
-            if (!ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                    policy_backend, true)) {
-                for (size_t j = 0; j < armed_count; ++j) {
-                    (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                        terminal_policy_meta_backends[j], false);
-                }
-                LLAMA_LOG_ERROR(
-                    "[PHONE_STAGE_TERMINAL_KEEP_INTERNAL] "
-                    "ub=%d block=%zu action=ARM_FAILED "
-                    "tokens=[%u,%u) outputs=%d backend=%s\n",
-                    ubatch_id,
-                    block_index,
-                    token_begin,
-                    token_begin + block_tokens,
-                    block_outputs,
-                    ggml_backend_name(policy_backend));
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
-            }
-            ++armed_count;
-        }
-
-        if (discard_phone_terminal_output) {
-            size_t discard_armed_count = 0;
-            for (ggml_backend_t policy_backend :
-                    terminal_policy_meta_backends) {
-                if (!ggml_backend_meta_set_phone_stage_terminal_discard(
-                        policy_backend, true)) {
-                    for (size_t j = 0; j < discard_armed_count; ++j) {
-                        (void) ggml_backend_meta_set_phone_stage_terminal_discard(
-                            terminal_policy_meta_backends[j], false);
-                    }
-                    for (ggml_backend_t keep_backend :
-                            terminal_policy_meta_backends) {
-                        (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                            keep_backend, false);
-                    }
-                    LLAMA_LOG_ERROR(
-                        "[PHONE_STAGE_TERMINAL_DISCARD] "
-                        "ub=%d block=%zu action=ARM_FAILED "
-                        "tokens=[%u,%u) backend=%s\n",
-                        ubatch_id,
-                        block_index,
-                        token_begin,
-                        token_begin + block_tokens,
-                        ggml_backend_name(policy_backend));
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
-                ++discard_armed_count;
-            }
-        }
-
         if (phone_cpu_chunk_stage_trace) {
             LLAMA_LOG_DEBUG(
-                "[PHONE_STAGE_TERMINAL_POLICY] "
-                "ub=%d block=%zu outputs=%d discard=%d "
-                "tokens=[%u,%u) meta_splits=%zu action=ARM_OK\n",
+                "[PHONE_STAGE_TERMINAL_DISCARD] "
+                "ub=%d block=%zu outputs=%d "
+                "tokens=[%u,%u) action=ARM_OK\n",
                 ubatch_id,
                 block_index,
                 block_outputs,
-                discard_phone_terminal_output ? 1 : 0,
                 token_begin,
-                token_begin + block_tokens,
-                terminal_policy_meta_backends.size());
+                token_begin + block_tokens);
         }
     }
 
@@ -2775,6 +2672,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
+    const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     if (phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
@@ -3018,18 +2916,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
         }
     }
-    const bool defer_terminal_policy_clear =
-        async_meta_armed && ret == GGML_STATUS_SUCCESS;
-    if (!defer_terminal_policy_clear) {
-        for (ggml_backend_t policy_backend :
-                terminal_policy_meta_backends) {
-            if (discard_phone_terminal_output) {
-                (void) ggml_backend_meta_set_phone_stage_terminal_discard(
-                    policy_backend, false);
-            }
-            (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                policy_backend, false);
-        }
+    if (terminal_discard_meta_backend != nullptr) {
+        (void) ggml_backend_meta_set_phone_stage_terminal_discard(
+            terminal_discard_meta_backend, false);
     }
     if (resident_output_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_resident_handoff(
@@ -4777,17 +4666,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         phone_primary_wavefront_env != nullptr &&
         std::atoi(phone_primary_wavefront_env) != 0;
 
-    // Correctness A/B for Chunk Ring: split the PHONE_ONLY tail out of the
-    // combined Tensor suffix, using the staged runner's explicit hidden
-    // output/input boundary. This costs a host round trip, but avoids
-    // pretending that a terminal internal KV view is a stage output.
-    const char * chunk_ring_split_tail_env =
-        std::getenv("LLAMA_HYBRID_CHUNK_RING_SPLIT_PHONE_TAIL");
-    const bool chunk_ring_split_phone_tail =
-        phone_primary_chunk_ring_requested &&
-        chunk_ring_split_tail_env != nullptr &&
-        std::atoi(chunk_ring_split_tail_env) != 0;
-
     // Minimal cross-layer entry for the common P=0 Phone-primary layout:
     //
     //   GPU prefix -> full-ubatch TENSOR_PHONE_PRIMARY suffix
@@ -4861,14 +4739,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const int suffix_macro_tokens =
             std::max(1, (int) cparams.n_ubatch);
-        const bool isolate_phone_tail =
-            phone_primary_wavefront_requested ||
-            (chunk_ring_split_phone_tail &&
-             runtime_stages.size() > 3 &&
-             runtime_stages[3].kind ==
-                 llama_hybrid_runtime_stage_kind::PHONE);
         const int tensor_stage_end =
-            isolate_phone_tail ?
+            phone_primary_wavefront_requested ?
                 runtime_stages[2].layer_end :
                 (int) hparams.n_layer();
         phone_primary_cpu_chunk_stages.push_back({
@@ -4879,27 +4751,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             runtime_plan.tensor_chunk_tokens,
         });
 
-        // Keep the phone tail separate only in explicit opt-in modes.
-        // The Chunk Ring A/B uses the existing host hidden boundary,
-        // without enabling the legacy wavefront runtime.
-        if (isolate_phone_tail) {
+        // Correctness-first V1: when Phone-primary wavefront is enabled, keep
+        // the Tensor region isolated and run any PHONE_ONLY tail as a separate
+        // staged region. This avoids mixing T wavefront ownership with tail
+        // ownership until exact (layer, chunk) dependencies are stable.
+        if (phone_primary_wavefront_requested) {
             for (size_t i = 3; i < runtime_stages.size(); ++i) {
                 phone_primary_cpu_chunk_stages.push_back(runtime_stages[i]);
             }
-        }
-
-        if (chunk_ring_split_phone_tail &&
-                std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
-            LLAMA_LOG_INFO(
-                "[HYBRID_RING_SPLIT_TAIL] enabled=%d "
-                "tensor=[%d,%d) tail_begin=%d stages=%zu "
-                "boundary=HOST_HIDDEN\n",
-                isolate_phone_tail ? 1 : 0,
-                runtime_stages[2].layer_begin,
-                tensor_stage_end,
-                runtime_stages.size() > 3 ?
-                    runtime_stages[3].layer_begin : -1,
-                phone_primary_cpu_chunk_stages.size());
         }
 
         if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
@@ -4920,8 +4779,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 phone_primary_cpu_chunk_stages[2].inner_chunk_tokens,
                 phone_primary_wavefront_requested ?
                     "PREFIX_STAGED_T_WAVEFRONT_SPLIT_TAIL" :
-                    isolate_phone_tail ?
-                    "PREFIX_STAGED_CHUNK_RING_SPLIT_TAIL" :
                     "PREFIX_STAGED_COMBINED_SUFFIX",
                 phone_primary_cpu_chunk_stages.size());
         }
@@ -6212,14 +6069,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const ggml_status async_meta_status =
                 ggml_backend_meta_wait_async_graph(
                     phone_split_backend);
-            // Terminal Phone ownership policies must remain armed until the
-            // async Meta worker has fully exited. run_hybrid_stage_block()
-            // returns after preparation, before the worker executes its
-            // single-owner communication path.
-            (void) ggml_backend_meta_set_phone_stage_terminal_discard(
-                phone_split_backend, false);
-            (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                phone_split_backend, false);
             if (async_meta_status != GGML_STATUS_SUCCESS) {
                 status = async_meta_status;
                 LLAMA_LOG_ERROR(
