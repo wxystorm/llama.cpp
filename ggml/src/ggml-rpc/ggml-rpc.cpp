@@ -2470,8 +2470,7 @@ static bool ggml_backend_rpc_route_snapshot_ready(
             stage_profile ? ggml_time_us() : 0;
 
         if (stage_profile) {
-            std::fprintf(
-                stderr,
+            GGML_LOG_INFO(
                 "[TENSOR_PHONE_RPC_STAGE] side=pc "
                 "stage=route_snapshot_ready_client lane=%u "
                 "seq=%" PRIu64 " request_bytes=%zu response_bytes=0 "
@@ -2521,8 +2520,7 @@ static bool ggml_backend_rpc_route_snapshot_ready(
     if (stage_profile) {
         rpc_cmd_roundtrip_profile_active =
             previous_profile;
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=route_snapshot_ready_client lane=%u "
             "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
@@ -2783,8 +2781,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     }
 
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=route_snapshot bytes=%zu storage_bytes=%zu "
             "compact_topk=%d topk_storage_bytes=%zu "
@@ -3033,8 +3030,7 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     }
 
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=router_batch "
             "bytes=%zu staged=%d lane=%d dst_sync_ms=%.3f "
             "rpc_roundtrip_ms=%.3f dst_set_ms=%.3f total_ms=%.3f\n",
@@ -3045,7 +3041,6 @@ static bool ggml_backend_rpc_get_tensor_batch3(
             rpc_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
-        std::fflush(stderr);
     }
 
     return true;
@@ -3474,8 +3469,7 @@ static bool ggml_backend_rpc_set_tensor_graph(
             send_us / 1000.0);
     }
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_set_add "
             "bytes=%zu graph_uid=%" PRIu64 " cache=%d graph_bytes=%zu "
             "src_sync_ms=%.3f dst_sync_ms=%.3f src_get_ms=%.3f "
@@ -3740,8 +3734,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     }
 
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc "
             "stage=return_chunk_join seq=%" PRIu64
             " lane=%zu bytes=%zu wire_bytes=%zu wire=%s "
@@ -3857,15 +3850,13 @@ static bool ggml_backend_rpc_set_tensor_async_return(
     const int64_t send_us = ggml_time_us() - send_begin_us;
 
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=pc stage=return_stage_send "
             "bytes=%zu pack_ms=%.3f send_ms=%.3f total_ms=%.3f\n",
             data_size,
             pack_us / 1000.0,
             send_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
-        std::fflush(stderr);
     }
 
     return status;
@@ -5827,8 +5818,7 @@ bool rpc_server::set_tensor_async_return(
     const int64_t write_us =
         stage_profile ? ggml_time_us() - write_begin_us : 0;
     if (stage_profile) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone stage=return_stage_write "
             "bytes=%zu async_write=%d write_ms=%.3f total_ms=%.3f status=%d\n",
             data_size,
@@ -5836,7 +5826,6 @@ bool rpc_server::set_tensor_async_return(
             write_us / 1000.0,
             (ggml_time_us() - begin_us) / 1000.0,
             status ? 1 : 0);
-        std::fflush(stderr);
     }
 
     return status;
@@ -5930,13 +5919,11 @@ bool rpc_server::phone_ffn_mark_ready(
     phone_ffn_ready_cv.notify_all();
 
     if (rpc_tensor_phone_stage_profile_enabled()) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=phone_ffn_chunk_ready device=%u seq=%" PRIu64 "\n",
             request.device,
             request.seq);
-        std::fflush(stderr);
     }
     return true;
 }
@@ -6217,8 +6204,7 @@ bool rpc_server::set_tensor_async_return_wait(
         set_tensor_async_return(legacy_input);
 
     if (rpc_tensor_phone_stage_profile_enabled()) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=return_chunk_join device=%u seq=%" PRIu64
             " ffn_wait_ms=%.3f bytes=%zu wire_bytes=%zu wire=%s "
@@ -6230,7 +6216,6 @@ bool rpc_server::set_tensor_async_return_wait(
             wire_size,
             wire_type == RPC_RETURN_WIRE_F16 ? "f16" : "raw",
             status ? 1 : 0);
-        std::fflush(stderr);
     }
 
     return status;
@@ -6658,8 +6643,7 @@ bool rpc_server::route_snapshot_ready(
     slot.cv.notify_all();
 
     if (rpc_tensor_phone_stage_profile_enabled()) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=route_snapshot_fill lane=%u "
             "seq=%" PRIu64 " bytes=%zu "
@@ -6885,8 +6869,7 @@ bool rpc_server::get_route_snapshot(
     if (stage_profile) {
         const int64_t producer_wait_est_us =
             std::max<int64_t>(0, ready_wait_us - slot_fill_us);
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=route_snapshot_server_wait lane=%u "
             "seq=%" PRIu64 " bytes=%zu storage_bytes=%zu "
@@ -8712,14 +8695,12 @@ bool rpc_server::synchronize(uint32_t device) {
 
     if (released_payloads != 0 &&
             rpc_tensor_phone_stage_profile_enabled()) {
-        std::fprintf(
-            stderr,
+        GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=async_return_payload_release "
             "device=%u count=%zu\n",
             device,
             released_payloads);
-        std::fflush(stderr);
     }
     return true;
 }
@@ -9799,8 +9780,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     stage_profile ? ggml_time_us() : 0;
 
                 if (stage_profile) {
-                    std::fprintf(
-                        stderr,
+                    GGML_LOG_INFO(
                         "[TENSOR_PHONE_RPC_STAGE] side=phone "
                         "stage=route_snapshot_ready_server lane=%u "
                         "seq=%" PRIu64 " request_bytes=%zu response_bytes=%zu "
@@ -9847,8 +9827,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     stage_profile ? ggml_time_us() : 0;
 
                 if (stage_profile) {
-                    std::fprintf(
-                        stderr,
+                    GGML_LOG_INFO(
                         "[TENSOR_PHONE_RPC_STAGE] side=phone "
                         "stage=route_snapshot_ready_async_server lane=%u "
                         "seq=%" PRIu64 " request_bytes=%zu response_bytes=0 "
@@ -9948,8 +9927,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
 
                 if (stage_profile) {
-                    std::fprintf(
-                        stderr,
+                    GGML_LOG_INFO(
                         "[TENSOR_PHONE_RPC_STAGE] side=phone "
                         "stage=route_snapshot_server_dispatch lane=%u "
                         "seq=%" PRIu64 " bytes=%zu "
