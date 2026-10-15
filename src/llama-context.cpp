@@ -2533,6 +2533,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const bool phone_cpu_chunk_stage_trace =
         std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
+    const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
 
     if (phone_resident_input) {
         ggml_tensor * stage_input_tensor =
@@ -2587,54 +2588,92 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
-    ggml_backend_t terminal_keep_meta_backend = nullptr;
-    ggml_backend_t terminal_discard_meta_backend = nullptr;
+    std::vector<ggml_backend_t> terminal_policy_meta_backends;
     if (terminal_phone_stage) {
-        const int n_backends =
-            ggml_backend_sched_get_n_backends(sched_use);
-        for (int i = 0; i < n_backends; ++i) {
+        for (int split_id = 0; split_id < n_splits; ++split_id) {
             ggml_backend_t candidate =
-                ggml_backend_sched_get_backend(
-                    sched_use, i);
-            if (ggml_backend_is_meta(candidate)) {
-                terminal_keep_meta_backend = candidate;
-                break;
+                ggml_backend_sched_get_split_backend(
+                    sched_use, split_id);
+            if (!ggml_backend_is_meta(candidate)) {
+                continue;
+            }
+            if (std::find(
+                    terminal_policy_meta_backends.begin(),
+                    terminal_policy_meta_backends.end(),
+                    candidate) ==
+                terminal_policy_meta_backends.end()) {
+                terminal_policy_meta_backends.push_back(candidate);
             }
         }
 
-        if (terminal_keep_meta_backend == nullptr ||
-            !ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                terminal_keep_meta_backend, true)) {
+        if (terminal_policy_meta_backends.empty()) {
             LLAMA_LOG_ERROR(
                 "[PHONE_STAGE_TERMINAL_KEEP_INTERNAL] "
-                "ub=%d block=%zu action=ARM_FAILED "
-                "tokens=[%u,%u) outputs=%d\n",
+                "ub=%d block=%zu action=ARM_FAILED reason=NO_META_SPLIT "
+                "tokens=[%u,%u) outputs=%d splits=%d\n",
                 ubatch_id,
                 block_index,
                 token_begin,
                 token_begin + block_tokens,
-                block_outputs);
+                block_outputs,
+                n_splits);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        if (discard_phone_terminal_output) {
-            terminal_discard_meta_backend =
-                terminal_keep_meta_backend;
-            if (!ggml_backend_meta_set_phone_stage_terminal_discard(
-                    terminal_discard_meta_backend, true)) {
-                (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-                    terminal_keep_meta_backend, false);
+        size_t armed_count = 0;
+        for (ggml_backend_t policy_backend :
+                terminal_policy_meta_backends) {
+            if (!ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                    policy_backend, true)) {
+                for (size_t j = 0; j < armed_count; ++j) {
+                    (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                        terminal_policy_meta_backends[j], false);
+                }
                 LLAMA_LOG_ERROR(
-                    "[PHONE_STAGE_TERMINAL_DISCARD] "
+                    "[PHONE_STAGE_TERMINAL_KEEP_INTERNAL] "
                     "ub=%d block=%zu action=ARM_FAILED "
-                    "tokens=[%u,%u)\n",
+                    "tokens=[%u,%u) outputs=%d backend=%s\n",
                     ubatch_id,
                     block_index,
                     token_begin,
-                    token_begin + block_tokens);
+                    token_begin + block_tokens,
+                    block_outputs,
+                    ggml_backend_name(policy_backend));
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
+            }
+            ++armed_count;
+        }
+
+        if (discard_phone_terminal_output) {
+            size_t discard_armed_count = 0;
+            for (ggml_backend_t policy_backend :
+                    terminal_policy_meta_backends) {
+                if (!ggml_backend_meta_set_phone_stage_terminal_discard(
+                        policy_backend, true)) {
+                    for (size_t j = 0; j < discard_armed_count; ++j) {
+                        (void) ggml_backend_meta_set_phone_stage_terminal_discard(
+                            terminal_policy_meta_backends[j], false);
+                    }
+                    for (ggml_backend_t keep_backend :
+                            terminal_policy_meta_backends) {
+                        (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                            keep_backend, false);
+                    }
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_STAGE_TERMINAL_DISCARD] "
+                        "ub=%d block=%zu action=ARM_FAILED "
+                        "tokens=[%u,%u) backend=%s\n",
+                        ubatch_id,
+                        block_index,
+                        token_begin,
+                        token_begin + block_tokens,
+                        ggml_backend_name(policy_backend));
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                ++discard_armed_count;
             }
         }
 
@@ -2642,13 +2681,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             LLAMA_LOG_DEBUG(
                 "[PHONE_STAGE_TERMINAL_POLICY] "
                 "ub=%d block=%zu outputs=%d discard=%d "
-                "tokens=[%u,%u) action=ARM_OK\n",
+                "tokens=[%u,%u) meta_splits=%zu action=ARM_OK\n",
                 ubatch_id,
                 block_index,
                 block_outputs,
                 discard_phone_terminal_output ? 1 : 0,
                 token_begin,
-                token_begin + block_tokens);
+                token_begin + block_tokens,
+                terminal_policy_meta_backends.size());
         }
     }
 
@@ -2695,7 +2735,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
-    const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     if (phone_cpu_chunk_stage_trace) {
         LLAMA_LOG_DEBUG(
             "[HYBRID_STAGE_CHECK] stage=%s layers=[%d,%d) tokens=%u "
@@ -2941,15 +2980,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
     const bool defer_terminal_policy_clear =
         async_meta_armed && ret == GGML_STATUS_SUCCESS;
-    if (!defer_terminal_policy_clear &&
-        terminal_discard_meta_backend != nullptr) {
-        (void) ggml_backend_meta_set_phone_stage_terminal_discard(
-            terminal_discard_meta_backend, false);
-    }
-    if (!defer_terminal_policy_clear &&
-        terminal_keep_meta_backend != nullptr) {
-        (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
-            terminal_keep_meta_backend, false);
+    if (!defer_terminal_policy_clear) {
+        for (ggml_backend_t policy_backend :
+                terminal_policy_meta_backends) {
+            if (discard_phone_terminal_output) {
+                (void) ggml_backend_meta_set_phone_stage_terminal_discard(
+                    policy_backend, false);
+            }
+            (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                policy_backend, false);
+        }
     }
     if (resident_output_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_resident_handoff(
