@@ -524,6 +524,8 @@ extern "C" {
         ggml_backend_t backend, bool enabled);
     GGML_API bool ggml_backend_meta_set_phone_stage_terminal_discard(
         ggml_backend_t backend, bool enabled);
+    GGML_API bool ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+        ggml_backend_t backend, bool enabled);
     GGML_API bool ggml_backend_meta_phone_stage_bridge_store(
         ggml_backend_t backend,
         const struct ggml_tensor * tensor,
