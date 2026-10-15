@@ -5900,15 +5900,25 @@ bool rpc_server::phone_ffn_mark_ready(
     }
 
     if (ring_graph_marker) {
+        const bool ring_npu_async =
+            std::getenv("GGML_RPC_DISABLE_CHUNK_RING_NPU_ASYNC") == nullptr;
+
+        if (!ring_npu_async) {
+            {
+                std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
+                phone_ffn_ready_seqs[request.device].insert(request.seq);
+            }
+            phone_ffn_ready_cv.notify_all();
+        }
+
         if (rpc_tensor_phone_stage_profile_enabled()) {
-            std::fprintf(
-                stderr,
+            GGML_LOG_INFO(
                 "[TENSOR_PHONE_RPC_STAGE] side=phone "
                 "stage=phone_ffn_graph_returned device=%u "
-                "seq=%" PRIu64 " ring_async=1\n",
+                "seq=%" PRIu64 " ring_async=%d\n",
                 request.device,
-                request.seq);
-            std::fflush(stderr);
+                request.seq,
+                ring_npu_async ? 1 : 0);
         }
         return true;
     }
@@ -8294,7 +8304,10 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         cursor = stage.down_index + 1;
     }
 
-    if (cpu_reduce_seq != 0) {
+    const bool ring_npu_async =
+        std::getenv("GGML_RPC_DISABLE_CHUNK_RING_NPU_ASYNC") == nullptr;
+
+    if (cpu_reduce_seq != 0 && ring_npu_async) {
         GGML_ASSERT(stages.size() == 1);
         const rpc_phone_npu_ffn_stage & stage = stages[0];
 
