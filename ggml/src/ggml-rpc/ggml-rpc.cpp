@@ -8281,6 +8281,65 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         cursor = stage.down_index + 1;
     }
 
+    if (cpu_reduce_seq != 0) {
+        GGML_ASSERT(stages.size() == 1);
+        const rpc_phone_npu_ffn_stage & stage = stages[0];
+
+        if (stage.front_end > 0) {
+            ggml_cgraph front = rpc_graph_view(
+                graph, 0, stage.front_end);
+            const ggml_status front_status =
+                ggml_backend_graph_compute(gpu, &front);
+            if (front_status != GGML_STATUS_SUCCESS) {
+                return front_status;
+            }
+        }
+
+        rpc_phone_npu_async_job job;
+        if (!prepare_phone_npu_async_job(
+                device,
+                cpu_reduce_seq,
+                graph,
+                stage,
+                job)) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_NPU_ASYNC] "
+                "seq=%" PRIu64 " layer=%d chunk=%d "
+                "status=FAIL reason=prepare_job\n",
+                cpu_reduce_seq,
+                stage.layer,
+                stage.chunk);
+            return GGML_STATUS_FAILED;
+        }
+
+        ensure_phone_npu_async_worker();
+        {
+            std::lock_guard<std::mutex> async_lock(
+                phone_npu_async_mutex);
+            if (phone_npu_async_stop) {
+                return GGML_STATUS_FAILED;
+            }
+            phone_npu_async_jobs.push_back(
+                std::move(job));
+        }
+        phone_npu_async_cv.notify_one();
+
+        GGML_LOG_INFO(
+            "[CHUNK_RING_NPU_ASYNC_ENQUEUE] "
+            "seq=%" PRIu64 " layer=%d chunk=%d tokens=%" PRId64
+            " queue_depth=%zu\n",
+            cpu_reduce_seq,
+            stage.layer,
+            stage.chunk,
+            stage.norm->ne[1],
+            phone_npu_async_jobs.size());
+
+        // The Ring-owned FFN stage is terminal by construction.  Returning
+        // here frees the compute socket so the next Attention chunk can run
+        // while the dedicated HTP worker processes this job.
+        return GGML_STATUS_SUCCESS;
+    }
+
     std::lock_guard<std::mutex> lock(phone_npu_mutex);
 
     cursor = 0;
