@@ -5853,6 +5853,16 @@ bool rpc_server::phone_ffn_mark_ready(
         {
             std::lock_guard<std::mutex> lock(
                 phone_npu_cpu_reduce_mutex);
+            auto & active =
+                phone_npu_cpu_reduce_active[request.device];
+            if (!active.insert(seq).second) {
+                GGML_LOG_ERROR(
+                    "[CHUNK_RING_CPU_ARM] device=%u seq=%" PRIu64
+                    " status=FAIL reason=duplicate_seq\n",
+                    request.device,
+                    seq);
+                return false;
+            }
             phone_npu_cpu_reduce_armed[request.device].
                 push_back(seq);
         }
@@ -5861,6 +5871,32 @@ bool rpc_server::phone_ffn_mark_ready(
             "[CHUNK_RING_CPU_ARM] device=%u seq=%" PRIu64 "\n",
             request.device,
             seq);
+        return true;
+    }
+
+    bool ring_owned = false;
+    {
+        std::lock_guard<std::mutex> join_lock(
+            phone_npu_cpu_reduce_mutex);
+        auto active_it =
+            phone_npu_cpu_reduce_active.find(request.device);
+        ring_owned =
+            active_it != phone_npu_cpu_reduce_active.end() &&
+            active_it->second.find(request.seq) !=
+                active_it->second.end();
+    }
+
+    if (ring_owned) {
+        if (rpc_tensor_phone_stage_profile_enabled()) {
+            std::fprintf(
+                stderr,
+                "[TENSOR_PHONE_RPC_STAGE] side=phone "
+                "stage=phone_ffn_graph_returned device=%u "
+                "seq=%" PRIu64 " ring_async=1\n",
+                request.device,
+                request.seq);
+            std::fflush(stderr);
+        }
         return true;
     }
 
@@ -5969,12 +6005,26 @@ bool rpc_server::set_tensor_async_return_wait(
 
     rpc_phone_npu_cpu_reduce_entry cpu_entry;
     bool cpu_reduce = false;
+    bool cpu_reduce_failed = false;
     {
         std::lock_guard<std::mutex> lock(
             phone_npu_cpu_reduce_mutex);
+
+        auto failed_it =
+            phone_npu_cpu_reduce_failed.find(request.device);
+        if (failed_it != phone_npu_cpu_reduce_failed.end()) {
+            cpu_reduce_failed =
+                failed_it->second.erase(
+                    request.phone_ffn_seq) != 0;
+            if (failed_it->second.empty()) {
+                phone_npu_cpu_reduce_failed.erase(failed_it);
+            }
+        }
+
         auto device_it =
             phone_npu_cpu_reduce_pending.find(request.device);
-        if (device_it != phone_npu_cpu_reduce_pending.end()) {
+        if (!cpu_reduce_failed &&
+                device_it != phone_npu_cpu_reduce_pending.end()) {
             auto entry_it =
                 device_it->second.find(request.phone_ffn_seq);
             if (entry_it != device_it->second.end()) {
@@ -5986,6 +6036,29 @@ bool rpc_server::set_tensor_async_return_wait(
                 cpu_reduce = true;
             }
         }
+
+        if (cpu_reduce_failed) {
+            auto active_it =
+                phone_npu_cpu_reduce_active.find(request.device);
+            if (active_it !=
+                    phone_npu_cpu_reduce_active.end()) {
+                active_it->second.erase(
+                    request.phone_ffn_seq);
+                if (active_it->second.empty()) {
+                    phone_npu_cpu_reduce_active.erase(active_it);
+                }
+            }
+        }
+    }
+
+    if (cpu_reduce_failed) {
+        GGML_LOG_ERROR(
+            "[CHUNK_RING_CPU_REDUCE] seq=%" PRIu64
+            " status=FAIL reason=npu_async_failed "
+            "ffn_wait_ms=%.3f\n",
+            request.phone_ffn_seq,
+            wait_us / 1000.0);
+        return false;
     }
 
     const uint8_t * wire_data =
@@ -6050,6 +6123,23 @@ bool rpc_server::set_tensor_async_return_wait(
             original_size);
         const int64_t upload_us =
             ggml_time_us() - upload_begin_us;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                phone_npu_cpu_reduce_mutex);
+            auto active_it =
+                phone_npu_cpu_reduce_active.find(
+                    request.device);
+            if (active_it !=
+                    phone_npu_cpu_reduce_active.end()) {
+                active_it->second.erase(
+                    request.phone_ffn_seq);
+                if (active_it->second.empty()) {
+                    phone_npu_cpu_reduce_active.erase(
+                        active_it);
+                }
+            }
+        }
 
         GGML_LOG_INFO(
             "[CHUNK_RING_CPU_REDUCE] "
