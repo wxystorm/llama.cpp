@@ -14081,6 +14081,28 @@ auto prefill_norm_sg_has_prework =
                 xlayer_direct_bound &&
                 return_task != 0;
 
+            if ((pipeline_debug || tensor_phone_stage_profile) &&
+                    phone_primary_chunk_ring) {
+                GGML_LOG_INFO(
+                    "[CHUNK_RING_DECISION] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "active=%d wave=%d range=[%d,%d] "
+                    "direct_bound=%d return_task=%" PRIu64
+                    " seq=%" PRIu64 " use_ring=%d defer_phone=%d\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i,
+                    phone_primary_chunk_ring_active ? 1 : 0,
+                    phone_primary_xlayer_wave ? 1 : 0,
+                    phone_primary_xlayer_first_layer,
+                    phone_primary_xlayer_last_layer,
+                    xlayer_direct_bound ? 1 : 0,
+                    return_task,
+                    phone_ffn_seq,
+                    use_ring_cpu_reduce ? 1 : 0,
+                    defer_local_phone_ffn ? 1 : 0);
+            }
+
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             int64_t phone_wall_us = 0;
             if (defer_local_phone_ffn) {
