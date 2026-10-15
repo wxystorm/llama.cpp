@@ -10078,12 +10078,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
 
                     int terminal_probe_layer = -1;
-                    if (suspicious_zero_dst &&
-                            nodes[active_backend] != nullptr &&
-                            std::sscanf(
-                                nodes[active_backend]->name,
-                                "Vcur-%d",
-                                &terminal_probe_layer) == 1) {
+                    const bool terminal_probe_layer_parsed =
+                        suspicious_zero_dst &&
+                        nodes[active_backend] != nullptr &&
+                        (std::sscanf(
+                             nodes[active_backend]->name,
+                             "Vcur-%d",
+                             &terminal_probe_layer) == 1 ||
+                         std::sscanf(
+                             nodes[active_backend]->name,
+                             "Kcur-%d",
+                             &terminal_probe_layer) == 1);
+                    if (terminal_probe_layer_parsed) {
                         char terminal_expected[64];
                         std::snprintf(
                             terminal_expected,
