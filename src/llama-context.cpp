@@ -4656,10 +4656,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const char * phone_primary_wavefront_env =
         std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_WAVEFRONT");
+    // Chunk Ring owns its own (layer, chunk) pipeline and must not implicitly
+    // enable the legacy Phone-primary wavefront execution path.  Keep
+    // wavefront as an explicit opt-in only.
     const bool phone_primary_wavefront_requested =
-        phone_primary_chunk_ring_requested ||
-        (phone_primary_wavefront_env != nullptr &&
-         std::atoi(phone_primary_wavefront_env) != 0);
+        phone_primary_wavefront_env != nullptr &&
+        std::atoi(phone_primary_wavefront_env) != 0;
 
     // Minimal cross-layer entry for the common P=0 Phone-primary layout:
     //
