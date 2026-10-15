@@ -5012,6 +5012,11 @@ private:
         phone_npu_cpu_reduce_pending;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>>
         phone_npu_cpu_reduce_active;
+    // One ordinary post-graph PHONE_FFN_MARK_READY is expected for every
+    // armed Ring seq.  Track that marker independently from active ownership
+    // so a very fast NPU+PC completion cannot make a late marker stale-ready.
+    std::unordered_map<uint32_t, std::unordered_set<uint64_t>>
+        phone_npu_cpu_reduce_marker_pending;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>>
         phone_npu_cpu_reduce_failed;
 
@@ -5863,6 +5868,8 @@ bool rpc_server::phone_ffn_mark_ready(
                     seq);
                 return false;
             }
+            phone_npu_cpu_reduce_marker_pending[
+                request.device].insert(seq);
             phone_npu_cpu_reduce_armed[request.device].
                 push_back(seq);
         }
@@ -5874,19 +5881,25 @@ bool rpc_server::phone_ffn_mark_ready(
         return true;
     }
 
-    bool ring_owned = false;
+    bool ring_graph_marker = false;
     {
         std::lock_guard<std::mutex> join_lock(
             phone_npu_cpu_reduce_mutex);
-        auto active_it =
-            phone_npu_cpu_reduce_active.find(request.device);
-        ring_owned =
-            active_it != phone_npu_cpu_reduce_active.end() &&
-            active_it->second.find(request.seq) !=
-                active_it->second.end();
+        auto marker_it =
+            phone_npu_cpu_reduce_marker_pending.find(
+                request.device);
+        if (marker_it !=
+                phone_npu_cpu_reduce_marker_pending.end()) {
+            ring_graph_marker =
+                marker_it->second.erase(request.seq) != 0;
+            if (marker_it->second.empty()) {
+                phone_npu_cpu_reduce_marker_pending.erase(
+                    marker_it);
+            }
+        }
     }
 
-    if (ring_owned) {
+    if (ring_graph_marker) {
         if (rpc_tensor_phone_stage_profile_enabled()) {
             std::fprintf(
                 stderr,
@@ -8743,6 +8756,7 @@ rpc_server::~rpc_server() {
         phone_npu_cpu_reduce_armed.clear();
         phone_npu_cpu_reduce_pending.clear();
         phone_npu_cpu_reduce_active.clear();
+        phone_npu_cpu_reduce_marker_pending.clear();
         phone_npu_cpu_reduce_failed.clear();
     }
     phone_npu_ffn_caches.clear();
