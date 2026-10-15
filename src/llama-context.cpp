@@ -2493,14 +2493,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         stage.layer_end < (int) model.hparams.n_layer() &&
         model.hybrid_layer_mode(stage.layer_end) ==
             llama_hybrid_layer_mode::PHONE_ONLY;
+    const bool terminal_phone_stage =
+        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        stage.layer_end == (int) model.hparams.n_layer();
+
     // A terminal PHONE stage with no requested block/stage output only
     // needs to commit its side effects (for example KV updates).  This is
     // independent of whether its input arrived through the resident bridge.
-    // Keep all Phone-only scheduler splits local so Meta does not manufacture
-    // a transient Phone->CPU export of an internal Kcur/Vcur zero shard.
     const bool discard_phone_terminal_output =
-        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        stage.layer_end == (int) model.hparams.n_layer() &&
+        terminal_phone_stage &&
         stage_output == nullptr &&
         block_outputs == 0;
 
@@ -2586,8 +2587,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         }
     }
 
+    ggml_backend_t terminal_keep_meta_backend = nullptr;
     ggml_backend_t terminal_discard_meta_backend = nullptr;
-    if (discard_phone_terminal_output) {
+    if (terminal_phone_stage) {
         const int n_backends =
             ggml_backend_sched_get_n_backends(sched_use);
         for (int i = 0; i < n_backends; ++i) {
@@ -2595,35 +2597,56 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 ggml_backend_sched_get_backend(
                     sched_use, i);
             if (ggml_backend_is_meta(candidate)) {
-                terminal_discard_meta_backend =
-                    candidate;
+                terminal_keep_meta_backend = candidate;
                 break;
             }
         }
 
-        if (terminal_discard_meta_backend == nullptr ||
-            !ggml_backend_meta_set_phone_stage_terminal_discard(
-                terminal_discard_meta_backend, true)) {
+        if (terminal_keep_meta_backend == nullptr ||
+            !ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                terminal_keep_meta_backend, true)) {
             LLAMA_LOG_ERROR(
-                "[PHONE_STAGE_TERMINAL_DISCARD] "
+                "[PHONE_STAGE_TERMINAL_KEEP_INTERNAL] "
                 "ub=%d block=%zu action=ARM_FAILED "
-                "tokens=[%u,%u)\n",
+                "tokens=[%u,%u) outputs=%d\n",
                 ubatch_id,
                 block_index,
                 token_begin,
-                token_begin + block_tokens);
+                token_begin + block_tokens,
+                block_outputs);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
+        if (discard_phone_terminal_output) {
+            terminal_discard_meta_backend =
+                terminal_keep_meta_backend;
+            if (!ggml_backend_meta_set_phone_stage_terminal_discard(
+                    terminal_discard_meta_backend, true)) {
+                (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                    terminal_keep_meta_backend, false);
+                LLAMA_LOG_ERROR(
+                    "[PHONE_STAGE_TERMINAL_DISCARD] "
+                    "ub=%d block=%zu action=ARM_FAILED "
+                    "tokens=[%u,%u)\n",
+                    ubatch_id,
+                    block_index,
+                    token_begin,
+                    token_begin + block_tokens);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+
         if (phone_cpu_chunk_stage_trace) {
             LLAMA_LOG_DEBUG(
-                "[PHONE_STAGE_TERMINAL_DISCARD] "
-                "ub=%d block=%zu outputs=%d "
+                "[PHONE_STAGE_TERMINAL_POLICY] "
+                "ub=%d block=%zu outputs=%d discard=%d "
                 "tokens=[%u,%u) action=ARM_OK\n",
                 ubatch_id,
                 block_index,
                 block_outputs,
+                discard_phone_terminal_output ? 1 : 0,
                 token_begin,
                 token_begin + block_tokens);
         }
@@ -2916,9 +2939,17 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
         }
     }
-    if (terminal_discard_meta_backend != nullptr) {
+    const bool defer_terminal_policy_clear =
+        async_meta_armed && ret == GGML_STATUS_SUCCESS;
+    if (!defer_terminal_policy_clear &&
+        terminal_discard_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_terminal_discard(
             terminal_discard_meta_backend, false);
+    }
+    if (!defer_terminal_policy_clear &&
+        terminal_keep_meta_backend != nullptr) {
+        (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+            terminal_keep_meta_backend, false);
     }
     if (resident_output_meta_backend != nullptr) {
         (void) ggml_backend_meta_set_phone_stage_resident_handoff(
@@ -6069,6 +6100,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const ggml_status async_meta_status =
                 ggml_backend_meta_wait_async_graph(
                     phone_split_backend);
+            // Terminal Phone ownership policies must remain armed until the
+            // async Meta worker has fully exited. run_hybrid_stage_block()
+            // returns after preparation, before the worker executes its
+            // single-owner communication path.
+            (void) ggml_backend_meta_set_phone_stage_terminal_discard(
+                phone_split_backend, false);
+            (void) ggml_backend_meta_set_phone_stage_terminal_keep_internal(
+                phone_split_backend, false);
             if (async_meta_status != GGML_STATUS_SUCCESS) {
                 status = async_meta_status;
                 LLAMA_LOG_ERROR(
