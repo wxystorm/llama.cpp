@@ -268,6 +268,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_FFN_MARK_READY,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
+    RPC_CMD_RETURN_BULK_ACQUIRE,
     RPC_CMD_COUNT,
 };
 
@@ -289,6 +290,7 @@ static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must
 static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -467,6 +469,17 @@ struct rpc_msg_get_route_snapshot_req {
     uint64_t sizes[3];
 };
 
+struct rpc_msg_return_bulk_acquire_req {
+    uint64_t seq;
+};
+
+struct rpc_msg_return_bulk_acquire_rsp {
+    uint8_t active;
+    uint8_t reserved[7];
+    uint64_t inflight;
+    uint64_t limit;
+};
+
 struct rpc_msg_set_tensor_graph_req_v6 {
     rpc_tensor tensor;
     uint64_t offset;
@@ -633,6 +646,8 @@ struct ggml_backend_rpc_device_context {
     rpc_snapshot_client_stats snapshot_client_stats;
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
+    // -1 unknown, 0 disabled, 1 enabled. Learned lazily from the Phone server.
+    std::atomic<int> network_bulk_shared_active { -1 };
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -3628,6 +3643,9 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             get_return_transfer_socket(
                 rpc_ctx->endpoint,
                 return_lane);
+        rpc_dev_ctx->network_bulk_shared_active.store(
+            -1,
+            std::memory_order_relaxed);
     }
     auto sock = return_sock;
     RPC_STATUS_ASSERT(sock != nullptr);
@@ -3706,6 +3724,43 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     const bool measure_profile =
         stage_profile || throttle_profile;
 
+    constexpr uint8_t RPC_NETWORK_BULK_MIN_PATCH = 18;
+    int64_t bulk_grant_us = 0;
+    uint64_t bulk_grant_inflight = 0;
+    uint64_t bulk_grant_limit = 0;
+    if (remote_patch >= RPC_NETWORK_BULK_MIN_PATCH &&
+            rpc_dev_ctx->network_bulk_shared_active.load(
+                std::memory_order_relaxed) != 0) {
+        rpc_msg_return_bulk_acquire_req bulk_request {};
+        bulk_request.seq = phone_ffn_seq;
+        rpc_msg_return_bulk_acquire_rsp bulk_response {};
+
+        const int64_t grant_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        const bool grant_status = send_rpc_cmd(
+            sock,
+            RPC_CMD_RETURN_BULK_ACQUIRE,
+            &bulk_request,
+            sizeof(bulk_request),
+            &bulk_response,
+            sizeof(bulk_response));
+        const int64_t grant_done_us =
+            measure_profile ? ggml_time_us() : 0;
+        RPC_STATUS_ASSERT(grant_status);
+
+        const bool shared_bulk_active =
+            bulk_response.active != 0;
+        rpc_dev_ctx->network_bulk_shared_active.store(
+            shared_bulk_active ? 1 : 0,
+            std::memory_order_relaxed);
+        bulk_grant_us =
+            measure_profile ?
+                grant_done_us - grant_begin_us :
+                0;
+        bulk_grant_inflight = bulk_response.inflight;
+        bulk_grant_limit = bulk_response.limit;
+    }
+
     rpc_cmd_roundtrip_profile roundtrip_profile {};
     rpc_cmd_roundtrip_profile * const previous_profile =
         rpc_cmd_roundtrip_profile_active;
@@ -3737,11 +3792,15 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             stderr,
             "[XLAYER_RETURN_RPC] seq=%" PRIu64
             " lane=%zu bytes=%zu wire=%zu "
+            "grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
             "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
+            bulk_grant_us / 1000.0,
+            bulk_grant_inflight,
+            bulk_grant_limit,
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
@@ -3753,11 +3812,15 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         GGML_LOG_INFO(
             "[RETURN_RPC] seq=%" PRIu64
             " lane=%zu bytes=%zu wire=%zu "
+            "grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
             "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
+            bulk_grant_us / 1000.0,
+            bulk_grant_inflight,
+            bulk_grant_limit,
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
@@ -4897,34 +4960,64 @@ public:
             local_tensor_source = *tensor_source;
         }
 
-        const char * route_bulk_env =
-            std::getenv("GGML_RPC_ROUTE_BULK_INFLIGHT");
-        if (route_bulk_env != nullptr &&
-                route_bulk_env[0] != '\0') {
+        const char * network_bulk_env =
+            std::getenv("GGML_RPC_NETWORK_BULK_INFLIGHT");
+        if (network_bulk_env != nullptr &&
+                network_bulk_env[0] != '\0') {
             char * end = nullptr;
             const long parsed =
-                std::strtol(route_bulk_env, &end, 10);
-            if (end != route_bulk_env &&
+                std::strtol(network_bulk_env, &end, 10);
+            if (end != network_bulk_env &&
                     *end == '\0' &&
                     parsed >= 1) {
+                network_bulk_shared = true;
                 route_bulk_limit =
                     std::min<size_t>(
-                        RPC_ROUTE_TRANSFER_LANES,
+                        RPC_ROUTE_TRANSFER_LANES +
+                            RPC_RETURN_TRANSFER_LANES,
                         static_cast<size_t>(parsed));
+                GGML_LOG_INFO(
+                    "[RPC_NETWORK_BULK_LIMIT] inflight=%zu "
+                    "route_slots=%zu return_slots=%zu\n",
+                    route_bulk_limit,
+                    RPC_ROUTE_TRANSFER_LANES,
+                    RPC_RETURN_TRANSFER_LANES);
             } else {
                 GGML_LOG_WARN(
-                    "[RPC_ROUTE_BULK_LIMIT] invalid=%s "
-                    "using_default=%zu\n",
-                    route_bulk_env,
-                    RPC_ROUTE_TRANSFER_LANES);
+                    "[RPC_NETWORK_BULK_LIMIT] invalid=%s "
+                    "shared_limit_disabled=1\n",
+                    network_bulk_env);
             }
         }
 
-        if (route_bulk_env != nullptr) {
-            GGML_LOG_INFO(
-                "[RPC_ROUTE_BULK_LIMIT] inflight=%zu slots=%zu\n",
-                route_bulk_limit,
-                RPC_ROUTE_TRANSFER_LANES);
+        // Keep the previous Route-only experiment as a fallback.
+        if (!network_bulk_shared) {
+            const char * route_bulk_env =
+                std::getenv("GGML_RPC_ROUTE_BULK_INFLIGHT");
+            if (route_bulk_env != nullptr &&
+                    route_bulk_env[0] != '\0') {
+                char * end = nullptr;
+                const long parsed =
+                    std::strtol(route_bulk_env, &end, 10);
+                if (end != route_bulk_env &&
+                        *end == '\0' &&
+                        parsed >= 1) {
+                    route_bulk_limit =
+                        std::min<size_t>(
+                            RPC_ROUTE_TRANSFER_LANES,
+                            static_cast<size_t>(parsed));
+                } else {
+                    GGML_LOG_WARN(
+                        "[RPC_ROUTE_BULK_LIMIT] invalid=%s "
+                        "using_default=%zu\n",
+                        route_bulk_env,
+                        RPC_ROUTE_TRANSFER_LANES);
+                }
+                GGML_LOG_INFO(
+                    "[RPC_ROUTE_BULK_LIMIT] inflight=%zu slots=%zu\n",
+                    route_bulk_limit,
+                    RPC_ROUTE_TRANSFER_LANES);
+            }
         }
     }
     ~rpc_server();
@@ -4980,6 +5073,13 @@ public:
     }
     size_t route_bulk_transfer_limit() const {
         return route_bulk_limit;
+    }
+    bool network_bulk_shared_enabled() const {
+        return network_bulk_shared;
+    }
+    bool route_bulk_wire_ack_required() const {
+        return network_bulk_shared ||
+            route_bulk_limit < RPC_ROUTE_TRANSFER_LANES;
     }
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -5125,14 +5225,13 @@ private:
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
         route_snapshot_devices;
 
-    // Keep the four stable route slots/GET lanes, but independently cap how
-    // many READY snapshots may enter the bulk TCP send phase at once. This
-    // avoids turning slot count into network concurrency and preserves the
-    // existing pre-armed GET / producer overlap.
+    // Bulk-wire admission. With GGML_RPC_NETWORK_BULK_INFLIGHT this one pool
+    // is shared by Phone->PC Route and PC->Phone Return payloads.
     std::mutex route_bulk_mutex;
     std::condition_variable route_bulk_cv;
     size_t route_bulk_inflight = 0;
     size_t route_bulk_limit = RPC_ROUTE_TRANSFER_LANES;
+    bool network_bulk_shared = false;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
@@ -9947,7 +10046,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     server.route_bulk_transfer_limit();
                 const bool wire_ack_required =
                     wire_ack_supported &&
-                    bulk_limit < RPC_ROUTE_TRANSFER_LANES;
+                    server.route_bulk_wire_ack_required();
                 const uint64_t wire_out_size =
                     out_size |
                     (wire_ack_required ?
