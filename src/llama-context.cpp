@@ -147,6 +147,150 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     return marker;
 }
 
+struct llama_hybrid_inner_membership_result {
+    std::vector<llama_hybrid_inner_node_membership> nodes;
+    int first_layer_node = -1;
+    int last_layer_node  = -1;
+    int covered_nodes    = 0;
+    int gap_nodes        = 0;
+    int transition_errors = 0;
+    bool chunked_markers = false;
+};
+
+static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_membership(
+        ggml_cgraph * gf) {
+    llama_hybrid_inner_membership_result result;
+    if (gf == nullptr) {
+        return result;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    result.nodes.resize((size_t) n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        result.nodes[(size_t) i].node_index = i;
+    }
+
+    int active_layer = -1;
+    int active_chunk = -1;
+    llama_hybrid_inner_stage_kind active_stage =
+        llama_hybrid_inner_stage_kind::UNKNOWN;
+
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const llama_hybrid_inner_stage_marker marker =
+            llama_hybrid_classify_inner_stage_marker(node->name);
+
+        if (marker.valid()) {
+            result.chunked_markers =
+                result.chunked_markers || marker.chunk >= 0;
+
+            switch (marker.kind) {
+                case llama_hybrid_inner_stage_kind::ATTN:
+                    if (marker.event == llama_hybrid_inner_stage_event::BEGIN) {
+                        if (active_stage != llama_hybrid_inner_stage_kind::UNKNOWN &&
+                            !(active_stage == llama_hybrid_inner_stage_kind::ATTN &&
+                              active_layer == marker.layer)) {
+                            ++result.transition_errors;
+                        }
+                        active_layer = marker.layer;
+                        active_chunk = marker.chunk;
+                        active_stage = llama_hybrid_inner_stage_kind::ATTN;
+                    } else if (marker.event == llama_hybrid_inner_stage_event::END) {
+                        if (active_stage != llama_hybrid_inner_stage_kind::ATTN ||
+                            active_layer != marker.layer) {
+                            ++result.transition_errors;
+                            active_layer = marker.layer;
+                            active_chunk = marker.chunk;
+                            active_stage = llama_hybrid_inner_stage_kind::ATTN;
+                        }
+                    }
+                    break;
+
+                case llama_hybrid_inner_stage_kind::FFN:
+                    if (marker.event == llama_hybrid_inner_stage_event::BEGIN) {
+                        if (active_layer != marker.layer ||
+                            (active_stage != llama_hybrid_inner_stage_kind::ATTN &&
+                             active_stage != llama_hybrid_inner_stage_kind::FFN)) {
+                            ++result.transition_errors;
+                        }
+                        active_layer = marker.layer;
+                        active_chunk = marker.chunk;
+                        active_stage = llama_hybrid_inner_stage_kind::FFN;
+                    } else if (marker.event == llama_hybrid_inner_stage_event::END) {
+                        if (active_stage != llama_hybrid_inner_stage_kind::FFN ||
+                            active_layer != marker.layer) {
+                            ++result.transition_errors;
+                            active_layer = marker.layer;
+                            active_chunk = marker.chunk;
+                            active_stage = llama_hybrid_inner_stage_kind::FFN;
+                        }
+                    }
+                    break;
+
+                case llama_hybrid_inner_stage_kind::REDUCE:
+                    if (marker.event == llama_hybrid_inner_stage_event::END) {
+                        if (active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
+                            active_layer != marker.layer) {
+                            ++result.transition_errors;
+                            active_layer = marker.layer;
+                            active_chunk = marker.chunk;
+                            active_stage = llama_hybrid_inner_stage_kind::REDUCE;
+                        }
+                    }
+                    break;
+
+                case llama_hybrid_inner_stage_kind::UNKNOWN:
+                    break;
+            }
+        }
+
+        if (active_layer >= 0 &&
+            active_stage != llama_hybrid_inner_stage_kind::UNKNOWN) {
+            llama_hybrid_inner_node_membership & membership =
+                result.nodes[(size_t) i];
+            membership.layer = active_layer;
+            membership.chunk = active_chunk;
+            membership.stage = active_stage;
+            ++result.covered_nodes;
+            if (result.first_layer_node < 0) {
+                result.first_layer_node = i;
+            }
+            result.last_layer_node = i;
+        }
+
+        if (marker.valid() &&
+            marker.kind == llama_hybrid_inner_stage_kind::FFN &&
+            marker.event == llama_hybrid_inner_stage_event::END &&
+            marker.chunk < 0) {
+            // The MoE result belongs to FFN.  The residual join / cvec nodes
+            // that follow it belong to REDUCE until l_out closes the layer.
+            active_stage = llama_hybrid_inner_stage_kind::REDUCE;
+            active_chunk = -1;
+        }
+
+        if (marker.valid() &&
+            marker.kind == llama_hybrid_inner_stage_kind::REDUCE &&
+            marker.event == llama_hybrid_inner_stage_event::END) {
+            active_layer = -1;
+            active_chunk = -1;
+            active_stage = llama_hybrid_inner_stage_kind::UNKNOWN;
+        }
+    }
+
+    if (result.first_layer_node >= 0 &&
+        result.last_layer_node >= result.first_layer_node) {
+        for (int i = result.first_layer_node;
+             i <= result.last_layer_node;
+             ++i) {
+            if (!result.nodes[(size_t) i].valid()) {
+                ++result.gap_nodes;
+            }
+        }
+    }
+
+    return result;
+}
+
 static const char * llama_hybrid_inner_target_name(const char * value) {
     if (value == nullptr || value[0] == '\0') {
         return nullptr;
@@ -288,41 +432,54 @@ static void llama_hybrid_log_inner_stage_bindings(
         std::string attn;
         std::string ffn;
         std::string reduce;
+        int attn_nodes   = 0;
+        int ffn_nodes    = 0;
+        int reduce_nodes = 0;
+        int unassigned_nodes = 0;
     };
 
     const int n_layer = (int) model.hparams.n_layer();
     std::vector<layer_binding> bindings((size_t) n_layer);
 
+    const llama_hybrid_inner_membership_result membership =
+        llama_hybrid_build_inner_node_membership(gf);
     const int n_nodes = ggml_graph_n_nodes(gf);
-    for (int i = 0; i < n_nodes; ++i) {
-        ggml_tensor * node = ggml_graph_node(gf, i);
-        const llama_hybrid_inner_stage_marker marker =
-            llama_hybrid_classify_inner_stage_marker(node->name);
-        if (!marker.valid() ||
-            marker.layer < 0 ||
-            marker.layer >= n_layer) {
+
+    for (const llama_hybrid_inner_node_membership & item :
+         membership.nodes) {
+        if (!item.valid() ||
+            item.layer < 0 ||
+            item.layer >= n_layer) {
             continue;
         }
 
+        ggml_tensor * node =
+            ggml_graph_node(gf, item.node_index);
         ggml_backend_t assigned =
             ggml_backend_sched_get_tensor_backend(sched_use, node);
         const char * assigned_name =
             assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
 
-        layer_binding & binding = bindings[(size_t) marker.layer];
+        layer_binding & binding = bindings[(size_t) item.layer];
         binding.seen = true;
-        binding.outer = outer_for_layer(marker.layer);
+        binding.outer = outer_for_layer(item.layer);
+        if (assigned == nullptr) {
+            ++binding.unassigned_nodes;
+        }
 
-        switch (marker.kind) {
+        switch (item.stage) {
             case llama_hybrid_inner_stage_kind::ATTN:
+                ++binding.attn_nodes;
                 llama_hybrid_inner_merge_backend(
                     binding.attn, assigned_name);
                 break;
             case llama_hybrid_inner_stage_kind::FFN:
+                ++binding.ffn_nodes;
                 llama_hybrid_inner_merge_backend(
                     binding.ffn, assigned_name);
                 break;
             case llama_hybrid_inner_stage_kind::REDUCE:
+                ++binding.reduce_nodes;
                 llama_hybrid_inner_merge_backend(
                     binding.reduce, assigned_name);
                 break;
@@ -332,18 +489,29 @@ static void llama_hybrid_log_inner_stage_bindings(
 
         if (verbose) {
             LLAMA_LOG_INFO(
-                "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
-                "stage=%s event=%s tensor=%s backend=%s\n",
+                "[INNER_NODE_BIND] outer=%s layer=%d chunk=%d "
+                "stage=%s node=%d op=%s tensor=%s backend=%s\n",
                 binding.outer.c_str(),
-                marker.layer, marker.chunk,
-                llama_hybrid_inner_stage_name(marker.kind),
-                llama_hybrid_inner_stage_event_name(marker.event),
-                node->name, assigned_name);
+                item.layer, item.chunk,
+                llama_hybrid_inner_stage_name(item.stage),
+                item.node_index,
+                ggml_op_name(node->op),
+                node->name,
+                assigned_name);
         }
     }
 
     const int scope_begin = stage != nullptr ? stage->layer_begin : 0;
     const int scope_end   = stage != nullptr ? stage->layer_end : n_layer;
+    const int layer_span_nodes =
+        membership.first_layer_node >= 0 &&
+        membership.last_layer_node >= membership.first_layer_node ?
+            membership.last_layer_node - membership.first_layer_node + 1 : 0;
+    const bool membership_ok =
+        !membership.chunked_markers &&
+        membership.transition_errors == 0 &&
+        membership.gap_nodes == 0 &&
+        layer_span_nodes == membership.covered_nodes;
 
     LLAMA_LOG_INFO(
         "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
@@ -354,6 +522,18 @@ static void llama_hybrid_log_inner_stage_bindings(
         reused_graph ? 1 : 0,
         n_nodes,
         have_target ? 1 : 0);
+    LLAMA_LOG_INFO(
+        "[INNER_NODE_MEMBERSHIP] status=%s span=[%d,%d] "
+        "span_nodes=%d covered=%d gaps=%d transition_errors=%d "
+        "chunked_markers=%d\n",
+        membership_ok ? "OK" : "CHECK",
+        membership.first_layer_node,
+        membership.last_layer_node,
+        layer_span_nodes,
+        membership.covered_nodes,
+        membership.gap_nodes,
+        membership.transition_errors,
+        membership.chunked_markers ? 1 : 0);
 
     auto same_binding = [&](int a, int b) {
         const layer_binding & x = bindings[(size_t) a];
@@ -417,6 +597,7 @@ static void llama_hybrid_log_inner_stage_bindings(
         LLAMA_LOG_INFO(
             "[INNER_STAGE_MAP] layers=[%d,%d) outer=%s pc_only=%d "
             "actual={attn:%s,ffn:%s,reduce:%s} "
+            "nodes={attn:%d,ffn:%d,reduce:%d,unassigned:%d} "
             "target={attn:%s,ffn:%s,reduce:%s} "
             "mismatch={attn:%d,ffn:%d,reduce:%d,total:%d}\n",
             begin, end,
@@ -425,6 +606,10 @@ static void llama_hybrid_log_inner_stage_bindings(
             binding.attn.empty() ? "-" : binding.attn.c_str(),
             binding.ffn.empty() ? "-" : binding.ffn.c_str(),
             binding.reduce.empty() ? "-" : binding.reduce.c_str(),
+            binding.attn_nodes,
+            binding.ffn_nodes,
+            binding.reduce_nodes,
+            binding.unassigned_nodes,
             desired_attn != nullptr ? desired_attn : "-",
             desired_ffn != nullptr ? desired_ffn : "-",
             desired_reduce != nullptr ? desired_reduce : "-",
