@@ -1070,6 +1070,302 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
     return true;
 }
 
+
+static bool llama_hybrid_apply_pc_inner_policy(
+        const llama_model & model,
+        const std::vector<ggml_backend_ptr> & backends,
+        ggml_backend_t backend_cpu,
+        ggml_backend_sched_t sched_use,
+        ggml_cgraph * gf,
+        uint32_t ubatch_tokens) {
+    const char * enable_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY");
+    if (enable_env == nullptr || std::atoi(enable_env) == 0 || gf == nullptr) {
+        return false;
+    }
+
+    if (backend_cpu == nullptr) {
+        LLAMA_LOG_WARN(
+            "[INNER_PC_POLICY] status=SKIP reason=NO_CPU "
+            "tokens=%u\n",
+            ubatch_tokens);
+        return false;
+    }
+
+    int min_tokens = 32;
+    const char * min_tokens_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_MIN_TOKENS");
+    if (min_tokens_env != nullptr && min_tokens_env[0] != '\0') {
+        min_tokens = std::max(1, std::atoi(min_tokens_env));
+    }
+    if ((int) ubatch_tokens < min_tokens) {
+        LLAMA_LOG_INFO(
+            "[INNER_PC_POLICY] status=SKIP reason=TOKEN_GATE "
+            "tokens=%u min_tokens=%d\n",
+            ubatch_tokens, min_tokens);
+        return false;
+    }
+
+    ggml_backend_t cuda_backend =
+        llama_hybrid_find_cuda_backend(backends);
+    if (cuda_backend == nullptr) {
+        LLAMA_LOG_WARN(
+            "[INNER_PC_POLICY] status=SKIP reason=NO_CUDA "
+            "tokens=%u\n",
+            ubatch_tokens);
+        return false;
+    }
+
+    const llama_hybrid_inner_membership_result membership =
+        llama_hybrid_build_inner_node_membership(gf);
+
+    if (membership.gap_nodes != 0 ||
+        membership.transition_errors != 0 ||
+        membership.chunked_markers) {
+        LLAMA_LOG_WARN(
+            "[INNER_PC_POLICY] status=SKIP reason=BAD_MEMBERSHIP "
+            "tokens=%u gaps=%d transition_errors=%d chunked=%d\n",
+            ubatch_tokens,
+            membership.gap_nodes,
+            membership.transition_errors,
+            membership.chunked_markers ? 1 : 0);
+        return false;
+    }
+
+    const int n_layer = (int) model.hparams.n_layer();
+    int layer_begin = 0;
+    int layer_end   = n_layer;
+
+    const char * layer_begin_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_BEGIN");
+    const char * layer_end_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_END");
+    if (layer_begin_env != nullptr && layer_begin_env[0] != '\0') {
+        layer_begin = std::atoi(layer_begin_env);
+    }
+    if (layer_end_env != nullptr && layer_end_env[0] != '\0') {
+        layer_end = std::atoi(layer_end_env);
+    }
+    if (layer_begin < 0 || layer_end > n_layer || layer_begin >= layer_end) {
+        LLAMA_LOG_WARN(
+            "[INNER_PC_POLICY] status=SKIP reason=BAD_LAYER_RANGE "
+            "tokens=%u layers=[%d,%d) n_layer=%d\n",
+            ubatch_tokens, layer_begin, layer_end, n_layer);
+        return false;
+    }
+
+    const ggml_backend_dev_t cpu_device =
+        ggml_backend_get_device(backend_cpu);
+
+    // A graph can represent the full model or only one outer runtime stage.
+    // Select only layers that are actually present in this graph.  This keeps
+    // the policy independent of the current outer-stage partition.
+    std::vector<unsigned char> layer_present((size_t) n_layer, 0);
+    for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+        if (item.valid() && item.layer >= 0 && item.layer < n_layer) {
+            layer_present[(size_t) item.layer] = 1;
+        }
+    }
+
+    std::vector<unsigned char> selected((size_t) n_layer, 0);
+    int selected_layers = 0;
+    int first_layer = n_layer;
+    int last_layer  = -1;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        if (!layer_present[(size_t) il] ||
+            model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::PC_ONLY ||
+            model.dev_layer(il) != cpu_device) {
+            continue;
+        }
+
+        selected[(size_t) il] = 1;
+        ++selected_layers;
+        first_layer = std::min(first_layer, il);
+        last_layer  = std::max(last_layer, il);
+    }
+
+    if (selected_layers == 0) {
+        // Normal for graphs belonging to another outer stage.
+        return false;
+    }
+
+    struct layer_stats {
+        int attn_nodes     = 0;
+        int compute_nodes  = 0;
+        int alias_nodes    = 0;
+        int anchored_state = 0;
+        int anchored_alias = 0;
+    };
+
+    std::vector<layer_stats> stats((size_t) n_layer);
+    std::vector<ggml_tensor *> compute_nodes;
+    std::vector<ggml_tensor *> alias_nodes;
+
+    auto contains_compute = [&](ggml_tensor * needle) {
+        return std::find(
+            compute_nodes.begin(), compute_nodes.end(), needle) !=
+            compute_nodes.end();
+    };
+
+    // Phase 1 is validation only.  Do not assign any backend until every
+    // selected Attention compute node has been proven CUDA-capable.  This
+    // avoids leaving a partially migrated region if one later layer fails.
+    for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+        if (!item.valid() ||
+            item.layer < 0 ||
+            item.layer >= n_layer ||
+            !selected[(size_t) item.layer] ||
+            item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+            continue;
+        }
+
+        layer_stats & st = stats[(size_t) item.layer];
+        ++st.attn_nodes;
+
+        ggml_tensor * node = ggml_graph_node(gf, item.node_index);
+        const bool is_alias =
+            llama_hybrid_is_view_op(node->op) ||
+            node->view_src != nullptr;
+        const bool is_state_write =
+            node->op == GGML_OP_SET_ROWS ||
+            node->op == GGML_OP_CPY;
+        const bool has_fixed_storage =
+            node->buffer != nullptr;
+
+        if (is_alias) {
+            continue;
+        }
+        if (is_state_write || has_fixed_storage || node->op == GGML_OP_NONE) {
+            ++st.anchored_state;
+            continue;
+        }
+        if (!ggml_backend_supports_op(cuda_backend, node)) {
+            LLAMA_LOG_WARN(
+                "[INNER_PC_POLICY] status=SKIP "
+                "reason=ATTN_COMPUTE_UNSUPPORTED "
+                "layer=%d tokens=%u node=%d tensor=%s op=%s backend=%s\n",
+                item.layer, ubatch_tokens,
+                item.node_index, node->name, ggml_op_name(node->op),
+                ggml_backend_name(cuda_backend));
+            return false;
+        }
+
+        compute_nodes.push_back(node);
+        ++st.compute_nodes;
+    }
+
+    for (int il = first_layer; il <= last_layer; ++il) {
+        if (!selected[(size_t) il]) {
+            continue;
+        }
+        const layer_stats & st = stats[(size_t) il];
+        if (st.attn_nodes == 0 || st.compute_nodes == 0) {
+            LLAMA_LOG_WARN(
+                "[INNER_PC_POLICY] status=SKIP reason=EMPTY_ATTN_STAGE "
+                "layer=%d tokens=%u attn_nodes=%d compute=%d\n",
+                il, ubatch_tokens, st.attn_nodes, st.compute_nodes);
+            return false;
+        }
+    }
+
+    // Temporary views follow a migrated compute root.  Views rooted in
+    // persistent/preallocated storage remain with that storage owner.
+    for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+        if (!item.valid() ||
+            item.layer < 0 ||
+            item.layer >= n_layer ||
+            !selected[(size_t) item.layer] ||
+            item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+            continue;
+        }
+
+        ggml_tensor * node = ggml_graph_node(gf, item.node_index);
+        const bool is_alias =
+            llama_hybrid_is_view_op(node->op) ||
+            node->view_src != nullptr;
+        if (!is_alias) {
+            continue;
+        }
+
+        ggml_tensor * root = node;
+        while (root->view_src != nullptr) {
+            root = root->view_src;
+        }
+
+        layer_stats & st = stats[(size_t) item.layer];
+        if (contains_compute(root)) {
+            alias_nodes.push_back(node);
+            ++st.alias_nodes;
+        } else {
+            ++st.anchored_alias;
+        }
+    }
+
+    // Phase 2: commit the validated stage policy.  FFN and REDUCE are left
+    // untouched and therefore inherit the existing PC CPU placement.  KV and
+    // other persistent Attention state also remain on their storage owner.
+    for (ggml_tensor * node : compute_nodes) {
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, node, cuda_backend);
+    }
+    for (ggml_tensor * node : alias_nodes) {
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, node, cuda_backend);
+    }
+
+    const char * verbose_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_VERBOSE");
+    const bool verbose =
+        verbose_env != nullptr && std::atoi(verbose_env) != 0;
+
+    int total_attn_nodes = 0;
+    int total_compute = 0;
+    int total_aliases = 0;
+    int total_anchored_state = 0;
+    int total_anchored_alias = 0;
+
+    for (int il = first_layer; il <= last_layer; ++il) {
+        if (!selected[(size_t) il]) {
+            continue;
+        }
+
+        const layer_stats & st = stats[(size_t) il];
+        total_attn_nodes      += st.attn_nodes;
+        total_compute         += st.compute_nodes;
+        total_aliases         += st.alias_nodes;
+        total_anchored_state  += st.anchored_state;
+        total_anchored_alias  += st.anchored_alias;
+
+        if (verbose) {
+            LLAMA_LOG_INFO(
+                "[INNER_PC_POLICY_LAYER] status=APPLIED "
+                "layer=%d tokens=%u attn_nodes=%d compute=%d aliases=%d "
+                "anchored_state=%d anchored_alias=%d "
+                "attn=%s ffn=INHERIT_CPU reduce=INHERIT_CPU\n",
+                il, ubatch_tokens,
+                st.attn_nodes, st.compute_nodes, st.alias_nodes,
+                st.anchored_state, st.anchored_alias,
+                ggml_backend_name(cuda_backend));
+        }
+    }
+
+    LLAMA_LOG_INFO(
+        "[INNER_PC_POLICY] status=APPLIED "
+        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU "
+        "tokens=%u layers=[%d,%d) selected_layers=%d "
+        "attn_nodes=%d compute=%d aliases=%d "
+        "anchored_state=%d anchored_alias=%d backend=%s "
+        "membership={gaps:%d,transition_errors:%d}\n",
+        ubatch_tokens,
+        first_layer, last_layer + 1, selected_layers,
+        total_attn_nodes, total_compute, total_aliases,
+        total_anchored_state, total_anchored_alias,
+        ggml_backend_name(cuda_backend),
+        membership.gap_nodes,
+        membership.transition_errors);
+    return true;
+}
+
 static const char * llama_hybrid_inner_target_name(const char * value) {
     if (value == nullptr || value[0] == '\0') {
         return nullptr;
@@ -3544,10 +3840,16 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                     ggml_backend_name(stage_input_backend) : "(unassigned)");
         }
 
-        // First real inner-scheduler experiment.  It is explicitly gated and
-        // restricted to one PC_ONLY Attention stage.  Existing callback pins
-        // and dev_layer() placement remain unchanged; this overrides only the
-        // validated ATTN node membership immediately before scheduler alloc.
+        // Formal PC inner-stage policy.  It is still explicitly gated, but it
+        // applies to every CPU-direct PC_ONLY layer present in this graph.
+        // Only movable Attention compute and its temporary alias closure move
+        // to CUDA; FFN/REDUCE, KV state, dev_layer(), and weight residence are
+        // intentionally unchanged.
+        llama_hybrid_apply_pc_inner_policy(
+            model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens);
+
+        // Keep the single-layer migration probes as a regression/debug path.
+        // They use a separate gate and remain useful for isolating failures.
         llama_hybrid_apply_single_pc_attn_migration(
             model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens);
 
