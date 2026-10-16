@@ -347,7 +347,8 @@ static void llama_hybrid_log_inner_stage_bindings(
         ggml_cgraph * gf,
         const llama_hybrid_runtime_stage * stage,
         ggml_backend_t backend_cpu,
-        bool reused_graph) {
+        bool reused_graph,
+        uint32_t ubatch_tokens) {
     const char * env = std::getenv("LLAMA_HYBRID_INNER_STAGE_DIAG");
     if (env == nullptr || std::atoi(env) == 0 || gf == nullptr) {
         return;
@@ -515,11 +516,12 @@ static void llama_hybrid_log_inner_stage_bindings(
 
     LLAMA_LOG_INFO(
         "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
-        "have_plan=%d reused=%d nodes=%d target=%d\n",
+        "have_plan=%d reused=%d tokens=%u nodes=%d target=%d\n",
         stage != nullptr ? "STAGED" : "FULL_GRAPH",
         scope_begin, scope_end,
         have_plan ? 1 : 0,
         reused_graph ? 1 : 0,
+        ubatch_tokens,
         n_nodes,
         have_target ? 1 : 0);
     LLAMA_LOG_INFO(
@@ -534,6 +536,65 @@ static void llama_hybrid_log_inner_stage_bindings(
         membership.gap_nodes,
         membership.transition_errors,
         membership.chunked_markers ? 1 : 0);
+
+    if (!membership_ok && membership.gap_nodes > 0) {
+        int shown = 0;
+        constexpr int max_gap_logs = 8;
+        for (int i = membership.first_layer_node;
+             i <= membership.last_layer_node && shown < max_gap_logs;
+             ++i) {
+            if (i < 0 || membership.nodes[(size_t) i].valid()) {
+                continue;
+            }
+
+            int prev = i - 1;
+            while (prev >= membership.first_layer_node &&
+                   !membership.nodes[(size_t) prev].valid()) {
+                --prev;
+            }
+            int next = i + 1;
+            while (next <= membership.last_layer_node &&
+                   !membership.nodes[(size_t) next].valid()) {
+                ++next;
+            }
+
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            ggml_backend_t assigned =
+                ggml_backend_sched_get_tensor_backend(sched_use, node);
+
+            const llama_hybrid_inner_node_membership * prev_item =
+                prev >= membership.first_layer_node ?
+                    &membership.nodes[(size_t) prev] : nullptr;
+            const llama_hybrid_inner_node_membership * next_item =
+                next <= membership.last_layer_node ?
+                    &membership.nodes[(size_t) next] : nullptr;
+
+            LLAMA_LOG_INFO(
+                "[INNER_NODE_GAP] node=%d op=%s tensor=%s backend=%s "
+                "prev={node:%d,layer:%d,stage:%s} "
+                "next={node:%d,layer:%d,stage:%s}\n",
+                i,
+                ggml_op_name(node->op),
+                node->name,
+                assigned != nullptr ?
+                    ggml_backend_name(assigned) : "(unassigned)",
+                prev,
+                prev_item != nullptr ? prev_item->layer : -1,
+                prev_item != nullptr ?
+                    llama_hybrid_inner_stage_name(prev_item->stage) : "-",
+                next,
+                next_item != nullptr ? next_item->layer : -1,
+                next_item != nullptr ?
+                    llama_hybrid_inner_stage_name(next_item->stage) : "-");
+            ++shown;
+        }
+        if (membership.gap_nodes > max_gap_logs) {
+            LLAMA_LOG_INFO(
+                "[INNER_NODE_GAP] omitted=%d after_first=%d\n",
+                membership.gap_nodes - max_gap_logs,
+                max_gap_logs);
+        }
+    }
 
     auto same_binding = [&](int a, int b) {
         const layer_binding & x = bindings[(size_t) a];
@@ -623,6 +684,92 @@ static void llama_hybrid_log_inner_stage_bindings(
             mismatch_count);
 
         begin = end;
+    }
+
+    // If a stage reports MIXED, emit only the first differing node per
+    // (layer, stage).  This keeps diagnostics compact while identifying the
+    // exact op that prevents safe stage-wide migration.
+    struct mixed_probe {
+        std::string first_backend;
+        bool reported = false;
+    };
+    std::vector<mixed_probe> attn_probe((size_t) n_layer);
+    std::vector<mixed_probe> ffn_probe((size_t) n_layer);
+    std::vector<mixed_probe> reduce_probe((size_t) n_layer);
+
+    auto probe_for = [&](int il, llama_hybrid_inner_stage_kind kind)
+            -> mixed_probe & {
+        switch (kind) {
+            case llama_hybrid_inner_stage_kind::ATTN:
+                return attn_probe[(size_t) il];
+            case llama_hybrid_inner_stage_kind::FFN:
+                return ffn_probe[(size_t) il];
+            case llama_hybrid_inner_stage_kind::REDUCE:
+                return reduce_probe[(size_t) il];
+            case llama_hybrid_inner_stage_kind::UNKNOWN:
+                return attn_probe[(size_t) il];
+        }
+        return attn_probe[(size_t) il];
+    };
+
+    int mixed_reports = 0;
+    constexpr int max_mixed_reports = 12;
+    for (const llama_hybrid_inner_node_membership & item :
+         membership.nodes) {
+        if (!item.valid() ||
+            item.layer < scope_begin ||
+            item.layer >= scope_end ||
+            mixed_reports >= max_mixed_reports) {
+            continue;
+        }
+
+        const layer_binding & binding =
+            bindings[(size_t) item.layer];
+        const std::string * aggregate = nullptr;
+        switch (item.stage) {
+            case llama_hybrid_inner_stage_kind::ATTN:
+                aggregate = &binding.attn;
+                break;
+            case llama_hybrid_inner_stage_kind::FFN:
+                aggregate = &binding.ffn;
+                break;
+            case llama_hybrid_inner_stage_kind::REDUCE:
+                aggregate = &binding.reduce;
+                break;
+            case llama_hybrid_inner_stage_kind::UNKNOWN:
+                break;
+        }
+        if (aggregate == nullptr || *aggregate != "MIXED") {
+            continue;
+        }
+
+        ggml_tensor * node =
+            ggml_graph_node(gf, item.node_index);
+        ggml_backend_t assigned =
+            ggml_backend_sched_get_tensor_backend(sched_use, node);
+        const std::string backend =
+            assigned != nullptr ?
+                ggml_backend_name(assigned) : "(unassigned)";
+
+        mixed_probe & probe = probe_for(item.layer, item.stage);
+        if (probe.first_backend.empty()) {
+            probe.first_backend = backend;
+            continue;
+        }
+        if (!probe.reported && backend != probe.first_backend) {
+            LLAMA_LOG_INFO(
+                "[INNER_STAGE_MIXED_NODE] layer=%d stage=%s "
+                "first_backend=%s node=%d op=%s tensor=%s backend=%s\n",
+                item.layer,
+                llama_hybrid_inner_stage_name(item.stage),
+                probe.first_backend.c_str(),
+                item.node_index,
+                ggml_op_name(node->op),
+                node->name,
+                backend.c_str());
+            probe.reported = true;
+            ++mixed_reports;
+        }
     }
 }
 
@@ -2647,7 +2794,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     // Sidecar only: log the same generic inner-stage map for both freshly
     // allocated and reused graphs.  No backend assignment is modified here.
     llama_hybrid_log_inner_stage_bindings(
-        model, sched_use, gf, stage, backend_cpu, reused_graph);
+        model, sched_use, gf, stage, backend_cpu, reused_graph,
+        ubatch.n_tokens);
 
     if (strict_cpu_stage) {
         // Validate both fresh allocations and reused graphs. A CPU-only
