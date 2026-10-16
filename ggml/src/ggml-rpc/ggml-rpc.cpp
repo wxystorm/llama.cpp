@@ -9590,14 +9590,39 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+
+    bool return_bulk_credit_held = false;
+    uint64_t return_bulk_credit_seq = 0;
+    int64_t return_bulk_credit_wait_us = 0;
+    size_t return_bulk_credit_inflight = 0;
+    size_t return_bulk_credit_limit = 0;
+
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
+            if (return_bulk_credit_held) {
+                server.release_route_bulk_credit();
+                return_bulk_credit_held = false;
+            }
             break;
         }
         if (cmd >= RPC_CMD_COUNT) {
-            // fail fast if the command is invalid
+            if (return_bulk_credit_held) {
+                server.release_route_bulk_credit();
+                return_bulk_credit_held = false;
+            }
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
+        }
+        if (return_bulk_credit_held &&
+                cmd != RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT) {
+            GGML_LOG_ERROR(
+                "[RETURN_BULK_SRV] seq=%" PRIu64
+                " status=FAIL reason=unexpected_cmd cmd=%u\n",
+                return_bulk_credit_seq,
+                static_cast<unsigned>(cmd));
+            server.release_route_bulk_credit();
+            return_bulk_credit_held = false;
+            return;
         }
         switch (cmd) {
             case RPC_CMD_HELLO: {
@@ -10163,11 +10188,113 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
-            case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+            case RPC_CMD_RETURN_BULK_ACQUIRE: {
+                rpc_msg_return_bulk_acquire_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                if (request.seq == 0 || return_bulk_credit_held) {
+                    return;
+                }
+
+                rpc_msg_return_bulk_acquire_rsp response {};
+                response.active =
+                    server.network_bulk_shared_enabled() ? 1 : 0;
+                if (response.active != 0) {
+                    const int64_t wait_begin_us = ggml_time_us();
+                    response.inflight =
+                        server.acquire_route_bulk_credit();
+                    return_bulk_credit_wait_us =
+                        ggml_time_us() - wait_begin_us;
+                    response.limit =
+                        server.route_bulk_transfer_limit();
+                    return_bulk_credit_held = true;
+                    return_bulk_credit_seq = request.seq;
+                    return_bulk_credit_inflight =
+                        static_cast<size_t>(response.inflight);
+                    return_bulk_credit_limit =
+                        static_cast<size_t>(response.limit);
+                }
+
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    if (return_bulk_credit_held) {
+                        server.release_route_bulk_credit();
+                        return_bulk_credit_held = false;
+                    }
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
+                const bool stage_profile =
+                    rpc_tensor_phone_stage_profile_enabled();
+                const int64_t recv_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    if (return_bulk_credit_held) {
+                        server.release_route_bulk_credit();
+                        return_bulk_credit_held = false;
+                    }
+                    return;
+                }
+                const int64_t recv_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (return_bulk_credit_held) {
+                    if (input.size() <
+                            sizeof(
+                                rpc_msg_set_tensor_async_return_wait_req_v14)) {
+                        server.release_route_bulk_credit();
+                        return_bulk_credit_held = false;
+                        return;
+                    }
+
+                    rpc_msg_set_tensor_async_return_wait_req_v14
+                        return_request {};
+                    std::memcpy(
+                        &return_request,
+                        input.data(),
+                        sizeof(return_request));
+                    if (return_request.phone_ffn_seq !=
+                            return_bulk_credit_seq) {
+                        GGML_LOG_ERROR(
+                            "[RETURN_BULK_SRV] expected=%" PRIu64
+                            " actual=%" PRIu64
+                            " status=FAIL reason=seq_mismatch\n",
+                            return_bulk_credit_seq,
+                            return_request.phone_ffn_seq);
+                        server.release_route_bulk_credit();
+                        return_bulk_credit_held = false;
+                        return;
+                    }
+
+                    // Full PC->Phone payload has reached Phone userspace.
+                    // Release before Phone-FFN dependency wait and reduce.
+                    server.release_route_bulk_credit();
+
+                    if (stage_profile) {
+                        GGML_LOG_INFO(
+                            "[RETURN_BULK_SRV] seq=%" PRIu64
+                            " credit=%.3f inflight=%zu/%zu recv=%.3f\n",
+                            return_bulk_credit_seq,
+                            return_bulk_credit_wait_us / 1000.0,
+                            return_bulk_credit_inflight,
+                            return_bulk_credit_limit,
+                            (recv_done_us - recv_begin_us) / 1000.0);
+                    }
+
+                    return_bulk_credit_held = false;
+                    return_bulk_credit_seq = 0;
+                    return_bulk_credit_wait_us = 0;
+                    return_bulk_credit_inflight = 0;
+                    return_bulk_credit_limit = 0;
+                }
+
                 if (!server.set_tensor_async_return_wait(input)) {
                     return;
                 }
