@@ -429,6 +429,205 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
     const char * probe =
         probe_env != nullptr && probe_env[0] != '\0' ? probe_env : "wo";
 
+    const bool probe_attn_norm =
+        std::strcmp(probe, "attn_norm") == 0 ||
+        std::strcmp(probe, "ATTN_NORM") == 0;
+    const bool probe_attn_compute =
+        std::strcmp(probe, "attn_compute") == 0 ||
+        std::strcmp(probe, "ATTN_COMPUTE") == 0;
+
+    if (probe_attn_norm) {
+        ggml_tensor * norm_out = nullptr;
+        for (const llama_hybrid_inner_node_membership & item :
+             membership.nodes) {
+            if (!item.valid() ||
+                item.layer != layer ||
+                item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+                continue;
+            }
+            ggml_tensor * node =
+                ggml_graph_node(gf, item.node_index);
+            if (llama_hybrid_name_starts_with(
+                    node->name, "attn_norm-")) {
+                norm_out = node;
+                break;
+            }
+        }
+
+        if (norm_out == nullptr ||
+            norm_out->src[0] == nullptr ||
+            norm_out->src[0]->op != GGML_OP_RMS_NORM) {
+            LLAMA_LOG_WARN(
+                "[INNER_ATTN_MIGRATE] status=SKIP "
+                "reason=ATTN_NORM_CHAIN_MISSING "
+                "layer=%d tokens=%u\n",
+                layer, ubatch_tokens);
+            return false;
+        }
+
+        ggml_tensor * raw_norm = norm_out->src[0];
+        const ggml_tensor * chain[] = { raw_norm, norm_out };
+        for (const ggml_tensor * node : chain) {
+            if (node->view_src != nullptr ||
+                node->buffer != nullptr ||
+                !ggml_backend_supports_op(
+                    cuda_backend,
+                    const_cast<ggml_tensor *>(node))) {
+                LLAMA_LOG_WARN(
+                    "[INNER_ATTN_MIGRATE] status=SKIP "
+                    "reason=ATTN_NORM_UNSAFE "
+                    "layer=%d tokens=%u tensor=%s op=%s "
+                    "view_src=%d buffer=%d supports=%d\n",
+                    layer, ubatch_tokens,
+                    node->name, ggml_op_name(node->op),
+                    node->view_src != nullptr ? 1 : 0,
+                    node->buffer != nullptr ? 1 : 0,
+                    ggml_backend_supports_op(
+                        cuda_backend,
+                        const_cast<ggml_tensor *>(node)) ? 1 : 0);
+                return false;
+            }
+        }
+
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, raw_norm, cuda_backend);
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, norm_out, cuda_backend);
+
+        LLAMA_LOG_INFO(
+            "[INNER_ATTN_MIGRATE] status=APPLIED_ATTN_NORM_PROBE "
+            "layer=%d tokens=%u raw=%s out=%s backend=%s\n",
+            layer, ubatch_tokens,
+            raw_norm->name, norm_out->name,
+            ggml_backend_name(cuda_backend));
+        return true;
+    }
+
+    if (probe_attn_compute) {
+        std::vector<ggml_tensor *> compute_nodes;
+        std::vector<ggml_tensor *> alias_nodes;
+        int attn_nodes = 0;
+        int anchored_state_nodes = 0;
+        int anchored_alias_nodes = 0;
+
+        auto contains_node = [](const std::vector<ggml_tensor *> & nodes,
+                                ggml_tensor * needle) {
+            return std::find(nodes.begin(), nodes.end(), needle) != nodes.end();
+        };
+
+        // First select real compute outputs. Stateful writes and preallocated
+        // storage remain anchored. Views are handled in a second pass so they
+        // can follow only a migrated temporary root.
+        for (const llama_hybrid_inner_node_membership & item :
+             membership.nodes) {
+            if (!item.valid() ||
+                item.layer != layer ||
+                item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+                continue;
+            }
+
+            ++attn_nodes;
+            ggml_tensor * node =
+                ggml_graph_node(gf, item.node_index);
+
+            const bool is_alias =
+                llama_hybrid_is_view_op(node->op) ||
+                node->view_src != nullptr;
+            const bool is_state_write =
+                node->op == GGML_OP_SET_ROWS ||
+                node->op == GGML_OP_CPY;
+            const bool has_fixed_storage =
+                node->buffer != nullptr;
+
+            if (is_alias) {
+                continue;
+            }
+            if (is_state_write || has_fixed_storage) {
+                ++anchored_state_nodes;
+                continue;
+            }
+            if (node->op == GGML_OP_NONE) {
+                ++anchored_state_nodes;
+                continue;
+            }
+            if (!ggml_backend_supports_op(cuda_backend, node)) {
+                LLAMA_LOG_WARN(
+                    "[INNER_ATTN_MIGRATE] status=SKIP "
+                    "reason=ATTN_COMPUTE_UNSUPPORTED "
+                    "layer=%d tokens=%u node=%d tensor=%s op=%s\n",
+                    layer, ubatch_tokens,
+                    item.node_index, node->name,
+                    ggml_op_name(node->op));
+                return false;
+            }
+            compute_nodes.push_back(node);
+        }
+
+        // Alias closure: a temporary view follows the migrated compute tensor
+        // it aliases. A view rooted in persistent/preallocated storage (e.g.
+        // KV SET_ROWS destination) stays on its original owner.
+        for (const llama_hybrid_inner_node_membership & item :
+             membership.nodes) {
+            if (!item.valid() ||
+                item.layer != layer ||
+                item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+                continue;
+            }
+
+            ggml_tensor * node =
+                ggml_graph_node(gf, item.node_index);
+            const bool is_alias =
+                llama_hybrid_is_view_op(node->op) ||
+                node->view_src != nullptr;
+            if (!is_alias) {
+                continue;
+            }
+
+            ggml_tensor * root = node;
+            while (root->view_src != nullptr) {
+                root = root->view_src;
+            }
+
+            if (contains_node(compute_nodes, root)) {
+                alias_nodes.push_back(node);
+            } else {
+                ++anchored_alias_nodes;
+            }
+        }
+
+        if (compute_nodes.empty()) {
+            LLAMA_LOG_WARN(
+                "[INNER_ATTN_MIGRATE] status=SKIP "
+                "reason=NO_ATTN_COMPUTE "
+                "layer=%d tokens=%u\n",
+                layer, ubatch_tokens);
+            return false;
+        }
+
+        for (ggml_tensor * node : compute_nodes) {
+            ggml_backend_sched_set_tensor_backend(
+                sched_use, node, cuda_backend);
+        }
+        for (ggml_tensor * node : alias_nodes) {
+            ggml_backend_sched_set_tensor_backend(
+                sched_use, node, cuda_backend);
+        }
+
+        LLAMA_LOG_INFO(
+            "[INNER_ATTN_MIGRATE] "
+            "status=APPLIED_ATTN_COMPUTE_PROBE "
+            "layer=%d tokens=%u attn_nodes=%d compute=%zu aliases=%zu "
+            "anchored_state=%d anchored_alias=%d backend=%s "
+            "membership={gaps:%d,transition_errors:%d}\n",
+            layer, ubatch_tokens,
+            attn_nodes, compute_nodes.size(), alias_nodes.size(),
+            anchored_state_nodes, anchored_alias_nodes,
+            ggml_backend_name(cuda_backend),
+            membership.gap_nodes,
+            membership.transition_errors);
+        return true;
+    }
+
     const bool probe_q =
         std::strcmp(probe, "q") == 0 ||
         std::strcmp(probe, "Q") == 0 ||
@@ -702,7 +901,7 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         !probe_wo_residual) {
         LLAMA_LOG_WARN(
             "[INNER_ATTN_MIGRATE] status=SKIP reason=BAD_PROBE "
-            "probe=%s accepted={wo,wo_residual,q,k,v,qv,qk,kv,qkv,qkv_norm_rope}\n",
+            "probe=%s accepted={attn_norm,attn_compute,wo,wo_residual,q,k,v,qv,qk,kv,qkv,qkv_norm_rope}\n",
             probe);
         return false;
     }
