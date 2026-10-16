@@ -4854,6 +4854,36 @@ public:
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
         }
+
+        const char * route_bulk_env =
+            std::getenv("GGML_RPC_ROUTE_BULK_INFLIGHT");
+        if (route_bulk_env != nullptr &&
+                route_bulk_env[0] != '\0') {
+            char * end = nullptr;
+            const long parsed =
+                std::strtol(route_bulk_env, &end, 10);
+            if (end != route_bulk_env &&
+                    *end == '\0' &&
+                    parsed >= 1) {
+                route_bulk_limit =
+                    std::min<size_t>(
+                        RPC_ROUTE_TRANSFER_LANES,
+                        static_cast<size_t>(parsed));
+            } else {
+                GGML_LOG_WARN(
+                    "[RPC_ROUTE_BULK_LIMIT] invalid=%s "
+                    "using_default=%zu\n",
+                    route_bulk_env,
+                    RPC_ROUTE_TRANSFER_LANES);
+            }
+        }
+
+        if (route_bulk_env != nullptr) {
+            GGML_LOG_INFO(
+                "[RPC_ROUTE_BULK_LIMIT] inflight=%zu slots=%zu\n",
+                route_bulk_limit,
+                RPC_ROUTE_TRANSFER_LANES);
+        }
     }
     ~rpc_server();
 
@@ -4887,6 +4917,28 @@ public:
     bool get_route_snapshot(
         const rpc_msg_get_route_snapshot_req & request,
         std::vector<uint8_t> & response);
+    size_t acquire_route_bulk_credit() {
+        std::unique_lock<std::mutex> lock(route_bulk_mutex);
+        route_bulk_cv.wait(
+            lock,
+            [&]() {
+                return route_bulk_inflight <
+                    route_bulk_limit;
+            });
+        ++route_bulk_inflight;
+        return route_bulk_inflight;
+    }
+    void release_route_bulk_credit() {
+        {
+            std::lock_guard<std::mutex> lock(route_bulk_mutex);
+            GGML_ASSERT(route_bulk_inflight > 0);
+            --route_bulk_inflight;
+        }
+        route_bulk_cv.notify_one();
+    }
+    size_t route_bulk_transfer_limit() const {
+        return route_bulk_limit;
+    }
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -5030,6 +5082,15 @@ private:
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
         route_snapshot_devices;
+
+    // Keep the four stable route slots/GET lanes, but independently cap how
+    // many READY snapshots may enter the bulk TCP send phase at once. This
+    // avoids turning slot count into network concurrency and preserves the
+    // existing pre-armed GET / producer overlap.
+    std::mutex route_bulk_mutex;
+    std::condition_variable route_bulk_cv;
+    size_t route_bulk_inflight = 0;
+    size_t route_bulk_limit = RPC_ROUTE_TRANSFER_LANES;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
@@ -9826,11 +9887,25 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 const uint64_t out_size =
                     static_cast<uint64_t>(response.size());
 
+                // Do not gate the request or the READY wait. Multiple GETs
+                // remain pre-armed and all four snapshot slots remain usable.
+                // Only READY snapshots entering the large TCP response are
+                // credit-limited.
+                const int64_t credit_wait_begin_us =
+                    measure_profile ? ggml_time_us() : 0;
+                const size_t bulk_inflight =
+                    server.acquire_route_bulk_credit();
+                const int64_t credit_wait_done_us =
+                    measure_profile ? ggml_time_us() : 0;
+                const size_t bulk_limit =
+                    server.route_bulk_transfer_limit();
+
                 const int64_t header_send_begin_us =
                     measure_profile ? ggml_time_us() : 0;
                 if (!sock->send_data(
                         &out_size,
                         sizeof(out_size))) {
+                    server.release_route_bulk_credit();
                     return;
                 }
                 const int64_t header_send_done_us =
@@ -9840,16 +9915,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         !sock->send_data(
                             response.data(),
                             response.size())) {
+                    server.release_route_bulk_credit();
                     return;
                 }
                 const int64_t payload_send_done_us =
                     measure_profile ? ggml_time_us() : 0;
+                server.release_route_bulk_credit();
 
                 if (route_profile) {
                     std::fprintf(
                         stderr,
                         "[ROUTE_SRV_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
                         "recv=%.3f queue=%.3f get=%.3f "
+                        "credit=%.3f inflight=%zu/%zu "
                         "hsend=%.3f psend=%.3f total=%.3f\n",
                         request.seq,
                         request.lane,
@@ -9860,6 +9938,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                             request_recv_done_us) / 1000.0,
                         (dispatch_done_us -
                             dispatch_begin_us) / 1000.0,
+                        (credit_wait_done_us -
+                            credit_wait_begin_us) / 1000.0,
+                        bulk_inflight,
+                        bulk_limit,
                         (header_send_done_us -
                             header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
@@ -9872,6 +9954,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     GGML_LOG_INFO(
                         "[ROUTE_SRV] seq=%" PRIu64 " lane=%u bytes=%zu "
                         "recv=%.3f queue=%.3f get=%.3f "
+                        "credit=%.3f inflight=%zu/%zu "
                         "hsend=%.3f psend=%.3f total=%.3f\n",
                         request.seq,
                         request.lane,
@@ -9882,6 +9965,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                             request_recv_done_us) / 1000.0,
                         (dispatch_done_us -
                             dispatch_begin_us) / 1000.0,
+                        (credit_wait_done_us -
+                            credit_wait_begin_us) / 1000.0,
+                        bulk_inflight,
+                        bulk_limit,
                         (header_send_done_us -
                             header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
