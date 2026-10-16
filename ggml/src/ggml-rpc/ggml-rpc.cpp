@@ -3716,42 +3716,33 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         std::fprintf(
             stderr,
             "[XLAYER_RETURN_RPC] seq=%" PRIu64
-            " lane=%zu bytes=%zu wire_bytes=%zu wire=%s "
-            "request_send_ms=%.3f "
-            "response_header_wait_ms=%.3f "
-            "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
+            " lane=%zu bytes=%zu wire=%zu "
+            "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
-            use_f16 ? "f16" : "raw",
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
             (end_us - begin_us) / 1000.0,
             status ? 1 : 0);
-        std::fflush(stderr);
     }
 
     if (stage_profile) {
         GGML_LOG_INFO(
-            "[TENSOR_PHONE_RPC_STAGE] side=pc "
-            "stage=return_chunk_join seq=%" PRIu64
-            " lane=%zu bytes=%zu wire_bytes=%zu wire=%s "
-            "request_send_ms=%.3f "
-            "response_header_wait_ms=%.3f "
-            "response_body_wait_ms=%.3f total_ms=%.3f status=%d\n",
+            "[RETURN_RPC] seq=%" PRIu64
+            " lane=%zu bytes=%zu wire=%zu "
+            "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
-            use_f16 ? "f16" : "raw",
             roundtrip_profile.request_send_us / 1000.0,
             roundtrip_profile.response_header_wait_us / 1000.0,
             roundtrip_profile.response_body_wait_us / 1000.0,
             (end_us - begin_us) / 1000.0,
             status ? 1 : 0);
-        std::fflush(stderr);
     }
 
     return status;
