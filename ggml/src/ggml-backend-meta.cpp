@@ -9867,6 +9867,53 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 return GGML_STATUS_SUCCESS;
             }
+
+            // A Meta scheduler split ending is not, by itself, a Phone
+            // ownership boundary. Explicit Phone->PC layer handoffs are
+            // handled above. If the next scheduler subgraph has no real PC
+            // consumer, keep the single-owner tensor Phone-resident instead
+            // of manufacturing a Phone->PC copy to the inactive placeholder.
+            if (n_backends == 2 && active_backend == 1) {
+                const bool pc_consumer_next =
+                    i + 1 < backend_ctx->n_subgraphs &&
+                    subgraph_will_execute_pc(i + 1);
+
+                if (!pc_consumer_next) {
+                    if (force_phone_block_exit) {
+                        GGML_LOG_ERROR(
+                            "[META_PHONE_EXIT_UNRESOLVED] "
+                            "sg=%zu/%zu layer=%d node=%s "
+                            "phone_owner_exit=%d layer_handoff=0 "
+                            "next_pc=0 next_phone=%d "
+                            "reason=forced_exit_without_explicit_handoff\n",
+                            i,
+                            backend_ctx->n_subgraphs,
+                            force_phone_block_layer,
+                            nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                            (int) phone_owner_exit,
+                            i + 1 < backend_ctx->n_subgraphs ?
+                                (int) subgraph_will_execute_phone(i + 1) : -1);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    handled = true;
+                    if (pipeline_debug || tensor_phone_stage_profile) {
+                        GGML_LOG_INFO(
+                            "[META_KEEP_PHONE_SPLIT_TAIL] "
+                            "sg=%zu/%zu node=%s phone_owner_exit=%d "
+                            "next_pc=0 next_phone=%d "
+                            "action=KEEP_PHONE_NO_PC_CONSUMER\n",
+                            i,
+                            backend_ctx->n_subgraphs,
+                            nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                            (int) phone_owner_exit,
+                            i + 1 < backend_ctx->n_subgraphs ?
+                                (int) subgraph_will_execute_phone(i + 1) : -1);
+                    }
+                    return GGML_STATUS_SUCCESS;
+                }
+            }
+
             GGML_ASSERT(ggml_is_contiguous(nodes[active_backend]));
             for (size_t j_dst = 0; j_dst < n_backends; ++j_dst) {
                 if (j_dst == active_backend) {
