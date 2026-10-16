@@ -13862,17 +13862,11 @@ auto prefill_norm_sg_has_prework =
                         if (pipeline_debug ||
                                 tensor_phone_stage_profile) {
                             GGML_LOG_INFO(
-                                "[PHONE_PREFILL_PC_BRANCH] "
-                                "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " ready_sched=%d pc_lane=%zu "
-                                "route_wait_ms=%.3f pc_gate_wait_ms=%.3f "
-                                "stage_copy_ms=%.3f pc_compute_ms=%.3f "
-                                "return_stage_ms=%.3f status=%d\n",
+                                "[PC_BRANCH] L=%d C=%d lane=%zu "
+                                "route=%.3f gate=%.3f copy=%.3f "
+                                "comp=%.3f ret=%.3f st=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
-                                i,
-                                task_id,
-                                phone_prefill_pc_ready_schedule ? 1 : 0,
                                 pc_worker_lane,
                                 route_wait_us / 1000.0,
                                 pc_gate_wait_us / 1000.0,
