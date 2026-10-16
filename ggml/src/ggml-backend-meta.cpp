@@ -9961,6 +9961,64 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     source_fence_us = ggml_time_us() - source_fence_start_us;
                 }
 
+                const bool same_layout =
+                    ggml_are_same_layout(nodes[active_backend], nodes[j_dst]);
+                if (!same_layout) {
+                    const ggml_tensor * src_node = nodes[active_backend];
+                    const ggml_tensor * dst_node = nodes[j_dst];
+                    GGML_LOG_ERROR(
+                        "[META_INVALID_HANDOFF] "
+                        "sg=%zu/%zu active=%zu dst_backend=%zu "
+                        "src=%s dst=%s "
+                        "src_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                        "dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                        "src_nb=[%zu,%zu,%zu,%zu] "
+                        "dst_nb=[%zu,%zu,%zu,%zu] "
+                        "src_bytes=%zu dst_bytes=%zu "
+                        "phone_owner_exit=%d phone_primary_sg=%d "
+                        "inferred_tp=%d forced_tp=%d "
+                        "force_block_exit=%d force_layer=%d "
+                        "next_pc=%d next_phone=%d "
+                        "internal_handoff=%d external_handoff=%d "
+                        "layer_handoff=%d phone_only=%d\n",
+                        i, backend_ctx->n_subgraphs,
+                        active_backend, j_dst,
+                        src_node != nullptr ? src_node->name : "(null)",
+                        dst_node != nullptr ? dst_node->name : "(null)",
+                        src_node != nullptr ? src_node->ne[0] : 0,
+                        src_node != nullptr ? src_node->ne[1] : 0,
+                        src_node != nullptr ? src_node->ne[2] : 0,
+                        src_node != nullptr ? src_node->ne[3] : 0,
+                        dst_node != nullptr ? dst_node->ne[0] : 0,
+                        dst_node != nullptr ? dst_node->ne[1] : 0,
+                        dst_node != nullptr ? dst_node->ne[2] : 0,
+                        dst_node != nullptr ? dst_node->ne[3] : 0,
+                        src_node != nullptr ? src_node->nb[0] : 0,
+                        src_node != nullptr ? src_node->nb[1] : 0,
+                        src_node != nullptr ? src_node->nb[2] : 0,
+                        src_node != nullptr ? src_node->nb[3] : 0,
+                        dst_node != nullptr ? dst_node->nb[0] : 0,
+                        dst_node != nullptr ? dst_node->nb[1] : 0,
+                        dst_node != nullptr ? dst_node->nb[2] : 0,
+                        dst_node != nullptr ? dst_node->nb[3] : 0,
+                        src_node != nullptr ? ggml_nbytes(src_node) : 0,
+                        dst_node != nullptr ? ggml_nbytes(dst_node) : 0,
+                        (int) phone_owner_exit,
+                        (int) phone_primary_tensor_sg,
+                        (int) inferred_phone_primary_tensor,
+                        (int) forced_phone_primary_tensor,
+                        (int) force_phone_block_exit,
+                        force_phone_block_layer,
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_pc(i + 1) : -1,
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_phone(i + 1) : -1,
+                        (int) internal_pc_handoff,
+                        (int) external_backend_handoff,
+                        (int) layer_handoff_to_pc,
+                        (int) subgraph_is_phone_only(i));
+                }
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
