@@ -2202,15 +2202,132 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
 
     const bool split_timing =
         getenv("GGML_SCHED_SPLIT_TIMING") != NULL;
+    const bool copy_profile =
+        getenv("GGML_SCHED_COPY_PROFILE") != NULL;
+    const bool copy_profile_verbose =
+        copy_profile &&
+        getenv("GGML_SCHED_COPY_PROFILE_VERBOSE") != NULL;
+    const bool copy_profile_sync =
+        copy_profile &&
+        getenv("GGML_SCHED_COPY_PROFILE_SYNC") != NULL;
+
+    size_t profile_inputs = 0;
+    size_t profile_bytes = 0;
+    size_t profile_weight_inputs = 0;
+    size_t profile_weight_bytes = 0;
+    size_t profile_activation_inputs = 0;
+    size_t profile_activation_bytes = 0;
+    size_t profile_cpu_cuda_inputs = 0;
+    size_t profile_cpu_cuda_bytes = 0;
+    size_t profile_cpu_cuda_weight_inputs = 0;
+    size_t profile_cpu_cuda_weight_bytes = 0;
+    size_t profile_cpu_cuda_activation_inputs = 0;
+    size_t profile_cpu_cuda_activation_bytes = 0;
+    int profile_cpu_cuda_splits = 0;
+    int64_t profile_cpu_cuda_prepare_us = 0;
+    int64_t profile_cpu_cuda_sync_wait_us = 0;
+
+    auto backend_is_cuda = [](ggml_backend_t backend) {
+        const char * name = backend != NULL ? ggml_backend_name(backend) : NULL;
+        return name != NULL &&
+            (strncmp(name, "CUDA", 4) == 0 ||
+             strncmp(name, "cuda", 4) == 0);
+    };
 
     for (int split_id = first_split; split_id < last_split; ++split_id) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
         const int64_t split_begin_us = split_timing ? ggml_time_us() : 0;
 
-        const int64_t prepare_begin_us = split_timing ? ggml_time_us() : 0;
+        bool split_has_cpu_cuda = false;
+        if (copy_profile) {
+            ggml_backend_t dst_backend =
+                sched->backends[split->backend_id];
+            const bool dst_cuda = backend_is_cuda(dst_backend);
+
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                ggml_tensor * input = split->inputs[input_id];
+                ggml_backend_t src_backend =
+                    ggml_backend_sched_get_tensor_backend(sched, input);
+                const size_t bytes = ggml_nbytes(input);
+                const bool is_weight =
+                    input->buffer != NULL &&
+                    ggml_backend_buffer_get_usage(input->buffer) ==
+                        GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                const bool src_cpu =
+                    src_backend != NULL &&
+                    ggml_backend_dev_type(
+                        ggml_backend_get_device(src_backend)) ==
+                        GGML_BACKEND_DEVICE_TYPE_CPU;
+                const bool cpu_cuda = src_cpu && dst_cuda;
+
+                ++profile_inputs;
+                profile_bytes += bytes;
+                if (is_weight) {
+                    ++profile_weight_inputs;
+                    profile_weight_bytes += bytes;
+                } else {
+                    ++profile_activation_inputs;
+                    profile_activation_bytes += bytes;
+                }
+
+                if (cpu_cuda) {
+                    split_has_cpu_cuda = true;
+                    ++profile_cpu_cuda_inputs;
+                    profile_cpu_cuda_bytes += bytes;
+                    if (is_weight) {
+                        ++profile_cpu_cuda_weight_inputs;
+                        profile_cpu_cuda_weight_bytes += bytes;
+                    } else {
+                        ++profile_cpu_cuda_activation_inputs;
+                        profile_cpu_cuda_activation_bytes += bytes;
+                    }
+
+                    if (copy_profile_verbose) {
+                        GGML_LOG_INFO(
+                            "[SCHED_COPY_INPUT] split=%d/%d src=%s dst=%s "
+                            "kind=%s bytes=%zu mib=%.3f tensor=%s\n",
+                            split_id,
+                            sched->n_splits,
+                            src_backend != NULL ?
+                                ggml_backend_name(src_backend) : "(null)",
+                            ggml_backend_name(dst_backend),
+                            is_weight ? "WEIGHT" : "ACTIVATION",
+                            bytes,
+                            bytes / (1024.0 * 1024.0),
+                            input->name);
+                    }
+                }
+            }
+
+            if (split_has_cpu_cuda) {
+                ++profile_cpu_cuda_splits;
+            }
+        }
+
+        const int64_t prepare_begin_us =
+            (split_timing || (copy_profile && split_has_cpu_cuda)) ?
+                ggml_time_us() : 0;
         enum ggml_status status = ggml_backend_sched_prepare_split(sched, split_id);
         const int64_t prepare_us =
-            split_timing ? ggml_time_us() - prepare_begin_us : 0;
+            (split_timing || (copy_profile && split_has_cpu_cuda)) ?
+                ggml_time_us() - prepare_begin_us : 0;
+
+        if (copy_profile && split_has_cpu_cuda) {
+            profile_cpu_cuda_prepare_us += prepare_us;
+
+            // Optional diagnostic mode: wait for the CUDA destination after
+            // submitting its split inputs.  prepare_ms + sync_wait_ms then
+            // approximates isolated copy cost.  This intentionally perturbs
+            // overlap, so it is never enabled by GGML_SCHED_COPY_PROFILE alone.
+            if (copy_profile_sync && status == GGML_STATUS_SUCCESS) {
+                const int64_t sync_begin_us = ggml_time_us();
+                ggml_backend_synchronize(
+                    sched->backends[split->backend_id]);
+                profile_cpu_cuda_sync_wait_us +=
+                    ggml_time_us() - sync_begin_us;
+            }
+        }
+
         if (status != GGML_STATUS_SUCCESS) {
             if (split_timing) {
                 GGML_LOG_DEBUG(
@@ -2254,6 +2371,36 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
             return status;
         }
     }
+
+    if (copy_profile && profile_inputs > 0) {
+        GGML_LOG_INFO(
+            "[SCHED_COPY_PROFILE] splits=[%d,%d) total_inputs=%zu "
+            "total_mib=%.3f weight_inputs=%zu weight_mib=%.3f "
+            "activation_inputs=%zu activation_mib=%.3f "
+            "cpu_cuda_splits=%d cpu_cuda_inputs=%zu cpu_cuda_mib=%.3f "
+            "cpu_cuda_weight_inputs=%zu cpu_cuda_weight_mib=%.3f "
+            "cpu_cuda_activation_inputs=%zu cpu_cuda_activation_mib=%.3f "
+            "cpu_cuda_prepare_submit_ms=%.3f sync_probe=%d "
+            "cpu_cuda_sync_wait_ms=%.3f\n",
+            first_split, last_split,
+            profile_inputs,
+            profile_bytes / (1024.0 * 1024.0),
+            profile_weight_inputs,
+            profile_weight_bytes / (1024.0 * 1024.0),
+            profile_activation_inputs,
+            profile_activation_bytes / (1024.0 * 1024.0),
+            profile_cpu_cuda_splits,
+            profile_cpu_cuda_inputs,
+            profile_cpu_cuda_bytes / (1024.0 * 1024.0),
+            profile_cpu_cuda_weight_inputs,
+            profile_cpu_cuda_weight_bytes / (1024.0 * 1024.0),
+            profile_cpu_cuda_activation_inputs,
+            profile_cpu_cuda_activation_bytes / (1024.0 * 1024.0),
+            profile_cpu_cuda_prepare_us / 1000.0,
+            copy_profile_sync ? 1 : 0,
+            profile_cpu_cuda_sync_wait_us / 1000.0);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
