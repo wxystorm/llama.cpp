@@ -147,6 +147,56 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     return marker;
 }
 
+static const char * llama_hybrid_inner_target_name(const char * value) {
+    if (value == nullptr || value[0] == '\0') {
+        return nullptr;
+    }
+    if (std::strcmp(value, "cpu") == 0 || std::strcmp(value, "CPU") == 0) {
+        return "CPU";
+    }
+    if (std::strcmp(value, "cuda") == 0 || std::strcmp(value, "CUDA") == 0 ||
+        std::strcmp(value, "gpu") == 0 || std::strcmp(value, "GPU") == 0) {
+        return "CUDA";
+    }
+    if (std::strcmp(value, "meta") == 0 || std::strcmp(value, "META") == 0) {
+        return "META";
+    }
+    return "INVALID";
+}
+
+static bool llama_hybrid_inner_target_matches(
+        const std::string & actual,
+        const char * target) {
+    if (target == nullptr) {
+        return true;
+    }
+    if (std::strcmp(target, "CPU") == 0) {
+        return actual == "CPU";
+    }
+    if (std::strcmp(target, "CUDA") == 0) {
+        return actual.rfind("CUDA", 0) == 0;
+    }
+    if (std::strcmp(target, "META") == 0) {
+        return actual.rfind("Meta", 0) == 0 ||
+               actual.rfind("META", 0) == 0;
+    }
+    return false;
+}
+
+static void llama_hybrid_inner_merge_backend(
+        std::string & dst,
+        const char * backend_name) {
+    const std::string value =
+        backend_name != nullptr ? backend_name : "(unassigned)";
+    if (dst.empty()) {
+        dst = value;
+        return;
+    }
+    if (dst != value) {
+        dst = "MIXED";
+    }
+}
+
 static void llama_hybrid_log_inner_stage_bindings(
         const llama_model & model,
         ggml_backend_sched_t sched_use,
@@ -156,6 +206,41 @@ static void llama_hybrid_log_inner_stage_bindings(
         bool reused_graph) {
     const char * env = std::getenv("LLAMA_HYBRID_INNER_STAGE_DIAG");
     if (env == nullptr || std::atoi(env) == 0 || gf == nullptr) {
+        return;
+    }
+
+    const char * verbose_env =
+        std::getenv("LLAMA_HYBRID_INNER_STAGE_VERBOSE");
+    const bool verbose =
+        verbose_env != nullptr && std::atoi(verbose_env) != 0;
+
+    // Reused decode graphs carry the same scheduler binding map.  Suppress
+    // them by default so diagnostics do not interleave with token/logit output.
+    // LLAMA_HYBRID_INNER_STAGE_VERBOSE=1 restores the old per-node view.
+    if (reused_graph && !verbose) {
+        return;
+    }
+
+    const char * target_attn = llama_hybrid_inner_target_name(
+        std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_TARGET"));
+    const char * target_ffn = llama_hybrid_inner_target_name(
+        std::getenv("LLAMA_HYBRID_INNER_PC_FFN_TARGET"));
+    const char * target_reduce = llama_hybrid_inner_target_name(
+        std::getenv("LLAMA_HYBRID_INNER_PC_REDUCE_TARGET"));
+    const bool have_target =
+        target_attn != nullptr ||
+        target_ffn != nullptr ||
+        target_reduce != nullptr;
+
+    if ((target_attn != nullptr && std::strcmp(target_attn, "INVALID") == 0) ||
+        (target_ffn != nullptr && std::strcmp(target_ffn, "INVALID") == 0) ||
+        (target_reduce != nullptr && std::strcmp(target_reduce, "INVALID") == 0)) {
+        LLAMA_LOG_WARN(
+            "[INNER_STAGE_TARGET] status=INVALID "
+            "accepted={cpu,cuda,meta} attn=%s ffn=%s reduce=%s\n",
+            target_attn != nullptr ? target_attn : "-",
+            target_ffn != nullptr ? target_ffn : "-",
+            target_reduce != nullptr ? target_reduce : "-");
         return;
     }
 
@@ -197,25 +282,25 @@ static void llama_hybrid_log_inner_stage_bindings(
         return "UNKNOWN";
     };
 
-    const int scope_begin = stage != nullptr ? stage->layer_begin : 0;
-    const int scope_end   = stage != nullptr ? stage->layer_end :
-        (int) model.hparams.n_layer();
+    struct layer_binding {
+        bool seen = false;
+        std::string outer;
+        std::string attn;
+        std::string ffn;
+        std::string reduce;
+    };
 
-    LLAMA_LOG_INFO(
-        "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
-        "have_plan=%d reused=%d nodes=%d\n",
-        stage != nullptr ? "STAGED" : "FULL_GRAPH",
-        scope_begin, scope_end,
-        have_plan ? 1 : 0,
-        reused_graph ? 1 : 0,
-        ggml_graph_n_nodes(gf));
+    const int n_layer = (int) model.hparams.n_layer();
+    std::vector<layer_binding> bindings((size_t) n_layer);
 
     const int n_nodes = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
         const llama_hybrid_inner_stage_marker marker =
             llama_hybrid_classify_inner_stage_marker(node->name);
-        if (!marker.valid()) {
+        if (!marker.valid() ||
+            marker.layer < 0 ||
+            marker.layer >= n_layer) {
             continue;
         }
 
@@ -224,14 +309,131 @@ static void llama_hybrid_log_inner_stage_bindings(
         const char * assigned_name =
             assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
 
+        layer_binding & binding = bindings[(size_t) marker.layer];
+        binding.seen = true;
+        binding.outer = outer_for_layer(marker.layer);
+
+        switch (marker.kind) {
+            case llama_hybrid_inner_stage_kind::ATTN:
+                llama_hybrid_inner_merge_backend(
+                    binding.attn, assigned_name);
+                break;
+            case llama_hybrid_inner_stage_kind::FFN:
+                llama_hybrid_inner_merge_backend(
+                    binding.ffn, assigned_name);
+                break;
+            case llama_hybrid_inner_stage_kind::REDUCE:
+                llama_hybrid_inner_merge_backend(
+                    binding.reduce, assigned_name);
+                break;
+            case llama_hybrid_inner_stage_kind::UNKNOWN:
+                break;
+        }
+
+        if (verbose) {
+            LLAMA_LOG_INFO(
+                "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
+                "stage=%s event=%s tensor=%s backend=%s\n",
+                binding.outer.c_str(),
+                marker.layer, marker.chunk,
+                llama_hybrid_inner_stage_name(marker.kind),
+                llama_hybrid_inner_stage_event_name(marker.event),
+                node->name, assigned_name);
+        }
+    }
+
+    const int scope_begin = stage != nullptr ? stage->layer_begin : 0;
+    const int scope_end   = stage != nullptr ? stage->layer_end : n_layer;
+
+    LLAMA_LOG_INFO(
+        "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
+        "have_plan=%d reused=%d nodes=%d target=%d\n",
+        stage != nullptr ? "STAGED" : "FULL_GRAPH",
+        scope_begin, scope_end,
+        have_plan ? 1 : 0,
+        reused_graph ? 1 : 0,
+        n_nodes,
+        have_target ? 1 : 0);
+
+    auto same_binding = [&](int a, int b) {
+        const layer_binding & x = bindings[(size_t) a];
+        const layer_binding & y = bindings[(size_t) b];
+        return x.seen == y.seen &&
+               x.outer == y.outer &&
+               x.attn == y.attn &&
+               x.ffn == y.ffn &&
+               x.reduce == y.reduce &&
+               model.hybrid_layer_mode(a) ==
+                   model.hybrid_layer_mode(b);
+    };
+
+    int begin = scope_begin;
+    while (begin < scope_end) {
+        while (begin < scope_end &&
+               !bindings[(size_t) begin].seen) {
+            ++begin;
+        }
+        if (begin >= scope_end) {
+            break;
+        }
+
+        int end = begin + 1;
+        while (end < scope_end &&
+               bindings[(size_t) end].seen &&
+               same_binding(begin, end)) {
+            ++end;
+        }
+
+        const layer_binding & binding =
+            bindings[(size_t) begin];
+        const bool pc_only =
+            model.hybrid_layer_mode(begin) ==
+                llama_hybrid_layer_mode::PC_ONLY;
+
+        const char * desired_attn =
+            pc_only ? target_attn : nullptr;
+        const char * desired_ffn =
+            pc_only ? target_ffn : nullptr;
+        const char * desired_reduce =
+            pc_only ? target_reduce : nullptr;
+
+        const bool attn_mismatch =
+            desired_attn != nullptr &&
+            !llama_hybrid_inner_target_matches(
+                binding.attn, desired_attn);
+        const bool ffn_mismatch =
+            desired_ffn != nullptr &&
+            !llama_hybrid_inner_target_matches(
+                binding.ffn, desired_ffn);
+        const bool reduce_mismatch =
+            desired_reduce != nullptr &&
+            !llama_hybrid_inner_target_matches(
+                binding.reduce, desired_reduce);
+        const int mismatch_count =
+            (attn_mismatch ? 1 : 0) +
+            (ffn_mismatch ? 1 : 0) +
+            (reduce_mismatch ? 1 : 0);
+
         LLAMA_LOG_INFO(
-            "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
-            "stage=%s event=%s tensor=%s backend=%s\n",
-            outer_for_layer(marker.layer),
-            marker.layer, marker.chunk,
-            llama_hybrid_inner_stage_name(marker.kind),
-            llama_hybrid_inner_stage_event_name(marker.event),
-            node->name, assigned_name);
+            "[INNER_STAGE_MAP] layers=[%d,%d) outer=%s pc_only=%d "
+            "actual={attn:%s,ffn:%s,reduce:%s} "
+            "target={attn:%s,ffn:%s,reduce:%s} "
+            "mismatch={attn:%d,ffn:%d,reduce:%d,total:%d}\n",
+            begin, end,
+            binding.outer.c_str(),
+            pc_only ? 1 : 0,
+            binding.attn.empty() ? "-" : binding.attn.c_str(),
+            binding.ffn.empty() ? "-" : binding.ffn.c_str(),
+            binding.reduce.empty() ? "-" : binding.reduce.c_str(),
+            desired_attn != nullptr ? desired_attn : "-",
+            desired_ffn != nullptr ? desired_ffn : "-",
+            desired_reduce != nullptr ? desired_reduce : "-",
+            attn_mismatch ? 1 : 0,
+            ffn_mismatch ? 1 : 0,
+            reduce_mismatch ? 1 : 0,
+            mismatch_count);
+
+        begin = end;
     }
 }
 
