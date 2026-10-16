@@ -372,6 +372,60 @@ static int llama_hybrid_gpu_pc_layers() {
     return std::max(0, std::atoi(value));
 }
 
+static bool llama_hybrid_parse_pc_stage_backend(
+        const char * env_name,
+        llama_pc_layer_backend & backend) {
+    const char * value = std::getenv(env_name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    if (std::strcmp(value, "cpu") == 0 ||
+            std::strcmp(value, "CPU") == 0) {
+        backend = llama_pc_layer_backend::CPU;
+        return true;
+    }
+    if (std::strcmp(value, "cuda") == 0 ||
+            std::strcmp(value, "CUDA") == 0 ||
+            std::strcmp(value, "gpu") == 0 ||
+            std::strcmp(value, "GPU") == 0) {
+        backend = llama_pc_layer_backend::CUDA;
+        return true;
+    }
+
+    throw std::runtime_error(format(
+        "%s must be one of {cpu,cuda}, got '%s'",
+        env_name, value));
+}
+
+static llama_pc_stage_policy llama_hybrid_pc_stage_policy_from_env() {
+    llama_pc_stage_policy policy;
+
+    bool any = false;
+    any = llama_hybrid_parse_pc_stage_backend(
+              "LLAMA_HYBRID_PC_ATTN_BACKEND", policy.attn) || any;
+    any = llama_hybrid_parse_pc_stage_backend(
+              "LLAMA_HYBRID_PC_FFN_BACKEND", policy.ffn) || any;
+    any = llama_hybrid_parse_pc_stage_backend(
+              "LLAMA_HYBRID_PC_REDUCE_BACKEND", policy.reduce) || any;
+    policy.enabled = any;
+
+    return policy;
+}
+
+static bool llama_hybrid_pc_stage_policy_uses_cuda(
+        const llama_pc_stage_policy & policy) {
+    return policy.enabled &&
+        (policy.attn == llama_pc_layer_backend::CUDA ||
+         policy.ffn == llama_pc_layer_backend::CUDA ||
+         policy.reduce == llama_pc_layer_backend::CUDA);
+}
+
+static const char * llama_hybrid_pc_backend_name(
+        llama_pc_layer_backend backend) {
+    return backend == llama_pc_layer_backend::CUDA ? "CUDA" : "CPU";
+}
+
 static ggml_backend_dev_t llama_hybrid_cuda_device() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1576,6 +1630,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
+        pc_stage_policies.assign(n_layer, llama_pc_stage_policy{});
         std::vector<int> pc_layer_ids;
         for (int il = 0; il < n_layer; ++il) {
             if (hybrid_layer_modes[il] == llama_hybrid_layer_mode::PC_ONLY) {
@@ -1589,11 +1644,34 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
         }
 
-        if (n_gpu_pc > 0) {
+        // V1 inner-plan override: apply one deterministic local policy to all
+        // PC_ONLY layers.  The automatic inner planner will populate the same
+        // per-layer policy structure later; keeping the representation here
+        // avoids coupling the generic Region Ring to environment variables.
+        const llama_pc_stage_policy manual_pc_stage_policy =
+            llama_hybrid_pc_stage_policy_from_env();
+        if (manual_pc_stage_policy.enabled) {
+            for (const int il : pc_layer_ids) {
+                pc_stage_policies[il] = manual_pc_stage_policy;
+            }
+            LLAMA_LOG_INFO(
+                "[PC_INNER_POLICY] source=environment layers=%zu "
+                "attn=%s ffn=%s reduce=%s\n",
+                pc_layer_ids.size(),
+                llama_hybrid_pc_backend_name(manual_pc_stage_policy.attn),
+                llama_hybrid_pc_backend_name(manual_pc_stage_policy.ffn),
+                llama_hybrid_pc_backend_name(manual_pc_stage_policy.reduce));
+        }
+
+        const bool pc_stage_policy_needs_cuda =
+            llama_hybrid_pc_stage_policy_uses_cuda(manual_pc_stage_policy);
+        if (n_gpu_pc > 0 || pc_stage_policy_needs_cuda) {
             ggml_backend_dev_t cuda_dev = llama_hybrid_cuda_device();
             if (cuda_dev == nullptr) {
                 throw std::runtime_error(
-                    "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
+                    pc_stage_policy_needs_cuda ?
+                        "PC inner stage policy requires the CUDA0 backend" :
+                        "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
             }
             const bool already_registered = std::any_of(
                 devices.begin(), devices.end(),
@@ -1699,11 +1777,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    const bool has_cuda_pc_layers = std::any_of(
-        pc_layer_backends.begin(), pc_layer_backends.end(),
-        [](llama_pc_layer_backend backend) {
-            return backend == llama_pc_layer_backend::CUDA;
-        });
+    const bool has_cuda_pc_layers =
+        std::any_of(
+            pc_layer_backends.begin(), pc_layer_backends.end(),
+            [](llama_pc_layer_backend backend) {
+                return backend == llama_pc_layer_backend::CUDA;
+            }) ||
+        std::any_of(
+            pc_stage_policies.begin(), pc_stage_policies.end(),
+            [](const llama_pc_stage_policy & policy) {
+                return llama_hybrid_pc_stage_policy_uses_cuda(policy);
+            });
     ggml_backend_dev_t cuda_dev = has_cuda_pc_layers ? llama_hybrid_cuda_device() : nullptr;
     if (has_cuda_pc_layers &&
             (cuda_dev == nullptr || pimpl->gpu_buft_list.find(cuda_dev) == pimpl->gpu_buft_list.end())) {
