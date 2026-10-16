@@ -334,6 +334,7 @@ static ggml_backend_t llama_hybrid_find_cuda_backend(
 static bool llama_hybrid_apply_single_pc_attn_migration(
         const llama_model & model,
         const std::vector<ggml_backend_ptr> & backends,
+        ggml_backend_t backend_cpu,
         ggml_backend_sched_t sched_use,
         ggml_cgraph * gf,
         uint32_t ubatch_tokens) {
@@ -367,6 +368,15 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         return false;
     }
 
+    if (backend_cpu == nullptr ||
+        model.dev_layer(layer) != ggml_backend_get_device(backend_cpu)) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NOT_CPU_DIRECT "
+            "layer=%d tokens=%u\n",
+            layer, ubatch_tokens);
+        return false;
+    }
+
     int min_tokens = 32;
     const char * min_tokens_env =
         std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_MIGRATE_MIN_TOKENS");
@@ -393,6 +403,19 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
+
+    if (membership.gap_nodes != 0 ||
+        membership.transition_errors != 0 ||
+        membership.chunked_markers) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=BAD_MEMBERSHIP "
+            "layer=%d tokens=%u gaps=%d transition_errors=%d chunked=%d\n",
+            layer, ubatch_tokens,
+            membership.gap_nodes,
+            membership.transition_errors,
+            membership.chunked_markers ? 1 : 0);
+        return false;
+    }
 
     std::vector<ggml_tensor *> attn_nodes;
     for (const llama_hybrid_inner_node_membership & item :
@@ -2920,7 +2943,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         // and dev_layer() placement remain unchanged; this overrides only the
         // validated ATTN node membership immediately before scheduler alloc.
         llama_hybrid_apply_single_pc_attn_migration(
-            model, backends, sched_use, gf, ubatch.n_tokens);
+            model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens);
 
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
