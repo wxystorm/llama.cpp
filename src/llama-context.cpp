@@ -48,6 +48,93 @@ static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_k
     return "UNKNOWN";
 }
 
+static const char * llama_hybrid_inner_stage_name(llama_hybrid_inner_stage_kind kind) {
+    switch (kind) {
+        case llama_hybrid_inner_stage_kind::ATTN:    return "ATTN";
+        case llama_hybrid_inner_stage_kind::FFN:     return "FFN";
+        case llama_hybrid_inner_stage_kind::REDUCE:  return "REDUCE";
+        case llama_hybrid_inner_stage_kind::UNKNOWN: break;
+    }
+    return "UNKNOWN";
+}
+
+static const char * llama_hybrid_inner_stage_event_name(llama_hybrid_inner_stage_event event) {
+    switch (event) {
+        case llama_hybrid_inner_stage_event::BEGIN: return "BEGIN";
+        case llama_hybrid_inner_stage_event::END:   return "END";
+        case llama_hybrid_inner_stage_event::NONE:  break;
+    }
+    return "NONE";
+}
+
+static bool llama_hybrid_name_starts_with(const char * name, const char * prefix) {
+    return name != nullptr && prefix != nullptr &&
+        std::strncmp(name, prefix, std::strlen(prefix)) == 0;
+}
+
+static int llama_hybrid_inner_marker_layer(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    const char * dash = std::strrchr(name, '-');
+    if (dash == nullptr || dash[1] == '\0') {
+        return -1;
+    }
+    return std::atoi(dash + 1);
+}
+
+static int llama_hybrid_inner_marker_chunk(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    const char * chunk = std::strstr(name, "chunk_");
+    if (chunk == nullptr) {
+        return -1;
+    }
+    chunk += std::strlen("chunk_");
+    return std::atoi(chunk);
+}
+
+// Classify existing graph callback names only.  This is deliberately a
+// sidecar: it does not create tensors, change graph topology, or move work.
+// The same vocabulary will later be consumed by the generic Region Ring.
+static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
+        const char * tensor_name) {
+    llama_hybrid_inner_stage_marker marker;
+    marker.layer = llama_hybrid_inner_marker_layer(tensor_name);
+    marker.chunk = llama_hybrid_inner_marker_chunk(tensor_name);
+
+    if (llama_hybrid_name_starts_with(tensor_name, "ffn_inp-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_inp_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
+        marker.event = llama_hybrid_inner_stage_event::END;
+        return marker;
+    }
+
+    if (llama_hybrid_name_starts_with(tensor_name, "ffn_norm-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_ffn_norm_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::FFN;
+        marker.event = llama_hybrid_inner_stage_event::BEGIN;
+        return marker;
+    }
+
+    if (llama_hybrid_name_starts_with(tensor_name, "ffn_moe_out-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_ffn_down_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::FFN;
+        marker.event = llama_hybrid_inner_stage_event::END;
+        return marker;
+    }
+
+    if (llama_hybrid_name_starts_with(tensor_name, "l_out-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_l_out_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::REDUCE;
+        marker.event = llama_hybrid_inner_stage_event::END;
+        return marker;
+    }
+
+    return marker;
+}
+
 static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_action action) {
     switch (action) {
         case llama_hybrid_boundary_action::PASS:       return "PASS";
@@ -2043,6 +2130,44 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // First generic inner-stage checkpoint.  It observes the scheduler's
+        // real post-allocation backend assignment for existing Qwen3-MoE
+        // boundary tensors without changing any assignment.  This gives us a
+        // correctness-safe map of (layer, stage, chunk) before we let an inner
+        // plan drive placement.
+        const char * inner_stage_diag_env =
+            std::getenv("LLAMA_HYBRID_INNER_STAGE_DIAG");
+        const bool inner_stage_diag =
+            inner_stage_diag_env != nullptr &&
+            std::atoi(inner_stage_diag_env) != 0;
+        if (inner_stage_diag && stage != nullptr) {
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                const llama_hybrid_inner_stage_marker marker =
+                    llama_hybrid_classify_inner_stage_marker(node->name);
+                if (!marker.valid()) {
+                    continue;
+                }
+
+                ggml_backend_t assigned =
+                    ggml_backend_sched_get_tensor_backend(sched_use, node);
+                const char * assigned_name =
+                    assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
+
+                LLAMA_LOG_INFO(
+                    "[INNER_STAGE_BIND] outer=%s layers=[%d,%d) "
+                    "layer=%d chunk=%d stage=%s event=%s "
+                    "tensor=%s backend=%s\n",
+                    llama_hybrid_runtime_stage_name(stage->kind),
+                    stage->layer_begin, stage->layer_end,
+                    marker.layer, marker.chunk,
+                    llama_hybrid_inner_stage_name(marker.kind),
+                    llama_hybrid_inner_stage_event_name(marker.event),
+                    node->name, assigned_name);
+            }
         }
         if (phone_cpu_chunk_stage_trace) {
             ggml_tensor * stage_input = res->get_stage_input();
