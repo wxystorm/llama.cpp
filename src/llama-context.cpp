@@ -314,6 +314,13 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
     return result;
 }
 
+static bool llama_hybrid_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_VIEW ||
+           op == GGML_OP_RESHAPE ||
+           op == GGML_OP_PERMUTE ||
+           op == GGML_OP_TRANSPOSE;
+}
+
 static ggml_backend_t llama_hybrid_find_cuda_backend(
         const std::vector<ggml_backend_ptr> & backends) {
     for (const auto & backend_ptr : backends) {
@@ -442,7 +449,7 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         // - preallocated buffers already have an owner
         // - SET_ROWS is a side-effecting view used by KV cache writes
         const bool is_view =
-            ggml_is_view_op(node->op) || node->view_src != nullptr;
+            llama_hybrid_is_view_op(node->op) || node->view_src != nullptr;
         const bool has_fixed_buffer = node->buffer != nullptr;
         const bool is_set_rows = node->op == GGML_OP_SET_ROWS;
 
