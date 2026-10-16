@@ -417,7 +417,13 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         return false;
     }
 
-    std::vector<ggml_tensor *> attn_nodes;
+    std::vector<ggml_tensor *> migratable_nodes;
+    int attn_nodes = 0;
+    int anchored_nodes = 0;
+    int anchored_view = 0;
+    int anchored_buffer = 0;
+    int anchored_set_rows = 0;
+
     for (const llama_hybrid_inner_node_membership & item :
          membership.nodes) {
         if (!item.valid() ||
@@ -425,39 +431,66 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
             item.stage != llama_hybrid_inner_stage_kind::ATTN) {
             continue;
         }
-        attn_nodes.push_back(
-            ggml_graph_node(gf, item.node_index));
+
+        ++attn_nodes;
+        ggml_tensor * node =
+            ggml_graph_node(gf, item.node_index);
+
+        // User backend assignments bypass the scheduler's normal inheritance
+        // rules. Never override nodes whose output is tied to existing storage:
+        // - view ops / view_src must stay with the aliased source
+        // - preallocated buffers already have an owner
+        // - SET_ROWS is a side-effecting view used by KV cache writes
+        const bool is_view =
+            ggml_is_view_op(node->op) || node->view_src != nullptr;
+        const bool has_fixed_buffer = node->buffer != nullptr;
+        const bool is_set_rows = node->op == GGML_OP_SET_ROWS;
+
+        if (is_view || has_fixed_buffer || is_set_rows) {
+            ++anchored_nodes;
+            anchored_view += is_view ? 1 : 0;
+            anchored_buffer += has_fixed_buffer ? 1 : 0;
+            anchored_set_rows += is_set_rows ? 1 : 0;
+            continue;
+        }
+
+        if (!ggml_backend_supports_op(cuda_backend, node)) {
+            LLAMA_LOG_WARN(
+                "[INNER_ATTN_MIGRATE] status=SKIP reason=UNSUPPORTED_COMPUTE "
+                "layer=%d tokens=%u node=%s op=%s backend=%s "
+                "attn_nodes=%d anchored=%d\n",
+                layer, ubatch_tokens,
+                node->name, ggml_op_name(node->op),
+                ggml_backend_name(cuda_backend),
+                attn_nodes, anchored_nodes);
+            return false;
+        }
+
+        migratable_nodes.push_back(node);
     }
 
-    if (attn_nodes.empty()) {
+    if (attn_nodes == 0 || migratable_nodes.empty()) {
         LLAMA_LOG_WARN(
-            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_ATTN_NODES "
-            "layer=%d tokens=%u\n",
-            layer, ubatch_tokens);
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_SAFE_COMPUTE "
+            "layer=%d tokens=%u attn_nodes=%d anchored=%d\n",
+            layer, ubatch_tokens,
+            attn_nodes, anchored_nodes);
         return false;
     }
 
-    for (ggml_tensor * node : attn_nodes) {
-        if (!ggml_backend_supports_op(cuda_backend, node)) {
-            LLAMA_LOG_WARN(
-                "[INNER_ATTN_MIGRATE] status=SKIP reason=UNSUPPORTED "
-                "layer=%d tokens=%u node=%s op=%s backend=%s\n",
-                layer, ubatch_tokens,
-                node->name, ggml_op_name(node->op),
-                ggml_backend_name(cuda_backend));
-            return false;
-        }
-    }
-
-    for (ggml_tensor * node : attn_nodes) {
+    for (ggml_tensor * node : migratable_nodes) {
         ggml_backend_sched_set_tensor_backend(
             sched_use, node, cuda_backend);
     }
 
     LLAMA_LOG_INFO(
-        "[INNER_ATTN_MIGRATE] status=APPLIED layer=%d tokens=%u "
-        "nodes=%zu backend=%s membership={gaps:%d,transition_errors:%d}\n",
-        layer, ubatch_tokens, attn_nodes.size(),
+        "[INNER_ATTN_MIGRATE] status=APPLIED_SAFE layer=%d tokens=%u "
+        "attn_nodes=%d migrated=%zu anchored=%d "
+        "anchored_detail={view:%d,buffer:%d,set_rows:%d} "
+        "backend=%s membership={gaps:%d,transition_errors:%d}\n",
+        layer, ubatch_tokens,
+        attn_nodes, migratable_nodes.size(), anchored_nodes,
+        anchored_view, anchored_buffer, anchored_set_rows,
         ggml_backend_name(cuda_backend),
         membership.gap_nodes,
         membership.transition_errors);
