@@ -104,6 +104,13 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     marker.layer = llama_hybrid_inner_marker_layer(tensor_name);
     marker.chunk = llama_hybrid_inner_marker_chunk(tensor_name);
 
+    if (llama_hybrid_name_starts_with(tensor_name, "attn_norm-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_attn_out_group_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
+        marker.event = llama_hybrid_inner_stage_event::BEGIN;
+        return marker;
+    }
+
     if (llama_hybrid_name_starts_with(tensor_name, "ffn_inp-") ||
         llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_inp_chunk_")) {
         marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
@@ -2142,7 +2149,75 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         const bool inner_stage_diag =
             inner_stage_diag_env != nullptr &&
             std::atoi(inner_stage_diag_env) != 0;
-        if (inner_stage_diag && stage != nullptr) {
+        if (inner_stage_diag) {
+            llama_hybrid_plan diag_plan = {};
+            const bool have_diag_plan =
+                llama_hybrid_runtime_plan_get(diag_plan);
+
+            auto marker_outer = [&](int il) -> const char * {
+                if (stage != nullptr) {
+                    return llama_hybrid_runtime_stage_name(stage->kind);
+                }
+
+                if (have_diag_plan && il >= 0) {
+                    const int gpu_end =
+                        diag_plan.gpu_pc_layers;
+                    const int pc_end =
+                        diag_plan.pc_layers;
+                    const int tensor_end =
+                        pc_end + diag_plan.tensor_layers;
+                    const int phone_end =
+                        tensor_end + diag_plan.phone_layers;
+
+                    if (il < gpu_end) {
+                        return "GPU";
+                    }
+                    if (il < pc_end) {
+                        return "CPU";
+                    }
+                    if (il < tensor_end) {
+                        return "TENSOR";
+                    }
+                    if (il < phone_end) {
+                        return "PHONE";
+                    }
+                }
+
+                if (il >= 0) {
+                    switch (model.hybrid_layer_mode(il)) {
+                        case llama_hybrid_layer_mode::PC_ONLY: {
+                            const ggml_backend_dev_t dev =
+                                model.dev_layer(il);
+                            if (backend_cpu != nullptr &&
+                                dev == ggml_backend_get_device(backend_cpu)) {
+                                return "CPU";
+                            }
+                            return "GPU";
+                        }
+                        case llama_hybrid_layer_mode::TENSOR_SPLIT:
+                        case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
+                            return "TENSOR";
+                        case llama_hybrid_layer_mode::PHONE_ONLY:
+                            return "PHONE";
+                    }
+                }
+                return "UNKNOWN";
+            };
+
+            const int scope_begin =
+                stage != nullptr ? stage->layer_begin : 0;
+            const int scope_end =
+                stage != nullptr ? stage->layer_end :
+                (int) model.hparams.n_layer();
+
+            LLAMA_LOG_INFO(
+                "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
+                "have_plan=%d nodes=%d\n",
+                stage != nullptr ? "STAGED" : "FULL_GRAPH",
+                scope_begin, scope_end,
+                have_diag_plan ? 1 : 0,
+                ggml_graph_n_nodes(gf));
+
             const int n_nodes = ggml_graph_n_nodes(gf);
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = ggml_graph_node(gf, i);
@@ -2158,11 +2233,9 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                     assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
 
                 LLAMA_LOG_INFO(
-                    "[INNER_STAGE_BIND] outer=%s layers=[%d,%d) "
-                    "layer=%d chunk=%d stage=%s event=%s "
-                    "tensor=%s backend=%s\n",
-                    llama_hybrid_runtime_stage_name(stage->kind),
-                    stage->layer_begin, stage->layer_end,
+                    "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
+                    "stage=%s event=%s tensor=%s backend=%s\n",
+                    marker_outer(marker.layer),
                     marker.layer, marker.chunk,
                     llama_hybrid_inner_stage_name(marker.kind),
                     llama_hybrid_inner_stage_event_name(marker.event),
