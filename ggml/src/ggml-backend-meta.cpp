@@ -12369,6 +12369,110 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         fflush(stderr);
     }
 
+    // Chunk Ring GPU FIFO.
+    //
+    // The existing graph already contains one wave-Attention marker and one
+    // wave-l_out marker for each (layer, chunk).  Use those markers to turn
+    // the previous graph-order dependency checks into an explicit circulating
+    // FIFO:
+    //
+    //   seed:        ATT(first_layer, C0..Cn)
+    //   consume:     GPU pops ATT(L,C)
+    //   completion:  l_out(L,C) finishes -> push ATT(L+1,C)
+    //
+    // PC/NPU/Return/Reduce keep using their existing worker queues.  No
+    // priority scheduler is introduced: this queue is strict FIFO.
+    struct phone_chunk_ring_gpu_task {
+        int layer = -1;
+        int chunk = -1;
+    };
+    std::deque<phone_chunk_ring_gpu_task> phone_chunk_ring_gpu_queue;
+    std::set<std::pair<int, int>> phone_chunk_ring_gpu_enqueued;
+    size_t phone_chunk_ring_gpu_push_count = 0;
+    size_t phone_chunk_ring_gpu_pop_count = 0;
+    bool phone_chunk_ring_gpu_fifo_active = false;
+
+    if (phone_primary_chunk_ring_active) {
+        std::map<std::pair<int, int>, size_t> attn_sg_by_chunk;
+        std::map<std::pair<int, int>, size_t> l_out_sg_by_chunk;
+        std::set<int> initial_chunks;
+
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            int attn_begin = -1;
+            int attn_count = 1;
+            int attn_layer = -1;
+            if (parse_prefill_wave_attn_sg(
+                    sg, attn_begin, attn_count, attn_layer)) {
+                for (int offset = 0; offset < attn_count; ++offset) {
+                    const int chunk = attn_begin + offset;
+                    attn_sg_by_chunk[{attn_layer, chunk}] = sg;
+                    if (attn_layer == phone_primary_xlayer_first_layer) {
+                        initial_chunks.insert(chunk);
+                    }
+                }
+            }
+
+            int l_out_chunk = -1;
+            int l_out_layer = -1;
+            if (parse_prefill_wave_l_out_sg(
+                    sg, l_out_chunk, l_out_layer)) {
+                l_out_sg_by_chunk[{l_out_layer, l_out_chunk}] = sg;
+            }
+        }
+
+        bool topology_ok = !initial_chunks.empty();
+        for (const auto & entry : attn_sg_by_chunk) {
+            const int layer = entry.first.first;
+            const int chunk = entry.first.second;
+            if (layer <= phone_primary_xlayer_first_layer ||
+                    layer > phone_primary_xlayer_last_layer) {
+                continue;
+            }
+
+            const auto pred =
+                l_out_sg_by_chunk.find({layer - 1, chunk});
+            if (pred == l_out_sg_by_chunk.end() ||
+                    pred->second >= entry.second) {
+                topology_ok = false;
+                GGML_LOG_ERROR(
+                    "[CHUNK_RING_GPU_Q_CAP] active=0 "
+                    "reason=bad_topology layer=%d chunk=%d "
+                    "pred_l_out_sg=%" PRIu64 " attn_sg=%" PRIu64 "\n",
+                    layer,
+                    chunk,
+                    pred == l_out_sg_by_chunk.end() ?
+                        UINT64_MAX : (uint64_t) pred->second,
+                    (uint64_t) entry.second);
+                break;
+            }
+        }
+
+        if (topology_ok) {
+            phone_chunk_ring_gpu_fifo_active = true;
+            for (int chunk : initial_chunks) {
+                const std::pair<int, int> key {
+                    phone_primary_xlayer_first_layer,
+                    chunk,
+                };
+                const bool inserted =
+                    phone_chunk_ring_gpu_enqueued.insert(key).second;
+                GGML_ASSERT(inserted);
+                phone_chunk_ring_gpu_queue.push_back({
+                    phone_primary_xlayer_first_layer,
+                    chunk,
+                });
+                ++phone_chunk_ring_gpu_push_count;
+            }
+
+            GGML_LOG_INFO(
+                "[CHUNK_RING_GPU_Q_CAP] active=1 "
+                "first_layer=%d last_layer=%d initial=%zu\n",
+                phone_primary_xlayer_first_layer,
+                phone_primary_xlayer_last_layer,
+                phone_chunk_ring_gpu_queue.size());
+        }
+    }
+
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         if (wave_crash_trace) {
@@ -12645,103 +12749,164 @@ auto prefill_norm_sg_has_prework =
                         phone_waited ? 1 : 0);
                 }
             } else if (is_prefill_wave_attn_sg) {
-                // Attention(L,C) consumes OUT(L-1,C), not the most recently
-                // submitted down tensor in graph order.  Let same-layer chunk
-                // prework run while current-layer returns are in flight, and
-                // when crossing a layer boundary wait only for the exact
-                // predecessor chunk.  Older than L-1 is outside the V1
-                // one-layer lookahead window and must be drained first.
-                bool older_waited = false;
-                int64_t older_wait_us = 0;
-                const ggml_status older_status = wait_prefill_reduces_before(
-                    prefill_wave_attn_layer - 1, older_waited, older_wait_us);
-                if (older_status != GGML_STATUS_SUCCESS) {
-                    return older_status;
-                }
-
-                bool older_phone_waited = false;
-                int64_t older_phone_wait_us = 0;
-                if (phone_prefill_chunk_join_active) {
-                    const ggml_status phone_status =
-                        reap_phone_prefill_pc_layers_before(
-                            prefill_wave_attn_layer - 1,
-                            older_phone_waited,
-                            older_phone_wait_us);
-                    if (phone_status != GGML_STATUS_SUCCESS) {
-                        return phone_status;
-                    }
-                }
-
-                if (older_waited || older_phone_waited) {
-                    ++return_wave_old_layer_wait_count;
-                    return_wave_old_layer_wait_us +=
-                        older_wait_us + older_phone_wait_us;
-                }
-
                 bool waited = false;
                 int64_t dependency_wait_us = 0;
-                if (prefill_wave_attn_layer > active_wavefront_first_layer) {
-                    for (int dep_chunk = prefill_wave_attn_chunk;
-                         dep_chunk < prefill_wave_attn_chunk + prefill_wave_attn_chunk_count;
-                         ++dep_chunk) {
-                        bool reduce_dep_waited = false;
-                        const int64_t reduce_wait_start_us =
-                            ggml_time_us();
-                        const ggml_status reduce_status =
-                            wait_prefill_reduce_dependency(
+
+                if (phone_chunk_ring_gpu_fifo_active) {
+                    // Queue membership is the dependency.  A task for
+                    // Attention(L,C) is inserted only after the predecessor
+                    // chunk's final l_out(L-1,C) has completed.  Therefore do
+                    // not re-scan/re-drain older layers here.
+                    for (int offset = 0;
+                         offset < prefill_wave_attn_chunk_count;
+                         ++offset) {
+                        const int expected_chunk =
+                            prefill_wave_attn_chunk + offset;
+                        if (phone_chunk_ring_gpu_queue.empty()) {
+                            GGML_LOG_ERROR(
+                                "[CHUNK_RING_GPU_Q_FAIL] "
+                                "reason=empty layer=%d chunk=%d sg=%zu\n",
+                                prefill_wave_attn_layer,
+                                expected_chunk,
+                                i);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        const phone_chunk_ring_gpu_task task =
+                            phone_chunk_ring_gpu_queue.front();
+                        if (task.layer != prefill_wave_attn_layer ||
+                                task.chunk != expected_chunk) {
+                            GGML_LOG_ERROR(
+                                "[CHUNK_RING_GPU_Q_FAIL] "
+                                "reason=order expected=%d/%d "
+                                "front=%d/%d sg=%zu size=%zu\n",
+                                prefill_wave_attn_layer,
+                                expected_chunk,
+                                task.layer,
+                                task.chunk,
+                                i,
+                                phone_chunk_ring_gpu_queue.size());
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        phone_chunk_ring_gpu_queue.pop_front();
+                        ++phone_chunk_ring_gpu_pop_count;
+
+                        if (pipeline_debug ||
+                                tensor_phone_stage_profile ||
+                                xlayer_wave_trace) {
+                            GGML_LOG_INFO(
+                                "[CHUNK_RING_GPU_Q_POP] "
+                                "layer=%d chunk=%d sg=%zu "
+                                "remaining=%zu pop=%zu\n",
+                                task.layer,
+                                task.chunk,
+                                i,
+                                phone_chunk_ring_gpu_queue.size(),
+                                phone_chunk_ring_gpu_pop_count);
+                        }
+                    }
+                } else {
+                    // Conservative legacy/V2 admission.  Keep this untouched
+                    // for non-Chunk-Ring graphs.
+                    bool older_waited = false;
+                    int64_t older_wait_us = 0;
+                    const ggml_status older_status =
+                        wait_prefill_reduces_before(
+                            prefill_wave_attn_layer - 1,
+                            older_waited,
+                            older_wait_us);
+                    if (older_status != GGML_STATUS_SUCCESS) {
+                        return older_status;
+                    }
+
+                    bool older_phone_waited = false;
+                    int64_t older_phone_wait_us = 0;
+                    if (phone_prefill_chunk_join_active) {
+                        const ggml_status phone_status =
+                            reap_phone_prefill_pc_layers_before(
                                 prefill_wave_attn_layer - 1,
-                                dep_chunk,
-                                reduce_dep_waited);
-                        const int64_t reduce_dep_wait_us =
-                            ggml_time_us() - reduce_wait_start_us;
-                        if (reduce_status != GGML_STATUS_SUCCESS) {
-                            return reduce_status;
+                                older_phone_waited,
+                                older_phone_wait_us);
+                        if (phone_status != GGML_STATUS_SUCCESS) {
+                            return phone_status;
                         }
+                    }
 
-                        bool phone_dep_waited = false;
-                        int64_t phone_dep_wait_us = 0;
-                        if (phone_prefill_chunk_join_active) {
-                            const ggml_status phone_status =
-                                wait_phone_prefill_pc_dependency(
+                    if (older_waited || older_phone_waited) {
+                        ++return_wave_old_layer_wait_count;
+                        return_wave_old_layer_wait_us +=
+                            older_wait_us + older_phone_wait_us;
+                    }
+
+                    if (prefill_wave_attn_layer >
+                            active_wavefront_first_layer) {
+                        for (int dep_chunk = prefill_wave_attn_chunk;
+                             dep_chunk <
+                                 prefill_wave_attn_chunk +
+                                     prefill_wave_attn_chunk_count;
+                             ++dep_chunk) {
+                            bool reduce_dep_waited = false;
+                            const int64_t reduce_wait_start_us =
+                                ggml_time_us();
+                            const ggml_status reduce_status =
+                                wait_prefill_reduce_dependency(
                                     prefill_wave_attn_layer - 1,
                                     dep_chunk,
-                                    phone_dep_waited,
-                                    phone_dep_wait_us);
-                            if (phone_status != GGML_STATUS_SUCCESS) {
-                                return phone_status;
+                                    reduce_dep_waited);
+                            const int64_t reduce_dep_wait_us =
+                                ggml_time_us() - reduce_wait_start_us;
+                            if (reduce_status != GGML_STATUS_SUCCESS) {
+                                return reduce_status;
                             }
-                        }
 
-                        const bool dep_waited =
-                            reduce_dep_waited ||
-                            phone_dep_waited;
-                        const int64_t dep_wait_us =
-                            reduce_dep_wait_us +
-                            phone_dep_wait_us;
-                        dependency_wait_us += dep_wait_us;
-                        waited = waited || dep_waited;
-                        if (dep_waited) {
-                            ++return_wave_dependency_wait_count;
-                            return_wave_dependency_wait_us += dep_wait_us;
-                            return_wave_dependency_wait_max_us =
-                                std::max(
-                                    return_wave_dependency_wait_max_us,
-                                    dep_wait_us);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[RETURN_WAVEFRONT_DEP_WAIT] "
-                                    "layer=%d chunk=%d "
-                                    "group_begin=%d group_count=%d "
-                                    "predecessor=%d wait_ms=%.3f "
-                                    "generic=%d phone=%d\n",
-                                    prefill_wave_attn_layer,
-                                    dep_chunk,
-                                    prefill_wave_attn_chunk,
-                                    prefill_wave_attn_chunk_count,
-                                    prefill_wave_attn_layer - 1,
-                                    dep_wait_us / 1000.0,
-                                    reduce_dep_waited ? 1 : 0,
-                                    phone_dep_waited ? 1 : 0);
+                            bool phone_dep_waited = false;
+                            int64_t phone_dep_wait_us = 0;
+                            if (phone_prefill_chunk_join_active) {
+                                const ggml_status phone_status =
+                                    wait_phone_prefill_pc_dependency(
+                                        prefill_wave_attn_layer - 1,
+                                        dep_chunk,
+                                        phone_dep_waited,
+                                        phone_dep_wait_us);
+                                if (phone_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return phone_status;
+                                }
+                            }
+
+                            const bool dep_waited =
+                                reduce_dep_waited ||
+                                phone_dep_waited;
+                            const int64_t dep_wait_us =
+                                reduce_dep_wait_us +
+                                phone_dep_wait_us;
+                            dependency_wait_us += dep_wait_us;
+                            waited = waited || dep_waited;
+                            if (dep_waited) {
+                                ++return_wave_dependency_wait_count;
+                                return_wave_dependency_wait_us +=
+                                    dep_wait_us;
+                                return_wave_dependency_wait_max_us =
+                                    std::max(
+                                        return_wave_dependency_wait_max_us,
+                                        dep_wait_us);
+                                if (pipeline_debug) {
+                                    printf(
+                                        "[RETURN_WAVEFRONT_DEP_WAIT] "
+                                        "layer=%d chunk=%d "
+                                        "group_begin=%d group_count=%d "
+                                        "predecessor=%d wait_ms=%.3f "
+                                        "generic=%d phone=%d\n",
+                                        prefill_wave_attn_layer,
+                                        dep_chunk,
+                                        prefill_wave_attn_chunk,
+                                        prefill_wave_attn_chunk_count,
+                                        prefill_wave_attn_layer - 1,
+                                        dep_wait_us / 1000.0,
+                                        reduce_dep_waited ? 1 : 0,
+                                        phone_dep_waited ? 1 : 0);
+                                }
                             }
                         }
                     }
@@ -14953,6 +15118,56 @@ auto prefill_norm_sg_has_prework =
         return compute_status;
     }
 
+    if (phone_chunk_ring_gpu_fifo_active &&
+            is_prefill_wave_l_out_sg &&
+            prefill_wave_l_out_layer >=
+                phone_primary_xlayer_first_layer &&
+            prefill_wave_l_out_layer <
+                phone_primary_xlayer_last_layer) {
+        const int next_layer =
+            prefill_wave_l_out_layer + 1;
+        const int next_chunk =
+            prefill_wave_l_out_chunk;
+        const std::pair<int, int> key {
+            next_layer,
+            next_chunk,
+        };
+
+        if (!phone_chunk_ring_gpu_enqueued.insert(key).second) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_GPU_Q_FAIL] "
+                "reason=duplicate_push source=%d/%d next=%d/%d sg=%zu\n",
+                prefill_wave_l_out_layer,
+                prefill_wave_l_out_chunk,
+                next_layer,
+                next_chunk,
+                i);
+            return GGML_STATUS_FAILED;
+        }
+
+        phone_chunk_ring_gpu_queue.push_back({
+            next_layer,
+            next_chunk,
+        });
+        ++phone_chunk_ring_gpu_push_count;
+
+        if (pipeline_debug ||
+                tensor_phone_stage_profile ||
+                xlayer_wave_trace) {
+            GGML_LOG_INFO(
+                "[CHUNK_RING_GPU_Q_PUSH] "
+                "source=%d/%d next=%d/%d sg=%zu "
+                "size=%zu push=%zu\n",
+                prefill_wave_l_out_layer,
+                prefill_wave_l_out_chunk,
+                next_layer,
+                next_chunk,
+                i,
+                phone_chunk_ring_gpu_queue.size(),
+                phone_chunk_ring_gpu_push_count);
+        }
+    }
+
     // Complete deferred TP input traces only for sources that are produced by
     // this subgraph itself. This distinguishes a real zero from a PRE trace
     // that simply inspected the destination before its ADD/other producer ran.
@@ -15509,6 +15724,19 @@ auto prefill_norm_sg_has_prework =
             phone_xlayer_v2_throttle_return_rpc_us / 1000.0,
             phone_xlayer_v2_throttle_add_submit_us / 1000.0,
             phone_xlayer_v2_throttle_other_us / 1000.0);
+    }
+
+    if (phone_chunk_ring_gpu_fifo_active) {
+        printf(
+            "[CHUNK_RING_GPU_Q_SUM] push=%zu pop=%zu remaining=%zu "
+            "status=%s\n",
+            phone_chunk_ring_gpu_push_count,
+            phone_chunk_ring_gpu_pop_count,
+            phone_chunk_ring_gpu_queue.size(),
+            phone_chunk_ring_gpu_queue.empty() &&
+                phone_chunk_ring_gpu_push_count ==
+                    phone_chunk_ring_gpu_pop_count ?
+                "DRAINED" : "PENDING");
     }
 
     if (runtime_profile_graph) {
