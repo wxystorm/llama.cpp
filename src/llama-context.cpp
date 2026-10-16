@@ -104,10 +104,15 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     marker.layer = llama_hybrid_inner_marker_layer(tensor_name);
     marker.chunk = llama_hybrid_inner_marker_chunk(tensor_name);
 
-    if (llama_hybrid_name_starts_with(tensor_name, "attn_norm-") ||
-        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_attn_out_group_")) {
+    if (llama_hybrid_name_starts_with(tensor_name, "attn_norm-")) {
         marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
         marker.event = llama_hybrid_inner_stage_event::BEGIN;
+        return marker;
+    }
+
+    if (llama_hybrid_name_starts_with(tensor_name, "prefill_wave_attn_out_group_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
+        marker.event = llama_hybrid_inner_stage_event::END;
         return marker;
     }
 
@@ -140,6 +145,94 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     }
 
     return marker;
+}
+
+static void llama_hybrid_log_inner_stage_bindings(
+        const llama_model & model,
+        ggml_backend_sched_t sched_use,
+        ggml_cgraph * gf,
+        const llama_hybrid_runtime_stage * stage,
+        ggml_backend_t backend_cpu,
+        bool reused_graph) {
+    const char * env = std::getenv("LLAMA_HYBRID_INNER_STAGE_DIAG");
+    if (env == nullptr || std::atoi(env) == 0 || gf == nullptr) {
+        return;
+    }
+
+    llama_hybrid_plan plan = {};
+    const bool have_plan = llama_hybrid_runtime_plan_get(plan);
+
+    auto outer_for_layer = [&](int il) -> const char * {
+        if (stage != nullptr) {
+            return llama_hybrid_runtime_stage_name(stage->kind);
+        }
+        if (have_plan && il >= 0) {
+            const int gpu_end    = plan.gpu_pc_layers;
+            const int pc_end     = plan.pc_layers;
+            const int tensor_end = pc_end + plan.tensor_layers;
+            const int phone_end  = tensor_end + plan.phone_layers;
+            if (il < gpu_end)    return "GPU";
+            if (il < pc_end)     return "CPU";
+            if (il < tensor_end) return "TENSOR";
+            if (il < phone_end)  return "PHONE";
+        }
+
+        if (il >= 0) {
+            switch (model.hybrid_layer_mode(il)) {
+                case llama_hybrid_layer_mode::PC_ONLY: {
+                    const ggml_backend_dev_t dev = model.dev_layer(il);
+                    if (backend_cpu != nullptr &&
+                        dev == ggml_backend_get_device(backend_cpu)) {
+                        return "CPU";
+                    }
+                    return "GPU";
+                }
+                case llama_hybrid_layer_mode::TENSOR_SPLIT:
+                case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
+                    return "TENSOR";
+                case llama_hybrid_layer_mode::PHONE_ONLY:
+                    return "PHONE";
+            }
+        }
+        return "UNKNOWN";
+    };
+
+    const int scope_begin = stage != nullptr ? stage->layer_begin : 0;
+    const int scope_end   = stage != nullptr ? stage->layer_end :
+        (int) model.hparams.n_layer();
+
+    LLAMA_LOG_INFO(
+        "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
+        "have_plan=%d reused=%d nodes=%d\n",
+        stage != nullptr ? "STAGED" : "FULL_GRAPH",
+        scope_begin, scope_end,
+        have_plan ? 1 : 0,
+        reused_graph ? 1 : 0,
+        ggml_graph_n_nodes(gf));
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const llama_hybrid_inner_stage_marker marker =
+            llama_hybrid_classify_inner_stage_marker(node->name);
+        if (!marker.valid()) {
+            continue;
+        }
+
+        ggml_backend_t assigned =
+            ggml_backend_sched_get_tensor_backend(sched_use, node);
+        const char * assigned_name =
+            assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
+
+        LLAMA_LOG_INFO(
+            "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
+            "stage=%s event=%s tensor=%s backend=%s\n",
+            outer_for_layer(marker.layer),
+            marker.layer, marker.chunk,
+            llama_hybrid_inner_stage_name(marker.kind),
+            llama_hybrid_inner_stage_event_name(marker.event),
+            node->name, assigned_name);
+    }
 }
 
 static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_action action) {
@@ -2139,109 +2232,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             return nullptr;
         }
 
-        // First generic inner-stage checkpoint.  It observes the scheduler's
-        // real post-allocation backend assignment for existing Qwen3-MoE
-        // boundary tensors without changing any assignment.  This gives us a
-        // correctness-safe map of (layer, stage, chunk) before we let an inner
-        // plan drive placement.
-        const char * inner_stage_diag_env =
-            std::getenv("LLAMA_HYBRID_INNER_STAGE_DIAG");
-        const bool inner_stage_diag =
-            inner_stage_diag_env != nullptr &&
-            std::atoi(inner_stage_diag_env) != 0;
-        if (inner_stage_diag) {
-            llama_hybrid_plan diag_plan = {};
-            const bool have_diag_plan =
-                llama_hybrid_runtime_plan_get(diag_plan);
-
-            auto marker_outer = [&](int il) -> const char * {
-                if (stage != nullptr) {
-                    return llama_hybrid_runtime_stage_name(stage->kind);
-                }
-
-                if (have_diag_plan && il >= 0) {
-                    const int gpu_end =
-                        diag_plan.gpu_pc_layers;
-                    const int pc_end =
-                        diag_plan.pc_layers;
-                    const int tensor_end =
-                        pc_end + diag_plan.tensor_layers;
-                    const int phone_end =
-                        tensor_end + diag_plan.phone_layers;
-
-                    if (il < gpu_end) {
-                        return "GPU";
-                    }
-                    if (il < pc_end) {
-                        return "CPU";
-                    }
-                    if (il < tensor_end) {
-                        return "TENSOR";
-                    }
-                    if (il < phone_end) {
-                        return "PHONE";
-                    }
-                }
-
-                if (il >= 0) {
-                    switch (model.hybrid_layer_mode(il)) {
-                        case llama_hybrid_layer_mode::PC_ONLY: {
-                            const ggml_backend_dev_t dev =
-                                model.dev_layer(il);
-                            if (backend_cpu != nullptr &&
-                                dev == ggml_backend_get_device(backend_cpu)) {
-                                return "CPU";
-                            }
-                            return "GPU";
-                        }
-                        case llama_hybrid_layer_mode::TENSOR_SPLIT:
-                        case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
-                            return "TENSOR";
-                        case llama_hybrid_layer_mode::PHONE_ONLY:
-                            return "PHONE";
-                    }
-                }
-                return "UNKNOWN";
-            };
-
-            const int scope_begin =
-                stage != nullptr ? stage->layer_begin : 0;
-            const int scope_end =
-                stage != nullptr ? stage->layer_end :
-                (int) model.hparams.n_layer();
-
-            LLAMA_LOG_INFO(
-                "[INNER_STAGE_DIAG] enabled=1 scope=%s layers=[%d,%d) "
-                "have_plan=%d nodes=%d\n",
-                stage != nullptr ? "STAGED" : "FULL_GRAPH",
-                scope_begin, scope_end,
-                have_diag_plan ? 1 : 0,
-                ggml_graph_n_nodes(gf));
-
-            const int n_nodes = ggml_graph_n_nodes(gf);
-            for (int i = 0; i < n_nodes; ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                const llama_hybrid_inner_stage_marker marker =
-                    llama_hybrid_classify_inner_stage_marker(node->name);
-                if (!marker.valid()) {
-                    continue;
-                }
-
-                ggml_backend_t assigned =
-                    ggml_backend_sched_get_tensor_backend(sched_use, node);
-                const char * assigned_name =
-                    assigned != nullptr ? ggml_backend_name(assigned) : "(unassigned)";
-
-                LLAMA_LOG_INFO(
-                    "[INNER_STAGE_BIND] outer=%s layer=%d chunk=%d "
-                    "stage=%s event=%s tensor=%s backend=%s\n",
-                    marker_outer(marker.layer),
-                    marker.layer, marker.chunk,
-                    llama_hybrid_inner_stage_name(marker.kind),
-                    llama_hybrid_inner_stage_event_name(marker.event),
-                    node->name, assigned_name);
-            }
-        }
         if (phone_cpu_chunk_stage_trace) {
             ggml_tensor * stage_input = res->get_stage_input();
             ggml_backend_t stage_input_backend =
@@ -2262,6 +2252,11 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             graph_alloc_us = ggml_time_us() - graph_alloc_begin_us;
         }
     }
+
+    // Sidecar only: log the same generic inner-stage map for both freshly
+    // allocated and reused graphs.  No backend assignment is modified here.
+    llama_hybrid_log_inner_stage_bindings(
+        model, sched_use, gf, stage, backend_cpu, reused_graph);
 
     if (strict_cpu_stage) {
         // Validate both fresh allocations and reused graphs. A CPU-only
