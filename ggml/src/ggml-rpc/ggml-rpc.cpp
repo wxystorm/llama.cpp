@@ -2334,6 +2334,12 @@ static bool ggml_backend_rpc_route_mark_ready(
 static constexpr uint64_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG =
     UINT64_C(1) << 63;
 
+// GET_ROUTE_SNAPSHOT patch-17 extension. The client advertises ACK support in
+// sizes[2]. The server mirrors the same bit in the response-size header only
+// when a sub-lane bulk limit is active.
+static constexpr uint64_t RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG =
+    UINT64_C(1) << 63;
+
 struct rpc_route_topk_compact_layout {
     bool supported = false;
     size_t rows = 0;
@@ -2573,6 +2579,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
 
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH = 13;
+    constexpr uint8_t RPC_ROUTE_SNAPSHOT_WIRE_ACK_MIN_PATCH = 17;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch =
         rpc_get_remote_patch(compute_key);
@@ -2623,6 +2630,13 @@ static bool ggml_backend_rpc_get_route_snapshot(
             RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG;
     }
 
+    const bool wire_ack_supported =
+        remote_patch >= RPC_ROUTE_SNAPSHOT_WIRE_ACK_MIN_PATCH;
+    if (wire_ack_supported) {
+        request.sizes[2] |=
+            RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG;
+    }
+
     auto * rpc_dev_ctx =
         static_cast<ggml_backend_rpc_device_context *>(
             ggml_backend_get_device(backend_src)->context);
@@ -2667,13 +2681,20 @@ static bool ggml_backend_rpc_get_route_snapshot(
         sizeof(request));
     const int64_t request_done_us = ggml_time_us();
 
-    uint64_t out_size = 0;
+    uint64_t wire_out_size = 0;
     if (status) {
         status = route_sock->recv_data(
-            &out_size,
-            sizeof(out_size));
+            &wire_out_size,
+            sizeof(wire_out_size));
     }
     const int64_t response_header_us = ggml_time_us();
+
+    const bool wire_ack_required =
+        (wire_out_size &
+         RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG) != 0;
+    const uint64_t out_size =
+        wire_out_size &
+        ~RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG;
 
     if (status && out_size != response.size()) {
         status = false;
@@ -2690,7 +2711,22 @@ static bool ggml_backend_rpc_get_route_snapshot(
             response.size());
     }
     const int64_t payload_done_us = ggml_time_us();
-    const int64_t rpc_us = payload_done_us - rpc_begin_us;
+
+    // Release is driven by PC userspace receive completion, not by Phone
+    // send() completion. ACK immediately before any destination tensor upload.
+    const int64_t ack_send_begin_us =
+        measure_profile ? ggml_time_us() : 0;
+    if (status && wire_ack_required) {
+        const uint64_t ack_seq = seq;
+        status = route_sock->send_data(
+            &ack_seq,
+            sizeof(ack_seq));
+    }
+    const int64_t ack_send_done_us =
+        measure_profile ? ggml_time_us() : 0;
+
+    const int64_t rpc_done_us = ggml_time_us();
+    const int64_t rpc_us = rpc_done_us - rpc_begin_us;
     RPC_STATUS_ASSERT(status);
 
     const int64_t request_send_us =
@@ -2699,6 +2735,10 @@ static bool ggml_backend_rpc_get_route_snapshot(
         response_header_us - request_done_us;
     const int64_t payload_recv_us =
         payload_done_us - response_header_us;
+    const int64_t ack_send_us =
+        wire_ack_required ?
+            ack_send_done_us - ack_send_begin_us :
+            0;
 
     const int64_t dst_set_begin_us =
         measure_profile ? ggml_time_us() : 0;
@@ -2757,7 +2797,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
             stderr,
             "[ROUTE_RPC_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
             "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
-            "set=%.3f total=%.3f\n",
+            "ack=%.3f set=%.3f total=%.3f\n",
             seq,
             lane,
             wire_total_size,
@@ -2765,6 +2805,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
             request_send_us / 1000.0,
             response_header_wait_us / 1000.0,
             payload_recv_us / 1000.0,
+            ack_send_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
     }
@@ -2773,7 +2814,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         GGML_LOG_INFO(
             "[ROUTE_RPC] seq=%" PRIu64 " lane=%u bytes=%zu "
             "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
-            "set=%.3f total=%.3f\n",
+            "ack=%.3f set=%.3f total=%.3f\n",
             seq,
             lane,
             wire_total_size,
@@ -2781,6 +2822,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
             request_send_us / 1000.0,
             response_header_wait_us / 1000.0,
             payload_recv_us / 1000.0,
+            ack_send_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
     }
@@ -6724,7 +6766,8 @@ bool rpc_server::get_route_snapshot(
         request.sizes[0],
         request.sizes[1] &
             ~RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_FLAG,
-        request.sizes[2],
+        request.sizes[2] &
+            ~RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG,
     };
 
     rpc_route_snapshot_slot & slot =
@@ -9886,6 +9929,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 // server wait/copy time without changing the RPC protocol.
                 const uint64_t out_size =
                     static_cast<uint64_t>(response.size());
+                const bool wire_ack_supported =
+                    (request.sizes[2] &
+                     RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG) != 0;
 
                 // Do not gate the request or the READY wait. Multiple GETs
                 // remain pre-armed and all four snapshot slots remain usable.
@@ -9899,12 +9945,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     measure_profile ? ggml_time_us() : 0;
                 const size_t bulk_limit =
                     server.route_bulk_transfer_limit();
+                const bool wire_ack_required =
+                    wire_ack_supported &&
+                    bulk_limit < RPC_ROUTE_TRANSFER_LANES;
+                const uint64_t wire_out_size =
+                    out_size |
+                    (wire_ack_required ?
+                        RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG :
+                        UINT64_C(0));
 
                 const int64_t header_send_begin_us =
                     measure_profile ? ggml_time_us() : 0;
                 if (!sock->send_data(
-                        &out_size,
-                        sizeof(out_size))) {
+                        &wire_out_size,
+                        sizeof(wire_out_size))) {
                     server.release_route_bulk_credit();
                     return;
                 }
@@ -9920,6 +9974,28 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 const int64_t payload_send_done_us =
                     measure_profile ? ggml_time_us() : 0;
+
+                int64_t ack_done_us = payload_send_done_us;
+                if (wire_ack_required) {
+                    uint64_t ack_seq = 0;
+                    if (!sock->recv_data(
+                            &ack_seq,
+                            sizeof(ack_seq))) {
+                        server.release_route_bulk_credit();
+                        return;
+                    }
+                    ack_done_us =
+                        measure_profile ? ggml_time_us() : payload_send_done_us;
+                    if (ack_seq != request.seq) {
+                        GGML_LOG_ERROR(
+                            "[RPC_ROUTE_BULK_ACK_MISMATCH] "
+                            "expected=%" PRIu64 " actual=%" PRIu64 "\n",
+                            request.seq,
+                            ack_seq);
+                        server.release_route_bulk_credit();
+                        return;
+                    }
+                }
                 server.release_route_bulk_credit();
 
                 if (route_profile) {
@@ -9928,7 +10004,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         "[ROUTE_SRV_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
                         "recv=%.3f queue=%.3f get=%.3f "
                         "credit=%.3f inflight=%zu/%zu "
-                        "hsend=%.3f psend=%.3f total=%.3f\n",
+                        "hsend=%.3f psend=%.3f ack=%.3f hold=%.3f "
+                        "total=%.3f\n",
                         request.seq,
                         request.lane,
                         response.size(),
@@ -9946,6 +10023,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                             header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_done_us) / 1000.0,
+                        (ack_done_us -
+                            payload_send_done_us) / 1000.0,
+                        (ack_done_us -
+                            header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_begin_us) / 1000.0);
                 }
@@ -9955,7 +10036,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         "[ROUTE_SRV] seq=%" PRIu64 " lane=%u bytes=%zu "
                         "recv=%.3f queue=%.3f get=%.3f "
                         "credit=%.3f inflight=%zu/%zu "
-                        "hsend=%.3f psend=%.3f total=%.3f\n",
+                        "hsend=%.3f psend=%.3f ack=%.3f hold=%.3f "
+                        "total=%.3f\n",
                         request.seq,
                         request.lane,
                         response.size(),
@@ -9973,6 +10055,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                             header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_done_us) / 1000.0,
+                        (ack_done_us -
+                            payload_send_done_us) / 1000.0,
+                        (ack_done_us -
+                            header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_begin_us) / 1000.0);
                 }
