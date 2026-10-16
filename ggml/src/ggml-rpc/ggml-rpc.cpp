@@ -427,6 +427,12 @@ enum rpc_return_wire_type : uint32_t {
     RPC_RETURN_WIRE_F16 = 1,
 };
 
+// v19: the sender asks the Phone server for an immediate receipt ACK after the
+// complete Return payload has reached Phone userspace. This ACK releases the
+// PC-side one-Return-at-a-time wire mutex before Phone FFN wait/reduce.
+static constexpr uint32_t RPC_RETURN_WIRE_EARLY_ACK_FLAG =
+    UINT32_C(1) << 0;
+
 struct rpc_msg_set_tensor_async_return_wait_req_v14 {
     uint32_t device;
     uint64_t phone_ffn_seq;
@@ -646,7 +652,17 @@ struct ggml_backend_rpc_device_context {
     rpc_snapshot_client_stats snapshot_client_stats;
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
-    // -1 unknown, 0 disabled, 1 enabled. Learned lazily from the Phone server.
+
+    // v19 directional network policy:
+    //   - at most one PC->Phone Return payload on the wire;
+    //   - Route is limited independently on the Phone server;
+    //   - one Route and one Return may overlap.
+    // A lane mutex remains held through the final RPC response so the same
+    // socket cannot be reused while its previous request is still draining.
+    std::mutex return_wire_mutex;
+    std::array<std::mutex, RPC_RETURN_TRANSFER_LANES> return_lane_mutex {};
+
+    // Legacy v18 shared-credit discovery/cache, kept only for old servers.
     std::atomic<int> network_bulk_shared_active { -1 };
 };
 
@@ -3604,6 +3620,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     constexpr uint8_t RPC_PHONE_FFN_JOIN_MIN_PATCH = 11;
     constexpr uint8_t RPC_RETURN_F16_MIN_PATCH = 15;
+    constexpr uint8_t RPC_DIRECTIONAL_BULK_MIN_PATCH = 19;
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch = rpc_get_remote_patch(compute_key);
     if (remote_patch < RPC_PHONE_FFN_JOIN_MIN_PATCH) {
@@ -3689,6 +3706,10 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         request.wire_type =
             use_f16 ? RPC_RETURN_WIRE_F16 :
                 RPC_RETURN_WIRE_RAW;
+        if (remote_patch >= RPC_DIRECTIONAL_BULK_MIN_PATCH) {
+            request.reserved |=
+                RPC_RETURN_WIRE_EARLY_ACK_FLAG;
+        }
         request.original_size = data_size;
 
         input.resize(sizeof(request) + wire_size);
@@ -3725,10 +3746,30 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         stage_profile || throttle_profile;
 
     constexpr uint8_t RPC_NETWORK_BULK_MIN_PATCH = 18;
-    int64_t bulk_grant_us = 0;
-    uint64_t bulk_grant_inflight = 0;
-    uint64_t bulk_grant_limit = 0;
-    if (remote_patch >= RPC_NETWORK_BULK_MIN_PATCH &&
+    const bool directional_bulk =
+        remote_patch >= RPC_DIRECTIONAL_BULK_MIN_PATCH;
+
+    int64_t bulk_admit_us = 0;
+    int64_t request_send_us = 0;
+    int64_t receipt_wait_us = 0;
+    int64_t tail_wait_us = 0;
+    int64_t legacy_grant_us = 0;
+    uint64_t legacy_grant_inflight = 0;
+    uint64_t legacy_grant_limit = 0;
+
+    // Keep each Return socket single-owner until its final RPC response. The
+    // direction-wide mutex below is released earlier, on the Phone receipt ACK.
+    std::unique_lock<std::mutex> return_lane_lock;
+    if (directional_bulk) {
+        return_lane_lock =
+            std::unique_lock<std::mutex>(
+                rpc_dev_ctx->return_lane_mutex[return_lane]);
+    }
+
+    // v18 fallback only: preserve the old Phone-granted shared-credit protocol
+    // when talking to an older server.
+    if (!directional_bulk &&
+            remote_patch >= RPC_NETWORK_BULK_MIN_PATCH &&
             rpc_dev_ctx->network_bulk_shared_active.load(
                 std::memory_order_relaxed) != 0) {
         rpc_msg_return_bulk_acquire_req bulk_request {};
@@ -3753,57 +3794,141 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         rpc_dev_ctx->network_bulk_shared_active.store(
             shared_bulk_active ? 1 : 0,
             std::memory_order_relaxed);
-        bulk_grant_us =
+        legacy_grant_us =
             measure_profile ?
                 grant_done_us - grant_begin_us :
                 0;
-        bulk_grant_inflight = bulk_response.inflight;
-        bulk_grant_limit = bulk_response.limit;
-    }
-
-    rpc_cmd_roundtrip_profile roundtrip_profile {};
-    rpc_cmd_roundtrip_profile * const previous_profile =
-        rpc_cmd_roundtrip_profile_active;
-    if (measure_profile) {
-        rpc_cmd_roundtrip_profile_active =
-            &roundtrip_profile;
+        legacy_grant_inflight = bulk_response.inflight;
+        legacy_grant_limit = bulk_response.limit;
     }
 
     const int64_t begin_us =
         measure_profile ? ggml_time_us() : 0;
+    bool status = true;
 
-    const bool status = send_rpc_cmd(
-        sock,
-        RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
-        input.data(),
-        input.size(),
-        nullptr,
-        0);
+    if (directional_bulk) {
+        const int64_t admit_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        std::unique_lock<std::mutex> return_wire_lock(
+            rpc_dev_ctx->return_wire_mutex);
+        const int64_t admit_done_us =
+            measure_profile ? ggml_time_us() : 0;
+        bulk_admit_us =
+            measure_profile ?
+                admit_done_us - admit_begin_us :
+                0;
+
+        const int64_t request_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        status = send_rpc_cmd(
+            sock,
+            RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
+            input.data(),
+            input.size());
+        const int64_t request_done_us =
+            measure_profile ? ggml_time_us() : 0;
+        request_send_us =
+            measure_profile ?
+                request_done_us - request_begin_us :
+                0;
+
+        uint64_t receipt_seq = 0;
+        const int64_t receipt_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        if (status) {
+            status = recv_msg(
+                sock,
+                &receipt_seq,
+                sizeof(receipt_seq));
+        }
+        const int64_t receipt_done_us =
+            measure_profile ? ggml_time_us() : 0;
+        receipt_wait_us =
+            measure_profile ?
+                receipt_done_us - receipt_begin_us :
+                0;
+        if (status && receipt_seq != phone_ffn_seq) {
+            GGML_LOG_ERROR(
+                "[RETURN_DIRECTIONAL_ACK_MISMATCH] "
+                "expected=%" PRIu64 " actual=%" PRIu64 "\n",
+                phone_ffn_seq,
+                receipt_seq);
+            status = false;
+        }
+
+        // The full Return payload is now in Phone userspace. Let the next
+        // Return payload use the opposite lane while this RPC waits for Phone
+        // FFN dependency/reduce and its final response.
+        return_wire_lock.unlock();
+
+        const int64_t tail_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        if (status) {
+            uint64_t final_size = UINT64_MAX;
+            status = sock->recv_data(
+                &final_size,
+                sizeof(final_size));
+            if (status && final_size != 0) {
+                status = false;
+            }
+        }
+        const int64_t tail_done_us =
+            measure_profile ? ggml_time_us() : 0;
+        tail_wait_us =
+            measure_profile ?
+                tail_done_us - tail_begin_us :
+                0;
+    } else {
+        rpc_cmd_roundtrip_profile roundtrip_profile {};
+        rpc_cmd_roundtrip_profile * const previous_profile =
+            rpc_cmd_roundtrip_profile_active;
+        if (measure_profile) {
+            rpc_cmd_roundtrip_profile_active =
+                &roundtrip_profile;
+        }
+
+        status = send_rpc_cmd(
+            sock,
+            RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
+            input.data(),
+            input.size(),
+            nullptr,
+            0);
+
+        if (measure_profile) {
+            rpc_cmd_roundtrip_profile_active =
+                previous_profile;
+            request_send_us =
+                roundtrip_profile.request_send_us;
+            tail_wait_us =
+                roundtrip_profile.response_header_wait_us +
+                roundtrip_profile.response_body_wait_us;
+        }
+    }
 
     const int64_t end_us =
         measure_profile ? ggml_time_us() : 0;
-    if (measure_profile) {
-        rpc_cmd_roundtrip_profile_active =
-            previous_profile;
-    }
 
     if (throttle_profile) {
         std::fprintf(
             stderr,
             "[XLAYER_RETURN_RPC] seq=%" PRIu64
-            " lane=%zu bytes=%zu wire=%zu "
-            "grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
-            "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
+            " lane=%zu bytes=%zu wire=%zu mode=%s "
+            "admit=%.3f req=%.3f receipt=%.3f tail=%.3f "
+            "legacy_grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
+            "total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
-            bulk_grant_us / 1000.0,
-            bulk_grant_inflight,
-            bulk_grant_limit,
-            roundtrip_profile.request_send_us / 1000.0,
-            roundtrip_profile.response_header_wait_us / 1000.0,
-            roundtrip_profile.response_body_wait_us / 1000.0,
+            directional_bulk ? "DIR1" : "LEGACY",
+            bulk_admit_us / 1000.0,
+            request_send_us / 1000.0,
+            receipt_wait_us / 1000.0,
+            tail_wait_us / 1000.0,
+            legacy_grant_us / 1000.0,
+            legacy_grant_inflight,
+            legacy_grant_limit,
             (end_us - begin_us) / 1000.0,
             status ? 1 : 0);
     }
@@ -3811,19 +3936,22 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     if (stage_profile) {
         GGML_LOG_INFO(
             "[RETURN_RPC] seq=%" PRIu64
-            " lane=%zu bytes=%zu wire=%zu "
-            "grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
-            "req=%.3f hdr=%.3f body=%.3f total=%.3f status=%d\n",
+            " lane=%zu bytes=%zu wire=%zu mode=%s "
+            "admit=%.3f req=%.3f receipt=%.3f tail=%.3f "
+            "legacy_grant=%.3f inflight=%" PRIu64 "/%" PRIu64 " "
+            "total=%.3f status=%d\n",
             phone_ffn_seq,
             return_lane,
             data_size,
             wire_size,
-            bulk_grant_us / 1000.0,
-            bulk_grant_inflight,
-            bulk_grant_limit,
-            roundtrip_profile.request_send_us / 1000.0,
-            roundtrip_profile.response_header_wait_us / 1000.0,
-            roundtrip_profile.response_body_wait_us / 1000.0,
+            directional_bulk ? "DIR1" : "LEGACY",
+            bulk_admit_us / 1000.0,
+            request_send_us / 1000.0,
+            receipt_wait_us / 1000.0,
+            tail_wait_us / 1000.0,
+            legacy_grant_us / 1000.0,
+            legacy_grant_inflight,
+            legacy_grant_limit,
             (end_us - begin_us) / 1000.0,
             status ? 1 : 0);
     }
@@ -4960,65 +5088,26 @@ public:
             local_tensor_source = *tensor_source;
         }
 
-        const char * network_bulk_env =
-            std::getenv("GGML_RPC_NETWORK_BULK_INFLIGHT");
-        if (network_bulk_env != nullptr &&
-                network_bulk_env[0] != '\0') {
-            char * end = nullptr;
-            const long parsed =
-                std::strtol(network_bulk_env, &end, 10);
-            if (end != network_bulk_env &&
-                    *end == '\0' &&
-                    parsed >= 1) {
-                network_bulk_shared = true;
-                route_bulk_limit =
-                    std::min<size_t>(
-                        RPC_ROUTE_TRANSFER_LANES +
-                            RPC_RETURN_TRANSFER_LANES,
-                        static_cast<size_t>(parsed));
-                GGML_LOG_INFO(
-                    "[RPC_NETWORK_BULK_LIMIT] inflight=%zu "
-                    "route_slots=%zu return_slots=%zu\n",
-                    route_bulk_limit,
-                    RPC_ROUTE_TRANSFER_LANES,
-                    RPC_RETURN_TRANSFER_LANES);
-            } else {
-                GGML_LOG_WARN(
-                    "[RPC_NETWORK_BULK_LIMIT] invalid=%s "
-                    "shared_limit_disabled=1\n",
-                    network_bulk_env);
-            }
-        }
+        // v19 formal policy: one Route + one Return may overlap, but never
+        // more than one bulk payload in either direction. Route wire
+        // completion is still tracked by the PC full-receive ACK.
+        network_bulk_shared = false;
+        route_bulk_limit = 1;
 
-        // Keep the previous Route-only experiment as a fallback.
-        if (!network_bulk_shared) {
-            const char * route_bulk_env =
-                std::getenv("GGML_RPC_ROUTE_BULK_INFLIGHT");
-            if (route_bulk_env != nullptr &&
-                    route_bulk_env[0] != '\0') {
-                char * end = nullptr;
-                const long parsed =
-                    std::strtol(route_bulk_env, &end, 10);
-                if (end != route_bulk_env &&
-                        *end == '\0' &&
-                        parsed >= 1) {
-                    route_bulk_limit =
-                        std::min<size_t>(
-                            RPC_ROUTE_TRANSFER_LANES,
-                            static_cast<size_t>(parsed));
-                } else {
-                    GGML_LOG_WARN(
-                        "[RPC_ROUTE_BULK_LIMIT] invalid=%s "
-                        "using_default=%zu\n",
-                        route_bulk_env,
-                        RPC_ROUTE_TRANSFER_LANES);
-                }
-                GGML_LOG_INFO(
-                    "[RPC_ROUTE_BULK_LIMIT] inflight=%zu slots=%zu\n",
-                    route_bulk_limit,
-                    RPC_ROUTE_TRANSFER_LANES);
-            }
-        }
+        const char * legacy_network_bulk_env =
+            std::getenv("GGML_RPC_NETWORK_BULK_INFLIGHT");
+        const char * legacy_route_bulk_env =
+            std::getenv("GGML_RPC_ROUTE_BULK_INFLIGHT");
+        GGML_LOG_INFO(
+            "[RPC_DIRECTIONAL_BULK] route_inflight=1 "
+            "return_inflight=1 route_slots=%zu return_slots=%zu"
+            "%s%s\n",
+            RPC_ROUTE_TRANSFER_LANES,
+            RPC_RETURN_TRANSFER_LANES,
+            legacy_network_bulk_env != nullptr ?
+                " legacy_network_env_ignored=1" : "",
+            legacy_route_bulk_env != nullptr ?
+                " legacy_route_env_ignored=1" : "");
     }
     ~rpc_server();
 
@@ -5078,8 +5167,8 @@ public:
         return network_bulk_shared;
     }
     bool route_bulk_wire_ack_required() const {
-        return network_bulk_shared ||
-            route_bulk_limit < RPC_ROUTE_TRANSFER_LANES;
+        return route_bulk_limit < RPC_ROUTE_TRANSFER_LANES ||
+            network_bulk_shared;
     }
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -5225,12 +5314,15 @@ private:
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
         route_snapshot_devices;
 
-    // Bulk-wire admission. With GGML_RPC_NETWORK_BULK_INFLIGHT this one pool
-    // is shared by Phone->PC Route and PC->Phone Return payloads.
+    // Phone->PC Route wire admission. v19 keeps this independent from Return:
+    // one Route may overlap one Return, but a second Route waits for the first
+    // PC full-receive ACK.
     std::mutex route_bulk_mutex;
     std::condition_variable route_bulk_cv;
     size_t route_bulk_inflight = 0;
-    size_t route_bulk_limit = RPC_ROUTE_TRANSFER_LANES;
+    size_t route_bulk_limit = 1;
+
+    // Legacy v18 shared-credit state. New v19 clients do not use it.
     bool network_bulk_shared = false;
 
     std::mutex async_return_payload_mutex;
@@ -10244,6 +10336,49 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 const int64_t recv_done_us =
                     stage_profile ? ggml_time_us() : 0;
+
+                bool directional_early_ack = false;
+                uint64_t directional_seq = 0;
+                if (input.size() >=
+                        sizeof(
+                            rpc_msg_set_tensor_async_return_wait_req)) {
+                    rpc_msg_set_tensor_async_return_wait_req
+                        request_v19 {};
+                    std::memcpy(
+                        &request_v19,
+                        input.data(),
+                        sizeof(request_v19));
+                    directional_early_ack =
+                        request_v19.wire_magic ==
+                            RPC_RETURN_WIRE_MAGIC &&
+                        (request_v19.reserved &
+                         RPC_RETURN_WIRE_EARLY_ACK_FLAG) != 0;
+                    directional_seq =
+                        request_v19.phone_ffn_seq;
+                }
+
+                const int64_t early_ack_begin_us =
+                    stage_profile ? ggml_time_us() : 0;
+                if (directional_early_ack) {
+                    if (!send_msg(
+                            sock,
+                            &directional_seq,
+                            sizeof(directional_seq))) {
+                        return;
+                    }
+                }
+                const int64_t early_ack_done_us =
+                    stage_profile ? ggml_time_us() : 0;
+
+                if (stage_profile && directional_early_ack) {
+                    GGML_LOG_INFO(
+                        "[RETURN_DIRECTIONAL_SRV] seq=%" PRIu64
+                        " recv=%.3f ack=%.3f\n",
+                        directional_seq,
+                        (recv_done_us - recv_begin_us) / 1000.0,
+                        (early_ack_done_us -
+                            early_ack_begin_us) / 1000.0);
+                }
 
                 if (return_bulk_credit_held) {
                     if (input.size() <
