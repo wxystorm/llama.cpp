@@ -372,118 +372,6 @@ static int llama_hybrid_gpu_pc_layers() {
     return std::max(0, std::atoi(value));
 }
 
-static bool llama_hybrid_parse_pc_stage_backend(
-        const char * env_name,
-        llama_pc_layer_backend & backend) {
-    const char * value = std::getenv(env_name);
-    if (value == nullptr || value[0] == '\0') {
-        return false;
-    }
-
-    if (std::strcmp(value, "cpu") == 0 ||
-            std::strcmp(value, "CPU") == 0) {
-        backend = llama_pc_layer_backend::CPU;
-        return true;
-    }
-    if (std::strcmp(value, "cuda") == 0 ||
-            std::strcmp(value, "CUDA") == 0 ||
-            std::strcmp(value, "gpu") == 0 ||
-            std::strcmp(value, "GPU") == 0) {
-        backend = llama_pc_layer_backend::CUDA;
-        return true;
-    }
-
-    throw std::runtime_error(format(
-        "%s must be one of {cpu,cuda}, got '%s'",
-        env_name, value));
-}
-
-static llama_pc_stage_policy llama_hybrid_pc_stage_policy_from_env() {
-    llama_pc_stage_policy policy;
-
-    bool any = false;
-    any = llama_hybrid_parse_pc_stage_backend(
-              "LLAMA_HYBRID_PC_ATTN_BACKEND", policy.attn) || any;
-    any = llama_hybrid_parse_pc_stage_backend(
-              "LLAMA_HYBRID_PC_FFN_BACKEND", policy.ffn) || any;
-    any = llama_hybrid_parse_pc_stage_backend(
-              "LLAMA_HYBRID_PC_REDUCE_BACKEND", policy.reduce) || any;
-    policy.enabled = any;
-
-    return policy;
-}
-
-static bool llama_hybrid_pc_stage_policy_uses_cuda(
-        const llama_pc_stage_policy & policy) {
-    return policy.enabled &&
-        (policy.attn == llama_pc_layer_backend::CUDA ||
-         policy.ffn == llama_pc_layer_backend::CUDA ||
-         policy.reduce == llama_pc_layer_backend::CUDA);
-}
-
-static const char * llama_hybrid_pc_backend_name(
-        llama_pc_layer_backend backend) {
-    return backend == llama_pc_layer_backend::CUDA ? "CUDA" : "CPU";
-}
-
-static bool llama_hybrid_tensor_is_attn_stage(llm_tensor tensor) {
-    switch (tensor) {
-        case LLM_TENSOR_ATTN_Q:
-        case LLM_TENSOR_ATTN_K:
-        case LLM_TENSOR_ATTN_V:
-        case LLM_TENSOR_ATTN_QKV:
-        case LLM_TENSOR_ATTN_OUT:
-        case LLM_TENSOR_ATTN_NORM:
-        case LLM_TENSOR_ATTN_NORM_2:
-        case LLM_TENSOR_ATTN_OUT_NORM:
-        case LLM_TENSOR_ATTN_POST_NORM:
-        case LLM_TENSOR_ATTN_Q_NORM:
-        case LLM_TENSOR_ATTN_K_NORM:
-        case LLM_TENSOR_ATTN_ROT_EMBD:
-        case LLM_TENSOR_ATTN_SINKS:
-        case LLM_TENSOR_ATTN_GATE:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool llama_hybrid_tensor_is_ffn_stage(llm_tensor tensor) {
-    switch (tensor) {
-        case LLM_TENSOR_FFN_GATE_INP:
-        case LLM_TENSOR_FFN_GATE_INP_SHEXP:
-        case LLM_TENSOR_FFN_NORM:
-        case LLM_TENSOR_FFN_POST_NORM:
-        case LLM_TENSOR_FFN_POST_NORM_1:
-        case LLM_TENSOR_FFN_POST_NORM_2:
-        case LLM_TENSOR_FFN_PRE_NORM_2:
-        case LLM_TENSOR_FFN_GATE:
-        case LLM_TENSOR_FFN_DOWN:
-        case LLM_TENSOR_FFN_UP:
-        case LLM_TENSOR_FFN_ACT:
-        case LLM_TENSOR_FFN_DOWN_EXP:
-        case LLM_TENSOR_FFN_GATE_EXP:
-        case LLM_TENSOR_FFN_UP_EXP:
-        case LLM_TENSOR_FFN_NORM_EXPS:
-        case LLM_TENSOR_FFN_DOWN_EXPS:
-        case LLM_TENSOR_FFN_GATE_EXPS:
-        case LLM_TENSOR_FFN_UP_EXPS:
-        case LLM_TENSOR_FFN_GATE_UP_EXPS:
-        case LLM_TENSOR_FFN_DOWN_SHEXP:
-        case LLM_TENSOR_FFN_GATE_SHEXP:
-        case LLM_TENSOR_FFN_UP_SHEXP:
-        case LLM_TENSOR_FFN_DOWN_CHEXPS:
-        case LLM_TENSOR_FFN_GATE_CHEXPS:
-        case LLM_TENSOR_FFN_UP_CHEXPS:
-        case LLM_TENSOR_FFN_EXP_PROBS_B:
-        case LLM_TENSOR_FFN_LATENT_DOWN:
-        case LLM_TENSOR_FFN_LATENT_UP:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static ggml_backend_dev_t llama_hybrid_cuda_device() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1688,7 +1576,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         pc_layer_backends.assign(n_layer, llama_pc_layer_backend::CPU);
-        pc_stage_policies.assign(n_layer, llama_pc_stage_policy{});
         std::vector<int> pc_layer_ids;
         for (int il = 0; il < n_layer; ++il) {
             if (hybrid_layer_modes[il] == llama_hybrid_layer_mode::PC_ONLY) {
@@ -1702,38 +1589,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
         }
 
-        // V1 inner-plan override: apply one deterministic local policy to all
-        // PC_ONLY layers.  The automatic inner planner will populate the same
-        // per-layer policy structure later; keeping the representation here
-        // avoids coupling the generic Region Ring to environment variables.
-        const llama_pc_stage_policy manual_pc_stage_policy =
-            llama_hybrid_pc_stage_policy_from_env();
-        if (manual_pc_stage_policy.enabled) {
-            for (const int il : pc_layer_ids) {
-                pc_stage_policies[il] = manual_pc_stage_policy;
-                // Whole-layer placement is only the legacy fallback.  In
-                // stage-placement mode keep that fallback on CPU and let each
-                // weight family select its local backend independently.
-                pc_layer_backends[il] = llama_pc_layer_backend::CPU;
-            }
-            LLAMA_LOG_INFO(
-                "[PC_INNER_POLICY] source=environment layers=%zu "
-                "attn=%s ffn=%s reduce=%s\n",
-                pc_layer_ids.size(),
-                llama_hybrid_pc_backend_name(manual_pc_stage_policy.attn),
-                llama_hybrid_pc_backend_name(manual_pc_stage_policy.ffn),
-                llama_hybrid_pc_backend_name(manual_pc_stage_policy.reduce));
-        }
-
-        const bool pc_stage_policy_needs_cuda =
-            llama_hybrid_pc_stage_policy_uses_cuda(manual_pc_stage_policy);
-        if (n_gpu_pc > 0 || pc_stage_policy_needs_cuda) {
+        if (n_gpu_pc > 0) {
             ggml_backend_dev_t cuda_dev = llama_hybrid_cuda_device();
             if (cuda_dev == nullptr) {
                 throw std::runtime_error(
-                    pc_stage_policy_needs_cuda ?
-                        "PC inner stage policy requires the CUDA0 backend" :
-                        "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
+                    "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
             }
             const bool already_registered = std::any_of(
                 devices.begin(), devices.end(),
@@ -1839,17 +1699,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    const bool has_cuda_pc_layers =
-        std::any_of(
-            pc_layer_backends.begin(), pc_layer_backends.end(),
-            [](llama_pc_layer_backend backend) {
-                return backend == llama_pc_layer_backend::CUDA;
-            }) ||
-        std::any_of(
-            pc_stage_policies.begin(), pc_stage_policies.end(),
-            [](const llama_pc_stage_policy & policy) {
-                return llama_hybrid_pc_stage_policy_uses_cuda(policy);
-            });
+    const bool has_cuda_pc_layers = std::any_of(
+        pc_layer_backends.begin(), pc_layer_backends.end(),
+        [](llama_pc_layer_backend backend) {
+            return backend == llama_pc_layer_backend::CUDA;
+        });
     ggml_backend_dev_t cuda_dev = has_cuda_pc_layers ? llama_hybrid_cuda_device() : nullptr;
     if (has_cuda_pc_layers &&
             (cuda_dev == nullptr || pimpl->gpu_buft_list.find(cuda_dev) == pimpl->gpu_buft_list.end())) {
@@ -2298,54 +2152,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer =
-        tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-
-    if (tn.bid >= 0 &&
-            tn.bid < (int) pc_stage_policies.size() &&
-            hybrid_layer_mode(tn.bid) == llama_hybrid_layer_mode::PC_ONLY) {
-        const llama_pc_stage_policy & policy = pc_stage_policies[tn.bid];
-        if (policy.enabled) {
-            bool stage_known = false;
-            llama_pc_layer_backend stage_backend = llama_pc_layer_backend::CPU;
-            const char * stage_name = "fallback";
-
-            if (llama_hybrid_tensor_is_attn_stage(tn.tensor)) {
-                stage_known = true;
-                stage_backend = policy.attn;
-                stage_name = "ATTN";
-            } else if (llama_hybrid_tensor_is_ffn_stage(tn.tensor)) {
-                stage_known = true;
-                stage_backend = policy.ffn;
-                stage_name = "FFN";
-            }
-
-            if (stage_known) {
-                if (stage_backend == llama_pc_layer_backend::CUDA) {
-                    ggml_backend_dev_t cuda_dev = llama_hybrid_cuda_device();
-                    if (cuda_dev == nullptr) {
-                        throw std::runtime_error(
-                            "PC inner stage policy selected CUDA but CUDA0 is unavailable");
-                    }
-                    const auto it = pimpl->gpu_buft_list.find(cuda_dev);
-                    if (it == pimpl->gpu_buft_list.end()) {
-                        throw std::runtime_error(
-                            "PC inner stage policy selected CUDA but no CUDA buffer list was registered");
-                    }
-                    buft_list_layer = &it->second;
-                } else {
-                    buft_list_layer = &pimpl->cpu_buft_list;
-                }
-
-                LLAMA_LOG_DEBUG(
-                    "[PC_STAGE_WEIGHT] layer=%d stage=%s backend=%s tensor=%s\n",
-                    tn.bid, stage_name,
-                    llama_hybrid_pc_backend_name(stage_backend),
-                    tn.str().c_str());
-            }
-        }
-    }
-
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -2412,13 +2219,6 @@ float llama_model::hybrid_tensor_pc_ratio(int il) const {
     }
     const float sum = split[0] + split[1];
     return sum > 0.0f ? split[0] / sum : 0.0f;
-}
-
-llama_pc_stage_policy llama_model::hybrid_pc_stage_policy(int il) const {
-    if (il < 0 || il >= (int) pc_stage_policies.size()) {
-        return {};
-    }
-    return pc_stage_policies[il];
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
