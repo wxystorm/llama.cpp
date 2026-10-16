@@ -550,6 +550,19 @@ enum class llama_pc_layer_backend {
     CUDA,
 };
 
+// First step of the hierarchical planner: a PC_ONLY region is still selected
+// by the outer layer placement, while the local/inner policy may place the
+// Attention and FFN stages on different PC backends.  Keep this independent
+// from the automatic planner for now so the runtime can be validated with a
+// deterministic manual policy first.
+struct llama_pc_stage_policy {
+    bool enabled = false;
+
+    llama_pc_layer_backend attn   = llama_pc_layer_backend::CPU;
+    llama_pc_layer_backend ffn    = llama_pc_layer_backend::CPU;
+    llama_pc_layer_backend reduce = llama_pc_layer_backend::CPU;
+};
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
@@ -617,6 +630,7 @@ struct llama_model {
     std::vector<llama_hybrid_layer_mode> hybrid_layer_modes;
     std::vector<float>                   hybrid_tensor_pc_ratios;
     std::vector<llama_pc_layer_backend>  pc_layer_backends;
+    std::vector<llama_pc_stage_policy>   pc_stage_policies;
 
     std::vector<llama_layer> layers;
 
@@ -664,6 +678,7 @@ struct llama_model {
     llama_split_mode split_mode() const;
     llama_hybrid_layer_mode hybrid_layer_mode(int il) const;
     float hybrid_tensor_pc_ratio(int il) const;
+    llama_pc_stage_policy hybrid_pc_stage_policy(int il) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
