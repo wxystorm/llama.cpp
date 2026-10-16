@@ -1791,11 +1791,32 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     // Attention and output-projection nodes. Off unless explicitly requested.
     // Never touch GPU/TENSOR/PHONE stages or the ordinary decode graph.
     const char * cpu_strict_env = std::getenv("LLAMA_HYBRID_CPU_DIRECT_STRICT");
+    bool pc_inner_stage_policy_active = false;
+    if (stage != nullptr &&
+            stage->kind == llama_hybrid_runtime_stage_kind::CPU) {
+        for (int il = stage->layer_begin; il < stage->layer_end; ++il) {
+            if (model.hybrid_pc_stage_policy(il).enabled) {
+                pc_inner_stage_policy_active = true;
+                break;
+            }
+        }
+    }
+
     const bool strict_cpu_stage =
         stage != nullptr &&
         stage->kind == llama_hybrid_runtime_stage_kind::CPU &&
+        !pc_inner_stage_policy_active &&
         cpu_strict_env != nullptr &&
         std::atoi(cpu_strict_env) != 0;
+
+    if (pc_inner_stage_policy_active &&
+            cpu_strict_env != nullptr &&
+            std::atoi(cpu_strict_env) != 0) {
+        LLAMA_LOG_INFO(
+            "[PC_INNER_POLICY] CPU_DIRECT_STRICT suppressed for "
+            "stage_layers=[%d,%d) because stage placement is active\n",
+            stage->layer_begin, stage->layer_end);
+    }
 
     if (strict_cpu_stage) {
         if (backend_cpu == nullptr) {
