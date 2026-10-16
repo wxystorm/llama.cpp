@@ -314,6 +314,133 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
     return result;
 }
 
+static ggml_backend_t llama_hybrid_find_cuda_backend(
+        const std::vector<ggml_backend_ptr> & backends) {
+    for (const auto & backend_ptr : backends) {
+        ggml_backend_t backend = backend_ptr.get();
+        if (backend == nullptr) {
+            continue;
+        }
+        const char * name = ggml_backend_name(backend);
+        if (name != nullptr &&
+            (std::strncmp(name, "CUDA", 4) == 0 ||
+             std::strncmp(name, "cuda", 4) == 0)) {
+            return backend;
+        }
+    }
+    return nullptr;
+}
+
+static bool llama_hybrid_apply_single_pc_attn_migration(
+        const llama_model & model,
+        const std::vector<ggml_backend_ptr> & backends,
+        ggml_backend_sched_t sched_use,
+        ggml_cgraph * gf,
+        uint32_t ubatch_tokens) {
+    const char * enable_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_MIGRATE");
+    if (enable_env == nullptr || std::atoi(enable_env) == 0 || gf == nullptr) {
+        return false;
+    }
+
+    const char * layer_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_MIGRATE_LAYER");
+    if (layer_env == nullptr || layer_env[0] == '\0') {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_LAYER "
+            "set=LLAMA_HYBRID_INNER_PC_ATTN_MIGRATE_LAYER\n");
+        return false;
+    }
+
+    const int layer = std::atoi(layer_env);
+    if (layer < 0 || layer >= (int) model.hparams.n_layer()) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=BAD_LAYER layer=%d\n",
+            layer);
+        return false;
+    }
+
+    if (model.hybrid_layer_mode(layer) != llama_hybrid_layer_mode::PC_ONLY) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NOT_PC_ONLY layer=%d\n",
+            layer);
+        return false;
+    }
+
+    int min_tokens = 32;
+    const char * min_tokens_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_MIGRATE_MIN_TOKENS");
+    if (min_tokens_env != nullptr && min_tokens_env[0] != '\0') {
+        min_tokens = std::max(1, std::atoi(min_tokens_env));
+    }
+    if ((int) ubatch_tokens < min_tokens) {
+        LLAMA_LOG_INFO(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=TOKEN_GATE "
+            "layer=%d tokens=%u min_tokens=%d\n",
+            layer, ubatch_tokens, min_tokens);
+        return false;
+    }
+
+    ggml_backend_t cuda_backend =
+        llama_hybrid_find_cuda_backend(backends);
+    if (cuda_backend == nullptr) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_CUDA "
+            "layer=%d tokens=%u\n",
+            layer, ubatch_tokens);
+        return false;
+    }
+
+    const llama_hybrid_inner_membership_result membership =
+        llama_hybrid_build_inner_node_membership(gf);
+
+    std::vector<ggml_tensor *> attn_nodes;
+    for (const llama_hybrid_inner_node_membership & item :
+         membership.nodes) {
+        if (!item.valid() ||
+            item.layer != layer ||
+            item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+            continue;
+        }
+        attn_nodes.push_back(
+            ggml_graph_node(gf, item.node_index));
+    }
+
+    if (attn_nodes.empty()) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_ATTN_NODES "
+            "layer=%d tokens=%u\n",
+            layer, ubatch_tokens);
+        return false;
+    }
+
+    for (ggml_tensor * node : attn_nodes) {
+        if (!ggml_backend_supports_op(cuda_backend, node)) {
+            LLAMA_LOG_WARN(
+                "[INNER_ATTN_MIGRATE] status=SKIP reason=UNSUPPORTED "
+                "layer=%d tokens=%u node=%s op=%s backend=%s\n",
+                layer, ubatch_tokens,
+                node->name, ggml_op_name(node->op),
+                ggml_backend_name(cuda_backend));
+            return false;
+        }
+    }
+
+    for (ggml_tensor * node : attn_nodes) {
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, node, cuda_backend);
+    }
+
+    LLAMA_LOG_INFO(
+        "[INNER_ATTN_MIGRATE] status=APPLIED layer=%d tokens=%u "
+        "nodes=%zu backend=%s membership={gaps:%d,transition_errors:%d}\n",
+        layer, ubatch_tokens, attn_nodes.size(),
+        ggml_backend_name(cuda_backend),
+        membership.gap_nodes,
+        membership.transition_errors);
+    return true;
+}
+
 static const char * llama_hybrid_inner_target_name(const char * value) {
     if (value == nullptr || value[0] == '\0') {
         return nullptr;
@@ -2787,6 +2914,13 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 stage_input_backend != nullptr ?
                     ggml_backend_name(stage_input_backend) : "(unassigned)");
         }
+
+        // First real inner-scheduler experiment.  It is explicitly gated and
+        // restricted to one PC_ONLY Attention stage.  Existing callback pins
+        // and dev_layer() placement remain unchanged; this overrides only the
+        // validated ATTN node membership immediately before scheduler alloc.
+        llama_hybrid_apply_single_pc_attn_migration(
+            model, backends, sched_use, gf, ubatch.n_tokens);
 
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
