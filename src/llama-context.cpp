@@ -544,7 +544,7 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         membership.gap_nodes,
         membership.transition_errors);
     return true;
-
+}
 
 static const char * llama_hybrid_inner_target_name(const char * value) {
     if (value == nullptr || value[0] == '\0') {
