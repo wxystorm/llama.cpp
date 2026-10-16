@@ -424,12 +424,15 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         return false;
     }
 
-    std::vector<ggml_tensor *> migratable_nodes;
-    int attn_nodes = 0;
-    int anchored_nodes = 0;
-    int anchored_view = 0;
-    int anchored_buffer = 0;
-    int anchored_set_rows = 0;
+    // Start with the smallest migration unit that cannot mutate KV/state:
+    // locate the natural FLASH_ATTN_EXT anchor, then move only the dense
+    // Attention output projection (the first MUL_MAT after FlashAttention and
+    // before ffn_inp). QKV/ROPE/KV writes and the residual handoff stay on the
+    // existing scheduler path.
+    int flash_node_index = -1;
+    int ffn_inp_node_index = -1;
+    ggml_tensor * wo_node = nullptr;
+    int wo_node_index = -1;
 
     for (const llama_hybrid_inner_node_membership & item :
          membership.nodes) {
@@ -439,70 +442,109 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
             continue;
         }
 
-        ++attn_nodes;
         ggml_tensor * node =
             ggml_graph_node(gf, item.node_index);
 
-        // User backend assignments bypass the scheduler's normal inheritance
-        // rules. Never override nodes whose output is tied to existing storage:
-        // - view ops / view_src must stay with the aliased source
-        // - preallocated buffers already have an owner
-        // - SET_ROWS is a side-effecting view used by KV cache writes
-        const bool is_view =
-            llama_hybrid_is_view_op(node->op) || node->view_src != nullptr;
-        const bool has_fixed_buffer = node->buffer != nullptr;
-        const bool is_set_rows = node->op == GGML_OP_SET_ROWS;
-
-        if (is_view || has_fixed_buffer || is_set_rows) {
-            ++anchored_nodes;
-            anchored_view += is_view ? 1 : 0;
-            anchored_buffer += has_fixed_buffer ? 1 : 0;
-            anchored_set_rows += is_set_rows ? 1 : 0;
+        if (flash_node_index < 0 &&
+            node->op == GGML_OP_FLASH_ATTN_EXT) {
+            flash_node_index = item.node_index;
             continue;
         }
 
-        if (!ggml_backend_supports_op(cuda_backend, node)) {
-            LLAMA_LOG_WARN(
-                "[INNER_ATTN_MIGRATE] status=SKIP reason=UNSUPPORTED_COMPUTE "
-                "layer=%d tokens=%u node=%s op=%s backend=%s "
-                "attn_nodes=%d anchored=%d\n",
-                layer, ubatch_tokens,
-                node->name, ggml_op_name(node->op),
-                ggml_backend_name(cuda_backend),
-                attn_nodes, anchored_nodes);
-            return false;
+        if (llama_hybrid_name_starts_with(node->name, "ffn_inp-")) {
+            ffn_inp_node_index = item.node_index;
+            break;
         }
 
-        migratable_nodes.push_back(node);
+        if (flash_node_index >= 0 &&
+            item.node_index > flash_node_index &&
+            wo_node == nullptr &&
+            node->op == GGML_OP_MUL_MAT) {
+            wo_node = node;
+            wo_node_index = item.node_index;
+        }
     }
 
-    if (attn_nodes == 0 || migratable_nodes.empty()) {
+    if (flash_node_index < 0) {
         LLAMA_LOG_WARN(
-            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_SAFE_COMPUTE "
-            "layer=%d tokens=%u attn_nodes=%d anchored=%d\n",
-            layer, ubatch_tokens,
-            attn_nodes, anchored_nodes);
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_FLASH_ANCHOR "
+            "layer=%d tokens=%u\n",
+            layer, ubatch_tokens);
         return false;
     }
 
-    for (ggml_tensor * node : migratable_nodes) {
-        ggml_backend_sched_set_tensor_backend(
-            sched_use, node, cuda_backend);
+    if (ffn_inp_node_index < 0 ||
+        ffn_inp_node_index <= flash_node_index) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_FFN_BOUNDARY "
+            "layer=%d tokens=%u flash_node=%d ffn_inp_node=%d\n",
+            layer, ubatch_tokens,
+            flash_node_index, ffn_inp_node_index);
+        return false;
     }
 
+    if (wo_node == nullptr ||
+        wo_node_index <= flash_node_index ||
+        wo_node_index >= ffn_inp_node_index) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_WO_MUL_MAT "
+            "layer=%d tokens=%u flash_node=%d ffn_inp_node=%d\n",
+            layer, ubatch_tokens,
+            flash_node_index, ffn_inp_node_index);
+        return false;
+    }
+
+    const bool wo_anchored =
+        llama_hybrid_is_view_op(wo_node->op) ||
+        wo_node->view_src != nullptr ||
+        wo_node->buffer != nullptr ||
+        wo_node->op == GGML_OP_SET_ROWS;
+    if (wo_anchored) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=WO_ANCHORED "
+            "layer=%d tokens=%u node=%d tensor=%s op=%s "
+            "view_src=%d buffer=%d\n",
+            layer, ubatch_tokens,
+            wo_node_index, wo_node->name,
+            ggml_op_name(wo_node->op),
+            wo_node->view_src != nullptr ? 1 : 0,
+            wo_node->buffer != nullptr ? 1 : 0);
+        return false;
+    }
+
+    if (!ggml_backend_supports_op(cuda_backend, wo_node)) {
+        LLAMA_LOG_WARN(
+            "[INNER_ATTN_MIGRATE] status=SKIP reason=WO_UNSUPPORTED "
+            "layer=%d tokens=%u node=%d tensor=%s op=%s backend=%s\n",
+            layer, ubatch_tokens,
+            wo_node_index, wo_node->name,
+            ggml_op_name(wo_node->op),
+            ggml_backend_name(cuda_backend));
+        return false;
+    }
+
+    const char * src0_name =
+        wo_node->src[0] != nullptr ? wo_node->src[0]->name : "(null)";
+    const char * src1_name =
+        wo_node->src[1] != nullptr ? wo_node->src[1]->name : "(null)";
+
+    ggml_backend_sched_set_tensor_backend(
+        sched_use, wo_node, cuda_backend);
+
     LLAMA_LOG_INFO(
-        "[INNER_ATTN_MIGRATE] status=APPLIED_SAFE layer=%d tokens=%u "
-        "attn_nodes=%d migrated=%zu anchored=%d "
-        "anchored_detail={view:%d,buffer:%d,set_rows:%d} "
-        "backend=%s membership={gaps:%d,transition_errors:%d}\n",
+        "[INNER_ATTN_MIGRATE] status=APPLIED_WO_PROBE "
+        "layer=%d tokens=%u flash_node=%d wo_node=%d ffn_inp_node=%d "
+        "wo={tensor:%s,op:%s,src0:%s,src1:%s} backend=%s "
+        "membership={gaps:%d,transition_errors:%d}\n",
         layer, ubatch_tokens,
-        attn_nodes, migratable_nodes.size(), anchored_nodes,
-        anchored_view, anchored_buffer, anchored_set_rows,
+        flash_node_index, wo_node_index, ffn_inp_node_index,
+        wo_node->name, ggml_op_name(wo_node->op),
+        src0_name, src1_name,
         ggml_backend_name(cuda_backend),
         membership.gap_nodes,
         membership.transition_errors);
     return true;
-}
+
 
 static const char * llama_hybrid_inner_target_name(const char * value) {
     if (value == nullptr || value[0] == '\0') {
