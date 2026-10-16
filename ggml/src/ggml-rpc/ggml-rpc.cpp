@@ -2755,56 +2755,34 @@ static bool ggml_backend_rpc_get_route_snapshot(
     if (route_profile) {
         std::fprintf(
             stderr,
-            "[RPC_ROUTE_STAGE] side=pc "
-            "stage=route_snapshot bytes=%zu storage_bytes=%zu "
-            "compact_topk=%d topk_storage_bytes=%zu "
-            "topk_wire_bytes=%zu lane=%u "
-            "seq=%" PRIu64 " dst_sync_ms=%.3f "
-            "request_send_ms=%.3f response_header_wait_ms=%.3f "
-            "payload_recv_ms=%.3f rpc_roundtrip_ms=%.3f "
-            "dst_set_ms=%.3f total_ms=%.3f\n",
-            wire_total_size,
-            storage_total_size,
-            compact_topk ? 1 : 0,
-            storage_sizes[1],
-            topk_wire_bytes,
-            lane,
+            "[ROUTE_RPC_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
+            "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
+            "set=%.3f total=%.3f\n",
             seq,
+            lane,
+            wire_total_size,
             dst_sync_us / 1000.0,
             request_send_us / 1000.0,
             response_header_wait_us / 1000.0,
             payload_recv_us / 1000.0,
-            rpc_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
-        std::fflush(stderr);
     }
 
     if (stage_profile) {
         GGML_LOG_INFO(
-            "[TENSOR_PHONE_RPC_STAGE] side=pc "
-            "stage=route_snapshot bytes=%zu storage_bytes=%zu "
-            "compact_topk=%d topk_storage_bytes=%zu "
-            "topk_wire_bytes=%zu lane=%u "
-            "seq=%" PRIu64 " dst_sync_ms=%.3f "
-            "request_send_ms=%.3f response_header_wait_ms=%.3f "
-            "payload_recv_ms=%.3f rpc_roundtrip_ms=%.3f "
-            "dst_set_ms=%.3f total_ms=%.3f\n",
-            wire_total_size,
-            storage_total_size,
-            compact_topk ? 1 : 0,
-            storage_sizes[1],
-            topk_wire_bytes,
-            lane,
+            "[ROUTE_RPC] seq=%" PRIu64 " lane=%u bytes=%zu "
+            "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
+            "set=%.3f total=%.3f\n",
             seq,
+            lane,
+            wire_total_size,
             dst_sync_us / 1000.0,
             request_send_us / 1000.0,
             response_header_wait_us / 1000.0,
             payload_recv_us / 1000.0,
-            rpc_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
-        std::fflush(stderr);
     }
 
     return true;
@@ -9894,42 +9872,11 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (route_profile) {
                     std::fprintf(
                         stderr,
-                        "[RPC_ROUTE_STAGE] side=phone "
-                        "stage=route_snapshot_dispatch lane=%u "
-                        "seq=%" PRIu64 " bytes=%zu "
-                        "request_body_recv_ms=%.3f "
-                        "get_route_total_ms=%.3f "
-                        "header_send_ms=%.3f payload_send_ms=%.3f "
-                        "wire_send_total_ms=%.3f\n",
-                        request.lane,
+                        "[ROUTE_SRV_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
+                        "recv=%.3f queue=%.3f get=%.3f "
+                        "hsend=%.3f psend=%.3f total=%.3f\n",
                         request.seq,
-                        response.size(),
-                        (request_recv_done_us -
-                            request_recv_begin_us) / 1000.0,
-                        (dispatch_done_us -
-                            dispatch_begin_us) / 1000.0,
-                        (header_send_done_us -
-                            header_send_begin_us) / 1000.0,
-                        (payload_send_done_us -
-                            header_send_done_us) / 1000.0,
-                        (payload_send_done_us -
-                            header_send_begin_us) / 1000.0);
-                    std::fflush(stderr);
-                }
-
-                if (stage_profile) {
-                    GGML_LOG_INFO(
-                        "[TENSOR_PHONE_RPC_STAGE] side=phone "
-                        "stage=route_snapshot_server_dispatch lane=%u "
-                        "seq=%" PRIu64 " bytes=%zu "
-                        "request_body_recv_ms=%.3f "
-                        "recv_to_dispatch_ms=%.3f "
-                        "get_route_total_ms=%.3f "
-                        "dispatch_to_header_ms=%.3f "
-                        "header_send_ms=%.3f payload_send_ms=%.3f "
-                        "wire_send_total_ms=%.3f\n",
                         request.lane,
-                        request.seq,
                         response.size(),
                         (request_recv_done_us -
                             request_recv_begin_us) / 1000.0,
@@ -9937,15 +9884,34 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                             request_recv_done_us) / 1000.0,
                         (dispatch_done_us -
                             dispatch_begin_us) / 1000.0,
-                        (header_send_begin_us -
-                            dispatch_done_us) / 1000.0,
                         (header_send_done_us -
                             header_send_begin_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_done_us) / 1000.0,
                         (payload_send_done_us -
                             header_send_begin_us) / 1000.0);
-                    std::fflush(stderr);
+                }
+
+                if (stage_profile) {
+                    GGML_LOG_INFO(
+                        "[ROUTE_SRV] seq=%" PRIu64 " lane=%u bytes=%zu "
+                        "recv=%.3f queue=%.3f get=%.3f "
+                        "hsend=%.3f psend=%.3f total=%.3f\n",
+                        request.seq,
+                        request.lane,
+                        response.size(),
+                        (request_recv_done_us -
+                            request_recv_begin_us) / 1000.0,
+                        (dispatch_begin_us -
+                            request_recv_done_us) / 1000.0,
+                        (dispatch_done_us -
+                            dispatch_begin_us) / 1000.0,
+                        (header_send_done_us -
+                            header_send_begin_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_done_us) / 1000.0,
+                        (payload_send_done_us -
+                            header_send_begin_us) / 1000.0);
                 }
                 break;
             }
