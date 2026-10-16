@@ -79,6 +79,24 @@ struct llama_hybrid_inner_stage_marker {
     }
 };
 
+// Sidecar membership for a real scheduler graph node.  The first version is
+// intentionally descriptive only: it records which transformer stage owns a
+// node but does not alter backend assignment.  Once validated, the same map
+// can be consumed by the inner scheduler instead of relying on dev_layer().
+struct llama_hybrid_inner_node_membership {
+    int node_index = -1;
+    int layer      = -1;
+    int chunk      = -1;
+    llama_hybrid_inner_stage_kind stage =
+        llama_hybrid_inner_stage_kind::UNKNOWN;
+
+    bool valid() const {
+        return node_index >= 0 &&
+               layer >= 0 &&
+               stage != llama_hybrid_inner_stage_kind::UNKNOWN;
+    }
+};
+
 struct llama_hybrid_runtime_stage {
     llama_hybrid_runtime_stage_kind kind;
     int layer_begin;
