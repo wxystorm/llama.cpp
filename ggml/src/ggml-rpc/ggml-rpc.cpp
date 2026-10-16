@@ -6811,58 +6811,34 @@ bool rpc_server::get_route_snapshot(
             std::max<int64_t>(0, ready_wait_us - slot_fill_us);
         std::fprintf(
             stderr,
-            "[RPC_ROUTE_STAGE] side=phone "
-            "stage=route_snapshot_wait lane=%u "
-            "seq=%" PRIu64 " bytes=%zu storage_bytes=%zu "
-            "compact_topk=%d topk_storage_bytes=%zu "
-            "topk_wire_bytes=%zu "
-            "lock_wait_ms=%.3f cv_wait_ms=%.3f "
-            "response_copy_ms=%.3f producer_wait_est_ms=%.3f "
-            "fill_ms=%.3f ready_wait_ms=%.3f\n",
-            request.lane,
+            "[ROUTE_WAIT_RAW] seq=%" PRIu64 " lane=%u "
+            "lock=%.3f cv=%.3f fill=%.3f copy=%.3f "
+            "prod=%.3f ready=%.3f\n",
             request.seq,
-            response.size(),
-            storage_total_size,
-            compact_topk_used ? 1 : 0,
-            topk_storage_bytes,
-            topk_wire_bytes,
+            request.lane,
             lock_wait_us / 1000.0,
             cv_wait_us / 1000.0,
+            slot_fill_us / 1000.0,
             response_copy_us / 1000.0,
             producer_wait_est_us / 1000.0,
-            slot_fill_us / 1000.0,
             ready_wait_us / 1000.0);
-        std::fflush(stderr);
     }
 
     if (stage_profile) {
         const int64_t producer_wait_est_us =
             std::max<int64_t>(0, ready_wait_us - slot_fill_us);
         GGML_LOG_INFO(
-            "[TENSOR_PHONE_RPC_STAGE] side=phone "
-            "stage=route_snapshot_server_wait lane=%u "
-            "seq=%" PRIu64 " bytes=%zu storage_bytes=%zu "
-            "compact_topk=%d topk_storage_bytes=%zu "
-            "topk_wire_bytes=%zu "
-            "enter_to_lock_ms=%.3f lock_wait_ms=%.3f "
-            "cv_wait_ms=%.3f response_copy_ms=%.3f "
-            "producer_wait_est_ms=%.3f fill_ms=%.3f "
-            "ready_wait_ms=%.3f\n",
-            request.lane,
+            "[ROUTE_WAIT] seq=%" PRIu64 " lane=%u "
+            "lock=%.3f cv=%.3f fill=%.3f copy=%.3f "
+            "prod=%.3f ready=%.3f\n",
             request.seq,
-            response.size(),
-            storage_total_size,
-            compact_topk_used ? 1 : 0,
-            topk_storage_bytes,
-            topk_wire_bytes,
-            (lock_begin_us - server_enter_us) / 1000.0,
+            request.lane,
             lock_wait_us / 1000.0,
             cv_wait_us / 1000.0,
+            slot_fill_us / 1000.0,
             response_copy_us / 1000.0,
             producer_wait_est_us / 1000.0,
-            slot_fill_us / 1000.0,
             ready_wait_us / 1000.0);
-        std::fflush(stderr);
     }
 
     return true;
