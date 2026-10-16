@@ -49,6 +49,36 @@ enum class llama_hybrid_runtime_stage_kind {
     PHONE,
 };
 
+// Generic inner-stage vocabulary for the next execution layer.  This is
+// intentionally orthogonal to llama_hybrid_runtime_stage_kind above:
+// runtime_stage_kind describes the outer region (GPU/CPU/TENSOR/PHONE),
+// while inner_stage_kind describes work inside one transformer layer.
+enum class llama_hybrid_inner_stage_kind {
+    UNKNOWN,
+    ATTN,
+    FFN,
+    REDUCE,
+};
+
+enum class llama_hybrid_inner_stage_event {
+    NONE,
+    BEGIN,
+    END,
+};
+
+struct llama_hybrid_inner_stage_marker {
+    llama_hybrid_inner_stage_kind  kind  = llama_hybrid_inner_stage_kind::UNKNOWN;
+    llama_hybrid_inner_stage_event event = llama_hybrid_inner_stage_event::NONE;
+    int layer = -1;
+    int chunk = -1;
+
+    bool valid() const {
+        return kind != llama_hybrid_inner_stage_kind::UNKNOWN &&
+               event != llama_hybrid_inner_stage_event::NONE &&
+               layer >= 0;
+    }
+};
+
 struct llama_hybrid_runtime_stage {
     llama_hybrid_runtime_stage_kind kind;
     int layer_begin;
