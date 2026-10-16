@@ -154,6 +154,7 @@ struct llama_hybrid_inner_membership_result {
     int covered_nodes    = 0;
     int gap_nodes        = 0;
     int transition_errors = 0;
+    int pre_boundary_norms = 0;
     bool chunked_markers = false;
 };
 
@@ -179,6 +180,28 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
         ggml_tensor * node = ggml_graph_node(gf, i);
         const llama_hybrid_inner_stage_marker marker =
             llama_hybrid_classify_inner_stage_marker(node->name);
+
+        // build_norm() emits the raw normalization op first (named "norm-L")
+        // and only the following weighted result receives attn_norm-L or
+        // ffn_norm-L.  The semantic stage therefore starts one node before
+        // the visible BEGIN marker.  Look ahead exactly one node so the raw
+        // RMS_NORM belongs to the same stage as that BEGIN marker.
+        llama_hybrid_inner_stage_marker next_marker;
+        const bool is_pre_boundary_norm =
+            node->op == GGML_OP_RMS_NORM &&
+            i + 1 < n_nodes &&
+            (next_marker = llama_hybrid_classify_inner_stage_marker(
+                 ggml_graph_node(gf, i + 1)->name)).valid() &&
+            next_marker.event == llama_hybrid_inner_stage_event::BEGIN &&
+            (next_marker.kind == llama_hybrid_inner_stage_kind::ATTN ||
+             next_marker.kind == llama_hybrid_inner_stage_kind::FFN);
+
+        if (is_pre_boundary_norm) {
+            active_layer = next_marker.layer;
+            active_chunk = next_marker.chunk;
+            active_stage = next_marker.kind;
+            ++result.pre_boundary_norms;
+        }
 
         if (marker.valid()) {
             result.chunked_markers =
@@ -527,7 +550,7 @@ static void llama_hybrid_log_inner_stage_bindings(
     LLAMA_LOG_INFO(
         "[INNER_NODE_MEMBERSHIP] status=%s span=[%d,%d] "
         "span_nodes=%d covered=%d gaps=%d transition_errors=%d "
-        "chunked_markers=%d\n",
+        "pre_boundary_norms=%d chunked_markers=%d\n",
         membership_ok ? "OK" : "CHECK",
         membership.first_layer_node,
         membership.last_layer_node,
@@ -535,6 +558,7 @@ static void llama_hybrid_log_inner_stage_bindings(
         membership.covered_nodes,
         membership.gap_nodes,
         membership.transition_errors,
+        membership.pre_boundary_norms,
         membership.chunked_markers ? 1 : 0);
 
     if (!membership_ok && membership.gap_nodes > 0) {
@@ -758,8 +782,9 @@ static void llama_hybrid_log_inner_stage_bindings(
         }
         if (!probe.reported && backend != probe.first_backend) {
             LLAMA_LOG_INFO(
-                "[INNER_STAGE_MIXED_NODE] layer=%d stage=%s "
+                "[INNER_STAGE_MIXED_NODE] tokens=%u layer=%d stage=%s "
                 "first_backend=%s node=%d op=%s tensor=%s backend=%s\n",
+                ubatch_tokens,
                 item.layer,
                 llama_hybrid_inner_stage_name(item.stage),
                 probe.first_backend.c_str(),
