@@ -9897,16 +9897,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
 
                     handled = true;
-                    if (pipeline_debug || tensor_phone_stage_profile) {
-                        GGML_LOG_INFO(
+                    if (phone_owner_exit) {
+                        GGML_LOG_ERROR(
                             "[META_KEEP_PHONE_SPLIT_TAIL] "
-                            "sg=%zu/%zu node=%s phone_owner_exit=%d "
+                            "sg=%zu/%zu node=%s phone_owner_exit=1 "
                             "next_pc=0 next_phone=%d "
                             "action=KEEP_PHONE_NO_PC_CONSUMER\n",
                             i,
                             backend_ctx->n_subgraphs,
                             nodes[1] != nullptr ? nodes[1]->name : "(null)",
-                            (int) phone_owner_exit,
+                            i + 1 < backend_ctx->n_subgraphs ?
+                                (int) subgraph_will_execute_phone(i + 1) : -1);
+                    } else if (pipeline_debug || tensor_phone_stage_profile) {
+                        GGML_LOG_INFO(
+                            "[META_KEEP_PHONE_SPLIT_TAIL] "
+                            "sg=%zu/%zu node=%s phone_owner_exit=0 "
+                            "next_pc=0 next_phone=%d "
+                            "action=KEEP_PHONE_NO_PC_CONSUMER\n",
+                            i,
+                            backend_ctx->n_subgraphs,
+                            nodes[1] != nullptr ? nodes[1]->name : "(null)",
                             i + 1 < backend_ctx->n_subgraphs ?
                                 (int) subgraph_will_execute_phone(i + 1) : -1);
                     }
