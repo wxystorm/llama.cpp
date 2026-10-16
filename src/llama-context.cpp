@@ -543,6 +543,10 @@ static void llama_hybrid_log_inner_stage_bindings(
                x.attn == y.attn &&
                x.ffn == y.ffn &&
                x.reduce == y.reduce &&
+               x.attn_nodes == y.attn_nodes &&
+               x.ffn_nodes == y.ffn_nodes &&
+               x.reduce_nodes == y.reduce_nodes &&
+               x.unassigned_nodes == y.unassigned_nodes &&
                model.hybrid_layer_mode(a) ==
                    model.hybrid_layer_mode(b);
     };
