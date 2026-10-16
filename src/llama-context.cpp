@@ -430,105 +430,146 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         probe_env != nullptr && probe_env[0] != '\0' ? probe_env : "wo";
 
     const bool probe_q =
-        std::strcmp(probe, "q") == 0 || std::strcmp(probe, "Q") == 0;
+        std::strcmp(probe, "q") == 0 ||
+        std::strcmp(probe, "Q") == 0 ||
+        std::strcmp(probe, "qv") == 0 ||
+        std::strcmp(probe, "QV") == 0 ||
+        std::strcmp(probe, "qk") == 0 ||
+        std::strcmp(probe, "QK") == 0 ||
+        std::strcmp(probe, "qkv") == 0 ||
+        std::strcmp(probe, "QKV") == 0;
     const bool probe_k =
-        std::strcmp(probe, "k") == 0 || std::strcmp(probe, "K") == 0;
+        std::strcmp(probe, "k") == 0 ||
+        std::strcmp(probe, "K") == 0 ||
+        std::strcmp(probe, "qk") == 0 ||
+        std::strcmp(probe, "QK") == 0 ||
+        std::strcmp(probe, "kv") == 0 ||
+        std::strcmp(probe, "KV") == 0 ||
+        std::strcmp(probe, "qkv") == 0 ||
+        std::strcmp(probe, "QKV") == 0;
     const bool probe_v =
-        std::strcmp(probe, "v") == 0 || std::strcmp(probe, "V") == 0;
+        std::strcmp(probe, "v") == 0 ||
+        std::strcmp(probe, "V") == 0 ||
+        std::strcmp(probe, "qv") == 0 ||
+        std::strcmp(probe, "QV") == 0 ||
+        std::strcmp(probe, "kv") == 0 ||
+        std::strcmp(probe, "KV") == 0 ||
+        std::strcmp(probe, "qkv") == 0 ||
+        std::strcmp(probe, "QKV") == 0;
 
     if (probe_q || probe_k || probe_v) {
-        const char proj_kind =
-            probe_q ? 'Q' : (probe_k ? 'K' : 'V');
-        const char * proj_prefix =
-            probe_q ? "Qcur-" : (probe_k ? "Kcur-" : "Vcur-");
+        struct projection_probe {
+            char kind;
+            const char * prefix;
+            ggml_tensor * proj = nullptr;
+            int proj_index = -1;
+            std::vector<ggml_tensor *> aliases;
+        };
 
-        ggml_tensor * proj = nullptr;
-        int proj_index = -1;
+        std::vector<projection_probe> projections;
+        if (probe_q) projections.push_back({'Q', "Qcur-"});
+        if (probe_k) projections.push_back({'K', "Kcur-"});
+        if (probe_v) projections.push_back({'V', "Vcur-"});
 
-        for (const llama_hybrid_inner_node_membership & item :
-             membership.nodes) {
-            if (!item.valid() ||
-                item.layer != layer ||
-                item.stage != llama_hybrid_inner_stage_kind::ATTN) {
-                continue;
+        for (projection_probe & pp : projections) {
+            for (const llama_hybrid_inner_node_membership & item :
+                 membership.nodes) {
+                if (!item.valid() ||
+                    item.layer != layer ||
+                    item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+                    continue;
+                }
+
+                ggml_tensor * node =
+                    ggml_graph_node(gf, item.node_index);
+                if (node->op == GGML_OP_MUL_MAT &&
+                    llama_hybrid_name_starts_with(node->name, pp.prefix)) {
+                    pp.proj = node;
+                    pp.proj_index = item.node_index;
+                    break;
+                }
             }
 
-            ggml_tensor * node =
-                ggml_graph_node(gf, item.node_index);
-            if (node->op == GGML_OP_MUL_MAT &&
-                llama_hybrid_name_starts_with(node->name, proj_prefix)) {
-                proj = node;
-                proj_index = item.node_index;
-                break;
+            if (pp.proj == nullptr) {
+                LLAMA_LOG_WARN(
+                    "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_%c_PROJ "
+                    "layer=%d tokens=%u probe=%s\n",
+                    pp.kind, layer, ubatch_tokens, probe);
+                return false;
+            }
+
+            const bool supports =
+                ggml_backend_supports_op(cuda_backend, pp.proj);
+            if (pp.proj->view_src != nullptr ||
+                pp.proj->buffer != nullptr ||
+                !supports) {
+                LLAMA_LOG_WARN(
+                    "[INNER_ATTN_MIGRATE] status=SKIP reason=%c_PROJ_UNSAFE "
+                    "layer=%d tokens=%u node=%d tensor=%s "
+                    "view_src=%d buffer=%d supports=%d probe=%s\n",
+                    pp.kind,
+                    layer, ubatch_tokens,
+                    pp.proj_index, pp.proj->name,
+                    pp.proj->view_src != nullptr ? 1 : 0,
+                    pp.proj->buffer != nullptr ? 1 : 0,
+                    supports ? 1 : 0,
+                    probe);
+                return false;
+            }
+
+            for (const llama_hybrid_inner_node_membership & item :
+                 membership.nodes) {
+                if (!item.valid() ||
+                    item.layer != layer ||
+                    item.stage != llama_hybrid_inner_stage_kind::ATTN ||
+                    item.node_index <= pp.proj_index) {
+                    continue;
+                }
+
+                ggml_tensor * node =
+                    ggml_graph_node(gf, item.node_index);
+                if (!llama_hybrid_is_view_op(node->op) ||
+                    node->view_src == nullptr) {
+                    continue;
+                }
+
+                ggml_tensor * root = node;
+                while (root->view_src != nullptr) {
+                    root = root->view_src;
+                }
+                if (root == pp.proj) {
+                    pp.aliases.push_back(node);
+                }
             }
         }
 
-        if (proj == nullptr) {
-            LLAMA_LOG_WARN(
-                "[INNER_ATTN_MIGRATE] status=SKIP reason=NO_%c_PROJ "
-                "layer=%d tokens=%u probe=%c\n",
-                proj_kind, layer, ubatch_tokens, proj_kind);
-            return false;
-        }
-
-        const bool supports =
-            ggml_backend_supports_op(cuda_backend, proj);
-        if (proj->view_src != nullptr ||
-            proj->buffer != nullptr ||
-            !supports) {
-            LLAMA_LOG_WARN(
-                "[INNER_ATTN_MIGRATE] status=SKIP reason=%c_PROJ_UNSAFE "
-                "layer=%d tokens=%u node=%d tensor=%s "
-                "view_src=%d buffer=%d supports=%d\n",
-                proj_kind,
-                layer, ubatch_tokens,
-                proj_index, proj->name,
-                proj->view_src != nullptr ? 1 : 0,
-                proj->buffer != nullptr ? 1 : 0,
-                supports ? 1 : 0);
-            return false;
-        }
-
-        std::vector<ggml_tensor *> aliases;
-        for (const llama_hybrid_inner_node_membership & item :
-             membership.nodes) {
-            if (!item.valid() ||
-                item.layer != layer ||
-                item.stage != llama_hybrid_inner_stage_kind::ATTN ||
-                item.node_index <= proj_index) {
-                continue;
-            }
-
-            ggml_tensor * node =
-                ggml_graph_node(gf, item.node_index);
-            if (!llama_hybrid_is_view_op(node->op) ||
-                node->view_src == nullptr) {
-                continue;
-            }
-
-            ggml_tensor * root = node;
-            while (root->view_src != nullptr) {
-                root = root->view_src;
-            }
-            if (root == proj) {
-                aliases.push_back(node);
-            }
-        }
-
-        ggml_backend_sched_set_tensor_backend(
-            sched_use, proj, cuda_backend);
-        for (ggml_tensor * alias : aliases) {
+        size_t total_aliases = 0;
+        for (projection_probe & pp : projections) {
             ggml_backend_sched_set_tensor_backend(
-                sched_use, alias, cuda_backend);
+                sched_use, pp.proj, cuda_backend);
+            for (ggml_tensor * alias : pp.aliases) {
+                ggml_backend_sched_set_tensor_backend(
+                    sched_use, alias, cuda_backend);
+            }
+            total_aliases += pp.aliases.size();
+
+            LLAMA_LOG_INFO(
+                "[INNER_ATTN_MIGRATE_PROJ] probe=%s kind=%c "
+                "layer=%d tokens=%u proj_node=%d proj_tensor=%s aliases=%zu "
+                "backend=%s\n",
+                probe, pp.kind,
+                layer, ubatch_tokens,
+                pp.proj_index, pp.proj->name, pp.aliases.size(),
+                ggml_backend_name(cuda_backend));
         }
 
         LLAMA_LOG_INFO(
-            "[INNER_ATTN_MIGRATE] status=APPLIED_%c_PROBE "
-            "layer=%d tokens=%u proj_node=%d proj_tensor=%s aliases=%zu "
+            "[INNER_ATTN_MIGRATE] status=APPLIED_PROJ_PROBE "
+            "probe=%s layer=%d tokens=%u projections=%zu aliases=%zu "
             "backend=%s membership={gaps:%d,transition_errors:%d}\n",
-            proj_kind,
+            probe,
             layer, ubatch_tokens,
-            proj_index, proj->name, aliases.size(),
+            projections.size(), total_aliases,
             ggml_backend_name(cuda_backend),
             membership.gap_nodes,
             membership.transition_errors);
@@ -539,7 +580,7 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         std::strcmp(probe, "WO") != 0) {
         LLAMA_LOG_WARN(
             "[INNER_ATTN_MIGRATE] status=SKIP reason=BAD_PROBE "
-            "probe=%s accepted={wo,q,k,v}\n",
+            "probe=%s accepted={wo,q,k,v,qv,qk,kv,qkv}\n",
             probe);
         return false;
     }
