@@ -9626,36 +9626,77 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_primary_tensor_sg ||
                 inferred_phone_primary_tensor ||
                 forced_phone_primary_tensor;
-            const bool internal_pc_handoff =
+            const bool internal_pc_handoff_candidate =
                 n_backends == 2 && active_backend == 1 &&
                 !tp_layer_context &&
                 i + 1 < backend_ctx->n_subgraphs &&
                 (subgraph_is_prefill_pc_only(i + 1) ||
                  subgraph_is_decode_pc_only_norm(i + 1));
+
             int layer = force_phone_block_exit ? force_phone_block_layer : -1;
             ggml_tensor * src_residual = nullptr;
-            if (internal_pc_handoff || phone_owner_exit) {
+            if (internal_pc_handoff_candidate || phone_owner_exit) {
                 src_residual = force_phone_block_exit ?
                     find_recent_ffn_inp(1, i, layer) :
                     find_recent_ffn_inp_layer(1, i, layer);
             }
+
             ggml_tensor * dst_l_out = nullptr;
-            if (internal_pc_handoff) {
-                dst_l_out = disable_layer_output_producers(0, i + 1, layer);
-            } else if (phone_owner_exit && src_residual != nullptr) {
+            if ((internal_pc_handoff_candidate || phone_owner_exit) &&
+                    src_residual != nullptr) {
                 char expected[64];
                 std::snprintf(expected, sizeof(expected), "l_out-%d", layer);
                 dst_l_out = find_exact_named_tensor(0, expected);
-                GGML_ASSERT(dst_l_out != nullptr);
-                GGML_ASSERT(std::strcmp(dst_l_out->name, expected) == 0);
-                GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
+                if (dst_l_out != nullptr) {
+                    GGML_ASSERT(std::strcmp(dst_l_out->name, expected) == 0);
+                }
             }
+
+            // Seeing a PC-only norm next does not prove that the current Phone
+            // split already holds a complete layer FFN result.  In MoE decode
+            // the split can end at ffn_moe_weighted-[L] with shape
+            // [n_embd,n_expert_used], while the residual/l_out are
+            // [n_embd,1].  Treat such tensors as ordinary cross-backend
+            // intermediates; only a full hidden-sized result may perform the
+            // synthetic residual ADD + l_out handoff.
+            const bool full_layer_handoff_shape =
+                src_residual != nullptr && dst_l_out != nullptr &&
+                nodes[1] != nullptr &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+
+            const bool internal_pc_handoff =
+                internal_pc_handoff_candidate &&
+                full_layer_handoff_shape;
+
+            if (internal_pc_handoff) {
+                ggml_tensor * disabled_l_out =
+                    disable_layer_output_producers(0, i + 1, layer);
+                GGML_ASSERT(disabled_l_out != nullptr);
+                GGML_ASSERT(disabled_l_out == dst_l_out);
+            } else if (internal_pc_handoff_candidate &&
+                       !full_layer_handoff_shape &&
+                       (pipeline_debug || nodes[1] != nullptr)) {
+                fprintf(
+                    stderr,
+                    "[META_LAYER_HANDOFF_SKIP] "
+                    "sg=%zu/%zu layer=%d node=%s node_bytes=%zu "
+                    "residual=%s residual_bytes=%zu dst=%s dst_bytes=%zu "
+                    "reason=PARTIAL_OR_INTERMEDIATE\n",
+                    i, backend_ctx->n_subgraphs, layer,
+                    nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                    nodes[1] != nullptr ? ggml_nbytes(nodes[1]) : 0,
+                    src_residual != nullptr ? src_residual->name : "(null)",
+                    src_residual != nullptr ? ggml_nbytes(src_residual) : 0,
+                    dst_l_out != nullptr ? dst_l_out->name : "(null)",
+                    dst_l_out != nullptr ? ggml_nbytes(dst_l_out) : 0);
+                fflush(stderr);
+            }
+
             const bool external_handoff_candidate =
                 !tp_layer_context &&
                 phone_owner_exit && !internal_pc_handoff &&
-                src_residual != nullptr && dst_l_out != nullptr &&
-                ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
-                ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+                full_layer_handoff_shape;
             const bool external_backend_handoff =
                 external_handoff_candidate &&
                 (i + 1 >= backend_ctx->n_subgraphs ||
