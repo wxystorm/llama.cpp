@@ -5054,24 +5054,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 tasks,
                 fallback_reason)) {
             if (fifo_requested) {
-                // Phase A correctness isolation:
-                // 0 = strict FIFO, no cross-backend overlap (A0)
-                // 1 = overlap GPU Attention with CPU FFN only; REDUCE is a
-                //     full barrier before next-layer Attention is released (A1)
-                // 2 = overlap FFN and REDUCE as well (A2 / old full-overlap path)
-                // Keep the default at 0 so each overlap boundary is enabled
-                // only after the previous mode has correct logits.
-                const char * fifo_overlap_env =
-                    std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_OVERLAP");
-                int fifo_overlap_mode =
-                    fifo_overlap_env != nullptr ?
-                        std::atoi(fifo_overlap_env) : 0;
-                fifo_overlap_mode =
-                    std::max(0, std::min(2, fifo_overlap_mode));
-                const bool fifo_ffn_overlap =
-                    fifo_overlap_mode >= 1;
-                const bool fifo_reduce_overlap =
-                    fifo_overlap_mode >= 2;
+                const bool fifo_trace =
+                    std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_TRACE") != nullptr &&
+                    std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_TRACE")) != 0;
 
                 const auto exact_stage =
                     [](const llama_hybrid_inner_v0_task & task,
@@ -5087,16 +5072,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 int max_chunk = -1;
 
                 for (const auto & task : tasks) {
-                    const bool semantic =
-                        task.layer_begin >= 0 &&
-                        task.layer_end == task.layer_begin + 1 &&
-                        task.chunk >= 0 &&
-                        (exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) ||
-                         exact_stage(task, llama_hybrid_inner_stage_kind::FFN) ||
-                         exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE));
-                    if (!semantic) {
+                    if (task.layer_begin < 0 ||
+                        task.layer_end != task.layer_begin + 1 ||
+                        task.chunk < 0) {
                         continue;
                     }
+
+                    if (!exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) &&
+                        !exact_stage(task, llama_hybrid_inner_stage_kind::FFN) &&
+                        !exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE)) {
+                        continue;
+                    }
+
                     if (first_semantic < 0) {
                         first_semantic = task.id;
                     }
@@ -5116,40 +5103,38 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const int n_chunks = max_chunk + 1;
                 const int n_layers =
                     fifo_topology_ok ? last_layer - first_layer + 1 : 0;
+                const size_t grid =
+                    fifo_topology_ok ?
+                        (size_t) n_layers * (size_t) n_chunks : 0;
 
-                std::vector<int> attn_ids;
-                std::vector<int> ffn_ids;
-                std::vector<int> reduce_ids;
-                if (fifo_topology_ok) {
-                    const size_t grid =
-                        (size_t) n_layers * (size_t) n_chunks;
-                    attn_ids.assign(grid, -1);
-                    ffn_ids.assign(grid, -1);
-                    reduce_ids.assign(grid, -1);
+                std::vector<int> attn_ids(grid, -1);
+                std::vector<int> ffn_ids(grid, -1);
+                std::vector<int> reduce_ids(grid, -1);
 
-                    const auto slot = [&](int layer, int chunk) -> size_t {
+                const auto ring_index =
+                    [&](int layer, int chunk) -> size_t {
                         return (size_t) (layer - first_layer) *
                                    (size_t) n_chunks +
                                (size_t) chunk;
                     };
 
+                if (fifo_topology_ok) {
                     for (int id = first_semantic;
                          id <= last_semantic;
                          ++id) {
                         const auto & task = tasks[(size_t) id];
-                        const bool semantic =
-                            task.layer_begin >= first_layer &&
-                            task.layer_begin <= last_layer &&
-                            task.layer_end == task.layer_begin + 1 &&
-                            task.chunk >= 0 &&
-                            task.chunk < n_chunks;
-                        if (!semantic) {
+
+                        if (task.layer_begin < first_layer ||
+                            task.layer_begin > last_layer ||
+                            task.layer_end != task.layer_begin + 1 ||
+                            task.chunk < 0 ||
+                            task.chunk >= n_chunks) {
                             fifo_topology_ok = false;
                             break;
                         }
 
                         const size_t idx =
-                            slot(task.layer_begin, task.chunk);
+                            ring_index(task.layer_begin, task.chunk);
                         if (exact_stage(
                                 task,
                                 llama_hybrid_inner_stage_kind::ATTN)) {
@@ -5167,40 +5152,35 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             break;
                         }
                     }
+                }
 
-                    if (fifo_topology_ok) {
-                        for (size_t i = 0;
-                             i < attn_ids.size();
-                             ++i) {
-                            if (attn_ids[i] < 0 ||
-                                ffn_ids[i] < 0 ||
-                                reduce_ids[i] < 0) {
-                                fifo_topology_ok = false;
-                                break;
-                            }
+                if (fifo_topology_ok) {
+                    for (size_t i = 0; i < grid; ++i) {
+                        if (attn_ids[i] < 0 ||
+                            ffn_ids[i] < 0 ||
+                            reduce_ids[i] < 0) {
+                            fifo_topology_ok = false;
+                            break;
+                        }
 
-                            ggml_backend_t attn_backend =
-                                tasks[(size_t) attn_ids[i]].backend;
-                            ggml_backend_t ffn_backend =
-                                tasks[(size_t) ffn_ids[i]].backend;
-                            ggml_backend_t reduce_backend =
-                                tasks[(size_t) reduce_ids[i]].backend;
+                        const auto & attn = tasks[(size_t) attn_ids[i]];
+                        const auto & ffn = tasks[(size_t) ffn_ids[i]];
+                        const auto & reduce = tasks[(size_t) reduce_ids[i]];
 
-                            if (attn_backend == nullptr ||
-                                ffn_backend == nullptr ||
-                                reduce_backend == nullptr ||
-                                ggml_backend_dev_type(
-                                    ggml_backend_get_device(attn_backend)) !=
-                                    GGML_BACKEND_DEVICE_TYPE_GPU ||
-                                ggml_backend_dev_type(
-                                    ggml_backend_get_device(ffn_backend)) !=
-                                    GGML_BACKEND_DEVICE_TYPE_CPU ||
-                                ggml_backend_dev_type(
-                                    ggml_backend_get_device(reduce_backend)) !=
-                                    GGML_BACKEND_DEVICE_TYPE_CPU) {
-                                fifo_topology_ok = false;
-                                break;
-                            }
+                        if (attn.backend == nullptr ||
+                            ffn.backend == nullptr ||
+                            reduce.backend == nullptr ||
+                            ggml_backend_dev_type(
+                                ggml_backend_get_device(attn.backend)) !=
+                                GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(
+                                ggml_backend_get_device(ffn.backend)) !=
+                                GGML_BACKEND_DEVICE_TYPE_CPU ||
+                            ggml_backend_dev_type(
+                                ggml_backend_get_device(reduce.backend)) !=
+                                GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            fifo_topology_ok = false;
+                            break;
                         }
                     }
                 }
@@ -5208,7 +5188,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 if (!fifo_topology_ok) {
                     LLAMA_LOG_ERROR(
                         "[INNER_FIFO] status=REJECT ub=%d block=%zu "
-                        "reason=UNSUPPORTED_STATIC_RING_TOPOLOGY "
+                        "reason=UNSUPPORTED_RING_TOPOLOGY "
                         "semantic=[%d,%d] layers=[%d,%d] chunks=%d\n",
                         ubatch_id,
                         block_index,
@@ -5220,38 +5200,19 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     ret = GGML_STATUS_FAILED;
                     ran_inner_v1_tasks = true;
                 } else {
-                    const auto ring_index =
-                        [&](int layer, int chunk) -> size_t {
-                            return (size_t) (layer - first_layer) *
-                                       (size_t) n_chunks +
-                                   (size_t) chunk;
-                        };
-
-                    // True backend-local FIFO runtime:
-                    //   GPU queue: ATTN only
-                    //   CPU queue: FFN + REDUCE
-                    //
-                    // A task becomes visible to the destination queue only
-                    // after its producer has completed on the source backend.
-                    // Every queue is push_back/pop_front; there is no global
-                    // ready set and no priority insertion.
                     std::deque<int> gpu_q;
                     std::deque<int> cpu_q;
-                    std::set<int> gpu_enqueued;
-                    std::set<int> cpu_enqueued;
-
                     std::mutex gpu_mutex;
                     std::mutex cpu_mutex;
                     std::condition_variable gpu_cv;
                     std::condition_variable cpu_cv;
 
-                    // Scheduler metadata mutation/submission is still
-                    // serialized. Backend execution may overlap after submit.
+                    // ggml scheduler metadata is shared, so split prepare/submit
+                    // stays serialized. Backend execution itself is independent.
                     std::mutex sched_submit_mutex;
 
                     std::atomic<int> fifo_error(0);
-                    const int ring_tasks =
-                        n_layers * n_chunks * 3;
+                    const int ring_tasks = n_layers * n_chunks * 3;
                     std::atomic<int> remaining(ring_tasks);
 
                     size_t gpu_push_count = 0;
@@ -5267,119 +5228,114 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         cpu_cv.notify_all();
                     };
 
+                    const auto finish_task = [&]() {
+                        if (remaining.fetch_sub(1) == 1) {
+                            gpu_cv.notify_all();
+                            cpu_cv.notify_all();
+                        }
+                    };
+
                     const auto enqueue_gpu =
-                        [&](int task_id, const char * source) -> bool {
-                            bool inserted = false;
+                        [&](int task_id, const char * source) {
                             size_t qsize = 0;
                             size_t push_index = 0;
                             {
                                 std::lock_guard<std::mutex> lock(gpu_mutex);
-                                inserted =
-                                    gpu_enqueued.insert(task_id).second;
-                                if (inserted) {
-                                    gpu_q.push_back(task_id);
-                                    ++gpu_push_count;
-                                    qsize = gpu_q.size();
-                                    push_index = gpu_push_count;
-                                }
+                                gpu_q.push_back(task_id);
+                                qsize = gpu_q.size();
+                                push_index = ++gpu_push_count;
                             }
-                            if (!inserted) {
-                                LLAMA_LOG_ERROR(
-                                    "[INNER_FIFO] status=FAIL "
-                                    "reason=DUP_GPU_ENQUEUE task=%d source=%s\n",
-                                    task_id,
+                            if (fifo_trace) {
+                                const auto & task = tasks[(size_t) task_id];
+                                LLAMA_LOG_INFO(
+                                    "[INNER_FIFO_GPU_PUSH] "
+                                    "task=%d layer=%d chunk=%d "
+                                    "size=%zu push=%zu source=%s\n",
+                                    task.id,
+                                    task.layer_begin,
+                                    task.chunk,
+                                    qsize,
+                                    push_index,
                                     source);
-                                set_error(GGML_STATUS_FAILED);
-                                return false;
                             }
-
-                            const auto & task = tasks[(size_t) task_id];
-                            LLAMA_LOG_INFO(
-                                "[INNER_FIFO_GPU_PUSH] "
-                                "task=%d layer=%d chunk=%d "
-                                "size=%zu push=%zu source=%s\n",
-                                task.id,
-                                task.layer_begin,
-                                task.chunk,
-                                qsize,
-                                push_index,
-                                source);
                             gpu_cv.notify_one();
-                            return true;
                         };
 
                     const auto enqueue_cpu =
-                        [&](int task_id, const char * source) -> bool {
-                            bool inserted = false;
+                        [&](int task_id, const char * source) {
                             size_t qsize = 0;
                             size_t push_index = 0;
                             {
                                 std::lock_guard<std::mutex> lock(cpu_mutex);
-                                inserted =
-                                    cpu_enqueued.insert(task_id).second;
-                                if (inserted) {
-                                    cpu_q.push_back(task_id);
-                                    ++cpu_push_count;
-                                    qsize = cpu_q.size();
-                                    push_index = cpu_push_count;
+                                cpu_q.push_back(task_id);
+                                qsize = cpu_q.size();
+                                push_index = ++cpu_push_count;
+                            }
+                            if (fifo_trace) {
+                                const auto & task = tasks[(size_t) task_id];
+                                LLAMA_LOG_INFO(
+                                    "[INNER_FIFO_CPU_PUSH] "
+                                    "task=%d stage=%s layer=%d chunk=%d "
+                                    "size=%zu push=%zu source=%s\n",
+                                    task.id,
+                                    llama_hybrid_inner_task_stage_mask_name(
+                                        task.stage_mask).c_str(),
+                                    task.layer_begin,
+                                    task.chunk,
+                                    qsize,
+                                    push_index,
+                                    source);
+                            }
+                            cpu_cv.notify_one();
+                        };
+
+                    const auto run_task =
+                        [&](llama_hybrid_inner_v0_task & task) -> ggml_status {
+                            ggml_status status = GGML_STATUS_SUCCESS;
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    sched_submit_mutex);
+                                status =
+                                    ggml_backend_sched_prepare_split(
+                                        sched_use,
+                                        task.first_split);
+                                if (status == GGML_STATUS_SUCCESS) {
+                                    status =
+                                        ggml_backend_sched_compute_split(
+                                            sched_use,
+                                            task.first_split);
                                 }
                             }
-                            if (!inserted) {
-                                LLAMA_LOG_ERROR(
-                                    "[INNER_FIFO] status=FAIL "
-                                    "reason=DUP_CPU_ENQUEUE task=%d source=%s\n",
-                                    task_id,
-                                    source);
-                                set_error(GGML_STATUS_FAILED);
-                                return false;
-                            }
 
-                            const auto & task = tasks[(size_t) task_id];
-                            LLAMA_LOG_INFO(
-                                "[INNER_FIFO_CPU_PUSH] "
-                                "task=%d stage=%s layer=%d chunk=%d "
-                                "size=%zu push=%zu source=%s\n",
-                                task.id,
-                                llama_hybrid_inner_task_stage_mask_name(
-                                    task.stage_mask).c_str(),
-                                task.layer_begin,
-                                task.chunk,
-                                qsize,
-                                push_index,
-                                source);
-                            cpu_cv.notify_one();
-                            return true;
+                            if (status == GGML_STATUS_SUCCESS) {
+                                // Successor publication always happens after
+                                // true completion of the producing backend.
+                                ggml_backend_synchronize(task.backend);
+                            }
+                            return status;
                         };
 
                     for (int chunk = 0; chunk < n_chunks; ++chunk) {
-                        const int task_id =
-                            attn_ids[ring_index(first_layer, chunk)];
-                        if (!enqueue_gpu(task_id, "INITIAL")) {
-                            break;
-                        }
+                        enqueue_gpu(
+                            attn_ids[ring_index(first_layer, chunk)],
+                            "INITIAL");
                     }
 
                     LLAMA_LOG_INFO(
                         "[INNER_FIFO] status=START ub=%d block=%zu "
                         "tokens=%u layers=[%d,%d) chunks=%d "
-                        "semantic=[%d,%d] "
                         "policy=BACKEND_LOCAL_FIFO "
                         "gpu=ATTN cpu=FFN+REDUCE "
-                        "storage=PINNED_HANDOFF_V0 "
-                        "ring_tasks=%d overlap_mode=%d\n",
+                        "storage=PINNED_HANDOFF_V0 ring_tasks=%d\n",
                         ubatch_id,
                         block_index,
                         block_tokens,
                         first_layer,
                         last_layer + 1,
                         n_chunks,
-                        first_semantic,
-                        last_semantic,
-                        ring_tasks,
-                        fifo_overlap_mode);
+                        ring_tasks);
 
-                    if (fifo_error.load() == 0 &&
-                        first_semantic > 0) {
+                    if (first_semantic > 0) {
                         ret = graph_compute_range(
                             sched_use,
                             0,
@@ -5395,8 +5351,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     std::thread gpu_worker;
                     std::thread cpu_worker;
 
-                    if (ret == GGML_STATUS_SUCCESS &&
-                        fifo_error.load() == 0) {
+                    if (ret == GGML_STATUS_SUCCESS) {
                         gpu_worker = std::thread([&]() {
                             while (true) {
                                 int task_id = -1;
@@ -5409,117 +5364,54 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                             !gpu_q.empty();
                                     });
 
-                                    if (fifo_error.load() != 0) {
+                                    if (fifo_error.load() != 0 ||
+                                        (remaining.load() == 0 &&
+                                         gpu_q.empty())) {
                                         return;
                                     }
                                     if (gpu_q.empty()) {
-                                        if (remaining.load() == 0) {
-                                            return;
-                                        }
                                         continue;
                                     }
 
                                     task_id = gpu_q.front();
                                     gpu_q.pop_front();
                                     ++gpu_pop_count;
-                                    const auto & task =
-                                        tasks[(size_t) task_id];
-                                    LLAMA_LOG_INFO(
-                                        "[INNER_FIFO_GPU_POP] "
-                                        "task=%d layer=%d chunk=%d "
-                                        "remaining_q=%zu pop=%zu\n",
-                                        task.id,
-                                        task.layer_begin,
-                                        task.chunk,
-                                        gpu_q.size(),
-                                        gpu_pop_count);
+
+                                    if (fifo_trace) {
+                                        const auto & task =
+                                            tasks[(size_t) task_id];
+                                        LLAMA_LOG_INFO(
+                                            "[INNER_FIFO_GPU_POP] "
+                                            "task=%d layer=%d chunk=%d "
+                                            "left=%zu pop=%zu\n",
+                                            task.id,
+                                            task.layer_begin,
+                                            task.chunk,
+                                            gpu_q.size(),
+                                            gpu_pop_count);
+                                    }
                                 }
 
-                                auto & task =
-                                    tasks[(size_t) task_id];
+                                auto & task = tasks[(size_t) task_id];
                                 if (!exact_stage(
                                         task,
                                         llama_hybrid_inner_stage_kind::ATTN)) {
-                                    LLAMA_LOG_ERROR(
-                                        "[INNER_FIFO] status=FAIL "
-                                        "reason=GPU_NON_ATTN task=%d stage=%s\n",
-                                        task.id,
-                                        llama_hybrid_inner_task_stage_mask_name(
-                                            task.stage_mask).c_str());
                                     set_error(GGML_STATUS_FAILED);
                                     return;
                                 }
 
-                                ggml_status task_status =
-                                    GGML_STATUS_SUCCESS;
-                                if (fifo_overlap_mode == 0) {
-                                    // A0: serialize the complete task,
-                                    // including global completion, with all
-                                    // scheduler submissions.
-                                    std::lock_guard<std::mutex> lock(
-                                        sched_submit_mutex);
-                                    task_status =
-                                        ggml_backend_sched_prepare_split(
-                                            sched_use,
-                                            task.first_split);
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        task_status =
-                                            ggml_backend_sched_compute_split(
-                                                sched_use,
-                                                task.first_split);
-                                    }
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        ggml_backend_sched_synchronize(
-                                            sched_use);
-                                    }
-                                } else {
-                                    {
-                                        std::lock_guard<std::mutex> lock(
-                                            sched_submit_mutex);
-                                        task_status =
-                                            ggml_backend_sched_prepare_split(
-                                                sched_use,
-                                                task.first_split);
-                                        if (task_status ==
-                                            GGML_STATUS_SUCCESS) {
-                                            task_status =
-                                                ggml_backend_sched_compute_split(
-                                                    sched_use,
-                                                    task.first_split);
-                                        }
-                                    }
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        // A successor is released only after
-                                        // true GPU completion.
-                                        ggml_backend_synchronize(
-                                            task.backend);
-                                    }
-                                }
-
-                                if (task_status !=
-                                    GGML_STATUS_SUCCESS) {
-                                    set_error(task_status);
+                                const ggml_status status = run_task(task);
+                                if (status != GGML_STATUS_SUCCESS) {
+                                    set_error(status);
                                     return;
                                 }
 
-                                const int ffn_id =
+                                enqueue_cpu(
                                     ffn_ids[ring_index(
                                         task.layer_begin,
-                                        task.chunk)];
-                                if (!enqueue_cpu(
-                                        ffn_id,
-                                        "ATTN_COMPLETE")) {
-                                    return;
-                                }
-
-                                if (remaining.fetch_sub(1) == 1) {
-                                    gpu_cv.notify_all();
-                                    cpu_cv.notify_all();
-                                    return;
-                                }
+                                        task.chunk)],
+                                    "ATTN_COMPLETE");
+                                finish_task();
                             }
                         });
 
@@ -5535,36 +5427,37 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                             !cpu_q.empty();
                                     });
 
-                                    if (fifo_error.load() != 0) {
+                                    if (fifo_error.load() != 0 ||
+                                        (remaining.load() == 0 &&
+                                         cpu_q.empty())) {
                                         return;
                                     }
                                     if (cpu_q.empty()) {
-                                        if (remaining.load() == 0) {
-                                            return;
-                                        }
                                         continue;
                                     }
 
                                     task_id = cpu_q.front();
                                     cpu_q.pop_front();
                                     ++cpu_pop_count;
-                                    const auto & task =
-                                        tasks[(size_t) task_id];
-                                    LLAMA_LOG_INFO(
-                                        "[INNER_FIFO_CPU_POP] "
-                                        "task=%d stage=%s layer=%d chunk=%d "
-                                        "remaining_q=%zu pop=%zu\n",
-                                        task.id,
-                                        llama_hybrid_inner_task_stage_mask_name(
-                                            task.stage_mask).c_str(),
-                                        task.layer_begin,
-                                        task.chunk,
-                                        cpu_q.size(),
-                                        cpu_pop_count);
+
+                                    if (fifo_trace) {
+                                        const auto & task =
+                                            tasks[(size_t) task_id];
+                                        LLAMA_LOG_INFO(
+                                            "[INNER_FIFO_CPU_POP] "
+                                            "task=%d stage=%s layer=%d chunk=%d "
+                                            "left=%zu pop=%zu\n",
+                                            task.id,
+                                            llama_hybrid_inner_task_stage_mask_name(
+                                                task.stage_mask).c_str(),
+                                            task.layer_begin,
+                                            task.chunk,
+                                            cpu_q.size(),
+                                            cpu_pop_count);
+                                    }
                                 }
 
-                                auto & task =
-                                    tasks[(size_t) task_id];
+                                auto & task = tasks[(size_t) task_id];
                                 const bool is_ffn =
                                     exact_stage(
                                         task,
@@ -5574,126 +5467,31 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                         task,
                                         llama_hybrid_inner_stage_kind::REDUCE);
                                 if (!is_ffn && !is_reduce) {
-                                    LLAMA_LOG_ERROR(
-                                        "[INNER_FIFO] status=FAIL "
-                                        "reason=CPU_BAD_STAGE task=%d stage=%s\n",
-                                        task.id,
-                                        llama_hybrid_inner_task_stage_mask_name(
-                                            task.stage_mask).c_str());
                                     set_error(GGML_STATUS_FAILED);
                                     return;
                                 }
 
-                                ggml_status task_status =
-                                    GGML_STATUS_SUCCESS;
-                                const bool full_barrier =
-                                    fifo_overlap_mode == 0 ||
-                                    (is_reduce &&
-                                     fifo_overlap_mode == 1);
-
-                                if (full_barrier) {
-                                    // A0: every task is globally serialized.
-                                    // A1: FFN may overlap GPU Attention, but
-                                    // REDUCE is the global barrier before
-                                    // releasing ATTN(L+1,C).
-                                    std::lock_guard<std::mutex> lock(
-                                        sched_submit_mutex);
-                                    task_status =
-                                        ggml_backend_sched_prepare_split(
-                                            sched_use,
-                                            task.first_split);
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        task_status =
-                                            ggml_backend_sched_compute_split(
-                                                sched_use,
-                                                task.first_split);
-                                    }
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        ggml_backend_sched_synchronize(
-                                            sched_use);
-                                    }
-
-                                    if (task_status ==
-                                            GGML_STATUS_SUCCESS &&
-                                        is_reduce &&
-                                        task.layer_begin < last_layer) {
-                                        const int next_attn =
-                                            attn_ids[ring_index(
-                                                task.layer_begin + 1,
-                                                task.chunk)];
-                                        // Keep successor publication inside
-                                        // the A1 barrier window so no new
-                                        // scheduler submit can slip between
-                                        // global completion and enqueue.
-                                        if (!enqueue_gpu(
-                                                next_attn,
-                                                "REDUCE_COMPLETE")) {
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    {
-                                        std::lock_guard<std::mutex> lock(
-                                            sched_submit_mutex);
-                                        task_status =
-                                            ggml_backend_sched_prepare_split(
-                                                sched_use,
-                                                task.first_split);
-                                        if (task_status ==
-                                            GGML_STATUS_SUCCESS) {
-                                            task_status =
-                                                ggml_backend_sched_compute_split(
-                                                    sched_use,
-                                                    task.first_split);
-                                        }
-                                    }
-                                    if (task_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                        // A1 FFN and all A2 CPU stages release
-                                        // successors only after true CPU
-                                        // completion.
-                                        ggml_backend_synchronize(
-                                            task.backend);
-                                    }
-                                }
-
-                                if (task_status !=
-                                    GGML_STATUS_SUCCESS) {
-                                    set_error(task_status);
+                                const ggml_status status = run_task(task);
+                                if (status != GGML_STATUS_SUCCESS) {
+                                    set_error(status);
                                     return;
                                 }
 
                                 if (is_ffn) {
-                                    const int reduce_id =
+                                    enqueue_cpu(
                                         reduce_ids[ring_index(
                                             task.layer_begin,
-                                            task.chunk)];
-                                    if (!enqueue_cpu(
-                                            reduce_id,
-                                            "FFN_COMPLETE")) {
-                                        return;
-                                    }
-                                } else if (
-                                    fifo_overlap_mode >= 2 &&
-                                    task.layer_begin < last_layer) {
-                                    const int next_attn =
+                                            task.chunk)],
+                                        "FFN_COMPLETE");
+                                } else if (task.layer_begin < last_layer) {
+                                    enqueue_gpu(
                                         attn_ids[ring_index(
                                             task.layer_begin + 1,
-                                            task.chunk)];
-                                    if (!enqueue_gpu(
-                                            next_attn,
-                                            "REDUCE_COMPLETE")) {
-                                        return;
-                                    }
+                                            task.chunk)],
+                                        "REDUCE_COMPLETE");
                                 }
 
-                                if (remaining.fetch_sub(1) == 1) {
-                                    gpu_cv.notify_all();
-                                    cpu_cv.notify_all();
-                                    return;
-                                }
+                                finish_task();
                             }
                         });
                     }
@@ -5721,8 +5519,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
 
                     if (ret == GGML_STATUS_SUCCESS &&
-                        last_semantic + 1 <
-                            (int) tasks.size()) {
+                        last_semantic + 1 < (int) tasks.size()) {
                         ret = graph_compute_range(
                             sched_use,
                             last_semantic + 1,
@@ -5731,29 +5528,35 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
 
                     if (ret == GGML_STATUS_SUCCESS) {
-                        const size_t gpu_left = gpu_q.size();
-                        const size_t cpu_left = cpu_q.size();
+                        size_t gpu_left = 0;
+                        size_t cpu_left = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(gpu_mutex);
+                            gpu_left = gpu_q.size();
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(cpu_mutex);
+                            cpu_left = cpu_q.size();
+                        }
+
                         LLAMA_LOG_INFO(
                             "[INNER_FIFO] status=DONE "
-                            "ub=%d block=%zu layers=[%d,%d) "
-                            "chunks=%d ring_tasks=%d "
+                            "ub=%d block=%zu layers=[%d,%d) chunks=%d "
                             "gpu={push:%zu,pop:%zu,left:%zu} "
                             "cpu={push:%zu,pop:%zu,left:%zu} "
-                            "overlap_mode=%d policy=BACKEND_LOCAL_FIFO "
+                            "policy=BACKEND_LOCAL_FIFO "
                             "storage=PINNED_HANDOFF_V0\n",
                             ubatch_id,
                             block_index,
                             first_layer,
                             last_layer + 1,
                             n_chunks,
-                            ring_tasks,
                             gpu_push_count,
                             gpu_pop_count,
                             gpu_left,
                             cpu_push_count,
                             cpu_pop_count,
-                            cpu_left,
-                            fifo_overlap_mode);
+                            cpu_left);
                     }
 
                     ran_inner_v1_tasks = true;
