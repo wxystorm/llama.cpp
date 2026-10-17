@@ -212,10 +212,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool pc_inner_chunk_ring_requested =
         pc_inner_chunk_ring_env != nullptr &&
         std::atoi(pc_inner_chunk_ring_env) != 0;
-    int pc_inner_chunk_tokens = 0;
+    int pc_inner_chunk_tokens = 128;
     if (const char * value =
             std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
-        pc_inner_chunk_tokens = std::max(0, std::atoi(value));
+        const int requested = std::atoi(value);
+        if (requested > 0) {
+            pc_inner_chunk_tokens = requested;
+        }
     }
 
     const bool return_wavefront_requested =
