@@ -16,19 +16,14 @@
 #include "llama.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cinttypes>
 #include <cmath>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
-#include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 //
@@ -563,208 +558,6 @@ static bool llama_hybrid_build_inner_v0_tasks(
     return !tasks.empty();
 }
 
-struct llama_hybrid_inner_fifo_plan {
-    int layer_begin = -1;
-    int layer_end   = -1;
-    int n_chunks    = 0;
-
-    int prefix_end   = 0;  // [0, prefix_end)
-    int suffix_begin = 0;  // [suffix_begin, n_tasks)
-
-    std::vector<int> successor;
-    std::vector<int> seeds;
-};
-
-static bool llama_hybrid_build_inner_fifo_plan(
-        const std::vector<llama_hybrid_inner_v0_task> & tasks,
-        llama_hybrid_inner_fifo_plan & plan,
-        std::string & reason) {
-    plan = {};
-    reason.clear();
-
-    if (tasks.empty()) {
-        reason = "NO_TASKS";
-        return false;
-    }
-
-    int first_semantic = -1;
-    int last_semantic  = -1;
-    int min_layer = std::numeric_limits<int>::max();
-    int max_layer = -1;
-    int max_chunk = -1;
-
-    auto exact_stage = [](const llama_hybrid_inner_v0_task & task,
-                          llama_hybrid_inner_stage_kind wanted) {
-        return task.stage_mask ==
-            llama_hybrid_inner_task_stage_bit(wanted);
-    };
-
-    for (const llama_hybrid_inner_v0_task & task : tasks) {
-        const bool semantic =
-            task.layer_begin >= 0 &&
-            task.layer_end == task.layer_begin + 1 &&
-            task.chunk >= 0 &&
-            (exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) ||
-             exact_stage(task, llama_hybrid_inner_stage_kind::FFN) ||
-             exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE));
-
-        if (!semantic) {
-            continue;
-        }
-
-        if (first_semantic < 0) {
-            first_semantic = task.id;
-        }
-        last_semantic = task.id;
-        min_layer = std::min(min_layer, task.layer_begin);
-        max_layer = std::max(max_layer, task.layer_begin);
-        max_chunk = std::max(max_chunk, task.chunk);
-    }
-
-    if (first_semantic < 0 ||
-        last_semantic < first_semantic ||
-        min_layer == std::numeric_limits<int>::max() ||
-        max_layer < min_layer ||
-        max_chunk < 0) {
-        reason = "NO_SEMANTIC_RING";
-        return false;
-    }
-
-    for (int i = first_semantic; i <= last_semantic; ++i) {
-        const llama_hybrid_inner_v0_task & task = tasks[(size_t) i];
-        const bool semantic =
-            task.layer_begin >= 0 &&
-            task.layer_end == task.layer_begin + 1 &&
-            task.chunk >= 0 &&
-            (exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) ||
-             exact_stage(task, llama_hybrid_inner_stage_kind::FFN) ||
-             exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE));
-        if (!semantic) {
-            reason = "MID_RING_ENVELOPE_TASK";
-            return false;
-        }
-    }
-
-    plan.layer_begin = min_layer;
-    plan.layer_end   = max_layer + 1;
-    plan.n_chunks    = max_chunk + 1;
-    plan.prefix_end  = first_semantic;
-    plan.suffix_begin = last_semantic + 1;
-    plan.successor.assign(tasks.size(), -1);
-
-    const auto find_task = [&](int layer, int chunk,
-                               llama_hybrid_inner_stage_kind stage) -> int {
-        for (const llama_hybrid_inner_v0_task & task : tasks) {
-            if (task.layer_begin != layer ||
-                task.layer_end != layer + 1 ||
-                task.chunk != chunk ||
-                task.stage_mask != llama_hybrid_inner_task_stage_bit(stage)) {
-                continue;
-            }
-            return task.id;
-        }
-        return -1;
-    };
-
-    std::vector<unsigned char> covered(tasks.size(), 0);
-
-    for (int layer = plan.layer_begin; layer < plan.layer_end; ++layer) {
-        for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
-            const int attn =
-                find_task(layer, chunk, llama_hybrid_inner_stage_kind::ATTN);
-            const int ffn =
-                find_task(layer, chunk, llama_hybrid_inner_stage_kind::FFN);
-            const int reduce =
-                find_task(layer, chunk, llama_hybrid_inner_stage_kind::REDUCE);
-
-            if (attn < 0 || ffn < 0 || reduce < 0) {
-                reason = "INCOMPLETE_RING_GRID";
-                return false;
-            }
-
-            covered[(size_t) attn] = 1;
-            covered[(size_t) ffn] = 1;
-            covered[(size_t) reduce] = 1;
-
-            plan.successor[(size_t) attn] = ffn;
-            plan.successor[(size_t) ffn] = reduce;
-
-            if (layer + 1 < plan.layer_end) {
-                const int next_attn =
-                    find_task(
-                        layer + 1,
-                        chunk,
-                        llama_hybrid_inner_stage_kind::ATTN);
-                if (next_attn < 0) {
-                    reason = "MISSING_NEXT_LAYER_ATTN";
-                    return false;
-                }
-                plan.successor[(size_t) reduce] = next_attn;
-            }
-        }
-    }
-
-    for (int i = first_semantic; i <= last_semantic; ++i) {
-        if (!covered[(size_t) i]) {
-            reason = "UNMAPPED_RING_TASK";
-            return false;
-        }
-    }
-
-    for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
-        const int seed =
-            find_task(
-                plan.layer_begin,
-                chunk,
-                llama_hybrid_inner_stage_kind::ATTN);
-        if (seed < 0) {
-            reason = "MISSING_SEED";
-            return false;
-        }
-        plan.seeds.push_back(seed);
-    }
-
-    // Every seed must independently walk one complete chunk chain without
-    // cycles or cross-chunk jumps.  This is the FIFO ring invariant.
-    std::vector<unsigned char> visited(tasks.size(), 0);
-    for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
-        int task_id = plan.seeds[(size_t) chunk];
-        int guard = 0;
-        while (task_id >= 0) {
-            if (task_id >= (int) tasks.size() ||
-                visited[(size_t) task_id] ||
-                tasks[(size_t) task_id].chunk != chunk) {
-                reason = "BROKEN_CHUNK_CHAIN";
-                return false;
-            }
-            visited[(size_t) task_id] = 1;
-            task_id = plan.successor[(size_t) task_id];
-            if (++guard > (plan.layer_end - plan.layer_begin) * 3 + 1) {
-                reason = "RING_CYCLE";
-                return false;
-            }
-        }
-    }
-
-    for (int i = first_semantic; i <= last_semantic; ++i) {
-        if (!visited[(size_t) i]) {
-            reason = "UNREACHABLE_RING_TASK";
-            return false;
-        }
-    }
-
-    return true;
-}
-
-struct llama_hybrid_inner_fifo_queue {
-    ggml_backend_t backend = nullptr;
-    std::deque<int> pending;
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool stop = false;
-    std::thread worker;
-};
-
 static bool llama_hybrid_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW ||
            op == GGML_OP_RESHAPE ||
@@ -1016,6 +809,7 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
 
@@ -1741,9 +1535,6 @@ static bool llama_hybrid_apply_pc_inner_policy(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
-    const bool pc_fifo_runtime =
-        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
-        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
@@ -1829,7 +1620,6 @@ static bool llama_hybrid_apply_pc_inner_policy(
     std::vector<layer_stats> stats((size_t) n_layer);
     std::vector<ggml_tensor *> compute_nodes;
     std::vector<ggml_tensor *> alias_nodes;
-    std::vector<ggml_tensor *> reduce_nodes;
 
     auto contains_compute = [&](ggml_tensor * needle) {
         return std::find(
@@ -1898,45 +1688,6 @@ static bool llama_hybrid_apply_pc_inner_policy(
         }
     }
 
-    if (pc_fifo_runtime) {
-        for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
-            if (!item.valid() ||
-                item.layer < 0 ||
-                item.layer >= n_layer ||
-                !selected[(size_t) item.layer] ||
-                item.stage != llama_hybrid_inner_stage_kind::REDUCE ||
-                item.chunk < 0) {
-                continue;
-            }
-
-            ggml_tensor * node = ggml_graph_node(gf, item.node_index);
-            if (llama_hybrid_is_view_op(node->op) ||
-                node->view_src != nullptr ||
-                node->buffer != nullptr ||
-                node->op == GGML_OP_NONE) {
-                continue;
-            }
-            if (!ggml_backend_supports_op(cuda_backend, node)) {
-                LLAMA_LOG_WARN(
-                    "[INNER_PC_POLICY] status=SKIP reason=REDUCE_UNSUPPORTED "
-                    "layer=%d chunk=%d tokens=%u node=%d tensor=%s op=%s "
-                    "backend=%s\n",
-                    item.layer, item.chunk, ubatch_tokens,
-                    item.node_index, node->name, ggml_op_name(node->op),
-                    ggml_backend_name(cuda_backend));
-                return false;
-            }
-            reduce_nodes.push_back(node);
-        }
-        if (reduce_nodes.empty()) {
-            LLAMA_LOG_WARN(
-                "[INNER_PC_POLICY] status=SKIP reason=EMPTY_REDUCE_STAGE "
-                "tokens=%u\n",
-                ubatch_tokens);
-            return false;
-        }
-    }
-
     // Temporary views follow a migrated compute root.  Views rooted in
     // persistent/preallocated storage remain with that storage owner.
     for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
@@ -1981,10 +1732,6 @@ static bool llama_hybrid_apply_pc_inner_policy(
         ggml_backend_sched_set_tensor_backend(
             sched_use, node, cuda_backend);
     }
-    for (ggml_tensor * node : reduce_nodes) {
-        ggml_backend_sched_set_tensor_backend(
-            sched_use, node, cuda_backend);
-    }
 
     const char * verbose_env =
         std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_VERBOSE");
@@ -2014,25 +1761,21 @@ static bool llama_hybrid_apply_pc_inner_policy(
                 "[INNER_PC_POLICY_LAYER] status=APPLIED "
                 "layer=%d tokens=%u attn_nodes=%d compute=%d aliases=%d "
                 "anchored_state=%d anchored_alias=%d "
-                "attn=%s ffn=INHERIT_CPU reduce=%s\n",
+                "attn=%s ffn=INHERIT_CPU reduce=INHERIT_CPU\n",
                 il, ubatch_tokens,
                 st.attn_nodes, st.compute_nodes, st.alias_nodes,
                 st.anchored_state, st.anchored_alias,
-                ggml_backend_name(cuda_backend),
-                pc_fifo_runtime ? ggml_backend_name(cuda_backend) : "INHERIT_CPU");
+                ggml_backend_name(cuda_backend));
         }
     }
 
     LLAMA_LOG_INFO(
         "[INNER_PC_POLICY] status=APPLIED "
-        "policy=%s scope=%s "
+        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU scope=%s "
         "tokens=%u layers=[%d,%d) selected_layers=%d "
         "attn_nodes=%d compute=%d aliases=%d "
         "anchored_state=%d anchored_alias=%d backend=%s "
         "membership={gaps:%d,transition_errors:%d}\n",
-        pc_fifo_runtime ?
-            "ATTN_CUDA_FFN_CPU_REDUCE_CUDA_FIFO" :
-            "ATTN_CUDA_FFN_CPU_REDUCE_CPU",
         all_tokens ? "ALL_TOKENS" : "TOKEN_GATED",
         ubatch_tokens,
         first_layer, last_layer + 1, selected_layers,
@@ -5292,462 +5035,132 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 membership,
                 tasks,
                 fallback_reason)) {
-            const bool fifo_requested =
-                std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
-                std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
+            std::deque<int> ready;
+            for (const llama_hybrid_inner_v0_task & task : tasks) {
+                if (task.pending_dependencies == 0) {
+                    ready.push_back(task.id);
+                }
+            }
 
-            if (fifo_requested) {
-                llama_hybrid_inner_fifo_plan fifo_plan;
-                std::string fifo_reason;
+            LLAMA_LOG_INFO(
+                "[INNER_TASK_V1] status=START ub=%d block=%zu tokens=%u "
+                "tasks=%zu splits=%d nodes=%d "
+                "membership={gaps:%d,transition_errors:%d,chunked:%d} "
+                "mode=LINEAR_CORRECTNESS\n",
+                ubatch_id,
+                block_index,
+                block_tokens,
+                tasks.size(),
+                n_splits,
+                ggml_graph_n_nodes(result->get_gf()),
+                membership.gap_nodes,
+                membership.transition_errors,
+                membership.chunked_markers ? 1 : 0);
 
-                if (!llama_hybrid_build_inner_fifo_plan(
-                        tasks, fifo_plan, fifo_reason)) {
+            ret = GGML_STATUS_SUCCESS;
+            size_t submitted = 0;
+            while (ret == GGML_STATUS_SUCCESS &&
+                   submitted < tasks.size()) {
+                if (ready.empty()) {
                     LLAMA_LOG_ERROR(
-                        "[INNER_FIFO] status=REJECT ub=%d block=%zu "
-                        "reason=%s action=ABORT_FIFO\n",
+                        "[INNER_TASK_V1] status=FAIL "
+                        "reason=READY_QUEUE_STALL ub=%d block=%zu "
+                        "submitted=%zu total=%zu\n",
                         ubatch_id,
                         block_index,
-                        fifo_reason.c_str());
+                        submitted,
+                        tasks.size());
                     ret = GGML_STATUS_FAILED;
-                    ran_inner_v1_tasks = true;
-                } else {
-                    LLAMA_LOG_INFO(
-                        "[INNER_FIFO] status=START ub=%d block=%zu "
-                        "tokens=%u layers=[%d,%d) chunks=%d tasks=%zu "
-                        "prefix=%d suffix=%d policy=BACKEND_FIFO "
-                        "enqueue=PUSH_BACK dequeue=POP_FRONT "
-                        "storage=PINNED_HANDOFF_V0\n",
-                        ubatch_id,
-                        block_index,
-                        block_tokens,
-                        fifo_plan.layer_begin,
-                        fifo_plan.layer_end,
-                        fifo_plan.n_chunks,
-                        tasks.size(),
-                        fifo_plan.prefix_end,
-                        (int) tasks.size() - fifo_plan.suffix_begin);
-
-                    // Configure backend thread counts through the existing
-                    // wrapper and execute the non-ring prefix first.
-                    ret = graph_compute_range(
-                        sched_use,
-                        0,
-                        fifo_plan.prefix_end,
-                        block_tokens > 1);
-
-                    if (ret == GGML_STATUS_SUCCESS) {
-                        std::vector<ggml_backend_t> prefix_backends;
-                        for (int i = 0; i < fifo_plan.prefix_end; ++i) {
-                            ggml_backend_t backend =
-                                ggml_backend_sched_get_split_backend(
-                                    sched_use, i);
-                            if (backend != nullptr &&
-                                std::find(
-                                    prefix_backends.begin(),
-                                    prefix_backends.end(),
-                                    backend) == prefix_backends.end()) {
-                                prefix_backends.push_back(backend);
-                            }
-                        }
-                        for (ggml_backend_t backend : prefix_backends) {
-                            ggml_backend_synchronize(backend);
-                        }
-                    }
-
-                    if (ret == GGML_STATUS_SUCCESS) {
-                        std::vector<std::unique_ptr<llama_hybrid_inner_fifo_queue>>
-                            queues;
-                        for (int i = fifo_plan.prefix_end;
-                             i < fifo_plan.suffix_begin;
-                             ++i) {
-                            ggml_backend_t backend = tasks[(size_t) i].backend;
-                            bool found = false;
-                            for (const auto & queue : queues) {
-                                if (queue->backend == backend) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) {
-                                auto queue =
-                                    std::make_unique<llama_hybrid_inner_fifo_queue>();
-                                queue->backend = backend;
-                                queues.push_back(std::move(queue));
-                            }
-                        }
-
-                        const int ring_tasks =
-                            fifo_plan.suffix_begin -
-                            fifo_plan.prefix_end;
-                        std::atomic<int> remaining(ring_tasks);
-                        std::atomic<int> fifo_error(0);
-                        std::mutex done_mutex;
-                        std::condition_variable done_cv;
-                        std::mutex prepare_mutex;
-
-                        const auto queue_index_for =
-                            [&](ggml_backend_t backend) -> int {
-                                for (size_t qi = 0; qi < queues.size(); ++qi) {
-                                    if (queues[qi]->backend == backend) {
-                                        return (int) qi;
-                                    }
-                                }
-                                return -1;
-                            };
-
-                        const auto enqueue_task =
-                            [&](int task_id, const char * reason) -> bool {
-                                if (task_id < fifo_plan.prefix_end ||
-                                    task_id >= fifo_plan.suffix_begin) {
-                                    return false;
-                                }
-
-                                const llama_hybrid_inner_v0_task & task =
-                                    tasks[(size_t) task_id];
-                                const int qi = queue_index_for(task.backend);
-                                if (qi < 0) {
-                                    return false;
-                                }
-
-                                size_t depth = 0;
-                                {
-                                    std::lock_guard<std::mutex> lock(
-                                        queues[(size_t) qi]->mutex);
-                                    queues[(size_t) qi]->pending.push_back(task_id);
-                                    depth =
-                                        queues[(size_t) qi]->pending.size();
-                                }
-                                queues[(size_t) qi]->cv.notify_one();
-
-                                const std::string stage_name =
-                                    llama_hybrid_inner_task_stage_mask_name(
-                                        task.stage_mask);
-                                LLAMA_LOG_INFO(
-                                    "[INNER_FIFO_ENQUEUE] ub=%d block=%zu "
-                                    "task=%d backend=%s stage=%s "
-                                    "layer=%d chunk=%d reason=%s depth=%zu\n",
-                                    ubatch_id,
-                                    block_index,
-                                    task.id,
-                                    task.backend != nullptr ?
-                                        ggml_backend_name(task.backend) :
-                                        "(null)",
-                                    stage_name.c_str(),
-                                    task.layer_begin,
-                                    task.chunk,
-                                    reason,
-                                    depth);
-                                return true;
-                            };
-
-                        const auto signal_error = [&](ggml_status status) {
-                            int expected = 0;
-                            fifo_error.compare_exchange_strong(
-                                expected, (int) status);
-                            done_cv.notify_all();
-                            for (const auto & queue : queues) {
-                                queue->cv.notify_all();
-                            }
-                        };
-
-                        for (size_t qi = 0; qi < queues.size(); ++qi) {
-                            llama_hybrid_inner_fifo_queue * queue =
-                                queues[qi].get();
-
-                            queue->worker = std::thread([&, queue, qi]() {
-                                while (true) {
-                                    int task_id = -1;
-                                    size_t depth_after_pop = 0;
-                                    {
-                                        std::unique_lock<std::mutex> lock(
-                                            queue->mutex);
-                                        queue->cv.wait(lock, [&]() {
-                                            return queue->stop ||
-                                                fifo_error.load() != 0 ||
-                                                !queue->pending.empty();
-                                        });
-
-                                        if ((queue->stop ||
-                                             fifo_error.load() != 0) &&
-                                            queue->pending.empty()) {
-                                            return;
-                                        }
-                                        if (fifo_error.load() != 0) {
-                                            return;
-                                        }
-
-                                        task_id = queue->pending.front();
-                                        queue->pending.pop_front();
-                                        depth_after_pop =
-                                            queue->pending.size();
-                                    }
-
-                                    llama_hybrid_inner_v0_task & task =
-                                        tasks[(size_t) task_id];
-                                    const std::string stage_name =
-                                        llama_hybrid_inner_task_stage_mask_name(
-                                            task.stage_mask);
-
-                                    LLAMA_LOG_INFO(
-                                        "[INNER_FIFO_POP] ub=%d block=%zu "
-                                        "queue=%zu task=%d backend=%s "
-                                        "stage=%s layer=%d chunk=%d "
-                                        "depth=%zu\n",
-                                        ubatch_id,
-                                        block_index,
-                                        qi,
-                                        task.id,
-                                        task.backend != nullptr ?
-                                            ggml_backend_name(task.backend) :
-                                            "(null)",
-                                        stage_name.c_str(),
-                                        task.layer_begin,
-                                        task.chunk,
-                                        depth_after_pop);
-
-                                    ggml_status task_status =
-                                        GGML_STATUS_SUCCESS;
-                                    {
-                                        // Scheduler split metadata is shared.
-                                        // Serialize preparation only; backend
-                                        // compute itself remains concurrent.
-                                        std::lock_guard<std::mutex> lock(
-                                            prepare_mutex);
-                                        task_status =
-                                            ggml_backend_sched_prepare_split_inputs_ready(
-                                                sched_use,
-                                                task.first_split);
-                                    }
-
-                                    if (task_status == GGML_STATUS_SUCCESS) {
-                                        task_status =
-                                            ggml_backend_sched_compute_split(
-                                                sched_use,
-                                                task.first_split);
-                                    }
-
-                                    if (task_status == GGML_STATUS_SUCCESS) {
-                                        // Completion, not submission, drives
-                                        // the next FIFO enqueue.
-                                        ggml_backend_synchronize(task.backend);
-                                    }
-
-                                    if (task_status != GGML_STATUS_SUCCESS) {
-                                        LLAMA_LOG_ERROR(
-                                            "[INNER_FIFO] status=FAIL "
-                                            "ub=%d block=%zu task=%d "
-                                            "backend=%s error=%d\n",
-                                            ubatch_id,
-                                            block_index,
-                                            task.id,
-                                            task.backend != nullptr ?
-                                                ggml_backend_name(task.backend) :
-                                                "(null)",
-                                            (int) task_status);
-                                        signal_error(task_status);
-                                        return;
-                                    }
-
-                                    const int successor =
-                                        fifo_plan.successor[(size_t) task.id];
-
-                                    LLAMA_LOG_INFO(
-                                        "[INNER_FIFO_COMPLETE] "
-                                        "ub=%d block=%zu task=%d "
-                                        "backend=%s stage=%s layer=%d "
-                                        "chunk=%d successor=%d\n",
-                                        ubatch_id,
-                                        block_index,
-                                        task.id,
-                                        task.backend != nullptr ?
-                                            ggml_backend_name(task.backend) :
-                                            "(null)",
-                                        stage_name.c_str(),
-                                        task.layer_begin,
-                                        task.chunk,
-                                        successor);
-
-                                    if (successor >= 0) {
-                                        if (!enqueue_task(
-                                                successor,
-                                                stage_name.c_str())) {
-                                            signal_error(GGML_STATUS_FAILED);
-                                            return;
-                                        }
-                                    }
-
-                                    if (remaining.fetch_sub(1) == 1) {
-                                        done_cv.notify_all();
-                                    }
-                                }
-                            });
-                        }
-
-                        for (int seed : fifo_plan.seeds) {
-                            if (!enqueue_task(seed, "SEED")) {
-                                signal_error(GGML_STATUS_FAILED);
-                                break;
-                            }
-                        }
-
-                        {
-                            std::unique_lock<std::mutex> lock(done_mutex);
-                            done_cv.wait(lock, [&]() {
-                                return remaining.load() == 0 ||
-                                    fifo_error.load() != 0;
-                            });
-                        }
-
-                        for (const auto & queue : queues) {
-                            {
-                                std::lock_guard<std::mutex> lock(
-                                    queue->mutex);
-                                queue->stop = true;
-                            }
-                            queue->cv.notify_all();
-                        }
-                        for (const auto & queue : queues) {
-                            if (queue->worker.joinable()) {
-                                queue->worker.join();
-                            }
-                        }
-
-                        if (fifo_error.load() != 0) {
-                            ret = (ggml_status) fifo_error.load();
-                        } else if (remaining.load() != 0) {
-                            ret = GGML_STATUS_FAILED;
-                        }
-
-                        if (ret == GGML_STATUS_SUCCESS &&
-                            fifo_plan.suffix_begin < (int) tasks.size()) {
-                            ret = graph_compute_range(
-                                sched_use,
-                                fifo_plan.suffix_begin,
-                                (int) tasks.size(),
-                                block_tokens > 1);
-                        }
-
-                        if (ret == GGML_STATUS_SUCCESS) {
-                            LLAMA_LOG_INFO(
-                                "[INNER_FIFO] status=DONE ub=%d block=%zu "
-                                "tokens=%u layers=[%d,%d) chunks=%d "
-                                "queues=%zu ring_tasks=%d "
-                                "policy=BACKEND_FIFO\n",
-                                ubatch_id,
-                                block_index,
-                                block_tokens,
-                                fifo_plan.layer_begin,
-                                fifo_plan.layer_end,
-                                fifo_plan.n_chunks,
-                                queues.size(),
-                                ring_tasks);
-                        }
-                    }
-
-                    ran_inner_v1_tasks = true;
-                }
-            } else {
-                std::deque<int> ready;
-                for (const llama_hybrid_inner_v0_task & task : tasks) {
-                    if (task.pending_dependencies == 0) {
-                        ready.push_back(task.id);
-                    }
+                    break;
                 }
 
+                const int task_id = ready.front();
+                ready.pop_front();
+                GGML_ASSERT(
+                    task_id >= 0 &&
+                    task_id < (int) tasks.size());
+
+                llama_hybrid_inner_v0_task & task =
+                    tasks[(size_t) task_id];
+                GGML_ASSERT(!task.submitted);
+                GGML_ASSERT(task.pending_dependencies == 0);
+
+                const std::string stage_name =
+                    llama_hybrid_inner_task_stage_mask_name(
+                        task.stage_mask);
                 LLAMA_LOG_INFO(
-                    "[INNER_TASK_V1] status=START ub=%d block=%zu tokens=%u "
-                    "tasks=%zu splits=%d nodes=%d "
-                    "membership={gaps:%d,transition_errors:%d,chunked:%d} "
-                    "mode=LINEAR_CORRECTNESS\n",
+                    "[INNER_TASK_V1_SUBMIT] "
+                    "ub=%d block=%zu task=%d split=[%d,%d) "
+                    "backend=%s stage=%s layers=[%d,%d) "
+                    "chunk=%d ready_q=%zu\n",
                     ubatch_id,
                     block_index,
-                    block_tokens,
-                    tasks.size(),
-                    n_splits,
-                    ggml_graph_n_nodes(result->get_gf()),
-                    membership.gap_nodes,
-                    membership.transition_errors,
-                    membership.chunked_markers ? 1 : 0);
+                    task.id,
+                    task.first_split,
+                    task.last_split,
+                    task.backend != nullptr ?
+                        ggml_backend_name(task.backend) :
+                        "(null)",
+                    stage_name.c_str(),
+                    task.layer_begin,
+                    task.layer_end,
+                    task.chunk,
+                    ready.size());
 
-                ret = GGML_STATUS_SUCCESS;
-                size_t submitted = 0;
-                while (ret == GGML_STATUS_SUCCESS &&
-                       submitted < tasks.size()) {
-                    if (ready.empty()) {
-                        LLAMA_LOG_ERROR(
-                            "[INNER_TASK_V1] status=FAIL "
-                            "reason=READY_QUEUE_STALL ub=%d block=%zu "
-                            "submitted=%zu total=%zu\n",
-                            ubatch_id,
-                            block_index,
-                            submitted,
-                            tasks.size());
-                        ret = GGML_STATUS_FAILED;
-                        break;
-                    }
-
-                    const int task_id = ready.front();
-                    ready.pop_front();
-                    llama_hybrid_inner_v0_task & task =
-                        tasks[(size_t) task_id];
-
-                    const std::string stage_name =
-                        llama_hybrid_inner_task_stage_mask_name(
-                            task.stage_mask);
-                    LLAMA_LOG_INFO(
-                        "[INNER_TASK_V1_SUBMIT] "
-                        "ub=%d block=%zu task=%d split=[%d,%d) "
-                        "backend=%s stage=%s layers=[%d,%d) "
-                        "chunk=%d ready_q=%zu\n",
+                ret = graph_compute_range(
+                    sched_use,
+                    task.first_split,
+                    task.last_split,
+                    block_tokens > 1);
+                if (ret != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_TASK_V1] status=FAIL "
+                        "reason=TASK_SUBMIT ub=%d block=%zu "
+                        "task=%d split=[%d,%d) error=%d\n",
                         ubatch_id,
                         block_index,
                         task.id,
                         task.first_split,
                         task.last_split,
-                        task.backend != nullptr ?
-                            ggml_backend_name(task.backend) :
-                            "(null)",
-                        stage_name.c_str(),
-                        task.layer_begin,
-                        task.layer_end,
-                        task.chunk,
-                        ready.size());
-
-                    ret = graph_compute_range(
-                        sched_use,
-                        task.first_split,
-                        task.last_split,
-                        block_tokens > 1);
-                    if (ret != GGML_STATUS_SUCCESS) {
-                        break;
-                    }
-
-                    task.submitted = true;
-                    ++submitted;
-                    for (int dependent_id : task.dependents) {
-                        llama_hybrid_inner_v0_task & dependent =
-                            tasks[(size_t) dependent_id];
-                        --dependent.pending_dependencies;
-                        if (dependent.pending_dependencies == 0) {
-                            ready.push_back(dependent_id);
-                        }
-                    }
+                        (int) ret);
+                    break;
                 }
 
-                if (ret == GGML_STATUS_SUCCESS &&
-                    submitted == tasks.size()) {
-                    LLAMA_LOG_INFO(
-                        "[INNER_TASK_V1] status=DONE "
-                        "ub=%d block=%zu tokens=%u tasks=%zu "
-                        "mode=LINEAR_CORRECTNESS\n",
-                        ubatch_id,
-                        block_index,
-                        block_tokens,
-                        submitted);
-                }
+                task.submitted = true;
+                ++submitted;
 
-                ran_inner_v1_tasks = true;
+                // V1 correctness mode intentionally keeps the physical
+                // scheduler order linear.  The tasks now carry real
+                // (layer,chunk,stage) identities; the next revision will
+                // replace this chain with semantic completion dependencies.
+                for (int dependent_id : task.dependents) {
+                    GGML_ASSERT(
+                        dependent_id >= 0 &&
+                        dependent_id < (int) tasks.size());
+                    llama_hybrid_inner_v0_task & dependent =
+                        tasks[(size_t) dependent_id];
+                    GGML_ASSERT(
+                        dependent.pending_dependencies > 0);
+                    --dependent.pending_dependencies;
+                    if (dependent.pending_dependencies == 0) {
+                        ready.push_back(dependent_id);
+                    }
+                }
             }
+
+            if (ret == GGML_STATUS_SUCCESS &&
+                submitted == tasks.size()) {
+                LLAMA_LOG_INFO(
+                    "[INNER_TASK_V1] status=DONE "
+                    "ub=%d block=%zu tokens=%u tasks=%zu "
+                    "mode=LINEAR_CORRECTNESS\n",
+                    ubatch_id,
+                    block_index,
+                    block_tokens,
+                    submitted);
+            }
+
+            ran_inner_v1_tasks = true;
         } else {
             if (!membership.chunked_markers) {
                 fallback_reason = "GRAPH_NOT_CHUNKED";
