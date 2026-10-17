@@ -5365,6 +5365,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         "semantic=[%d,%d] "
                         "policy=BACKEND_LOCAL_FIFO "
                         "gpu=ATTN cpu=FFN+REDUCE "
+                        "storage=PINNED_HANDOFF_V0 "
                         "ring_tasks=%d overlap_mode=%d\n",
                         ubatch_id,
                         block_index,
@@ -5738,7 +5739,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             "chunks=%d ring_tasks=%d "
                             "gpu={push:%zu,pop:%zu,left:%zu} "
                             "cpu={push:%zu,pop:%zu,left:%zu} "
-                            "overlap_mode=%d policy=BACKEND_LOCAL_FIFO\n",
+                            "overlap_mode=%d policy=BACKEND_LOCAL_FIFO "
+                            "storage=PINNED_HANDOFF_V0\n",
                             ubatch_id,
                             block_index,
                             first_layer,
