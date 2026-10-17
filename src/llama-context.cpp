@@ -129,12 +129,16 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
         return marker;
     }
 
-    if (llama_hybrid_name_starts_with(tensor_name, "ffn_inp-") ||
-        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_inp_chunk_")) {
+    if (llama_hybrid_name_starts_with(tensor_name, "ffn_inp-")) {
         marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
         marker.event = llama_hybrid_inner_stage_event::END;
         return marker;
     }
+
+    // prefill_wave_ffn_inp_chunk_* is a residual view emitted after the
+    // group-level FFN normalization has already started.  Its chunk id is
+    // useful for diagnostics, but treating it as ATTN END would make the
+    // graph appear to transition backwards FFN -> ATTN.
 
     if (llama_hybrid_name_starts_with(tensor_name, "ffn_norm-") ||
         llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_norm_group_") ||
@@ -1502,12 +1506,16 @@ static bool llama_hybrid_apply_pc_inner_policy(
         return false;
     }
 
+    const bool pc_chunk_ring =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
 
     if (membership.gap_nodes != 0 ||
         membership.transition_errors != 0 ||
-        membership.chunked_markers) {
+        (membership.chunked_markers && !pc_chunk_ring)) {
         LLAMA_LOG_WARN(
             "[INNER_PC_POLICY] status=SKIP reason=BAD_MEMBERSHIP "
             "tokens=%u gaps=%d transition_errors=%d chunked=%d\n",
