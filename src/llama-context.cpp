@@ -485,6 +485,18 @@ static bool llama_hybrid_build_inner_v0_tasks(
                 continue;
             }
 
+            ggml_tensor * node = ggml_graph_node(gf, node_id);
+            if (node->op == GGML_OP_VIEW ||
+                node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE ||
+                node->op == GGML_OP_TRANSPOSE) {
+                // Views may be emitted just before the executable boundary of
+                // the next chunk and therefore live in the previous scheduler
+                // split.  They must not make that physical task look like a
+                // mixed-chunk task; derive task identity from executable ops.
+                continue;
+            }
+
             const llama_hybrid_inner_node_membership & item =
                 membership.nodes[(size_t) node_id];
             if (!item.valid()) {
