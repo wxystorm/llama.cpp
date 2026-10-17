@@ -5046,16 +5046,23 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
             if (fifo_requested) {
                 // Phase A correctness isolation:
-                // keep FIFO dispatch semantics, but disable cross-backend
-                // overlap by default.  This separates queue/order bugs from
-                // gallocr lifetime / async-copy overlap bugs.  Set
-                // LLAMA_HYBRID_INNER_PC_FIFO_OVERLAP=1 only after the strict
-                // FIFO control produces correct logits.
+                // 0 = strict FIFO, no cross-backend overlap (A0)
+                // 1 = overlap GPU Attention with CPU FFN only; REDUCE is a
+                //     full barrier before next-layer Attention is released (A1)
+                // 2 = overlap FFN and REDUCE as well (A2 / old full-overlap path)
+                // Keep the default at 0 so each overlap boundary is enabled
+                // only after the previous mode has correct logits.
                 const char * fifo_overlap_env =
                     std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_OVERLAP");
-                const bool fifo_overlap =
-                    fifo_overlap_env != nullptr &&
-                    std::atoi(fifo_overlap_env) != 0;
+                int fifo_overlap_mode =
+                    fifo_overlap_env != nullptr ?
+                        std::atoi(fifo_overlap_env) : 0;
+                fifo_overlap_mode =
+                    std::max(0, std::min(2, fifo_overlap_mode));
+                const bool fifo_ffn_overlap =
+                    fifo_overlap_mode >= 1;
+                const bool fifo_reduce_overlap =
+                    fifo_overlap_mode >= 2;
 
                 const auto exact_stage =
                     [](const llama_hybrid_inner_v0_task & task,
@@ -5242,7 +5249,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         "semantic=[%d,%d] "
                         "policy=META_STYLE_STATIC_ORDER "
                         "gpu=ATTN cpu=FFN+REDUCE "
-                        "cpu_inflight_max=1 overlap=%d\n",
+                        "cpu_inflight_max=1 overlap_mode=%d\n",
                         ubatch_id,
                         block_index,
                         block_tokens,
@@ -5251,7 +5258,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         n_chunks,
                         first_semantic,
                         last_semantic,
-                        fifo_overlap ? 1 : 0);
+                        fifo_overlap_mode);
 
                     if (first_semantic > 0) {
                         ret = graph_compute_range(
@@ -5330,14 +5337,20 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 }
                                 if (task_status ==
                                     GGML_STATUS_SUCCESS) {
-                                    if (fifo_overlap) {
+                                    const bool reduce_task =
+                                        exact_stage(
+                                            task,
+                                            llama_hybrid_inner_stage_kind::REDUCE);
+                                    if ((reduce_task && fifo_reduce_overlap) ||
+                                        (!reduce_task && fifo_ffn_overlap)) {
                                         ggml_backend_synchronize(
                                             task.backend);
                                     } else {
-                                        // Strict Phase A control: no backend
-                                        // may retain in-flight work/copies
-                                        // before the next FIFO task becomes
-                                        // eligible.
+                                        // Phase A0/A1 barrier. In A0 every CPU
+                                        // stage is a full barrier; in A1 FFN may
+                                        // overlap GPU Attention but REDUCE closes
+                                        // the overlap window before releasing the
+                                        // next-layer Attention token.
                                         ggml_backend_sched_synchronize(
                                             sched_use);
                                     }
@@ -5487,7 +5500,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             }
                             if (ret ==
                                 GGML_STATUS_SUCCESS) {
-                                if (fifo_overlap) {
+                                if (fifo_ffn_overlap) {
+                                    // The GPU task itself must be complete
+                                    // before its successor can be released, but
+                                    // an already-running CPU FFN may continue.
                                     ggml_backend_synchronize(
                                         task.backend);
                                 } else {
@@ -5545,7 +5561,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             }
                             cpu_cv.notify_one();
 
-                            if (!fifo_overlap &&
+                            const bool reduce_task =
+                                exact_stage(
+                                    task,
+                                    llama_hybrid_inner_stage_kind::REDUCE);
+                            const bool must_close_overlap =
+                                !fifo_ffn_overlap ||
+                                (reduce_task && !fifo_reduce_overlap);
+                            if (must_close_overlap &&
                                 !wait_cpu_idle()) {
                                 ret =
                                     (ggml_status) fifo_error.load();
@@ -5603,7 +5626,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             "[INNER_FIFO] status=DONE "
                             "ub=%d block=%zu layers=[%d,%d) "
                             "chunks=%d gpu={push:%zu,pop:%zu,left:%zu} "
-                            "cpu={push:%zu,pop:%zu} overlap=%d\n",
+                            "cpu={push:%zu,pop:%zu} overlap_mode=%d\n",
                             ubatch_id,
                             block_index,
                             first_layer,
@@ -5614,7 +5637,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             gpu_q.size(),
                             cpu_push_count,
                             cpu_pop_count,
-                            fifo_overlap ? 1 : 0);
+                            fifo_overlap_mode);
                     }
 
                     ran_inner_v1_tasks = true;
