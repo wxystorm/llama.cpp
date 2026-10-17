@@ -334,7 +334,13 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
 
         if (marker.valid() &&
             marker.kind == llama_hybrid_inner_stage_kind::REDUCE &&
-            marker.event == llama_hybrid_inner_stage_event::END) {
+            marker.event == llama_hybrid_inner_stage_event::END &&
+            marker.chunk < 0) {
+            // A chunk REDUCE is not the end of the semantic layer.  The wave
+            // graph may still emit CONCAT/assembly nodes that join all chunk
+            // outputs before the aggregate l_out-L marker.  Keep REDUCE
+            // ownership alive across those nodes and close the layer only at
+            // the unchunked aggregate l_out.
             active_layer = -1;
             active_chunk = -1;
             active_stage = llama_hybrid_inner_stage_kind::UNKNOWN;
@@ -5129,11 +5135,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             if (!membership.chunked_markers) {
                 fallback_reason = "GRAPH_NOT_CHUNKED";
             }
-            LLAMA_LOG_WARN(
-                "[INNER_TASK_V1] status=FALLBACK "
+            LLAMA_LOG_ERROR(
+                "[INNER_TASK_V1] status=REJECT "
                 "ub=%d block=%zu tokens=%u reason=%s "
                 "membership={gaps:%d,transition_errors:%d,chunked:%d} "
-                "action=FULL_STAGE_RANGE\n",
+                "action=ABORT_UNSAFE_CHUNK_GRAPH\n",
                 ubatch_id,
                 block_index,
                 block_tokens,
@@ -5141,6 +5147,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 membership.gap_nodes,
                 membership.transition_errors,
                 membership.chunked_markers ? 1 : 0);
+
+            // Once the model builder emitted a chunk-wave graph, a task-build
+            // failure cannot safely fall back by executing the same graph as
+            // one monolithic range: that is still the new graph, not the old
+            // baseline topology.  Fail cleanly so correctness bugs cannot
+            // mutate KV state and surface later as a process crash.
+            ret = GGML_STATUS_FAILED;
+            ran_inner_v1_tasks = true;
         }
     }
 
