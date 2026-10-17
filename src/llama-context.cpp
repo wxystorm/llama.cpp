@@ -16,14 +16,19 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 //
@@ -557,6 +562,214 @@ static bool llama_hybrid_build_inner_v0_tasks(
 
     return !tasks.empty();
 }
+
+struct llama_hybrid_inner_fifo_plan {
+    int layer_begin = -1;
+    int layer_end   = -1;
+    int n_chunks    = 0;
+
+    int prefix_end   = 0;  // [0, prefix_end)
+    int suffix_begin = 0;  // [suffix_begin, n_tasks)
+
+    std::vector<int> successor;
+    std::vector<int> seeds;
+};
+
+static bool llama_hybrid_build_inner_fifo_plan(
+        const std::vector<llama_hybrid_inner_v0_task> & tasks,
+        llama_hybrid_inner_fifo_plan & plan,
+        std::string & reason) {
+    plan = {};
+    reason.clear();
+
+    if (tasks.empty()) {
+        reason = "NO_TASKS";
+        return false;
+    }
+
+    int first_semantic = -1;
+    int last_semantic  = -1;
+    int min_layer = std::numeric_limits<int>::max();
+    int max_layer = -1;
+    int max_chunk = -1;
+
+    auto exact_stage = [](const llama_hybrid_inner_v0_task & task,
+                          llama_hybrid_inner_stage_kind wanted) {
+        return task.stage_mask ==
+            llama_hybrid_inner_task_stage_bit(wanted);
+    };
+
+    for (const llama_hybrid_inner_v0_task & task : tasks) {
+        const bool semantic =
+            task.layer_begin >= 0 &&
+            task.layer_end == task.layer_begin + 1 &&
+            task.chunk >= 0 &&
+            (exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) ||
+             exact_stage(task, llama_hybrid_inner_stage_kind::FFN) ||
+             exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE));
+
+        if (!semantic) {
+            continue;
+        }
+
+        if (first_semantic < 0) {
+            first_semantic = task.id;
+        }
+        last_semantic = task.id;
+        min_layer = std::min(min_layer, task.layer_begin);
+        max_layer = std::max(max_layer, task.layer_begin);
+        max_chunk = std::max(max_chunk, task.chunk);
+    }
+
+    if (first_semantic < 0 ||
+        last_semantic < first_semantic ||
+        min_layer == std::numeric_limits<int>::max() ||
+        max_layer < min_layer ||
+        max_chunk < 0) {
+        reason = "NO_SEMANTIC_RING";
+        return false;
+    }
+
+    for (int i = first_semantic; i <= last_semantic; ++i) {
+        const llama_hybrid_inner_v0_task & task = tasks[(size_t) i];
+        const bool semantic =
+            task.layer_begin >= 0 &&
+            task.layer_end == task.layer_begin + 1 &&
+            task.chunk >= 0 &&
+            (exact_stage(task, llama_hybrid_inner_stage_kind::ATTN) ||
+             exact_stage(task, llama_hybrid_inner_stage_kind::FFN) ||
+             exact_stage(task, llama_hybrid_inner_stage_kind::REDUCE));
+        if (!semantic) {
+            reason = "MID_RING_ENVELOPE_TASK";
+            return false;
+        }
+    }
+
+    plan.layer_begin = min_layer;
+    plan.layer_end   = max_layer + 1;
+    plan.n_chunks    = max_chunk + 1;
+    plan.prefix_end  = first_semantic;
+    plan.suffix_begin = last_semantic + 1;
+    plan.successor.assign(tasks.size(), -1);
+
+    const auto find_task = [&](int layer, int chunk,
+                               llama_hybrid_inner_stage_kind stage) -> int {
+        for (const llama_hybrid_inner_v0_task & task : tasks) {
+            if (task.layer_begin != layer ||
+                task.layer_end != layer + 1 ||
+                task.chunk != chunk ||
+                task.stage_mask != llama_hybrid_inner_task_stage_bit(stage)) {
+                continue;
+            }
+            return task.id;
+        }
+        return -1;
+    };
+
+    std::vector<unsigned char> covered(tasks.size(), 0);
+
+    for (int layer = plan.layer_begin; layer < plan.layer_end; ++layer) {
+        for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
+            const int attn =
+                find_task(layer, chunk, llama_hybrid_inner_stage_kind::ATTN);
+            const int ffn =
+                find_task(layer, chunk, llama_hybrid_inner_stage_kind::FFN);
+            const int reduce =
+                find_task(layer, chunk, llama_hybrid_inner_stage_kind::REDUCE);
+
+            if (attn < 0 || ffn < 0 || reduce < 0) {
+                reason = "INCOMPLETE_RING_GRID";
+                return false;
+            }
+
+            covered[(size_t) attn] = 1;
+            covered[(size_t) ffn] = 1;
+            covered[(size_t) reduce] = 1;
+
+            plan.successor[(size_t) attn] = ffn;
+            plan.successor[(size_t) ffn] = reduce;
+
+            if (layer + 1 < plan.layer_end) {
+                const int next_attn =
+                    find_task(
+                        layer + 1,
+                        chunk,
+                        llama_hybrid_inner_stage_kind::ATTN);
+                if (next_attn < 0) {
+                    reason = "MISSING_NEXT_LAYER_ATTN";
+                    return false;
+                }
+                plan.successor[(size_t) reduce] = next_attn;
+            }
+        }
+    }
+
+    for (int i = first_semantic; i <= last_semantic; ++i) {
+        if (!covered[(size_t) i]) {
+            reason = "UNMAPPED_RING_TASK";
+            return false;
+        }
+    }
+
+    for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
+        const int seed =
+            find_task(
+                plan.layer_begin,
+                chunk,
+                llama_hybrid_inner_stage_kind::ATTN);
+        if (seed < 0) {
+            reason = "MISSING_SEED";
+            return false;
+        }
+        plan.seeds.push_back(seed);
+    }
+
+    // Every seed must independently walk one complete chunk chain without
+    // cycles or cross-chunk jumps.  This is the FIFO ring invariant.
+    std::vector<unsigned char> visited(tasks.size(), 0);
+    for (int chunk = 0; chunk < plan.n_chunks; ++chunk) {
+        int task_id = plan.seeds[(size_t) chunk];
+        int guard = 0;
+        while (task_id >= 0) {
+            if (task_id >= (int) tasks.size() ||
+                visited[(size_t) task_id] ||
+                tasks[(size_t) task_id].chunk != chunk) {
+                reason = "BROKEN_CHUNK_CHAIN";
+                return false;
+            }
+            visited[(size_t) task_id] = 1;
+            task_id = plan.successor[(size_t) task_id];
+            if (++guard > (plan.layer_end - plan.layer_begin) * 3 + 1) {
+                reason = "RING_CYCLE";
+                return false;
+            }
+        }
+    }
+
+    for (int i = first_semantic; i <= last_semantic; ++i) {
+        if (!visited[(size_t) i]) {
+            reason = "UNREACHABLE_RING_TASK";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct llama_hybrid_inner_fifo_task_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool prepared = false;
+};
+
+struct llama_hybrid_inner_fifo_queue {
+    ggml_backend_t backend = nullptr;
+    std::deque<int> pending;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop = false;
+    std::thread worker;
+};
 
 static bool llama_hybrid_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW ||
