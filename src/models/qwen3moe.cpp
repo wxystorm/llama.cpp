@@ -1186,9 +1186,26 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
     cur = inpL;
 
+    const auto pin_pc_fifo_graph = [&]() {
+        if (!pc_inner_wavefront || !pc_inner_fifo_requested) {
+            return;
+        }
+
+        // Correctness control for backend-local FIFO execution.
+        // Dynamic task order is not the static order assumed by gallocr, so
+        // keep every node result in this inner chunk graph alive for the full
+        // graph lifetime. Once FIFO correctness is proven, replace this with
+        // explicit per-chunk slot ownership instead of permanent graph pinning.
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_set_output(ggml_graph_node(gf, i));
+        }
+    };
+
     if (!build_output_head) {
         res->t_stage_output = cur;
         ggml_build_forward_expand(gf, cur);
+        pin_pc_fifo_graph();
         return;
     }
 
@@ -1206,4 +1223,5 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+    pin_pc_fifo_graph();
 }
