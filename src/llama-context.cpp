@@ -5960,7 +5960,148 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
         (batched || decode_profile_this_token) ?
             ggml_time_us() : 0;
 
-    if (decode_profile_this_token) {
+    const char * inner_task_v0_env =
+        std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0");
+    const bool inner_task_v0_requested =
+        inner_task_v0_env != nullptr && std::atoi(inner_task_v0_env) != 0;
+    const bool inner_task_v0_verbose =
+        std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0_VERBOSE") != nullptr;
+    bool ran_inner_task_v0 = false;
+
+    if (inner_task_v0_requested && !cparams.warmup) {
+        const llama_hybrid_inner_membership_result membership =
+            llama_hybrid_build_inner_node_membership(res->get_gf());
+        std::vector<llama_hybrid_inner_v0_task> tasks;
+        std::string fallback_reason;
+
+        if (llama_hybrid_build_inner_v0_tasks(
+                sched_use, res->get_gf(), membership, tasks, fallback_reason)) {
+            std::deque<int> ready;
+            for (const llama_hybrid_inner_v0_task & task : tasks) {
+                if (task.pending_dependencies == 0) {
+                    ready.push_back(task.id);
+                }
+            }
+
+            LLAMA_LOG_INFO(
+                "[INNER_TASK_V0] status=START ub=%d tokens=%u tasks=%zu "
+                "splits=%d nodes=%d "
+                "membership={gaps:%d,transition_errors:%d} "
+                "mode=WHOLE_BATCH\n",
+                ubatch_id,
+                ubatch.n_tokens,
+                tasks.size(),
+                n_splits,
+                ggml_graph_n_nodes(res->get_gf()),
+                membership.gap_nodes,
+                membership.transition_errors);
+
+            ret = GGML_STATUS_SUCCESS;
+            size_t submitted = 0;
+            while (ret == GGML_STATUS_SUCCESS && submitted < tasks.size()) {
+                if (ready.empty()) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_TASK_V0] status=FAIL reason=READY_QUEUE_STALL "
+                        "ub=%d submitted=%zu total=%zu\n",
+                        ubatch_id, submitted, tasks.size());
+                    ret = GGML_STATUS_FAILED;
+                    break;
+                }
+
+                const int task_id = ready.front();
+                ready.pop_front();
+                GGML_ASSERT(task_id >= 0 && task_id < (int) tasks.size());
+
+                llama_hybrid_inner_v0_task & task = tasks[(size_t) task_id];
+                GGML_ASSERT(!task.submitted);
+                GGML_ASSERT(task.pending_dependencies == 0);
+
+                if (inner_task_v0_verbose) {
+                    const std::string stage_name =
+                        llama_hybrid_inner_task_stage_mask_name(task.stage_mask);
+                    LLAMA_LOG_INFO(
+                        "[INNER_TASK_V0_SUBMIT] ub=%d task=%d split=[%d,%d) "
+                        "backend=%s stage=%s layers=[%d,%d) chunk=%d "
+                        "ready_q=%zu\n",
+                        ubatch_id,
+                        task.id,
+                        task.first_split,
+                        task.last_split,
+                        task.backend != nullptr ?
+                            ggml_backend_name(task.backend) : "(null)",
+                        stage_name.c_str(),
+                        task.layer_begin,
+                        task.layer_end,
+                        task.chunk,
+                        ready.size());
+                }
+
+                ret = graph_compute_range(
+                    sched_use,
+                    task.first_split,
+                    task.last_split,
+                    batched);
+                if (ret != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_TASK_V0] status=FAIL reason=TASK_SUBMIT "
+                        "ub=%d task=%d split=[%d,%d) backend=%s error=%d\n",
+                        ubatch_id,
+                        task.id,
+                        task.first_split,
+                        task.last_split,
+                        task.backend != nullptr ?
+                            ggml_backend_name(task.backend) : "(null)",
+                        ret);
+                    break;
+                }
+
+                task.submitted = true;
+                ++submitted;
+
+                for (int dependent_id : task.dependents) {
+                    GGML_ASSERT(
+                        dependent_id >= 0 &&
+                        dependent_id < (int) tasks.size());
+                    llama_hybrid_inner_v0_task & dependent =
+                        tasks[(size_t) dependent_id];
+                    GGML_ASSERT(dependent.pending_dependencies > 0);
+                    --dependent.pending_dependencies;
+                    if (dependent.pending_dependencies == 0) {
+                        ready.push_back(dependent_id);
+                    }
+                }
+            }
+
+            if (ret == GGML_STATUS_SUCCESS && submitted == tasks.size()) {
+                LLAMA_LOG_INFO(
+                    "[INNER_TASK_V0] status=DONE ub=%d tokens=%u tasks=%zu "
+                    "mode=WHOLE_BATCH completion=INHERIT_SCHED_EVENTS\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    submitted);
+            }
+            ran_inner_task_v0 = true;
+        } else {
+            LLAMA_LOG_WARN(
+                "[INNER_TASK_V0] status=FALLBACK ub=%d tokens=%u reason=%s "
+                "action=ORIGINAL_SCHEDULER\n",
+                ubatch_id,
+                ubatch.n_tokens,
+                fallback_reason.c_str());
+        }
+    } else if (inner_task_v0_requested && cparams.warmup) {
+        LLAMA_LOG_INFO(
+            "[INNER_TASK_V0] status=SKIP reason=WARMUP_PROBE "
+            "ub=%d tokens=%u\n",
+            ubatch_id,
+            ubatch.n_tokens);
+    }
+
+    if (ran_inner_task_v0) {
+        // V0 already submitted the entire graph through the explicit ready
+        // queue above.  Preserve the existing final synchronization/output
+        // path; do not execute the graph a second time.
+    } else if (decode_profile_this_token) {
         // Keep the scheduler semantics identical to compute_range(): prepare
         // and submit every split in order, but do not add any synchronization.
         // The split timings therefore measure scheduler/dispatch wall time,
@@ -9777,147 +9918,15 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    const char * inner_task_v0_env =
-        std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0");
-    const bool inner_task_v0_requested =
-        inner_task_v0_env != nullptr && std::atoi(inner_task_v0_env) != 0;
-    const bool inner_task_v0_verbose =
-        std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0_VERBOSE") != nullptr;
-
-    ggml_status status = GGML_STATUS_SUCCESS;
-    bool ran_inner_task_v0 = false;
-
-    // Initialization/capability probes must not establish the runtime task
-    // topology for real inference.  Keep them on the original scheduler path,
-    // matching the PC inner-policy warmup isolation rule.
-    if (inner_task_v0_requested && !cparams.warmup) {
-        const llama_hybrid_inner_membership_result membership =
-            llama_hybrid_build_inner_node_membership(gf);
-        std::vector<llama_hybrid_inner_v0_task> tasks;
-        std::string fallback_reason;
-
-        if (llama_hybrid_build_inner_v0_tasks(
-                sched.get(), gf, membership, tasks, fallback_reason)) {
-            std::deque<int> ready;
-            for (const llama_hybrid_inner_v0_task & task : tasks) {
-                if (task.pending_dependencies == 0) {
-                    ready.push_back(task.id);
-                }
-            }
-
-            LLAMA_LOG_INFO(
-                "[INNER_TASK_V0] status=START tasks=%zu splits=%d nodes=%d "
-                "membership={gaps:%d,transition_errors:%d} mode=WHOLE_BATCH\n",
-                tasks.size(),
-                ggml_backend_sched_get_n_splits(sched.get()),
-                gf != nullptr ? ggml_graph_n_nodes(gf) : 0,
-                membership.gap_nodes,
-                membership.transition_errors);
-
-            size_t submitted = 0;
-            while (status == GGML_STATUS_SUCCESS && submitted < tasks.size()) {
-                if (ready.empty()) {
-                    LLAMA_LOG_ERROR(
-                        "[INNER_TASK_V0] status=FAIL reason=READY_QUEUE_STALL "
-                        "submitted=%zu total=%zu\n",
-                        submitted, tasks.size());
-                    status = GGML_STATUS_FAILED;
-                    break;
-                }
-
-                const int task_id = ready.front();
-                ready.pop_front();
-                GGML_ASSERT(task_id >= 0 && task_id < (int) tasks.size());
-                llama_hybrid_inner_v0_task & task = tasks[(size_t) task_id];
-                GGML_ASSERT(!task.submitted);
-                GGML_ASSERT(task.pending_dependencies == 0);
-
-                if (inner_task_v0_verbose) {
-                    const std::string stage_name =
-                        llama_hybrid_inner_task_stage_mask_name(task.stage_mask);
-                    LLAMA_LOG_INFO(
-                        "[INNER_TASK_V0_SUBMIT] task=%d split=[%d,%d) "
-                        "backend=%s stage=%s layers=[%d,%d) chunk=%d ready_q=%zu\n",
-                        task.id,
-                        task.first_split,
-                        task.last_split,
-                        task.backend != nullptr ?
-                            ggml_backend_name(task.backend) : "(null)",
-                        stage_name.c_str(),
-                        task.layer_begin,
-                        task.layer_end,
-                        task.chunk,
-                        ready.size());
-                }
-
-                // Do not synchronize here.  V0 intentionally inherits the
-                // scheduler's existing cross-backend copy/event fencing, so
-                // dispatching one task at a time does not introduce a new
-                // per-stage barrier.  A successful return means the scheduler
-                // accepted this task's split range; later versions will attach
-                // explicit completion events before relaxing dependencies.
-                status = ggml_backend_sched_compute_range(
-                    sched.get(), task.first_split, task.last_split);
-                if (status != GGML_STATUS_SUCCESS) {
-                    LLAMA_LOG_ERROR(
-                        "[INNER_TASK_V0] status=FAIL reason=TASK_SUBMIT "
-                        "task=%d split=[%d,%d) backend=%s error=%d\n",
-                        task.id,
-                        task.first_split,
-                        task.last_split,
-                        task.backend != nullptr ?
-                            ggml_backend_name(task.backend) : "(null)",
-                        status);
-                    break;
-                }
-
-                task.submitted = true;
-                ++submitted;
-
-                for (int dependent_id : task.dependents) {
-                    GGML_ASSERT(
-                        dependent_id >= 0 &&
-                        dependent_id < (int) tasks.size());
-                    llama_hybrid_inner_v0_task & dependent =
-                        tasks[(size_t) dependent_id];
-                    GGML_ASSERT(dependent.pending_dependencies > 0);
-                    --dependent.pending_dependencies;
-                    if (dependent.pending_dependencies == 0) {
-                        ready.push_back(dependent_id);
-                    }
-                }
-            }
-
-            if (status == GGML_STATUS_SUCCESS && submitted == tasks.size()) {
-                LLAMA_LOG_INFO(
-                    "[INNER_TASK_V0] status=DONE tasks=%zu "
-                    "mode=WHOLE_BATCH completion=INHERIT_SCHED_EVENTS\n",
-                    submitted);
-            }
-            ran_inner_task_v0 = true;
-        } else {
-            LLAMA_LOG_WARN(
-                "[INNER_TASK_V0] status=FALLBACK reason=%s "
-                "action=ORIGINAL_SCHEDULER\n",
-                fallback_reason.c_str());
-        }
-    } else if (inner_task_v0_requested && cparams.warmup) {
-        LLAMA_LOG_INFO(
-            "[INNER_TASK_V0] status=SKIP reason=WARMUP_PROBE\n");
-    }
-
-    if (!ran_inner_task_v0) {
-        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-        }
+    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
 }
-
 ggml_status llama_context::graph_compute_range(ggml_backend_sched_t sched_use,
                                                int                  first_split,
                                                int                  last_split,
