@@ -809,6 +809,9 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+    const bool pc_fifo_runtime =
+        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
@@ -1620,6 +1623,7 @@ static bool llama_hybrid_apply_pc_inner_policy(
     std::vector<layer_stats> stats((size_t) n_layer);
     std::vector<ggml_tensor *> compute_nodes;
     std::vector<ggml_tensor *> alias_nodes;
+    std::vector<ggml_tensor *> reduce_nodes;
 
     auto contains_compute = [&](ggml_tensor * needle) {
         return std::find(
@@ -1688,6 +1692,45 @@ static bool llama_hybrid_apply_pc_inner_policy(
         }
     }
 
+    if (pc_fifo_runtime) {
+        for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+            if (!item.valid() ||
+                item.layer < 0 ||
+                item.layer >= n_layer ||
+                !selected[(size_t) item.layer] ||
+                item.stage != llama_hybrid_inner_stage_kind::REDUCE ||
+                item.chunk < 0) {
+                continue;
+            }
+
+            ggml_tensor * node = ggml_graph_node(gf, item.node_index);
+            if (llama_hybrid_is_view_op(node->op) ||
+                node->view_src != nullptr ||
+                node->buffer != nullptr ||
+                node->op == GGML_OP_NONE) {
+                continue;
+            }
+            if (!ggml_backend_supports_op(cuda_backend, node)) {
+                LLAMA_LOG_WARN(
+                    "[INNER_PC_POLICY] status=SKIP reason=REDUCE_UNSUPPORTED "
+                    "layer=%d chunk=%d tokens=%u node=%d tensor=%s op=%s "
+                    "backend=%s\n",
+                    item.layer, item.chunk, ubatch_tokens,
+                    item.node_index, node->name, ggml_op_name(node->op),
+                    ggml_backend_name(cuda_backend));
+                return false;
+            }
+            reduce_nodes.push_back(node);
+        }
+        if (reduce_nodes.empty()) {
+            LLAMA_LOG_WARN(
+                "[INNER_PC_POLICY] status=SKIP reason=EMPTY_REDUCE_STAGE "
+                "tokens=%u\n",
+                ubatch_tokens);
+            return false;
+        }
+    }
+
     // Temporary views follow a migrated compute root.  Views rooted in
     // persistent/preallocated storage remain with that storage owner.
     for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
@@ -1732,6 +1775,10 @@ static bool llama_hybrid_apply_pc_inner_policy(
         ggml_backend_sched_set_tensor_backend(
             sched_use, node, cuda_backend);
     }
+    for (ggml_tensor * node : reduce_nodes) {
+        ggml_backend_sched_set_tensor_backend(
+            sched_use, node, cuda_backend);
+    }
 
     const char * verbose_env =
         std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_VERBOSE");
@@ -1761,21 +1808,25 @@ static bool llama_hybrid_apply_pc_inner_policy(
                 "[INNER_PC_POLICY_LAYER] status=APPLIED "
                 "layer=%d tokens=%u attn_nodes=%d compute=%d aliases=%d "
                 "anchored_state=%d anchored_alias=%d "
-                "attn=%s ffn=INHERIT_CPU reduce=INHERIT_CPU\n",
+                "attn=%s ffn=INHERIT_CPU reduce=%s\n",
                 il, ubatch_tokens,
                 st.attn_nodes, st.compute_nodes, st.alias_nodes,
                 st.anchored_state, st.anchored_alias,
-                ggml_backend_name(cuda_backend));
+                ggml_backend_name(cuda_backend),
+                pc_fifo_runtime ? ggml_backend_name(cuda_backend) : "INHERIT_CPU");
         }
     }
 
     LLAMA_LOG_INFO(
         "[INNER_PC_POLICY] status=APPLIED "
-        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU scope=%s "
+        "policy=%s scope=%s "
         "tokens=%u layers=[%d,%d) selected_layers=%d "
         "attn_nodes=%d compute=%d aliases=%d "
         "anchored_state=%d anchored_alias=%d backend=%s "
         "membership={gaps:%d,transition_errors:%d}\n",
+        pc_fifo_runtime ?
+            "ATTN_CUDA_FFN_CPU_REDUCE_CUDA_FIFO" :
+            "ATTN_CUDA_FFN_CPU_REDUCE_CPU",
         all_tokens ? "ALL_TOKENS" : "TOKEN_GATED",
         ubatch_tokens,
         first_layer, last_layer + 1, selected_layers,
