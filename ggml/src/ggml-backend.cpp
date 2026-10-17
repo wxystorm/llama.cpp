@@ -1544,10 +1544,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        const bool fifo_dynamic_order =
+                            getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != NULL &&
+                            atoi(getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || fifo_dynamic_order) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
