@@ -6895,6 +6895,79 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+
+    const char * inner_pc_chunk_ring_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING");
+    const bool inner_pc_chunk_ring_requested =
+        inner_pc_chunk_ring_env != nullptr &&
+        std::atoi(inner_pc_chunk_ring_env) != 0;
+    int inner_pc_chunk_tokens = 128;
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
+        const int requested = std::atoi(value);
+        if (requested > 0) {
+            inner_pc_chunk_tokens = requested;
+        }
+    }
+
+    int inner_pc_cpu_stage_index = -1;
+    if (has_runtime_plan && model.arch == LLM_ARCH_QWEN3MOE) {
+        for (size_t i = 0; i < runtime_stages.size(); ++i) {
+            if (runtime_stages[i].kind ==
+                    llama_hybrid_runtime_stage_kind::CPU &&
+                runtime_stages[i].layer_end -
+                    runtime_stages[i].layer_begin > 1) {
+                inner_pc_cpu_stage_index = (int) i;
+                break;
+            }
+        }
+    }
+
+    const bool inner_pc_chunk_topology =
+        inner_pc_chunk_ring_requested &&
+        inner_pc_cpu_stage_index >= 0 &&
+        runtime_stages.size() >= 2;
+
+    std::vector<llama_hybrid_runtime_stage> inner_pc_chunk_stages;
+    if (inner_pc_chunk_topology) {
+        inner_pc_chunk_stages = runtime_stages;
+
+        // Correctness-first V1 uses one full-prompt outer block per stage.
+        // Only the CPU-direct stage is token-chunked internally by the model
+        // graph.  This avoids mixing outer macro pipelining with the new
+        // Layer x Chunk task semantics during the first validation step.
+        const int full_macro_tokens =
+            std::max(1, (int) cparams.n_ubatch);
+        for (auto & stage : inner_pc_chunk_stages) {
+            stage.macro_tokens = full_macro_tokens;
+        }
+        inner_pc_chunk_stages[
+            (size_t) inner_pc_cpu_stage_index].inner_chunk_tokens =
+                inner_pc_chunk_tokens;
+
+        const auto & cpu_stage =
+            inner_pc_chunk_stages[
+                (size_t) inner_pc_cpu_stage_index];
+        LLAMA_LOG_INFO(
+            "[INNER_TASK_V1_CONFIG] enabled=1 "
+            "cpu_layers=[%d,%d) chunk_tokens=%d stages=%zu "
+            "outer_macro=%d mode=SERIAL_OUTER_CHUNKED_INNER\n",
+            cpu_stage.layer_begin,
+            cpu_stage.layer_end,
+            inner_pc_chunk_tokens,
+            inner_pc_chunk_stages.size(),
+            full_macro_tokens);
+    } else if (inner_pc_chunk_ring_requested) {
+        LLAMA_LOG_WARN(
+            "[INNER_TASK_V1_CONFIG] enabled=0 "
+            "reason=UNSUPPORTED_TOPOLOGY has_plan=%d arch=%d "
+            "cpu_stage=%d stages=%zu\n",
+            has_runtime_plan ? 1 : 0,
+            (int) model.arch,
+            inner_pc_cpu_stage_index,
+            runtime_stages.size());
+    }
+
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
     const bool return_wavefront_requested =
@@ -6955,6 +7028,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     [](const llama_hybrid_runtime_stage & stage) { return stage.macro_tokens > 0; });
     const bool stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
+        !inner_pc_chunk_ring_requested &&
         !tensor_phone_primary_exec &&
         gpu_tensor_topology && model.arch != LLM_ARCH_QWEN2;
     const bool gpu_cpu_tensor_topology =
@@ -7159,6 +7233,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3MOE;
     const bool generalized_stage_queue_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
+        !inner_pc_chunk_ring_requested &&
         !tensor_phone_primary_exec &&
         valid_stage_macros && generalized_stage_arch &&
         !return_wavefront_full_graph_override &&
@@ -7167,6 +7242,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
          gpu_cpu_tensor_phone_topology);
     const bool stage_serial_plan_eligible =
         stage_queue_requested && has_runtime_plan &&
+        !inner_pc_chunk_ring_requested &&
         !tensor_phone_primary_exec &&
         !gpu_tensor_topology && runtime_stages.size() >= 2 &&
         valid_stage_macros && generalized_stage_arch;
