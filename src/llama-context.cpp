@@ -4308,8 +4308,34 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             model, backend_cpu, sched_use, gf, ubatch.n_tokens,
             cparams.warmup);
 
+        const bool fifo_dynamic_order_lifetime =
+            stage != nullptr &&
+            stage->kind == llama_hybrid_runtime_stage_kind::CPU &&
+            ubatch.n_tokens > 1 &&
+            !cparams.warmup &&
+            std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0 &&
+            std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
+
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
-        if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
+        ggml_backend_sched_set_dynamic_order_lifetime(
+            sched_use, fifo_dynamic_order_lifetime);
+        const bool graph_alloc_ok =
+            ggml_backend_sched_alloc_graph(sched_use, gf);
+        ggml_backend_sched_set_dynamic_order_lifetime(sched_use, false);
+
+        if (fifo_dynamic_order_lifetime) {
+            LLAMA_LOG_INFO(
+                "[INNER_FIFO_LIFETIME] stage=%s layers=[%d,%d) tokens=%u "
+                "copy_pin=1 scope=ALLOC_GRAPH_ONLY\n",
+                llama_hybrid_runtime_stage_name(stage->kind),
+                stage->layer_begin,
+                stage->layer_end,
+                ubatch.n_tokens);
+        }
+
+        if (!graph_alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
