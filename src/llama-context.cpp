@@ -413,92 +413,48 @@ static bool llama_hybrid_build_inner_v0_tasks(
         return false;
     }
 
-    struct backend_span {
-        int begin = -1;
-        int end   = -1;
-        ggml_backend_t backend = nullptr;
-    };
-
-    std::vector<backend_span> spans;
-    int span_begin = 0;
-    ggml_backend_t current_backend = nullptr;
-    bool found_compute_node = false;
-
-    // Reconstruct the backend-change splits from the public tensor assignments.
-    // If the scheduler introduced an additional same-backend split (for example
-    // because of an input-capacity or incompatible-weight boundary), the span
-    // count will not match n_splits and V0 falls back to the original executor.
-    for (int i = 0; i < n_nodes; ++i) {
-        ggml_tensor * node = ggml_graph_node(gf, i);
-        if (node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE ||
-            node->op == GGML_OP_PERMUTE ||
-            node->op == GGML_OP_TRANSPOSE) {
-            continue;
-        }
-
-        ggml_backend_t backend =
-            ggml_backend_sched_get_tensor_backend(sched_use, node);
-        if (backend == nullptr) {
-            reason = "UNASSIGNED_BACKEND";
-            return false;
-        }
-
-        if (!found_compute_node) {
-            current_backend = backend;
-            found_compute_node = true;
-            continue;
-        }
-
-        if (backend != current_backend) {
-            spans.push_back({span_begin, i, current_backend});
-            span_begin = i;
-            current_backend = backend;
-        }
-    }
-
-    if (!found_compute_node || current_backend == nullptr) {
-        reason = "NO_COMPUTE_NODE";
-        return false;
-    }
-    spans.push_back({span_begin, n_nodes, current_backend});
-
-    if ((int) spans.size() != n_splits) {
-        reason = "SPLIT_TOPOLOGY_NOT_BACKEND_ONLY";
-        return false;
-    }
-
     tasks.reserve((size_t) n_splits);
+    int previous_end = 0;
+
     for (int split_id = 0; split_id < n_splits; ++split_id) {
-        const backend_span & span = spans[(size_t) split_id];
-        ggml_backend_t split_backend =
-            ggml_backend_sched_get_split_backend(sched_use, split_id);
-        if (split_backend != span.backend) {
-            reason = "SPLIT_BACKEND_MISMATCH";
+        const int split_begin =
+            ggml_backend_sched_get_split_start(sched_use, split_id);
+        const int split_end =
+            ggml_backend_sched_get_split_end(sched_use, split_id);
+
+        if (split_begin < 0 ||
+            split_begin > split_end ||
+            split_end > n_nodes ||
+            split_begin != previous_end) {
+            reason = "INVALID_SPLIT_RANGE";
             tasks.clear();
             return false;
         }
+        previous_end = split_end;
 
         llama_hybrid_inner_v0_task task;
         task.id          = split_id;
         task.first_split = split_id;
         task.last_split  = split_id + 1;
-        task.backend     = split_backend;
+        task.backend     =
+            ggml_backend_sched_get_split_backend(sched_use, split_id);
         task.chunk       = 0;
 
         int min_layer = std::numeric_limits<int>::max();
         int max_layer = -1;
-        for (int node_id = span.begin; node_id < span.end; ++node_id) {
+        for (int node_id = split_begin; node_id < split_end; ++node_id) {
             if (node_id < 0 || node_id >= (int) membership.nodes.size()) {
                 continue;
             }
+
             const llama_hybrid_inner_node_membership & item =
                 membership.nodes[(size_t) node_id];
             if (!item.valid()) {
                 continue;
             }
 
-            task.stage_mask |= llama_hybrid_inner_task_stage_bit(item.stage);
+            task.stage_mask |=
+                llama_hybrid_inner_task_stage_bit(item.stage);
             min_layer = std::min(min_layer, item.layer);
             max_layer = std::max(max_layer, item.layer);
         }
@@ -508,13 +464,20 @@ static bool llama_hybrid_build_inner_v0_tasks(
             task.layer_end   = max_layer + 1;
         }
 
-        // V0 intentionally preserves the exact scheduler order.  Dependencies
-        // are explicit even though they form a simple chain today.
+        // V0/V0.5 still preserve scheduler order. The important difference in
+        // V0.5 is that same-backend semantic boundaries can now materialize as
+        // separate splits/tasks rather than being merged by backend identity.
         task.pending_dependencies = split_id == 0 ? 0 : 1;
         if (!tasks.empty()) {
             tasks.back().dependents.push_back(split_id);
         }
         tasks.push_back(std::move(task));
+    }
+
+    if (previous_end != n_nodes) {
+        reason = "INCOMPLETE_SPLIT_COVERAGE";
+        tasks.clear();
+        return false;
     }
 
     return !tasks.empty();
@@ -525,6 +488,118 @@ static bool llama_hybrid_is_view_op(enum ggml_op op) {
            op == GGML_OP_RESHAPE ||
            op == GGML_OP_PERMUTE ||
            op == GGML_OP_TRANSPOSE;
+}
+
+static bool llama_hybrid_apply_inner_task_stage_boundaries(
+        const llama_model & model,
+        ggml_backend_sched_t sched_use,
+        ggml_cgraph * gf,
+        uint32_t ubatch_tokens,
+        bool warmup_probe) {
+    const char * runtime_env =
+        std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0");
+    const char * boundary_env =
+        std::getenv("LLAMA_HYBRID_INNER_TASK_STAGE_BOUNDARIES");
+
+    const bool runtime_enabled =
+        runtime_env != nullptr && std::atoi(runtime_env) != 0;
+    const bool boundaries_enabled =
+        boundary_env != nullptr && std::atoi(boundary_env) != 0;
+
+    if (!runtime_enabled || !boundaries_enabled ||
+        sched_use == nullptr || gf == nullptr) {
+        return false;
+    }
+
+    if (warmup_probe) {
+        LLAMA_LOG_INFO(
+            "[INNER_TASK_STAGE_BOUNDARY] status=SKIP "
+            "reason=WARMUP_PROBE tokens=%u\n",
+            ubatch_tokens);
+        return false;
+    }
+
+    const llama_hybrid_inner_membership_result membership =
+        llama_hybrid_build_inner_node_membership(gf);
+    if (membership.gap_nodes != 0 ||
+        membership.transition_errors != 0 ||
+        membership.chunked_markers) {
+        LLAMA_LOG_WARN(
+            "[INNER_TASK_STAGE_BOUNDARY] status=SKIP "
+            "reason=BAD_MEMBERSHIP tokens=%u "
+            "gaps=%d transition_errors=%d chunked=%d\n",
+            ubatch_tokens,
+            membership.gap_nodes,
+            membership.transition_errors,
+            membership.chunked_markers ? 1 : 0);
+        return false;
+    }
+
+    int last_layer = -1;
+    int last_chunk = -2;
+    llama_hybrid_inner_stage_kind last_stage =
+        llama_hybrid_inner_stage_kind::UNKNOWN;
+    bool have_pc_stage = false;
+    int boundaries = 0;
+
+    const bool verbose =
+        std::getenv("LLAMA_HYBRID_INNER_TASK_STAGE_BOUNDARIES_VERBOSE") != nullptr;
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const llama_hybrid_inner_node_membership & item =
+            membership.nodes[(size_t) i];
+
+        if (!item.valid() ||
+            item.layer < 0 ||
+            item.layer >= (int) model.hparams.n_layer() ||
+            model.hybrid_layer_mode(item.layer) !=
+                llama_hybrid_layer_mode::PC_ONLY) {
+            have_pc_stage = false;
+            continue;
+        }
+
+        if (llama_hybrid_is_view_op(node->op)) {
+            continue;
+        }
+
+        const bool stage_changed =
+            !have_pc_stage ||
+            item.layer != last_layer ||
+            item.chunk != last_chunk ||
+            item.stage != last_stage;
+
+        if (stage_changed) {
+            ggml_backend_sched_set_split_boundary(sched_use, node);
+            ++boundaries;
+
+            if (verbose) {
+                LLAMA_LOG_INFO(
+                    "[INNER_TASK_STAGE_BOUNDARY_NODE] "
+                    "tokens=%u node=%d tensor=%s layer=%d chunk=%d stage=%s\n",
+                    ubatch_tokens,
+                    i,
+                    node->name,
+                    item.layer,
+                    item.chunk,
+                    llama_hybrid_inner_stage_name(item.stage));
+            }
+        }
+
+        have_pc_stage = true;
+        last_layer = item.layer;
+        last_chunk = item.chunk;
+        last_stage = item.stage;
+    }
+
+    LLAMA_LOG_INFO(
+        "[INNER_TASK_STAGE_BOUNDARY] status=APPLIED "
+        "tokens=%u boundaries=%d scope=PC_ONLY\n",
+        ubatch_tokens,
+        boundaries);
+
+    return boundaries > 0;
 }
 
 static ggml_backend_t llama_hybrid_find_cuda_backend(
@@ -4074,6 +4149,12 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         // They use a separate gate and remain useful for isolating failures.
         llama_hybrid_apply_single_pc_attn_migration(
             model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens);
+
+        // V0.5: materialize semantic stage boundaries inside PC_ONLY layers.
+        // This can split FFN and REDUCE even when both execute on CPU, without
+        // changing backend placement or introducing a synchronization barrier.
+        llama_hybrid_apply_inner_task_stage_boundaries(
+            model, sched_use, gf, ubatch.n_tokens, cparams.warmup);
 
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
