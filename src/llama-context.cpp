@@ -172,6 +172,7 @@ struct llama_hybrid_inner_membership_result {
     int covered_nodes    = 0;
     int gap_nodes        = 0;
     int transition_errors = 0;
+    int first_transition_error_node = -1;
     int pre_boundary_norms = 0;
     bool chunked_markers = false;
 };
@@ -193,6 +194,13 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
     int active_chunk = -1;
     llama_hybrid_inner_stage_kind active_stage =
         llama_hybrid_inner_stage_kind::UNKNOWN;
+
+    const auto note_transition_error = [&](int node_index) {
+        note_transition_error(i);
+        if (result.first_transition_error_node < 0) {
+            result.first_transition_error_node = node_index;
+        }
+    };
 
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -233,7 +241,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                             active_stage != llama_hybrid_inner_stage_kind::UNKNOWN &&
                             !(active_stage == llama_hybrid_inner_stage_kind::ATTN &&
                               active_layer == marker.layer)) {
-                            ++result.transition_errors;
+                            note_transition_error(i);
                         }
                         active_layer = marker.layer;
                         active_chunk = marker.chunk;
@@ -247,7 +255,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                         if (!chunk_match &&
                             (active_stage != llama_hybrid_inner_stage_kind::ATTN ||
                              active_layer != marker.layer)) {
-                            ++result.transition_errors;
+                            note_transition_error(i);
                             active_layer = marker.layer;
                             active_chunk = marker.chunk;
                             active_stage = llama_hybrid_inner_stage_kind::ATTN;
@@ -262,7 +270,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                             (active_layer != marker.layer ||
                              (active_stage != llama_hybrid_inner_stage_kind::ATTN &&
                               active_stage != llama_hybrid_inner_stage_kind::FFN))) {
-                            ++result.transition_errors;
+                            note_transition_error(i);
                         }
                         active_layer = marker.layer;
                         active_chunk = marker.chunk;
@@ -276,7 +284,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                         if (!chunk_match &&
                             (active_stage != llama_hybrid_inner_stage_kind::FFN ||
                              active_layer != marker.layer)) {
-                            ++result.transition_errors;
+                            note_transition_error(i);
                             active_layer = marker.layer;
                             active_chunk = marker.chunk;
                             active_stage = llama_hybrid_inner_stage_kind::FFN;
@@ -294,7 +302,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                         if (marker.chunk < 0 &&
                             (active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
                              active_layer != marker.layer)) {
-                            ++result.transition_errors;
+                            note_transition_error(i);
                         }
 
                         active_layer = marker.layer;
@@ -1996,8 +2004,11 @@ static void llama_hybrid_log_inner_stage_bindings(
         membership.first_layer_node >= 0 &&
         membership.last_layer_node >= membership.first_layer_node ?
             membership.last_layer_node - membership.first_layer_node + 1 : 0;
+    const bool diag_pc_chunk_ring =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
     const bool membership_ok =
-        !membership.chunked_markers &&
+        (!membership.chunked_markers || diag_pc_chunk_ring) &&
         membership.transition_errors == 0 &&
         membership.gap_nodes == 0 &&
         layer_span_nodes == membership.covered_nodes;
@@ -2025,6 +2036,25 @@ static void llama_hybrid_log_inner_stage_bindings(
         membership.transition_errors,
         membership.pre_boundary_norms,
         membership.chunked_markers ? 1 : 0);
+
+    if (membership.transition_errors > 0 &&
+        membership.first_transition_error_node >= 0 &&
+        membership.first_transition_error_node < n_nodes) {
+        const int i = membership.first_transition_error_node;
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const llama_hybrid_inner_stage_marker marker =
+            llama_hybrid_classify_inner_stage_marker(node->name);
+        LLAMA_LOG_INFO(
+            "[INNER_TRANSITION_ERROR] node=%d op=%s tensor=%s "
+            "marker={layer:%d,chunk:%d,stage:%s,event:%s}\n",
+            i,
+            ggml_op_name(node->op),
+            node->name,
+            marker.layer,
+            marker.chunk,
+            llama_hybrid_inner_stage_name(marker.kind),
+            llama_hybrid_inner_stage_event_name(marker.event));
+    }
 
     if (!membership_ok && membership.gap_nodes > 0) {
         int shown = 0;
