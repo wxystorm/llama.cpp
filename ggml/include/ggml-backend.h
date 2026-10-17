@@ -358,6 +358,10 @@ extern "C" {
                                                              struct ggml_cgraph * graph);  // returns success
     // Prepare or compute one split of the currently allocated graph. Split ranges are [first_split, last_split).
     GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
+    // Prepare a split whose producer task has already completed. This avoids
+    // synchronizing the entire source backend before a fallback copy and is
+    // intended for completion-driven FIFO runtimes.
+    GGML_API enum ggml_status ggml_backend_sched_prepare_split_inputs_ready(ggml_backend_sched_t sched, int split_id);
     GGML_API enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id);
     GGML_API enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched,
                                                                int                  first_split,
