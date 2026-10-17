@@ -677,13 +677,29 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                      ++ci) {
                     const int64_t count =
                         wave_chunk_sizes[ci];
-                    ggml_tensor * ffn_inp =
-                        ggml_view_2d(
-                            ctx0, group_ffn_inp,
-                            group_ffn_inp->ne[0], count,
-                            group_ffn_inp->nb[1],
-                            group_offset_tokens *
-                                group_ffn_inp->nb[1]);
+                    ggml_tensor * ffn_inp = nullptr;
+                    if (pc_inner_wavefront &&
+                        group_chunk_count == 1 &&
+                        group_offset_tokens == 0 &&
+                        count == group_token_count) {
+                        // PC inner V1: materialize the residual on the FFN
+                        // backend instead of keeping a VIEW whose root remains
+                        // on CUDA.  group_ffn_norm already requires
+                        // group_ffn_inp on CPU, so this CONT reuses the same
+                        // cross-backend input copy and gives REDUCE(L,C) a
+                        // CPU-resident residual.  Without this, REDUCE later
+                        // asks the scheduler to copy a CUDA-root VIEW as a
+                        // second independent split input.
+                        ffn_inp = ggml_cont(ctx0, group_ffn_inp);
+                    } else {
+                        ffn_inp =
+                            ggml_view_2d(
+                                ctx0, group_ffn_inp,
+                                group_ffn_inp->ne[0], count,
+                                group_ffn_inp->nb[1],
+                                group_offset_tokens *
+                                    group_ffn_inp->nb[1]);
+                    }
                     const std::string ffn_inp_name =
                         "prefill_wave_ffn_inp_chunk_" +
                         std::to_string(ci);
