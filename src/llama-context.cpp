@@ -8715,6 +8715,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        bool inner_pc_chunk_candidate =
+            inner_pc_chunk_topology &&
+            !inner_pc_chunk_stages.empty() &&
+            cparams.causal_attn &&
+            ubatch.n_tokens > 1 &&
+            ubatch.n_tokens > (uint32_t) inner_pc_chunk_tokens &&
+            ubatch.token != nullptr &&
+            ubatch.embd == nullptr &&
+            ubatch.n_pos == 1 &&
+            !ubatch.equal_seqs() &&
+            ubatch.n_seqs_unq == 1 &&
+            !cparams.embeddings &&
+            !cparams.embeddings_nextn &&
+            cparams.cb_eval == nullptr &&
+            std::none_of(
+                cparams.embeddings_layer_inp.begin(),
+                cparams.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; });
+
         bool phone_primary_gpu_tensor_wavefront_candidate =
             phone_primary_gpu_tensor_wavefront_topology &&
             !phone_primary_gpu_tensor_wavefront_stages.empty() &&
@@ -8809,7 +8828,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const llm_graph_result * res          = nullptr;
         bool                     pipe_success = false;
 
-        if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
+        if (inner_pc_chunk_candidate) {
+            const auto & cpu_stage =
+                inner_pc_chunk_stages[
+                    (size_t) inner_pc_cpu_stage_index];
+            LLAMA_LOG_INFO(
+                "[INNER_TASK_V1] status=RUN ub=%d tokens=%u "
+                "cpu_layers=[%d,%d) chunk_tokens=%d stages=%zu\n",
+                ubatch_id,
+                ubatch.n_tokens,
+                cpu_stage.layer_begin,
+                cpu_stage.layer_end,
+                inner_pc_chunk_tokens,
+                inner_pc_chunk_stages.size());
+
+            res = process_ubatch_staged(
+                ubatch,
+                ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(),
+                sched.get(),
+                gf_res_prev.get(),
+                inner_pc_chunk_stages,
+                ubatch_id,
+                status);
+            sched_use = sched.get();
+        } else if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
             LLAMA_LOG_WARN(
                 "[HYBRID_PIPE] ub=%d generalized stage queue unsupported for this ubatch; using full graph\n",
                 ubatch_id);
