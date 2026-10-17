@@ -430,7 +430,10 @@ static bool llama_hybrid_build_inner_v0_tasks(
     // count will not match n_splits and V0 falls back to the original executor.
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
-        if (ggml_is_view_op(node->op)) {
+        if (node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE ||
+            node->op == GGML_OP_TRANSPOSE) {
             continue;
         }
 
