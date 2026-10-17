@@ -9739,10 +9739,60 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     (int) force_phone_block_exit);
             }
 
-            GGML_ASSERT(!layer_handoff_to_pc ||
-                (src_residual != nullptr && dst_l_out != nullptr &&
-                 ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
-                 ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out)));
+            const bool layer_handoff_shape_ok =
+                src_residual != nullptr && dst_l_out != nullptr &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(src_residual) &&
+                ggml_nbytes(nodes[1]) == ggml_nbytes(dst_l_out);
+            if (layer_handoff_to_pc && !layer_handoff_shape_ok) {
+                int decode_chunk = -1;
+                int decode_layer = -1;
+                const bool node_is_decode_chunk =
+                    nodes[1] != nullptr &&
+                    ggml_backend_meta_parse_decode_ffn_chunk(
+                        nodes[1]->name, decode_chunk, decode_layer);
+                fprintf(
+                    stderr,
+                    "[META_LAYER_HANDOFF_MISMATCH] "
+                    "sg=%zu/%zu layer=%d "
+                    "node={name:%s,op:%s,ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "],bytes:%zu} "
+                    "residual={name:%s,ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "],bytes:%zu} "
+                    "dst={name:%s,ne:[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "],bytes:%zu} "
+                    "internal=%d external=%d phone_owner_exit=%d forced=%d "
+                    "next_prefill_pc=%d next_decode_pc_norm=%d "
+                    "decode_chunk=%d decode_layer=%d\n",
+                    i, backend_ctx->n_subgraphs, layer,
+                    nodes[1] != nullptr ? nodes[1]->name : "(null)",
+                    nodes[1] != nullptr ? ggml_op_name(nodes[1]->op) : "(null)",
+                    nodes[1] != nullptr ? nodes[1]->ne[0] : 0,
+                    nodes[1] != nullptr ? nodes[1]->ne[1] : 0,
+                    nodes[1] != nullptr ? nodes[1]->ne[2] : 0,
+                    nodes[1] != nullptr ? nodes[1]->ne[3] : 0,
+                    nodes[1] != nullptr ? ggml_nbytes(nodes[1]) : 0,
+                    src_residual != nullptr ? src_residual->name : "(null)",
+                    src_residual != nullptr ? src_residual->ne[0] : 0,
+                    src_residual != nullptr ? src_residual->ne[1] : 0,
+                    src_residual != nullptr ? src_residual->ne[2] : 0,
+                    src_residual != nullptr ? src_residual->ne[3] : 0,
+                    src_residual != nullptr ? ggml_nbytes(src_residual) : 0,
+                    dst_l_out != nullptr ? dst_l_out->name : "(null)",
+                    dst_l_out != nullptr ? dst_l_out->ne[0] : 0,
+                    dst_l_out != nullptr ? dst_l_out->ne[1] : 0,
+                    dst_l_out != nullptr ? dst_l_out->ne[2] : 0,
+                    dst_l_out != nullptr ? dst_l_out->ne[3] : 0,
+                    dst_l_out != nullptr ? ggml_nbytes(dst_l_out) : 0,
+                    (int) internal_pc_handoff,
+                    (int) external_backend_handoff,
+                    (int) phone_owner_exit,
+                    (int) force_phone_block_exit,
+                    i + 1 < backend_ctx->n_subgraphs ?
+                        (int) subgraph_is_prefill_pc_only(i + 1) : -1,
+                    i + 1 < backend_ctx->n_subgraphs ?
+                        (int) subgraph_is_decode_pc_only_norm(i + 1) : -1,
+                    node_is_decode_chunk ? decode_chunk : -1,
+                    node_is_decode_chunk ? decode_layer : -1);
+                fflush(stderr);
+            }
+            GGML_ASSERT(!layer_handoff_to_pc || layer_handoff_shape_ok);
             if (layer_handoff_to_pc) {
                 const ggml_backend_rpc_fence_t rpc_fence =
                     ggml_backend_meta_get_rpc_fence(bcj_src.backend);
