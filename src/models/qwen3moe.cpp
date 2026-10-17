@@ -206,6 +206,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     const int planned_chunk_tokens =
         llama_hybrid_runtime_prefill_chunk_tokens();
+
+    const char * pc_inner_chunk_ring_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING");
+    const bool pc_inner_chunk_ring_requested =
+        pc_inner_chunk_ring_env != nullptr &&
+        std::atoi(pc_inner_chunk_ring_env) != 0;
+    int pc_inner_chunk_tokens = 0;
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
+        pc_inner_chunk_tokens = std::max(0, std::atoi(value));
+    }
+
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
     const bool phone_primary_chunk_ring_requested =
@@ -245,36 +257,53 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         std::getenv("GGML_META_PHONE_PREFILL_CHUNK_JOIN") != nullptr;
     const bool any_wavefront_requested =
         return_wavefront_requested ||
-        phone_primary_wavefront_requested;
+        phone_primary_wavefront_requested ||
+        pc_inner_chunk_ring_requested;
 
-    bool moe_stage_wavefront =
+    const llama_hybrid_layer_mode wavefront_mode =
+        model.hybrid_layer_mode(layer_begin);
+
+    const bool wavefront_shape_eligible =
         any_wavefront_requested &&
         stage_graph &&
         n_tokens > 1 &&
         ubatch.n_pos == 1 &&
         ubatch.n_seqs_unq == 1 &&
         (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
-        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-        planned_chunk_tokens > 0 &&
         layer_end - layer_begin > 1 &&
         loras->empty();
 
-    const llama_hybrid_layer_mode wavefront_mode =
-        model.hybrid_layer_mode(layer_begin);
+    const bool tensor_wavefront_base =
+        wavefront_shape_eligible &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        planned_chunk_tokens > 0;
+
     const bool phone_primary_wavefront =
-        moe_stage_wavefront &&
+        tensor_wavefront_base &&
         phone_primary_wavefront_requested &&
         phone_primary_wavefront_runtime_ready &&
         wavefront_mode ==
             llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
     const bool tensor_split_wavefront =
-        moe_stage_wavefront &&
+        tensor_wavefront_base &&
         return_wavefront_requested &&
         wavefront_mode ==
             llama_hybrid_layer_mode::TENSOR_SPLIT;
-    moe_stage_wavefront =
+    const bool pc_inner_wavefront =
+        wavefront_shape_eligible &&
+        pc_inner_chunk_ring_requested &&
+        pc_inner_chunk_tokens > 0 &&
+        wavefront_mode == llama_hybrid_layer_mode::PC_ONLY;
+
+    bool moe_stage_wavefront =
         phone_primary_wavefront ||
-        tensor_split_wavefront;
+        tensor_split_wavefront ||
+        pc_inner_wavefront;
+
+    const int wave_chunk_tokens =
+        pc_inner_wavefront ?
+            pc_inner_chunk_tokens :
+            planned_chunk_tokens;
 
     int moe_wavefront_layer_end = layer_begin;
     if (moe_stage_wavefront) {
@@ -293,12 +322,19 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             moe_stage_wavefront = false;
         }
 
+        // The PC inner ring is deliberately stage-local.  Do not silently
+        // build only a prefix of a CPU-direct stage because that would make
+        // task identities depend on an outer graph-builder accident.
+        if (pc_inner_wavefront &&
+                moe_wavefront_layer_end != layer_end) {
+            moe_stage_wavefront = false;
+        }
+
         if (phone_primary_wavefront) {
             // Correctness-first cross-layer V1 deliberately limits the
             // Phone-primary wavefront to a small prefix.  The remaining
             // TENSOR_PHONE_PRIMARY layers (and any PHONE_ONLY tail) fall back
-            // to the ordinary graph builder below.  This lets us validate
-            // L,C -> L+1,C dependencies without changing the stable suffix.
+            // to the ordinary graph builder below.
             moe_wavefront_layer_end =
                 std::min(
                     moe_wavefront_layer_end,
@@ -315,12 +351,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         qwen3moe_wave_attn_target_tokens();
     if (moe_stage_wavefront) {
         wave_chunk_sizes =
-            llama_hybrid_runtime_tensor_chunks(
-                (int) n_tokens, planned_chunk_tokens);
-        if (phone_primary_wavefront) {
-            // Correctness-first V1: keep Phone-primary Attention dependencies
-            // exactly XT-granular. Coarse groups can be restored after the
-            // per-chunk owner/return path is proven stable.
+            pc_inner_wavefront ?
+                llama_hybrid_split_by_chunk_size(
+                    (int) n_tokens, wave_chunk_tokens) :
+                llama_hybrid_runtime_tensor_chunks(
+                    (int) n_tokens, wave_chunk_tokens);
+
+        if (phone_primary_wavefront || pc_inner_wavefront) {
+            // Keep correctness-first rings exactly chunk-granular.  Coarse
+            // Attention grouping can be restored after the (L,C) task runtime
+            // and completion dependencies are proven stable.
             wave_attn_group_counts.assign(wave_chunk_sizes.size(), 1);
         } else {
             wave_attn_group_counts =
@@ -328,20 +368,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     wave_chunk_sizes, wave_attn_target_tokens);
         }
 
-        // A single coarse Attention group is equivalent to the old layer
-        // barrier but carries extra wavefront bookkeeping, so keep the
-        // existing macro-Attention path for small Tensor jobs.
         moe_stage_wavefront =
             wave_chunk_sizes.size() > 1 &&
             wave_attn_group_counts.size() > 1;
 
-        // Do not call a layout "coarse" if any Attention group collapses back
-        // to roughly one XT chunk. This is the failure mode of 192 tokens with
-        // XT=64,target=128: the only two-group partition is 128+64. The small
-        // 64-token Attention can cost more than the return barrier it hides.
-        // Requiring >= 75% of the target keeps useful layouts such as
-        // 103+153 (target=128) and 128+128, while falling back for 128+64.
-        if (moe_stage_wavefront && !phone_primary_wavefront) {
+        // Coarse-group quality gating only applies to the legacy
+        // TENSOR_SPLIT return-wavefront.  PC/Phone rings intentionally use
+        // one Attention group per token chunk.
+        if (moe_stage_wavefront && tensor_split_wavefront) {
             const int min_group_tokens =
                 qwen3moe_wave_attn_min_group_tokens(
                     wave_attn_target_tokens);
@@ -362,22 +396,23 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     if (any_wavefront_requested && stage_graph && n_tokens > 1) {
-        LLAMA_LOG_DEBUG(
+        LLAMA_LOG_INFO(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d phone_primary=%d "
-            "phone_runtime_ready=%d tokens=%" PRId64
+            "pc_inner=%d phone_runtime_ready=%d tokens=%" PRId64
             " stage=[%d,%d) wave=[%d,%d) "
             "equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
-            "XT=%d target=%d min_group=%d phone_wave_max=%d "
+            "chunk_tokens=%d target=%d min_group=%d phone_wave_max=%d "
             "chunks=%zu groups=%zu\n",
             moe_stage_wavefront ? 1 : 0,
             phone_primary_wavefront && moe_stage_wavefront ? 1 : 0,
+            pc_inner_wavefront && moe_stage_wavefront ? 1 : 0,
             phone_primary_wavefront_runtime_ready ? 1 : 0,
             n_tokens, layer_begin, layer_end,
             layer_begin,
             moe_stage_wavefront ? moe_wavefront_layer_end : layer_begin,
             ubatch.equal_seqs() ? 1 : 0,
             ubatch.n_seqs, ubatch.n_seqs_unq,
-            planned_chunk_tokens, wave_attn_target_tokens,
+            wave_chunk_tokens, wave_attn_target_tokens,
             qwen3moe_wave_attn_min_group_tokens(
                 wave_attn_target_tokens),
             phone_primary_wave_max_layers,
@@ -445,7 +480,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             " XT=%d attn_target=%d chunks=%s groups=%s "
             "first_attn=%" PRId64 " phone_primary=%d tail_layers=%d\n",
             layer_begin, moe_wavefront_layer_end, n_tokens,
-            planned_chunk_tokens, wave_attn_target_tokens,
+            wave_chunk_tokens, wave_attn_target_tokens,
             list_tokens(wave_chunk_sizes).c_str(),
             list_tokens(coarse_group_tokens).c_str(),
             n_tokens,
@@ -472,6 +507,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // layers trade coarse Attention grouping for cross-layer return
             // overlap.
             const std::vector<int> layer_group_counts =
+                pc_inner_wavefront ?
+                    wave_attn_group_counts :
                 wave_layer == layer_begin ?
                     std::vector<int>{ (int) wave_chunk_sizes.size() } :
                     wave_attn_group_counts;
