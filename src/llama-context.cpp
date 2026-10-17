@@ -1077,10 +1077,19 @@ static bool llama_hybrid_apply_pc_inner_policy(
         ggml_backend_t backend_cpu,
         ggml_backend_sched_t sched_use,
         ggml_cgraph * gf,
-        uint32_t ubatch_tokens) {
+        uint32_t ubatch_tokens,
+        bool internal_probe) {
     const char * enable_env =
         std::getenv("LLAMA_HYBRID_INNER_PC_POLICY");
     if (enable_env == nullptr || std::atoi(enable_env) == 0 || gf == nullptr) {
+        return false;
+    }
+
+    if (internal_probe) {
+        LLAMA_LOG_INFO(
+            "[INNER_PC_POLICY] status=SKIP reason=WARMUP_PROBE "
+            "tokens=%u\n",
+            ubatch_tokens);
         return false;
     }
 
@@ -3852,7 +3861,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         // to CUDA; FFN/REDUCE, KV state, dev_layer(), and weight residence are
         // intentionally unchanged.
         llama_hybrid_apply_pc_inner_policy(
-            model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens);
+            model, backends, backend_cpu, sched_use, gf, ubatch.n_tokens,
+            cparams.warmup);
 
         // Keep the single-layer migration probes as a regression/debug path.
         // They use a separate gate and remain useful for isolating failures.
