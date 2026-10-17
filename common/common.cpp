@@ -1428,6 +1428,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
+        // Mark this decode/encode as an initialization probe. Runtime
+        // placement policies must not treat it as user prefill/decode and
+        // leave scheduler allocation state in a probe-specific topology.
+        llama_set_warmup(lctx, true);
+
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
         llama_token eos = llama_vocab_eos(vocab);
@@ -1455,6 +1460,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
         }
+        llama_set_warmup(lctx, false);
+
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
@@ -1498,7 +1505,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
+    // This is a capability probe, not real generation. Mark it so backend
+    // placement experiments do not mutate scheduler state based on this
+    // synthetic two-token graph.
+    llama_set_warmup(ctx, true);
     int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    llama_set_warmup(ctx, false);
+
     if (ret != 0) {
         COM_ERR("llama_decode() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
