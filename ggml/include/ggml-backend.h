@@ -340,6 +340,13 @@ extern "C" {
     GGML_API void ggml_backend_sched_set_split_boundary(ggml_backend_sched_t sched,
                                                         struct ggml_tensor * node);
 
+    // Preserve scheduler-created cross-backend input copies for graphs that
+    // will be executed in a dynamic split order. This is a graph-allocation
+    // policy only: callers should enable it immediately before alloc_graph()
+    // for the affected graph and disable it immediately afterwards.
+    GGML_API void ggml_backend_sched_set_dynamic_order_lifetime(ggml_backend_sched_t sched,
+                                                                bool enabled);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,
                                                                            ggml_backend_t       backend);
     GGML_API size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
