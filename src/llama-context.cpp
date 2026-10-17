@@ -16,14 +16,19 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 //
