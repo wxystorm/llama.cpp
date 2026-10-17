@@ -5326,7 +5326,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         "tokens=%u layers=[%d,%d) chunks=%d "
                         "policy=BACKEND_LOCAL_FIFO "
                         "gpu=ATTN cpu=FFN+REDUCE "
-                        "storage=PIN_ALL_GRAPH_V0 ring_tasks=%d\n",
+                        "storage=PIN_ALL_GRAPH_PLUS_SCHED_COPY_V0 ring_tasks=%d\n",
                         ubatch_id,
                         block_index,
                         block_tokens,
@@ -5545,7 +5545,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             "gpu={push:%zu,pop:%zu,left:%zu} "
                             "cpu={push:%zu,pop:%zu,left:%zu} "
                             "policy=BACKEND_LOCAL_FIFO "
-                            "storage=PIN_ALL_GRAPH_V0\n",
+                            "storage=PIN_ALL_GRAPH_PLUS_SCHED_COPY_V0\n",
                             ubatch_id,
                             block_index,
                             first_layer,
