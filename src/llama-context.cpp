@@ -196,7 +196,7 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
         llama_hybrid_inner_stage_kind::UNKNOWN;
 
     const auto note_transition_error = [&](int node_index) {
-        note_transition_error(i);
+        ++result.transition_errors;
         if (result.first_transition_error_node < 0) {
             result.first_transition_error_node = node_index;
         }
