@@ -212,6 +212,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool pc_inner_chunk_ring_requested =
         pc_inner_chunk_ring_env != nullptr &&
         std::atoi(pc_inner_chunk_ring_env) != 0;
+    const char * pc_inner_fifo_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME");
+    const bool pc_inner_fifo_requested =
+        pc_inner_fifo_env != nullptr &&
+        std::atoi(pc_inner_fifo_env) != 0;
     int pc_inner_chunk_tokens = 128;
     if (const char * value =
             std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
@@ -548,6 +553,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             wave_l_out,
                             wave_l_out_name.c_str(),
                             wave_layer - 1);
+                        if (pc_inner_wavefront && pc_inner_fifo_requested) {
+                            // Dynamic backend-local FIFO may execute consumers
+                            // after the static graph lifetime would otherwise
+                            // release/reuse this cross-layer handoff.
+                            ggml_set_output(wave_l_out);
+                        }
                         ggml_build_forward_expand(gf, wave_l_out);
                         hidden_chunks[ci] = wave_l_out;
                     }
@@ -651,6 +662,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * group_ffn_inp =
                     ggml_add(ctx0, attn, group_inp);
 
+                if (pc_inner_wavefront && pc_inner_fifo_requested) {
+                    // ATTN -> FFN handoff must outlive static gallocr order
+                    // when backend workers advance independently.
+                    ggml_set_output(group_ffn_inp);
+                }
+
                 // Keep FFN normalization coarse as well. The old wavefront
                 // normalized every XT chunk independently, fragmenting a PC
                 // operation that the normal Qwen3-MoE path performs once for
@@ -707,6 +724,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         ffn_inp,
                         ffn_inp_name.c_str(),
                         wave_layer);
+
+                    if (pc_inner_wavefront && pc_inner_fifo_requested) {
+                        // Keep the materialized residual alive until REDUCE
+                        // consumes it under dynamic FIFO scheduling.
+                        ggml_set_output(ffn_inp);
+                    }
 
                     ggml_tensor * ffn_norm =
                         ggml_view_2d(
@@ -781,6 +804,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         down_name.c_str(),
                         wave_layer);
 
+                    if (pc_inner_wavefront && pc_inner_fifo_requested) {
+                        // FFN -> REDUCE handoff must not be reused according
+                        // to the original static execution lifetime.
+                        ggml_set_output(down);
+                    }
+
                     ggml_build_forward_expand(gf, down);
                     pending_wave_down_chunks[ci] = down;
                     pending_wave_residual_chunks[ci] =
@@ -816,6 +845,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 wave_l_out,
                 wave_l_out_name.c_str(),
                 moe_wavefront_layer_end - 1);
+            if (pc_inner_wavefront && pc_inner_fifo_requested) {
+                ggml_set_output(wave_l_out);
+            }
             ggml_build_forward_expand(gf, wave_l_out);
             hidden_chunks[ci] = wave_l_out;
         }
