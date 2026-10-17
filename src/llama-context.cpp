@@ -5023,7 +5023,20 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     const bool inner_pc_chunk_ring =
         inner_pc_chunk_ring_env != nullptr &&
         std::atoi(inner_pc_chunk_ring_env) != 0;
+    const bool fifo_requested =
+        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
     bool ran_inner_v1_tasks = false;
+
+    if (fifo_requested && !inner_pc_chunk_ring) {
+        LLAMA_LOG_WARN(
+            "[INNER_FIFO_GATE] status=SKIP "
+            "reason=CHUNK_RING_DISABLED ub=%d block=%zu stage=%s tokens=%u\n",
+            ubatch_id,
+            block_index,
+            llama_hybrid_runtime_stage_name(stage.kind),
+            block_tokens);
+    }
 
     if (inner_pc_chunk_ring &&
         stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
@@ -5040,10 +5053,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 membership,
                 tasks,
                 fallback_reason)) {
-            const bool fifo_requested =
-                std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
-                std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
-
             if (fifo_requested) {
                 // Phase A correctness isolation:
                 // 0 = strict FIFO, no cross-backend overlap (A0)
@@ -5748,6 +5757,22 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             if (!membership.chunked_markers) {
                 fallback_reason = "GRAPH_NOT_CHUNKED";
             }
+            if (fifo_requested) {
+                LLAMA_LOG_WARN(
+                    "[INNER_FIFO_GATE] status=SKIP "
+                    "reason=%s ub=%d block=%zu stage=%s tokens=%u "
+                    "membership={gaps:%d,transition_errors:%d,chunked:%d}\n",
+                    fallback_reason.empty() ?
+                        "TASK_BUILD_FAILED" :
+                        fallback_reason.c_str(),
+                    ubatch_id,
+                    block_index,
+                    llama_hybrid_runtime_stage_name(stage.kind),
+                    block_tokens,
+                    membership.gap_nodes,
+                    membership.transition_errors,
+                    membership.chunked_markers ? 1 : 0);
+            }
             LLAMA_LOG_ERROR(
                 "[INNER_TASK_V1] status=REJECT "
                 "ub=%d block=%zu tokens=%u reason=%s "
@@ -5769,6 +5794,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             ret = GGML_STATUS_FAILED;
             ran_inner_v1_tasks = true;
         }
+    } else if (fifo_requested &&
+               inner_pc_chunk_ring &&
+               stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+               cparams.warmup) {
+        LLAMA_LOG_INFO(
+            "[INNER_FIFO_GATE] status=SKIP "
+            "reason=WARMUP_PROBE ub=%d block=%zu tokens=%u\n",
+            ubatch_id,
+            block_index,
+            block_tokens);
     }
 
     if (!ran_inner_v1_tasks) {
