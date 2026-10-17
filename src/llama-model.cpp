@@ -2188,6 +2188,12 @@ static bool llama_hybrid_inner_pc_attn_weight_residence_enabled_for_layer(
         return false;
     }
 
+    const char * all_tokens_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_ALL_TOKENS");
+    if (all_tokens_env == nullptr || std::atoi(all_tokens_env) == 0) {
+        return false;
+    }
+
     if (il < 0 || il >= (int) model.hparams.n_layer()) {
         return false;
     }
