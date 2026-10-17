@@ -546,11 +546,18 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
         std::getenv("LLAMA_HYBRID_INNER_TASK_RUNTIME_V0");
     const char * boundary_env =
         std::getenv("LLAMA_HYBRID_INNER_TASK_STAGE_BOUNDARIES");
+    const char * pc_chunk_ring_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING");
 
+    const bool pc_chunk_ring =
+        pc_chunk_ring_env != nullptr &&
+        std::atoi(pc_chunk_ring_env) != 0;
     const bool runtime_enabled =
-        runtime_env != nullptr && std::atoi(runtime_env) != 0;
+        pc_chunk_ring ||
+        (runtime_env != nullptr && std::atoi(runtime_env) != 0);
     const bool boundaries_enabled =
-        boundary_env != nullptr && std::atoi(boundary_env) != 0;
+        pc_chunk_ring ||
+        (boundary_env != nullptr && std::atoi(boundary_env) != 0);
 
     const char * pc_policy_env =
         std::getenv("LLAMA_HYBRID_INNER_PC_POLICY");
@@ -569,10 +576,6 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
             ubatch_tokens);
         return false;
     }
-
-    const bool pc_chunk_ring =
-        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
-        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
@@ -4953,7 +4956,179 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+
+    const char * inner_pc_chunk_ring_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING");
+    const bool inner_pc_chunk_ring =
+        inner_pc_chunk_ring_env != nullptr &&
+        std::atoi(inner_pc_chunk_ring_env) != 0;
+    bool ran_inner_v1_tasks = false;
+
+    if (inner_pc_chunk_ring &&
+        stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+        !cparams.warmup) {
+        const llama_hybrid_inner_membership_result membership =
+            llama_hybrid_build_inner_node_membership(result->get_gf());
+        std::vector<llama_hybrid_inner_v0_task> tasks;
+        std::string fallback_reason;
+
+        if (membership.chunked_markers &&
+            llama_hybrid_build_inner_v0_tasks(
+                sched_use,
+                result->get_gf(),
+                membership,
+                tasks,
+                fallback_reason)) {
+            std::deque<int> ready;
+            for (const llama_hybrid_inner_v0_task & task : tasks) {
+                if (task.pending_dependencies == 0) {
+                    ready.push_back(task.id);
+                }
+            }
+
+            LLAMA_LOG_INFO(
+                "[INNER_TASK_V1] status=START ub=%d block=%zu tokens=%u "
+                "tasks=%zu splits=%d nodes=%d "
+                "membership={gaps:%d,transition_errors:%d,chunked:%d} "
+                "mode=LINEAR_CORRECTNESS\n",
+                ubatch_id,
+                block_index,
+                block_tokens,
+                tasks.size(),
+                n_splits,
+                ggml_graph_n_nodes(result->get_gf()),
+                membership.gap_nodes,
+                membership.transition_errors,
+                membership.chunked_markers ? 1 : 0);
+
+            ret = GGML_STATUS_SUCCESS;
+            size_t submitted = 0;
+            while (ret == GGML_STATUS_SUCCESS &&
+                   submitted < tasks.size()) {
+                if (ready.empty()) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_TASK_V1] status=FAIL "
+                        "reason=READY_QUEUE_STALL ub=%d block=%zu "
+                        "submitted=%zu total=%zu\n",
+                        ubatch_id,
+                        block_index,
+                        submitted,
+                        tasks.size());
+                    ret = GGML_STATUS_FAILED;
+                    break;
+                }
+
+                const int task_id = ready.front();
+                ready.pop_front();
+                GGML_ASSERT(
+                    task_id >= 0 &&
+                    task_id < (int) tasks.size());
+
+                llama_hybrid_inner_v0_task & task =
+                    tasks[(size_t) task_id];
+                GGML_ASSERT(!task.submitted);
+                GGML_ASSERT(task.pending_dependencies == 0);
+
+                const std::string stage_name =
+                    llama_hybrid_inner_task_stage_mask_name(
+                        task.stage_mask);
+                LLAMA_LOG_INFO(
+                    "[INNER_TASK_V1_SUBMIT] "
+                    "ub=%d block=%zu task=%d split=[%d,%d) "
+                    "backend=%s stage=%s layers=[%d,%d) "
+                    "chunk=%d ready_q=%zu\n",
+                    ubatch_id,
+                    block_index,
+                    task.id,
+                    task.first_split,
+                    task.last_split,
+                    task.backend != nullptr ?
+                        ggml_backend_name(task.backend) :
+                        "(null)",
+                    stage_name.c_str(),
+                    task.layer_begin,
+                    task.layer_end,
+                    task.chunk,
+                    ready.size());
+
+                ret = graph_compute_range(
+                    sched_use,
+                    task.first_split,
+                    task.last_split,
+                    block_tokens > 1);
+                if (ret != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_TASK_V1] status=FAIL "
+                        "reason=TASK_SUBMIT ub=%d block=%zu "
+                        "task=%d split=[%d,%d) error=%d\n",
+                        ubatch_id,
+                        block_index,
+                        task.id,
+                        task.first_split,
+                        task.last_split,
+                        (int) ret);
+                    break;
+                }
+
+                task.submitted = true;
+                ++submitted;
+
+                // V1 correctness mode intentionally keeps the physical
+                // scheduler order linear.  The tasks now carry real
+                // (layer,chunk,stage) identities; the next revision will
+                // replace this chain with semantic completion dependencies.
+                for (int dependent_id : task.dependents) {
+                    GGML_ASSERT(
+                        dependent_id >= 0 &&
+                        dependent_id < (int) tasks.size());
+                    llama_hybrid_inner_v0_task & dependent =
+                        tasks[(size_t) dependent_id];
+                    GGML_ASSERT(
+                        dependent.pending_dependencies > 0);
+                    --dependent.pending_dependencies;
+                    if (dependent.pending_dependencies == 0) {
+                        ready.push_back(dependent_id);
+                    }
+                }
+            }
+
+            if (ret == GGML_STATUS_SUCCESS &&
+                submitted == tasks.size()) {
+                LLAMA_LOG_INFO(
+                    "[INNER_TASK_V1] status=DONE "
+                    "ub=%d block=%zu tokens=%u tasks=%zu "
+                    "mode=LINEAR_CORRECTNESS\n",
+                    ubatch_id,
+                    block_index,
+                    block_tokens,
+                    submitted);
+            }
+
+            ran_inner_v1_tasks = true;
+        } else {
+            if (!membership.chunked_markers) {
+                fallback_reason = "GRAPH_NOT_CHUNKED";
+            }
+            LLAMA_LOG_WARN(
+                "[INNER_TASK_V1] status=FALLBACK "
+                "ub=%d block=%zu tokens=%u reason=%s "
+                "membership={gaps:%d,transition_errors:%d,chunked:%d} "
+                "action=FULL_STAGE_RANGE\n",
+                ubatch_id,
+                block_index,
+                block_tokens,
+                fallback_reason.c_str(),
+                membership.gap_nodes,
+                membership.transition_errors,
+                membership.chunked_markers ? 1 : 0);
+        }
+    }
+
+    if (!ran_inner_v1_tasks) {
+        ret = graph_compute_range(
+            sched_use, 0, n_splits, block_tokens > 1);
+    }
+
     const int64_t compute_end_us = timing != nullptr ? ggml_time_us() : 0;
     struct ggml_cpu_stage_profile real_cpu_profile = {};
     const bool real_cpu_profile_ok = cpu_profile_armed &&
