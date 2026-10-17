@@ -224,7 +224,9 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
             switch (marker.kind) {
                 case llama_hybrid_inner_stage_kind::ATTN:
                     if (marker.event == llama_hybrid_inner_stage_event::BEGIN) {
-                        if (active_stage != llama_hybrid_inner_stage_kind::UNKNOWN &&
+                        const bool chunk_switch = marker.chunk >= 0;
+                        if (!chunk_switch &&
+                            active_stage != llama_hybrid_inner_stage_kind::UNKNOWN &&
                             !(active_stage == llama_hybrid_inner_stage_kind::ATTN &&
                               active_layer == marker.layer)) {
                             ++result.transition_errors;
@@ -233,8 +235,14 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
                         active_chunk = marker.chunk;
                         active_stage = llama_hybrid_inner_stage_kind::ATTN;
                     } else if (marker.event == llama_hybrid_inner_stage_event::END) {
-                        if (active_stage != llama_hybrid_inner_stage_kind::ATTN ||
-                            active_layer != marker.layer) {
+                        const bool chunk_match =
+                            marker.chunk >= 0 &&
+                            active_stage == llama_hybrid_inner_stage_kind::ATTN &&
+                            active_layer == marker.layer &&
+                            active_chunk == marker.chunk;
+                        if (!chunk_match &&
+                            (active_stage != llama_hybrid_inner_stage_kind::ATTN ||
+                             active_layer != marker.layer)) {
                             ++result.transition_errors;
                             active_layer = marker.layer;
                             active_chunk = marker.chunk;
@@ -245,17 +253,25 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
 
                 case llama_hybrid_inner_stage_kind::FFN:
                     if (marker.event == llama_hybrid_inner_stage_event::BEGIN) {
-                        if (active_layer != marker.layer ||
-                            (active_stage != llama_hybrid_inner_stage_kind::ATTN &&
-                             active_stage != llama_hybrid_inner_stage_kind::FFN)) {
+                        const bool chunk_switch = marker.chunk >= 0;
+                        if (!chunk_switch &&
+                            (active_layer != marker.layer ||
+                             (active_stage != llama_hybrid_inner_stage_kind::ATTN &&
+                              active_stage != llama_hybrid_inner_stage_kind::FFN))) {
                             ++result.transition_errors;
                         }
                         active_layer = marker.layer;
                         active_chunk = marker.chunk;
                         active_stage = llama_hybrid_inner_stage_kind::FFN;
                     } else if (marker.event == llama_hybrid_inner_stage_event::END) {
-                        if (active_stage != llama_hybrid_inner_stage_kind::FFN ||
-                            active_layer != marker.layer) {
+                        const bool chunk_match =
+                            marker.chunk >= 0 &&
+                            active_stage == llama_hybrid_inner_stage_kind::FFN &&
+                            active_layer == marker.layer &&
+                            active_chunk == marker.chunk;
+                        if (!chunk_match &&
+                            (active_stage != llama_hybrid_inner_stage_kind::FFN ||
+                             active_layer != marker.layer)) {
                             ++result.transition_errors;
                             active_layer = marker.layer;
                             active_chunk = marker.chunk;
@@ -266,15 +282,14 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
 
                 case llama_hybrid_inner_stage_kind::REDUCE:
                     if (marker.event == llama_hybrid_inner_stage_event::END) {
-                        const bool chunk_reduce_from_ffn =
-                            marker.chunk >= 0 &&
-                            active_stage == llama_hybrid_inner_stage_kind::FFN &&
-                            active_layer == marker.layer &&
-                            (active_chunk < 0 || active_chunk == marker.chunk);
-
-                        if ((active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
-                             active_layer != marker.layer) &&
-                            !chunk_reduce_from_ffn) {
+                        // Chunk-wave graphs intentionally defer REDUCE(L,C)
+                        // until the corresponding next-layer Attention group
+                        // becomes eligible, so graph insertion order may jump
+                        // from FFN(L+1,C-1) to REDUCE(L,C).  That is a legal
+                        // (layer,chunk) transition, not a membership error.
+                        if (marker.chunk < 0 &&
+                            (active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
+                             active_layer != marker.layer)) {
                             ++result.transition_errors;
                         }
 
