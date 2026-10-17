@@ -10249,6 +10249,46 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
     const int chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
 
+    const char * pc_inner_chunk_ring_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING");
+    const bool pc_inner_chunk_ring =
+        pc_inner_chunk_ring_env != nullptr &&
+        std::atoi(pc_inner_chunk_ring_env) != 0;
+    if (pc_inner_chunk_ring && model.hparams.n_layer() > 0) {
+        int pc_chunk_tokens = 128;
+        if (const char * value =
+                std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
+            const int requested = std::atoi(value);
+            if (requested > 0) {
+                pc_chunk_tokens = requested;
+            }
+        }
+
+        const auto pc_chunks =
+            llama_hybrid_split_by_chunk_size(
+                (int) n_tokens, pc_chunk_tokens);
+        if (pc_chunks.size() > 1) {
+            const uint64_t pc_layers = std::count_if(
+                model.hybrid_layer_modes.begin(),
+                model.hybrid_layer_modes.end(),
+                [](llama_hybrid_layer_mode mode) {
+                    return mode == llama_hybrid_layer_mode::PC_ONLY;
+                });
+            const uint64_t n_layers = model.hparams.n_layer();
+            const uint64_t base_nodes_per_layer =
+                (base + n_layers - 1) / n_layers;
+
+            // PC inner wavefront duplicates Attention + FFN topology per token
+            // chunk.  Count every PC_ONLY layer here rather than trying to
+            // identify CPU-direct layers without a context backend pointer;
+            // this intentionally over-reserves the GPU-only prefix.
+            res +=
+                pc_layers *
+                (pc_chunks.size() - 1) *
+                (base_nodes_per_layer + 32ull);
+        }
+    }
+
     if (chunk_tokens > 0 && model.hparams.n_layer() > 0) {
         const auto chunks = llama_hybrid_split_by_chunk_size((int) n_tokens, chunk_tokens);
         const uint64_t n_chunks = chunks.size();
