@@ -979,6 +979,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool dynamic_order_lifetime;
 
     int debug;
 
@@ -1547,7 +1548,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || sched->dynamic_order_lifetime) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -2871,6 +2872,13 @@ void ggml_backend_sched_set_split_boundary(
         sched->n_forced_split_nodes <
         sched->forced_split_nodes_capacity);
     sched->forced_split_nodes[sched->n_forced_split_nodes++] = node;
+}
+
+void ggml_backend_sched_set_dynamic_order_lifetime(
+        ggml_backend_sched_t sched,
+        bool enabled) {
+    GGML_ASSERT(sched);
+    sched->dynamic_order_lifetime = enabled;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
