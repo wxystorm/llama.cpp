@@ -87,12 +87,24 @@ static int llama_hybrid_inner_marker_chunk(const char * name) {
     if (name == nullptr) {
         return -1;
     }
+
     const char * chunk = std::strstr(name, "chunk_");
-    if (chunk == nullptr) {
-        return -1;
+    if (chunk != nullptr) {
+        chunk += std::strlen("chunk_");
+        return std::atoi(chunk);
     }
-    chunk += std::strlen("chunk_");
-    return std::atoi(chunk);
+
+    // Chunk-granular Attention is named as
+    //   prefill_wave_attn_*_group_<chunk_begin>_<chunk_count>-<layer>.
+    // V1 currently forces chunk_count=1 for the PC inner ring, so group_begin
+    // is also the logical chunk id consumed by the task runtime.
+    const char * group = std::strstr(name, "group_");
+    if (group != nullptr) {
+        group += std::strlen("group_");
+        return std::atoi(group);
+    }
+
+    return -1;
 }
 
 // Classify existing graph callback names only.  This is deliberately a
@@ -104,7 +116,8 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     marker.layer = llama_hybrid_inner_marker_layer(tensor_name);
     marker.chunk = llama_hybrid_inner_marker_chunk(tensor_name);
 
-    if (llama_hybrid_name_starts_with(tensor_name, "attn_norm-")) {
+    if (llama_hybrid_name_starts_with(tensor_name, "attn_norm-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_attn_norm_group_")) {
         marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
         marker.event = llama_hybrid_inner_stage_event::BEGIN;
         return marker;
@@ -124,6 +137,7 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     }
 
     if (llama_hybrid_name_starts_with(tensor_name, "ffn_norm-") ||
+        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_norm_group_") ||
         llama_hybrid_name_starts_with(tensor_name, "prefill_ffn_norm_chunk_")) {
         marker.kind  = llama_hybrid_inner_stage_kind::FFN;
         marker.event = llama_hybrid_inner_stage_event::BEGIN;
@@ -252,13 +266,21 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
 
                 case llama_hybrid_inner_stage_kind::REDUCE:
                     if (marker.event == llama_hybrid_inner_stage_event::END) {
-                        if (active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
-                            active_layer != marker.layer) {
+                        const bool chunk_reduce_from_ffn =
+                            marker.chunk >= 0 &&
+                            active_stage == llama_hybrid_inner_stage_kind::FFN &&
+                            active_layer == marker.layer &&
+                            (active_chunk < 0 || active_chunk == marker.chunk);
+
+                        if ((active_stage != llama_hybrid_inner_stage_kind::REDUCE ||
+                             active_layer != marker.layer) &&
+                            !chunk_reduce_from_ffn) {
                             ++result.transition_errors;
-                            active_layer = marker.layer;
-                            active_chunk = marker.chunk;
-                            active_stage = llama_hybrid_inner_stage_kind::REDUCE;
                         }
+
+                        active_layer = marker.layer;
+                        active_chunk = marker.chunk;
+                        active_stage = llama_hybrid_inner_stage_kind::REDUCE;
                     }
                     break;
 
@@ -401,11 +423,6 @@ static bool llama_hybrid_build_inner_v0_tasks(
         reason = "BAD_MEMBERSHIP";
         return false;
     }
-    if (membership.chunked_markers) {
-        reason = "CHUNKED_GRAPH_NOT_V0";
-        return false;
-    }
-
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     const int n_nodes  = ggml_graph_n_nodes(gf);
     if (n_splits <= 0 || n_nodes <= 0) {
@@ -438,10 +455,12 @@ static bool llama_hybrid_build_inner_v0_tasks(
         task.last_split  = split_id + 1;
         task.backend     =
             ggml_backend_sched_get_split_backend(sched_use, split_id);
-        task.chunk       = 0;
+        task.chunk       = -1;
 
         int min_layer = std::numeric_limits<int>::max();
         int max_layer = -1;
+        int split_chunk = -1;
+        bool mixed_chunks = false;
         for (int node_id = split_begin; node_id < split_end; ++node_id) {
             if (node_id < 0 || node_id >= (int) membership.nodes.size()) {
                 continue;
@@ -457,14 +476,25 @@ static bool llama_hybrid_build_inner_v0_tasks(
                 llama_hybrid_inner_task_stage_bit(item.stage);
             min_layer = std::min(min_layer, item.layer);
             max_layer = std::max(max_layer, item.layer);
+
+            if (item.chunk >= 0) {
+                if (split_chunk < 0) {
+                    split_chunk = item.chunk;
+                } else if (split_chunk != item.chunk) {
+                    mixed_chunks = true;
+                }
+            }
         }
 
         if (max_layer >= 0) {
             task.layer_begin = min_layer;
             task.layer_end   = max_layer + 1;
         }
+        if (!mixed_chunks && split_chunk >= 0) {
+            task.chunk = split_chunk;
+        }
 
-        // V0/V0.5 still preserve scheduler order. The important difference in
+        // V0/V0.5/V1 still preserve scheduler order. The important difference in
         // V0.5 is that same-backend semantic boundaries can now materialize as
         // separate splits/tasks rather than being merged by backend identity.
         task.pending_dependencies = split_id == 0 ? 0 : 1;
@@ -525,11 +555,15 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
         return false;
     }
 
+    const bool pc_chunk_ring =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
     if (membership.gap_nodes != 0 ||
         membership.transition_errors != 0 ||
-        membership.chunked_markers) {
+        (membership.chunked_markers && !pc_chunk_ring)) {
         LLAMA_LOG_WARN(
             "[INNER_TASK_STAGE_BOUNDARY] status=SKIP "
             "reason=BAD_MEMBERSHIP tokens=%u "
@@ -724,12 +758,16 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
         return false;
     }
 
+    const bool pc_chunk_ring =
+        std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
 
     if (membership.gap_nodes != 0 ||
         membership.transition_errors != 0 ||
-        membership.chunked_markers) {
+        (membership.chunked_markers && !pc_chunk_ring)) {
         LLAMA_LOG_WARN(
             "[INNER_ATTN_MIGRATE] status=SKIP reason=BAD_MEMBERSHIP "
             "layer=%d tokens=%u gaps=%d transition_errors=%d chunked=%d\n",
