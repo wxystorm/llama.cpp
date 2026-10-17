@@ -2338,7 +2338,6 @@ enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched, in
                             input->name);
                     }
                 }
-            }
 
                 if (cuda_cpu) {
                     split_has_cuda_cpu = true;
