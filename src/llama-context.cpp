@@ -5045,6 +5045,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
 
             if (fifo_requested) {
+                // Phase A correctness isolation:
+                // keep FIFO dispatch semantics, but disable cross-backend
+                // overlap by default.  This separates queue/order bugs from
+                // gallocr lifetime / async-copy overlap bugs.  Set
+                // LLAMA_HYBRID_INNER_PC_FIFO_OVERLAP=1 only after the strict
+                // FIFO control produces correct logits.
+                const char * fifo_overlap_env =
+                    std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_OVERLAP");
+                const bool fifo_overlap =
+                    fifo_overlap_env != nullptr &&
+                    std::atoi(fifo_overlap_env) != 0;
+
                 const auto exact_stage =
                     [](const llama_hybrid_inner_v0_task & task,
                        llama_hybrid_inner_stage_kind stage) {
@@ -5230,7 +5242,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         "semantic=[%d,%d] "
                         "policy=META_STYLE_STATIC_ORDER "
                         "gpu=ATTN cpu=FFN+REDUCE "
-                        "cpu_inflight_max=1\n",
+                        "cpu_inflight_max=1 overlap=%d\n",
                         ubatch_id,
                         block_index,
                         block_tokens,
@@ -5238,7 +5250,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         last_layer + 1,
                         n_chunks,
                         first_semantic,
-                        last_semantic);
+                        last_semantic,
+                        fifo_overlap ? 1 : 0);
 
                     if (first_semantic > 0) {
                         ret = graph_compute_range(
@@ -5317,8 +5330,17 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 }
                                 if (task_status ==
                                     GGML_STATUS_SUCCESS) {
-                                    ggml_backend_synchronize(
-                                        task.backend);
+                                    if (fifo_overlap) {
+                                        ggml_backend_synchronize(
+                                            task.backend);
+                                    } else {
+                                        // Strict Phase A control: no backend
+                                        // may retain in-flight work/copies
+                                        // before the next FIFO task becomes
+                                        // eligible.
+                                        ggml_backend_sched_synchronize(
+                                            sched_use);
+                                    }
                                 }
 
                                 if (task_status !=
@@ -5465,8 +5487,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             }
                             if (ret ==
                                 GGML_STATUS_SUCCESS) {
-                                ggml_backend_synchronize(
-                                    task.backend);
+                                if (fifo_overlap) {
+                                    ggml_backend_synchronize(
+                                        task.backend);
+                                } else {
+                                    ggml_backend_sched_synchronize(
+                                        sched_use);
+                                }
                             }
                         } else if (
                             exact_stage(
@@ -5517,6 +5544,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                     cpu_push_count);
                             }
                             cpu_cv.notify_one();
+
+                            if (!fifo_overlap &&
+                                !wait_cpu_idle()) {
+                                ret =
+                                    (ggml_status) fifo_error.load();
+                                break;
+                            }
                         } else {
                             LLAMA_LOG_ERROR(
                                 "[INNER_FIFO] status=FAIL "
@@ -5569,7 +5603,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             "[INNER_FIFO] status=DONE "
                             "ub=%d block=%zu layers=[%d,%d) "
                             "chunks=%d gpu={push:%zu,pop:%zu,left:%zu} "
-                            "cpu={push:%zu,pop:%zu}\n",
+                            "cpu={push:%zu,pop:%zu} overlap=%d\n",
                             ubatch_id,
                             block_index,
                             first_layer,
@@ -5579,7 +5613,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             gpu_pop_count,
                             gpu_q.size(),
                             cpu_push_count,
-                            cpu_pop_count);
+                            cpu_pop_count,
+                            fifo_overlap ? 1 : 0);
                     }
 
                     ran_inner_v1_tasks = true;
