@@ -1092,10 +1092,25 @@ static bool llama_hybrid_apply_pc_inner_policy(
         return false;
     }
 
-    // The formal PC inner policy is stage-wide, not prefill-only.  Attention
-    // weights may be resident on CUDA, so decode must use the same explicit
-    // Attention compute placement instead of falling back to scheduler
-    // inference from weight location.  KV/state writes remain anchored below.
+    const bool all_tokens =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_ALL_TOKENS") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_ALL_TOKENS")) != 0;
+
+    int min_tokens = 32;
+    const char * min_tokens_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_MIN_TOKENS");
+    if (min_tokens_env != nullptr && min_tokens_env[0] != '\0') {
+        min_tokens = std::max(1, std::atoi(min_tokens_env));
+    }
+
+    if (!all_tokens && (int) ubatch_tokens < min_tokens) {
+        LLAMA_LOG_INFO(
+            "[INNER_PC_POLICY] status=SKIP reason=TOKEN_GATE "
+            "tokens=%u min_tokens=%d all_tokens=0\n",
+            ubatch_tokens, min_tokens);
+        return false;
+    }
+
     ggml_backend_t cuda_backend =
         llama_hybrid_find_cuda_backend(backends);
     if (cuda_backend == nullptr) {
@@ -1341,11 +1356,12 @@ static bool llama_hybrid_apply_pc_inner_policy(
 
     LLAMA_LOG_INFO(
         "[INNER_PC_POLICY] status=APPLIED "
-        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU scope=ALL_TOKENS "
+        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU scope=%s "
         "tokens=%u layers=[%d,%d) selected_layers=%d "
         "attn_nodes=%d compute=%d aliases=%d "
         "anchored_state=%d anchored_alias=%d backend=%s "
         "membership={gaps:%d,transition_errors:%d}\n",
+        all_tokens ? "ALL_TOKENS" : "TOKEN_GATED",
         ubatch_tokens,
         first_layer, last_layer + 1, selected_layers,
         total_attn_nodes, total_compute, total_aliases,
