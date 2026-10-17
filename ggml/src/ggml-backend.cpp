@@ -1984,10 +1984,7 @@ static void ggml_backend_sched_debug_tensor(
         n > 6 ? data[6] : 0.0f, n > 7 ? data[7] : 0.0f);
 }
 
-static enum ggml_status ggml_backend_sched_prepare_split_impl(
-        ggml_backend_sched_t sched,
-        int split_id,
-        bool producer_inputs_ready) {
+enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
 
@@ -2110,12 +2107,7 @@ static enum ggml_status ggml_backend_sched_prepare_split_impl(
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                 if (!split_backend->iface.cpy_tensor_async ||
                     !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                    const bool is_weight =
-                        ggml_backend_buffer_get_usage(input->buffer) ==
-                        GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-                    if (!producer_inputs_ready || is_weight) {
-                        ggml_backend_synchronize(input_backend);
-                    }
+                    ggml_backend_synchronize(input_backend);
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     } else {
@@ -2147,20 +2139,6 @@ static enum ggml_status ggml_backend_sched_prepare_split_impl(
     }
 
     return GGML_STATUS_SUCCESS;
-}
-
-enum ggml_status ggml_backend_sched_prepare_split(
-        ggml_backend_sched_t sched,
-        int split_id) {
-    return ggml_backend_sched_prepare_split_impl(
-        sched, split_id, false);
-}
-
-enum ggml_status ggml_backend_sched_prepare_split_inputs_ready(
-        ggml_backend_sched_t sched,
-        int split_id) {
-    return ggml_backend_sched_prepare_split_impl(
-        sched, split_id, true);
 }
 
 enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id) {
