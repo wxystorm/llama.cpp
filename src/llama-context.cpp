@@ -492,6 +492,7 @@ static bool llama_hybrid_is_view_op(enum ggml_op op) {
 
 static bool llama_hybrid_apply_inner_task_stage_boundaries(
         const llama_model & model,
+        ggml_backend_t backend_cpu,
         ggml_backend_sched_t sched_use,
         ggml_cgraph * gf,
         uint32_t ubatch_tokens,
@@ -506,8 +507,13 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
     const bool boundaries_enabled =
         boundary_env != nullptr && std::atoi(boundary_env) != 0;
 
-    if (!runtime_enabled || !boundaries_enabled ||
-        sched_use == nullptr || gf == nullptr) {
+    const char * pc_policy_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY");
+    const bool pc_policy_enabled =
+        pc_policy_env != nullptr && std::atoi(pc_policy_env) != 0;
+
+    if (!runtime_enabled || !boundaries_enabled || !pc_policy_enabled ||
+        backend_cpu == nullptr || sched_use == nullptr || gf == nullptr) {
         return false;
     }
 
@@ -535,6 +541,31 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
         return false;
     }
 
+    const int n_layer = (int) model.hparams.n_layer();
+    int layer_begin = 0;
+    int layer_end   = n_layer;
+
+    const char * layer_begin_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_BEGIN");
+    const char * layer_end_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_END");
+    if (layer_begin_env != nullptr && layer_begin_env[0] != '\0') {
+        layer_begin = std::atoi(layer_begin_env);
+    }
+    if (layer_end_env != nullptr && layer_end_env[0] != '\0') {
+        layer_end = std::atoi(layer_end_env);
+    }
+    if (layer_begin < 0 || layer_end > n_layer || layer_begin >= layer_end) {
+        LLAMA_LOG_WARN(
+            "[INNER_TASK_STAGE_BOUNDARY] status=SKIP "
+            "reason=BAD_LAYER_RANGE tokens=%u layers=[%d,%d) n_layer=%d\n",
+            ubatch_tokens, layer_begin, layer_end, n_layer);
+        return false;
+    }
+
+    const ggml_backend_dev_t cpu_device =
+        ggml_backend_get_device(backend_cpu);
+
     int last_layer = -1;
     int last_chunk = -2;
     llama_hybrid_inner_stage_kind last_stage =
@@ -552,10 +583,11 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
             membership.nodes[(size_t) i];
 
         if (!item.valid() ||
-            item.layer < 0 ||
-            item.layer >= (int) model.hparams.n_layer() ||
+            item.layer < layer_begin ||
+            item.layer >= layer_end ||
             model.hybrid_layer_mode(item.layer) !=
-                llama_hybrid_layer_mode::PC_ONLY) {
+                llama_hybrid_layer_mode::PC_ONLY ||
+            model.dev_layer(item.layer) != cpu_device) {
             have_pc_stage = false;
             continue;
         }
@@ -595,9 +627,12 @@ static bool llama_hybrid_apply_inner_task_stage_boundaries(
 
     LLAMA_LOG_INFO(
         "[INNER_TASK_STAGE_BOUNDARY] status=APPLIED "
-        "tokens=%u boundaries=%d scope=PC_ONLY\n",
+        "tokens=%u boundaries=%d scope=PC_ONLY_CPU_DIRECT "
+        "layers=[%d,%d)\n",
         ubatch_tokens,
-        boundaries);
+        boundaries,
+        layer_begin,
+        layer_end);
 
     return boundaries > 0;
 }
@@ -4154,7 +4189,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         // This can split FFN and REDUCE even when both execute on CPU, without
         // changing backend placement or introducing a synchronization barrier.
         llama_hybrid_apply_inner_task_stage_boundaries(
-            model, sched_use, gf, ubatch.n_tokens, cparams.warmup);
+            model, backend_cpu, sched_use, gf, ubatch.n_tokens,
+            cparams.warmup);
 
         const int64_t graph_alloc_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched_use, gf)) {
