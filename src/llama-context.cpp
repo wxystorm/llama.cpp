@@ -5584,7 +5584,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     membership.chunked_markers ? 1 : 0);
             }
             LLAMA_LOG_ERROR(
-                "[INNER_TASK_V1] status=REJECT "
+                "[INNER_FIFO_BUILD] status=REJECT "
                 "ub=%d block=%zu tokens=%u reason=%s "
                 "membership={gaps:%d,transition_errors:%d,chunked:%d} "
                 "action=ABORT_UNSAFE_CHUNK_GRAPH\n",
@@ -7616,7 +7616,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             inner_pc_chunk_stages[
                 (size_t) inner_pc_cpu_stage_index];
         LLAMA_LOG_INFO(
-            "[INNER_TASK_V1_CONFIG] enabled=1 "
+            "[INNER_FIFO_CONFIG] enabled=1 "
             "cpu_layers=[%d,%d) chunk_tokens=%d stages=%zu "
             "outer_macro=%d mode=SERIAL_OUTER_CHUNKED_INNER\n",
             cpu_stage.layer_begin,
@@ -7626,7 +7626,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             full_macro_tokens);
     } else if (inner_pc_chunk_ring_requested) {
         LLAMA_LOG_WARN(
-            "[INNER_TASK_V1_CONFIG] enabled=0 "
+            "[INNER_FIFO_CONFIG] enabled=0 "
             "reason=UNSUPPORTED_TOPOLOGY has_plan=%d arch=%d "
             "cpu_stage=%d stages=%zu\n",
             has_runtime_plan ? 1 : 0,
@@ -9500,7 +9500,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 inner_pc_chunk_stages[
                     (size_t) inner_pc_cpu_stage_index];
             LLAMA_LOG_INFO(
-                "[INNER_TASK_V1] status=RUN ub=%d tokens=%u "
+                "[INNER_FIFO] status=RUN ub=%d tokens=%u "
                 "cpu_layers=[%d,%d) chunk_tokens=%d stages=%zu\n",
                 ubatch_id,
                 ubatch.n_tokens,
