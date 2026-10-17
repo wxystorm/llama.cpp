@@ -1022,10 +1022,6 @@ static bool llama_hybrid_apply_single_pc_attn_migration(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
-    const bool pc_fifo_runtime =
-        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
-        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
-
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
 
@@ -1751,6 +1747,9 @@ static bool llama_hybrid_apply_pc_inner_policy(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+    const bool pc_fifo_runtime =
+        std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_RUNTIME")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
@@ -5381,14 +5380,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 queue->backend = backend;
                                 queues.push_back(std::move(queue));
                             }
-                        }
-
-                        std::vector<std::unique_ptr<llama_hybrid_inner_fifo_task_state>>
-                            task_states;
-                        task_states.reserve(tasks.size());
-                        for (size_t i = 0; i < tasks.size(); ++i) {
-                            task_states.push_back(
-                                std::make_unique<llama_hybrid_inner_fifo_task_state>());
                         }
 
                         const int ring_tasks =
