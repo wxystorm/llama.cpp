@@ -756,12 +756,6 @@ static bool llama_hybrid_build_inner_fifo_plan(
     return true;
 }
 
-struct llama_hybrid_inner_fifo_task_state {
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool prepared = false;
-};
-
 struct llama_hybrid_inner_fifo_queue {
     ggml_backend_t backend = nullptr;
     std::deque<int> pending;
