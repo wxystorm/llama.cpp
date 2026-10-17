@@ -17,6 +17,72 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static ggml_backend_dev_t llama_hybrid_kv_cuda_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                reg != nullptr &&
+                std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool llama_hybrid_inner_pc_attn_kv_residence_enabled_for_layer(
+        const llama_model & model,
+        int il) {
+    const char * kv_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_KV_RESIDENCE");
+    if (kv_env == nullptr || std::atoi(kv_env) == 0) {
+        return false;
+    }
+
+    // KV residence is part of the formal PC Attention stage policy.  Do not
+    // move persistent state independently from explicit Attention compute
+    // placement.
+    const char * policy_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY");
+    if (policy_env == nullptr || std::atoi(policy_env) == 0) {
+        return false;
+    }
+
+    if (il < 0 || il >= (int) model.hparams.n_layer()) {
+        return false;
+    }
+    if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::PC_ONLY) {
+        return false;
+    }
+
+    // This experimental path is only for the CPU-direct PC_ONLY region.  GPU
+    // native PC layers already keep their KV on the GPU through dev_layer().
+    ggml_backend_dev_t layer_dev = model.dev_layer(il);
+    if (layer_dev == nullptr ||
+        ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    int layer_begin = 0;
+    int layer_end = (int) model.hparams.n_layer();
+
+    const char * layer_begin_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_BEGIN");
+    const char * layer_end_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_POLICY_LAYER_END");
+
+    if (layer_begin_env != nullptr && layer_begin_env[0] != '\0') {
+        layer_begin = std::atoi(layer_begin_env);
+    }
+    if (layer_end_env != nullptr && layer_end_env[0] != '\0') {
+        layer_end = std::atoi(layer_end_env);
+    }
+
+    return il >= layer_begin && il < layer_end;
+}
+
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -160,6 +226,11 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    int inner_pc_attn_kv_layers = 0;
+    size_t inner_pc_attn_kv_bytes = 0;
+    int inner_pc_attn_kv_first_layer = (int) n_layer;
+    int inner_pc_attn_kv_last_layer = -1;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -210,12 +281,38 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_dev_t kv_dev = nullptr;
 
-        if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+        const bool inner_pc_attn_kv_cuda =
+            llama_hybrid_inner_pc_attn_kv_residence_enabled_for_layer(
+                model, (int) il);
 
-            dev_name = ggml_backend_dev_name(dev);
+        if (inner_pc_attn_kv_cuda) {
+            kv_dev = llama_hybrid_kv_cuda_device();
+            if (kv_dev == nullptr) {
+                throw std::runtime_error(format(
+                    "%s: PC Attention KV residence requested for layer %u "
+                    "but CUDA0 is unavailable",
+                    __func__, il));
+            }
+
+            buft = ggml_backend_dev_buffer_type(kv_dev);
+            dev_name = ggml_backend_dev_name(kv_dev);
+        } else if (offload) {
+            kv_dev = model.dev_layer(il);
+            buft = ggml_backend_dev_buffer_type(kv_dev);
+            dev_name = ggml_backend_dev_name(kv_dev);
+        }
+
+        if (inner_pc_attn_kv_cuda &&
+            std::getenv("LLAMA_HYBRID_INNER_PC_ATTN_KV_VERBOSE") != nullptr) {
+            LLAMA_LOG_INFO(
+                "[INNER_PC_ATTN_KV_LAYER] layer=%u residence=%s "
+                "dev_layer=%s offload=%d\n",
+                il,
+                dev_name,
+                ggml_backend_dev_name(model.dev_layer(il)),
+                offload ? 1 : 0);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -245,6 +342,31 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        if (inner_pc_attn_kv_cuda) {
+            ++inner_pc_attn_kv_layers;
+            inner_pc_attn_kv_first_layer =
+                std::min(inner_pc_attn_kv_first_layer, (int) il);
+            inner_pc_attn_kv_last_layer =
+                std::max(inner_pc_attn_kv_last_layer, (int) il);
+            if (k != nullptr) {
+                inner_pc_attn_kv_bytes += ggml_nbytes(k);
+            }
+            if (v != nullptr) {
+                inner_pc_attn_kv_bytes += ggml_nbytes(v);
+            }
+        }
+    }
+
+    if (inner_pc_attn_kv_layers > 0) {
+        LLAMA_LOG_INFO(
+            "[INNER_PC_ATTN_KV] status=APPLIED layers=[%d,%d) "
+            "selected_layers=%d residence=CUDA bytes=%.3f MiB "
+            "state_ops=FOLLOW_STORAGE_OWNER\n",
+            inner_pc_attn_kv_first_layer,
+            inner_pc_attn_kv_last_layer + 1,
+            inner_pc_attn_kv_layers,
+            inner_pc_attn_kv_bytes / (1024.0 * 1024.0));
     }
 
     if (reuse) {
