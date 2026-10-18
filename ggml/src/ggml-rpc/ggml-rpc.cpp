@@ -8918,11 +8918,29 @@ bool rpc_server::synchronize(uint32_t device) {
     ggml_backend_dev_t dev =
         ggml_backend_get_device(backend);
 
+    const bool sync_diag =
+        std::getenv("GGML_META_XLAYER_BOUNDARY_DIAG") != nullptr;
+    if (sync_diag) {
+        GGML_LOG_ERROR(
+            "[RPC_SERVER_SYNC] event=BEGIN device=%u backend=%s\n",
+            device,
+            dev != nullptr ? ggml_backend_dev_name(dev) : "unknown");
+        fflush(stderr);
+    }
+
     size_t released_payloads = 0;
     {
         std::lock_guard<std::mutex> lock(
             async_return_payload_mutex);
         ggml_backend_synchronize(backend);
+
+        if (sync_diag) {
+            GGML_LOG_ERROR(
+                "[RPC_SERVER_SYNC] event=BACKEND_DONE device=%u backend=%s\n",
+                device,
+                dev != nullptr ? ggml_backend_dev_name(dev) : "unknown");
+            fflush(stderr);
+        }
 
         if (dev != nullptr) {
             auto it = async_return_payloads.find(dev);
@@ -8931,6 +8949,15 @@ bool rpc_server::synchronize(uint32_t device) {
                 async_return_payloads.erase(it);
             }
         }
+    }
+
+    if (sync_diag) {
+        GGML_LOG_ERROR(
+            "[RPC_SERVER_SYNC] event=END device=%u backend=%s released_payloads=%zu\n",
+            device,
+            dev != nullptr ? ggml_backend_dev_name(dev) : "unknown",
+            released_payloads);
+        fflush(stderr);
     }
 
     if (released_payloads != 0 &&
