@@ -523,6 +523,12 @@ struct both_ready_sample {
     double gpu_tail_wait_ms = 0.0;
 };
 
+struct fused_join_sample {
+    double wall_ms = 0.0;
+    double d2h_ready_ms = 0.0;
+    double cpu_rms_ms = 0.0;
+};
+
 int main(int argc, char ** argv) {
     options opt;
     if (!parse_options(argc, argv, opt)) {
@@ -802,6 +808,40 @@ int main(int argc, char ** argv) {
         return out;
     };
 
+    auto run_fused_join_ready = [&]() -> fused_join_sample {
+        fused_join_sample out;
+        const auto t0 = clock_type::now();
+
+        ggml_backend_tensor_get_async(copy_backend, x, host_x, 0, x_bytes);
+        ggml_backend_event_record(d2h_done, copy_backend);
+
+        const ggml_status num_st = ggml_backend_graph_compute_async(compute_backend, graph_num);
+        if (num_st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "fused-join numerator graph failed: %d\n", (int) num_st);
+            std::exit(26);
+        }
+
+        ggml_backend_event_synchronize(d2h_done);
+        const auto td2h = clock_type::now();
+        out.d2h_ready_ms = elapsed_ms(t0, td2h);
+
+        const auto tcpu0 = clock_type::now();
+        rms_pool.run(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        const auto tcpu1 = clock_type::now();
+        out.cpu_rms_ms = elapsed_ms(tcpu0, tcpu1);
+
+        // Realistic fused-consumer bound: return the 1-float-per-token scale to
+        // the GPU and join streams, but do not launch the explicit Q/K/V scale
+        // graph. A future fused Q/K norm / V consumer could start here.
+        ggml_backend_tensor_set_async(copy_backend, inv_r, host_inv_r, 0, r_bytes);
+        ggml_backend_event_record(r_ready, copy_backend);
+        ggml_backend_event_wait(compute_backend, r_ready);
+        ggml_backend_synchronize(compute_backend);
+
+        out.wall_ms = elapsed_ms(t0, clock_type::now());
+        return out;
+    };
+
     std::printf(
         "[PC_RMS_BENCH_CONFIG] device=%d device_name=\"%s\" tokens=%" PRId64
         " embd=%" PRId64 " q_dim=%" PRId64 " kv_dim=%" PRId64
@@ -816,6 +856,7 @@ int main(int argc, char ** argv) {
         (void) run_serial();
         (void) run_split();
         (void) run_both_ready();
+        (void) run_fused_join_ready();
     }
 
     // Keep a resident host copy for isolated CPU-kernel timing below.
@@ -870,6 +911,9 @@ int main(int argc, char ** argv) {
     std::vector<double> both_ready_d2h_ms;
     std::vector<double> both_ready_cpu_ms;
     std::vector<double> both_ready_gpu_tail_ms;
+    std::vector<double> fused_join_ms;
+    std::vector<double> fused_join_d2h_ms;
+    std::vector<double> fused_join_cpu_ms;
     std::vector<double> cpu_scalar_ms;
     std::vector<double> cpu_fast_ms;
 
@@ -883,6 +927,9 @@ int main(int argc, char ** argv) {
     both_ready_d2h_ms.reserve(opt.iters);
     both_ready_cpu_ms.reserve(opt.iters);
     both_ready_gpu_tail_ms.reserve(opt.iters);
+    fused_join_ms.reserve(opt.iters);
+    fused_join_d2h_ms.reserve(opt.iters);
+    fused_join_cpu_ms.reserve(opt.iters);
     cpu_scalar_ms.reserve(opt.iters);
     cpu_fast_ms.reserve(opt.iters);
 
@@ -904,6 +951,11 @@ int main(int argc, char ** argv) {
         both_ready_cpu_ms.push_back(br.cpu_rms_ms);
         both_ready_gpu_tail_ms.push_back(br.gpu_tail_wait_ms);
 
+        const fused_join_sample fj = run_fused_join_ready();
+        fused_join_ms.push_back(fj.wall_ms);
+        fused_join_d2h_ms.push_back(fj.d2h_ready_ms);
+        fused_join_cpu_ms.push_back(fj.cpu_rms_ms);
+
         const auto scalar_t0 = clock_type::now();
         cpu_rms_inv_scalar(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
         cpu_scalar_ms.push_back(elapsed_ms(scalar_t0, clock_type::now()));
@@ -923,6 +975,9 @@ int main(int argc, char ** argv) {
     const sample_stats s_both_d2h = summarize(both_ready_d2h_ms);
     const sample_stats s_both_cpu = summarize(both_ready_cpu_ms);
     const sample_stats s_both_gpu_tail = summarize(both_ready_gpu_tail_ms);
+    const sample_stats s_fused_join = summarize(fused_join_ms);
+    const sample_stats s_fused_join_d2h = summarize(fused_join_d2h_ms);
+    const sample_stats s_fused_join_cpu = summarize(fused_join_cpu_ms);
     const sample_stats s_cpu_scalar = summarize(cpu_scalar_ms);
     const sample_stats s_cpu_fast = summarize(cpu_fast_ms);
 
@@ -957,6 +1012,16 @@ int main(int argc, char ** argv) {
         s_both_d2h.mean, s_both_cpu.mean, s_both_gpu_tail.mean,
         s_serial.mean - s_both.mean,
         s_both.mean > 0.0 ? s_serial.mean / s_both.mean : 0.0);
+
+    std::printf(
+        "[PC_RMS_BENCH] mode=FUSED_JOIN_READY"
+        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f min_ms=%.6f"
+        " d2h_ready_mean_ms=%.6f cpu_rms_mean_ms=%.6f"
+        " vs_serial_delta_ms=%.6f vs_serial_speedup=%.6fx\n",
+        s_fused_join.mean, s_fused_join.p50, s_fused_join.p95, s_fused_join.min,
+        s_fused_join_d2h.mean, s_fused_join_cpu.mean,
+        s_serial.mean - s_fused_join.mean,
+        s_fused_join.mean > 0.0 ? s_serial.mean / s_fused_join.mean : 0.0);
 
     std::printf(
         "[PC_RMS_COMPONENT] gpu_numerator_mean_ms=%.6f"
