@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-rpc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
