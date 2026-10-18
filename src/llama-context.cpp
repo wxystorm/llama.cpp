@@ -5417,7 +5417,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool pc_local_ring_prefix_topology =
         pc_local_ring_entry_requested &&
         has_runtime_plan &&
-        !tensor_phone_primary_exec &&
         model.arch == LLM_ARCH_QWEN3MOE &&
         runtime_stages.size() >= 3 &&
         runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
