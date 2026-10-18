@@ -3574,6 +3574,243 @@ static bool ggml_backend_rpc_set_tensor_graph(
     return status;
 }
 
+static bool rpc_client_read_dense_tensor(
+        const ggml_tensor * tensor,
+        std::vector<uint8_t> & dense) {
+    if (tensor == nullptr ||
+        tensor->buffer == nullptr ||
+        ggml_blck_size(tensor->type) != 1) {
+        return false;
+    }
+
+    const size_t elem = ggml_type_size(tensor->type);
+    const size_t span = ggml_nbytes(tensor);
+    const size_t n = (size_t) ggml_nelements(tensor);
+
+    std::vector<uint8_t> raw(span);
+    ggml_backend_tensor_get(
+        tensor,
+        raw.data(),
+        0,
+        raw.size());
+
+    dense.resize(n * elem);
+    size_t out = 0;
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0) {
+                    const size_t off =
+                        (size_t) i0 * tensor->nb[0] +
+                        (size_t) i1 * tensor->nb[1] +
+                        (size_t) i2 * tensor->nb[2] +
+                        (size_t) i3 * tensor->nb[3];
+                    if (off + elem > raw.size()) {
+                        return false;
+                    }
+                    memcpy(
+                        dense.data() + out * elem,
+                        raw.data() + off,
+                        elem);
+                    ++out;
+                }
+            }
+        }
+    }
+    return out == n;
+}
+
+static bool ggml_backend_rpc_run_private_ffn(
+        ggml_backend_t backend,
+        int layer,
+        int chunk,
+        const ggml_tensor * hidden,
+        const ggml_tensor * topk,
+        const ggml_tensor * route_weights,
+        ggml_tensor * down) {
+    if (backend == nullptr ||
+        !ggml_backend_is_rpc(backend) ||
+        layer < 0 ||
+        chunk < 0 ||
+        hidden == nullptr ||
+        topk == nullptr ||
+        route_weights == nullptr ||
+        down == nullptr ||
+        hidden->type != GGML_TYPE_F32 ||
+        topk->type != GGML_TYPE_I32 ||
+        route_weights->type != GGML_TYPE_F32 ||
+        down->type != GGML_TYPE_F32 ||
+        hidden->ne[0] <= 0 ||
+        hidden->ne[1] <= 0 ||
+        topk->ne[0] <= 0 ||
+        topk->ne[1] != hidden->ne[1] ||
+        route_weights->ne[0] != 1 ||
+        route_weights->ne[1] != topk->ne[0] ||
+        route_weights->ne[2] != hidden->ne[1] ||
+        down->ne[0] != hidden->ne[0] ||
+        down->ne[1] != hidden->ne[1]) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(
+            backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    auto sock = get_phone_ffn_socket(
+        rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_PHONE_NPU_FFN_DIRECT_MIN_PATCH = 20;
+    const std::string socket_key =
+        rpc_ctx->endpoint + "_phone_ffn";
+    if (rpc_get_remote_patch(socket_key) <
+            RPC_PHONE_NPU_FFN_DIRECT_MIN_PATCH) {
+        return false;
+    }
+
+    std::vector<uint8_t> hidden_dense;
+    std::vector<uint8_t> topk_dense;
+    std::vector<uint8_t> route_dense;
+
+    const int64_t pack_begin_us = ggml_time_us();
+    if (!rpc_client_read_dense_tensor(
+            hidden,
+            hidden_dense) ||
+        !rpc_client_read_dense_tensor(
+            topk,
+            topk_dense) ||
+        !rpc_client_read_dense_tensor(
+            route_weights,
+            route_dense)) {
+        return false;
+    }
+
+    const size_t output_bytes =
+        (size_t) ggml_nelements(hidden) *
+        sizeof(float);
+    if (ggml_nbytes(down) != output_bytes ||
+        hidden->ne[0] > UINT32_MAX ||
+        hidden->ne[1] > UINT32_MAX ||
+        topk->ne[0] > UINT32_MAX) {
+        return false;
+    }
+
+    rpc_msg_phone_npu_ffn_direct_req request {};
+    request.device = rpc_ctx->device;
+    request.layer = layer;
+    request.chunk = chunk;
+    request.n_embd = (uint32_t) hidden->ne[0];
+    request.n_tokens = (uint32_t) hidden->ne[1];
+    request.n_expert_used = (uint32_t) topk->ne[0];
+    request.hidden_bytes = hidden_dense.size();
+    request.topk_bytes = topk_dense.size();
+    request.route_bytes = route_dense.size();
+
+    if (hidden_dense.size() >
+            SIZE_MAX - topk_dense.size() ||
+        hidden_dense.size() + topk_dense.size() >
+            SIZE_MAX - route_dense.size() ||
+        sizeof(request) >
+            SIZE_MAX -
+            (hidden_dense.size() +
+             topk_dense.size() +
+             route_dense.size())) {
+        return false;
+    }
+
+    std::vector<uint8_t> input(
+        sizeof(request) +
+        hidden_dense.size() +
+        topk_dense.size() +
+        route_dense.size());
+
+    size_t cursor = 0;
+    memcpy(
+        input.data() + cursor,
+        &request,
+        sizeof(request));
+    cursor += sizeof(request);
+
+    memcpy(
+        input.data() + cursor,
+        hidden_dense.data(),
+        hidden_dense.size());
+    cursor += hidden_dense.size();
+
+    memcpy(
+        input.data() + cursor,
+        topk_dense.data(),
+        topk_dense.size());
+    cursor += topk_dense.size();
+
+    memcpy(
+        input.data() + cursor,
+        route_dense.data(),
+        route_dense.size());
+    cursor += route_dense.size();
+    GGML_ASSERT(cursor == input.size());
+
+    const int64_t pack_done_us = ggml_time_us();
+
+    std::vector<uint8_t> output(
+        sizeof(rpc_msg_phone_npu_ffn_direct_rsp) +
+        output_bytes);
+
+    const int64_t rpc_begin_us = ggml_time_us();
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_PHONE_NPU_FFN_DIRECT,
+        input.data(),
+        input.size(),
+        output.data(),
+        output.size());
+    const int64_t rpc_done_us = ggml_time_us();
+
+    if (!status) {
+        return false;
+    }
+
+    rpc_msg_phone_npu_ffn_direct_rsp response {};
+    memcpy(
+        &response,
+        output.data(),
+        sizeof(response));
+
+    if (response.result == 0 ||
+        response.output_bytes != output_bytes) {
+        return false;
+    }
+
+    ggml_backend_tensor_set(
+        down,
+        output.data() + sizeof(response),
+        0,
+        output_bytes);
+    const int64_t set_done_us = ggml_time_us();
+
+    GGML_LOG_INFO(
+        "[INNER_FIFO_PHONE_FFN_RPC] layer=%d chunk=%d tokens=%" PRId64
+        " tx_bytes=%zu rx_bytes=%zu pack_ms=%.3f rpc_ms=%.3f "
+        "set_ms=%.3f status=OK\n",
+        layer,
+        chunk,
+        hidden->ne[1],
+        hidden_dense.size() +
+            topk_dense.size() +
+            route_dense.size(),
+        output_bytes,
+        (pack_done_us - pack_begin_us) / 1000.0,
+        (rpc_done_us - rpc_begin_us) / 1000.0,
+        (set_done_us - rpc_done_us) / 1000.0);
+
+    return true;
+}
+
 static bool ggml_backend_rpc_phone_ffn_mark_ready(
         ggml_backend_t backend,
         uint64_t seq) {
@@ -11529,6 +11766,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return_wait);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_RUN_PRIVATE_FFN_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_run_private_ffn);
     }
     GGML_UNUSED(reg);
 
