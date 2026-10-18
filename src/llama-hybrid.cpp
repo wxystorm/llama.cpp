@@ -2641,6 +2641,58 @@ static bool llama_hybrid_plan_pc_local(
     bool found = false;
     llama_pc_local_sim_result best_sim;
 
+    std::array<llama_hybrid_pc_local_plan, 2> best_by_split {};
+    std::array<llama_pc_local_sim_result, 2>  best_sim_by_split {};
+    std::array<bool, 2> found_by_split { false, false };
+
+    const auto split_index = [](llama_pc_local_split_orientation split) {
+        return split ==
+            llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN ? 0 : 1;
+    };
+
+    const auto sim_better = [](
+            const llama_pc_local_sim_result & sim,
+            const llama_pc_local_sim_result & incumbent,
+            bool incumbent_valid) {
+        return
+            !incumbent_valid ||
+            sim.makespan_ms < incumbent.makespan_ms - 1e-9 ||
+            (std::fabs(sim.makespan_ms - incumbent.makespan_ms) < 1e-9 &&
+             sim.weight_stall_ms < incumbent.weight_stall_ms - 1e-9) ||
+            (std::fabs(sim.makespan_ms - incumbent.makespan_ms) < 1e-9 &&
+             std::fabs(sim.weight_stall_ms - incumbent.weight_stall_ms) < 1e-9 &&
+             sim.peak_weight_bytes < incumbent.peak_weight_bytes);
+    };
+
+    const auto assign_plan = [&](
+            llama_hybrid_pc_local_plan & dst,
+            const llama_pc_local_sim_result & sim,
+            llama_pc_local_split_orientation split,
+            std::vector<llama_pc_local_layer_mode> pattern,
+            int gpu_full) {
+        dst = {};
+        dst.valid = true;
+        dst.applied = false;
+        dst.layer_begin = layer_begin;
+        dst.layer_end = layer_begin + n_layers;
+        dst.chunk_tokens = chunk_tokens;
+        dst.split = split;
+        dst.layer_modes = std::move(pattern);
+        dst.split_layers = n_layers - gpu_full;
+        dst.gpu_full_layers = gpu_full;
+        dst.gpu_weight_budget_bytes = gpu_weight_budget;
+        dst.initial_resident_layers = sim.initial_resident_layers;
+        dst.initial_resident_bytes = sim.initial_resident_bytes;
+        dst.predicted_peak_weight_bytes = sim.peak_weight_bytes;
+        dst.predicted_cpu_busy_ms = sim.cpu_busy_ms;
+        dst.predicted_gpu_busy_ms = sim.gpu_busy_ms;
+        dst.predicted_transfer_busy_ms = sim.transfer_busy_ms;
+        dst.predicted_weight_stall_ms = sim.weight_stall_ms;
+        dst.predicted_ms = sim.makespan_ms;
+        dst.max_cpu_queue = sim.max_cpu_queue;
+        dst.max_gpu_queue = sim.max_gpu_queue;
+    };
+
     for (const auto split : {
             llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN,
             llama_pc_local_split_orientation::GPU_ATTN_CPU_FFN }) {
@@ -2659,55 +2711,24 @@ static bool llama_hybrid_plan_pc_local(
                     continue;
                 }
 
-                const bool better =
-                    !found ||
-                    sim.makespan_ms < best_sim.makespan_ms - 1e-9 ||
-                    (std::fabs(
-                         sim.makespan_ms - best_sim.makespan_ms) < 1e-9 &&
-                     sim.weight_stall_ms <
-                         best_sim.weight_stall_ms - 1e-9) ||
-                    (std::fabs(
-                         sim.makespan_ms - best_sim.makespan_ms) < 1e-9 &&
-                     std::fabs(
-                         sim.weight_stall_ms -
-                         best_sim.weight_stall_ms) < 1e-9 &&
-                     sim.peak_weight_bytes <
-                         best_sim.peak_weight_bytes);
-                if (!better) {
-                    continue;
+                const int si = split_index(split);
+                if (sim_better(
+                        sim, best_sim_by_split[(size_t) si],
+                        found_by_split[(size_t) si])) {
+                    found_by_split[(size_t) si] = true;
+                    best_sim_by_split[(size_t) si] = sim;
+                    assign_plan(
+                        best_by_split[(size_t) si],
+                        sim, split, pattern, gpu_full);
                 }
 
-                found = true;
-                best_sim = sim;
-                best.valid = true;
-                best.applied = false;
-                best.layer_begin = layer_begin;
-                best.layer_end = layer_begin + n_layers;
-                best.chunk_tokens = chunk_tokens;
-                best.split = split;
-                best.layer_modes = std::move(pattern);
-                best.split_layers = n_layers - gpu_full;
-                best.gpu_full_layers = gpu_full;
-                best.gpu_weight_budget_bytes =
-                    gpu_weight_budget;
-                best.initial_resident_layers =
-                    sim.initial_resident_layers;
-                best.initial_resident_bytes =
-                    sim.initial_resident_bytes;
-                best.predicted_peak_weight_bytes =
-                    sim.peak_weight_bytes;
-                best.predicted_cpu_busy_ms =
-                    sim.cpu_busy_ms;
-                best.predicted_gpu_busy_ms =
-                    sim.gpu_busy_ms;
-                best.predicted_transfer_busy_ms =
-                    sim.transfer_busy_ms;
-                best.predicted_weight_stall_ms =
-                    sim.weight_stall_ms;
-                best.predicted_ms =
-                    sim.makespan_ms;
-                best.max_cpu_queue = sim.max_cpu_queue;
-                best.max_gpu_queue = sim.max_gpu_queue;
+                if (sim_better(sim, best_sim, found)) {
+                    found = true;
+                    best_sim = sim;
+                    assign_plan(
+                        best, sim, split, std::move(pattern),
+                        gpu_full);
+                }
             }
         }
     }
@@ -2716,65 +2737,107 @@ static bool llama_hybrid_plan_pc_local(
         return false;
     }
 
-    double cpu_attn = 0.0;
-    double gpu_attn = 0.0;
-    double cpu_attn_base = 0.0;
-    double gpu_attn_base = 0.0;
-    double cpu_full = 0.0;
-    double gpu_full = 0.0;
-    if (llama_hybrid_attn_cost(
-            profile.cpu_attn, chunk_tokens, chunk_tokens,
-            cpu_attn) &&
-        llama_hybrid_attn_cost(
-            profile.gpu_attn, chunk_tokens, chunk_tokens,
-            gpu_attn) &&
-        llama_hybrid_attn_cost(
-            profile.cpu_attn, chunk_tokens, chunk_tokens,
-            cpu_attn_base) &&
-        llama_hybrid_attn_cost(
-            profile.gpu_attn, chunk_tokens, chunk_tokens,
-            gpu_attn_base) &&
-        llama_hybrid_layer_block_cost(
-            profile.cpu_layer_blocks, chunk_tokens,
-            false, cpu_full) &&
-        llama_hybrid_layer_block_cost(
-            profile.gpu_layer_blocks, chunk_tokens,
-            false, gpu_full)) {
-        best.cpu_attn_ms = cpu_attn;
-        best.gpu_attn_ms = gpu_attn;
-        best.cpu_ffn_ms =
-            std::max(0.0, cpu_full - cpu_attn_base);
-        best.gpu_ffn_ms =
-            std::max(0.0, gpu_full - gpu_attn_base);
+    const auto finalize_metrics =
+        [&](llama_hybrid_pc_local_plan & plan) {
+            if (!plan.valid) {
+                return;
+            }
+
+            double cpu_attn = 0.0;
+            double gpu_attn = 0.0;
+            double cpu_attn_base = 0.0;
+            double gpu_attn_base = 0.0;
+            double cpu_full = 0.0;
+            double gpu_full = 0.0;
+            if (llama_hybrid_attn_cost(
+                    profile.cpu_attn, chunk_tokens, chunk_tokens,
+                    cpu_attn) &&
+                llama_hybrid_attn_cost(
+                    profile.gpu_attn, chunk_tokens, chunk_tokens,
+                    gpu_attn) &&
+                llama_hybrid_attn_cost(
+                    profile.cpu_attn, chunk_tokens, chunk_tokens,
+                    cpu_attn_base) &&
+                llama_hybrid_attn_cost(
+                    profile.gpu_attn, chunk_tokens, chunk_tokens,
+                    gpu_attn_base) &&
+                llama_hybrid_layer_block_cost(
+                    profile.cpu_layer_blocks, chunk_tokens,
+                    false, cpu_full) &&
+                llama_hybrid_layer_block_cost(
+                    profile.gpu_layer_blocks, chunk_tokens,
+                    false, gpu_full)) {
+                plan.cpu_attn_ms = cpu_attn;
+                plan.gpu_attn_ms = gpu_attn;
+                plan.cpu_ffn_ms =
+                    std::max(0.0, cpu_full - cpu_attn_base);
+                plan.gpu_ffn_ms =
+                    std::max(0.0, gpu_full - gpu_attn_base);
+            }
+
+            size_t reference_weight = 0;
+            for (int il = 0; il < n_layers; ++il) {
+                if (plan.layer_modes[(size_t) il] ==
+                        llama_pc_local_layer_mode::SPLIT) {
+                    reference_weight =
+                        llama_pc_local_layer_gpu_weight_bytes(
+                            profile, layer_begin + il, plan.split,
+                            llama_pc_local_layer_mode::SPLIT);
+                    break;
+                }
+            }
+            if (reference_weight == 0 && n_layers > 0) {
+                reference_weight =
+                    llama_pc_local_layer_gpu_weight_bytes(
+                        profile, layer_begin, plan.split,
+                        plan.layer_modes.front());
+            }
+
+            double reference_ms = 0.0;
+            if (reference_weight > 0 &&
+                llama_hybrid_transfer_cost(
+                    profile.pc_to_gpu_weight,
+                    reference_weight, reference_ms, true) &&
+                reference_ms > 0.0) {
+                plan.weight_h2d_gbps =
+                    (double) reference_weight /
+                    (reference_ms / 1000.0) / 1.0e9;
+            }
+        };
+
+    finalize_metrics(best);
+    for (auto & candidate : best_by_split) {
+        finalize_metrics(candidate);
     }
 
-    size_t reference_weight = 0;
-    for (int il = 0; il < n_layers; ++il) {
-        if (best.layer_modes[(size_t) il] ==
-                llama_pc_local_layer_mode::SPLIT) {
-            reference_weight =
-                llama_pc_local_layer_gpu_weight_bytes(
-                    profile, layer_begin + il, best.split,
-                    llama_pc_local_layer_mode::SPLIT);
-            break;
+    // Always expose the best candidate for each split direction before
+    // printing the globally selected candidate.  This keeps the search broad
+    // while making it obvious whether the original CPU_ATTN_GPU_FFN design is
+    // close to or far from the reverse orientation.
+    for (size_t i = 0; i < best_by_split.size(); ++i) {
+        const auto & candidate = best_by_split[i];
+        if (!candidate.valid) {
+            continue;
         }
-    }
-    if (reference_weight == 0 && n_layers > 0) {
-        reference_weight =
-            llama_pc_local_layer_gpu_weight_bytes(
-                profile, layer_begin, best.split,
-                best.layer_modes.front());
-    }
-
-    double reference_ms = 0.0;
-    if (reference_weight > 0 &&
-        llama_hybrid_transfer_cost(
-            profile.pc_to_gpu_weight,
-            reference_weight, reference_ms, true) &&
-        reference_ms > 0.0) {
-        best.weight_h2d_gbps =
-            (double) reference_weight /
-            (reference_ms / 1000.0) / 1.0e9;
+        LLAMA_LOG_ERROR(
+            "[PC_LOCAL_PLAN_CANDIDATE] orientation=%s split=%d full=%d "
+            "makespan_ms=%.3f cpu_ms=%.3f gpu_ms=%.3f xfer_ms=%.3f "
+            "stall_ms=%.3f initial_layers=%d peak_mib=%.1f\n",
+            llama_pc_local_split_name(candidate.split),
+            candidate.split_layers,
+            candidate.gpu_full_layers,
+            candidate.predicted_ms,
+            candidate.predicted_cpu_busy_ms,
+            candidate.predicted_gpu_busy_ms,
+            candidate.predicted_transfer_busy_ms,
+            candidate.predicted_weight_stall_ms,
+            candidate.initial_resident_layers,
+            candidate.predicted_peak_weight_bytes / 1048576.0);
+        LLAMA_LOG_ERROR(
+            "[PC_LOCAL_PLAN_CANDIDATE_PATTERN] orientation=%s pattern=%s\n",
+            llama_pc_local_split_name(candidate.split),
+            llama_pc_local_pattern_string(
+                candidate.layer_modes).c_str());
     }
 
     return true;
