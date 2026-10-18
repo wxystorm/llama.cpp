@@ -202,6 +202,12 @@ struct llama_hybrid_profile {
     double decode_tail_ms         = 0.0;
 
     std::vector<llama_hybrid_transfer_point> gpu_to_pc;
+
+    // Large host/RAM -> CUDA copies used by the PC local weight-streaming
+    // planner.  This is intentionally separate from activation transfer
+    // profiling because the relevant sizes are tens to hundreds of MiB.
+    std::vector<llama_hybrid_transfer_point> pc_to_gpu_weight;
+
     std::vector<llama_hybrid_transfer_point> pc_to_phone;
     // Measured SET_TENSOR_ASYNC_RETURN_WAIT round trip. Keys are the original
     // F32 output size; samples include F16 wire conversion when enabled.
@@ -412,6 +418,59 @@ struct llama_hybrid_decode_plan {
     size_t gpu_memory   = 0;
 };
 
+enum class llama_pc_local_split_orientation {
+    NONE,
+    CPU_ATTN_GPU_FFN,
+    GPU_ATTN_CPU_FFN,
+};
+
+enum class llama_pc_local_layer_mode : uint8_t {
+    SPLIT,
+    GPU_FULL,
+};
+
+// Inner plan for a PC_ONLY region.  This is deliberately a backend-mapping
+// and residency plan, not a scheduler policy: runtime execution will still be
+// complete -> push_back(next ready task) -> FIFO.
+struct llama_hybrid_pc_local_plan {
+    bool valid   = false;
+    bool applied = false; // phase 1 is prediction/logging only
+
+    int layer_begin  = 0;
+    int layer_end    = 0;
+    int chunk_tokens = 128;
+
+    llama_pc_local_split_orientation split =
+        llama_pc_local_split_orientation::NONE;
+    std::vector<llama_pc_local_layer_mode> layer_modes;
+
+    int split_layers    = 0;
+    int gpu_full_layers = 0;
+
+    size_t gpu_weight_budget_bytes    = 0;
+    size_t initial_resident_bytes     = 0;
+    int    initial_resident_layers    = 0;
+    size_t predicted_peak_weight_bytes = 0;
+
+    // Stage anchors at chunk_tokens.  Attention is reported at KV=query for
+    // readability; the simulator uses KV-aware Attention points per chunk.
+    double cpu_attn_ms = 0.0;
+    double cpu_ffn_ms  = 0.0;
+    double gpu_attn_ms = 0.0;
+    double gpu_ffn_ms  = 0.0;
+
+    double weight_h2d_gbps = 0.0;
+
+    double predicted_cpu_busy_ms      = 0.0;
+    double predicted_gpu_busy_ms      = 0.0;
+    double predicted_transfer_busy_ms = 0.0;
+    double predicted_weight_stall_ms  = 0.0;
+    double predicted_ms               = 0.0;
+
+    int max_cpu_queue = 0;
+    int max_gpu_queue = 0;
+};
+
 struct llama_hybrid_plan {
     int tensor_layers = 0;
     int phone_layers  = 0;
@@ -453,6 +512,10 @@ struct llama_hybrid_plan {
     size_t pc_memory    = 0;
     size_t phone_memory = 0;
     size_t gpu_memory   = 0;
+
+    // Prediction-only in phase 1.  It must not change existing model
+    // placement until the new FULL task/runtime path is implemented.
+    llama_hybrid_pc_local_plan pc_local;
 };
 
 enum class llama_hybrid_boundary_action {
