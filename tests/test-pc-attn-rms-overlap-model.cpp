@@ -55,6 +55,7 @@ struct options {
     int iters = 50;
     int cpu_threads = 0;
     int copy_prime = 16;
+    int stabilize_ms = 1500;
 };
 
 static void usage(const char * argv0) {
@@ -68,7 +69,8 @@ static void usage(const char * argv0) {
         "  --warmup N           warmup block iterations (default: 5)\n"
         "  --iters N            measured block iterations per phase (default: 50)\n"
         "  --cpu-threads N      CPU RMS threads (default: min(8, HW threads))\n"
-        "  --copy-prime N       D2H/H2D prime iterations before fused-only phase (default: 16)\n",
+        "  --copy-prime N       D2H/H2D prime iterations before paired phase (default: 16)\n"
+        "  --stabilize-ms N      GPU serial burn-in before measurement (default: 1500 ms)\n",
         argv0);
 }
 
@@ -134,6 +136,9 @@ static bool parse_options(int argc, char ** argv, options & opt) {
         } else if (a == "--copy-prime") {
             const char * s = need("--copy-prime");
             if (!s || !parse_i32(s, opt.copy_prime)) return false;
+        } else if (a == "--stabilize-ms") {
+            const char * s = need("--stabilize-ms");
+            if (!s || !parse_i32(s, opt.stabilize_ms)) return false;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             return false;
@@ -142,7 +147,8 @@ static bool parse_options(int argc, char ** argv, options & opt) {
 
     if (opt.model_path.empty() || opt.device < 0 || opt.start_layer < 0 ||
         opt.layers <= 0 || opt.tokens <= 0 || opt.warmup < 0 ||
-        opt.iters <= 0 || opt.cpu_threads < 0 || opt.copy_prime < 0) {
+        opt.iters <= 0 || opt.cpu_threads < 0 || opt.copy_prime < 0 ||
+        opt.stabilize_ms < 0) {
         return false;
     }
 
@@ -779,11 +785,12 @@ int main(int argc, char ** argv) {
     std::printf(
         "[PC_RMS_REAL_CONFIG] device=%d device_name=\"%s\""
         " layers=[%d,%d) tokens=%" PRId64
-        " warmup=%d iters=%d cpu_threads=%d cpu_kernel=%s copy_prime=%d"
+        " warmup=%d iters=%d cpu_threads=%d cpu_kernel=%s copy_prime=%d stabilize_ms=%d"
         " x_bytes=%zu return_bytes=%zu eps=%.9g\n",
         opt.device, dev_desc,
         opt.start_layer, opt.start_layer + opt.layers, opt.tokens,
-        opt.warmup, opt.iters, cpu_pool.n_threads(), cpu_kernel_name(), opt.copy_prime,
+        opt.warmup, opt.iters, cpu_pool.n_threads(), cpu_kernel_name(),
+        opt.copy_prime, opt.stabilize_ms,
         x_bytes, r_bytes, cases[0].eps);
 
     // Real-weight correctness of the algebraic split. The timed fused mode
@@ -830,66 +837,111 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<double>> layer_cpu((size_t) opt.layers);
     std::vector<std::vector<double>> layer_join_tail((size_t) opt.layers);
 
-    std::vector<double> block_serial_pre;
-    std::vector<double> block_serial_post;
-    std::vector<double> block_serial_all;
-    std::vector<double> block_fused;
-    block_serial_pre.reserve(opt.iters);
-    block_serial_post.reserve(opt.iters);
-    block_serial_all.reserve((size_t) opt.iters * 2);
-    block_fused.reserve(opt.iters);
-
-    // Phase A: baseline only. Do not touch the copy stream while measuring.
-    for (int w = 0; w < opt.warmup; ++w) {
-        for (auto & lc : cases) (void) run_serial_layer(lc);
-    }
-    for (int it = 0; it < opt.iters; ++it) {
+    auto run_serial_block = [&](bool record) -> double {
         const auto b0 = clock_type::now();
         for (int i = 0; i < opt.layers; ++i) {
-            layer_serial[(size_t) i].push_back(
-                run_serial_layer(cases[(size_t) i]));
+            const double ms = run_serial_layer(cases[(size_t) i]);
+            if (record) {
+                layer_serial[(size_t) i].push_back(ms);
+            }
         }
-        const double wall = elapsed_ms(b0, clock_type::now());
-        block_serial_pre.push_back(wall);
-        block_serial_all.push_back(wall);
-    }
+        return elapsed_ms(b0, clock_type::now());
+    };
 
-    // Prime the copy stream immediately before the fused-only phase. This
-    // distinguishes steady-state transfer cost from copy-engine/stream wakeup.
+    auto run_fused_block = [&](bool record) -> double {
+        const auto b0 = clock_type::now();
+        for (int i = 0; i < opt.layers; ++i) {
+            const fused_sample s = run_fused_layer(cases[(size_t) i]);
+            if (record) {
+                layer_fused[(size_t) i].push_back(s.wall_ms);
+                layer_d2h[(size_t) i].push_back(s.d2h_ms);
+                layer_cpu[(size_t) i].push_back(s.cpu_ms);
+                layer_join_tail[(size_t) i].push_back(s.join_tail_ms);
+            }
+        }
+        return elapsed_ms(b0, clock_type::now());
+    };
+
+    // The laptop GPU showed a large pre/post frequency drift in the first
+    // real-weight probe. Stabilize on the exact serial block before comparing
+    // implementations so that a clock ramp cannot masquerade as a speedup.
+    const auto stabilize_begin = clock_type::now();
+    int stabilize_blocks = 0;
+    while (elapsed_ms(stabilize_begin, clock_type::now()) < opt.stabilize_ms) {
+        (void) run_serial_block(false);
+        ++stabilize_blocks;
+        if (opt.stabilize_ms == 0) {
+            break;
+        }
+    }
+    const double stabilize_actual_ms =
+        elapsed_ms(stabilize_begin, clock_type::now());
+    std::printf(
+        "[PC_RMS_REAL_STABILIZE] requested_ms=%d actual_ms=%.3f blocks=%d\n",
+        opt.stabilize_ms, stabilize_actual_ms, stabilize_blocks);
+
+    // Keep the copy engine hot before the paired test. The first D2H after a
+    // long idle period is intentionally excluded from the authoritative A/B.
     prime_copy_path(opt.copy_prime);
 
-    // Phase B: fused-only continuous blocks. Layer 0 now follows layer N-1
-    // from the previous block instead of following a GPU-serial block.
+    // Warm both paths using the same ABBA/B AAB ordering used below. This also
+    // gives CUDA graph capture a chance to settle for every per-layer graph.
     for (int w = 0; w < opt.warmup; ++w) {
-        for (auto & lc : cases) (void) run_fused_layer(lc);
-    }
-    for (int it = 0; it < opt.iters; ++it) {
-        const auto b0 = clock_type::now();
-        for (int i = 0; i < opt.layers; ++i) {
-            const fused_sample s =
-                run_fused_layer(cases[(size_t) i]);
-            layer_fused[(size_t) i].push_back(s.wall_ms);
-            layer_d2h[(size_t) i].push_back(s.d2h_ms);
-            layer_cpu[(size_t) i].push_back(s.cpu_ms);
-            layer_join_tail[(size_t) i].push_back(s.join_tail_ms);
+        if ((w & 1) == 0) {
+            (void) run_serial_block(false);
+            (void) run_fused_block(false);
+            (void) run_fused_block(false);
+            (void) run_serial_block(false);
+        } else {
+            (void) run_fused_block(false);
+            (void) run_serial_block(false);
+            (void) run_serial_block(false);
+            (void) run_fused_block(false);
         }
-        block_fused.push_back(elapsed_ms(b0, clock_type::now()));
     }
 
-    // Phase C: baseline recheck to expose GPU clock / thermal drift rather
-    // than accidentally crediting that drift to the fused helper path.
-    for (int w = 0; w < opt.warmup; ++w) {
-        for (auto & lc : cases) (void) run_serial_layer(lc);
-    }
+    // Authoritative measurement: two serial and two fused blocks are kept in
+    // a very short time window. Alternating ABBA and BAAB cancels first-order
+    // clock/thermal drift while avoiding a systematic first/last advantage.
+    std::vector<double> paired_serial_ms;
+    std::vector<double> paired_fused_ms;
+    std::vector<double> paired_delta_ms;
+    std::vector<double> paired_speedup;
+    paired_serial_ms.reserve(opt.iters);
+    paired_fused_ms.reserve(opt.iters);
+    paired_delta_ms.reserve(opt.iters);
+    paired_speedup.reserve(opt.iters);
+
+    int fused_wins = 0;
+
     for (int it = 0; it < opt.iters; ++it) {
-        const auto b0 = clock_type::now();
-        for (int i = 0; i < opt.layers; ++i) {
-            layer_serial[(size_t) i].push_back(
-                run_serial_layer(cases[(size_t) i]));
+        double s0 = 0.0;
+        double s1 = 0.0;
+        double f0 = 0.0;
+        double f1 = 0.0;
+
+        if ((it & 1) == 0) {
+            s0 = run_serial_block(true);
+            f0 = run_fused_block(true);
+            f1 = run_fused_block(true);
+            s1 = run_serial_block(true);
+        } else {
+            f0 = run_fused_block(true);
+            s0 = run_serial_block(true);
+            s1 = run_serial_block(true);
+            f1 = run_fused_block(true);
         }
-        const double wall = elapsed_ms(b0, clock_type::now());
-        block_serial_post.push_back(wall);
-        block_serial_all.push_back(wall);
+
+        const double serial_avg = 0.5 * (s0 + s1);
+        const double fused_avg  = 0.5 * (f0 + f1);
+        paired_serial_ms.push_back(serial_avg);
+        paired_fused_ms.push_back(fused_avg);
+        paired_delta_ms.push_back(serial_avg - fused_avg);
+        paired_speedup.push_back(
+            fused_avg > 0.0 ? serial_avg / fused_avg : 0.0);
+        if (fused_avg < serial_avg) {
+            ++fused_wins;
+        }
     }
 
     for (int i = 0; i < opt.layers; ++i) {
@@ -901,14 +953,14 @@ int main(int argc, char ** argv) {
 
         std::printf(
             "[PC_RMS_REAL_PER_LAYER] layer=%d"
-            " gpu_serial_mean_ms=%.6f gpu_serial_p50_ms=%.6f gpu_serial_p95_ms=%.6f"
+            " gpu_serial_mean_ms=%.6f gpu_serial_p50_ms=%.6f gpu_serial_p95_ms=%.6f gpu_serial_p99_ms=%.6f"
             " fused_mean_ms=%.6f fused_p50_ms=%.6f fused_p95_ms=%.6f fused_p99_ms=%.6f fused_max_ms=%.6f"
             " d2h_mean_ms=%.6f d2h_p50_ms=%.6f d2h_p95_ms=%.6f d2h_p99_ms=%.6f d2h_max_ms=%.6f"
             " cpu_mean_ms=%.6f cpu_p50_ms=%.6f cpu_p95_ms=%.6f cpu_p99_ms=%.6f cpu_max_ms=%.6f"
             " join_tail_mean_ms=%.6f join_tail_p50_ms=%.6f join_tail_p95_ms=%.6f join_tail_p99_ms=%.6f join_tail_max_ms=%.6f"
             " delta_ms=%.6f speedup=%.6fx\n",
             cases[(size_t) i].il,
-            a.mean, a.p50, a.p95,
+            a.mean, a.p50, a.p95, a.p99,
             b.mean, b.p50, b.p95, b.p99, b.max,
             d.mean, d.p50, d.p95, d.p99, d.max,
             cp.mean, cp.p50, cp.p95, cp.p99, cp.max,
@@ -917,49 +969,66 @@ int main(int argc, char ** argv) {
             b.mean > 0.0 ? a.mean / b.mean : 0.0);
     }
 
-    const stats bs_pre = summarize(block_serial_pre);
-    const stats bs_post = summarize(block_serial_post);
-    const stats bs = summarize(block_serial_all);
-    const stats bf = summarize(block_fused);
+    const stats ps = summarize(paired_serial_ms);
+    const stats pf = summarize(paired_fused_ms);
+    const stats pd = summarize(paired_delta_ms);
+    const stats pr = summarize(paired_speedup);
+
+    const size_t drift_n =
+        std::max<size_t>(1, paired_serial_ms.size() / 4);
+    std::vector<double> serial_first(
+        paired_serial_ms.begin(),
+        paired_serial_ms.begin() + drift_n);
+    std::vector<double> serial_last(
+        paired_serial_ms.end() - drift_n,
+        paired_serial_ms.end());
+    std::vector<double> fused_first(
+        paired_fused_ms.begin(),
+        paired_fused_ms.begin() + drift_n);
+    std::vector<double> fused_last(
+        paired_fused_ms.end() - drift_n,
+        paired_fused_ms.end());
+
+    const stats sf = summarize(serial_first);
+    const stats sl = summarize(serial_last);
+    const stats ff = summarize(fused_first);
+    const stats fl = summarize(fused_last);
 
     std::printf(
-        "[PC_RMS_REAL_BLOCK] mode=GPU_SERIAL_PRE layers=%d"
-        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
-        opt.layers, bs_pre.mean, bs_pre.p50, bs_pre.p95,
-        bs_pre.p99, bs_pre.min, bs_pre.max);
+        "[PC_RMS_REAL_PAIRED] pattern=ABBA_BAAB pairs=%d"
+        " serial_mean_ms=%.6f serial_p50_ms=%.6f serial_p95_ms=%.6f serial_p99_ms=%.6f"
+        " fused_mean_ms=%.6f fused_p50_ms=%.6f fused_p95_ms=%.6f fused_p99_ms=%.6f"
+        " delta_mean_ms=%.6f delta_p50_ms=%.6f delta_p95_ms=%.6f"
+        " speedup_mean=%.6fx speedup_p50=%.6fx"
+        " fused_wins=%d fused_win_ratio=%.3f\n",
+        opt.iters,
+        ps.mean, ps.p50, ps.p95, ps.p99,
+        pf.mean, pf.p50, pf.p95, pf.p99,
+        pd.mean, pd.p50, pd.p95,
+        pr.mean, pr.p50,
+        fused_wins,
+        opt.iters > 0 ? (double) fused_wins / (double) opt.iters : 0.0);
 
     std::printf(
-        "[PC_RMS_REAL_BLOCK] mode=FUSED_ONLY layers=%d"
-        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
-        opt.layers, bf.mean, bf.p50, bf.p95,
-        bf.p99, bf.min, bf.max);
-
-    std::printf(
-        "[PC_RMS_REAL_BLOCK] mode=GPU_SERIAL_POST layers=%d"
-        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
-        opt.layers, bs_post.mean, bs_post.p50, bs_post.p95,
-        bs_post.p99, bs_post.min, bs_post.max);
-
-    std::printf(
-        "[PC_RMS_REAL_DRIFT]"
-        " serial_pre_mean_ms=%.6f serial_post_mean_ms=%.6f"
-        " serial_post_over_pre=%.6fx"
-        " serial_pre_p50_ms=%.6f serial_post_p50_ms=%.6f\n",
-        bs_pre.mean, bs_post.mean,
-        bs_pre.mean > 0.0 ? bs_post.mean / bs_pre.mean : 0.0,
-        bs_pre.p50, bs_post.p50);
+        "[PC_RMS_REAL_DRIFT] quarter=%zu"
+        " serial_first_mean_ms=%.6f serial_last_mean_ms=%.6f serial_last_over_first=%.6fx"
+        " fused_first_mean_ms=%.6f fused_last_mean_ms=%.6f fused_last_over_first=%.6fx\n",
+        drift_n,
+        sf.mean, sl.mean, sf.mean > 0.0 ? sl.mean / sf.mean : 0.0,
+        ff.mean, fl.mean, ff.mean > 0.0 ? fl.mean / ff.mean : 0.0);
 
     std::printf(
         "[PC_RMS_REAL_RESULT] correctness=%s"
         " layers=[%d,%d) tokens=%" PRId64
-        " baseline_combined_mean_ms=%.6f fused_only_mean_ms=%.6f"
-        " delta_ms=%.6f speedup=%.6fx verdict=%s\n",
+        " paired_serial_mean_ms=%.6f paired_fused_mean_ms=%.6f"
+        " delta_ms=%.6f speedup=%.6fx fused_win_ratio=%.3f verdict=%s\n",
         all_correct ? "PASS" : "FAIL",
         opt.start_layer, opt.start_layer + opt.layers, opt.tokens,
-        bs.mean, bf.mean,
-        bs.mean - bf.mean,
-        bf.mean > 0.0 ? bs.mean / bf.mean : 0.0,
-        all_correct && bf.mean < bs.mean ?
+        ps.mean, pf.mean,
+        ps.mean - pf.mean,
+        pf.mean > 0.0 ? ps.mean / pf.mean : 0.0,
+        opt.iters > 0 ? (double) fused_wins / (double) opt.iters : 0.0,
+        all_correct && pf.mean < ps.mean ?
             "REAL_WEIGHT_FUSED_BOUND_FASTER" :
         all_correct ? "REAL_WEIGHT_GPU_SERIAL_FASTER_OR_EQUAL" :
             "INVALID_CORRECTNESS");
