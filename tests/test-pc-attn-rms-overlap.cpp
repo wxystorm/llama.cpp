@@ -11,10 +11,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(__AVX2__) || defined(_M_AVX2)
+#include <immintrin.h>
+#endif
 
 // Standalone microbenchmark for the PC Attention-entry split discussed in the
 // hybrid scheduler work.
@@ -52,6 +59,7 @@ struct options {
     int64_t kv_dim = 512;
     int warmup = 10;
     int iters = 100;
+    int cpu_threads = 0;
     float eps = 1.0e-6f;
     enum ggml_type weight_type = GGML_TYPE_Q4_K;
 };
@@ -66,6 +74,7 @@ static void usage(const char * argv0) {
         "  --kv-dim N          K/V projection width (default: 512)\n"
         "  --warmup N          warmup iterations (default: 10)\n"
         "  --iters N           measured iterations (default: 100)\n"
+        "  --cpu-threads N     CPU RMS threads (default: min(8, hardware threads))\n"
         "  --eps X             RMSNorm epsilon (default: 1e-6)\n"
         "  --weight-type TYPE  q4_k | q6_k | q4_0 (default: q4_k)\n",
         argv0);
@@ -125,6 +134,9 @@ static bool parse_options(int argc, char ** argv, options & opt) {
         } else if (a == "--iters") {
             const char * s = need("--iters");
             if (!s || !parse_i32(s, opt.iters)) return false;
+        } else if (a == "--cpu-threads") {
+            const char * s = need("--cpu-threads");
+            if (!s || !parse_i32(s, opt.cpu_threads)) return false;
         } else if (a == "--eps") {
             const char * s = need("--eps");
             if (!s) return false;
@@ -151,8 +163,15 @@ static bool parse_options(int argc, char ** argv, options & opt) {
     }
 
     if (opt.device < 0 || opt.tokens <= 0 || opt.n_embd <= 0 || opt.q_dim <= 0 ||
-        opt.kv_dim <= 0 || opt.warmup < 0 || opt.iters <= 0 || opt.eps <= 0.0f) {
+        opt.kv_dim <= 0 || opt.warmup < 0 || opt.iters <= 0 || opt.cpu_threads < 0 || opt.eps <= 0.0f) {
         return false;
+    }
+
+    if (opt.cpu_threads == 0) {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        opt.cpu_threads = std::min<int>(8, std::min<int>((int) hw, (int) opt.tokens));
+    } else {
+        opt.cpu_threads = std::min<int>(opt.cpu_threads, (int) opt.tokens);
     }
 
     const int64_t bs = ggml_blck_size(opt.weight_type);
@@ -214,7 +233,57 @@ static bool set_quantized_weight(
     return true;
 }
 
-static void cpu_rms_inv(
+static float cpu_sum_sq_fast(const float * row, int64_t n_embd) {
+#if defined(__AVX2__) || defined(_M_AVX2)
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+
+    int64_t i = 0;
+    for (; i + 16 <= n_embd; i += 16) {
+        const __m256 x0 = _mm256_loadu_ps(row + i + 0);
+        const __m256 x1 = _mm256_loadu_ps(row + i + 8);
+#if defined(__FMA__) || defined(_M_FMA)
+        sum0 = _mm256_fmadd_ps(x0, x0, sum0);
+        sum1 = _mm256_fmadd_ps(x1, x1, sum1);
+#else
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(x0, x0));
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(x1, x1));
+#endif
+    }
+
+    const __m256 sum = _mm256_add_ps(sum0, sum1);
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, sum);
+
+    float total =
+        lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+        lanes[4] + lanes[5] + lanes[6] + lanes[7];
+
+    for (; i < n_embd; ++i) {
+        total += row[i] * row[i];
+    }
+    return total;
+#else
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    int64_t i = 0;
+    for (; i + 4 <= n_embd; i += 4) {
+        sum0 += row[i + 0] * row[i + 0];
+        sum1 += row[i + 1] * row[i + 1];
+        sum2 += row[i + 2] * row[i + 2];
+        sum3 += row[i + 3] * row[i + 3];
+    }
+    float total = sum0 + sum1 + sum2 + sum3;
+    for (; i < n_embd; ++i) {
+        total += row[i] * row[i];
+    }
+    return total;
+#endif
+}
+
+static void cpu_rms_inv_scalar(
         const float * x,
         float * inv_r,
         int64_t n_embd,
@@ -222,13 +291,151 @@ static void cpu_rms_inv(
         float eps) {
     for (int64_t t = 0; t < tokens; ++t) {
         const float * row = x + t * n_embd;
-        double sum_sq = 0.0;
+        float sum_sq = 0.0f;
         for (int64_t i = 0; i < n_embd; ++i) {
-            const double v = row[i];
-            sum_sq += v * v;
+            sum_sq += row[i] * row[i];
         }
-        inv_r[t] = 1.0f / std::sqrt((float) (sum_sq / (double) n_embd) + eps);
+        inv_r[t] = 1.0f / std::sqrt(sum_sq / (float) n_embd + eps);
     }
+}
+
+class cpu_rms_pool {
+public:
+    explicit cpu_rms_pool(int n_threads) :
+        n_threads_(std::max(1, n_threads)) {
+        for (int tid = 1; tid < n_threads_; ++tid) {
+            workers_.emplace_back([this, tid]() { worker_loop(tid); });
+        }
+    }
+
+    ~cpu_rms_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+            generation_++;
+        }
+        start_cv_.notify_all();
+        for (std::thread & t : workers_) {
+            t.join();
+        }
+    }
+
+    void run(
+            const float * x,
+            float * inv_r,
+            int64_t n_embd,
+            int64_t tokens,
+            float eps) {
+        if (n_threads_ == 1) {
+            compute_range(0, x, inv_r, n_embd, tokens, eps);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            x_ = x;
+            inv_r_ = inv_r;
+            n_embd_ = n_embd;
+            tokens_ = tokens;
+            eps_ = eps;
+            done_workers_ = 0;
+            generation_++;
+        }
+        start_cv_.notify_all();
+
+        // The caller is worker 0. This avoids wasting one hardware thread on
+        // synchronization and reduces the wake-up overhead for this small job.
+        compute_range(0, x, inv_r, n_embd, tokens, eps);
+
+        std::unique_lock<std::mutex> lock(mu_);
+        done_cv_.wait(lock, [&]() { return done_workers_ == n_threads_ - 1; });
+    }
+
+    int n_threads() const {
+        return n_threads_;
+    }
+
+private:
+    void compute_range(
+            int tid,
+            const float * x,
+            float * inv_r,
+            int64_t n_embd,
+            int64_t tokens,
+            float eps) const {
+        const int64_t t0 = tokens * tid / n_threads_;
+        const int64_t t1 = tokens * (tid + 1) / n_threads_;
+
+        for (int64_t t = t0; t < t1; ++t) {
+            const float sum_sq = cpu_sum_sq_fast(x + t * n_embd, n_embd);
+            inv_r[t] = 1.0f / std::sqrt(sum_sq / (float) n_embd + eps);
+        }
+    }
+
+    void worker_loop(int tid) {
+        uint64_t seen_generation = 0;
+        for (;;) {
+            const float * x = nullptr;
+            float * inv_r = nullptr;
+            int64_t n_embd = 0;
+            int64_t tokens = 0;
+            float eps = 0.0f;
+
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                start_cv_.wait(lock, [&]() {
+                    return stop_ || generation_ != seen_generation;
+                });
+                if (stop_) {
+                    return;
+                }
+
+                seen_generation = generation_;
+                x = x_;
+                inv_r = inv_r_;
+                n_embd = n_embd_;
+                tokens = tokens_;
+                eps = eps_;
+            }
+
+            compute_range(tid, x, inv_r, n_embd, tokens, eps);
+
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                done_workers_++;
+            }
+            done_cv_.notify_one();
+        }
+    }
+
+    int n_threads_ = 1;
+    std::vector<std::thread> workers_;
+
+    std::mutex mu_;
+    std::condition_variable start_cv_;
+    std::condition_variable done_cv_;
+
+    bool stop_ = false;
+    uint64_t generation_ = 0;
+    int done_workers_ = 0;
+
+    const float * x_ = nullptr;
+    float * inv_r_ = nullptr;
+    int64_t n_embd_ = 0;
+    int64_t tokens_ = 0;
+    float eps_ = 0.0f;
+};
+
+static const char * cpu_kernel_name() {
+#if defined(__AVX2__) || defined(_M_AVX2)
+#if defined(__FMA__) || defined(_M_FMA)
+    return "AVX2_FMA";
+#else
+    return "AVX2";
+#endif
+#else
+    return "SCALAR_UNROLLED";
+#endif
 }
 
 struct sample_stats {
@@ -307,6 +514,13 @@ struct split_sample {
     double wall_ms = 0.0;
     double d2h_ready_ms = 0.0;
     double cpu_rms_ms = 0.0;
+};
+
+struct both_ready_sample {
+    double wall_ms = 0.0;
+    double d2h_ready_ms = 0.0;
+    double cpu_rms_ms = 0.0;
+    double gpu_tail_wait_ms = 0.0;
 };
 
 int main(int argc, char ** argv) {
@@ -458,6 +672,8 @@ int main(int argc, char ** argv) {
     float * host_x = (float *) ggml_backend_buffer_get_base(host_x_buffer);
     float * host_inv_r = (float *) ggml_backend_buffer_get_base(host_r_buffer);
 
+    cpu_rms_pool rms_pool(opt.cpu_threads);
+
     ggml_backend_event_t d2h_done = ggml_backend_event_new(ggml_backend_get_device(copy_backend));
     ggml_backend_event_t r_ready = ggml_backend_event_new(ggml_backend_get_device(copy_backend));
     if (!d2h_done || !r_ready) {
@@ -533,7 +749,7 @@ int main(int argc, char ** argv) {
         out.d2h_ready_ms = elapsed_ms(t0, td2h);
 
         const auto tcpu0 = clock_type::now();
-        cpu_rms_inv(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        rms_pool.run(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
         const auto tcpu1 = clock_type::now();
         out.cpu_rms_ms = elapsed_ms(tcpu0, tcpu1);
 
@@ -554,18 +770,59 @@ int main(int argc, char ** argv) {
         return out;
     };
 
+    auto run_both_ready = [&]() -> both_ready_sample {
+        both_ready_sample out;
+        const auto t0 = clock_type::now();
+
+        ggml_backend_tensor_get_async(copy_backend, x, host_x, 0, x_bytes);
+        ggml_backend_event_record(d2h_done, copy_backend);
+
+        const ggml_status num_st = ggml_backend_graph_compute_async(compute_backend, graph_num);
+        if (num_st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "both-ready numerator graph failed: %d\n", (int) num_st);
+            std::exit(25);
+        }
+
+        ggml_backend_event_synchronize(d2h_done);
+        const auto td2h = clock_type::now();
+        out.d2h_ready_ms = elapsed_ms(t0, td2h);
+
+        const auto tcpu0 = clock_type::now();
+        rms_pool.run(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        const auto tcpu1 = clock_type::now();
+        out.cpu_rms_ms = elapsed_ms(tcpu0, tcpu1);
+
+        // Lower bound for a future fused design: do not return inv_r to the GPU
+        // and do not launch the explicit Q/K/V scale graph. We only wait until
+        // both independent branches are ready.
+        ggml_backend_synchronize(compute_backend);
+        const auto tend = clock_type::now();
+        out.gpu_tail_wait_ms = elapsed_ms(tcpu1, tend);
+        out.wall_ms = elapsed_ms(t0, tend);
+        return out;
+    };
+
     std::printf(
         "[PC_RMS_BENCH_CONFIG] device=%d device_name=\"%s\" tokens=%" PRId64
         " embd=%" PRId64 " q_dim=%" PRId64 " kv_dim=%" PRId64
-        " weight=%s eps=%.9g warmup=%d iters=%d x_bytes=%zu return_bytes=%zu\n",
+        " weight=%s eps=%.9g warmup=%d iters=%d cpu_threads=%d cpu_kernel=%s"
+        " x_bytes=%zu return_bytes=%zu\n",
         opt.device, dev_desc, opt.tokens, opt.n_embd, opt.q_dim, opt.kv_dim,
         ggml_type_name(opt.weight_type), opt.eps, opt.warmup, opt.iters,
-        x_bytes, r_bytes);
+        rms_pool.n_threads(), cpu_kernel_name(), x_bytes, r_bytes);
 
     // Warm all three graphs and both copy directions before collecting data.
     for (int i = 0; i < opt.warmup; ++i) {
         (void) run_serial();
         (void) run_split();
+        (void) run_both_ready();
+    }
+
+    // Keep a resident host copy for isolated CPU-kernel timing below.
+    ggml_backend_tensor_get(x, host_x, 0, x_bytes);
+    for (int i = 0; i < opt.warmup; ++i) {
+        cpu_rms_inv_scalar(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        rms_pool.run(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
     }
 
     // Correctness: the split graph consumes the real numerator outputs through
@@ -609,6 +866,12 @@ int main(int argc, char ** argv) {
     std::vector<double> cpu_rms_ms;
     std::vector<double> num_ms;
     std::vector<double> scale_ms;
+    std::vector<double> both_ready_ms;
+    std::vector<double> both_ready_d2h_ms;
+    std::vector<double> both_ready_cpu_ms;
+    std::vector<double> both_ready_gpu_tail_ms;
+    std::vector<double> cpu_scalar_ms;
+    std::vector<double> cpu_fast_ms;
 
     serial_ms.reserve(opt.iters);
     split_ms.reserve(opt.iters);
@@ -616,6 +879,12 @@ int main(int argc, char ** argv) {
     cpu_rms_ms.reserve(opt.iters);
     num_ms.reserve(opt.iters);
     scale_ms.reserve(opt.iters);
+    both_ready_ms.reserve(opt.iters);
+    both_ready_d2h_ms.reserve(opt.iters);
+    both_ready_cpu_ms.reserve(opt.iters);
+    both_ready_gpu_tail_ms.reserve(opt.iters);
+    cpu_scalar_ms.reserve(opt.iters);
+    cpu_fast_ms.reserve(opt.iters);
 
     for (int i = 0; i < opt.iters; ++i) {
         serial_ms.push_back(run_serial());
@@ -628,6 +897,20 @@ int main(int argc, char ** argv) {
         // terms that should be summed to reconstruct split wall time.
         num_ms.push_back(run_num_only());
         scale_ms.push_back(run_scale_only());
+
+        const both_ready_sample br = run_both_ready();
+        both_ready_ms.push_back(br.wall_ms);
+        both_ready_d2h_ms.push_back(br.d2h_ready_ms);
+        both_ready_cpu_ms.push_back(br.cpu_rms_ms);
+        both_ready_gpu_tail_ms.push_back(br.gpu_tail_wait_ms);
+
+        const auto scalar_t0 = clock_type::now();
+        cpu_rms_inv_scalar(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        cpu_scalar_ms.push_back(elapsed_ms(scalar_t0, clock_type::now()));
+
+        const auto fast_t0 = clock_type::now();
+        rms_pool.run(host_x, host_inv_r, opt.n_embd, opt.tokens, opt.eps);
+        cpu_fast_ms.push_back(elapsed_ms(fast_t0, clock_type::now()));
     }
 
     const sample_stats s_serial = summarize(serial_ms);
@@ -636,6 +919,12 @@ int main(int argc, char ** argv) {
     const sample_stats s_cpu = summarize(cpu_rms_ms);
     const sample_stats s_num = summarize(num_ms);
     const sample_stats s_scale = summarize(scale_ms);
+    const sample_stats s_both = summarize(both_ready_ms);
+    const sample_stats s_both_d2h = summarize(both_ready_d2h_ms);
+    const sample_stats s_both_cpu = summarize(both_ready_cpu_ms);
+    const sample_stats s_both_gpu_tail = summarize(both_ready_gpu_tail_ms);
+    const sample_stats s_cpu_scalar = summarize(cpu_scalar_ms);
+    const sample_stats s_cpu_fast = summarize(cpu_fast_ms);
 
     const double speedup = s_split.mean > 0.0 ? s_serial.mean / s_split.mean : 0.0;
     const double saved = s_serial.mean - s_split.mean;
@@ -651,6 +940,23 @@ int main(int argc, char ** argv) {
         " d2h_ready_mean_ms=%.6f cpu_rms_mean_ms=%.6f\n",
         s_split.mean, s_split.p50, s_split.p95, s_split.min,
         s_d2h.mean, s_cpu.mean);
+
+    std::printf(
+        "[PC_RMS_CPU] threads=%d kernel=%s"
+        " scalar_mean_ms=%.6f optimized_mean_ms=%.6f speedup=%.3fx\n",
+        rms_pool.n_threads(), cpu_kernel_name(),
+        s_cpu_scalar.mean, s_cpu_fast.mean,
+        s_cpu_fast.mean > 0.0 ? s_cpu_scalar.mean / s_cpu_fast.mean : 0.0);
+
+    std::printf(
+        "[PC_RMS_BENCH] mode=BOTH_READY_LOWER_BOUND"
+        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f min_ms=%.6f"
+        " d2h_ready_mean_ms=%.6f cpu_rms_mean_ms=%.6f gpu_tail_wait_mean_ms=%.6f"
+        " vs_serial_delta_ms=%.6f vs_serial_speedup=%.6fx\n",
+        s_both.mean, s_both.p50, s_both.p95, s_both.min,
+        s_both_d2h.mean, s_both_cpu.mean, s_both_gpu_tail.mean,
+        s_serial.mean - s_both.mean,
+        s_both.mean > 0.0 ? s_serial.mean / s_both.mean : 0.0);
 
     std::printf(
         "[PC_RMS_COMPONENT] gpu_numerator_mean_ms=%.6f"
