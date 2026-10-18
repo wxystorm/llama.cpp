@@ -261,6 +261,11 @@ struct layer_graph {
     ggml_tensor * pos = nullptr;
     ggml_tensor * mask = nullptr;
 
+    // Per-layer stage views over the full graph. ATTN ends exactly at
+    // ffn_inp (attention output + residual), and FFN ends at layer output.
+    std::vector<ggml_cgraph *> attn_graphs;
+    std::vector<ggml_cgraph *> ffn_graphs;
+
     std::vector<copied_weight> copies;
     size_t weight_bytes = 0;
     size_t buffer_bytes = 0;
@@ -292,9 +297,10 @@ static bool build_full_layer_graph(
     const size_t tensor_budget = (size_t) n_layers * 128 + 256;
 
     ggml_init_params p = {};
+    const size_t graph_count = 1 + 2 * (size_t) n_layers;
     p.mem_size =
         tensor_budget * ggml_tensor_overhead() +
-        ggml_graph_overhead_custom(graph_size, false);
+        graph_count * ggml_graph_overhead_custom(graph_size, false);
     p.no_alloc = true;
 
     out.ctx = ggml_init(p);
@@ -351,6 +357,11 @@ static bool build_full_layer_graph(
     ggml_set_name(out.mask, "layer_bench_mask");
 
     ggml_tensor * cur = out.input;
+
+    std::vector<ggml_tensor *> attn_ends;
+    std::vector<ggml_tensor *> layer_ends;
+    attn_ends.reserve((size_t) n_layers);
+    layer_ends.reserve((size_t) n_layers);
 
     const float rms_eps = model->hparams.f_norm_rms_eps;
     const int n_expert = (int) model->hparams.n_expert;
@@ -445,6 +456,10 @@ static bool build_full_layer_graph(
 
         ggml_tensor * attn_out = ggml_mul_mat(out.ctx, wo, attn);
         ggml_tensor * ffn_inp = ggml_add(out.ctx, attn_out, cur);
+        const std::string attn_name =
+            "layer_bench_attn_out_" + std::to_string(il);
+        ggml_set_name(ffn_inp, attn_name.c_str());
+        attn_ends.push_back(ffn_inp);
 
         ggml_tensor * ffn_norm = ggml_rms_norm(
             out.ctx, ffn_inp, rms_eps);
@@ -511,6 +526,7 @@ static bool build_full_layer_graph(
         const std::string name =
             "layer_bench_out_" + std::to_string(il);
         ggml_set_name(cur, name.c_str());
+        layer_ends.push_back(cur);
     }
 
     out.output = cur;
@@ -519,6 +535,88 @@ static bool build_full_layer_graph(
     ggml_build_forward_expand(out.graph, out.output);
 
     const int n_nodes = ggml_graph_n_nodes(out.graph);
+
+    // Split the already-built full graph at the exact Transformer boundary:
+    //
+    //   ATTN: layer input
+    //         -> RMS/QKV/QK-norm/RoPE/FA/O-proj/residual
+    //         -> ffn_inp
+    //
+    //   FFN:  ffn_inp
+    //         -> FFN RMS/router/top-k/experts/combine/residual
+    //         -> layer output
+    //
+    // The subgraphs reuse the same tensors and buffers. No copies are inserted.
+    out.attn_graphs.reserve((size_t) n_layers);
+    out.ffn_graphs.reserve((size_t) n_layers);
+
+    int previous_layer_end = -1;
+    for (int li = 0; li < n_layers; ++li) {
+        int attn_end_index = -1;
+        int layer_end_index = -1;
+        for (int i = previous_layer_end + 1; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(out.graph, i);
+            if (node == attn_ends[(size_t) li]) {
+                attn_end_index = i;
+            }
+            if (node == layer_ends[(size_t) li]) {
+                layer_end_index = i;
+                break;
+            }
+        }
+
+        if (attn_end_index < 0 ||
+            layer_end_index <= attn_end_index) {
+            std::fprintf(
+                stderr,
+                "failed to split layer %d graph: prev=%d attn_end=%d layer_end=%d\n",
+                start_layer + li,
+                previous_layer_end,
+                attn_end_index,
+                layer_end_index);
+            return false;
+        }
+
+        const int attn_nodes =
+            attn_end_index - previous_layer_end;
+        const int ffn_nodes =
+            layer_end_index - attn_end_index;
+
+        ggml_cgraph * attn_graph = ggml_new_graph_custom(
+            out.ctx, std::max(16, attn_nodes + 4), false);
+        ggml_cgraph * ffn_graph = ggml_new_graph_custom(
+            out.ctx, std::max(16, ffn_nodes + 4), false);
+        if (!attn_graph || !ffn_graph) {
+            return false;
+        }
+
+        for (int i = previous_layer_end + 1;
+             i <= attn_end_index; ++i) {
+            ggml_graph_add_node(
+                attn_graph,
+                ggml_graph_node(out.graph, i));
+        }
+        for (int i = attn_end_index + 1;
+             i <= layer_end_index; ++i) {
+            ggml_graph_add_node(
+                ffn_graph,
+                ggml_graph_node(out.graph, i));
+        }
+
+        out.attn_graphs.push_back(attn_graph);
+        out.ffn_graphs.push_back(ffn_graph);
+
+        std::printf(
+            "[PC_LAYER_BENCH_SPLIT] backend=%s layer=%d"
+            " attn_nodes=%d ffn_nodes=%d\n",
+            ggml_backend_name(backend),
+            start_layer + li,
+            attn_nodes,
+            ffn_nodes);
+
+        previous_layer_end = layer_end_index;
+    }
+
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(out.graph, i);
         if (!ggml_backend_supports_op(backend, node)) {
@@ -632,6 +730,45 @@ static stats run_graph(
             std::exit(21);
         }
         ggml_backend_synchronize(backend);
+        samples.push_back(ms_between(t0, clock_type::now()));
+    }
+    return summarize(samples);
+}
+
+static stats run_stage_block(
+        const char * label,
+        const std::vector<ggml_cgraph *> & graphs,
+        ggml_backend_t backend,
+        int warmup,
+        int iters) {
+    if (graphs.empty()) {
+        return {};
+    }
+
+    auto submit_block = [&]() {
+        for (ggml_cgraph * graph : graphs) {
+            const ggml_status st =
+                ggml_backend_graph_compute_async(backend, graph);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(
+                    stderr,
+                    "%s stage graph failed: %d\n",
+                    label, (int) st);
+                std::exit(22);
+            }
+        }
+        ggml_backend_synchronize(backend);
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        submit_block();
+    }
+
+    std::vector<double> samples;
+    samples.reserve((size_t) iters);
+    for (int i = 0; i < iters; ++i) {
+        const auto t0 = clock_type::now();
+        submit_block();
         samples.push_back(ms_between(t0, clock_type::now()));
     }
     return summarize(samples);
@@ -805,6 +942,24 @@ int main(int argc, char ** argv) {
     const stats gs = run_graph(
         "CUDA", gpu_graph, gpu, opt.warmup, opt.iters);
 
+    // Stage timing intentionally submits all selected layers' ATTN graphs as
+    // one block, then all selected layers' FFN graphs as one block. This
+    // keeps distinct real layer weights in flight while paying only one host
+    // synchronize per measured block, so the result is not dominated by
+    // per-layer synchronization overhead.
+    const stats cpu_attn = run_stage_block(
+        "CPU_ATTN", cpu_graph.attn_graphs,
+        cpu, opt.warmup, opt.iters);
+    const stats cpu_ffn = run_stage_block(
+        "CPU_FFN", cpu_graph.ffn_graphs,
+        cpu, opt.warmup, opt.iters);
+    const stats gpu_attn = run_stage_block(
+        "CUDA_ATTN", gpu_graph.attn_graphs,
+        gpu, opt.warmup, opt.iters);
+    const stats gpu_ffn = run_stage_block(
+        "CUDA_FFN", gpu_graph.ffn_graphs,
+        gpu, opt.warmup, opt.iters);
+
     std::printf(
         "[PC_LAYER_BENCH_RESULT] backend=CPU"
         " block_layers=%d tokens=%d"
@@ -824,6 +979,50 @@ int main(int argc, char ** argv) {
         gs.mean, gs.p50, gs.p95, gs.min, gs.max,
         gs.mean / opt.layers,
         gs.p50 / opt.layers);
+
+    const auto print_stage = [&](const char * backend_name,
+                                 const char * stage,
+                                 const stats & s) {
+        std::printf(
+            "[PC_LAYER_BENCH_STAGE] backend=%s stage=%s"
+            " block_layers=%d tokens=%d"
+            " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f min_ms=%.6f max_ms=%.6f"
+            " per_layer_mean_ms=%.6f per_layer_p50_ms=%.6f\n",
+            backend_name, stage,
+            opt.layers, opt.tokens,
+            s.mean, s.p50, s.p95, s.min, s.max,
+            s.mean / opt.layers,
+            s.p50 / opt.layers);
+    };
+
+    print_stage("CPU",  "ATTN", cpu_attn);
+    print_stage("CPU",  "FFN",  cpu_ffn);
+    print_stage("CUDA", "ATTN", gpu_attn);
+    print_stage("CUDA", "FFN",  gpu_ffn);
+
+    std::printf(
+        "[PC_LAYER_BENCH_STAGE_SUM] backend=CPU"
+        " attn_per_layer_ms=%.6f ffn_per_layer_ms=%.6f"
+        " split_sum_per_layer_ms=%.6f full_per_layer_ms=%.6f"
+        " split_over_full=%.4fx\n",
+        cpu_attn.mean / opt.layers,
+        cpu_ffn.mean / opt.layers,
+        (cpu_attn.mean + cpu_ffn.mean) / opt.layers,
+        cs.mean / opt.layers,
+        cs.mean > 0.0 ?
+            (cpu_attn.mean + cpu_ffn.mean) / cs.mean : 0.0);
+
+    std::printf(
+        "[PC_LAYER_BENCH_STAGE_SUM] backend=CUDA"
+        " attn_per_layer_ms=%.6f ffn_per_layer_ms=%.6f"
+        " split_sum_per_layer_ms=%.6f full_per_layer_ms=%.6f"
+        " split_over_full=%.4fx\n",
+        gpu_attn.mean / opt.layers,
+        gpu_ffn.mean / opt.layers,
+        (gpu_attn.mean + gpu_ffn.mean) / opt.layers,
+        gs.mean / opt.layers,
+        gs.mean > 0.0 ?
+            (gpu_attn.mean + gpu_ffn.mean) / gs.mean : 0.0);
 
     std::printf(
         "[PC_LAYER_BENCH_COMPARE]"
