@@ -246,12 +246,18 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     llama_build(test-pc-attn-rms-overlap.cpp)
     target_link_libraries(test-pc-attn-rms-overlap PRIVATE ggml-cuda)
 
-    # This benchmark intentionally measures an optimized host-side RMS reduction.
-    # Enable AVX2 only for this standalone target on x86 hosts.
+    llama_build(test-pc-attn-rms-overlap-model.cpp)
+    target_include_directories(test-pc-attn-rms-overlap-model PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-pc-attn-rms-overlap-model PRIVATE ggml-cuda)
+
+    # These standalone probes intentionally measure an optimized host-side RMS reduction.
+    # Enable AVX2 only for the probe targets on x86 hosts.
     if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         target_compile_options(test-pc-attn-rms-overlap PRIVATE /arch:AVX2)
+        target_compile_options(test-pc-attn-rms-overlap-model PRIVATE /arch:AVX2)
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         target_compile_options(test-pc-attn-rms-overlap PRIVATE -mavx2 -mfma)
+        target_compile_options(test-pc-attn-rms-overlap-model PRIVATE -mavx2 -mfma)
     endif()
 endif()
 
