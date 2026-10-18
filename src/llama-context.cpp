@@ -1584,13 +1584,16 @@ static bool llama_hybrid_apply_pc_inner_policy(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
-    const bool pc_phone_ffn =
+    const bool pc_phone_ffn_requested =
         pc_chunk_ring &&
         std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
+    const bool pc_phone_ffn =
+        pc_phone_ffn_requested &&
+        membership.pc_phone_ffn_graph;
 
     if (membership.gap_nodes != 0 ||
         membership.transition_errors != 0 ||
