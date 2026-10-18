@@ -18,12 +18,15 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 //
@@ -1786,12 +1789,35 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         stage != nullptr;
     const bool log_prepare_breakdown = log_formal_prepare || log_stage_prepare;
 
-    // Experiment B: force every operation in the prefill CPU_DIRECT Stage
-    // onto the raw CPU backend, including otherwise unlabelled Flash
-    // Attention and output-projection nodes. Off unless explicitly requested.
-    // Never touch GPU/TENSOR/PHONE stages or the ordinary decode graph.
+    const char * pc_local_ring_env =
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING");
+    bool pc_local_ring_stage =
+        stage != nullptr &&
+        stage->kind == llama_hybrid_runtime_stage_kind::CPU &&
+        ubatch.n_tokens > 1 &&
+        model.arch == LLM_ARCH_QWEN3MOE &&
+        pc_local_ring_env != nullptr &&
+        std::atoi(pc_local_ring_env) != 0;
+
+    if (pc_local_ring_stage) {
+        for (int il = stage->layer_begin; il < stage->layer_end; ++il) {
+            if (model.hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::PC_ONLY ||
+                il >= (int) model.pc_layer_backends.size() ||
+                model.pc_layer_backends[il] !=
+                    llama_pc_layer_backend::CPU) {
+                pc_local_ring_stage = false;
+                break;
+            }
+        }
+    }
+
+    // CPU_DIRECT_STRICT is a legacy whole-layer CPU experiment. It is
+    // intentionally disabled for the PC local Ring, whose layer owner is CUDA
+    // and whose FFN alone is CPU.
     const char * cpu_strict_env = std::getenv("LLAMA_HYBRID_CPU_DIRECT_STRICT");
     const bool strict_cpu_stage =
+        !pc_local_ring_stage &&
         stage != nullptr &&
         stage->kind == llama_hybrid_runtime_stage_kind::CPU &&
         cpu_strict_env != nullptr &&
@@ -1867,7 +1893,13 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     const bool phone_cpu_chunk_stage_trace =
         stage != nullptr &&
         std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
-    const bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
+    // First PC Ring version deliberately rebuilds the graph. This keeps task
+    // split boundaries graph-instance-local and removes reuse/lifetime
+    // ambiguity while correctness is being established.
+    const bool can_reuse_graph =
+        !pc_local_ring_stage &&
+        !graph_reuse_disable &&
+        res->can_reuse(gparams);
     if (log_prepare_breakdown) {
         reuse_check_us = ggml_time_us() - reuse_check_begin_us;
     }
@@ -1920,6 +1952,151 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (pc_local_ring_stage) {
+            ggml_backend_t ring_gpu = nullptr;
+            const ggml_backend_dev_t ring_gpu_dev =
+                model.dev_layer(stage->layer_begin);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) ==
+                        ring_gpu_dev) {
+                    ring_gpu = backend.get();
+                    break;
+                }
+            }
+
+            if (ring_gpu == nullptr || backend_cpu == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[PC_LOCAL_RING_BIND] status=FAIL reason=BACKEND_MISSING "
+                    "gpu=%p cpu=%p\n",
+                    (void *) ring_gpu,
+                    (void *) backend_cpu);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            enum class pc_ring_bind_stage {
+                ATTN,
+                FFN,
+                REDUCE,
+            };
+
+            auto parse_ring_marker =
+                [](const char * name,
+                   const char * fmt,
+                   int & chunk,
+                   int & layer) -> bool {
+                    int n = 0;
+                    return std::sscanf(
+                               name,
+                               fmt,
+                               &chunk,
+                               &layer,
+                               &n) == 2 &&
+                           name[n] == '\0';
+                };
+
+            pc_ring_bind_stage bind_stage =
+                pc_ring_bind_stage::ATTN;
+            bool force_next_split = false;
+            int attn_markers = 0;
+            int ffn_markers = 0;
+            int reduce_markers = 0;
+
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int node_id = 0; node_id < n_nodes; ++node_id) {
+                ggml_tensor * node =
+                    ggml_graph_node(gf, node_id);
+
+                if (!ggml_is_view_op(node->op)) {
+                    if (force_next_split) {
+                        ggml_backend_sched_set_split_boundary(
+                            sched_use,
+                            node);
+                        force_next_split = false;
+                    }
+
+                    ggml_backend_t target =
+                        bind_stage == pc_ring_bind_stage::FFN ?
+                            backend_cpu :
+                            ring_gpu;
+                    if (!ggml_backend_supports_op(target, node)) {
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_BIND] status=FAIL "
+                            "reason=UNSUPPORTED node=%d tensor=%s op=%s "
+                            "stage=%s backend=%s\n",
+                            node_id,
+                            node->name,
+                            ggml_op_name(node->op),
+                            bind_stage == pc_ring_bind_stage::ATTN ?
+                                "ATTN" :
+                            bind_stage == pc_ring_bind_stage::FFN ?
+                                "FFN" : "REDUCE",
+                            ggml_backend_name(target));
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                    ggml_backend_sched_set_tensor_backend(
+                        sched_use,
+                        node,
+                        target);
+                }
+
+                int marker_chunk = -1;
+                int marker_layer = -1;
+                if (parse_ring_marker(
+                        node->name,
+                        "pc_ring_attn_out_chunk_%d-%d%n",
+                        marker_chunk,
+                        marker_layer)) {
+                    bind_stage = pc_ring_bind_stage::FFN;
+                    force_next_split = true;
+                    ++attn_markers;
+                } else if (parse_ring_marker(
+                        node->name,
+                        "pc_ring_ffn_out_chunk_%d-%d%n",
+                        marker_chunk,
+                        marker_layer)) {
+                    bind_stage = pc_ring_bind_stage::REDUCE;
+                    force_next_split = true;
+                    ++ffn_markers;
+                } else if (parse_ring_marker(
+                        node->name,
+                        "pc_ring_reduce_chunk_%d-%d%n",
+                        marker_chunk,
+                        marker_layer)) {
+                    bind_stage = pc_ring_bind_stage::ATTN;
+                    force_next_split = true;
+                    ++reduce_markers;
+                }
+            }
+
+            if (attn_markers == 0 ||
+                attn_markers != ffn_markers ||
+                attn_markers != reduce_markers) {
+                LLAMA_LOG_ERROR(
+                    "[PC_LOCAL_RING_BIND] status=FAIL reason=MARKERS "
+                    "attn=%d ffn=%d reduce=%d\n",
+                    attn_markers,
+                    ffn_markers,
+                    reduce_markers);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            ggml_backend_sched_set_dynamic_order_lifetime(
+                sched_use,
+                true);
+
+            LLAMA_LOG_INFO(
+                "[PC_LOCAL_RING_BIND] status=OK layers=[%d,%d) "
+                "tasks=%d gpu=%s cpu=%s\n",
+                stage->layer_begin,
+                stage->layer_end,
+                attn_markers * 3,
+                ggml_backend_name(ring_gpu),
+                ggml_backend_name(backend_cpu));
         }
 
         if (strict_cpu_stage) {
