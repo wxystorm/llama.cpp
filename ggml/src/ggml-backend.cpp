@@ -955,6 +955,11 @@ struct ggml_backend_sched {
     int splits_capacity;
     int max_split_inputs;
 
+    // Optional semantic boundaries for dynamic task-order runtimes.
+    struct ggml_tensor ** forced_split_nodes;
+    int n_forced_split_nodes;
+    int forced_split_nodes_capacity;
+
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
@@ -972,6 +977,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool dynamic_order_lifetime;
 
     int debug;
 
@@ -1399,6 +1405,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // pass 5: split graph, find tensors that need to be copied
     {
+        const auto is_forced_split_node =
+            [&](const struct ggml_tensor * node) -> bool {
+                for (int k = 0; k < sched->n_forced_split_nodes; ++k) {
+                    if (sched->forced_split_nodes[k] == node) {
+                        return true;
+                    }
+                }
+                return false;
+            };
         const auto split_input_limit_for_backend =
             [&](int backend_id) -> int {
                 if (backend_id >= 0 &&
@@ -1423,6 +1438,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 break;
             }
         }
+        const int first_compute_node = i;
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
@@ -1436,6 +1452,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             const int node_backend_id = tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
+
+            const bool force_new_split =
+                i != first_compute_node &&
+                is_forced_split_node(node);
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
@@ -1470,7 +1490,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
-            if (node_backend_id != cur_backend_id || need_new_split) {
+            if (node_backend_id != cur_backend_id || need_new_split || force_new_split) {
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
@@ -1526,7 +1546,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || sched->dynamic_order_lifetime) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -2334,6 +2354,11 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    sched->forced_split_nodes =
+        (ggml_tensor **) calloc(graph_size, sizeof(sched->forced_split_nodes[0]));
+    sched->forced_split_nodes_capacity = (int) graph_size;
+    sched->n_forced_split_nodes = 0;
+
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
@@ -2378,6 +2403,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     free(sched->splits);
+    free(sched->forced_split_nodes);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -2392,6 +2418,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->n_forced_split_nodes = 0;
+    sched->dynamic_order_lifetime = false;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2561,6 +2589,42 @@ ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, 
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
     return sched->backends[sched->splits[split_id].backend_id];
+}
+
+int ggml_backend_sched_get_split_start(ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    return sched->splits[split_id].i_start;
+}
+
+int ggml_backend_sched_get_split_end(ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    return sched->splits[split_id].i_end;
+}
+
+void ggml_backend_sched_set_split_boundary(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * node) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(node != NULL);
+    GGML_ASSERT(!sched->is_alloc);
+
+    for (int i = 0; i < sched->n_forced_split_nodes; ++i) {
+        if (sched->forced_split_nodes[i] == node) {
+            return;
+        }
+    }
+
+    GGML_ASSERT(sched->n_forced_split_nodes < sched->forced_split_nodes_capacity);
+    sched->forced_split_nodes[sched->n_forced_split_nodes++] = node;
+}
+
+void ggml_backend_sched_set_dynamic_order_lifetime(
+        ggml_backend_sched_t sched,
+        bool enabled) {
+    GGML_ASSERT(sched);
+    sched->dynamic_order_lifetime = enabled;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
