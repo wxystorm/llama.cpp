@@ -22,6 +22,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <set>
 #include <string>
 #include <thread>
@@ -2012,6 +2013,817 @@ static bool llama_hybrid_layer_block_total_cost(
 
     total_ms = target_layers * std::max(0.0, per_layer_ms);
     return std::isfinite(total_ms);
+}
+
+
+enum class llama_pc_local_sim_task_kind {
+    CPU_ATTN,
+    CPU_FFN,
+    GPU_ATTN,
+    GPU_FFN,
+    GPU_FULL,
+};
+
+struct llama_pc_local_chunk_cost {
+    int    tokens   = 0;
+    double cpu_attn = 0.0;
+    double cpu_ffn  = 0.0;
+    double gpu_attn = 0.0;
+    double gpu_ffn  = 0.0;
+};
+
+struct llama_pc_local_sim_task {
+    llama_pc_local_sim_task_kind kind =
+        llama_pc_local_sim_task_kind::CPU_ATTN;
+    int    layer      = 0;
+    int    chunk      = 0;
+    double enqueue_ms = 0.0;
+};
+
+enum class llama_pc_local_sim_event_kind {
+    CPU_DONE,
+    GPU_DONE,
+    XFER_DONE,
+};
+
+struct llama_pc_local_sim_event {
+    double end_ms = 0.0;
+    uint64_t seq  = 0;
+    llama_pc_local_sim_event_kind kind =
+        llama_pc_local_sim_event_kind::CPU_DONE;
+    llama_pc_local_sim_task task;
+    int layer = -1;
+};
+
+struct llama_pc_local_sim_event_later {
+    bool operator()(
+            const llama_pc_local_sim_event & a,
+            const llama_pc_local_sim_event & b) const {
+        if (a.end_ms != b.end_ms) {
+            return a.end_ms > b.end_ms;
+        }
+        return a.seq > b.seq;
+    }
+};
+
+struct llama_pc_local_sim_result {
+    double makespan_ms       = 0.0;
+    double cpu_busy_ms       = 0.0;
+    double gpu_busy_ms       = 0.0;
+    double transfer_busy_ms  = 0.0;
+    double weight_stall_ms   = 0.0;
+    size_t peak_weight_bytes = 0;
+    int max_cpu_queue        = 0;
+    int max_gpu_queue        = 0;
+    int initial_resident_layers = 0;
+    size_t initial_resident_bytes = 0;
+};
+
+static const char * llama_pc_local_split_name(
+        llama_pc_local_split_orientation split) {
+    switch (split) {
+        case llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN:
+            return "CPU_ATTN_GPU_FFN";
+        case llama_pc_local_split_orientation::GPU_ATTN_CPU_FFN:
+            return "GPU_ATTN_CPU_FFN";
+        case llama_pc_local_split_orientation::NONE:
+            break;
+    }
+    return "NONE";
+}
+
+static std::string llama_pc_local_pattern_string(
+        const std::vector<llama_pc_local_layer_mode> & pattern) {
+    std::string out;
+    out.reserve(pattern.size());
+    for (const auto mode : pattern) {
+        out.push_back(
+            mode == llama_pc_local_layer_mode::GPU_FULL ? 'G' : 'S');
+    }
+    return out;
+}
+
+static std::vector<llama_pc_local_layer_mode>
+llama_pc_local_even_pattern(
+        int n_layers,
+        int gpu_full_layers,
+        int phase) {
+    std::vector<llama_pc_local_layer_mode> result(
+        (size_t) n_layers,
+        llama_pc_local_layer_mode::SPLIT);
+    if (n_layers <= 0 || gpu_full_layers <= 0) {
+        return result;
+    }
+    if (gpu_full_layers >= n_layers) {
+        std::fill(
+            result.begin(), result.end(),
+            llama_pc_local_layer_mode::GPU_FULL);
+        return result;
+    }
+
+    int acc = std::clamp(phase, 0, n_layers - 1);
+    for (int il = 0; il < n_layers; ++il) {
+        acc += gpu_full_layers;
+        if (acc >= n_layers) {
+            result[(size_t) il] =
+                llama_pc_local_layer_mode::GPU_FULL;
+            acc -= n_layers;
+        }
+    }
+    return result;
+}
+
+static bool llama_pc_local_build_chunk_costs(
+        const llama_hybrid_profile & profile,
+        const std::vector<int> & chunks,
+        std::vector<llama_pc_local_chunk_cost> & result) {
+    result.clear();
+    result.reserve(chunks.size());
+
+    int kv_tokens = 0;
+    for (const int tokens : chunks) {
+        if (tokens <= 0) {
+            return false;
+        }
+        kv_tokens += tokens;
+
+        llama_pc_local_chunk_cost cost;
+        cost.tokens = tokens;
+
+        double cpu_attn_base = 0.0;
+        double gpu_attn_base = 0.0;
+        double cpu_full      = 0.0;
+        double gpu_full      = 0.0;
+
+        if (!llama_hybrid_attn_cost(
+                profile.cpu_attn, tokens, kv_tokens,
+                cost.cpu_attn) ||
+            !llama_hybrid_attn_cost(
+                profile.gpu_attn, tokens, kv_tokens,
+                cost.gpu_attn) ||
+            !llama_hybrid_attn_cost(
+                profile.cpu_attn, tokens, tokens,
+                cpu_attn_base) ||
+            !llama_hybrid_attn_cost(
+                profile.gpu_attn, tokens, tokens,
+                gpu_attn_base) ||
+            !llama_hybrid_layer_block_cost(
+                profile.cpu_layer_blocks, tokens, false,
+                cpu_full) ||
+            !llama_hybrid_layer_block_cost(
+                profile.gpu_layer_blocks, tokens, false,
+                gpu_full)) {
+            return false;
+        }
+
+        // Full-layer probes already contain FFN norm/router/expert/combine
+        // work.  Subtract an Attention probe at KV=query to obtain the FFN
+        // stage anchor without incorrectly charging long-KV Attention to FFN.
+        cost.cpu_ffn = std::max(0.0, cpu_full - cpu_attn_base);
+        cost.gpu_ffn = std::max(0.0, gpu_full - gpu_attn_base);
+        if (cost.cpu_ffn <= 0.0 || cost.gpu_ffn <= 0.0) {
+            return false;
+        }
+
+        result.push_back(cost);
+    }
+    return true;
+}
+
+static size_t llama_pc_local_layer_gpu_weight_bytes(
+        const llama_hybrid_profile & profile,
+        int global_layer,
+        llama_pc_local_split_orientation split,
+        llama_pc_local_layer_mode mode) {
+    if (global_layer < 0 ||
+        global_layer >= (int) profile.layer_weight_bytes.size()) {
+        return 0;
+    }
+
+    const size_t i = (size_t) global_layer;
+    if (mode == llama_pc_local_layer_mode::GPU_FULL) {
+        return profile.layer_weight_bytes[i];
+    }
+
+    const size_t mirrored =
+        i < profile.layer_mirrored_bytes.size() ?
+            profile.layer_mirrored_bytes[i] : 0;
+    if (split ==
+        llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN) {
+        const size_t ffn =
+            i < profile.layer_ffn_split_bytes.size() ?
+                profile.layer_ffn_split_bytes[i] : 0;
+        return ffn + mirrored;
+    }
+
+    const size_t attn =
+        i < profile.layer_attn_forced_bytes.size() ?
+            profile.layer_attn_forced_bytes[i] : 0;
+    return attn + mirrored;
+}
+
+static bool llama_pc_local_simulate(
+        const llama_hybrid_profile & profile,
+        int layer_begin,
+        const std::vector<llama_pc_local_layer_mode> & pattern,
+        llama_pc_local_split_orientation split,
+        const std::vector<llama_pc_local_chunk_cost> & chunk_costs,
+        size_t gpu_weight_budget_bytes,
+        llama_pc_local_sim_result & out) {
+    out = {};
+    const int n_layers = (int) pattern.size();
+    const int n_chunks = (int) chunk_costs.size();
+    if (n_layers <= 0 || n_chunks <= 0 ||
+        gpu_weight_budget_bytes == 0 ||
+        profile.pc_to_gpu_weight.empty()) {
+        return false;
+    }
+
+    std::vector<size_t> layer_weight_bytes((size_t) n_layers, 0);
+    std::vector<double> layer_load_ms((size_t) n_layers, 0.0);
+    for (int il = 0; il < n_layers; ++il) {
+        const size_t bytes =
+            llama_pc_local_layer_gpu_weight_bytes(
+                profile, layer_begin + il, split,
+                pattern[(size_t) il]);
+        double load_ms = 0.0;
+        if (bytes == 0 ||
+            !llama_hybrid_transfer_cost(
+                profile.pc_to_gpu_weight, bytes, load_ms, true)) {
+            return false;
+        }
+        layer_weight_bytes[(size_t) il] = bytes;
+        layer_load_ms[(size_t) il] = load_ms;
+    }
+
+    // Weight states: 0 absent, 1 loading, 2 resident, 3 evicted.
+    std::vector<uint8_t> weight_state((size_t) n_layers, 0);
+    std::vector<int> gpu_done((size_t) n_layers, 0);
+    std::vector<std::deque<llama_pc_local_sim_task>>
+        gpu_pending((size_t) n_layers);
+
+    size_t live_weight_bytes = 0;
+    int next_prefetch = 0;
+    while (next_prefetch < n_layers) {
+        const size_t bytes = layer_weight_bytes[(size_t) next_prefetch];
+        if (bytes > gpu_weight_budget_bytes - live_weight_bytes) {
+            break;
+        }
+        weight_state[(size_t) next_prefetch] = 2;
+        live_weight_bytes += bytes;
+        ++next_prefetch;
+    }
+    if (next_prefetch == 0) {
+        return false;
+    }
+    out.initial_resident_layers = next_prefetch;
+    out.initial_resident_bytes = live_weight_bytes;
+    out.peak_weight_bytes = live_weight_bytes;
+
+    std::deque<llama_pc_local_sim_task> cpu_q;
+    std::deque<llama_pc_local_sim_task> gpu_q;
+
+    bool cpu_busy  = false;
+    bool gpu_busy  = false;
+    bool xfer_busy = false;
+    int finished_chunks = 0;
+
+    double gpu_blocked_since = -1.0;
+    uint64_t event_seq = 0;
+    std::priority_queue<
+        llama_pc_local_sim_event,
+        std::vector<llama_pc_local_sim_event>,
+        llama_pc_local_sim_event_later> events;
+
+    const auto chunk_cost = [&](const llama_pc_local_sim_task & task)
+            -> const llama_pc_local_chunk_cost & {
+        return chunk_costs[(size_t) task.chunk];
+    };
+
+    const auto cpu_duration = [&](const llama_pc_local_sim_task & task) {
+        const auto & cost = chunk_cost(task);
+        switch (task.kind) {
+            case llama_pc_local_sim_task_kind::CPU_ATTN:
+                return cost.cpu_attn;
+            case llama_pc_local_sim_task_kind::CPU_FFN:
+                return cost.cpu_ffn;
+            default:
+                break;
+        }
+        return 0.0;
+    };
+
+    const auto gpu_duration = [&](const llama_pc_local_sim_task & task) {
+        const auto & cost = chunk_cost(task);
+        switch (task.kind) {
+            case llama_pc_local_sim_task_kind::GPU_ATTN:
+                return cost.gpu_attn;
+            case llama_pc_local_sim_task_kind::GPU_FFN:
+                return cost.gpu_ffn;
+            case llama_pc_local_sim_task_kind::GPU_FULL:
+                return cost.gpu_attn + cost.gpu_ffn;
+            default:
+                break;
+        }
+        return 0.0;
+    };
+
+    const auto push_event = [&](double end_ms,
+                                llama_pc_local_sim_event_kind kind,
+                                const llama_pc_local_sim_task & task,
+                                int layer) mutable {
+        llama_pc_local_sim_event event;
+        event.end_ms = end_ms;
+        event.seq = ++event_seq;
+        event.kind = kind;
+        event.task = task;
+        event.layer = layer;
+        events.push(event);
+    };
+
+    const auto enqueue_cpu = [&](const llama_pc_local_sim_task & task) {
+        cpu_q.push_back(task);
+        out.max_cpu_queue =
+            std::max(out.max_cpu_queue, (int) cpu_q.size());
+    };
+
+    const auto enqueue_gpu = [&](const llama_pc_local_sim_task & task) {
+        if (weight_state[(size_t) task.layer] == 2) {
+            gpu_q.push_back(task);
+            out.max_gpu_queue =
+                std::max(out.max_gpu_queue, (int) gpu_q.size());
+        } else {
+            gpu_pending[(size_t) task.layer].push_back(task);
+        }
+    };
+
+    const auto release_gpu_pending = [&](int layer) {
+        auto & pending = gpu_pending[(size_t) layer];
+        while (!pending.empty()) {
+            gpu_q.push_back(pending.front());
+            pending.pop_front();
+        }
+        out.max_gpu_queue =
+            std::max(out.max_gpu_queue, (int) gpu_q.size());
+    };
+
+    const auto has_gpu_pending = [&]() {
+        for (const auto & pending : gpu_pending) {
+            if (!pending.empty()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto enqueue_layer_entry =
+        [&](int layer, int chunk, double now) {
+            llama_pc_local_sim_task task;
+            task.layer = layer;
+            task.chunk = chunk;
+            task.enqueue_ms = now;
+
+            if (pattern[(size_t) layer] ==
+                    llama_pc_local_layer_mode::GPU_FULL) {
+                task.kind = llama_pc_local_sim_task_kind::GPU_FULL;
+                enqueue_gpu(task);
+                return;
+            }
+
+            if (split ==
+                    llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN) {
+                task.kind = llama_pc_local_sim_task_kind::CPU_ATTN;
+                enqueue_cpu(task);
+            } else {
+                task.kind = llama_pc_local_sim_task_kind::GPU_ATTN;
+                enqueue_gpu(task);
+            }
+        };
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        enqueue_layer_entry(0, ci, 0.0);
+    }
+
+    const auto try_start_transfer = [&](double now) mutable {
+        if (xfer_busy || next_prefetch >= n_layers) {
+            return;
+        }
+        const size_t bytes =
+            layer_weight_bytes[(size_t) next_prefetch];
+        if (bytes > gpu_weight_budget_bytes - live_weight_bytes) {
+            return;
+        }
+
+        const int layer = next_prefetch++;
+        weight_state[(size_t) layer] = 1;
+        live_weight_bytes += bytes;
+        out.peak_weight_bytes =
+            std::max(out.peak_weight_bytes, live_weight_bytes);
+
+        const double dur = layer_load_ms[(size_t) layer];
+        xfer_busy = true;
+        out.transfer_busy_ms += dur;
+
+        llama_pc_local_sim_task dummy;
+        push_event(
+            now + dur,
+            llama_pc_local_sim_event_kind::XFER_DONE,
+            dummy, layer);
+    };
+
+    const auto try_start_cpu = [&](double now) mutable {
+        if (cpu_busy || cpu_q.empty()) {
+            return;
+        }
+        const auto task = cpu_q.front();
+        cpu_q.pop_front();
+        const double dur = cpu_duration(task);
+        if (dur <= 0.0) {
+            return;
+        }
+        cpu_busy = true;
+        out.cpu_busy_ms += dur;
+        push_event(
+            now + dur,
+            llama_pc_local_sim_event_kind::CPU_DONE,
+            task, task.layer);
+    };
+
+    const auto try_start_gpu = [&](double now) mutable {
+        if (gpu_busy) {
+            return;
+        }
+        if (gpu_q.empty()) {
+            if (has_gpu_pending() && gpu_blocked_since < 0.0) {
+                gpu_blocked_since = now;
+            }
+            return;
+        }
+
+        if (gpu_blocked_since >= 0.0) {
+            out.weight_stall_ms += now - gpu_blocked_since;
+            gpu_blocked_since = -1.0;
+        }
+
+        const auto task = gpu_q.front();
+        gpu_q.pop_front();
+        const double dur = gpu_duration(task);
+        if (dur <= 0.0) {
+            return;
+        }
+        gpu_busy = true;
+        out.gpu_busy_ms += dur;
+        push_event(
+            now + dur,
+            llama_pc_local_sim_event_kind::GPU_DONE,
+            task, task.layer);
+    };
+
+    const auto dispatch = [&](double now) mutable {
+        try_start_transfer(now);
+        try_start_cpu(now);
+        try_start_gpu(now);
+    };
+
+    dispatch(0.0);
+    double now = 0.0;
+
+    while (finished_chunks < n_chunks) {
+        if (events.empty()) {
+            return false;
+        }
+
+        now = events.top().end_ms;
+        std::vector<llama_pc_local_sim_event> batch;
+        while (!events.empty() &&
+               std::fabs(events.top().end_ms - now) < 1e-9) {
+            batch.push_back(events.top());
+            events.pop();
+        }
+
+        for (const auto & event : batch) {
+            if (event.kind ==
+                    llama_pc_local_sim_event_kind::XFER_DONE) {
+                xfer_busy = false;
+                const int layer = event.layer;
+                weight_state[(size_t) layer] = 2;
+                release_gpu_pending(layer);
+                continue;
+            }
+
+            if (event.kind ==
+                    llama_pc_local_sim_event_kind::CPU_DONE) {
+                cpu_busy = false;
+                const auto & task = event.task;
+                if (task.kind ==
+                        llama_pc_local_sim_task_kind::CPU_ATTN) {
+                    llama_pc_local_sim_task next = task;
+                    next.kind =
+                        llama_pc_local_sim_task_kind::GPU_FFN;
+                    next.enqueue_ms = now;
+                    enqueue_gpu(next);
+                } else {
+                    // GPU_ATTN -> CPU_FFN completes a split layer.
+                    const int next_layer = task.layer + 1;
+                    if (next_layer >= n_layers) {
+                        ++finished_chunks;
+                    } else {
+                        enqueue_layer_entry(
+                            next_layer, task.chunk, now);
+                    }
+                }
+                continue;
+            }
+
+            gpu_busy = false;
+            const auto & task = event.task;
+
+            // Every layer has exactly one GPU-side task per chunk:
+            // FFN in CPU_ATTN_GPU_FFN, ATTN in GPU_ATTN_CPU_FFN,
+            // or FULL.  Once the final chunk leaves that GPU stage the
+            // layer's GPU weights can never be touched again.
+            const int layer = task.layer;
+            ++gpu_done[(size_t) layer];
+            if (gpu_done[(size_t) layer] == n_chunks) {
+                if (weight_state[(size_t) layer] != 2) {
+                    return false;
+                }
+                weight_state[(size_t) layer] = 3;
+                live_weight_bytes -=
+                    layer_weight_bytes[(size_t) layer];
+            }
+
+            if (task.kind ==
+                    llama_pc_local_sim_task_kind::GPU_ATTN) {
+                llama_pc_local_sim_task next = task;
+                next.kind =
+                    llama_pc_local_sim_task_kind::CPU_FFN;
+                next.enqueue_ms = now;
+                enqueue_cpu(next);
+            } else {
+                // GPU_FFN or GPU_FULL completes the layer.
+                const int next_layer = layer + 1;
+                if (next_layer >= n_layers) {
+                    ++finished_chunks;
+                } else {
+                    enqueue_layer_entry(
+                        next_layer, task.chunk, now);
+                }
+            }
+        }
+
+        dispatch(now);
+    }
+
+    if (gpu_blocked_since >= 0.0) {
+        out.weight_stall_ms += now - gpu_blocked_since;
+    }
+    out.makespan_ms = now;
+    return std::isfinite(out.makespan_ms) && out.makespan_ms > 0.0;
+}
+
+static bool llama_hybrid_plan_pc_local(
+        const llama_hybrid_profile & profile,
+        const llama_hybrid_constraints & constraints,
+        const llama_hybrid_plan & outer,
+        llama_hybrid_pc_local_plan & best) {
+    best = {};
+    if (outer.pc_layers <= 0 ||
+        profile.gpu_attn.empty() ||
+        profile.gpu_layer_blocks.empty() ||
+        profile.cpu_attn.empty() ||
+        profile.cpu_layer_blocks.empty() ||
+        profile.pc_to_gpu_weight.empty()) {
+        return false;
+    }
+
+    const int work_tokens =
+        constraints.target_ubatch_tokens > 0 ?
+            constraints.target_ubatch_tokens :
+            (profile.reference_tokens > 0 ?
+                profile.reference_tokens :
+                LLAMA_HYBRID_REFERENCE_TOKENS);
+    if (work_tokens <= 1) {
+        return false;
+    }
+
+    int chunk_tokens = std::min(128, work_tokens);
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_PC_LOCAL_PLAN_CHUNK_TOKENS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' &&
+            parsed > 0 && parsed <= work_tokens) {
+            chunk_tokens = (int) parsed;
+        }
+    }
+
+    const auto chunks =
+        llama_hybrid_split_by_chunk_size(work_tokens, chunk_tokens);
+    std::vector<llama_pc_local_chunk_cost> chunk_costs;
+    if (!llama_pc_local_build_chunk_costs(
+            profile, chunks, chunk_costs)) {
+        return false;
+    }
+
+    const size_t gpu_budget = llama_hybrid_effective_budget(
+        constraints.gpu_memory_budget,
+        profile.gpu_free_mem,
+        LLAMA_HYBRID_GPU_MEMORY_FRACTION);
+    if (gpu_budget <= constraints.gpu_runtime_reserve_bytes) {
+        return false;
+    }
+    const size_t gpu_weight_budget =
+        gpu_budget - constraints.gpu_runtime_reserve_bytes;
+
+    const int layer_begin = 0;
+    const int n_layers = outer.pc_layers;
+    bool found = false;
+    llama_pc_local_sim_result best_sim;
+
+    for (const auto split : {
+            llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN,
+            llama_pc_local_split_orientation::GPU_ATTN_CPU_FFN }) {
+        for (int gpu_full = 0; gpu_full <= n_layers; ++gpu_full) {
+            const int phases =
+                gpu_full > 0 && gpu_full < n_layers ? n_layers : 1;
+            for (int phase = 0; phase < phases; ++phase) {
+                auto pattern =
+                    llama_pc_local_even_pattern(
+                        n_layers, gpu_full, phase);
+
+                llama_pc_local_sim_result sim;
+                if (!llama_pc_local_simulate(
+                        profile, layer_begin, pattern, split,
+                        chunk_costs, gpu_weight_budget, sim)) {
+                    continue;
+                }
+
+                const bool better =
+                    !found ||
+                    sim.makespan_ms < best_sim.makespan_ms - 1e-9 ||
+                    (std::fabs(
+                         sim.makespan_ms - best_sim.makespan_ms) < 1e-9 &&
+                     sim.weight_stall_ms <
+                         best_sim.weight_stall_ms - 1e-9) ||
+                    (std::fabs(
+                         sim.makespan_ms - best_sim.makespan_ms) < 1e-9 &&
+                     std::fabs(
+                         sim.weight_stall_ms -
+                         best_sim.weight_stall_ms) < 1e-9 &&
+                     sim.peak_weight_bytes <
+                         best_sim.peak_weight_bytes);
+                if (!better) {
+                    continue;
+                }
+
+                found = true;
+                best_sim = sim;
+                best.valid = true;
+                best.applied = false;
+                best.layer_begin = layer_begin;
+                best.layer_end = layer_begin + n_layers;
+                best.chunk_tokens = chunk_tokens;
+                best.split = split;
+                best.layer_modes = std::move(pattern);
+                best.split_layers = n_layers - gpu_full;
+                best.gpu_full_layers = gpu_full;
+                best.gpu_weight_budget_bytes =
+                    gpu_weight_budget;
+                best.initial_resident_layers =
+                    sim.initial_resident_layers;
+                best.initial_resident_bytes =
+                    sim.initial_resident_bytes;
+                best.predicted_peak_weight_bytes =
+                    sim.peak_weight_bytes;
+                best.predicted_cpu_busy_ms =
+                    sim.cpu_busy_ms;
+                best.predicted_gpu_busy_ms =
+                    sim.gpu_busy_ms;
+                best.predicted_transfer_busy_ms =
+                    sim.transfer_busy_ms;
+                best.predicted_weight_stall_ms =
+                    sim.weight_stall_ms;
+                best.predicted_ms =
+                    sim.makespan_ms;
+                best.max_cpu_queue = sim.max_cpu_queue;
+                best.max_gpu_queue = sim.max_gpu_queue;
+            }
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    double cpu_attn = 0.0;
+    double gpu_attn = 0.0;
+    double cpu_attn_base = 0.0;
+    double gpu_attn_base = 0.0;
+    double cpu_full = 0.0;
+    double gpu_full = 0.0;
+    if (llama_hybrid_attn_cost(
+            profile.cpu_attn, chunk_tokens, chunk_tokens,
+            cpu_attn) &&
+        llama_hybrid_attn_cost(
+            profile.gpu_attn, chunk_tokens, chunk_tokens,
+            gpu_attn) &&
+        llama_hybrid_attn_cost(
+            profile.cpu_attn, chunk_tokens, chunk_tokens,
+            cpu_attn_base) &&
+        llama_hybrid_attn_cost(
+            profile.gpu_attn, chunk_tokens, chunk_tokens,
+            gpu_attn_base) &&
+        llama_hybrid_layer_block_cost(
+            profile.cpu_layer_blocks, chunk_tokens,
+            false, cpu_full) &&
+        llama_hybrid_layer_block_cost(
+            profile.gpu_layer_blocks, chunk_tokens,
+            false, gpu_full)) {
+        best.cpu_attn_ms = cpu_attn;
+        best.gpu_attn_ms = gpu_attn;
+        best.cpu_ffn_ms =
+            std::max(0.0, cpu_full - cpu_attn_base);
+        best.gpu_ffn_ms =
+            std::max(0.0, gpu_full - gpu_attn_base);
+    }
+
+    size_t reference_weight = 0;
+    for (int il = 0; il < n_layers; ++il) {
+        if (best.layer_modes[(size_t) il] ==
+                llama_pc_local_layer_mode::SPLIT) {
+            reference_weight =
+                llama_pc_local_layer_gpu_weight_bytes(
+                    profile, layer_begin + il, best.split,
+                    llama_pc_local_layer_mode::SPLIT);
+            break;
+        }
+    }
+    if (reference_weight == 0 && n_layers > 0) {
+        reference_weight =
+            llama_pc_local_layer_gpu_weight_bytes(
+                profile, layer_begin, best.split,
+                best.layer_modes.front());
+    }
+
+    double reference_ms = 0.0;
+    if (reference_weight > 0 &&
+        llama_hybrid_transfer_cost(
+            profile.pc_to_gpu_weight,
+            reference_weight, reference_ms, true) &&
+        reference_ms > 0.0) {
+        best.weight_h2d_gbps =
+            (double) reference_weight /
+            (reference_ms / 1000.0) / 1.0e9;
+    }
+
+    return true;
+}
+
+static void llama_hybrid_pc_local_plan_print(
+        const llama_hybrid_pc_local_plan & plan) {
+    if (!plan.valid) {
+        LLAMA_LOG_ERROR(
+            "[PC_LOCAL_PLAN] status=UNAVAILABLE applied=0\n");
+        return;
+    }
+
+    const std::string pattern =
+        llama_pc_local_pattern_string(plan.layer_modes);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN] status=OK applied=%d orientation=%s "
+        "layers=[%d,%d) chunk_tokens=%d split=%d gpu_full=%d "
+        "pattern=%s\n",
+        plan.applied ? 1 : 0,
+        llama_pc_local_split_name(plan.split),
+        plan.layer_begin, plan.layer_end,
+        plan.chunk_tokens,
+        plan.split_layers, plan.gpu_full_layers,
+        pattern.c_str());
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_STAGE] cpu_attn_ms=%.3f cpu_ffn_ms=%.3f "
+        "gpu_attn_ms=%.3f gpu_ffn_ms=%.3f h2d_gbps=%.3f\n",
+        plan.cpu_attn_ms, plan.cpu_ffn_ms,
+        plan.gpu_attn_ms, plan.gpu_ffn_ms,
+        plan.weight_h2d_gbps);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_RESIDENCY] gpu_weight_budget_mib=%.1f "
+        "initial_layers=%d initial_mib=%.1f peak_mib=%.1f\n",
+        plan.gpu_weight_budget_bytes / 1048576.0,
+        plan.initial_resident_layers,
+        plan.initial_resident_bytes / 1048576.0,
+        plan.predicted_peak_weight_bytes / 1048576.0);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_PRED] makespan_ms=%.3f cpu_busy_ms=%.3f "
+        "gpu_busy_ms=%.3f xfer_busy_ms=%.3f weight_stall_ms=%.3f "
+        "max_cpu_q=%d max_gpu_q=%d applied=0\n",
+        plan.predicted_ms,
+        plan.predicted_cpu_busy_ms,
+        plan.predicted_gpu_busy_ms,
+        plan.predicted_transfer_busy_ms,
+        plan.predicted_weight_stall_ms,
+        plan.max_cpu_queue,
+        plan.max_gpu_queue);
 }
 
 static bool llama_hybrid_phone_block_cost(const llama_hybrid_profile & profile, int layers, double & result_ms) {
