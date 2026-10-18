@@ -269,6 +269,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
     RPC_CMD_RETURN_BULK_ACQUIRE,
+    RPC_CMD_PHONE_NPU_FFN_DIRECT,
     RPC_CMD_COUNT,
 };
 
@@ -291,6 +292,7 @@ static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY 
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_NPU_FFN_DIRECT == 35, "RPC_CMD_PHONE_NPU_FFN_DIRECT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -484,6 +486,25 @@ struct rpc_msg_return_bulk_acquire_rsp {
     uint8_t reserved[7];
     uint64_t inflight;
     uint64_t limit;
+};
+
+struct rpc_msg_phone_npu_ffn_direct_req {
+    uint32_t device;
+    int32_t layer;
+    int32_t chunk;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t n_expert_used;
+    uint32_t reserved;
+    uint64_t hidden_bytes;
+    uint64_t topk_bytes;
+    uint64_t route_bytes;
+};
+
+struct rpc_msg_phone_npu_ffn_direct_rsp {
+    uint32_t result;
+    uint32_t reserved;
+    uint64_t output_bytes;
 };
 
 struct rpc_msg_set_tensor_graph_req_v6 {
@@ -1239,6 +1260,7 @@ enum class rpc_socket_role {
     ROUTE_TRANSFER_3,
     RETURN_TRANSFER_0,
     RETURN_TRANSFER_1,
+    PHONE_FFN,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1276,6 +1298,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::RETURN_TRANSFER_1:
             suffix = "_return_transfer_1";
+            break;
+        case rpc_socket_role::PHONE_FFN:
+            suffix = "_phone_ffn";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1351,6 +1376,13 @@ static std::shared_ptr<socket_t> get_return_transfer_socket(
         lane == 0 ?
             rpc_socket_role::RETURN_TRANSFER_0 :
             rpc_socket_role::RETURN_TRANSFER_1);
+}
+
+static std::shared_ptr<socket_t> get_phone_ffn_socket(
+        const std::string & endpoint) {
+    return get_socket_role(
+        endpoint,
+        rpc_socket_role::PHONE_FFN);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -5255,6 +5287,9 @@ private:
         uint32_t device,
         uint64_t graph_uid,
         ggml_cgraph * graph);
+    bool phone_npu_ffn_direct(
+        const std::vector<uint8_t> & input,
+        std::vector<uint8_t> & output);
 
 
     std::vector<ggml_backend_t> backends;
