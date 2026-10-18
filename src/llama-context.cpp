@@ -115,7 +115,8 @@ static int llama_hybrid_inner_marker_chunk(const char * name) {
 // sidecar: it does not create tensors, change graph topology, or move work.
 // The same vocabulary will later be consumed by the generic Region Ring.
 static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
-        const char * tensor_name) {
+        const char * tensor_name,
+        bool pc_phone_ffn_graph = false) {
     llama_hybrid_inner_stage_marker marker;
     marker.layer = llama_hybrid_inner_marker_layer(tensor_name);
     marker.chunk = llama_hybrid_inner_marker_chunk(tensor_name);
@@ -144,11 +145,7 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     // useful for diagnostics, but treating it as ATTN END would make the
     // graph appear to transition backwards FFN -> ATTN.
 
-    const bool pc_phone_ffn =
-        std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN") != nullptr &&
-        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN")) != 0;
-
-    if (pc_phone_ffn &&
+    if (pc_phone_ffn_graph &&
         llama_hybrid_name_starts_with(
             tensor_name,
             "phone_prefill_ffn_ready_chunk_")) {
@@ -157,7 +154,7 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
         return marker;
     }
 
-    if (pc_phone_ffn &&
+    if (pc_phone_ffn_graph &&
         llama_hybrid_name_starts_with(
             tensor_name,
             "phone_prefill_ffn_input_chunk_")) {
@@ -169,7 +166,7 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     // In the PC->Phone ring, FFN norm + Router/Top-K belong to the GPU
     // front-end. Keep the existing FFN BEGIN marker behavior unchanged for
     // every other execution mode.
-    if (!(pc_phone_ffn &&
+    if (!(pc_phone_ffn_graph &&
           (llama_hybrid_name_starts_with(
                tensor_name,
                "prefill_wave_ffn_norm_group_") ||
@@ -211,6 +208,7 @@ struct llama_hybrid_inner_membership_result {
     int first_transition_error_node = -1;
     int pre_boundary_norms = 0;
     bool chunked_markers = false;
+    bool pc_phone_ffn_graph = false;
 };
 
 static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_membership(
@@ -221,6 +219,17 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
     }
 
     const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node != nullptr &&
+            llama_hybrid_name_starts_with(
+                node->name,
+                "phone_prefill_ffn_ready_chunk_")) {
+            result.pc_phone_ffn_graph = true;
+            break;
+        }
+    }
+
     result.nodes.resize((size_t) n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         result.nodes[(size_t) i].node_index = i;
@@ -241,7 +250,9 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
         const llama_hybrid_inner_stage_marker marker =
-            llama_hybrid_classify_inner_stage_marker(node->name);
+            llama_hybrid_classify_inner_stage_marker(
+                node->name,
+                result.pc_phone_ffn_graph);
 
         // build_norm() emits the raw normalization op first (named "norm-L")
         // and only the following weighted result receives attn_norm-L or
@@ -253,7 +264,8 @@ static llama_hybrid_inner_membership_result llama_hybrid_build_inner_node_member
             node->op == GGML_OP_RMS_NORM &&
             i + 1 < n_nodes &&
             (next_marker = llama_hybrid_classify_inner_stage_marker(
-                 ggml_graph_node(gf, i + 1)->name)).valid() &&
+                 ggml_graph_node(gf, i + 1)->name,
+                 result.pc_phone_ffn_graph)).valid() &&
             next_marker.event == llama_hybrid_inner_stage_event::BEGIN &&
             (next_marker.kind == llama_hybrid_inner_stage_kind::ATTN ||
              next_marker.kind == llama_hybrid_inner_stage_kind::FFN);
@@ -2101,7 +2113,9 @@ static void llama_hybrid_log_inner_stage_bindings(
         const int i = membership.first_transition_error_node;
         ggml_tensor * node = ggml_graph_node(gf, i);
         const llama_hybrid_inner_stage_marker marker =
-            llama_hybrid_classify_inner_stage_marker(node->name);
+            llama_hybrid_classify_inner_stage_marker(
+                node->name,
+                membership.pc_phone_ffn_graph);
         LLAMA_LOG_INFO(
             "[INNER_TRANSITION_ERROR] node=%d op=%s tensor=%s "
             "marker={layer:%d,chunk:%d,stage:%s,event:%s}\n",
