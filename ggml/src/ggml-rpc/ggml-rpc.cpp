@@ -10787,6 +10787,27 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_PHONE_NPU_FFN_DIRECT: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+
+                std::vector<uint8_t> output;
+                if (!server.phone_npu_ffn_direct(
+                        input,
+                        output)) {
+                    return;
+                }
+
+                if (!send_msg(
+                        sock,
+                        output.data(),
+                        output.size())) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT: {
                 const bool stage_profile =
                     rpc_tensor_phone_stage_profile_enabled();
