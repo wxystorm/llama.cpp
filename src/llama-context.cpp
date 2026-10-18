@@ -3192,6 +3192,29 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             int completed = 0;
             bool stop = false;
 
+            // Lightweight PC Ring timing. Keep scheduling semantics unchanged:
+            // these counters observe queue/compute time only.
+            std::vector<int64_t> enqueue_us(
+                (size_t) expected_tasks, 0);
+            int64_t attn_exec_us = 0;
+            int64_t ffn_exec_us = 0;
+            int64_t reduce_exec_us = 0;
+            int64_t gpu_queue_wait_us = 0;
+            int64_t cpu_queue_wait_us = 0;
+            int64_t gpu_idle_wait_us = 0;
+            int64_t cpu_idle_wait_us = 0;
+            int attn_count = 0;
+            int ffn_count = 0;
+            int reduce_count = 0;
+            const int64_t ring_wall_begin_us = ggml_time_us();
+
+            for (const pc_ring_job & job : gpu_queue) {
+                const int index = task_index(job);
+                GGML_ASSERT(index >= 0);
+                enqueue_us[(size_t) index] =
+                    ring_wall_begin_us;
+            }
+
             auto run_job =
                 [&](const pc_ring_job & job)
                     -> ggml_status {
@@ -3234,6 +3257,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     {
                         std::unique_lock<std::mutex> lock(
                             queue_mutex);
+                        const int64_t wait_begin_us =
+                            ggml_time_us();
                         queue_cv.wait(
                             lock,
                             [&]() {
@@ -3242,6 +3267,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                         GGML_STATUS_SUCCESS ||
                                     !cpu_queue.empty();
                             });
+                        cpu_idle_wait_us +=
+                            ggml_time_us() - wait_begin_us;
                         if (stop ||
                             ring_status !=
                                 GGML_STATUS_SUCCESS) {
@@ -3249,10 +3276,21 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         }
                         job = cpu_queue.front();
                         cpu_queue.pop_front();
+                        const int index = task_index(job);
+                        GGML_ASSERT(index >= 0);
+                        if (enqueue_us[(size_t) index] != 0) {
+                            cpu_queue_wait_us +=
+                                ggml_time_us() -
+                                enqueue_us[(size_t) index];
+                        }
                     }
 
+                    const int64_t exec_begin_us =
+                        ggml_time_us();
                     const ggml_status status =
                         run_job(job);
+                    const int64_t exec_us =
+                        ggml_time_us() - exec_begin_us;
 
                     {
                         std::lock_guard<std::mutex> lock(
@@ -3263,10 +3301,19 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             stop = true;
                         } else {
                             ++completed;
-                            gpu_queue.push_back({
+                            ffn_exec_us += exec_us;
+                            ++ffn_count;
+
+                            pc_ring_job next {
                                 PC_RING_REDUCE,
                                 job.layer,
-                                job.chunk });
+                                job.chunk };
+                            gpu_queue.push_back(next);
+                            const int next_index =
+                                task_index(next);
+                            GGML_ASSERT(next_index >= 0);
+                            enqueue_us[(size_t) next_index] =
+                                ggml_time_us();
                         }
                     }
                     queue_cv.notify_all();
@@ -3291,6 +3338,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 {
                     std::unique_lock<std::mutex> lock(
                         queue_mutex);
+                    const int64_t wait_begin_us =
+                        ggml_time_us();
                     queue_cv.wait(
                         lock,
                         [&]() {
@@ -3300,6 +3349,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                        expected_tasks ||
                                    !gpu_queue.empty();
                         });
+                    gpu_idle_wait_us +=
+                        ggml_time_us() - wait_begin_us;
                     if (ring_status !=
                             GGML_STATUS_SUCCESS ||
                         completed == expected_tasks) {
@@ -3307,6 +3358,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
                     job = gpu_queue.front();
                     gpu_queue.pop_front();
+                    const int index = task_index(job);
+                    GGML_ASSERT(index >= 0);
+                    if (enqueue_us[(size_t) index] != 0) {
+                        gpu_queue_wait_us +=
+                            ggml_time_us() -
+                            enqueue_us[(size_t) index];
+                    }
 
                     if (phone_cpu_chunk_stage_trace) {
                         LLAMA_LOG_DEBUG(
@@ -3321,8 +3379,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
                 }
 
+                const int64_t exec_begin_us =
+                    ggml_time_us();
                 const ggml_status status =
                     run_job(job);
+                const int64_t exec_us =
+                    ggml_time_us() - exec_begin_us;
 
                 {
                     std::lock_guard<std::mutex> lock(
@@ -3333,18 +3395,38 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         stop = true;
                     } else {
                         ++completed;
-                        if (job.kind ==
-                                PC_RING_ATTN) {
-                            cpu_queue.push_back({
+                        if (job.kind == PC_RING_ATTN) {
+                            attn_exec_us += exec_us;
+                            ++attn_count;
+
+                            pc_ring_job next {
                                 PC_RING_FFN,
                                 job.layer,
-                                job.chunk });
-                        } else if (job.layer + 1 <
-                                stage.layer_end) {
-                            gpu_queue.push_back({
-                                PC_RING_ATTN,
-                                job.layer + 1,
-                                job.chunk });
+                                job.chunk };
+                            cpu_queue.push_back(next);
+                            const int next_index =
+                                task_index(next);
+                            GGML_ASSERT(next_index >= 0);
+                            enqueue_us[(size_t) next_index] =
+                                ggml_time_us();
+                        } else {
+                            reduce_exec_us += exec_us;
+                            ++reduce_count;
+
+                            if (job.layer + 1 <
+                                    stage.layer_end) {
+                                pc_ring_job next {
+                                    PC_RING_ATTN,
+                                    job.layer + 1,
+                                    job.chunk };
+                                gpu_queue.push_back(next);
+                                const int next_index =
+                                    task_index(next);
+                                GGML_ASSERT(next_index >= 0);
+                                enqueue_us[
+                                    (size_t) next_index] =
+                                    ggml_time_us();
+                            }
                         }
                     }
                 }
@@ -3358,6 +3440,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
             queue_cv.notify_all();
             cpu_worker.join();
+
+            const int64_t ring_wall_us =
+                ggml_time_us() - ring_wall_begin_us;
 
             ret = ring_status;
             if (ret == GGML_STATUS_SUCCESS &&
@@ -3378,13 +3463,47 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     sched_use);
             }
 
+            const int64_t serial_exec_us =
+                attn_exec_us +
+                ffn_exec_us +
+                reduce_exec_us;
+            const int64_t overlap_us =
+                std::max<int64_t>(
+                    0,
+                    serial_exec_us - ring_wall_us);
+            const double overlap_ratio =
+                serial_exec_us > 0 ?
+                    (double) overlap_us /
+                        (double) serial_exec_us :
+                    0.0;
+
             LLAMA_LOG_INFO(
                 "[PC_LOCAL_RING_SUM] status=%s "
-                "completed=%d expected=%d\n",
+                "completed=%d expected=%d "
+                "wall_ms=%.3f "
+                "attn_ms=%.3f(%d) "
+                "ffn_ms=%.3f(%d) "
+                "reduce_ms=%.3f(%d) "
+                "gpu_idle_ms=%.3f cpu_idle_ms=%.3f "
+                "gpu_qwait_ms=%.3f cpu_qwait_ms=%.3f "
+                "overlap_ms=%.3f overlap_ratio=%.3f\n",
                 ret == GGML_STATUS_SUCCESS ?
                     "OK" : "FAIL",
                 completed,
-                expected_tasks);
+                expected_tasks,
+                ring_wall_us / 1000.0,
+                attn_exec_us / 1000.0,
+                attn_count,
+                ffn_exec_us / 1000.0,
+                ffn_count,
+                reduce_exec_us / 1000.0,
+                reduce_count,
+                gpu_idle_wait_us / 1000.0,
+                cpu_idle_wait_us / 1000.0,
+                gpu_queue_wait_us / 1000.0,
+                cpu_queue_wait_us / 1000.0,
+                overlap_us / 1000.0,
+                overlap_ratio);
         }
     } else {
         ret = graph_compute_range(
