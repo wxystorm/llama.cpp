@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -1952,6 +1953,27 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (pc_local_ring_stage) {
+            bool have_ring_marker = false;
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; ++i) {
+                const char * name = ggml_graph_node(gf, i)->name;
+                if (std::strncmp(
+                        name,
+                        "pc_ring_attn_out_chunk_",
+                        23) == 0) {
+                    have_ring_marker = true;
+                    break;
+                }
+            }
+            if (!have_ring_marker) {
+                // One-chunk/special-case CPU blocks use the ordinary graph.
+                // The mixed CUDA-attention/CPU-FFN placement remains valid,
+                // but no dynamic FIFO execution is needed.
+                pc_local_ring_stage = false;
+            }
         }
 
         if (pc_local_ring_stage) {
