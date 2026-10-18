@@ -518,8 +518,9 @@ static bool build_full_layer_graph(
         out.ctx, graph_size, false);
     ggml_build_forward_expand(out.graph, out.output);
 
-    for (int i = 0; i < out.graph->n_nodes; ++i) {
-        ggml_tensor * node = out.graph->nodes[i];
+    const int n_nodes = ggml_graph_n_nodes(out.graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(out.graph, i);
         if (!ggml_backend_supports_op(backend, node)) {
             std::fprintf(
                 stderr,
