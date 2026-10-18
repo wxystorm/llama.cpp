@@ -8379,6 +8379,7 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
     }
 
     if (phone_npu_backend == nullptr ||
+        graph == nullptr ||
         stage.layer < 0 ||
         stage.norm == nullptr) {
         return false;
