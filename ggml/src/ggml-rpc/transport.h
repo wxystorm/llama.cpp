@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -12,6 +13,11 @@ static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 
 struct socket_t {
     ~socket_t();
+
+    // Serializes one complete RPC transaction on a shared connection.
+    // Callers that use the socket as an RPC request/response stream must hold
+    // this from the first request byte through the final response byte.
+    std::mutex transaction_mutex;
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
