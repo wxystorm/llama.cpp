@@ -8502,7 +8502,6 @@ bool rpc_server::execute_phone_npu_async_job(
         std::vector<float> & output) {
     if (phone_npu_backend == nullptr ||
             job.cache == nullptr ||
-            job.down == nullptr ||
             job.n_embd <= 0 ||
             job.n_tokens <= 0 ||
             job.n_expert_used <= 0) {
@@ -8608,7 +8607,13 @@ bool rpc_server::execute_phone_npu_async_job(
 
     const size_t output_bytes =
         (size_t) ggml_nelements(out) * sizeof(float);
-    if (output_bytes != ggml_nbytes(job.down)) {
+    const size_t expected_output_bytes =
+        (size_t) job.n_embd *
+        (size_t) job.n_tokens *
+        sizeof(float);
+    if (output_bytes != expected_output_bytes ||
+        (job.down != nullptr &&
+         output_bytes != ggml_nbytes(job.down))) {
         return false;
     }
 
