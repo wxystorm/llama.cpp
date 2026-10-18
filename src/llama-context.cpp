@@ -1684,9 +1684,10 @@ static bool llama_hybrid_apply_pc_inner_policy(
             compute_nodes.end();
     };
 
-    // Phase 1 is validation only.  Do not assign any backend until every
-    // selected Attention compute node has been proven CUDA-capable.  This
-    // avoids leaving a partially migrated region if one later layer fails.
+    // Phase 1 is validation only. Baseline mode validates Attention; the
+    // PC->Phone FIFO additionally validates Reduce because both stages belong
+    // to the GPU queue. Do not assign any backend until the complete selected
+    // region is CUDA-capable.
     for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
         const bool move_stage =
             item.stage == llama_hybrid_inner_stage_kind::ATTN ||
@@ -1727,8 +1728,10 @@ static bool llama_hybrid_apply_pc_inner_policy(
         if (!ggml_backend_supports_op(cuda_backend, node)) {
             LLAMA_LOG_WARN(
                 "[INNER_PC_POLICY] status=SKIP "
-                "reason=ATTN_COMPUTE_UNSUPPORTED "
-                "layer=%d tokens=%u node=%d tensor=%s op=%s backend=%s\n",
+                "reason=STAGE_COMPUTE_UNSUPPORTED "
+                "stage=%s layer=%d tokens=%u node=%d tensor=%s op=%s backend=%s\n",
+                item.stage == llama_hybrid_inner_stage_kind::REDUCE ?
+                    "REDUCE" : "ATTN",
                 item.layer, ubatch_tokens,
                 item.node_index, node->name, ggml_op_name(node->op),
                 ggml_backend_name(cuda_backend));
@@ -1749,6 +1752,13 @@ static bool llama_hybrid_apply_pc_inner_policy(
                 "[INNER_PC_POLICY] status=SKIP reason=EMPTY_ATTN_STAGE "
                 "layer=%d tokens=%u attn_nodes=%d compute=%d\n",
                 il, ubatch_tokens, st.attn_nodes, st.compute_nodes);
+            return false;
+        }
+        if (pc_phone_ffn && st.reduce_nodes == 0) {
+            LLAMA_LOG_WARN(
+                "[INNER_PC_POLICY] status=SKIP reason=EMPTY_REDUCE_STAGE "
+                "layer=%d tokens=%u\n",
+                il, ubatch_tokens);
             return false;
         }
     }
@@ -1790,9 +1800,11 @@ static bool llama_hybrid_apply_pc_inner_policy(
         }
     }
 
-    // Phase 2: commit the validated stage policy.  FFN and REDUCE are left
-    // untouched and therefore inherit the existing PC CPU placement.  KV and
-    // other persistent Attention state also remain on their storage owner.
+    // Phase 2: commit the validated stage policy. Baseline mode moves only
+    // Attention. PC->Phone FIFO moves Attention + Reduce to CUDA while expert
+    // FFN stays as an unexecuted CPU placeholder split whose output slot is
+    // filled by the direct Phone HTP worker. KV/persistent state stays on its
+    // existing storage owner.
     for (ggml_tensor * node : compute_nodes) {
         ggml_backend_sched_set_tensor_backend(
             sched_use, node, cuda_backend);
