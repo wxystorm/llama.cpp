@@ -115,6 +115,14 @@ class Simulator:
         self.cpu_q: Deque[Task] = deque()
         self.gpu_q: Deque[Task] = deque()
 
+        # A GPU task is not scheduler-ready until both its activation and its
+        # layer weights are ready.  Weight-blocked tasks live here, outside the
+        # GPU FIFO, so a missing weight can never head-of-line block unrelated
+        # ready GPU work.
+        self.gpu_pending: List[Deque[Task]] = [
+            deque() for _ in range(self.n_layers)
+        ]
+
         # Weight states: ABSENT, LOADING, RESIDENT, EVICTED.
         self.weight_state = ["ABSENT"] * self.n_layers
         self.live_weight_mib = 0.0
@@ -184,8 +192,28 @@ class Simulator:
         self.max_cpu_queue = max(self.max_cpu_queue, len(self.cpu_q))
 
     def enqueue_gpu(self, task: Task) -> None:
-        self.gpu_q.append(task)
-        self.max_gpu_queue = max(self.max_gpu_queue, len(self.gpu_q))
+        # "ready -> push_back" is the only scheduler rule.  A task whose
+        # activation is ready but whose weights are not resident is a weight
+        # dependency, not a FIFO entry.
+        if self.weight_state[task.layer] == "RESIDENT":
+            self.gpu_q.append(task)
+            self.max_gpu_queue = max(
+                self.max_gpu_queue, len(self.gpu_q)
+            )
+        else:
+            self.gpu_pending[task.layer].append(task)
+
+    def release_weight_ready_tasks(self, layer: int) -> None:
+        pending = self.gpu_pending[layer]
+        while pending:
+            self.gpu_q.append(pending.popleft())
+        self.max_gpu_queue = max(
+            self.max_gpu_queue, len(self.gpu_q)
+        )
+
+    def has_weight_blocked_gpu_work(self) -> bool:
+        return any(self.gpu_pending[layer]
+                   for layer in range(self.n_layers))
 
     def enqueue_next_layer(self, layer: int, chunk: int, tokens: int, now: float) -> None:
         next_layer = layer + 1
@@ -211,6 +239,7 @@ class Simulator:
 
     def evict_layer(self, layer: int, now: float) -> None:
         assert self.weight_state[layer] == "RESIDENT"
+        assert not self.gpu_pending[layer]
         self.weight_state[layer] = "EVICTED"
         self.live_layers -= 1
         self.live_weight_mib -= self.layer_weight_mib(layer)
@@ -290,20 +319,23 @@ class Simulator:
             return
 
         if not self.gpu_q:
-            self.gpu_blocked_since = None
-            return
-
-        task = self.gpu_q[0]
-        if self.weight_state[task.layer] != "RESIDENT":
-            if self.gpu_blocked_since is None:
-                self.gpu_blocked_since = now
+            # Weight stall means the GPU has activation-ready work, but none
+            # of it is scheduler-ready because its weights are still absent.
+            if self.has_weight_blocked_gpu_work():
+                if self.gpu_blocked_since is None:
+                    self.gpu_blocked_since = now
+            else:
+                self.gpu_blocked_since = None
             return
 
         if self.gpu_blocked_since is not None:
-            self.gpu_weight_stall_ms += now - self.gpu_blocked_since
+            self.gpu_weight_stall_ms += (
+                now - self.gpu_blocked_since
+            )
             self.gpu_blocked_since = None
 
         task = self.gpu_q.popleft()
+        assert self.weight_state[task.layer] == "RESIDENT"
         dur = self.gpu_task_ms(task)
         self.gpu_busy = True
         self.gpu_busy_ms += dur
@@ -345,9 +377,9 @@ class Simulator:
         self.peak_live_layers = self.live_layers
         self.peak_live_weight_mib = self.live_weight_mib
 
-        # Core Chunk Ring invariant: all initial chunks enter layer 0 FIFO
-        # first.  Any next-layer task is appended only after its predecessor
-        # completes, so it cannot jump ahead of the initial chunks.
+        # Core Chunk Ring invariant: all initial activation-ready chunks are
+        # admitted in chunk order.  GPU work is appended to the scheduler FIFO
+        # only after both activation and weight dependencies are satisfied.
         for chunk, tokens in enumerate(self.chunk_sizes):
             if self.pattern[0] == "S":
                 self.enqueue_cpu(Task("A", 0, chunk, tokens, 0.0))
@@ -365,6 +397,7 @@ class Simulator:
                     "simulation deadlocked: "
                     f"finished={self.finished_chunks}/{self.n_chunks} "
                     f"cpu_q={len(self.cpu_q)} gpu_q={len(self.gpu_q)} "
+                    f"gpu_pending={sum(len(q) for q in self.gpu_pending)} "
                     f"next_prefetch={self.next_prefetch} "
                     f"live_layers={self.live_layers}"
                 )
@@ -380,6 +413,7 @@ class Simulator:
                     self.xfer_busy = False
                     assert self.weight_state[layer] == "LOADING"
                     self.weight_state[layer] = "RESIDENT"
+                    self.release_weight_ready_tasks(layer)
 
                 elif event_kind == "CPU_DONE":
                     task = payload
