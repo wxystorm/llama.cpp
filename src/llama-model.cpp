@@ -2190,7 +2190,9 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (pc_local_ring_layer) {
         switch (tn.tensor) {
             case LLM_TENSOR_FFN_NORM:
+            case LLM_TENSOR_FFN_NORM_EXPS:
             case LLM_TENSOR_FFN_GATE_INP:
+            case LLM_TENSOR_FFN_GATE_INP_SHEXP:
             case LLM_TENSOR_FFN_GATE:
             case LLM_TENSOR_FFN_UP:
             case LLM_TENSOR_FFN_DOWN:
@@ -2198,6 +2200,9 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             case LLM_TENSOR_FFN_UP_EXPS:
             case LLM_TENSOR_FFN_DOWN_EXPS:
             case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_SHEXP:
+            case LLM_TENSOR_FFN_UP_SHEXP:
+            case LLM_TENSOR_FFN_DOWN_SHEXP:
                 buft_list_layer = &pimpl->cpu_buft_list;
                 break;
             default:
