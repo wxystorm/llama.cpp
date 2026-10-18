@@ -5401,6 +5401,78 @@ int llama_context::decode(const llama_batch & batch_inp) {
         runtime_stages[2].macro_tokens >= runtime_stages[3].macro_tokens &&
         runtime_stages[2].macro_tokens % runtime_stages[3].macro_tokens == 0;
 
+    const char * pc_local_ring_entry_env =
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING");
+    const bool pc_local_ring_entry_requested =
+        pc_local_ring_entry_env != nullptr &&
+        std::atoi(pc_local_ring_entry_env) != 0;
+
+    // Dedicated entry for the PC-local Ring. Do not reuse the old generalized
+    // Stage Queue because that would also stage the Tensor suffix. Instead:
+    //
+    //   GPU prefix -> full-ubatch PC_LOCAL_RING -> original full suffix
+    //
+    // The suffix starts at the first Tensor layer and retains the model's
+    // existing per-layer Tensor/Phone ownership policy.
+    const bool pc_local_ring_prefix_topology =
+        pc_local_ring_entry_requested &&
+        has_runtime_plan &&
+        !tensor_phone_primary_exec &&
+        model.arch == LLM_ARCH_QWEN3MOE &&
+        runtime_stages.size() >= 3 &&
+        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
+        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
+        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
+        runtime_stages[1].layer_end == runtime_stages[2].layer_begin;
+
+    std::vector<llama_hybrid_runtime_stage>
+        pc_local_ring_prefix_stages;
+    if (pc_local_ring_prefix_topology) {
+        pc_local_ring_prefix_stages.push_back(runtime_stages[0]);
+
+        const int full_macro =
+            std::max(1, (int) cparams.n_ubatch);
+
+        pc_local_ring_prefix_stages.push_back({
+            llama_hybrid_runtime_stage_kind::CPU,
+            runtime_stages[1].layer_begin,
+            runtime_stages[1].layer_end,
+            full_macro,
+            0,
+        });
+
+        pc_local_ring_prefix_stages.push_back({
+            llama_hybrid_runtime_stage_kind::TENSOR,
+            runtime_stages[2].layer_begin,
+            (int) hparams.n_layer(),
+            full_macro,
+            runtime_plan.tensor_chunk_tokens,
+        });
+
+        LLAMA_LOG_INFO(
+            "[PC_LOCAL_RING_ENTRY] enabled=1 "
+            "GPU=[%d,%d) XG=%d "
+            "CPU=[%d,%d) macro=%d "
+            "SUFFIX=[%d,%d) macro=%d XT=%d\n",
+            pc_local_ring_prefix_stages[0].layer_begin,
+            pc_local_ring_prefix_stages[0].layer_end,
+            pc_local_ring_prefix_stages[0].macro_tokens,
+            pc_local_ring_prefix_stages[1].layer_begin,
+            pc_local_ring_prefix_stages[1].layer_end,
+            pc_local_ring_prefix_stages[1].macro_tokens,
+            pc_local_ring_prefix_stages[2].layer_begin,
+            pc_local_ring_prefix_stages[2].layer_end,
+            pc_local_ring_prefix_stages[2].macro_tokens,
+            pc_local_ring_prefix_stages[2].inner_chunk_tokens);
+    } else if (pc_local_ring_entry_requested) {
+        LLAMA_LOG_WARN(
+            "[PC_LOCAL_RING_ENTRY] enabled=0 reason=UNSUPPORTED_TOPOLOGY "
+            "has_plan=%d phone_primary=%d stages=%zu\n",
+            has_runtime_plan ? 1 : 0,
+            tensor_phone_primary_exec ? 1 : 0,
+            runtime_stages.size());
+    }
+
     // Phone-primary Tensor uses the full-graph Meta path for its internal
     // per-chunk route/FFN/join semantics.  A full graph, however, also makes
     // the preceding PC_ONLY CPU region consume the whole prompt at once, so
@@ -7057,6 +7129,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        const bool pc_local_ring_prefix_candidate =
+            pc_local_ring_prefix_topology &&
+            !pc_local_ring_prefix_stages.empty() &&
+            cparams.causal_attn &&
+            ubatch.n_tokens > 1 &&
+            ubatch.token != nullptr &&
+            ubatch.embd == nullptr &&
+            ubatch.n_pos == 1 &&
+            !ubatch.equal_seqs() &&
+            ubatch.n_seqs_unq == 1 &&
+            !cparams.embeddings &&
+            !cparams.embeddings_nextn &&
+            cparams.cb_eval == nullptr &&
+            std::none_of(
+                cparams.embeddings_layer_inp.begin(),
+                cparams.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; });
+
         bool phone_primary_gpu_tensor_wavefront_candidate =
             phone_primary_gpu_tensor_wavefront_topology &&
             !phone_primary_gpu_tensor_wavefront_stages.empty() &&
@@ -7226,6 +7316,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_tensor_ready_bytes = 0;
                 hybrid_phone_ready_bytes = 0;
             }
+        } else if (pc_local_ring_prefix_candidate) {
+            LLAMA_LOG_INFO(
+                "[PC_LOCAL_RING_ENTRY] ub=%d tokens=%u action=RUN\n",
+                ubatch_id,
+                ubatch.n_tokens);
+            res = process_ubatch_staged(
+                ubatch,
+                ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(),
+                sched.get(),
+                gf_res_prev.get(),
+                pc_local_ring_prefix_stages,
+                ubatch_id,
+                status);
         } else if (phone_primary_gpu_tensor_wavefront_candidate) {
             if (std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr) {
                 LLAMA_LOG_DEBUG(
