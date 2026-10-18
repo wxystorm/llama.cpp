@@ -5164,8 +5164,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 if (phone_ffn_requested) {
                     for (const auto & candidate_ptr : backends) {
                         ggml_backend_t candidate = candidate_ptr.get();
-                        if (candidate == nullptr ||
-                            !ggml_backend_is_rpc(candidate)) {
+                        if (candidate == nullptr) {
                             continue;
                         }
 
