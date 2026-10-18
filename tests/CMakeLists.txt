@@ -242,6 +242,11 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_CUDA AND NOT GGML_BACKEND_DL)
+    llama_build(test-pc-attn-rms-overlap.cpp)
+    target_link_libraries(test-pc-attn-rms-overlap PRIVATE ggml-cuda)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
