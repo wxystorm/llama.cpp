@@ -54,6 +54,7 @@ struct options {
     int warmup = 5;
     int iters = 50;
     int cpu_threads = 0;
+    int copy_prime = 16;
 };
 
 static void usage(const char * argv0) {
@@ -65,8 +66,9 @@ static void usage(const char * argv0) {
         "  --layers N           number of consecutive layers (default: 4)\n"
         "  --tokens N           activation tokens (default: 128)\n"
         "  --warmup N           warmup block iterations (default: 5)\n"
-        "  --iters N            measured block iterations (default: 50)\n"
-        "  --cpu-threads N      CPU RMS threads (default: min(8, HW threads))\n",
+        "  --iters N            measured block iterations per phase (default: 50)\n"
+        "  --cpu-threads N      CPU RMS threads (default: min(8, HW threads))\n"
+        "  --copy-prime N       D2H/H2D prime iterations before fused-only phase (default: 16)\n",
         argv0);
 }
 
@@ -129,6 +131,9 @@ static bool parse_options(int argc, char ** argv, options & opt) {
         } else if (a == "--cpu-threads") {
             const char * s = need("--cpu-threads");
             if (!s || !parse_i32(s, opt.cpu_threads)) return false;
+        } else if (a == "--copy-prime") {
+            const char * s = need("--copy-prime");
+            if (!s || !parse_i32(s, opt.copy_prime)) return false;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             return false;
@@ -137,7 +142,7 @@ static bool parse_options(int argc, char ** argv, options & opt) {
 
     if (opt.model_path.empty() || opt.device < 0 || opt.start_layer < 0 ||
         opt.layers <= 0 || opt.tokens <= 0 || opt.warmup < 0 ||
-        opt.iters <= 0 || opt.cpu_threads < 0) {
+        opt.iters <= 0 || opt.cpu_threads < 0 || opt.copy_prime < 0) {
         return false;
     }
 
@@ -319,7 +324,9 @@ struct stats {
     double mean = 0.0;
     double p50 = 0.0;
     double p95 = 0.0;
+    double p99 = 0.0;
     double min = 0.0;
+    double max = 0.0;
 };
 
 static stats summarize(std::vector<double> v) {
@@ -327,6 +334,7 @@ static stats summarize(std::vector<double> v) {
     if (v.empty()) return s;
     s.mean = std::accumulate(v.begin(), v.end(), 0.0) / (double) v.size();
     s.min = *std::min_element(v.begin(), v.end());
+    s.max = *std::max_element(v.begin(), v.end());
     std::sort(v.begin(), v.end());
 
     auto pct = [&](double p) {
@@ -338,6 +346,7 @@ static stats summarize(std::vector<double> v) {
     };
     s.p50 = pct(0.50);
     s.p95 = pct(0.95);
+    s.p99 = pct(0.99);
     return s;
 }
 
@@ -551,6 +560,7 @@ struct fused_sample {
     double wall_ms = 0.0;
     double d2h_ms = 0.0;
     double cpu_ms = 0.0;
+    double join_tail_ms = 0.0;
 };
 
 int main(int argc, char ** argv) {
@@ -711,7 +721,9 @@ int main(int argc, char ** argv) {
         ggml_backend_event_wait(compute_backend, r_ready);
         ggml_backend_synchronize(compute_backend);
 
-        s.wall_ms = elapsed_ms(t0, clock_type::now());
+        const auto tend = clock_type::now();
+        s.join_tail_ms = elapsed_ms(tc1, tend);
+        s.wall_ms = elapsed_ms(t0, tend);
         return s;
     };
 
@@ -725,20 +737,54 @@ int main(int argc, char ** argv) {
         ggml_backend_synchronize(compute_backend);
     };
 
+    auto prime_copy_path = [&](int reps) {
+        if (reps <= 0) {
+            std::printf("[PC_RMS_REAL_COPY_PRIME] reps=0 status=SKIP\n");
+            return;
+        }
+
+        std::fill(host_r, host_r + opt.tokens, 1.0f);
+        std::vector<double> d2h_ms;
+        std::vector<double> h2d_ms;
+        d2h_ms.reserve((size_t) reps);
+        h2d_ms.reserve((size_t) reps);
+
+        for (int i = 0; i < reps; ++i) {
+            const auto d0 = clock_type::now();
+            ggml_backend_tensor_get_async(
+                copy_backend, cases[0].x, host_x, 0, x_bytes);
+            ggml_backend_event_record(d2h_done, copy_backend);
+            ggml_backend_event_synchronize(d2h_done);
+            d2h_ms.push_back(elapsed_ms(d0, clock_type::now()));
+
+            const auto h0 = clock_type::now();
+            ggml_backend_tensor_set_async(
+                copy_backend, cases[0].inv_r, host_r, 0, r_bytes);
+            ggml_backend_event_record(r_ready, copy_backend);
+            ggml_backend_event_synchronize(r_ready);
+            h2d_ms.push_back(elapsed_ms(h0, clock_type::now()));
+        }
+
+        const stats d = summarize(d2h_ms);
+        const stats h = summarize(h2d_ms);
+        std::printf(
+            "[PC_RMS_REAL_COPY_PRIME] reps=%d"
+            " d2h_mean_ms=%.6f d2h_p50_ms=%.6f d2h_p95_ms=%.6f d2h_p99_ms=%.6f d2h_max_ms=%.6f"
+            " h2d_mean_ms=%.6f h2d_p50_ms=%.6f h2d_p95_ms=%.6f h2d_p99_ms=%.6f h2d_max_ms=%.6f\n",
+            reps,
+            d.mean, d.p50, d.p95, d.p99, d.max,
+            h.mean, h.p50, h.p95, h.p99, h.max);
+    };
+
     std::printf(
         "[PC_RMS_REAL_CONFIG] device=%d device_name=\"%s\""
         " layers=[%d,%d) tokens=%" PRId64
-        " warmup=%d iters=%d cpu_threads=%d cpu_kernel=%s"
+        " warmup=%d iters=%d cpu_threads=%d cpu_kernel=%s copy_prime=%d"
         " x_bytes=%zu return_bytes=%zu eps=%.9g\n",
         opt.device, dev_desc,
         opt.start_layer, opt.start_layer + opt.layers, opt.tokens,
-        opt.warmup, opt.iters, cpu_pool.n_threads(), cpu_kernel_name(),
+        opt.warmup, opt.iters, cpu_pool.n_threads(), cpu_kernel_name(), opt.copy_prime,
         x_bytes, r_bytes, cases[0].eps);
-
-    for (int w = 0; w < opt.warmup; ++w) {
-        for (auto & c : cases) (void) run_serial_layer(c);
-        for (auto & c : cases) (void) run_fused_layer(c);
-    }
 
     // Real-weight correctness of the algebraic split. The timed fused mode
     // intentionally stops before the explicit scale, but correctness is
@@ -782,70 +828,135 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<double>> layer_fused((size_t) opt.layers);
     std::vector<std::vector<double>> layer_d2h((size_t) opt.layers);
     std::vector<std::vector<double>> layer_cpu((size_t) opt.layers);
-    std::vector<double> block_serial;
+    std::vector<std::vector<double>> layer_join_tail((size_t) opt.layers);
+
+    std::vector<double> block_serial_pre;
+    std::vector<double> block_serial_post;
+    std::vector<double> block_serial_all;
     std::vector<double> block_fused;
-    block_serial.reserve(opt.iters);
+    block_serial_pre.reserve(opt.iters);
+    block_serial_post.reserve(opt.iters);
+    block_serial_all.reserve((size_t) opt.iters * 2);
     block_fused.reserve(opt.iters);
 
+    // Phase A: baseline only. Do not touch the copy stream while measuring.
+    for (int w = 0; w < opt.warmup; ++w) {
+        for (auto & lc : cases) (void) run_serial_layer(lc);
+    }
     for (int it = 0; it < opt.iters; ++it) {
-        const auto bs0 = clock_type::now();
+        const auto b0 = clock_type::now();
         for (int i = 0; i < opt.layers; ++i) {
-            layer_serial[(size_t) i].push_back(run_serial_layer(cases[(size_t) i]));
+            layer_serial[(size_t) i].push_back(
+                run_serial_layer(cases[(size_t) i]));
         }
-        block_serial.push_back(elapsed_ms(bs0, clock_type::now()));
+        const double wall = elapsed_ms(b0, clock_type::now());
+        block_serial_pre.push_back(wall);
+        block_serial_all.push_back(wall);
+    }
 
-        const auto bf0 = clock_type::now();
+    // Prime the copy stream immediately before the fused-only phase. This
+    // distinguishes steady-state transfer cost from copy-engine/stream wakeup.
+    prime_copy_path(opt.copy_prime);
+
+    // Phase B: fused-only continuous blocks. Layer 0 now follows layer N-1
+    // from the previous block instead of following a GPU-serial block.
+    for (int w = 0; w < opt.warmup; ++w) {
+        for (auto & lc : cases) (void) run_fused_layer(lc);
+    }
+    for (int it = 0; it < opt.iters; ++it) {
+        const auto b0 = clock_type::now();
         for (int i = 0; i < opt.layers; ++i) {
-            const fused_sample s = run_fused_layer(cases[(size_t) i]);
+            const fused_sample s =
+                run_fused_layer(cases[(size_t) i]);
             layer_fused[(size_t) i].push_back(s.wall_ms);
             layer_d2h[(size_t) i].push_back(s.d2h_ms);
             layer_cpu[(size_t) i].push_back(s.cpu_ms);
+            layer_join_tail[(size_t) i].push_back(s.join_tail_ms);
         }
-        block_fused.push_back(elapsed_ms(bf0, clock_type::now()));
+        block_fused.push_back(elapsed_ms(b0, clock_type::now()));
+    }
+
+    // Phase C: baseline recheck to expose GPU clock / thermal drift rather
+    // than accidentally crediting that drift to the fused helper path.
+    for (int w = 0; w < opt.warmup; ++w) {
+        for (auto & lc : cases) (void) run_serial_layer(lc);
+    }
+    for (int it = 0; it < opt.iters; ++it) {
+        const auto b0 = clock_type::now();
+        for (int i = 0; i < opt.layers; ++i) {
+            layer_serial[(size_t) i].push_back(
+                run_serial_layer(cases[(size_t) i]));
+        }
+        const double wall = elapsed_ms(b0, clock_type::now());
+        block_serial_post.push_back(wall);
+        block_serial_all.push_back(wall);
     }
 
     for (int i = 0; i < opt.layers; ++i) {
         const stats a = summarize(layer_serial[(size_t) i]);
         const stats b = summarize(layer_fused[(size_t) i]);
         const stats d = summarize(layer_d2h[(size_t) i]);
-        const stats c = summarize(layer_cpu[(size_t) i]);
+        const stats cp = summarize(layer_cpu[(size_t) i]);
+        const stats j = summarize(layer_join_tail[(size_t) i]);
 
         std::printf(
             "[PC_RMS_REAL_PER_LAYER] layer=%d"
-            " gpu_serial_mean_ms=%.6f gpu_serial_p50_ms=%.6f"
-            " fused_join_mean_ms=%.6f fused_join_p50_ms=%.6f"
-            " d2h_mean_ms=%.6f cpu_rms_mean_ms=%.6f"
+            " gpu_serial_mean_ms=%.6f gpu_serial_p50_ms=%.6f gpu_serial_p95_ms=%.6f"
+            " fused_mean_ms=%.6f fused_p50_ms=%.6f fused_p95_ms=%.6f fused_p99_ms=%.6f fused_max_ms=%.6f"
+            " d2h_mean_ms=%.6f d2h_p50_ms=%.6f d2h_p95_ms=%.6f d2h_p99_ms=%.6f d2h_max_ms=%.6f"
+            " cpu_mean_ms=%.6f cpu_p50_ms=%.6f cpu_p95_ms=%.6f cpu_p99_ms=%.6f cpu_max_ms=%.6f"
+            " join_tail_mean_ms=%.6f join_tail_p50_ms=%.6f join_tail_p95_ms=%.6f join_tail_p99_ms=%.6f join_tail_max_ms=%.6f"
             " delta_ms=%.6f speedup=%.6fx\n",
             cases[(size_t) i].il,
-            a.mean, a.p50,
-            b.mean, b.p50,
-            d.mean, c.mean,
+            a.mean, a.p50, a.p95,
+            b.mean, b.p50, b.p95, b.p99, b.max,
+            d.mean, d.p50, d.p95, d.p99, d.max,
+            cp.mean, cp.p50, cp.p95, cp.p99, cp.max,
+            j.mean, j.p50, j.p95, j.p99, j.max,
             a.mean - b.mean,
             b.mean > 0.0 ? a.mean / b.mean : 0.0);
     }
 
-    const stats bs = summarize(block_serial);
+    const stats bs_pre = summarize(block_serial_pre);
+    const stats bs_post = summarize(block_serial_post);
+    const stats bs = summarize(block_serial_all);
     const stats bf = summarize(block_fused);
 
     std::printf(
-        "[PC_RMS_REAL_BLOCK] mode=GPU_SERIAL layers=%d"
-        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f min_ms=%.6f\n",
-        opt.layers, bs.mean, bs.p50, bs.p95, bs.min);
+        "[PC_RMS_REAL_BLOCK] mode=GPU_SERIAL_PRE layers=%d"
+        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
+        opt.layers, bs_pre.mean, bs_pre.p50, bs_pre.p95,
+        bs_pre.p99, bs_pre.min, bs_pre.max);
 
     std::printf(
-        "[PC_RMS_REAL_BLOCK] mode=FUSED_JOIN_READY layers=%d"
-        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f min_ms=%.6f"
-        " delta_ms=%.6f speedup=%.6fx\n",
-        opt.layers, bf.mean, bf.p50, bf.p95, bf.min,
-        bs.mean - bf.mean,
-        bf.mean > 0.0 ? bs.mean / bf.mean : 0.0);
+        "[PC_RMS_REAL_BLOCK] mode=FUSED_ONLY layers=%d"
+        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
+        opt.layers, bf.mean, bf.p50, bf.p95,
+        bf.p99, bf.min, bf.max);
+
+    std::printf(
+        "[PC_RMS_REAL_BLOCK] mode=GPU_SERIAL_POST layers=%d"
+        " mean_ms=%.6f p50_ms=%.6f p95_ms=%.6f p99_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
+        opt.layers, bs_post.mean, bs_post.p50, bs_post.p95,
+        bs_post.p99, bs_post.min, bs_post.max);
+
+    std::printf(
+        "[PC_RMS_REAL_DRIFT]"
+        " serial_pre_mean_ms=%.6f serial_post_mean_ms=%.6f"
+        " serial_post_over_pre=%.6fx"
+        " serial_pre_p50_ms=%.6f serial_post_p50_ms=%.6f\n",
+        bs_pre.mean, bs_post.mean,
+        bs_pre.mean > 0.0 ? bs_post.mean / bs_pre.mean : 0.0,
+        bs_pre.p50, bs_post.p50);
 
     std::printf(
         "[PC_RMS_REAL_RESULT] correctness=%s"
         " layers=[%d,%d) tokens=%" PRId64
+        " baseline_combined_mean_ms=%.6f fused_only_mean_ms=%.6f"
         " delta_ms=%.6f speedup=%.6fx verdict=%s\n",
         all_correct ? "PASS" : "FAIL",
         opt.start_layer, opt.start_layer + opt.layers, opt.tokens,
+        bs.mean, bf.mean,
         bs.mean - bf.mean,
         bf.mean > 0.0 ? bs.mean / bf.mean : 0.0,
         all_correct && bf.mean < bs.mean ?
