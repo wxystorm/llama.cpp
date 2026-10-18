@@ -8393,29 +8393,10 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
         return false;
     }
 
-    // Prefer phone-local GGUF weights. Legacy graph-owned weights remain a
-    // fallback for older server setups.
-    if (local_tensor_source.get_info != nullptr &&
-        local_tensor_source.read != nullptr) {
-        std::unique_ptr<rpc_phone_npu_ffn_cache> local_entry;
-        if (!rpc_phone_npu_build_local_ffn_cache(
-                local_tensor_source,
-                phone_npu_backend,
-                stage,
-                local_entry) ||
-            !local_entry) {
-            return false;
-        }
-
-        cache = local_entry.get();
-        phone_npu_ffn_caches.emplace(
-            stage.layer,
-            std::move(local_entry));
-        return true;
-    }
-
-    // Compatibility fallback for older RPC servers without a local GGUF
-    // tensor source: seed the private cache from the RPC-visible graph.
+    // Legacy Tensor/Phone graphs must keep their original weight source:
+    // seed the private HTP cache from the RPC-visible graph tensors.  The
+    // phone-local GGUF source is reserved exclusively for the new direct
+    // PC->Phone FIFO path in prepare_phone_npu_direct_ffn_cache().
     char name[GGML_MAX_NAME] = {};
     std::snprintf(name, sizeof(name),
         "blk.%d.ffn_up_exps.weight", stage.layer);
