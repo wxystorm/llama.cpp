@@ -5552,9 +5552,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             if (fifo_trace) {
                                 const auto & task = tasks[(size_t) task_id];
                                 LLAMA_LOG_INFO(
-                                    "[INNER_FIFO_CPU_PUSH] "
-                                    "task=%d stage=%s layer=%d chunk=%d "
-                                    "size=%zu push=%zu source=%s\n",
+                                    phone_ffn_requested ?
+                                        "[INNER_FIFO_PHONE_PUSH] "
+                                        "task=%d stage=%s layer=%d chunk=%d "
+                                        "size=%zu push=%zu source=%s\n" :
+                                        "[INNER_FIFO_CPU_PUSH] "
+                                        "task=%d stage=%s layer=%d chunk=%d "
+                                        "size=%zu push=%zu source=%s\n",
                                     task.id,
                                     llama_hybrid_inner_task_stage_mask_name(
                                         task.stage_mask).c_str(),
@@ -5602,8 +5606,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     LLAMA_LOG_INFO(
                         "[INNER_FIFO] status=START ub=%d block=%zu "
                         "tokens=%u layers=[%d,%d) chunks=%d "
-                        "policy=BACKEND_LOCAL_FIFO "
-                        "gpu=ATTN cpu=FFN+REDUCE "
+                        "policy=%s gpu=%s ffn_queue=%s "
                         "storage=PIN_ALL_GRAPH_PLUS_SCHED_COPY_V0 ring_tasks=%d\n",
                         ubatch_id,
                         block_index,
@@ -5611,6 +5614,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         first_layer,
                         last_layer + 1,
                         n_chunks,
+                        phone_ffn_requested ?
+                            "GPU_PHONE_FIFO" :
+                            "BACKEND_LOCAL_FIFO",
+                        phone_ffn_requested ?
+                            "ATTN+REDUCE" :
+                            "ATTN",
+                        phone_ffn_requested ?
+                            "PHONE_PRIVATE_HTP" :
+                            "CPU_FFN+REDUCE",
                         ring_tasks);
 
                     if (first_semantic > 0) {
@@ -5671,24 +5683,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 }
 
                                 auto & task = tasks[(size_t) task_id];
-                                if (!exact_stage(
+                                const bool is_attn =
+                                    exact_stage(
                                         task,
-                                        llama_hybrid_inner_stage_kind::ATTN)) {
+                                        llama_hybrid_inner_stage_kind::ATTN);
+                                const bool is_reduce =
+                                    exact_stage(
+                                        task,
+                                        llama_hybrid_inner_stage_kind::REDUCE);
+
+                                if (!is_attn &&
+                                    !(phone_ffn_requested &&
+                                      is_reduce)) {
                                     set_error(GGML_STATUS_FAILED);
                                     return;
                                 }
 
-                                const ggml_status status = run_task(task);
+                                const ggml_status status =
+                                    run_task(task);
                                 if (status != GGML_STATUS_SUCCESS) {
                                     set_error(status);
                                     return;
                                 }
 
-                                enqueue_cpu(
-                                    ffn_ids[ring_index(
-                                        task.layer_begin,
-                                        task.chunk)],
-                                    "ATTN_COMPLETE");
+                                if (is_attn) {
+                                    enqueue_cpu(
+                                        ffn_ids[ring_index(
+                                            task.layer_begin,
+                                            task.chunk)],
+                                        "ATTN_COMPLETE");
+                                } else if (
+                                    task.layer_begin < last_layer) {
+                                    // Strict FIFO: next-layer Attention is
+                                    // appended behind every GPU task already
+                                    // waiting in the queue.
+                                    enqueue_gpu(
+                                        attn_ids[ring_index(
+                                            task.layer_begin + 1,
+                                            task.chunk)],
+                                        "REDUCE_COMPLETE");
+                                }
                                 finish_task();
                             }
                         });
@@ -5722,9 +5756,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                         const auto & task =
                                             tasks[(size_t) task_id];
                                         LLAMA_LOG_INFO(
-                                            "[INNER_FIFO_CPU_POP] "
-                                            "task=%d stage=%s layer=%d chunk=%d "
-                                            "left=%zu pop=%zu\n",
+                                            phone_ffn_requested ?
+                                                "[INNER_FIFO_PHONE_POP] "
+                                                "task=%d stage=%s layer=%d chunk=%d "
+                                                "left=%zu pop=%zu\n" :
+                                                "[INNER_FIFO_CPU_POP] "
+                                                "task=%d stage=%s layer=%d chunk=%d "
+                                                "left=%zu pop=%zu\n",
                                             task.id,
                                             llama_hybrid_inner_task_stage_mask_name(
                                                 task.stage_mask).c_str(),
@@ -5748,20 +5786,59 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                     set_error(GGML_STATUS_FAILED);
                                     return;
                                 }
+                                if (phone_ffn_requested &&
+                                    !is_ffn) {
+                                    set_error(GGML_STATUS_FAILED);
+                                    return;
+                                }
 
-                                const ggml_status status = run_task(task);
+                                ggml_status status =
+                                    GGML_STATUS_SUCCESS;
+                                if (phone_ffn_requested) {
+                                    const size_t idx =
+                                        ring_index(
+                                            task.layer_begin,
+                                            task.chunk);
+                                    const phone_ffn_binding & binding =
+                                        phone_bindings[idx];
+
+                                    const bool phone_ok =
+                                        phone_ffn_run(
+                                            phone_ffn_backend,
+                                            task.layer_begin,
+                                            task.chunk,
+                                            binding.hidden,
+                                            binding.topk,
+                                            binding.route_weights,
+                                            binding.down);
+                                    status = phone_ok ?
+                                        GGML_STATUS_SUCCESS :
+                                        GGML_STATUS_FAILED;
+                                } else {
+                                    status = run_task(task);
+                                }
+
                                 if (status != GGML_STATUS_SUCCESS) {
                                     set_error(status);
                                     return;
                                 }
 
                                 if (is_ffn) {
-                                    enqueue_cpu(
-                                        reduce_ids[ring_index(
-                                            task.layer_begin,
-                                            task.chunk)],
-                                        "FFN_COMPLETE");
-                                } else if (task.layer_begin < last_layer) {
+                                    if (phone_ffn_requested) {
+                                        enqueue_gpu(
+                                            reduce_ids[ring_index(
+                                                task.layer_begin,
+                                                task.chunk)],
+                                            "PHONE_FFN_COMPLETE");
+                                    } else {
+                                        enqueue_cpu(
+                                            reduce_ids[ring_index(
+                                                task.layer_begin,
+                                                task.chunk)],
+                                            "FFN_COMPLETE");
+                                    }
+                                } else if (
+                                    task.layer_begin < last_layer) {
                                     enqueue_gpu(
                                         attn_ids[ring_index(
                                             task.layer_begin + 1,
