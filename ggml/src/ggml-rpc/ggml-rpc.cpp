@@ -5481,6 +5481,12 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
+    // Wire-command entry point: rpc_serve_client() is a free dispatcher, so
+    // the handler itself must be public even though all HTP/cache helpers stay
+    // private.
+    bool phone_npu_ffn_direct(
+        const std::vector<uint8_t> & input,
+        std::vector<uint8_t> & output);
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -5527,11 +5533,6 @@ private:
         uint32_t device,
         uint64_t graph_uid,
         ggml_cgraph * graph);
-    bool phone_npu_ffn_direct(
-        const std::vector<uint8_t> & input,
-        std::vector<uint8_t> & output);
-
-
     std::vector<ggml_backend_t> backends;
     // Private phone-local execution backend. It is deliberately not part of
     // the RPC-visible backend vector and therefore cannot become an Outer
