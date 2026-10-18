@@ -2707,6 +2707,28 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     const bool phone_cpu_chunk_stage_trace =
         std::getenv("LLAMA_HYBRID_STAGE_TRACE") != nullptr;
 
+    bool pc_local_ring_runtime = false;
+    if (stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+        block_tokens > 1 &&
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0) {
+        ggml_cgraph * ring_graph = result->get_gf();
+        const int ring_nodes =
+            ring_graph != nullptr ?
+                ggml_graph_n_nodes(ring_graph) : 0;
+        for (int i = 0; i < ring_nodes; ++i) {
+            const char * name =
+                ggml_graph_node(ring_graph, i)->name;
+            if (std::strncmp(
+                    name,
+                    "pc_ring_attn_out_chunk_",
+                    23) == 0) {
+                pc_local_ring_runtime = true;
+                break;
+            }
+        }
+    }
+
     if (phone_resident_input) {
         ggml_tensor * stage_input_tensor =
             result->get_stage_input();
@@ -2899,7 +2921,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ggml_backend_t, int, struct ggml_cpu_stage_profile *);
     cpu_profile_control_fn cpu_profile_control = nullptr;
     bool cpu_profile_armed = false;
-    if (stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
+    if (!pc_local_ring_runtime &&
+        stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
         block_tokens >= 16 && backend_cpu != nullptr) {
         const char * enabled = std::getenv("LLAMA_HYBRID_REAL_CPU_PROFILE");
         if (enabled != nullptr && std::atoi(enabled) != 0) {
@@ -2916,7 +2939,612 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+
+    if (pc_local_ring_runtime) {
+        enum class pc_ring_task_kind {
+            ATTN,
+            FFN,
+            REDUCE,
+        };
+
+        struct pc_ring_task {
+            pc_ring_task_kind kind;
+            int layer;
+            int chunk;
+            int split_id;
+            ggml_backend_t backend;
+        };
+
+        auto kind_name = [](pc_ring_task_kind kind) {
+            switch (kind) {
+                case pc_ring_task_kind::ATTN:   return "ATTN";
+                case pc_ring_task_kind::FFN:    return "FFN";
+                case pc_ring_task_kind::REDUCE: return "REDUCE";
+            }
+            return "?";
+        };
+
+        auto parse_marker =
+            [](const char * name,
+               const char * fmt,
+               int & chunk,
+               int & layer) -> bool {
+                int n = 0;
+                return std::sscanf(
+                           name,
+                           fmt,
+                           &chunk,
+                           &layer,
+                           &n) == 2 &&
+                       name[n] == '\0';
+            };
+
+        ggml_cgraph * ring_graph =
+            result->get_gf();
+        std::vector<pc_ring_task> tasks;
+        std::vector<int> split_task(
+            (size_t) n_splits,
+            -1);
+
+        bool mapping_ok = ring_graph != nullptr;
+        for (int split_id = 0;
+             mapping_ok && split_id < n_splits;
+             ++split_id) {
+            const int i_start =
+                ggml_backend_sched_get_split_start(
+                    sched_use,
+                    split_id);
+            const int i_end =
+                ggml_backend_sched_get_split_end(
+                    sched_use,
+                    split_id);
+
+            int found = 0;
+            pc_ring_task found_task {
+                pc_ring_task_kind::ATTN,
+                -1,
+                -1,
+                split_id,
+                ggml_backend_sched_get_split_backend(
+                    sched_use,
+                    split_id),
+            };
+
+            for (int node_id = i_start;
+                 node_id < i_end;
+                 ++node_id) {
+                ggml_tensor * node =
+                    ggml_graph_node(
+                        ring_graph,
+                        node_id);
+                int chunk = -1;
+                int layer = -1;
+
+                if (parse_marker(
+                        node->name,
+                        "pc_ring_attn_out_chunk_%d-%d%n",
+                        chunk,
+                        layer)) {
+                    found_task.kind =
+                        pc_ring_task_kind::ATTN;
+                    found_task.chunk = chunk;
+                    found_task.layer = layer;
+                    ++found;
+                } else if (parse_marker(
+                        node->name,
+                        "pc_ring_ffn_out_chunk_%d-%d%n",
+                        chunk,
+                        layer)) {
+                    found_task.kind =
+                        pc_ring_task_kind::FFN;
+                    found_task.chunk = chunk;
+                    found_task.layer = layer;
+                    ++found;
+                } else if (parse_marker(
+                        node->name,
+                        "pc_ring_reduce_chunk_%d-%d%n",
+                        chunk,
+                        layer)) {
+                    found_task.kind =
+                        pc_ring_task_kind::REDUCE;
+                    found_task.chunk = chunk;
+                    found_task.layer = layer;
+                    ++found;
+                }
+            }
+
+            if (found > 1) {
+                mapping_ok = false;
+                break;
+            }
+            if (found == 1) {
+                split_task[(size_t) split_id] =
+                    (int) tasks.size();
+                tasks.push_back(found_task);
+            }
+        }
+
+        int first_task_split = n_splits;
+        int last_task_split = -1;
+        for (const pc_ring_task & task : tasks) {
+            first_task_split =
+                std::min(
+                    first_task_split,
+                    task.split_id);
+            last_task_split =
+                std::max(
+                    last_task_split,
+                    task.split_id);
+        }
+
+        if (tasks.empty()) {
+            mapping_ok = false;
+        }
+
+        if (mapping_ok) {
+            for (int split_id = first_task_split;
+                 split_id <= last_task_split;
+                 ++split_id) {
+                if (split_task[(size_t) split_id] < 0) {
+                    mapping_ok = false;
+                    break;
+                }
+            }
+        }
+
+        auto find_task =
+            [&](pc_ring_task_kind kind,
+                int layer,
+                int chunk) -> int {
+                for (size_t i = 0;
+                     i < tasks.size();
+                     ++i) {
+                    if (tasks[i].kind == kind &&
+                        tasks[i].layer == layer &&
+                        tasks[i].chunk == chunk) {
+                        return (int) i;
+                    }
+                }
+                return -1;
+            };
+
+        std::vector<int> seed_tasks;
+        if (mapping_ok) {
+            for (size_t i = 0;
+                 i < tasks.size();
+                 ++i) {
+                if (tasks[i].kind ==
+                        pc_ring_task_kind::ATTN &&
+                    tasks[i].layer ==
+                        stage.layer_begin) {
+                    seed_tasks.push_back((int) i);
+                }
+            }
+            std::sort(
+                seed_tasks.begin(),
+                seed_tasks.end(),
+                [&](int a, int b) {
+                    return tasks[(size_t) a].chunk <
+                           tasks[(size_t) b].chunk;
+                });
+
+            if (seed_tasks.empty()) {
+                mapping_ok = false;
+            }
+        }
+
+        if (mapping_ok) {
+            for (size_t i = 0;
+                 i < seed_tasks.size();
+                 ++i) {
+                if (tasks[(size_t) seed_tasks[i]].chunk !=
+                        (int) i) {
+                    mapping_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (mapping_ok) {
+            const int n_chunks =
+                (int) seed_tasks.size();
+            const int n_layers =
+                stage.layer_end -
+                stage.layer_begin;
+            const size_t expected_tasks =
+                (size_t) n_chunks *
+                (size_t) n_layers * 3;
+
+            if (tasks.size() != expected_tasks) {
+                mapping_ok = false;
+            }
+
+            const ggml_backend_dev_t gpu_dev =
+                model.dev_layer(stage.layer_begin);
+            for (int layer = stage.layer_begin;
+                 mapping_ok &&
+                 layer < stage.layer_end;
+                 ++layer) {
+                for (int chunk = 0;
+                     mapping_ok &&
+                     chunk < n_chunks;
+                     ++chunk) {
+                    const int attn =
+                        find_task(
+                            pc_ring_task_kind::ATTN,
+                            layer,
+                            chunk);
+                    const int ffn =
+                        find_task(
+                            pc_ring_task_kind::FFN,
+                            layer,
+                            chunk);
+                    const int reduce =
+                        find_task(
+                            pc_ring_task_kind::REDUCE,
+                            layer,
+                            chunk);
+                    if (attn < 0 ||
+                        ffn < 0 ||
+                        reduce < 0) {
+                        mapping_ok = false;
+                        break;
+                    }
+
+                    if (ggml_backend_get_device(
+                            tasks[(size_t) attn].backend) !=
+                            gpu_dev ||
+                        ggml_backend_get_device(
+                            tasks[(size_t) reduce].backend) !=
+                            gpu_dev ||
+                        tasks[(size_t) ffn].backend !=
+                            backend_cpu) {
+                        mapping_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!mapping_ok) {
+            LLAMA_LOG_ERROR(
+                "[PC_LOCAL_RING_Q_CAP] active=0 "
+                "reason=TASK_MAP splits=%d tasks=%zu\n",
+                n_splits,
+                tasks.size());
+            ret = GGML_STATUS_FAILED;
+        } else {
+            // Any graph prefix is a prerequisite of the first ATTN task.
+            if (first_task_split > 0) {
+                ret = graph_compute_range(
+                    sched_use,
+                    0,
+                    first_task_split,
+                    block_tokens > 1);
+                if (ret == GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_synchronize(
+                        sched_use);
+                }
+            }
+
+            const int n_chunks =
+                (int) seed_tasks.size();
+            const size_t expected_tasks =
+                tasks.size();
+
+            std::deque<int> gpu_queue;
+            std::deque<int> cpu_queue;
+            std::vector<uint8_t> queued(
+                tasks.size(),
+                0);
+            std::vector<uint8_t> completed_task(
+                tasks.size(),
+                0);
+
+            std::mutex queue_mutex;
+            std::mutex prepare_mutex;
+            std::condition_variable queue_cv;
+            size_t completed_count = 0;
+            ggml_status ring_status = ret;
+
+            auto enqueue_locked =
+                [&](int task_id) -> bool {
+                    if (task_id < 0 ||
+                        task_id >= (int) tasks.size() ||
+                        queued[(size_t) task_id]) {
+                        return false;
+                    }
+                    queued[(size_t) task_id] = 1;
+                    if (tasks[(size_t) task_id].kind ==
+                            pc_ring_task_kind::FFN) {
+                        cpu_queue.push_back(task_id);
+                    } else {
+                        gpu_queue.push_back(task_id);
+                    }
+                    return true;
+                };
+
+            if (ring_status == GGML_STATUS_SUCCESS) {
+                std::lock_guard<std::mutex> lock(
+                    queue_mutex);
+                for (int task_id : seed_tasks) {
+                    if (!enqueue_locked(task_id)) {
+                        ring_status =
+                            GGML_STATUS_FAILED;
+                        break;
+                    }
+                }
+            }
+
+            // CPU task execution uses the same thread pool/thread count as the
+            // ordinary graph_compute_range path.
+            const int ring_threads =
+                block_tokens > 1 ?
+                    cparams.n_threads_batch :
+                    cparams.n_threads;
+            ggml_threadpool_t ring_tp =
+                block_tokens > 1 ?
+                    threadpool_batch :
+                    threadpool;
+            if (backend_cpu != nullptr) {
+                auto * reg =
+                    ggml_backend_dev_backend_reg(
+                        ggml_backend_get_device(
+                            backend_cpu));
+                auto * set_threadpool_fn =
+                    (decltype(
+                        ggml_backend_cpu_set_threadpool) *)
+                    ggml_backend_reg_get_proc_address(
+                        reg,
+                        "ggml_backend_cpu_set_threadpool");
+                if (set_threadpool_fn) {
+                    set_threadpool_fn(
+                        backend_cpu,
+                        ring_tp);
+                }
+            }
+            for (const auto & set_n_threads_fn :
+                    set_n_threads_fns) {
+                set_n_threads_fn.second(
+                    set_n_threads_fn.first,
+                    ring_threads);
+            }
+
+            auto run_task =
+                [&](int task_id) -> ggml_status {
+                    const pc_ring_task & task =
+                        tasks[(size_t) task_id];
+
+                    ggml_status status =
+                        GGML_STATUS_SUCCESS;
+                    {
+                        // prepare_split mutates scheduler copy/event state;
+                        // keep only this short host-side phase serialized.
+                        std::lock_guard<std::mutex> lock(
+                            prepare_mutex);
+                        status =
+                            ggml_backend_sched_prepare_split(
+                                sched_use,
+                                task.split_id);
+                    }
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+
+                    status =
+                        ggml_backend_sched_compute_split(
+                            sched_use,
+                            task.split_id);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+
+                    // Completion is the only event that can publish the next
+                    // task. No speculative readiness or priority insertion.
+                    ggml_backend_synchronize(
+                        task.backend);
+                    return GGML_STATUS_SUCCESS;
+                };
+
+            auto worker =
+                [&](bool cpu_worker) {
+                    while (true) {
+                        int task_id = -1;
+                        {
+                            std::unique_lock<std::mutex> lock(
+                                queue_mutex);
+                            queue_cv.wait(
+                                lock,
+                                [&]() {
+                                    const bool have_task =
+                                        cpu_worker ?
+                                            !cpu_queue.empty() :
+                                            !gpu_queue.empty();
+                                    return have_task ||
+                                        ring_status !=
+                                            GGML_STATUS_SUCCESS ||
+                                        completed_count ==
+                                            expected_tasks;
+                                });
+
+                            if (ring_status !=
+                                    GGML_STATUS_SUCCESS ||
+                                completed_count ==
+                                    expected_tasks) {
+                                return;
+                            }
+
+                            auto & queue =
+                                cpu_worker ?
+                                    cpu_queue :
+                                    gpu_queue;
+                            if (queue.empty()) {
+                                continue;
+                            }
+                            task_id = queue.front();
+                            queue.pop_front();
+
+                            if (phone_cpu_chunk_stage_trace) {
+                                const pc_ring_task & task =
+                                    tasks[(size_t) task_id];
+                                LLAMA_LOG_DEBUG(
+                                    "[PC_LOCAL_RING_Q] event=POP "
+                                    "kind=%s layer=%d chunk=%d "
+                                    "gpu_q=%zu cpu_q=%zu\n",
+                                    kind_name(task.kind),
+                                    task.layer,
+                                    task.chunk,
+                                    gpu_queue.size(),
+                                    cpu_queue.size());
+                            }
+                        }
+
+                        const ggml_status status =
+                            run_task(task_id);
+
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                queue_mutex);
+                            if (status !=
+                                    GGML_STATUS_SUCCESS) {
+                                ring_status = status;
+                                queue_cv.notify_all();
+                                return;
+                            }
+
+                            GGML_ASSERT(
+                                !completed_task[
+                                    (size_t) task_id]);
+                            completed_task[
+                                (size_t) task_id] = 1;
+                            ++completed_count;
+
+                            const pc_ring_task & task =
+                                tasks[(size_t) task_id];
+                            int next_task = -1;
+                            if (task.kind ==
+                                    pc_ring_task_kind::ATTN) {
+                                next_task =
+                                    find_task(
+                                        pc_ring_task_kind::FFN,
+                                        task.layer,
+                                        task.chunk);
+                            } else if (task.kind ==
+                                    pc_ring_task_kind::FFN) {
+                                next_task =
+                                    find_task(
+                                        pc_ring_task_kind::REDUCE,
+                                        task.layer,
+                                        task.chunk);
+                            } else if (task.layer + 1 <
+                                    stage.layer_end) {
+                                next_task =
+                                    find_task(
+                                        pc_ring_task_kind::ATTN,
+                                        task.layer + 1,
+                                        task.chunk);
+                            }
+
+                            if (next_task >= 0) {
+                                if (!enqueue_locked(
+                                        next_task)) {
+                                    ring_status =
+                                        GGML_STATUS_FAILED;
+                                    queue_cv.notify_all();
+                                    return;
+                                }
+
+                                if (phone_cpu_chunk_stage_trace) {
+                                    const pc_ring_task & next =
+                                        tasks[
+                                            (size_t) next_task];
+                                    LLAMA_LOG_DEBUG(
+                                        "[PC_LOCAL_RING_Q] event=PUSH "
+                                        "kind=%s layer=%d chunk=%d "
+                                        "gpu_q=%zu cpu_q=%zu\n",
+                                        kind_name(next.kind),
+                                        next.layer,
+                                        next.chunk,
+                                        gpu_queue.size(),
+                                        cpu_queue.size());
+                                }
+                            }
+
+                            queue_cv.notify_all();
+                        }
+                    }
+                };
+
+            if (ring_status == GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_INFO(
+                    "[PC_LOCAL_RING_Q_CAP] active=1 "
+                    "layers=[%d,%d) chunks=%d tasks=%zu "
+                    "splits=%d task_range=[%d,%d]\n",
+                    stage.layer_begin,
+                    stage.layer_end,
+                    n_chunks,
+                    tasks.size(),
+                    n_splits,
+                    first_task_split,
+                    last_task_split);
+
+                std::thread gpu_thread(
+                    worker,
+                    false);
+                std::thread cpu_thread(
+                    worker,
+                    true);
+                queue_cv.notify_all();
+                gpu_thread.join();
+                cpu_thread.join();
+            }
+
+            ret = ring_status;
+
+            if (ret == GGML_STATUS_SUCCESS &&
+                completed_count != expected_tasks) {
+                LLAMA_LOG_ERROR(
+                    "[PC_LOCAL_RING_SUM] status=FAIL "
+                    "completed=%zu expected=%zu\n",
+                    completed_count,
+                    expected_tasks);
+                ret = GGML_STATUS_FAILED;
+            }
+
+            // Final concat/output-head work is deliberately outside the Ring.
+            // It may share the GPU backend with REDUCE, so the forced split
+            // after the last REDUCE prevents it from running early.
+            if (ret == GGML_STATUS_SUCCESS &&
+                last_task_split + 1 < n_splits) {
+                ret = graph_compute_range(
+                    sched_use,
+                    last_task_split + 1,
+                    n_splits,
+                    block_tokens > 1);
+            }
+            if (ret == GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_synchronize(
+                    sched_use);
+            }
+
+            LLAMA_LOG_INFO(
+                "[PC_LOCAL_RING_SUM] status=%s "
+                "completed=%zu expected=%zu gpu_q=%zu cpu_q=%zu\n",
+                ret == GGML_STATUS_SUCCESS ?
+                    "OK" : "FAIL",
+                completed_count,
+                expected_tasks,
+                gpu_queue.size(),
+                cpu_queue.size());
+        }
+    } else {
+        ret = graph_compute_range(
+            sched_use,
+            0,
+            n_splits,
+            block_tokens > 1);
+    }
+
     const int64_t compute_end_us = timing != nullptr ? ggml_time_us() : 0;
     struct ggml_cpu_stage_profile real_cpu_profile = {};
     const bool real_cpu_profile_ok = cpu_profile_armed &&
@@ -2962,6 +3590,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     // apply_ubatch, including its padding. set_stage_range() only slices
     // cell indexes; it does not change n_kv between XC subblocks.
     if (ret == GGML_STATUS_SUCCESS &&
+        !pc_local_ring_runtime &&
         stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
         block_tokens > 1) {
         const char * kv_diag = std::getenv("LLAMA_HYBRID_CPU_KV_DIAG");
@@ -3015,6 +3644,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     // matching tokens/KV/threads and 1 CPU split with complete FFN boundaries.
     // This sidecar never changes the original per-stage execution or scorer.
     if (ret == GGML_STATUS_SUCCESS &&
+        !pc_local_ring_runtime &&
         stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
         block_tokens >= 16 &&
         real_cpu_profile_ok) {
