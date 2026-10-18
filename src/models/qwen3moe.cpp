@@ -223,6 +223,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     bool pc_local_ring_stage =
         pc_local_ring_requested &&
         stage_graph &&
+        !build_output_head &&
         n_tokens > 1 &&
         ubatch.n_pos == 1 &&
         ubatch.n_seqs_unq == 1 &&
