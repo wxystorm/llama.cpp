@@ -206,6 +206,295 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     const int planned_chunk_tokens =
         llama_hybrid_runtime_prefill_chunk_tokens();
+
+    // PC local Ring is intentionally independent from the old Tensor/Phone
+    // wavefront. A complete PC_ONLY stage is split into token chunks, and each
+    // (layer, chunk) exposes exactly three task boundaries:
+    //
+    //   CUDA Attention -> CPU FFN -> CUDA Reduce
+    //
+    // The runtime owns the FIFO order. The graph only describes the ordinary
+    // Transformer math and stable task outputs.
+    const char * pc_local_ring_env =
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING");
+    const bool pc_local_ring_requested =
+        pc_local_ring_env != nullptr &&
+        std::atoi(pc_local_ring_env) != 0;
+    bool pc_local_ring_stage =
+        pc_local_ring_requested &&
+        stage_graph &&
+        n_tokens > 1 &&
+        ubatch.n_pos == 1 &&
+        ubatch.n_seqs_unq == 1 &&
+        (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
+        loras->empty();
+
+    if (pc_local_ring_stage) {
+        for (int il = layer_begin; il < layer_end; ++il) {
+            if (model.hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::PC_ONLY ||
+                il >= (int) model.pc_layer_backends.size() ||
+                model.pc_layer_backends[il] !=
+                    llama_pc_layer_backend::CPU ||
+                cvec->tensor_for(il) != nullptr) {
+                pc_local_ring_stage = false;
+                break;
+            }
+        }
+    }
+
+    int pc_local_ring_chunk_tokens = 128;
+    if (const char * value =
+            std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_CHUNK_TOKENS")) {
+        const int parsed = std::atoi(value);
+        if (parsed > 0) {
+            pc_local_ring_chunk_tokens = parsed;
+        }
+    }
+
+    std::vector<int> pc_local_ring_chunks;
+    if (pc_local_ring_stage) {
+        pc_local_ring_chunks =
+            llama_hybrid_split_by_chunk_size(
+                (int) n_tokens,
+                pc_local_ring_chunk_tokens);
+        pc_local_ring_stage =
+            pc_local_ring_chunks.size() > 1;
+    }
+
+    if (pc_local_ring_stage) {
+        std::vector<int64_t> chunk_begin(
+            pc_local_ring_chunks.size(), 0);
+        std::vector<ggml_tensor *> hidden_chunks;
+        hidden_chunks.reserve(pc_local_ring_chunks.size());
+
+        int64_t token_begin = 0;
+        for (size_t ci = 0; ci < pc_local_ring_chunks.size(); ++ci) {
+            chunk_begin[ci] = token_begin;
+            token_begin += pc_local_ring_chunks[ci];
+        }
+        GGML_ASSERT(token_begin == n_tokens);
+
+        LLAMA_LOG_INFO(
+            "[PC_LOCAL_RING_GRAPH] layers=[%d,%d) tokens=%" PRId64
+            " chunk_tokens=%d chunks=%zu\n",
+            layer_begin,
+            layer_end,
+            n_tokens,
+            pc_local_ring_chunk_tokens,
+            pc_local_ring_chunks.size());
+
+        ggml_tensor * ring_entry = ggml_cont(ctx0, inpL);
+        cb(ring_entry, "pc_ring_entry", layer_begin);
+        ggml_build_forward_expand(gf, ring_entry);
+
+        for (size_t ci = 0; ci < pc_local_ring_chunks.size(); ++ci) {
+            hidden_chunks.push_back(
+                ggml_view_2d(
+                    ctx0,
+                    ring_entry,
+                    ring_entry->ne[0],
+                    pc_local_ring_chunks[ci],
+                    ring_entry->nb[1],
+                    chunk_begin[ci] * ring_entry->nb[1]));
+        }
+
+        for (int il = layer_begin; il < layer_end; ++il) {
+            for (size_t ci = 0; ci < pc_local_ring_chunks.size(); ++ci) {
+                const int64_t count =
+                    pc_local_ring_chunks[ci];
+                ggml_tensor * layer_inp =
+                    hidden_chunks[ci];
+
+                // ---- GPU / ATTN -------------------------------------------------
+                ggml_tensor * attn_norm =
+                    build_norm(
+                        layer_inp,
+                        model.layers[il].attn_norm,
+                        NULL,
+                        LLM_NORM_RMS,
+                        il);
+
+                auto [Qcur, Kcur, Vcur] =
+                    build_qkv(
+                        model.layers[il],
+                        attn_norm,
+                        n_embd_head,
+                        n_head,
+                        n_head_kv,
+                        il);
+
+                Qcur = build_norm(
+                    Qcur,
+                    model.layers[il].attn_q_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    il);
+                Kcur = build_norm(
+                    Kcur,
+                    model.layers[il].attn_k_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    il);
+
+                ggml_tensor * pos_chunk =
+                    ggml_view_1d(
+                        ctx0,
+                        inp_pos,
+                        count,
+                        chunk_begin[ci] * inp_pos->nb[0]);
+
+                Qcur = ggml_rope_ext(
+                    ctx0,
+                    Qcur,
+                    pos_chunk,
+                    nullptr,
+                    n_rot,
+                    rope_type,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+                Kcur = ggml_rope_ext(
+                    ctx0,
+                    Kcur,
+                    pos_chunk,
+                    nullptr,
+                    n_rot,
+                    rope_type,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+
+                auto * attn_range =
+                    build_attn_inp_kv_range(
+                        (uint32_t) chunk_begin[ci],
+                        (uint32_t) count);
+                ggml_tensor * attn =
+                    build_attn(
+                        attn_range,
+                        model.layers[il].wo,
+                        model.layers[il].wo_b,
+                        model.layers[il].wo_s,
+                        Qcur,
+                        Kcur,
+                        Vcur,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        1.0f / sqrtf(float(n_embd_head)),
+                        il);
+
+                ggml_tensor * ffn_inp =
+                    ggml_add(ctx0, attn, layer_inp);
+                const std::string attn_out_name =
+                    "pc_ring_attn_out_chunk_" +
+                    std::to_string(ci);
+                cb(ffn_inp, attn_out_name.c_str(), il);
+                ggml_set_output(ffn_inp);
+                ggml_build_forward_expand(gf, ffn_inp);
+
+                // ---- CPU / FFN --------------------------------------------------
+                ggml_tensor * ffn_norm =
+                    build_norm(
+                        ffn_inp,
+                        model.layers[il].ffn_norm,
+                        NULL,
+                        LLM_NORM_RMS,
+                        il);
+
+                ggml_tensor * moe_out =
+                    build_moe_ffn(
+                        ffn_norm,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        nullptr,
+                        n_expert,
+                        n_expert_used,
+                        LLM_FFN_SILU,
+                        true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il,
+                        nullptr,
+                        nullptr,
+                        model.layers[il].ffn_up_exps_s,
+                        model.layers[il].ffn_gate_exps_s,
+                        model.layers[il].ffn_down_exps_s,
+                        nullptr,
+                        1,
+                        nullptr,
+                        nullptr);
+
+                const std::string ffn_out_name =
+                    "pc_ring_ffn_out_chunk_" +
+                    std::to_string(ci);
+                cb(moe_out, ffn_out_name.c_str(), il);
+                ggml_set_output(moe_out);
+                ggml_build_forward_expand(gf, moe_out);
+
+                // ---- GPU / REDUCE -----------------------------------------------
+                ggml_tensor * l_out =
+                    ggml_add(ctx0, moe_out, ffn_inp);
+                const std::string reduce_name =
+                    "pc_ring_reduce_chunk_" +
+                    std::to_string(ci);
+                cb(l_out, reduce_name.c_str(), il);
+                ggml_set_output(l_out);
+                ggml_build_forward_expand(gf, l_out);
+
+                hidden_chunks[ci] = l_out;
+            }
+        }
+
+        cur = hidden_chunks[0];
+        for (size_t ci = 1; ci < hidden_chunks.size(); ++ci) {
+            cur = ggml_concat(
+                ctx0,
+                cur,
+                hidden_chunks[ci],
+                1);
+        }
+
+        if (!build_output_head) {
+            res->t_stage_output = cur;
+            ggml_build_forward_expand(gf, cur);
+            return;
+        }
+
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        if (inp_out_ids != nullptr) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+
+        cur = build_norm(
+            cur,
+            model.output_norm,
+            NULL,
+            LLM_NORM_RMS,
+            -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(
+            model.output,
+            cur,
+            model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
     const bool phone_primary_chunk_ring_requested =
