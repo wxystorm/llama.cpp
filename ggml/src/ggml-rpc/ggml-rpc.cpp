@@ -5505,6 +5505,9 @@ private:
         ggml_cgraph * graph,
         const rpc_phone_npu_ffn_stage & stage,
         rpc_phone_npu_ffn_cache *& cache);
+    bool prepare_phone_npu_direct_ffn_cache(
+        const rpc_phone_npu_ffn_stage & stage,
+        rpc_phone_npu_ffn_cache *& cache);
     bool run_phone_npu_ffn_stage(
         ggml_cgraph * graph,
         const rpc_phone_npu_ffn_stage & stage,
@@ -5543,6 +5546,12 @@ private:
         int,
         std::unique_ptr<rpc_phone_npu_ffn_cache>>
         phone_npu_ffn_caches;
+
+    // Generic PC->Phone direct FIFO walks layers monotonically. Keep only its
+    // current layer resident on HTP so a long PC stage cannot accumulate one
+    // full expert-weight cache per layer.
+    std::unique_ptr<rpc_phone_npu_ffn_cache>
+        phone_npu_direct_ffn_cache;
 
     // Chunk Ring CPU-reduce ownership.  "armed" seqs are announced by Meta
     // before a Phone FFN graph is submitted.  A completed private-HTP partial
@@ -8104,6 +8113,257 @@ bool rpc_server::set_tensor_graph_compute(
 }
 
 
+static bool rpc_phone_npu_build_local_ffn_cache(
+        const ggml_rpc_local_tensor_source & local_tensor_source,
+        ggml_backend_t phone_npu_backend,
+        const rpc_phone_npu_ffn_stage & stage,
+        std::unique_ptr<rpc_phone_npu_ffn_cache> & entry) {
+    entry.reset();
+
+    if (phone_npu_backend == nullptr ||
+        stage.layer < 0 ||
+        stage.norm == nullptr ||
+        local_tensor_source.get_info == nullptr ||
+        local_tensor_source.read == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t repack =
+        rpc_phone_npu_repack_buft(phone_npu_backend);
+    if (repack == nullptr) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_PRELOAD] layer=%d status=FAIL reason=no_repack_buffer\n",
+            stage.layer);
+        return false;
+    }
+
+    char local_names[3][GGML_MAX_NAME] = {};
+    std::snprintf(
+        local_names[0], sizeof(local_names[0]),
+        "blk.%d.ffn_up_exps.weight", stage.layer);
+    std::snprintf(
+        local_names[1], sizeof(local_names[1]),
+        "blk.%d.ffn_gate_exps.weight", stage.layer);
+    std::snprintf(
+        local_names[2], sizeof(local_names[2]),
+        "blk.%d.ffn_down_exps.weight", stage.layer);
+
+    ggml_rpc_local_tensor_info local_info[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        if (!local_tensor_source.get_info(
+                local_tensor_source.user_data,
+                local_names[i],
+                &local_info[i])) {
+            return false;
+        }
+    }
+
+    const auto local_dim =
+        [](const ggml_rpc_local_tensor_info & info, int dim) -> int64_t {
+            if (dim < 0 ||
+                dim >= (int) info.n_dims ||
+                dim >= GGML_MAX_DIMS ||
+                info.ne[dim] > (uint64_t) INT64_MAX) {
+                return 1;
+            }
+            return (int64_t) info.ne[dim];
+        };
+    const auto local_type =
+        [](const ggml_rpc_local_tensor_info & info) {
+            return (enum ggml_type) info.type;
+        };
+
+    const bool local_shape_ok =
+        local_info[0].n_dims > 0 &&
+        local_info[0].n_dims <= GGML_MAX_DIMS &&
+        local_info[1].n_dims > 0 &&
+        local_info[1].n_dims <= GGML_MAX_DIMS &&
+        local_info[2].n_dims > 0 &&
+        local_info[2].n_dims <= GGML_MAX_DIMS &&
+        local_info[0].type < GGML_TYPE_COUNT &&
+        local_info[1].type < GGML_TYPE_COUNT &&
+        local_info[2].type < GGML_TYPE_COUNT &&
+        rpc_phone_npu_supported_k_quant(
+            local_type(local_info[0])) &&
+        rpc_phone_npu_supported_k_quant(
+            local_type(local_info[1])) &&
+        rpc_phone_npu_supported_k_quant(
+            local_type(local_info[2])) &&
+        local_dim(local_info[0], 0) == stage.norm->ne[0] &&
+        local_dim(local_info[1], 0) == stage.norm->ne[0] &&
+        local_dim(local_info[0], 1) ==
+            local_dim(local_info[1], 1) &&
+        local_dim(local_info[0], 2) ==
+            local_dim(local_info[1], 2) &&
+        local_dim(local_info[2], 0) ==
+            local_dim(local_info[0], 1) &&
+        local_dim(local_info[2], 1) == stage.norm->ne[0] &&
+        local_dim(local_info[2], 2) ==
+            local_dim(local_info[0], 2);
+
+    if (!local_shape_ok) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
+            "source=LOCAL_GGUF reason=weight_shape_or_type "
+            "norm_ne0=%" PRId64 " "
+            "up={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
+            "gate={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
+            "down={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]}\n",
+            stage.layer,
+            stage.norm->ne[0],
+            local_info[0].type,
+            local_dim(local_info[0], 0),
+            local_dim(local_info[0], 1),
+            local_dim(local_info[0], 2),
+            local_info[1].type,
+            local_dim(local_info[1], 0),
+            local_dim(local_info[1], 1),
+            local_dim(local_info[1], 2),
+            local_info[2].type,
+            local_dim(local_info[2], 0),
+            local_dim(local_info[2], 1),
+            local_dim(local_info[2], 2));
+        return false;
+    }
+
+    auto built =
+        std::make_unique<rpc_phone_npu_ffn_cache>();
+    built->layer = stage.layer;
+    built->ctx_w = rpc_phone_npu_make_ctx();
+    if (!built->ctx_w) {
+        return false;
+    }
+
+    ggml_tensor ** npu_weights[3] = {
+        &built->w_up,
+        &built->w_gate,
+        &built->w_down,
+    };
+
+    for (int i = 0; i < 3; ++i) {
+        int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+        for (uint32_t d = 0;
+             d < local_info[i].n_dims;
+             ++d) {
+            if (local_info[i].ne[d] == 0 ||
+                local_info[i].ne[d] >
+                    (uint64_t) INT64_MAX) {
+                return false;
+            }
+            ne[d] =
+                (int64_t) local_info[i].ne[d];
+        }
+
+        *npu_weights[i] = ggml_new_tensor(
+            built->ctx_w.get(),
+            GGML_TYPE_Q4_0,
+            (int) local_info[i].n_dims,
+            ne);
+    }
+
+    ggml_set_name(
+        built->w_up,
+        "phone_npu_ffn_up_q4_0");
+    ggml_set_name(
+        built->w_gate,
+        "phone_npu_ffn_gate_q4_0");
+    ggml_set_name(
+        built->w_down,
+        "phone_npu_ffn_down_q4_0");
+
+    built->wbuf.reset(
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            built->ctx_w.get(),
+            repack));
+    if (!built->wbuf) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
+            "source=LOCAL_GGUF reason=weight_alloc\n",
+            stage.layer);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(
+        built->wbuf.get(),
+        GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    size_t total_bytes = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (local_info[i].nbytes == 0 ||
+            local_info[i].nbytes > SIZE_MAX) {
+            return false;
+        }
+
+        std::vector<uint8_t> raw(
+            (size_t) local_info[i].nbytes);
+        if (!local_tensor_source.read(
+                local_tensor_source.user_data,
+                local_names[i],
+                0,
+                raw.data(),
+                raw.size())) {
+            GGML_LOG_ERROR(
+                "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
+                "source=LOCAL_GGUF reason=weight_read name=%s\n",
+                stage.layer,
+                local_names[i]);
+            return false;
+        }
+
+        int64_t nelements = 1;
+        for (uint32_t d = 0;
+             d < local_info[i].n_dims;
+             ++d) {
+            if (local_info[i].ne[d] >
+                (uint64_t) (INT64_MAX / nelements)) {
+                return false;
+            }
+            nelements *=
+                (int64_t) local_info[i].ne[d];
+        }
+
+        const int64_t row_elems =
+            (int64_t) local_info[i].ne[0];
+        if (row_elems <= 0 ||
+            nelements % row_elems != 0) {
+            return false;
+        }
+
+        std::vector<uint8_t> converted;
+        if (!rpc_phone_npu_convert_k_raw_to_q4_0(
+                (enum ggml_type) local_info[i].type,
+                row_elems,
+                nelements / row_elems,
+                raw.data(),
+                raw.size(),
+                converted) ||
+            converted.size() !=
+                ggml_nbytes(*npu_weights[i])) {
+            GGML_LOG_ERROR(
+                "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
+                "source=LOCAL_GGUF reason=weight_convert name=%s\n",
+                stage.layer,
+                local_names[i]);
+            return false;
+        }
+
+        ggml_backend_tensor_set(
+            *npu_weights[i],
+            converted.data(),
+            0,
+            converted.size());
+        total_bytes += converted.size();
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_PRELOAD] layer=%d source=LOCAL_GGUF "
+        "format=q4_0 bytes=%zu status=OK\n",
+        stage.layer,
+        total_bytes);
+
+    entry = std::move(built);
+    return true;
+}
+
 bool rpc_server::prepare_phone_npu_ffn_cache(
         ggml_cgraph * graph,
         const rpc_phone_npu_ffn_stage & stage,
@@ -8132,224 +8392,24 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
         return false;
     }
 
-    // Preferred path for the generic PC->Phone ring: construct the private
-    // HTP weight cache directly from the phone-local GGUF source.  The RPC
-    // compute graph therefore no longer has to carry the large expert weights
-    // merely to seed the private cache.
-    const bool have_local_source =
-        local_tensor_source.get_info != nullptr &&
-        local_tensor_source.read != nullptr;
-
-    char local_names[3][GGML_MAX_NAME] = {};
-    std::snprintf(
-        local_names[0], sizeof(local_names[0]),
-        "blk.%d.ffn_up_exps.weight", stage.layer);
-    std::snprintf(
-        local_names[1], sizeof(local_names[1]),
-        "blk.%d.ffn_gate_exps.weight", stage.layer);
-    std::snprintf(
-        local_names[2], sizeof(local_names[2]),
-        "blk.%d.ffn_down_exps.weight", stage.layer);
-
-    ggml_rpc_local_tensor_info local_info[3] = {};
-    bool have_local_weights = have_local_source;
-    if (have_local_weights) {
-        for (int i = 0; i < 3; ++i) {
-            if (!local_tensor_source.get_info(
-                    local_tensor_source.user_data,
-                    local_names[i],
-                    &local_info[i])) {
-                have_local_weights = false;
-                break;
-            }
-        }
-    }
-
-    const auto local_dim =
-        [](const ggml_rpc_local_tensor_info & info, int dim) -> int64_t {
-            if (dim < 0 || dim >= (int) info.n_dims ||
-                dim >= GGML_MAX_DIMS ||
-                info.ne[dim] > (uint64_t) INT64_MAX) {
-                return 1;
-            }
-            return (int64_t) info.ne[dim];
-        };
-
-    if (have_local_weights) {
-        const auto local_type =
-            [](const ggml_rpc_local_tensor_info & info) {
-                return (enum ggml_type) info.type;
-            };
-
-        const bool local_shape_ok =
-            local_info[0].n_dims > 0 &&
-            local_info[0].n_dims <= GGML_MAX_DIMS &&
-            local_info[1].n_dims > 0 &&
-            local_info[1].n_dims <= GGML_MAX_DIMS &&
-            local_info[2].n_dims > 0 &&
-            local_info[2].n_dims <= GGML_MAX_DIMS &&
-            local_info[0].type < GGML_TYPE_COUNT &&
-            local_info[1].type < GGML_TYPE_COUNT &&
-            local_info[2].type < GGML_TYPE_COUNT &&
-            rpc_phone_npu_supported_k_quant(local_type(local_info[0])) &&
-            rpc_phone_npu_supported_k_quant(local_type(local_info[1])) &&
-            rpc_phone_npu_supported_k_quant(local_type(local_info[2])) &&
-            local_dim(local_info[0], 0) == stage.norm->ne[0] &&
-            local_dim(local_info[1], 0) == stage.norm->ne[0] &&
-            local_dim(local_info[0], 1) == local_dim(local_info[1], 1) &&
-            local_dim(local_info[0], 2) == local_dim(local_info[1], 2) &&
-            local_dim(local_info[2], 0) == local_dim(local_info[0], 1) &&
-            local_dim(local_info[2], 1) == stage.norm->ne[0] &&
-            local_dim(local_info[2], 2) == local_dim(local_info[0], 2);
-
-        if (!local_shape_ok) {
-            GGML_LOG_ERROR(
-                "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
-                "source=LOCAL_GGUF reason=weight_shape_or_type "
-                "norm_ne0=%" PRId64 " "
-                "up={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
-                "gate={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]} "
-                "down={type:%u ne:[%" PRId64 ",%" PRId64 ",%" PRId64 "]}\n",
-                stage.layer,
-                stage.norm->ne[0],
-                local_info[0].type,
-                local_dim(local_info[0], 0),
-                local_dim(local_info[0], 1),
-                local_dim(local_info[0], 2),
-                local_info[1].type,
-                local_dim(local_info[1], 0),
-                local_dim(local_info[1], 1),
-                local_dim(local_info[1], 2),
-                local_info[2].type,
-                local_dim(local_info[2], 0),
-                local_dim(local_info[2], 1),
-                local_dim(local_info[2], 2));
+    // Prefer phone-local GGUF weights. Legacy graph-owned weights remain a
+    // fallback for older server setups.
+    if (local_tensor_source.get_info != nullptr &&
+        local_tensor_source.read != nullptr) {
+        std::unique_ptr<rpc_phone_npu_ffn_cache> local_entry;
+        if (!rpc_phone_npu_build_local_ffn_cache(
+                local_tensor_source,
+                phone_npu_backend,
+                stage,
+                local_entry) ||
+            !local_entry) {
             return false;
         }
 
-        auto entry =
-            std::make_unique<rpc_phone_npu_ffn_cache>();
-        entry->layer = stage.layer;
-        entry->ctx_w = rpc_phone_npu_make_ctx();
-        if (!entry->ctx_w) {
-            return false;
-        }
-
-        ggml_tensor ** npu_weights[3] = {
-            &entry->w_up,
-            &entry->w_gate,
-            &entry->w_down,
-        };
-
-        for (int i = 0; i < 3; ++i) {
-            int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
-            for (uint32_t d = 0; d < local_info[i].n_dims; ++d) {
-                if (local_info[i].ne[d] == 0 ||
-                    local_info[i].ne[d] > (uint64_t) INT64_MAX) {
-                    return false;
-                }
-                ne[d] = (int64_t) local_info[i].ne[d];
-            }
-
-            *npu_weights[i] = ggml_new_tensor(
-                entry->ctx_w.get(),
-                GGML_TYPE_Q4_0,
-                (int) local_info[i].n_dims,
-                ne);
-        }
-
-        ggml_set_name(entry->w_up, "phone_npu_ffn_up_q4_0");
-        ggml_set_name(entry->w_gate, "phone_npu_ffn_gate_q4_0");
-        ggml_set_name(entry->w_down, "phone_npu_ffn_down_q4_0");
-
-        entry->wbuf.reset(
-            ggml_backend_alloc_ctx_tensors_from_buft(
-                entry->ctx_w.get(), repack));
-        if (!entry->wbuf) {
-            GGML_LOG_ERROR(
-                "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
-                "source=LOCAL_GGUF reason=weight_alloc\n",
-                stage.layer);
-            return false;
-        }
-        ggml_backend_buffer_set_usage(
-            entry->wbuf.get(),
-            GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-        size_t total_bytes = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (local_info[i].nbytes == 0 ||
-                local_info[i].nbytes > SIZE_MAX) {
-                return false;
-            }
-
-            std::vector<uint8_t> raw(
-                (size_t) local_info[i].nbytes);
-            if (!local_tensor_source.read(
-                    local_tensor_source.user_data,
-                    local_names[i],
-                    0,
-                    raw.data(),
-                    raw.size())) {
-                GGML_LOG_ERROR(
-                    "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
-                    "source=LOCAL_GGUF reason=weight_read name=%s\n",
-                    stage.layer,
-                    local_names[i]);
-                return false;
-            }
-
-            int64_t nelements = 1;
-            for (uint32_t d = 0; d < local_info[i].n_dims; ++d) {
-                if (local_info[i].ne[d] >
-                    (uint64_t) (INT64_MAX / nelements)) {
-                    return false;
-                }
-                nelements *= (int64_t) local_info[i].ne[d];
-            }
-
-            const int64_t row_elems =
-                (int64_t) local_info[i].ne[0];
-            if (row_elems <= 0 ||
-                nelements % row_elems != 0) {
-                return false;
-            }
-
-            std::vector<uint8_t> converted;
-            if (!rpc_phone_npu_convert_k_raw_to_q4_0(
-                    (enum ggml_type) local_info[i].type,
-                    row_elems,
-                    nelements / row_elems,
-                    raw.data(),
-                    raw.size(),
-                    converted) ||
-                converted.size() !=
-                    ggml_nbytes(*npu_weights[i])) {
-                GGML_LOG_ERROR(
-                    "[PHONE_NPU_PRELOAD] layer=%d status=FAIL "
-                    "source=LOCAL_GGUF reason=weight_convert name=%s\n",
-                    stage.layer,
-                    local_names[i]);
-                return false;
-            }
-
-            ggml_backend_tensor_set(
-                *npu_weights[i],
-                converted.data(),
-                0,
-                converted.size());
-            total_bytes += converted.size();
-        }
-
-        cache = entry.get();
+        cache = local_entry.get();
         phone_npu_ffn_caches.emplace(
-            stage.layer, std::move(entry));
-
-        GGML_LOG_INFO(
-            "[PHONE_NPU_PRELOAD] layer=%d source=LOCAL_GGUF "
-            "format=q4_0 bytes=%zu status=OK\n",
             stage.layer,
-            total_bytes);
+            std::move(local_entry));
         return true;
     }
 
@@ -8483,6 +8543,45 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
         "[PHONE_NPU_PRELOAD] layer=%d source=RPC_GRAPH "
         "format=q4_0 bytes=%zu status=OK\n",
         stage.layer, total_bytes);
+    return true;
+}
+
+bool rpc_server::prepare_phone_npu_direct_ffn_cache(
+        const rpc_phone_npu_ffn_stage & stage,
+        rpc_phone_npu_ffn_cache *& cache) {
+    cache = nullptr;
+
+    if (phone_npu_direct_ffn_cache != nullptr &&
+        phone_npu_direct_ffn_cache->layer ==
+            stage.layer) {
+        cache =
+            phone_npu_direct_ffn_cache.get();
+        return true;
+    }
+
+    // Strict FIFO advances monotonically by layer. Release the previous
+    // direct layer before allocating the next one so the PC stage cannot fill
+    // HTP memory with one cache per transformer layer.
+    phone_npu_direct_ffn_cache.reset();
+
+    std::unique_ptr<rpc_phone_npu_ffn_cache> next;
+    if (!rpc_phone_npu_build_local_ffn_cache(
+            local_tensor_source,
+            phone_npu_backend,
+            stage,
+            next) ||
+        !next) {
+        return false;
+    }
+
+    phone_npu_direct_ffn_cache =
+        std::move(next);
+    cache =
+        phone_npu_direct_ffn_cache.get();
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_DIRECT_CACHE] layer=%d policy=ONE_LAYER status=READY\n",
+        stage.layer);
     return true;
 }
 
@@ -8993,8 +9092,7 @@ bool rpc_server::phone_npu_ffn_direct(
             phone_npu_mutex);
 
         rpc_phone_npu_ffn_cache * cache = nullptr;
-        if (prepare_phone_npu_ffn_cache(
-                nullptr,
+        if (prepare_phone_npu_direct_ffn_cache(
                 stage,
                 cache) &&
             cache != nullptr) {
