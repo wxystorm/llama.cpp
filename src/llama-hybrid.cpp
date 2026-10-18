@@ -6878,13 +6878,34 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
     // once.  A failed large probe is diagnostic-only; smaller points remain
     // usable for interpolation/extrapolation.
     constexpr size_t mib = 1024ull * 1024ull;
+    size_t representative_attn = profile.attn_weight_bytes_per_layer;
+    size_t representative_ffn  = profile.ffn_weight_bytes_per_layer;
+    size_t representative_total = profile.total_weight_bytes_per_layer;
+    if (profile.n_layer > 0 &&
+        profile.layer_weight_bytes.size() == (size_t) profile.n_layer &&
+        profile.layer_attn_forced_bytes.size() == (size_t) profile.n_layer &&
+        profile.layer_ffn_split_bytes.size() == (size_t) profile.n_layer &&
+        profile.layer_mirrored_bytes.size() == (size_t) profile.n_layer) {
+        const size_t mid = (size_t) profile.n_layer / 2;
+        representative_total = profile.layer_weight_bytes[mid];
+        // Mirrored tensors contain the small norms/router/control weights.
+        // Conservatively include them in either split stage's GPU residency.
+        representative_attn =
+            profile.layer_attn_forced_bytes[mid] +
+            profile.layer_mirrored_bytes[mid];
+        representative_ffn =
+            profile.layer_ffn_split_bytes[mid] +
+            profile.layer_mirrored_bytes[mid];
+    }
+
     std::vector<size_t> weight_probe_sizes = {
         16ull * mib,
         64ull * mib,
         128ull * mib,
-        profile.attn_weight_bytes_per_layer,
-        profile.ffn_weight_bytes_per_layer,
-        profile.total_weight_bytes_per_layer,
+        256ull * mib,
+        representative_attn,
+        representative_ffn,
+        representative_total,
     };
     weight_probe_sizes.erase(
         std::remove(weight_probe_sizes.begin(), weight_probe_sizes.end(), size_t(0)),
