@@ -10346,6 +10346,21 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
 
     if (found) {
+        // Phase 1 of the PC local redesign: build and publish the inner plan
+        // for diagnostics only.  Existing model placement/runtime execution
+        // deliberately ignore pc_local until the FULL task path and sliding
+        // residency manager are implemented.
+        llama_hybrid_pc_local_plan pc_local;
+        if (llama_hybrid_plan_pc_local(
+                profile, constraints, best_plan, pc_local)) {
+            best_plan.pc_local = std::move(pc_local);
+        } else {
+            best_plan.pc_local = {};
+        }
+        llama_hybrid_pc_local_plan_print(best_plan.pc_local);
+    }
+
+    if (found) {
         llama_hybrid_decode_plan decode_plan;
         if (!llama_hybrid_predict_decode_plan(
                 profile, constraints, decode_plan)) {
