@@ -569,6 +569,13 @@ struct fused_sample {
     double join_tail_ms = 0.0;
 };
 
+struct no_return_sample {
+    double wall_ms = 0.0;
+    double d2h_ms = 0.0;
+    double cpu_ms = 0.0;
+    double gpu_tail_ms = 0.0;
+};
+
 int main(int argc, char ** argv) {
     options opt;
     if (!parse_options(argc, argv, opt)) {
@@ -733,6 +740,40 @@ int main(int argc, char ** argv) {
         return s;
     };
 
+    auto run_no_return_layer = [&](layer_case & c) -> no_return_sample {
+        no_return_sample s;
+        const auto t0 = clock_type::now();
+
+        ggml_backend_tensor_get_async(copy_backend, c.x, host_x, 0, x_bytes);
+        ggml_backend_event_record(d2h_done, copy_backend);
+
+        const ggml_status st =
+            ggml_backend_graph_compute_async(compute_backend, c.graph_num);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "no-return numerator layer %d failed: %d\n", c.il, (int) st);
+            std::exit(23);
+        }
+
+        ggml_backend_event_synchronize(d2h_done);
+        const auto td2h = clock_type::now();
+        s.d2h_ms = elapsed_ms(t0, td2h);
+
+        const auto tc0 = clock_type::now();
+        cpu_pool.run(host_x, host_r, c.n_embd, opt.tokens, c.eps);
+        const auto tc1 = clock_type::now();
+        s.cpu_ms = elapsed_ms(tc0, tc1);
+
+        // Diagnostic lower bound for a future mapped/fused consumer:
+        // deliberately omit the 512-byte H2D copy and the cross-stream
+        // return event. We wait only for the already-running QKV numerator.
+        ggml_backend_synchronize(compute_backend);
+
+        const auto tend = clock_type::now();
+        s.gpu_tail_ms = elapsed_ms(tc1, tend);
+        s.wall_ms = elapsed_ms(t0, tend);
+        return s;
+    };
+
     auto run_explicit_split_layer = [&](layer_case & c) {
         (void) run_fused_layer(c);
         const ggml_status st = ggml_backend_graph_compute_async(compute_backend, c.graph_scale);
@@ -837,6 +878,11 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<double>> layer_cpu((size_t) opt.layers);
     std::vector<std::vector<double>> layer_join_tail((size_t) opt.layers);
 
+    std::vector<std::vector<double>> layer_no_return((size_t) opt.layers);
+    std::vector<std::vector<double>> layer_no_return_d2h((size_t) opt.layers);
+    std::vector<std::vector<double>> layer_no_return_cpu((size_t) opt.layers);
+    std::vector<std::vector<double>> layer_no_return_gpu_tail((size_t) opt.layers);
+
     auto run_serial_block = [&](bool record) -> double {
         const auto b0 = clock_type::now();
         for (int i = 0; i < opt.layers; ++i) {
@@ -862,9 +908,24 @@ int main(int argc, char ** argv) {
         return elapsed_ms(b0, clock_type::now());
     };
 
-    // The laptop GPU showed a large pre/post frequency drift in the first
-    // real-weight probe. Stabilize on the exact serial block before comparing
-    // implementations so that a clock ramp cannot masquerade as a speedup.
+    auto run_no_return_block = [&](bool record) -> double {
+        const auto b0 = clock_type::now();
+        for (int i = 0; i < opt.layers; ++i) {
+            const no_return_sample s =
+                run_no_return_layer(cases[(size_t) i]);
+            if (record) {
+                layer_no_return[(size_t) i].push_back(s.wall_ms);
+                layer_no_return_d2h[(size_t) i].push_back(s.d2h_ms);
+                layer_no_return_cpu[(size_t) i].push_back(s.cpu_ms);
+                layer_no_return_gpu_tail[(size_t) i].push_back(s.gpu_tail_ms);
+            }
+        }
+        return elapsed_ms(b0, clock_type::now());
+    };
+
+    // Stabilize the laptop GPU on the exact real-weight QKV workload before
+    // comparing paths. This removes the large first-run clock ramp observed
+    // in the earlier PRE/FUSED/POST experiment.
     const auto stabilize_begin = clock_type::now();
     int stabilize_blocks = 0;
     while (elapsed_ms(stabilize_begin, clock_type::now()) < opt.stabilize_ms) {
@@ -880,67 +941,91 @@ int main(int argc, char ** argv) {
         "[PC_RMS_REAL_STABILIZE] requested_ms=%d actual_ms=%.3f blocks=%d\n",
         opt.stabilize_ms, stabilize_actual_ms, stabilize_blocks);
 
-    // Keep the copy engine hot before the paired test. The first D2H after a
-    // long idle period is intentionally excluded from the authoritative A/B.
     prime_copy_path(opt.copy_prime);
 
-    // Warm both paths using the same ABBA/B AAB ordering used below. This also
-    // gives CUDA graph capture a chance to settle for every per-layer graph.
+    // Warm all three paths. The no-return path is not an implementation
+    // candidate by itself; it isolates the cost/jitter introduced after CPU
+    // RMS by the 512-byte return copy and cross-stream event.
     for (int w = 0; w < opt.warmup; ++w) {
-        if ((w & 1) == 0) {
-            (void) run_serial_block(false);
-            (void) run_fused_block(false);
-            (void) run_fused_block(false);
-            (void) run_serial_block(false);
-        } else {
-            (void) run_fused_block(false);
-            (void) run_serial_block(false);
-            (void) run_serial_block(false);
-            (void) run_fused_block(false);
-        }
+        (void) run_serial_block(false);
+        (void) run_fused_block(false);
+        (void) run_no_return_block(false);
     }
 
-    // Authoritative measurement: two serial and two fused blocks are kept in
-    // a very short time window. Alternating ABBA and BAAB cancels first-order
-    // clock/thermal drift while avoiding a systematic first/last advantage.
+    // Balanced 3-way paired measurement.
+    //
+    // S = ordinary all-GPU RMS + QKV
+    // C = CPU RMS + 512B H2D + cross-stream return event
+    // N = CPU RMS + no return copy/event (mapped/fused lower bound)
+    //
+    // The three palindromic orders rotate every iteration so every mode
+    // occupies the edge, middle, and center positions over a 3-iteration
+    // cycle while first-order drift cancels inside each iteration:
+    //   S C N N C S
+    //   C N S S N C
+    //   N S C C S N
     std::vector<double> paired_serial_ms;
-    std::vector<double> paired_fused_ms;
-    std::vector<double> paired_delta_ms;
-    std::vector<double> paired_speedup;
-    paired_serial_ms.reserve(opt.iters);
-    paired_fused_ms.reserve(opt.iters);
-    paired_delta_ms.reserve(opt.iters);
-    paired_speedup.reserve(opt.iters);
+    std::vector<double> paired_copy_ms;
+    std::vector<double> paired_no_return_ms;
+    std::vector<double> paired_copy_delta_ms;
+    std::vector<double> paired_no_return_delta_ms;
 
-    int fused_wins = 0;
+    paired_serial_ms.reserve(opt.iters);
+    paired_copy_ms.reserve(opt.iters);
+    paired_no_return_ms.reserve(opt.iters);
+    paired_copy_delta_ms.reserve(opt.iters);
+    paired_no_return_delta_ms.reserve(opt.iters);
+
+    int copy_wins = 0;
+    int no_return_wins = 0;
 
     for (int it = 0; it < opt.iters; ++it) {
-        double s0 = 0.0;
-        double s1 = 0.0;
-        double f0 = 0.0;
-        double f1 = 0.0;
+        double s0 = 0.0, s1 = 0.0;
+        double c0 = 0.0, c1 = 0.0;
+        double n0 = 0.0, n1 = 0.0;
 
-        if ((it & 1) == 0) {
-            s0 = run_serial_block(true);
-            f0 = run_fused_block(true);
-            f1 = run_fused_block(true);
-            s1 = run_serial_block(true);
-        } else {
-            f0 = run_fused_block(true);
-            s0 = run_serial_block(true);
-            s1 = run_serial_block(true);
-            f1 = run_fused_block(true);
+        switch (it % 3) {
+            case 0:
+                s0 = run_serial_block(true);
+                c0 = run_fused_block(true);
+                n0 = run_no_return_block(true);
+                n1 = run_no_return_block(true);
+                c1 = run_fused_block(true);
+                s1 = run_serial_block(true);
+                break;
+            case 1:
+                c0 = run_fused_block(true);
+                n0 = run_no_return_block(true);
+                s0 = run_serial_block(true);
+                s1 = run_serial_block(true);
+                n1 = run_no_return_block(true);
+                c1 = run_fused_block(true);
+                break;
+            default:
+                n0 = run_no_return_block(true);
+                s0 = run_serial_block(true);
+                c0 = run_fused_block(true);
+                c1 = run_fused_block(true);
+                s1 = run_serial_block(true);
+                n1 = run_no_return_block(true);
+                break;
         }
 
         const double serial_avg = 0.5 * (s0 + s1);
-        const double fused_avg  = 0.5 * (f0 + f1);
+        const double copy_avg = 0.5 * (c0 + c1);
+        const double no_return_avg = 0.5 * (n0 + n1);
+
         paired_serial_ms.push_back(serial_avg);
-        paired_fused_ms.push_back(fused_avg);
-        paired_delta_ms.push_back(serial_avg - fused_avg);
-        paired_speedup.push_back(
-            fused_avg > 0.0 ? serial_avg / fused_avg : 0.0);
-        if (fused_avg < serial_avg) {
-            ++fused_wins;
+        paired_copy_ms.push_back(copy_avg);
+        paired_no_return_ms.push_back(no_return_avg);
+        paired_copy_delta_ms.push_back(serial_avg - copy_avg);
+        paired_no_return_delta_ms.push_back(serial_avg - no_return_avg);
+
+        if (copy_avg < serial_avg) {
+            ++copy_wins;
+        }
+        if (no_return_avg < serial_avg) {
+            ++no_return_wins;
         }
     }
 
@@ -951,87 +1036,98 @@ int main(int argc, char ** argv) {
         const stats cp = summarize(layer_cpu[(size_t) i]);
         const stats j = summarize(layer_join_tail[(size_t) i]);
 
+        const stats nr = summarize(layer_no_return[(size_t) i]);
+        const stats nrd = summarize(layer_no_return_d2h[(size_t) i]);
+        const stats nrc = summarize(layer_no_return_cpu[(size_t) i]);
+        const stats nrt = summarize(layer_no_return_gpu_tail[(size_t) i]);
+
         std::printf(
             "[PC_RMS_REAL_PER_LAYER] layer=%d"
-            " gpu_serial_mean_ms=%.6f gpu_serial_p50_ms=%.6f gpu_serial_p95_ms=%.6f gpu_serial_p99_ms=%.6f"
-            " fused_mean_ms=%.6f fused_p50_ms=%.6f fused_p95_ms=%.6f fused_p99_ms=%.6f fused_max_ms=%.6f"
-            " d2h_mean_ms=%.6f d2h_p50_ms=%.6f d2h_p95_ms=%.6f d2h_p99_ms=%.6f d2h_max_ms=%.6f"
-            " cpu_mean_ms=%.6f cpu_p50_ms=%.6f cpu_p95_ms=%.6f cpu_p99_ms=%.6f cpu_max_ms=%.6f"
-            " join_tail_mean_ms=%.6f join_tail_p50_ms=%.6f join_tail_p95_ms=%.6f join_tail_p99_ms=%.6f join_tail_max_ms=%.6f"
-            " delta_ms=%.6f speedup=%.6fx\n",
+            " serial_mean_ms=%.6f serial_p50_ms=%.6f serial_p95_ms=%.6f serial_p99_ms=%.6f"
+            " copy_mean_ms=%.6f copy_p50_ms=%.6f copy_p95_ms=%.6f copy_p99_ms=%.6f copy_max_ms=%.6f"
+            " copy_d2h_p50_ms=%.6f copy_d2h_p99_ms=%.6f"
+            " copy_cpu_p50_ms=%.6f copy_cpu_p99_ms=%.6f"
+            " copy_join_p50_ms=%.6f copy_join_p99_ms=%.6f copy_join_max_ms=%.6f"
+            " no_return_mean_ms=%.6f no_return_p50_ms=%.6f no_return_p95_ms=%.6f no_return_p99_ms=%.6f no_return_max_ms=%.6f"
+            " nr_d2h_p50_ms=%.6f nr_d2h_p99_ms=%.6f"
+            " nr_cpu_p50_ms=%.6f nr_cpu_p99_ms=%.6f"
+            " nr_gpu_tail_p50_ms=%.6f nr_gpu_tail_p99_ms=%.6f nr_gpu_tail_max_ms=%.6f\n",
             cases[(size_t) i].il,
             a.mean, a.p50, a.p95, a.p99,
             b.mean, b.p50, b.p95, b.p99, b.max,
-            d.mean, d.p50, d.p95, d.p99, d.max,
-            cp.mean, cp.p50, cp.p95, cp.p99, cp.max,
-            j.mean, j.p50, j.p95, j.p99, j.max,
-            a.mean - b.mean,
-            b.mean > 0.0 ? a.mean / b.mean : 0.0);
+            d.p50, d.p99,
+            cp.p50, cp.p99,
+            j.p50, j.p99, j.max,
+            nr.mean, nr.p50, nr.p95, nr.p99, nr.max,
+            nrd.p50, nrd.p99,
+            nrc.p50, nrc.p99,
+            nrt.p50, nrt.p99, nrt.max);
     }
 
     const stats ps = summarize(paired_serial_ms);
-    const stats pf = summarize(paired_fused_ms);
-    const stats pd = summarize(paired_delta_ms);
-    const stats pr = summarize(paired_speedup);
+    const stats pc = summarize(paired_copy_ms);
+    const stats pn = summarize(paired_no_return_ms);
+    const stats pcd = summarize(paired_copy_delta_ms);
+    const stats pnd = summarize(paired_no_return_delta_ms);
 
     const size_t drift_n =
         std::max<size_t>(1, paired_serial_ms.size() / 4);
-    std::vector<double> serial_first(
+    const stats sf = summarize(std::vector<double>(
         paired_serial_ms.begin(),
-        paired_serial_ms.begin() + drift_n);
-    std::vector<double> serial_last(
+        paired_serial_ms.begin() + drift_n));
+    const stats sl = summarize(std::vector<double>(
         paired_serial_ms.end() - drift_n,
-        paired_serial_ms.end());
-    std::vector<double> fused_first(
-        paired_fused_ms.begin(),
-        paired_fused_ms.begin() + drift_n);
-    std::vector<double> fused_last(
-        paired_fused_ms.end() - drift_n,
-        paired_fused_ms.end());
-
-    const stats sf = summarize(serial_first);
-    const stats sl = summarize(serial_last);
-    const stats ff = summarize(fused_first);
-    const stats fl = summarize(fused_last);
+        paired_serial_ms.end()));
 
     std::printf(
-        "[PC_RMS_REAL_PAIRED] pattern=ABBA_BAAB pairs=%d"
+        "[PC_RMS_REAL_TRIPLET] pattern=SCN_NCS__CNS_SNC__NSC_CSN pairs=%d"
         " serial_mean_ms=%.6f serial_p50_ms=%.6f serial_p95_ms=%.6f serial_p99_ms=%.6f"
-        " fused_mean_ms=%.6f fused_p50_ms=%.6f fused_p95_ms=%.6f fused_p99_ms=%.6f"
-        " delta_mean_ms=%.6f delta_p50_ms=%.6f delta_p95_ms=%.6f"
-        " speedup_mean=%.6fx speedup_p50=%.6fx"
-        " fused_wins=%d fused_win_ratio=%.3f\n",
+        " copy_mean_ms=%.6f copy_p50_ms=%.6f copy_p95_ms=%.6f copy_p99_ms=%.6f"
+        " copy_delta_mean_ms=%.6f copy_delta_p50_ms=%.6f copy_wins=%d copy_win_ratio=%.3f"
+        " no_return_mean_ms=%.6f no_return_p50_ms=%.6f no_return_p95_ms=%.6f no_return_p99_ms=%.6f"
+        " no_return_delta_mean_ms=%.6f no_return_delta_p50_ms=%.6f"
+        " no_return_wins=%d no_return_win_ratio=%.3f\n",
         opt.iters,
         ps.mean, ps.p50, ps.p95, ps.p99,
-        pf.mean, pf.p50, pf.p95, pf.p99,
-        pd.mean, pd.p50, pd.p95,
-        pr.mean, pr.p50,
-        fused_wins,
-        opt.iters > 0 ? (double) fused_wins / (double) opt.iters : 0.0);
+        pc.mean, pc.p50, pc.p95, pc.p99,
+        pcd.mean, pcd.p50,
+        copy_wins,
+        opt.iters > 0 ? (double) copy_wins / (double) opt.iters : 0.0,
+        pn.mean, pn.p50, pn.p95, pn.p99,
+        pnd.mean, pnd.p50,
+        no_return_wins,
+        opt.iters > 0 ? (double) no_return_wins / (double) opt.iters : 0.0);
 
     std::printf(
         "[PC_RMS_REAL_DRIFT] quarter=%zu"
-        " serial_first_mean_ms=%.6f serial_last_mean_ms=%.6f serial_last_over_first=%.6fx"
-        " fused_first_mean_ms=%.6f fused_last_mean_ms=%.6f fused_last_over_first=%.6fx\n",
+        " serial_first_mean_ms=%.6f serial_last_mean_ms=%.6f serial_last_over_first=%.6fx\n",
         drift_n,
-        sf.mean, sl.mean, sf.mean > 0.0 ? sl.mean / sf.mean : 0.0,
-        ff.mean, fl.mean, ff.mean > 0.0 ? fl.mean / ff.mean : 0.0);
+        sf.mean, sl.mean,
+        sf.mean > 0.0 ? sl.mean / sf.mean : 0.0);
+
+    const bool copy_faster = pc.mean < ps.mean;
+    const bool no_return_faster = pn.mean < ps.mean;
 
     std::printf(
         "[PC_RMS_REAL_RESULT] correctness=%s"
         " layers=[%d,%d) tokens=%" PRId64
-        " paired_serial_mean_ms=%.6f paired_fused_mean_ms=%.6f"
-        " delta_ms=%.6f speedup=%.6fx fused_win_ratio=%.3f verdict=%s\n",
+        " serial_mean_ms=%.6f copy_mean_ms=%.6f no_return_mean_ms=%.6f"
+        " copy_speedup=%.6fx no_return_speedup=%.6fx"
+        " copy_win_ratio=%.3f no_return_win_ratio=%.3f"
+        " verdict=%s\n",
         all_correct ? "PASS" : "FAIL",
         opt.start_layer, opt.start_layer + opt.layers, opt.tokens,
-        ps.mean, pf.mean,
-        ps.mean - pf.mean,
-        pf.mean > 0.0 ? ps.mean / pf.mean : 0.0,
-        opt.iters > 0 ? (double) fused_wins / (double) opt.iters : 0.0,
-        all_correct && pf.mean < ps.mean ?
-            "REAL_WEIGHT_FUSED_BOUND_FASTER" :
-        all_correct ? "REAL_WEIGHT_GPU_SERIAL_FASTER_OR_EQUAL" :
-            "INVALID_CORRECTNESS");
+        ps.mean, pc.mean, pn.mean,
+        pc.mean > 0.0 ? ps.mean / pc.mean : 0.0,
+        pn.mean > 0.0 ? ps.mean / pn.mean : 0.0,
+        opt.iters > 0 ? (double) copy_wins / (double) opt.iters : 0.0,
+        opt.iters > 0 ? (double) no_return_wins / (double) opt.iters : 0.0,
+        !all_correct ? "INVALID_CORRECTNESS" :
+        no_return_faster && !copy_faster ?
+            "RETURN_PATH_IS_BOTTLENECK" :
+        copy_faster ?
+            "COPY_RETURN_ALREADY_FASTER" :
+            "GPU_SERIAL_FASTER_OR_EQUAL");
 
     ggml_backend_event_free(r_ready);
     ggml_backend_event_free(d2h_done);
