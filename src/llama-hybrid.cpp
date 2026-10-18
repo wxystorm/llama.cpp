@@ -2328,7 +2328,7 @@ static bool llama_pc_local_simulate(
         return 0.0;
     };
 
-    const auto push_event = [&](double end_ms,
+    auto push_event = [&](double end_ms,
                                 llama_pc_local_sim_event_kind kind,
                                 const llama_pc_local_sim_task & task,
                                 int layer) mutable {
@@ -2404,7 +2404,7 @@ static bool llama_pc_local_simulate(
         enqueue_layer_entry(0, ci, 0.0);
     }
 
-    const auto try_start_transfer = [&](double now) mutable {
+    auto try_start_transfer = [&](double now) mutable {
         if (xfer_busy || next_prefetch >= n_layers) {
             return;
         }
@@ -2431,7 +2431,7 @@ static bool llama_pc_local_simulate(
             dummy, layer);
     };
 
-    const auto try_start_cpu = [&](double now) mutable {
+    auto try_start_cpu = [&](double now) mutable {
         if (cpu_busy || cpu_q.empty()) {
             return;
         }
@@ -2449,7 +2449,7 @@ static bool llama_pc_local_simulate(
             task, task.layer);
     };
 
-    const auto try_start_gpu = [&](double now) mutable {
+    auto try_start_gpu = [&](double now) mutable {
         if (gpu_busy) {
             return;
         }
@@ -2479,7 +2479,7 @@ static bool llama_pc_local_simulate(
             task, task.layer);
     };
 
-    const auto dispatch = [&](double now) mutable {
+    auto dispatch = [&](double now) mutable {
         try_start_transfer(now);
         try_start_cpu(now);
         try_start_gpu(now);
