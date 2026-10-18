@@ -891,6 +891,9 @@ static bool send_rpc_cmd_compact_small(
         enum rpc_cmd cmd,
         const T & request) {
 
+    std::lock_guard<std::mutex> transaction_lock(
+        sock->transaction_mutex);
+
     constexpr size_t request_size = sizeof(T);
 
     std::array<uint8_t,
@@ -923,9 +926,7 @@ static bool send_rpc_cmd_compact_small(
         packet.size());
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
-// No response
-static bool send_rpc_cmd(
+static bool send_rpc_cmd_unlocked(
         socket_ptr sock,
         enum rpc_cmd cmd,
         const void * input,
@@ -962,6 +963,24 @@ static bool send_rpc_cmd(
         input_size);
 }
 
+// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+// No response
+static bool send_rpc_cmd(
+        socket_ptr sock,
+        enum rpc_cmd cmd,
+        const void * input,
+        size_t input_size) {
+
+    std::lock_guard<std::mutex> transaction_lock(
+        sock->transaction_mutex);
+
+    return send_rpc_cmd_unlocked(
+        sock,
+        cmd,
+        input,
+        input_size);
+}
+
 struct rpc_cmd_roundtrip_profile {
     int64_t request_send_us         = 0;
     int64_t response_header_wait_us = 0;
@@ -974,12 +993,15 @@ static thread_local rpc_cmd_roundtrip_profile *
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    std::lock_guard<std::mutex> transaction_lock(
+        sock->transaction_mutex);
+
     rpc_cmd_roundtrip_profile * const profile =
         rpc_cmd_roundtrip_profile_active;
 
     const int64_t request_send_begin_us =
         profile != nullptr ? ggml_time_us() : 0;
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    if (!send_rpc_cmd_unlocked(sock, cmd, input, input_size)) {
         return false;
     }
     const int64_t request_send_done_us =
