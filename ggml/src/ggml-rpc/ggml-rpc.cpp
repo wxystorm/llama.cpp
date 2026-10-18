@@ -8626,6 +8626,176 @@ bool rpc_server::execute_phone_npu_async_job(
     return true;
 }
 
+bool rpc_server::phone_npu_ffn_direct(
+        const std::vector<uint8_t> & input,
+        std::vector<uint8_t> & output) {
+    if (input.size() < sizeof(rpc_msg_phone_npu_ffn_direct_req) ||
+        phone_npu_backend == nullptr) {
+        return false;
+    }
+
+    rpc_msg_phone_npu_ffn_direct_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+
+    if (request.device >= backends.size() ||
+        request.layer < 0 ||
+        request.chunk < 0 ||
+        request.n_embd == 0 ||
+        request.n_tokens == 0 ||
+        request.n_expert_used == 0) {
+        return false;
+    }
+
+    const auto mul_size = [](size_t a, size_t b, size_t & out) {
+        if (a != 0 && b > SIZE_MAX / a) {
+            return false;
+        }
+        out = a * b;
+        return true;
+    };
+
+    size_t hidden_elems = 0;
+    size_t route_elems = 0;
+    size_t hidden_bytes = 0;
+    size_t topk_bytes = 0;
+    size_t route_bytes = 0;
+    size_t output_bytes = 0;
+
+    if (!mul_size(
+            (size_t) request.n_embd,
+            (size_t) request.n_tokens,
+            hidden_elems) ||
+        !mul_size(
+            (size_t) request.n_expert_used,
+            (size_t) request.n_tokens,
+            route_elems) ||
+        !mul_size(hidden_elems, sizeof(float), hidden_bytes) ||
+        !mul_size(route_elems, sizeof(int32_t), topk_bytes) ||
+        !mul_size(route_elems, sizeof(float), route_bytes) ||
+        !mul_size(hidden_elems, sizeof(float), output_bytes) ||
+        request.hidden_bytes != hidden_bytes ||
+        request.topk_bytes != topk_bytes ||
+        request.route_bytes != route_bytes) {
+        return false;
+    }
+
+    size_t payload_bytes = 0;
+    if (hidden_bytes > SIZE_MAX - topk_bytes ||
+        hidden_bytes + topk_bytes > SIZE_MAX - route_bytes) {
+        return false;
+    }
+    payload_bytes = hidden_bytes + topk_bytes + route_bytes;
+    if (sizeof(request) > SIZE_MAX - payload_bytes ||
+        input.size() != sizeof(request) + payload_bytes) {
+        return false;
+    }
+
+    const uint8_t * cursor =
+        input.data() + sizeof(request);
+
+    rpc_phone_npu_async_job job;
+    job.device = request.device;
+    job.seq = 0;
+    job.layer = request.layer;
+    job.chunk = request.chunk;
+    job.prefill = request.n_tokens > 1;
+    job.down = nullptr;
+    job.n_embd = request.n_embd;
+    job.n_tokens = request.n_tokens;
+    job.n_expert_used = request.n_expert_used;
+    job.hidden_dense.assign(
+        cursor,
+        cursor + hidden_bytes);
+    cursor += hidden_bytes;
+    job.topk_dense.assign(
+        cursor,
+        cursor + topk_bytes);
+    cursor += topk_bytes;
+    job.route_dense.assign(
+        cursor,
+        cursor + route_bytes);
+
+    // prepare_phone_npu_ffn_cache() only needs the norm shape on its
+    // phone-local GGUF path.  A metadata-only tensor keeps the direct wire
+    // protocol independent from any RPC-visible weight graph.
+    ggml_context_ptr ctx_meta =
+        rpc_phone_npu_make_ctx(64u * 1024u);
+    if (!ctx_meta) {
+        return false;
+    }
+    ggml_tensor * fake_norm = ggml_new_tensor_2d(
+        ctx_meta.get(),
+        GGML_TYPE_F32,
+        request.n_embd,
+        request.n_tokens);
+
+    rpc_phone_npu_ffn_stage stage;
+    stage.layer = request.layer;
+    stage.chunk = request.chunk;
+    stage.prefill = request.n_tokens > 1;
+    stage.norm = fake_norm;
+
+    std::vector<float> npu_output;
+    bool ok = false;
+    const int64_t begin_us = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> npu_lock(
+            phone_npu_mutex);
+
+        rpc_phone_npu_ffn_cache * cache = nullptr;
+        if (prepare_phone_npu_ffn_cache(
+                nullptr,
+                stage,
+                cache) &&
+            cache != nullptr) {
+            job.cache = cache;
+            ok = execute_phone_npu_async_job(
+                job,
+                npu_output);
+        }
+    }
+    const int64_t done_us = ggml_time_us();
+
+    output.assign(
+        sizeof(rpc_msg_phone_npu_ffn_direct_rsp) +
+            output_bytes,
+        0);
+
+    rpc_msg_phone_npu_ffn_direct_rsp response {};
+    response.result = ok ? 1u : 0u;
+    response.output_bytes = output_bytes;
+    memcpy(
+        output.data(),
+        &response,
+        sizeof(response));
+
+    if (ok) {
+        if (npu_output.size() * sizeof(float) !=
+                output_bytes) {
+            return false;
+        }
+        memcpy(
+            output.data() + sizeof(response),
+            npu_output.data(),
+            output_bytes);
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_DIRECT] layer=%d chunk=%d tokens=%u "
+        "hidden_bytes=%zu route_bytes=%zu output_bytes=%zu "
+        "compute_ms=%.3f status=%s\n",
+        request.layer,
+        request.chunk,
+        request.n_tokens,
+        hidden_bytes,
+        topk_bytes + route_bytes,
+        output_bytes,
+        (done_us - begin_us) / 1000.0,
+        ok ? "OK" : "FAIL");
+
+    return true;
+}
+
 void rpc_server::ensure_phone_npu_async_worker() {
     std::lock_guard<std::mutex> lock(phone_npu_async_mutex);
     if (phone_npu_async_thread.joinable()) {
