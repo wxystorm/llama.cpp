@@ -217,6 +217,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool pc_inner_fifo_requested =
         pc_inner_fifo_env != nullptr &&
         std::atoi(pc_inner_fifo_env) != 0;
+    const char * pc_inner_phone_ffn_env =
+        std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN");
+    const bool pc_inner_phone_ffn_requested =
+        pc_inner_fifo_requested &&
+        pc_inner_phone_ffn_env != nullptr &&
+        std::atoi(pc_inner_phone_ffn_env) != 0;
     int pc_inner_chunk_tokens = 128;
     if (const char * value =
             std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_TOKENS")) {
@@ -747,7 +753,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         wave_layer);
 
                     llm_graph_moe_routing phone_routing;
-                    if (phone_primary_wavefront) {
+                    const bool pc_phone_ffn =
+                        pc_inner_wavefront &&
+                        pc_inner_phone_ffn_requested;
+                    if (phone_primary_wavefront ||
+                        pc_phone_ffn) {
                         phone_routing =
                             build_moe_routing(
                                 ffn_norm,
@@ -775,9 +785,54 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             wave_layer);
                     }
 
+                    ggml_tensor * ffn_compute_inp =
+                        ffn_norm;
+                    if (pc_phone_ffn) {
+                        // The PC->Phone ring treats FFN normalization and
+                        // routing as the GPU front-end.  Materialize those
+                        // dependencies before the explicit PHONE_FFN_BEGIN
+                        // marker so the FIFO GPU task can publish a fully
+                        // prepared {hidden, topk, route_weights} tuple.
+                        ggml_build_forward_expand(
+                            gf,
+                            phone_routing.selected_experts);
+                        ggml_build_forward_expand(
+                            gf,
+                            phone_routing.weights);
+
+                        ggml_tensor * phone_ffn_ready =
+                            ggml_view_tensor(
+                                ctx0,
+                                ffn_norm);
+                        const std::string phone_ready_name =
+                            "phone_prefill_ffn_ready_chunk_" +
+                            std::to_string(ci);
+                        cb(
+                            phone_ffn_ready,
+                            phone_ready_name.c_str(),
+                            wave_layer);
+                        ggml_build_forward_expand(
+                            gf,
+                            phone_ffn_ready);
+
+                        ggml_tensor * phone_ffn_input =
+                            ggml_view_tensor(
+                                ctx0,
+                                phone_ffn_ready);
+                        const std::string phone_input_name =
+                            "phone_prefill_ffn_input_chunk_" +
+                            std::to_string(ci);
+                        cb(
+                            phone_ffn_input,
+                            phone_input_name.c_str(),
+                            wave_layer);
+                        ffn_compute_inp =
+                            phone_ffn_input;
+                    }
+
                     ggml_tensor * down =
                         build_moe_ffn(
-                            ffn_norm,
+                            ffn_compute_inp,
                             model.layers[wave_layer].ffn_gate_inp,
                             model.layers[wave_layer].ffn_up_exps,
                             model.layers[wave_layer].ffn_gate_exps,
