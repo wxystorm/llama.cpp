@@ -250,6 +250,10 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     target_include_directories(test-pc-attn-rms-overlap-model PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-pc-attn-rms-overlap-model PRIVATE ggml-cuda)
 
+    llama_build(test-pc-layer-speed.cpp)
+    target_include_directories(test-pc-layer-speed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-pc-layer-speed PRIVATE ggml-cuda)
+
     # These standalone probes intentionally measure an optimized host-side RMS reduction.
     # Enable AVX2 only for the probe targets on x86 hosts.
     if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
