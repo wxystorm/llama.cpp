@@ -2031,7 +2031,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 ggml_tensor * node =
                     ggml_graph_node(gf, node_id);
 
-                if (!ggml_is_view_op(node->op)) {
+                if (node->view_src == nullptr) {
                     if (force_next_split) {
                         ggml_backend_sched_set_split_boundary(
                             sched_use,
