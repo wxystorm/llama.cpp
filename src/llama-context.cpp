@@ -5152,6 +5152,45 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const bool fifo_trace =
                     std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_TRACE") != nullptr &&
                     std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_FIFO_TRACE")) != 0;
+                const bool phone_ffn_env_requested =
+                    std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN") != nullptr &&
+                    std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN")) != 0;
+                const bool phone_ffn_requested =
+                    phone_ffn_env_requested &&
+                    membership.pc_phone_ffn_graph;
+
+                ggml_backend_t phone_ffn_backend = nullptr;
+                ggml_backend_rpc_run_private_ffn_t phone_ffn_run = nullptr;
+                if (phone_ffn_requested) {
+                    for (const auto & candidate_ptr : backends) {
+                        ggml_backend_t candidate = candidate_ptr.get();
+                        if (candidate == nullptr ||
+                            !ggml_backend_is_rpc(candidate)) {
+                            continue;
+                        }
+
+                        ggml_backend_dev_t dev =
+                            ggml_backend_get_device(candidate);
+                        ggml_backend_reg_t reg =
+                            dev != nullptr ?
+                                ggml_backend_dev_backend_reg(dev) :
+                                nullptr;
+                        if (reg == nullptr) {
+                            continue;
+                        }
+
+                        auto fn =
+                            reinterpret_cast<ggml_backend_rpc_run_private_ffn_t>(
+                                ggml_backend_reg_get_proc_address(
+                                    reg,
+                                    GGML_BACKEND_RPC_RUN_PRIVATE_FFN_PROC));
+                        if (fn != nullptr) {
+                            phone_ffn_backend = candidate;
+                            phone_ffn_run = fn;
+                            break;
+                        }
+                    }
+                }
 
                 const auto exact_stage =
                     [](const llama_hybrid_inner_v0_task & task,
@@ -5206,6 +5245,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 std::vector<int> ffn_ids(grid, -1);
                 std::vector<int> reduce_ids(grid, -1);
 
+                struct phone_ffn_binding {
+                    ggml_tensor * hidden = nullptr;
+                    ggml_tensor * topk = nullptr;
+                    ggml_tensor * route_weights = nullptr;
+                    ggml_tensor * down = nullptr;
+                };
+                std::vector<phone_ffn_binding> phone_bindings(grid);
+
                 const auto ring_index =
                     [&](int layer, int chunk) -> size_t {
                         return (size_t) (layer - first_layer) *
@@ -5249,6 +5296,140 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
                 }
 
+                if (fifo_topology_ok &&
+                    phone_ffn_env_requested &&
+                    !phone_ffn_requested) {
+                    LLAMA_LOG_ERROR(
+                        "[INNER_FIFO_PHONE] status=REJECT "
+                        "reason=PHONE_MARKERS_MISSING ub=%d block=%zu\n",
+                        ubatch_id,
+                        block_index);
+                    fifo_topology_ok = false;
+                }
+
+                if (fifo_topology_ok && phone_ffn_requested) {
+                    if (phone_ffn_backend == nullptr ||
+                        phone_ffn_run == nullptr) {
+                        LLAMA_LOG_ERROR(
+                            "[INNER_FIFO_PHONE] status=REJECT "
+                            "reason=NO_PHONE_RPC_DIRECT_FFN "
+                            "ub=%d block=%zu\n",
+                            ubatch_id,
+                            block_index);
+                        fifo_topology_ok = false;
+                    }
+                }
+
+                const auto find_graph_node =
+                    [&](const char * name) -> ggml_tensor * {
+                        const int n_nodes =
+                            ggml_graph_n_nodes(result->get_gf());
+                        for (int i = 0; i < n_nodes; ++i) {
+                            ggml_tensor * node =
+                                ggml_graph_node(result->get_gf(), i);
+                            if (node != nullptr &&
+                                std::strcmp(node->name, name) == 0) {
+                                return node;
+                            }
+                        }
+                        return nullptr;
+                    };
+
+                if (fifo_topology_ok && phone_ffn_requested) {
+                    for (int layer = first_layer;
+                         layer <= last_layer &&
+                         fifo_topology_ok;
+                         ++layer) {
+                        for (int chunk = 0;
+                             chunk < n_chunks;
+                             ++chunk) {
+                            const size_t idx =
+                                ring_index(layer, chunk);
+                            phone_ffn_binding & binding =
+                                phone_bindings[idx];
+
+                            char name[GGML_MAX_NAME] = {};
+
+                            std::snprintf(
+                                name,
+                                sizeof(name),
+                                "phone_prefill_ffn_ready_chunk_%d-%d",
+                                chunk,
+                                layer);
+                            binding.hidden =
+                                find_graph_node(name);
+
+                            std::snprintf(
+                                name,
+                                sizeof(name),
+                                "phone_prefill_route_topk_chunk_%d-%d",
+                                chunk,
+                                layer);
+                            binding.topk =
+                                find_graph_node(name);
+
+                            std::snprintf(
+                                name,
+                                sizeof(name),
+                                "phone_prefill_route_weights_chunk_%d-%d",
+                                chunk,
+                                layer);
+                            binding.route_weights =
+                                find_graph_node(name);
+
+                            std::snprintf(
+                                name,
+                                sizeof(name),
+                                "prefill_ffn_down_chunk_%d-%d",
+                                chunk,
+                                layer);
+                            binding.down =
+                                find_graph_node(name);
+
+                            const bool shape_ok =
+                                binding.hidden != nullptr &&
+                                binding.topk != nullptr &&
+                                binding.route_weights != nullptr &&
+                                binding.down != nullptr &&
+                                binding.hidden->type == GGML_TYPE_F32 &&
+                                binding.topk->type == GGML_TYPE_I32 &&
+                                binding.route_weights->type == GGML_TYPE_F32 &&
+                                binding.down->type == GGML_TYPE_F32 &&
+                                binding.hidden->ne[0] ==
+                                    binding.down->ne[0] &&
+                                binding.hidden->ne[1] ==
+                                    binding.down->ne[1] &&
+                                binding.topk->ne[1] ==
+                                    binding.hidden->ne[1] &&
+                                binding.route_weights->ne[0] == 1 &&
+                                binding.route_weights->ne[1] ==
+                                    binding.topk->ne[0] &&
+                                binding.route_weights->ne[2] ==
+                                    binding.hidden->ne[1];
+
+                            if (!shape_ok) {
+                                LLAMA_LOG_ERROR(
+                                    "[INNER_FIFO_PHONE] status=REJECT "
+                                    "reason=BAD_PHONE_BINDING "
+                                    "layer=%d chunk=%d "
+                                    "hidden=%s topk=%s route=%s down=%s\n",
+                                    layer,
+                                    chunk,
+                                    binding.hidden != nullptr ?
+                                        binding.hidden->name : "(null)",
+                                    binding.topk != nullptr ?
+                                        binding.topk->name : "(null)",
+                                    binding.route_weights != nullptr ?
+                                        binding.route_weights->name : "(null)",
+                                    binding.down != nullptr ?
+                                        binding.down->name : "(null)");
+                                fifo_topology_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if (fifo_topology_ok) {
                     for (size_t i = 0; i < grid; ++i) {
                         if (attn_ids[i] < 0 ||
@@ -5273,7 +5454,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 GGML_BACKEND_DEVICE_TYPE_CPU ||
                             ggml_backend_dev_type(
                                 ggml_backend_get_device(reduce.backend)) !=
-                                GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                (phone_ffn_requested ?
+                                    GGML_BACKEND_DEVICE_TYPE_GPU :
+                                    GGML_BACKEND_DEVICE_TYPE_CPU)) {
                             fifo_topology_ok = false;
                             break;
                         }
