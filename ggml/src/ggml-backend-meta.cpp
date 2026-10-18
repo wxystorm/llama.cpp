@@ -10743,6 +10743,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 "[RETURN_WAVEFRONT_DOWN_READY] layer=%d chunk=%d lane=%zu\n",
                                 prefill_down_layer_0, prefill_down_chunk_0, return_lane);
                         }
+                    } else if (!use_snapshot_pipeline && !handoff_to_phone) {
+                        // Conservative MoE prefill returns reuse the same host
+                        // temporary storage on the next worker task.  The ADD
+                        // above is asynchronous, so task completion alone does
+                        // not prove that node_tmp is no longer being consumed.
+                        // Fence the PC backend before publishing task completion
+                        // so the next chunk cannot overwrite node_tmp early.
+                        const int64_t reduce_sync_start_us = ggml_time_us();
+                        ggml_backend_synchronize(bcj_dst.backend);
+                        reduce_sync_us = ggml_time_us() - reduce_sync_start_us;
+                        if (pipeline_debug) {
+                            GGML_LOG_INFO(
+                                "[PREFILL_CONSERVATIVE_REDUCE_SYNC] "
+                                "layer=%d chunk=%d lane=%zu wait_ms=%.3f\n",
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                return_lane,
+                                reduce_sync_us / 1000.0);
+                        }
                     }
 
                     if (!handoff_to_phone) {
