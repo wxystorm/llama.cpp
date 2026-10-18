@@ -575,7 +575,10 @@ int main(int argc, char ** argv) {
     }
 
     if (model->arch != LLM_ARCH_QWEN3MOE) {
-        std::fprintf(stderr, "expected Qwen3-MoE, got %s\n", model->arch_name().c_str());
+        // llama_model::arch_name() is an internal, non-exported C++ method
+        // when llama is built as a Windows DLL. Keep this standalone probe
+        // compatible with shared builds by reading the already-visible enum.
+        std::fprintf(stderr, "expected Qwen3-MoE, got arch enum=%d\n", (int) model->arch);
         llama_model_free(model);
         llama_backend_free();
         return 3;
