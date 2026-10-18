@@ -2790,38 +2790,56 @@ static void llama_hybrid_pc_local_plan_print(
 
     const std::string pattern =
         llama_pc_local_pattern_string(plan.layer_modes);
+
+    // Keep diagnostics intentionally short.  Some Windows/PowerShell capture
+    // paths visually truncate long prefixed log lines even though the llama
+    // logger itself dynamically expands its message buffer.
     LLAMA_LOG_ERROR(
-        "[PC_LOCAL_PLAN] status=OK applied=%d orientation=%s "
-        "layers=[%d,%d) chunk_tokens=%d split=%d gpu_full=%d "
-        "pattern=%s\n",
+        "[PC_LOCAL_PLAN] status=OK applied=%d orientation=%s layers=[%d,%d)\n",
         plan.applied ? 1 : 0,
         llama_pc_local_split_name(plan.split),
-        plan.layer_begin, plan.layer_end,
+        plan.layer_begin, plan.layer_end);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_LAYOUT] chunk=%d split=%d full=%d\n",
         plan.chunk_tokens,
-        plan.split_layers, plan.gpu_full_layers,
+        plan.split_layers,
+        plan.gpu_full_layers);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_PATTERN] %s\n",
         pattern.c_str());
+
     LLAMA_LOG_ERROR(
-        "[PC_LOCAL_PLAN_STAGE] cpu_attn_ms=%.3f cpu_ffn_ms=%.3f "
-        "gpu_attn_ms=%.3f gpu_ffn_ms=%.3f h2d_gbps=%.3f\n",
-        plan.cpu_attn_ms, plan.cpu_ffn_ms,
-        plan.gpu_attn_ms, plan.gpu_ffn_ms,
+        "[PC_LOCAL_PLAN_CPU] attn_ms=%.3f ffn_ms=%.3f\n",
+        plan.cpu_attn_ms,
+        plan.cpu_ffn_ms);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_GPU] attn_ms=%.3f ffn_ms=%.3f\n",
+        plan.gpu_attn_ms,
+        plan.gpu_ffn_ms);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_H2D] gbps=%.3f\n",
         plan.weight_h2d_gbps);
+
     LLAMA_LOG_ERROR(
-        "[PC_LOCAL_PLAN_RESIDENCY] gpu_weight_budget_mib=%.1f "
-        "initial_layers=%d initial_mib=%.1f peak_mib=%.1f\n",
+        "[PC_LOCAL_PLAN_RESIDENT] budget_mib=%.1f initial_layers=%d initial_mib=%.1f\n",
         plan.gpu_weight_budget_bytes / 1048576.0,
         plan.initial_resident_layers,
-        plan.initial_resident_bytes / 1048576.0,
-        plan.predicted_peak_weight_bytes / 1048576.0);
+        plan.initial_resident_bytes / 1048576.0);
     LLAMA_LOG_ERROR(
-        "[PC_LOCAL_PLAN_PRED] makespan_ms=%.3f cpu_busy_ms=%.3f "
-        "gpu_busy_ms=%.3f xfer_busy_ms=%.3f weight_stall_ms=%.3f "
-        "max_cpu_q=%d max_gpu_q=%d applied=0\n",
+        "[PC_LOCAL_PLAN_PEAK] weight_mib=%.1f\n",
+        plan.predicted_peak_weight_bytes / 1048576.0);
+
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_TIME] makespan_ms=%.3f cpu_busy_ms=%.3f gpu_busy_ms=%.3f\n",
         plan.predicted_ms,
         plan.predicted_cpu_busy_ms,
-        plan.predicted_gpu_busy_ms,
+        plan.predicted_gpu_busy_ms);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_XFER] busy_ms=%.3f stall_ms=%.3f\n",
         plan.predicted_transfer_busy_ms,
-        plan.predicted_weight_stall_ms,
+        plan.predicted_weight_stall_ms);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_QUEUE] cpu_max=%d gpu_max=%d applied=0\n",
         plan.max_cpu_queue,
         plan.max_gpu_queue);
 }
@@ -6991,7 +7009,7 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
             ms > 0.0 ?
                 (double) requested_bytes / (ms / 1000.0) / 1.0e9 :
                 0.0;
-        LLAMA_LOG_INFO(
+        LLAMA_LOG_ERROR(
             "[HYBRID_PROFILE_WEIGHT_H2D] bytes=%zu mib=%.3f ms=%.3f gbps=%.3f status=OK\n",
             requested_bytes,
             requested_bytes / 1048576.0,
