@@ -10803,6 +10803,32 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pending_prefill_reduce_chunk[return_lane]  = prefill_down_chunk_0;
             pending_prefill_reduce_worker[return_lane] = reduce_worker;
 
+            if (!use_snapshot_pipeline) {
+                // Correctness A/B for MoE prefill: keep the local PC partial
+                // alive until the Phone payload has arrived and the reduce ADD
+                // has completed.  Without the snapshot path, later chunks may
+                // otherwise advance while node_dst still belongs to the
+                // pending reduce worker, allowing allocator-managed storage to
+                // be reused before the ADD consumes it.
+                const int64_t conservative_wait_start_us = ggml_time_us();
+                const ggml_status conservative_status =
+                    wait_prefill_reduce_lane(return_lane);
+                const int64_t conservative_wait_us =
+                    ggml_time_us() - conservative_wait_start_us;
+                if (pipeline_debug) {
+                    GGML_LOG_INFO(
+                        "[PREFILL_CONSERVATIVE_CHUNK_BARRIER] "
+                        "layer=%d chunk=%d wait_ms=%.3f status=%d\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        conservative_wait_us / 1000.0,
+                        (int) conservative_status);
+                }
+                if (conservative_status != GGML_STATUS_SUCCESS) {
+                    return conservative_status;
+                }
+            }
+
             if (use_snapshot_pipeline) {
                 const int64_t snapshot_arm_start_us = ggml_time_us();
                 const int64_t enqueue_to_arm_us = snapshot_arm_start_us - return_enqueue_us;
