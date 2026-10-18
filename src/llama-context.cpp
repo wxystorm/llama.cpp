@@ -144,9 +144,41 @@ static llama_hybrid_inner_stage_marker llama_hybrid_classify_inner_stage_marker(
     // useful for diagnostics, but treating it as ATTN END would make the
     // graph appear to transition backwards FFN -> ATTN.
 
-    if (llama_hybrid_name_starts_with(tensor_name, "ffn_norm-") ||
-        llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_norm_group_") ||
-        llama_hybrid_name_starts_with(tensor_name, "prefill_ffn_norm_chunk_")) {
+    const bool pc_phone_ffn =
+        std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN")) != 0;
+
+    if (pc_phone_ffn &&
+        llama_hybrid_name_starts_with(
+            tensor_name,
+            "phone_prefill_ffn_ready_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::ATTN;
+        marker.event = llama_hybrid_inner_stage_event::END;
+        return marker;
+    }
+
+    if (pc_phone_ffn &&
+        llama_hybrid_name_starts_with(
+            tensor_name,
+            "phone_prefill_ffn_input_chunk_")) {
+        marker.kind  = llama_hybrid_inner_stage_kind::FFN;
+        marker.event = llama_hybrid_inner_stage_event::BEGIN;
+        return marker;
+    }
+
+    // In the PC->Phone ring, FFN norm + Router/Top-K belong to the GPU
+    // front-end. Keep the existing FFN BEGIN marker behavior unchanged for
+    // every other execution mode.
+    if (!(pc_phone_ffn &&
+          (llama_hybrid_name_starts_with(
+               tensor_name,
+               "prefill_wave_ffn_norm_group_") ||
+           llama_hybrid_name_starts_with(
+               tensor_name,
+               "prefill_ffn_norm_chunk_"))) &&
+        (llama_hybrid_name_starts_with(tensor_name, "ffn_norm-") ||
+         llama_hybrid_name_starts_with(tensor_name, "prefill_wave_ffn_norm_group_") ||
+         llama_hybrid_name_starts_with(tensor_name, "prefill_ffn_norm_chunk_"))) {
         marker.kind  = llama_hybrid_inner_stage_kind::FFN;
         marker.event = llama_hybrid_inner_stage_event::BEGIN;
         return marker;
@@ -1539,6 +1571,10 @@ static bool llama_hybrid_apply_pc_inner_policy(
     const bool pc_chunk_ring =
         std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING") != nullptr &&
         std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_CHUNK_RING")) != 0;
+    const bool pc_phone_ffn =
+        pc_chunk_ring &&
+        std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_INNER_PC_PHONE_FFN")) != 0;
 
     const llama_hybrid_inner_membership_result membership =
         llama_hybrid_build_inner_node_membership(gf);
@@ -1615,6 +1651,7 @@ static bool llama_hybrid_apply_pc_inner_policy(
 
     struct layer_stats {
         int attn_nodes     = 0;
+        int reduce_nodes   = 0;
         int compute_nodes  = 0;
         int alias_nodes    = 0;
         int anchored_state = 0;
@@ -1635,16 +1672,24 @@ static bool llama_hybrid_apply_pc_inner_policy(
     // selected Attention compute node has been proven CUDA-capable.  This
     // avoids leaving a partially migrated region if one later layer fails.
     for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+        const bool move_stage =
+            item.stage == llama_hybrid_inner_stage_kind::ATTN ||
+            (pc_phone_ffn &&
+             item.stage == llama_hybrid_inner_stage_kind::REDUCE);
         if (!item.valid() ||
             item.layer < 0 ||
             item.layer >= n_layer ||
             !selected[(size_t) item.layer] ||
-            item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+            !move_stage) {
             continue;
         }
 
         layer_stats & st = stats[(size_t) item.layer];
-        ++st.attn_nodes;
+        if (item.stage == llama_hybrid_inner_stage_kind::ATTN) {
+            ++st.attn_nodes;
+        } else {
+            ++st.reduce_nodes;
+        }
 
         ggml_tensor * node = ggml_graph_node(gf, item.node_index);
         const bool is_alias =
@@ -1695,11 +1740,15 @@ static bool llama_hybrid_apply_pc_inner_policy(
     // Temporary views follow a migrated compute root.  Views rooted in
     // persistent/preallocated storage remain with that storage owner.
     for (const llama_hybrid_inner_node_membership & item : membership.nodes) {
+        const bool move_stage =
+            item.stage == llama_hybrid_inner_stage_kind::ATTN ||
+            (pc_phone_ffn &&
+             item.stage == llama_hybrid_inner_stage_kind::REDUCE);
         if (!item.valid() ||
             item.layer < 0 ||
             item.layer >= n_layer ||
             !selected[(size_t) item.layer] ||
-            item.stage != llama_hybrid_inner_stage_kind::ATTN) {
+            !move_stage) {
             continue;
         }
 
@@ -1765,21 +1814,26 @@ static bool llama_hybrid_apply_pc_inner_policy(
                 "[INNER_PC_POLICY_LAYER] status=APPLIED "
                 "layer=%d tokens=%u attn_nodes=%d compute=%d aliases=%d "
                 "anchored_state=%d anchored_alias=%d "
-                "attn=%s ffn=INHERIT_CPU reduce=INHERIT_CPU\n",
+                "attn=%s ffn=%s reduce=%s\n",
                 il, ubatch_tokens,
                 st.attn_nodes, st.compute_nodes, st.alias_nodes,
                 st.anchored_state, st.anchored_alias,
-                ggml_backend_name(cuda_backend));
+                ggml_backend_name(cuda_backend),
+                pc_phone_ffn ? "PHONE_PRIVATE_HTP" : "INHERIT_CPU",
+                pc_phone_ffn ? ggml_backend_name(cuda_backend) : "INHERIT_CPU");
         }
     }
 
     LLAMA_LOG_INFO(
         "[INNER_PC_POLICY] status=APPLIED "
-        "policy=ATTN_CUDA_FFN_CPU_REDUCE_CPU scope=%s "
+        "policy=%s scope=%s "
         "tokens=%u layers=[%d,%d) selected_layers=%d "
         "attn_nodes=%d compute=%d aliases=%d "
         "anchored_state=%d anchored_alias=%d backend=%s "
         "membership={gaps:%d,transition_errors:%d}\n",
+        pc_phone_ffn ?
+            "ATTN_CUDA_FFN_PHONE_REDUCE_CUDA" :
+            "ATTN_CUDA_FFN_CPU_REDUCE_CPU",
         all_tokens ? "ALL_TOKENS" : "TOKEN_GATED",
         ubatch_tokens,
         first_layer, last_layer + 1, selected_layers,
