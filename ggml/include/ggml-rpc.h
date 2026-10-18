@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    19
+#define RPC_PROTO_PATCH_VERSION    20
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -102,6 +102,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC \
     "ggml_backend_rpc_set_tensor_async_return_wait"
 
+#define GGML_BACKEND_RPC_RUN_PRIVATE_FFN_PROC \
+    "ggml_backend_rpc_run_private_ffn"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -143,6 +146,15 @@ using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         size_t size,
         uint64_t phone_ffn_seq,
         size_t return_lane);
+
+using ggml_backend_rpc_run_private_ffn_t = bool (*)(
+        ggml_backend_t backend,
+        int layer,
+        int chunk,
+        const ggml_tensor * hidden,
+        const ggml_tensor * topk,
+        const ggml_tensor * route_weights,
+        ggml_tensor * down);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
