@@ -5535,6 +5535,10 @@ private:
     // Meta tensor-split participant.
     ggml_backend_t phone_npu_backend = nullptr;
     std::mutex phone_npu_mutex;
+    // Direct Phone-FFN uses a dedicated socket, so cache lookup can now race
+    // with the legacy graph path. Protect the map separately from the HTP
+    // execution lane; cache entries are immutable after publication.
+    std::mutex phone_npu_cache_mutex;
     std::unordered_map<
         int,
         std::unique_ptr<rpc_phone_npu_ffn_cache>>
@@ -8105,6 +8109,8 @@ bool rpc_server::prepare_phone_npu_ffn_cache(
         const rpc_phone_npu_ffn_stage & stage,
         rpc_phone_npu_ffn_cache *& cache) {
     cache = nullptr;
+    std::unique_lock<std::mutex> cache_lock(
+        phone_npu_cache_mutex);
     auto it = phone_npu_ffn_caches.find(stage.layer);
     if (it != phone_npu_ffn_caches.end()) {
         cache = it->second.get();
@@ -8658,14 +8664,21 @@ bool rpc_server::prepare_phone_npu_async_job(
 
     rpc_phone_npu_ffn_cache * cache = nullptr;
 
-    // Cached weights are immutable after construction, so a hit does not need
-    // the HTP execution mutex.  A miss performs the one-time repack/upload
-    // under that mutex to avoid colliding with the running NPU job.
-    auto cache_it = phone_npu_ffn_caches.find(stage.layer);
-    if (cache_it != phone_npu_ffn_caches.end()) {
-        cache = cache_it->second.get();
-    } else {
-        std::lock_guard<std::mutex> npu_lock(phone_npu_mutex);
+    // Cached weights are immutable after publication. A hit only needs the
+    // cache-map mutex. A miss additionally takes the HTP execution mutex while
+    // repacking/uploading so cache construction cannot collide with compute.
+    {
+        std::lock_guard<std::mutex> cache_lock(
+            phone_npu_cache_mutex);
+        auto cache_it =
+            phone_npu_ffn_caches.find(stage.layer);
+        if (cache_it != phone_npu_ffn_caches.end()) {
+            cache = cache_it->second.get();
+        }
+    }
+    if (cache == nullptr) {
+        std::lock_guard<std::mutex> npu_lock(
+            phone_npu_mutex);
         if (!prepare_phone_npu_ffn_cache(
                 graph, stage, cache)) {
             return false;
