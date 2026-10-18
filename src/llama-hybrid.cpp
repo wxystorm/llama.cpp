@@ -804,6 +804,7 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
         profile.decode_tail_ms);
 
     llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
+    llama_hybrid_transfer_print("pc_to_gpu_weight", profile.pc_to_gpu_weight);
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
     llama_hybrid_transfer_print("phone_prefill_return", profile.phone_prefill_return);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
@@ -5987,6 +5988,7 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
                                                ggml_backend_t         gpu_backend,
                                                ggml_backend_t         pc_backend) {
     profile.gpu_to_pc.clear();
+    profile.pc_to_gpu_weight.clear();
     if (gpu_backend == nullptr) {
         return true;
     }
@@ -6055,6 +6057,113 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
         profile.gpu_to_pc.push_back({ bytes, ms, ms });
         LLAMA_LOG_INFO("[HYBRID_PROFILE_TRANSFER] kind=gpu_to_pc tokens=%d bytes=%zu ms=%.3f\n",
                        token_sizes[i], bytes, ms);
+    }
+
+    // Weight streaming is a different transfer regime from activations:
+    // hundreds of MiB, host/RAM -> CUDA, and it directly determines whether
+    // the sliding residency window can stay ahead of compute.  Probe it
+    // separately and sequentially so startup never needs all probe buffers at
+    // once.  A failed large probe is diagnostic-only; smaller points remain
+    // usable for interpolation/extrapolation.
+    constexpr size_t mib = 1024ull * 1024ull;
+    std::vector<size_t> weight_probe_sizes = {
+        16ull * mib,
+        64ull * mib,
+        128ull * mib,
+        profile.attn_weight_bytes_per_layer,
+        profile.ffn_weight_bytes_per_layer,
+        profile.total_weight_bytes_per_layer,
+    };
+    weight_probe_sizes.erase(
+        std::remove(weight_probe_sizes.begin(), weight_probe_sizes.end(), size_t(0)),
+        weight_probe_sizes.end());
+    std::sort(weight_probe_sizes.begin(), weight_probe_sizes.end());
+    weight_probe_sizes.erase(
+        std::unique(weight_probe_sizes.begin(), weight_probe_sizes.end()),
+        weight_probe_sizes.end());
+
+    const size_t hard_cap = 512ull * mib;
+    const size_t free_cap =
+        profile.gpu_free_mem > 0 ? profile.gpu_free_mem / 4 : hard_cap;
+    const size_t probe_cap = std::min(hard_cap, free_cap);
+
+    for (const size_t requested_bytes : weight_probe_sizes) {
+        if (requested_bytes == 0 || requested_bytes > probe_cap) {
+            LLAMA_LOG_INFO(
+                "[HYBRID_PROFILE_WEIGHT_H2D] bytes=%zu status=SKIP cap=%zu\n",
+                requested_bytes, probe_cap);
+            continue;
+        }
+
+        const ggml_init_params weight_ctx_params = {
+            /*.mem_size   =*/ggml_tensor_overhead(),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ggml_context_ptr weight_pc_ctx(ggml_init(weight_ctx_params));
+        ggml_context_ptr weight_gpu_ctx(ggml_init(weight_ctx_params));
+        if (!weight_pc_ctx || !weight_gpu_ctx) {
+            continue;
+        }
+
+        ggml_tensor * src = ggml_new_tensor_1d(
+            weight_pc_ctx.get(), GGML_TYPE_I8, (int64_t) requested_bytes);
+        ggml_tensor * dst = ggml_new_tensor_1d(
+            weight_gpu_ctx.get(), GGML_TYPE_I8, (int64_t) requested_bytes);
+
+        ggml_backend_buffer_ptr weight_pc_buffer(
+            ggml_backend_alloc_ctx_tensors(weight_pc_ctx.get(), pc_backend));
+        ggml_backend_buffer_ptr weight_gpu_buffer(
+            ggml_backend_alloc_ctx_tensors(weight_gpu_ctx.get(), gpu_backend));
+        if (!weight_pc_buffer || !weight_gpu_buffer) {
+            LLAMA_LOG_INFO(
+                "[HYBRID_PROFILE_WEIGHT_H2D] bytes=%zu status=SKIP_ALLOC\n",
+                requested_bytes);
+            continue;
+        }
+
+        ggml_backend_buffer_clear(weight_pc_buffer.get(), 0x5a);
+        ggml_backend_synchronize(pc_backend);
+
+        std::array<double, LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples;
+        bool ok = true;
+        for (int run = 0;
+             run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS +
+                       LLAMA_HYBRID_COMPUTE_MEASURE_RUNS;
+             ++run) {
+            const int64_t begin_us = ggml_time_us();
+            ggml_backend_tensor_copy(src, dst);
+            ggml_backend_synchronize(gpu_backend);
+            ggml_backend_synchronize(pc_backend);
+            const int64_t end_us = ggml_time_us();
+
+            if (end_us < begin_us) {
+                ok = false;
+                break;
+            }
+            if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
+                samples[run - LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] =
+                    (end_us - begin_us) / 1000.0;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+
+        const double ms = llama_hybrid_rpc_median(samples);
+        profile.pc_to_gpu_weight.push_back({
+            requested_bytes, ms, ms
+        });
+        const double gbps =
+            ms > 0.0 ?
+                (double) requested_bytes / (ms / 1000.0) / 1.0e9 :
+                0.0;
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_WEIGHT_H2D] bytes=%zu mib=%.3f ms=%.3f gbps=%.3f status=OK\n",
+            requested_bytes,
+            requested_bytes / 1048576.0,
+            ms,
+            gbps);
     }
 
     return true;
