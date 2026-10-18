@@ -10514,7 +10514,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_meta_get_snapshot_arm(bcj_src.backend);
             const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
                 ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
+            // Keep prefill snapshot semantics aligned with decode. Dense FFN
+            // boundaries end directly in MUL_MAT and are safe for the current
+            // snapshot fast path. Qwen3-MoE prefill boundaries end after expert
+            // aggregation (typically ADD), so snapshotting them can expose an
+            // incomplete dependency chain when multiple chunks are in flight.
+            const bool snapshot_compatible_prefill_chunk =
+                node_src->op == GGML_OP_MUL_MAT &&
+                node_dst->op == GGML_OP_MUL_MAT;
             const bool use_snapshot_pipeline =
+                snapshot_compatible_prefill_chunk &&
                 snapshot_prepares[i].prepared &&
                 snapshot_arm != nullptr &&
                 set_snapshot_read != nullptr;
@@ -13517,8 +13526,15 @@ auto prefill_norm_sg_has_prework =
             !layer_attention_phone_owned(prefill_down_layer)) {
         ggml_tensor * phone_prefill_down = get_prefill_down_boundary_node(1, i);
         ggml_tensor * pc_prefill_down = get_prefill_down_boundary_node(0, i);
+        const bool snapshot_compatible_prefill_chunk =
+            phone_prefill_down != nullptr &&
+            pc_prefill_down != nullptr &&
+            phone_prefill_down->op == GGML_OP_MUL_MAT &&
+            pc_prefill_down->op == GGML_OP_MUL_MAT;
+
         if (phone_prefill_down != nullptr && pc_prefill_down != nullptr &&
-                (phone_prefill_down->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                (phone_prefill_down->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                snapshot_compatible_prefill_chunk) {
             prepare_graph_snapshot(i, phone_prefill_down);
 
             if (pipeline_debug) {
@@ -13527,6 +13543,17 @@ auto prefill_norm_sg_has_prework =
                        i, prefill_down_layer, prefill_down_chunk,
                        phone_prefill_down->name, ggml_nbytes(phone_prefill_down));
             }
+        } else if (pipeline_debug &&
+                phone_prefill_down != nullptr &&
+                pc_prefill_down != nullptr &&
+                !snapshot_compatible_prefill_chunk) {
+            GGML_LOG_INFO(
+                "[PREFILL_SNAPSHOT_PREPARE_SKIP] layer=%d chunk=%d "
+                "phone_op=%s pc_op=%s\n",
+                prefill_down_layer,
+                prefill_down_chunk,
+                ggml_op_name(phone_prefill_down->op),
+                ggml_op_name(pc_prefill_down->op));
         }
     }
 
