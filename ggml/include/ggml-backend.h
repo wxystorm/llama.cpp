@@ -330,7 +330,19 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int            ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
+    GGML_API int            ggml_backend_sched_get_split_start(ggml_backend_sched_t sched, int split_id);
+    GGML_API int            ggml_backend_sched_get_split_end(ggml_backend_sched_t sched, int split_id);
     GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+
+    // Optional task boundary for runtimes that execute scheduler splits in a
+    // dependency-driven order instead of plain graph order.
+    GGML_API void ggml_backend_sched_set_split_boundary(ggml_backend_sched_t sched,
+                                                        struct ggml_tensor * node);
+
+    // Keep scheduler-created cross-backend copies alive for the full graph.
+    // Used only by dynamic split-order runtimes such as the PC local ring.
+    GGML_API void ggml_backend_sched_set_dynamic_order_lifetime(ggml_backend_sched_t sched,
+                                                                bool enabled);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,
                                                                            ggml_backend_t       backend);
