@@ -1589,11 +1589,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
         }
 
-        if (n_gpu_pc > 0) {
+        const bool pc_local_ring_requested =
+            arch == LLM_ARCH_QWEN3MOE &&
+            std::getenv("LLAMA_HYBRID_PC_LOCAL_RING") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0 &&
+            n_gpu_pc < (int) pc_layer_ids.size();
+
+        if (n_gpu_pc > 0 || pc_local_ring_requested) {
             ggml_backend_dev_t cuda_dev = llama_hybrid_cuda_device();
             if (cuda_dev == nullptr) {
                 throw std::runtime_error(
-                    "LLAMA_HYBRID_GPU_PC_LAYERS requires the CUDA0 backend");
+                    "PC CUDA placement requires the CUDA0 backend");
             }
             const bool already_registered = std::any_of(
                 devices.begin(), devices.end(),
@@ -1704,8 +1710,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         [](llama_pc_layer_backend backend) {
             return backend == llama_pc_layer_backend::CUDA;
         });
-    ggml_backend_dev_t cuda_dev = has_cuda_pc_layers ? llama_hybrid_cuda_device() : nullptr;
-    if (has_cuda_pc_layers &&
+    const bool pc_local_ring_requested =
+        arch == LLM_ARCH_QWEN3MOE &&
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0;
+    ggml_backend_dev_t cuda_dev =
+        (has_cuda_pc_layers || pc_local_ring_requested) ?
+            llama_hybrid_cuda_device() : nullptr;
+    if ((has_cuda_pc_layers || pc_local_ring_requested) &&
             (cuda_dev == nullptr || pimpl->gpu_buft_list.find(cuda_dev) == pimpl->gpu_buft_list.end())) {
         throw std::runtime_error(format("%s: CUDA0 is not available for PC_ONLY layers", __func__));
     }
@@ -1766,10 +1778,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         };
     }
 
-    // A PC_ONLY layer assigned to CPU does not need Meta/RPC at all.
-    // Place both its weights and graph directly on the CPU backend. Meta is
-    // reserved for TENSOR_SPLIT / PHONE_ONLY layers that actually need the
-    // secondary RPC backend.
+    if (pc_local_ring_requested && arch == LLM_ARCH_QWEN3MOE) {
+        LLAMA_LOG_DEBUG(
+            "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=PC_LOCAL_RING "
+            "owner=CUDA ffn=CPU device=%s\n",
+            il, ggml_backend_dev_name(cuda_dev));
+
+        return {
+            cuda_dev,
+            &pimpl->gpu_buft_list.at(cuda_dev)
+        };
+    }
+
+    // Ordinary PC_ONLY CPU layer.
     LLAMA_LOG_DEBUG(
         "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CPU_DIRECT device=%s\n",
         il, ggml_backend_dev_name(cpu_dev));
@@ -2152,7 +2173,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_layer =
+        tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+
+    // PC local ring v1: the layer/KV owner is CUDA, while Qwen3-MoE
+    // Router/FFN weights stay on CPU. Tensor and Phone layers are untouched.
+    const bool pc_local_ring_layer =
+        arch == LLM_ARCH_QWEN3MOE &&
+        tn.bid >= 0 &&
+        tn.bid < (int) pc_layer_backends.size() &&
+        hybrid_layer_mode(tn.bid) == llama_hybrid_layer_mode::PC_ONLY &&
+        pc_layer_backends[tn.bid] == llama_pc_layer_backend::CPU &&
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0;
+
+    if (pc_local_ring_layer) {
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_NORM:
+            case LLM_TENSOR_FFN_GATE_INP:
+            case LLM_TENSOR_FFN_GATE:
+            case LLM_TENSOR_FFN_UP:
+            case LLM_TENSOR_FFN_DOWN:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+                buft_list_layer = &pimpl->cpu_buft_list;
+                break;
+            default:
+                break;
+        }
+    }
+
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
