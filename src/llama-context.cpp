@@ -4315,6 +4315,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     const int bi =
                         split_backend_index(range.begin);
                     if (bi < 0 || bi > 1) {
+                        restore_boundary_views();
                         restore_boundary_bindings();
                         free_boundary_buffers();
                         ret = GGML_STATUS_FAILED;
@@ -4326,6 +4327,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     if (scratch_backends[bi] == nullptr) {
                         scratch_backends[bi] = backend;
                     } else if (scratch_backends[bi] != backend) {
+                        restore_boundary_views();
                         restore_boundary_bindings();
                         free_boundary_buffers();
                         ret = GGML_STATUS_FAILED;
@@ -4374,6 +4376,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 scratch_buffers[bj] = nullptr;
                             }
                         }
+                        restore_boundary_views();
                         restore_boundary_bindings();
                         free_boundary_buffers();
                         ret = GGML_STATUS_ALLOC_FAILED;
