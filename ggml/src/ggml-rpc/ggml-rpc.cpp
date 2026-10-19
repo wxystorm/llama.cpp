@@ -11475,6 +11475,30 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return_wait);
     }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_transport_open);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_TRANSPORT_SUBMIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_transport_submit);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_transport_receive);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_TRANSPORT_STATS_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_transport_stats);
+    }
     GGML_UNUSED(reg);
 
     return NULL;
