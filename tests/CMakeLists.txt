@@ -267,6 +267,12 @@ endif()
 
 llama_build(test-phone-layer-speed.cpp)
 target_include_directories(test-phone-layer-speed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (TARGET ggml-opencl)
+    add_dependencies(test-phone-layer-speed ggml-opencl)
+endif()
+if (TARGET ggml-hexagon)
+    add_dependencies(test-phone-layer-speed ggml-hexagon)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
