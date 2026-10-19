@@ -3247,10 +3247,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 stage.layer_end - stage.layer_begin;
             const int expected_primitive_tasks =
                 n_layers * n_chunks * 3;
-            std::vector<int> task_split(
+
+            struct pc_ring_split_range {
+                int begin = -1;
+                int end   = -1;
+            };
+            std::vector<pc_ring_split_range> task_ranges(
                 expected_primitive_tasks > 0 ?
-                    (size_t) expected_primitive_tasks : 0,
-                -1);
+                    (size_t) expected_primitive_tasks : 0);
 
             auto primitive_index =
                 [&](int kind, int layer, int chunk) -> int {
@@ -3269,49 +3273,162 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         kind;
                 };
 
-            if (expected_primitive_tasks <= 0 ||
-                (int) markers.size() !=
-                    expected_primitive_tasks ||
-                last_task_split - first_task_split + 1 !=
-                    expected_primitive_tasks) {
-                ring_ok = false;
+            // pc_ring_entry is the explicit boundary between ordinary prefix
+            // graph work and the first Ring primitive. The scheduler may
+            // further split a primitive because host-canonical weights need
+            // copies, so a logical task is a RANGE of scheduler splits.
+            int ring_entry_node = -1;
+            const int ring_graph_nodes =
+                ring_graph != nullptr ?
+                    ggml_graph_n_nodes(ring_graph) : 0;
+            for (int node_id = 0;
+                 node_id < ring_graph_nodes;
+                 ++node_id) {
+                if (std::strncmp(
+                        ggml_graph_node(
+                            ring_graph, node_id)->name,
+                        "pc_ring_entry",
+                        13) == 0) {
+                    ring_entry_node = node_id;
+                    break;
+                }
             }
 
+            int ring_entry_split = -1;
+            if (ring_entry_node >= 0) {
+                for (int split = 0;
+                     split < n_splits;
+                     ++split) {
+                    const int i_start =
+                        ggml_backend_sched_get_split_start(
+                            sched_use, split);
+                    const int i_end =
+                        ggml_backend_sched_get_split_end(
+                            sched_use, split);
+                    if (ring_entry_node >= i_start &&
+                        ring_entry_node < i_end) {
+                        ring_entry_split = split;
+                        break;
+                    }
+                }
+            }
+
+            const auto split_backend_index =
+                [&](int split) -> int {
+                    ggml_backend_t split_backend =
+                        ggml_backend_sched_get_split_backend(
+                            sched_use, split);
+                    if (split_backend == backend_cpu) {
+                        return 0;
+                    }
+                    const ggml_backend_dev_t split_dev =
+                        ggml_backend_get_device(split_backend);
+                    return split_dev ==
+                            model.dev_layer(stage.layer_begin) ?
+                        1 : -1;
+                };
+
+            const char * task_map_fail = nullptr;
+            int fail_split = -1;
+            int fail_expected_backend = -1;
+            int fail_actual_backend = -1;
+
+            if (expected_primitive_tasks <= 0 ||
+                (int) markers.size() !=
+                    expected_primitive_tasks) {
+                ring_ok = false;
+                task_map_fail = "MARKER_COUNT";
+            } else if (ring_entry_split < 0 ||
+                       markers.empty() ||
+                       ring_entry_split >= markers.front().split) {
+                ring_ok = false;
+                task_map_fail = "ENTRY_RANGE";
+            }
+
+            int next_range_begin =
+                ring_entry_split >= 0 ?
+                    ring_entry_split + 1 : -1;
+
             for (const pc_ring_marker & marker : markers) {
+                if (!ring_ok) {
+                    break;
+                }
+
                 const int index =
                     primitive_index(
                         marker.job.kind,
                         marker.job.layer,
                         marker.job.chunk);
                 if (index < 0 ||
-                    task_split[(size_t) index] != -1) {
+                    task_ranges[(size_t) index].begin >= 0 ||
+                    next_range_begin < 0 ||
+                    next_range_begin > marker.split) {
                     ring_ok = false;
+                    task_map_fail = "RANGE";
+                    fail_split = marker.split;
                     break;
                 }
-                task_split[(size_t) index] = marker.split;
 
+                const int range_begin = next_range_begin;
+                const int range_end   = marker.split + 1;
                 const int expected_backend =
                     backend_index(
                         slot_for_kind(
                             marker.job.layer,
                             marker.job.kind));
-                ggml_backend_t split_backend =
-                    ggml_backend_sched_get_split_backend(
-                        sched_use, marker.split);
-                const int actual_backend =
-                    split_backend == backend_cpu ? 0 : 1;
-                if (expected_backend < 0 ||
-                    actual_backend != expected_backend) {
+                if (expected_backend < 0) {
                     ring_ok = false;
+                    task_map_fail = "BACKEND_SLOT";
+                    fail_split = marker.split;
                     break;
+                }
+
+                for (int split = range_begin;
+                     split < range_end;
+                     ++split) {
+                    const int actual_backend =
+                        split_backend_index(split);
+                    if (actual_backend !=
+                            expected_backend) {
+                        ring_ok = false;
+                        task_map_fail = "BACKEND_RANGE";
+                        fail_split = split;
+                        fail_expected_backend =
+                            expected_backend;
+                        fail_actual_backend =
+                            actual_backend;
+                        break;
+                    }
+                }
+                if (!ring_ok) {
+                    break;
+                }
+
+                task_ranges[(size_t) index] = {
+                    range_begin,
+                    range_end,
+                };
+                next_range_begin = range_end;
+            }
+
+            if (ring_ok) {
+                for (const auto & range : task_ranges) {
+                    if (range.begin < 0 ||
+                        range.end <= range.begin) {
+                        ring_ok = false;
+                        task_map_fail = "MISSING_TASK";
+                        break;
+                    }
                 }
             }
 
-            for (int split : task_split) {
-                if (split < 0) {
-                    ring_ok = false;
-                    break;
-                }
+            first_task_split =
+                ring_entry_split >= 0 ?
+                    ring_entry_split + 1 :
+                    first_task_split;
+            if (!markers.empty()) {
+                last_task_split =
+                    markers.back().split;
             }
 
             int expected_jobs = 0;
@@ -3324,10 +3441,27 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             if (!ring_ok || expected_jobs <= 0) {
                 LLAMA_LOG_ERROR(
                     "[PC_LOCAL_RING_Q_CAP] active=0 "
-                    "reason=TASK_MAP splits=%d markers=%zu "
-                    "layers=%d chunks=%d jobs=%d\n",
-                    n_splits, markers.size(),
-                    n_layers, n_chunks, expected_jobs);
+                    "reason=TASK_MAP detail=%s "
+                    "splits=%d markers=%zu expected_markers=%d "
+                    "entry_split=%d first=%d last=%d "
+                    "layers=%d chunks=%d jobs=%d "
+                    "fail_split=%d expected_backend=%d actual_backend=%d\n",
+                    task_map_fail != nullptr ?
+                        task_map_fail :
+                        (expected_jobs <= 0 ?
+                            "JOB_COUNT" : "UNKNOWN"),
+                    n_splits,
+                    markers.size(),
+                    expected_primitive_tasks,
+                    ring_entry_split,
+                    first_task_split,
+                    last_task_split,
+                    n_layers,
+                    n_chunks,
+                    expected_jobs,
+                    fail_split,
+                    fail_expected_backend,
+                    fail_actual_backend);
                 ret = GGML_STATUS_FAILED;
             } else {
                 if (first_task_split > 0) {
@@ -3439,32 +3573,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         if (index < 0) {
                             return GGML_STATUS_FAILED;
                         }
-                        const int split =
-                            task_split[(size_t) index];
+                        const pc_ring_split_range range =
+                            task_ranges[(size_t) index];
+                        if (range.begin < 0 ||
+                            range.end <= range.begin) {
+                            return GGML_STATUS_FAILED;
+                        }
 
-                        ggml_status status =
-                            GGML_STATUS_SUCCESS;
-                        {
-                            std::lock_guard<std::mutex> lock(
-                                prepare_mutex);
+                        // A primitive may contain several scheduler splits
+                        // because the scheduler subdivides host-weight copies.
+                        // Keep all of those splits inside the logical FIFO task.
+                        for (int split = range.begin;
+                             split < range.end;
+                             ++split) {
+                            ggml_status status =
+                                GGML_STATUS_SUCCESS;
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    prepare_mutex);
+                                status =
+                                    ggml_backend_sched_prepare_split(
+                                        sched_use, split);
+                            }
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
+                            }
+
                             status =
-                                ggml_backend_sched_prepare_split(
+                                ggml_backend_sched_compute_split(
                                     sched_use, split);
-                        }
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
-                        }
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
+                            }
 
-                        status =
-                            ggml_backend_sched_compute_split(
-                                sched_use, split);
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
+                            // Bootstrap correctness path: synchronize each
+                            // internal split. Weight Manager/prefetch will later
+                            // remove this intentionally conservative barrier.
+                            ggml_backend_synchronize(
+                                ggml_backend_sched_get_split_backend(
+                                    sched_use, split));
                         }
-
-                        ggml_backend_synchronize(
-                            ggml_backend_sched_get_split_backend(
-                                sched_use, split));
                         return GGML_STATUS_SUCCESS;
                     };
 
@@ -3617,7 +3765,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "[PC_LOCAL_RING_Q_CAP] active=1 "
                     "layers=[%d,%d) chunks=%d "
                     "primitive_tasks=%d jobs=%d "
-                    "task_range=[%d,%d] "
+                    "split_range=[%d,%d] internal_splits=%d "
                     "B0=CPU B1=ACCEL\n",
                     stage.layer_begin,
                     stage.layer_end,
@@ -3625,7 +3773,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     expected_primitive_tasks,
                     expected_jobs,
                     first_task_split,
-                    last_task_split);
+                    last_task_split,
+                    last_task_split - first_task_split + 1);
 
                 std::thread backend_0_worker(
                     [&]() { worker_loop(0); });
