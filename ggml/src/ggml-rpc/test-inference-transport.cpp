@@ -6,12 +6,46 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 using bench_clock = std::chrono::steady_clock;
+
+static void install_crash_diagnostics() {
+    std::set_terminate([]() {
+        std::fprintf(stderr, "[INFERENCE_TRANSPORT_CRASH] kind=std_terminate\n");
+        std::fflush(stderr);
+        std::abort();
+    });
+
+#ifdef _WIN32
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS * info) -> LONG {
+        const DWORD code =
+            info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+        void * address =
+            info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+        std::fprintf(
+            stderr,
+            "[INFERENCE_TRANSPORT_CRASH] kind=seh code=0x%08lx address=%p tid=%lu\n",
+            static_cast<unsigned long>(code),
+            address,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        std::fflush(stderr);
+        return EXCEPTION_EXECUTE_HANDLER;
+    });
+#endif
+}
 
 struct bench_options {
     bool server = false;
@@ -483,6 +517,8 @@ static void print_stats(
 }
 
 int main(int argc, char ** argv) {
+    install_crash_diagnostics();
+
     bench_options opt;
 
     if (!parse_args(argc, argv, opt)) {
