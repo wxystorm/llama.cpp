@@ -4547,7 +4547,17 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
                         const int bi =
                             split_backend_index(range.begin);
-                        std::vector<pc_ring_scratch_saved> scratch_saved;
+                        if (!boundary_output_is_free(
+                                layer, chunk, kind)) {
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_OWNERSHIP] status=FAIL "
+                                "reason=OUTPUT_BUSY kind=%d layer=%d chunk=%d "
+                                "backend=B%d\n",
+                                kind, layer, chunk, bi);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        std::vector<pc_ring_tensor_saved> scratch_saved;
                         ggml_status primitive_status =
                             bind_primitive_scratch(
                                 range, bi, scratch_saved);
@@ -4625,6 +4635,26 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
                         restore_primitive_scratch(
                             scratch_saved);
+
+                        if (primitive_status ==
+                                GGML_STATUS_SUCCESS &&
+                            !commit_boundary_ownership(
+                                layer, chunk, kind)) {
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_OWNERSHIP] status=FAIL "
+                                "reason=COMMIT kind=%d layer=%d chunk=%d "
+                                "backend=B%d\n",
+                                kind, layer, chunk, bi);
+                            primitive_status =
+                                GGML_STATUS_FAILED;
+                        } else if (primitive_status ==
+                                       GGML_STATUS_SUCCESS &&
+                                   ring_exec_trace) {
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_OWNERSHIP] status=OK "
+                                "kind=%d layer=%d chunk=%d backend=B%d\n",
+                                kind, layer, chunk, bi);
+                        }
 
                         if (ring_exec_trace) {
                             const char * kind_name =
@@ -4793,8 +4823,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "layers=[%d,%d) chunks=%d "
                     "primitive_tasks=%d jobs=%d "
                     "split_range=[%d,%d] internal_splits=%d "
-                    "B0=CPU B1=ACCEL lifetime=TASK_SCRATCH "
-                    "scheduler_exec=SERIAL_PROBE\n",
+                    "B0=CPU B1=ACCEL "
+                    "lifetime=EXPLICIT_BOUNDARY_POOL+TASK_SCRATCH "
+                    "full=ATOMIC_JOB scheduler_exec=SERIAL_PROBE\n",
                     stage.layer_begin,
                     stage.layer_end,
                     n_chunks,
