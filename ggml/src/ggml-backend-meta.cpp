@@ -10251,6 +10251,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 int64_t dst_fence_us = 0;
                 int64_t add_submit_us = 0;
 
+                const bool l47_moe_reduce_diag =
+                    layer == 47 &&
+                    std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr;
+                if (l47_moe_reduce_diag) {
+                    fence_backend(bcj_src.backend);
+                    fence_backend(bcj_dst.backend);
+                    meta_debug_tensor(
+                        bcj_src.backend,
+                        node_src,
+                        "L47_MOE_PC_PARTIAL_PRE");
+                    meta_debug_tensor(
+                        bcj_dst.backend,
+                        node_dst,
+                        "L47_MOE_PHONE_PARTIAL_PRE");
+                    GGML_LOG_ERROR(
+                        "[L47_MOE_REDUCE_PATH] sg=%zu mode=%s "
+                        "strict=%d fused_allowed=%d src=%s dst=%s\n",
+                        i,
+                        mode,
+                        strict_phone_primary_fence ? 1 : 0,
+                        allow_fused_set_add ? 1 : 0,
+                        node_src->name,
+                        node_dst->name);
+                }
+
                 if (allow_fused_set_add) {
                     const int64_t fused_begin_us = ggml_time_us();
                     fused_set_add_used = set_tensor_graph(
@@ -10292,6 +10317,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     if (status != GGML_STATUS_SUCCESS) {
                         return status;
                     }
+                }
+
+                if (l47_moe_reduce_diag) {
+                    fence_backend(bcj_dst.backend);
+                    meta_debug_tensor(
+                        bcj_dst.backend,
+                        node_dst,
+                        "L47_MOE_PHONE_REDUCED_POST");
+                    GGML_LOG_ERROR(
+                        "[L47_MOE_REDUCE_DONE] sg=%zu mode=%s "
+                        "fused=%d copy_ms=%.3f add_ms=%.3f fused_ms=%.3f\n",
+                        i,
+                        mode,
+                        fused_set_add_used ? 1 : 0,
+                        copy_us / 1000.0,
+                        add_submit_us / 1000.0,
+                        fused_set_add_us / 1000.0);
                 }
 
                 // Fused mode sends the PC partial and the one-node Phone ADD
