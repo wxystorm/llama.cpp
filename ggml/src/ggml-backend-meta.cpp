@@ -4500,6 +4500,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         pending_phone_prefill_phone_branches;
 
     std::map<size_t, int> deferred_phone_prefill_return_sgs;
+
+    // The graph allocator may overlap final l_out storage with chunk
+    // intermediates because l_out is normally produced only after all chunk
+    // outputs are consumed. Never assemble a multi-chunk Tensor->Phone handoff
+    // into that allocator-owned storage early.
+    std::map<int, std::shared_ptr<std::vector<uint8_t>>>
+        prefill_handoff_host_stage;
+
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_task { 0, 0 };
     std::array<int, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_layer { -1, -1 };
     std::array<int, ggml_backend_meta_context::PREFILL_RETURN_LANES> pending_prefill_reduce_chunk { -1, -1 };
@@ -5039,6 +5047,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
         return true;
+    };
+    auto prefill_down_chunk_count = [&](int layer) -> int {
+        int count = 0;
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+            if (graph == nullptr || graph->n_nodes == 0) {
+                continue;
+            }
+            ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
+            int chunk = -1;
+            int parsed_layer = -1;
+            if (ggml_backend_meta_parse_prefill_down_chunk(
+                    last->name, chunk, parsed_layer) &&
+                parsed_layer == layer) {
+                ++count;
+            }
+        }
+        return count;
     };
     auto decode_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_is_tensor_phone_primary(layer)) {
@@ -10531,12 +10558,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 prefill_layer_hands_off_to_phone(i, prefill_down_layer_0);
             const bool layer_handoff =
                 handoff_to_phone && prefill_is_last_down_chunk(i, prefill_down_layer_0);
+            const int handoff_chunk_count =
+                handoff_to_phone ?
+                    prefill_down_chunk_count(prefill_down_layer_0) : 0;
+            const bool staged_multi_chunk_handoff =
+                handoff_to_phone && handoff_chunk_count > 1;
             ggml_tensor * pc_l_out = handoff_to_phone ?
                 find_layer_output(0, prefill_down_layer_0) : nullptr;
             ggml_tensor * phone_l_out = layer_handoff ?
                 disable_layer_output_producers(1, i + 1, prefill_down_layer_0) : nullptr;
             ggml_tensor * pc_residual = handoff_to_phone ?
                 find_recent_ffn_inp(0, i, prefill_down_layer_0) : nullptr;
+            std::shared_ptr<std::vector<uint8_t>> handoff_host_stage;
+            if (staged_multi_chunk_handoff) {
+                auto & stage =
+                    prefill_handoff_host_stage[prefill_down_layer_0];
+                if (stage == nullptr) {
+                    stage = std::make_shared<std::vector<uint8_t>>(
+                        ggml_nbytes(pc_l_out));
+                }
+                handoff_host_stage = stage;
+            }
             GGML_ASSERT(!handoff_to_phone ||
                 (pc_l_out != nullptr && pc_residual != nullptr &&
                  ggml_nbytes(pc_l_out) == ggml_nbytes(pc_residual)));
@@ -10548,9 +10590,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * pc_output_chunk = nullptr;
             ggml_tensor * residual_chunk = nullptr;
             ggml_cgraph * chunk_layer_graph = nullptr;
+            const size_t handoff_chunk_offset = handoff_to_phone ?
+                down_chunk_offset(
+                    0, true, prefill_down_layer_0, prefill_down_chunk_0) :
+                0;
             if (handoff_to_phone) {
-                const size_t chunk_offset = down_chunk_offset(
-                    0, true, prefill_down_layer_0, prefill_down_chunk_0);
+                const size_t chunk_offset = handoff_chunk_offset;
 
                 residual_chunk = get_node_aux(node_dst);
                 residual_chunk->view_src = pc_residual;
@@ -10571,11 +10616,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 chunk_layer_graph->nodes[0] = node_layer;
                 chunk_layer_graph->n_nodes = 1;
 
-                pc_output_chunk = get_node_aux(node_dst);
-                pc_output_chunk->view_src = pc_l_out;
-                pc_output_chunk->view_offs = chunk_offset;
-                ggml_backend_view_init(pc_output_chunk);
-                GGML_ASSERT(ggml_nbytes(pc_output_chunk) == ggml_nbytes(node_dst));
+                if (!staged_multi_chunk_handoff) {
+                    pc_output_chunk = get_node_aux(node_dst);
+                    pc_output_chunk->view_src = pc_l_out;
+                    pc_output_chunk->view_offs = chunk_offset;
+                    ggml_backend_view_init(pc_output_chunk);
+                    GGML_ASSERT(
+                        ggml_nbytes(pc_output_chunk) ==
+                        ggml_nbytes(node_dst));
+                } else {
+                    GGML_ASSERT(handoff_host_stage != nullptr);
+                    GGML_ASSERT(
+                        chunk_offset + ggml_nbytes(node_dst) <=
+                        handoff_host_stage->size());
+                }
             }
 
             const int64_t return_enqueue_us = ggml_time_us();
@@ -10584,7 +10638,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
                     snapshot_seq, return_enqueue_us, handoff_to_phone, prefill_down_layer_0,
                     prefill_down_chunk_0, layer_handoff, pc_l_out, phone_l_out,
-                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
+                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane,
+                    staged_multi_chunk_handoff, handoff_host_stage,
+                    handoff_chunk_offset](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
                         reduce_worker,
                         task_id,
@@ -10733,30 +10789,68 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         return finish_return(layer_status);
                     }
                     ggml_backend_synchronize(bcj_dst.backend);
-                    ggml_backend_tensor_copy_async(
-                        bcj_dst.backend, bcj_dst.backend, node_dst, pc_output_chunk);
 
-                    // pc_output_chunk is allocator-visible storage used to
-                    // assemble the full layer output. Every chunk must finish
-                    // materializing before this worker publishes completion;
-                    // otherwise node_dst may be reused by the next chunk while
-                    // the async local copy still consumes it. The old code only
-                    // synchronized the final chunk, which made a single-chunk
-                    // prefill safe but left multi-chunk prefill racy.
-                    const int64_t materialize_sync_start_us = ggml_time_us();
-                    ggml_backend_synchronize(bcj_dst.backend);
-                    const int64_t materialize_sync_us =
-                        ggml_time_us() - materialize_sync_start_us;
-                    if (pipeline_debug) {
-                        GGML_LOG_INFO(
-                            "[PREFILL_CHUNK_MATERIALIZED] "
-                            "layer=%d chunk=%d lane=%zu wait_ms=%.3f last=%d\n",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0,
-                            return_lane,
-                            materialize_sync_us / 1000.0,
-                            layer_handoff ? 1 : 0);
+                    if (staged_multi_chunk_handoff) {
+                        GGML_ASSERT(handoff_host_stage != nullptr);
+                        const size_t chunk_bytes = ggml_nbytes(node_dst);
+                        GGML_ASSERT(
+                            handoff_chunk_offset + chunk_bytes <=
+                            handoff_host_stage->size());
+
+                        ggml_backend_tensor_get(
+                            node_dst,
+                            handoff_host_stage->data() + handoff_chunk_offset,
+                            0,
+                            chunk_bytes);
+
+                        if (pipeline_debug) {
+                            GGML_LOG_INFO(
+                                "[PREFILL_HANDOFF_HOST_STAGE] "
+                                "layer=%d chunk=%d offset=%zu bytes=%zu "
+                                "last=%d\n",
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                handoff_chunk_offset,
+                                chunk_bytes,
+                                layer_handoff ? 1 : 0);
+                        }
+
+                        if (!layer_handoff) {
+                            return finish_return(status);
+                        }
+
+                        GGML_ASSERT(phone_l_out != nullptr);
+                        GGML_ASSERT(
+                            handoff_host_stage->size() ==
+                            ggml_nbytes(phone_l_out));
+
+                        const int64_t handoff_start_us = ggml_time_us();
+                        ggml_backend_tensor_set(
+                            phone_l_out,
+                            handoff_host_stage->data(),
+                            0,
+                            handoff_host_stage->size());
+                        const int64_t handoff_us =
+                            ggml_time_us() - handoff_start_us;
+                        record_copy_wait(handoff_us);
+                        record_direct_copy();
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[META_LAYER_HANDOFF] layer=%d 0->1 "
+                                "tensor=%s bytes=%zu mode=HOST_STAGE\n",
+                                prefill_down_layer_0,
+                                phone_l_out->name,
+                                ggml_nbytes(phone_l_out));
+                        }
+                        return finish_return(status);
                     }
+
+                    GGML_ASSERT(pc_output_chunk != nullptr);
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend, bcj_dst.backend,
+                        node_dst, pc_output_chunk);
+                    ggml_backend_synchronize(bcj_dst.backend);
 
                     if (!layer_handoff) {
                         return finish_return(status);
