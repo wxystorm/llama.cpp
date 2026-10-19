@@ -406,11 +406,27 @@ struct inference_transport::impl {
         size_t queue_size = 0;
         size_t inflight = 0;
 
+        bool cancelled = false;
         {
             std::lock_guard<std::mutex> lock(tx_mu);
-            tx_pending.push_back(tx.slot);
-            queue_size = tx_pending.size();
-            inflight = tx_pending.size() + tx_in_progress;
+            if (stopping.load(std::memory_order_acquire)) {
+                slot.payload_bytes = 0;
+                tx_free.push_back(tx.slot);
+                cancelled = true;
+            } else {
+                tx_pending.push_back(tx.slot);
+                queue_size = tx_pending.size();
+                inflight = tx_pending.size() + tx_in_progress;
+            }
+        }
+
+        tx.slot = UINT32_MAX;
+        tx.data = nullptr;
+        tx.capacity = 0;
+
+        if (cancelled) {
+            tx_free_cv.notify_one();
+            return false;
         }
 
         {
@@ -418,10 +434,6 @@ struct inference_transport::impl {
             stats.tx_queue_max = std::max(stats.tx_queue_max, queue_size);
             stats.tx_inflight_max = std::max(stats.tx_inflight_max, inflight);
         }
-
-        tx.slot = UINT32_MAX;
-        tx.data = nullptr;
-        tx.capacity = 0;
 
         tx_pending_cv.notify_one();
         return true;
