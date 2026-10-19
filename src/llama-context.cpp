@@ -6727,6 +6727,272 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     0,
                     logits_copy_bytes);
 
+                // Opt-in decode zero-logits triage.  The observed failure mode
+                // is distinctive: prompt output is usable, then subsequent
+                // decode rows become exactly zero.  Compare the device-side
+                // logits with the host row first; if the source itself is zero,
+                // walk a few semantic boundaries backward through the graph.
+                const bool zero_logits_diag =
+                    ubatch.n_tokens == 1 &&
+                    std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+                    std::atoi(std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0;
+                if (zero_logits_diag) {
+                    const int64_t diag_sync_begin_us = ggml_time_us();
+
+                    // Diagnostic only: force all scheduled work and the async
+                    // logits copy to completion.  If merely enabling this
+                    // diagnostic makes generation correct, the bug is an
+                    // ordering/completion race rather than numerical compute.
+                    ggml_backend_sched_synchronize(sched_use);
+                    ggml_backend_synchronize(backend_res);
+
+                    const int64_t diag_sync_us =
+                        ggml_time_us() - diag_sync_begin_us;
+                    const size_t diag_count = (size_t) n_vocab;
+                    const float * host_row = logits_out;
+
+                    auto collect_f32_stats = [](
+                            const float * data,
+                            size_t count,
+                            size_t & zero,
+                            size_t & nonfinite,
+                            float & min_value,
+                            float & max_value,
+                            float & max_abs) {
+                        zero = 0;
+                        nonfinite = 0;
+                        min_value = std::numeric_limits<float>::infinity();
+                        max_value = -std::numeric_limits<float>::infinity();
+                        max_abs = 0.0f;
+                        for (size_t k = 0; k < count; ++k) {
+                            const float value = data[k];
+                            zero += value == 0.0f;
+                            if (!std::isfinite(value)) {
+                                ++nonfinite;
+                                continue;
+                            }
+                            min_value = std::min(min_value, value);
+                            max_value = std::max(max_value, value);
+                            max_abs = std::max(max_abs, std::fabs(value));
+                        }
+                        if (!std::isfinite(min_value)) {
+                            min_value = 0.0f;
+                        }
+                        if (!std::isfinite(max_value)) {
+                            max_value = 0.0f;
+                        }
+                    };
+
+                    std::vector<float> source_logits(diag_count);
+                    ggml_backend_tensor_get(
+                        t_logits,
+                        source_logits.data(),
+                        0,
+                        diag_count * sizeof(float));
+
+                    size_t host_zero = 0;
+                    size_t host_nonfinite = 0;
+                    float host_min = 0.0f;
+                    float host_max = 0.0f;
+                    float host_max_abs = 0.0f;
+                    collect_f32_stats(
+                        host_row,
+                        diag_count,
+                        host_zero,
+                        host_nonfinite,
+                        host_min,
+                        host_max,
+                        host_max_abs);
+
+                    size_t source_zero = 0;
+                    size_t source_nonfinite = 0;
+                    float source_min = 0.0f;
+                    float source_max = 0.0f;
+                    float source_max_abs = 0.0f;
+                    collect_f32_stats(
+                        source_logits.data(),
+                        diag_count,
+                        source_zero,
+                        source_nonfinite,
+                        source_min,
+                        source_max,
+                        source_max_abs);
+
+                    size_t mismatch = 0;
+                    float max_abs_diff = 0.0f;
+                    for (size_t k = 0; k < diag_count; ++k) {
+                        const float a = host_row[k];
+                        const float b = source_logits[k];
+                        if (!std::isfinite(a) || !std::isfinite(b)) {
+                            mismatch += a != b;
+                            continue;
+                        }
+                        const float diff = std::fabs(a - b);
+                        max_abs_diff = std::max(max_abs_diff, diff);
+                        mismatch += diff != 0.0f;
+                    }
+
+                    LLAMA_LOG_ERROR(
+                        "[ZERO_LOGITS_DIAG] stage=LOGITS pos=%" PRId64
+                        " backend=%s sync_ms=%.3f count=%zu "
+                        "host_zero=%zu source_zero=%zu "
+                        "host_nonfinite=%zu source_nonfinite=%zu "
+                        "host_min=%.9g host_max=%.9g "
+                        "source_min=%.9g source_max=%.9g "
+                        "mismatch=%zu max_abs_diff=%.9g\n",
+                        ubatch.pos != nullptr ? ubatch.pos[0] : -1,
+                        ggml_backend_name(backend_res),
+                        diag_sync_us / 1000.0,
+                        diag_count,
+                        host_zero,
+                        source_zero,
+                        host_nonfinite,
+                        source_nonfinite,
+                        host_min,
+                        host_max,
+                        source_min,
+                        source_max,
+                        mismatch,
+                        max_abs_diff);
+
+                    const int last_layer =
+                        (int) model.hparams.n_layer() - 1;
+                    int last_tensor_layer = -1;
+                    for (int il = 0; il <= last_layer; ++il) {
+                        const llama_hybrid_layer_mode mode =
+                            model.hybrid_layer_mode(il);
+                        if (mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+                            mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+                            last_tensor_layer = il;
+                        }
+                    }
+
+                    std::vector<std::string> diag_names {
+                        "result_norm",
+                    };
+                    const auto add_layer_diag_names =
+                        [&](int il) {
+                            if (il < 0 || il > last_layer) {
+                                return;
+                            }
+                            for (const char * base : {
+                                     "attn_out",
+                                     "ffn_inp",
+                                     "l_out" }) {
+                                const std::string name =
+                                    std::string(base) + "-" +
+                                    std::to_string(il);
+                                if (std::find(
+                                        diag_names.begin(),
+                                        diag_names.end(),
+                                        name) == diag_names.end()) {
+                                    diag_names.push_back(name);
+                                }
+                            }
+                        };
+
+                    add_layer_diag_names(last_tensor_layer);
+                    add_layer_diag_names(last_tensor_layer + 1);
+                    add_layer_diag_names(last_layer);
+
+                    ggml_cgraph * diag_gf = res->get_gf();
+                    for (const std::string & wanted : diag_names) {
+                        ggml_tensor * tensor = nullptr;
+                        if (diag_gf != nullptr) {
+                            for (int ni = 0;
+                                 ni < ggml_graph_n_nodes(diag_gf);
+                                 ++ni) {
+                                ggml_tensor * candidate =
+                                    ggml_graph_node(diag_gf, ni);
+                                if (candidate != nullptr &&
+                                    wanted == candidate->name) {
+                                    tensor = candidate;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (tensor == nullptr) {
+                            LLAMA_LOG_ERROR(
+                                "[ZERO_LOGITS_DIAG] stage=%s status=MISSING\n",
+                                wanted.c_str());
+                            continue;
+                        }
+
+                        ggml_backend_t tensor_backend =
+                            ggml_backend_sched_get_tensor_backend(
+                                sched_use, tensor);
+                        if (tensor_backend == nullptr) {
+                            LLAMA_LOG_ERROR(
+                                "[ZERO_LOGITS_DIAG] stage=%s "
+                                "status=NO_BACKEND op=%s\n",
+                                wanted.c_str(),
+                                ggml_op_name(tensor->op));
+                            continue;
+                        }
+
+                        if (tensor->type != GGML_TYPE_F32 ||
+                            !ggml_is_contiguous(tensor)) {
+                            LLAMA_LOG_ERROR(
+                                "[ZERO_LOGITS_DIAG] stage=%s "
+                                "status=SKIP type=%s contiguous=%d "
+                                "ne=[%" PRId64 ",%" PRId64
+                                ",%" PRId64 ",%" PRId64 "] backend=%s\n",
+                                wanted.c_str(),
+                                ggml_type_name(tensor->type),
+                                ggml_is_contiguous(tensor) ? 1 : 0,
+                                tensor->ne[0], tensor->ne[1],
+                                tensor->ne[2], tensor->ne[3],
+                                ggml_backend_name(tensor_backend));
+                            continue;
+                        }
+
+                        ggml_backend_synchronize(tensor_backend);
+                        const size_t n =
+                            std::min<size_t>(
+                                (size_t) ggml_nelements(tensor),
+                                4096);
+                        std::vector<float> values(n);
+                        ggml_backend_tensor_get(
+                            tensor,
+                            values.data(),
+                            0,
+                            n * sizeof(float));
+
+                        size_t zero = 0;
+                        size_t nonfinite = 0;
+                        float min_value = 0.0f;
+                        float max_value = 0.0f;
+                        float max_abs = 0.0f;
+                        collect_f32_stats(
+                            values.data(),
+                            n,
+                            zero,
+                            nonfinite,
+                            min_value,
+                            max_value,
+                            max_abs);
+
+                        LLAMA_LOG_ERROR(
+                            "[ZERO_LOGITS_DIAG] stage=%s status=OK "
+                            "backend=%s op=%s sample=%zu zero=%zu "
+                            "nonfinite=%zu min=%.9g max=%.9g max_abs=%.9g "
+                            "ne=[%" PRId64 ",%" PRId64
+                            ",%" PRId64 ",%" PRId64 "]\n",
+                            wanted.c_str(),
+                            ggml_backend_name(tensor_backend),
+                            ggml_op_name(tensor->op),
+                            n,
+                            zero,
+                            nonfinite,
+                            min_value,
+                            max_value,
+                            max_abs,
+                            tensor->ne[0], tensor->ne[1],
+                            tensor->ne[2], tensor->ne[3]);
+                    }
+                }
+
                 // The server samples the first generated token from the raw
                 // logits produced by the prompt graph.  Keep an explicit
                 // backend fence on this prefill output copy while diagnosing
