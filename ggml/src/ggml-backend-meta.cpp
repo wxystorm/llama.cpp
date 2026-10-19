@@ -15767,6 +15767,74 @@ auto prefill_norm_sg_has_prework =
     compute_complete = false;
 }
 
+        if (std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+                n_backends == 2) {
+            const int boundary_layer = subgraph_layer(communication_sg);
+            if (boundary_layer == 46 || boundary_layer == 47) {
+                for (size_t j = 0; j < n_backends; ++j) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * graph =
+                        bcj.cgraphs[communication_sg].cgraph_main;
+                    if (graph == nullptr || graph->n_nodes <= 0) {
+                        continue;
+                    }
+
+                    ggml_tensor * last =
+                        graph->nodes[graph->n_nodes - 1];
+                    ggml_backend_synchronize(bcj.backend);
+
+                    size_t zero = 0;
+                    size_t nonfinite = 0;
+                    double l2 = 0.0;
+                    double max_abs = 0.0;
+                    const size_t n = ggml_nelements(last);
+
+                    if (last->type == GGML_TYPE_F32) {
+                        std::vector<float> values(n);
+                        ggml_backend_tensor_get(
+                            last,
+                            values.data(),
+                            0,
+                            n * sizeof(float));
+                        for (float x : values) {
+                            zero += x == 0.0f;
+                            if (!std::isfinite(x)) {
+                                ++nonfinite;
+                                continue;
+                            }
+                            const double xd = x;
+                            l2 += xd * xd;
+                            max_abs =
+                                std::max(max_abs, std::abs(xd));
+                        }
+                    }
+
+                    GGML_LOG_ERROR(
+                        "[LAYER_BOUNDARY] L=%d sg=%zu j=%zu b=%s "
+                        "first=%s last=%s op=%s comp=%d "
+                        "src0=%s src1=%s n=%zu z=%zu nf=%zu "
+                        "l2=%.6g max=%.6g\n",
+                        boundary_layer,
+                        communication_sg,
+                        j,
+                        ggml_backend_name(bcj.backend),
+                        graph->nodes[0]->name,
+                        last->name,
+                        ggml_op_name(last->op),
+                        !!(last->flags & GGML_TENSOR_FLAG_COMPUTE),
+                        last->src[0] != nullptr ?
+                            last->src[0]->name : "-",
+                        last->src[1] != nullptr ?
+                            last->src[1]->name : "-",
+                        n,
+                        zero,
+                        nonfinite,
+                        std::sqrt(l2),
+                        max_abs);
+                }
+            }
+        }
+
         if (pipeline_debug && communication_sg == 0) {
             auto & bcj = backend_ctx->backend_configs[0];
             ggml_cgraph * graph = bcj.cgraphs[communication_sg].cgraph_main;
