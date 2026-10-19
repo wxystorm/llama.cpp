@@ -814,6 +814,12 @@ static bool g_rpc_transport_wsa_started = false;
 #endif
 
 bool rpc_transport_init() {
+    // transport.cpp profiles send/recv with ggml_time_us().
+    // On Windows ggml_time_us() divides by the QueryPerformanceFrequency
+    // value initialized by ggml_time_init(), so standalone transport users
+    // must initialize the timer before RX/TX worker threads can call it.
+    ggml_time_init();
+
 #ifdef _WIN32
     std::lock_guard<std::mutex> lock(g_rpc_transport_mu);
     if (g_rpc_transport_wsa_started) {
