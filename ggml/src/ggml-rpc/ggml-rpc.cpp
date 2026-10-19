@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "ggml-quants.h"
 #include "transport.h"
+#include "inference-transport.h"
 
 #include <array>
 #include <atomic>
@@ -269,6 +270,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
     RPC_CMD_RETURN_BULK_ACQUIRE,
+    RPC_CMD_INFERENCE_DATA_PLANE_OPEN,
     RPC_CMD_COUNT,
 };
 
@@ -291,6 +293,7 @@ static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY 
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INFERENCE_DATA_PLANE_OPEN == 35, "RPC_CMD_INFERENCE_DATA_PLANE_OPEN must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -305,6 +308,25 @@ struct rpc_msg_hello_rsp {
     uint8_t padding;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
+
+struct rpc_msg_inference_data_plane_open_req {
+    uint32_t tx_slots;
+    uint32_t rx_slots;
+    uint64_t max_payload_bytes;
+};
+
+struct rpc_msg_inference_data_plane_open_rsp {
+    uint32_t result;
+    uint32_t tx_slots;
+    uint32_t rx_slots;
+    uint32_t reserved;
+    uint64_t max_payload_bytes;
+};
+
+static_assert(sizeof(rpc_msg_inference_data_plane_open_req) == 16,
+              "inference data-plane open request wire size changed");
+static_assert(sizeof(rpc_msg_inference_data_plane_open_rsp) == 24,
+              "inference data-plane open response wire size changed");
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
