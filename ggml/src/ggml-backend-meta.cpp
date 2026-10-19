@@ -13413,6 +13413,9 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
+        ggml_tensor * final_norm_diag_pc = nullptr;
+        ggml_tensor * final_norm_diag_phone = nullptr;
+
         int64_t subgraph_compute_wall_us = 0;
         if (!compute_complete) {
     if (n_backends == 2) {
@@ -13643,8 +13646,6 @@ auto prefill_norm_sg_has_prework =
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
-    ggml_tensor * final_norm_diag_pc = nullptr;
-    ggml_tensor * final_norm_diag_phone = nullptr;
     if (std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
             is_decode_pc_only_norm_sg(i) && n_backends == 2) {
         auto * g0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
