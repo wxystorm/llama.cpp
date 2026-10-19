@@ -172,7 +172,8 @@ static bool new_send_ack(inference_transport & transport, uint64_t seq) {
 
 static bool run_new(
         const bench_options & opt,
-        inference_transport_stats & out_stats) {
+        inference_transport_stats & out_stats,
+        double & wall_ms) {
     inference_transport_config config;
     config.tx_slots = opt.slots;
     config.rx_slots = opt.slots;
@@ -194,6 +195,8 @@ static bool run_new(
         std::fprintf(stderr, "failed to create new inference transport\n");
         return false;
     }
+
+    const auto begin = bench_clock::now();
 
     const bool need_send = opt.mode == "send" || opt.mode == "bidir";
     const bool need_recv = opt.mode == "recv" || opt.mode == "bidir";
@@ -269,8 +272,10 @@ static bool run_new(
         transport->healthy();
 
     out_stats = transport->stats();
-    transport->stop();
+    const auto end = bench_clock::now();
+    wall_ms = std::chrono::duration<double, std::milli>(end - begin).count();
 
+    transport->stop();
     return success;
 }
 
@@ -341,7 +346,8 @@ static bool legacy_send_one(
 
 static bool run_legacy(
         const bench_options & opt,
-        inference_transport_stats & stats) {
+        inference_transport_stats & stats,
+        double & wall_ms) {
     if (!rpc_transport_init()) {
         return false;
     }
@@ -370,6 +376,7 @@ static bool run_legacy(
     }
 
     std::vector<uint8_t> payload(opt.bytes);
+    const auto begin = bench_clock::now();
 
     if (opt.mode == "send") {
         for (size_t i = 0; i < opt.frames; ++i) {
@@ -377,6 +384,8 @@ static bool run_legacy(
                 return false;
             }
         }
+        const auto end = bench_clock::now();
+        wall_ms = std::chrono::duration<double, std::milli>(end - begin).count();
         return true;
     }
 
@@ -386,6 +395,8 @@ static bool run_legacy(
                 return false;
             }
         }
+        const auto end = bench_clock::now();
+        wall_ms = std::chrono::duration<double, std::milli>(end - begin).count();
         return true;
     }
 
@@ -403,6 +414,8 @@ static bool run_legacy(
         }
     }
 
+    const auto end = bench_clock::now();
+    wall_ms = std::chrono::duration<double, std::milli>(end - begin).count();
     return true;
 }
 
@@ -471,17 +484,12 @@ int main(int argc, char ** argv) {
     }
 
     inference_transport_stats stats = {};
-
-    const auto begin = bench_clock::now();
+    double wall_ms = 0.0;
 
     const bool success =
         opt.engine == "new"
-            ? run_new(opt, stats)
-            : run_legacy(opt, stats);
-
-    const auto end = bench_clock::now();
-    const double wall_ms =
-        std::chrono::duration<double, std::milli>(end - begin).count();
+            ? run_new(opt, stats, wall_ms)
+            : run_legacy(opt, stats, wall_ms);
 
     print_stats(opt, stats, wall_ms, success);
     return success ? 0 : 1;
