@@ -209,12 +209,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     // PC local Ring is intentionally independent from the old Tensor/Phone
     // wavefront. A complete PC_ONLY stage is split into token chunks, and each
-    // (layer, chunk) exposes exactly three task boundaries:
-    //
-    //   CUDA Attention -> CPU FFN -> CUDA Reduce
-    //
-    // The runtime owns the FIFO order. The graph only describes the ordinary
-    // Transformer math and stable task outputs.
+    // (layer, chunk) exposes stable ATTN / FFN / REDUCE boundaries.  Backend
+    // ownership is supplied by the Inner Planner at runtime; the graph itself
+    // contains no CPU/GPU scheduling policy.
     const char * pc_local_ring_env =
         std::getenv("LLAMA_HYBRID_PC_LOCAL_RING");
     const bool pc_local_ring_requested =
@@ -231,15 +228,22 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         loras->empty();
 
     if (pc_local_ring_stage) {
-        for (int il = layer_begin; il < layer_end; ++il) {
+        llama_hybrid_plan runtime_plan;
+        pc_local_ring_stage =
+            llama_hybrid_runtime_plan_get(runtime_plan) &&
+            runtime_plan.pc_local.valid &&
+            layer_begin == runtime_plan.pc_local.layer_begin &&
+            layer_end == runtime_plan.pc_local.layer_end &&
+            (int) runtime_plan.pc_local.layer_modes.size() ==
+                layer_end - layer_begin;
+
+        for (int il = layer_begin;
+             pc_local_ring_stage && il < layer_end;
+             ++il) {
             if (model.hybrid_layer_mode(il) !=
                     llama_hybrid_layer_mode::PC_ONLY ||
-                il >= (int) model.pc_layer_backends.size() ||
-                model.pc_layer_backends[il] !=
-                    llama_pc_layer_backend::CPU ||
                 cvec->tensor_for(il) != nullptr) {
                 pc_local_ring_stage = false;
-                break;
             }
         }
     }

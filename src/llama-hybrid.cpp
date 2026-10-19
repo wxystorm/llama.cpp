@@ -127,12 +127,22 @@ bool llama_hybrid_runtime_plan_set(const llama_hybrid_plan & plan) {
         return false;
     }
 
+    llama_hybrid_plan runtime_plan = plan;
+    const char * pc_ring_env =
+        std::getenv("LLAMA_HYBRID_PC_LOCAL_RING");
+    if (runtime_plan.pc_local.valid &&
+        pc_ring_env != nullptr &&
+        std::atoi(pc_ring_env) != 0) {
+        runtime_plan.pc_local.applied = true;
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
-        g_llama_hybrid_runtime_plan = plan;
+        g_llama_hybrid_runtime_plan = runtime_plan;
         g_llama_hybrid_runtime_wave_calibration.reset();
         llama_hybrid_runtime_set_dual_return(
-            plan.tensor_layers > 0 && !plan.tensor_phone_primary);
+            runtime_plan.tensor_layers > 0 &&
+            !runtime_plan.tensor_phone_primary);
     }
 
     LLAMA_LOG_INFO(
