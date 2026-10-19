@@ -265,6 +265,9 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+llama_build(test-phone-layer-speed.cpp)
+target_include_directories(test-phone-layer-speed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
