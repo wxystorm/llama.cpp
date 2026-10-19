@@ -418,15 +418,27 @@ struct llama_hybrid_decode_plan {
     size_t gpu_memory   = 0;
 };
 
-enum class llama_pc_local_split_orientation {
+// A local Inner Planner talks about abstract compute slots rather than
+// concrete device classes.  The PC adapter currently maps BACKEND_0 -> CPU
+// and BACKEND_1 -> CUDA, while another local executor may map the same slots
+// to e.g. GPU/NPU.  Tasks therefore carry an explicit backend slot instead of
+// encoding a device in the task kind.
+enum class llama_hybrid_local_backend_slot : uint8_t {
     NONE,
-    CPU_ATTN_GPU_FFN,
-    GPU_ATTN_CPU_FFN,
+    BACKEND_0,
+    BACKEND_1,
+};
+
+struct llama_hybrid_local_stage_backends {
+    llama_hybrid_local_backend_slot attn   = llama_hybrid_local_backend_slot::NONE;
+    llama_hybrid_local_backend_slot ffn    = llama_hybrid_local_backend_slot::NONE;
+    llama_hybrid_local_backend_slot reduce = llama_hybrid_local_backend_slot::NONE;
+    llama_hybrid_local_backend_slot full   = llama_hybrid_local_backend_slot::NONE;
 };
 
 enum class llama_pc_local_layer_mode : uint8_t {
     SPLIT,
-    GPU_FULL,
+    FULL,
 };
 
 // Inner plan for a PC_ONLY region.  This is deliberately a backend-mapping
@@ -434,18 +446,17 @@ enum class llama_pc_local_layer_mode : uint8_t {
 // complete -> push_back(next ready task) -> FIFO.
 struct llama_hybrid_pc_local_plan {
     bool valid   = false;
-    bool applied = false; // phase 1 is prediction/logging only
+    bool applied = false; // enabled by the PC-local Ring runtime
 
     int layer_begin  = 0;
     int layer_end    = 0;
     int chunk_tokens = 128;
 
-    llama_pc_local_split_orientation split =
-        llama_pc_local_split_orientation::NONE;
+    llama_hybrid_local_stage_backends stage_backends;
     std::vector<llama_pc_local_layer_mode> layer_modes;
 
-    int split_layers    = 0;
-    int gpu_full_layers = 0;
+    int split_layers = 0;
+    int full_layers  = 0;
 
     size_t gpu_weight_budget_bytes    = 0;
     size_t initial_resident_bytes     = 0;

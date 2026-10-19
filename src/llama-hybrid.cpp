@@ -2016,12 +2016,10 @@ static bool llama_hybrid_layer_block_total_cost(
 }
 
 
-enum class llama_pc_local_sim_task_kind {
-    CPU_ATTN,
-    CPU_FFN,
-    GPU_ATTN,
-    GPU_FFN,
-    GPU_FULL,
+enum class llama_pc_local_sim_task_stage {
+    ATTN,
+    FFN,
+    FULL,
 };
 
 struct llama_pc_local_chunk_cost {
@@ -2033,16 +2031,18 @@ struct llama_pc_local_chunk_cost {
 };
 
 struct llama_pc_local_sim_task {
-    llama_pc_local_sim_task_kind kind =
-        llama_pc_local_sim_task_kind::CPU_ATTN;
+    llama_pc_local_sim_task_stage stage =
+        llama_pc_local_sim_task_stage::ATTN;
+    llama_hybrid_local_backend_slot backend =
+        llama_hybrid_local_backend_slot::BACKEND_0;
     int    layer      = 0;
     int    chunk      = 0;
     double enqueue_ms = 0.0;
 };
 
 enum class llama_pc_local_sim_event_kind {
-    CPU_DONE,
-    GPU_DONE,
+    BACKEND_0_DONE,
+    BACKEND_1_DONE,
     XFER_DONE,
 };
 
@@ -2050,7 +2050,7 @@ struct llama_pc_local_sim_event {
     double end_ms = 0.0;
     uint64_t seq  = 0;
     llama_pc_local_sim_event_kind kind =
-        llama_pc_local_sim_event_kind::CPU_DONE;
+        llama_pc_local_sim_event_kind::BACKEND_0_DONE;
     llama_pc_local_sim_task task;
     int layer = -1;
 };
@@ -2079,17 +2079,30 @@ struct llama_pc_local_sim_result {
     size_t initial_resident_bytes = 0;
 };
 
-static const char * llama_pc_local_split_name(
-        llama_pc_local_split_orientation split) {
-    switch (split) {
-        case llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN:
-            return "CPU_ATTN_GPU_FFN";
-        case llama_pc_local_split_orientation::GPU_ATTN_CPU_FFN:
-            return "GPU_ATTN_CPU_FFN";
-        case llama_pc_local_split_orientation::NONE:
+static const char * llama_hybrid_local_backend_slot_name(
+        llama_hybrid_local_backend_slot backend) {
+    switch (backend) {
+        case llama_hybrid_local_backend_slot::BACKEND_0:
+            return "B0";
+        case llama_hybrid_local_backend_slot::BACKEND_1:
+            return "B1";
+        case llama_hybrid_local_backend_slot::NONE:
             break;
     }
     return "NONE";
+}
+
+static std::string llama_pc_local_mapping_string(
+        const llama_hybrid_local_stage_backends & mapping) {
+    std::string out = "ATTN=";
+    out += llama_hybrid_local_backend_slot_name(mapping.attn);
+    out += ",FFN=";
+    out += llama_hybrid_local_backend_slot_name(mapping.ffn);
+    out += ",REDUCE=";
+    out += llama_hybrid_local_backend_slot_name(mapping.reduce);
+    out += ",FULL=";
+    out += llama_hybrid_local_backend_slot_name(mapping.full);
+    return out;
 }
 
 static std::string llama_pc_local_pattern_string(
@@ -2098,7 +2111,7 @@ static std::string llama_pc_local_pattern_string(
     out.reserve(pattern.size());
     for (const auto mode : pattern) {
         out.push_back(
-            mode == llama_pc_local_layer_mode::GPU_FULL ? 'G' : 'S');
+            mode == llama_pc_local_layer_mode::FULL ? 'F' : 'S');
     }
     return out;
 }
@@ -2106,27 +2119,27 @@ static std::string llama_pc_local_pattern_string(
 static std::vector<llama_pc_local_layer_mode>
 llama_pc_local_even_pattern(
         int n_layers,
-        int gpu_full_layers,
+        int full_layers,
         int phase) {
     std::vector<llama_pc_local_layer_mode> result(
         (size_t) n_layers,
         llama_pc_local_layer_mode::SPLIT);
-    if (n_layers <= 0 || gpu_full_layers <= 0) {
+    if (n_layers <= 0 || full_layers <= 0) {
         return result;
     }
-    if (gpu_full_layers >= n_layers) {
+    if (full_layers >= n_layers) {
         std::fill(
             result.begin(), result.end(),
-            llama_pc_local_layer_mode::GPU_FULL);
+            llama_pc_local_layer_mode::FULL);
         return result;
     }
 
     int acc = std::clamp(phase, 0, n_layers - 1);
     for (int il = 0; il < n_layers; ++il) {
-        acc += gpu_full_layers;
+        acc += full_layers;
         if (acc >= n_layers) {
             result[(size_t) il] =
-                llama_pc_local_layer_mode::GPU_FULL;
+                llama_pc_local_layer_mode::FULL;
             acc -= n_layers;
         }
     }
@@ -2176,9 +2189,6 @@ static bool llama_pc_local_build_chunk_costs(
             return false;
         }
 
-        // Full-layer probes already contain FFN norm/router/expert/combine
-        // work.  Subtract an Attention probe at KV=query to obtain the FFN
-        // stage anchor without incorrectly charging long-KV Attention to FFN.
         cost.cpu_ffn = std::max(0.0, cpu_full - cpu_attn_base);
         cost.gpu_ffn = std::max(0.0, gpu_full - gpu_attn_base);
         if (cost.cpu_ffn <= 0.0 || cost.gpu_ffn <= 0.0) {
@@ -2193,7 +2203,7 @@ static bool llama_pc_local_build_chunk_costs(
 static size_t llama_pc_local_layer_gpu_weight_bytes(
         const llama_hybrid_profile & profile,
         int global_layer,
-        llama_pc_local_split_orientation split,
+        const llama_hybrid_local_stage_backends & mapping,
         llama_pc_local_layer_mode mode) {
     if (global_layer < 0 ||
         global_layer >= (int) profile.layer_weight_bytes.size()) {
@@ -2201,32 +2211,44 @@ static size_t llama_pc_local_layer_gpu_weight_bytes(
     }
 
     const size_t i = (size_t) global_layer;
-    if (mode == llama_pc_local_layer_mode::GPU_FULL) {
+    if (mode == llama_pc_local_layer_mode::FULL) {
+        return mapping.full ==
+                    llama_hybrid_local_backend_slot::BACKEND_1 ?
+            profile.layer_weight_bytes[i] : 0;
+    }
+
+    const bool attn_on_gpu =
+        mapping.attn == llama_hybrid_local_backend_slot::BACKEND_1;
+    const bool ffn_on_gpu =
+        mapping.ffn == llama_hybrid_local_backend_slot::BACKEND_1;
+
+    if (attn_on_gpu && ffn_on_gpu) {
         return profile.layer_weight_bytes[i];
     }
 
     const size_t mirrored =
         i < profile.layer_mirrored_bytes.size() ?
             profile.layer_mirrored_bytes[i] : 0;
-    if (split ==
-        llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN) {
+    if (ffn_on_gpu) {
         const size_t ffn =
             i < profile.layer_ffn_split_bytes.size() ?
                 profile.layer_ffn_split_bytes[i] : 0;
         return ffn + mirrored;
     }
-
-    const size_t attn =
-        i < profile.layer_attn_forced_bytes.size() ?
-            profile.layer_attn_forced_bytes[i] : 0;
-    return attn + mirrored;
+    if (attn_on_gpu) {
+        const size_t attn =
+            i < profile.layer_attn_forced_bytes.size() ?
+                profile.layer_attn_forced_bytes[i] : 0;
+        return attn + mirrored;
+    }
+    return 0;
 }
 
 static bool llama_pc_local_simulate(
         const llama_hybrid_profile & profile,
         int layer_begin,
         const std::vector<llama_pc_local_layer_mode> & pattern,
-        llama_pc_local_split_orientation split,
+        const llama_hybrid_local_stage_backends & mapping,
         const std::vector<llama_pc_local_chunk_cost> & chunk_costs,
         size_t gpu_weight_budget_bytes,
         llama_pc_local_sim_result & out) {
@@ -2239,13 +2261,31 @@ static bool llama_pc_local_simulate(
         return false;
     }
 
+    const auto backend_index =
+        [](llama_hybrid_local_backend_slot backend) -> int {
+            if (backend == llama_hybrid_local_backend_slot::BACKEND_0) {
+                return 0;
+            }
+            if (backend == llama_hybrid_local_backend_slot::BACKEND_1) {
+                return 1;
+            }
+            return -1;
+        };
+
+    if (backend_index(mapping.attn) < 0 ||
+        backend_index(mapping.ffn) < 0 ||
+        backend_index(mapping.full) < 0) {
+        return false;
+    }
+
     std::vector<size_t> layer_weight_bytes((size_t) n_layers, 0);
     std::vector<double> layer_load_ms((size_t) n_layers, 0.0);
+    std::vector<int> gpu_consumers_target((size_t) n_layers, 0);
     for (int il = 0; il < n_layers; ++il) {
+        const auto mode = pattern[(size_t) il];
         const size_t bytes =
             llama_pc_local_layer_gpu_weight_bytes(
-                profile, layer_begin + il, split,
-                pattern[(size_t) il]);
+                profile, layer_begin + il, mapping, mode);
         double load_ms = 0.0;
         if (bytes == 0 ||
             !llama_hybrid_transfer_cost(
@@ -2254,9 +2294,26 @@ static bool llama_pc_local_simulate(
         }
         layer_weight_bytes[(size_t) il] = bytes;
         layer_load_ms[(size_t) il] = load_ms;
+
+        int per_chunk = 0;
+        if (mode == llama_pc_local_layer_mode::FULL) {
+            per_chunk =
+                mapping.full ==
+                    llama_hybrid_local_backend_slot::BACKEND_1 ? 1 : 0;
+        } else {
+            per_chunk +=
+                mapping.attn ==
+                    llama_hybrid_local_backend_slot::BACKEND_1 ? 1 : 0;
+            per_chunk +=
+                mapping.ffn ==
+                    llama_hybrid_local_backend_slot::BACKEND_1 ? 1 : 0;
+        }
+        if (per_chunk <= 0) {
+            return false;
+        }
+        gpu_consumers_target[(size_t) il] = per_chunk * n_chunks;
     }
 
-    // Weight states: 0 absent, 1 loading, 2 resident, 3 evicted.
     std::vector<uint8_t> weight_state((size_t) n_layers, 0);
     std::vector<int> gpu_done((size_t) n_layers, 0);
     std::vector<std::deque<llama_pc_local_sim_task>>
@@ -2280,11 +2337,8 @@ static bool llama_pc_local_simulate(
     out.initial_resident_bytes = live_weight_bytes;
     out.peak_weight_bytes = live_weight_bytes;
 
-    std::deque<llama_pc_local_sim_task> cpu_q;
-    std::deque<llama_pc_local_sim_task> gpu_q;
-
-    bool cpu_busy  = false;
-    bool gpu_busy  = false;
+    std::array<std::deque<llama_pc_local_sim_task>, 2> queues;
+    std::array<bool, 2> backend_busy { false, false };
     bool xfer_busy = false;
     int finished_chunks = 0;
 
@@ -2300,38 +2354,35 @@ static bool llama_pc_local_simulate(
         return chunk_costs[(size_t) task.chunk];
     };
 
-    const auto cpu_duration = [&](const llama_pc_local_sim_task & task) {
+    const auto task_duration = [&](const llama_pc_local_sim_task & task) {
         const auto & cost = chunk_cost(task);
-        switch (task.kind) {
-            case llama_pc_local_sim_task_kind::CPU_ATTN:
-                return cost.cpu_attn;
-            case llama_pc_local_sim_task_kind::CPU_FFN:
-                return cost.cpu_ffn;
-            default:
-                break;
-        }
-        return 0.0;
-    };
-
-    const auto gpu_duration = [&](const llama_pc_local_sim_task & task) {
-        const auto & cost = chunk_cost(task);
-        switch (task.kind) {
-            case llama_pc_local_sim_task_kind::GPU_ATTN:
-                return cost.gpu_attn;
-            case llama_pc_local_sim_task_kind::GPU_FFN:
-                return cost.gpu_ffn;
-            case llama_pc_local_sim_task_kind::GPU_FULL:
-                return cost.gpu_attn + cost.gpu_ffn;
-            default:
-                break;
+        const int bi = backend_index(task.backend);
+        if (bi == 0) {
+            switch (task.stage) {
+                case llama_pc_local_sim_task_stage::ATTN:
+                    return cost.cpu_attn;
+                case llama_pc_local_sim_task_stage::FFN:
+                    return cost.cpu_ffn;
+                case llama_pc_local_sim_task_stage::FULL:
+                    return cost.cpu_attn + cost.cpu_ffn;
+            }
+        } else if (bi == 1) {
+            switch (task.stage) {
+                case llama_pc_local_sim_task_stage::ATTN:
+                    return cost.gpu_attn;
+                case llama_pc_local_sim_task_stage::FFN:
+                    return cost.gpu_ffn;
+                case llama_pc_local_sim_task_stage::FULL:
+                    return cost.gpu_attn + cost.gpu_ffn;
+            }
         }
         return 0.0;
     };
 
     auto push_event = [&](double end_ms,
-                                llama_pc_local_sim_event_kind kind,
-                                const llama_pc_local_sim_task & task,
-                                int layer) mutable {
+                          llama_pc_local_sim_event_kind kind,
+                          const llama_pc_local_sim_task & task,
+                          int layer) mutable {
         llama_pc_local_sim_event event;
         event.end_ms = end_ms;
         event.seq = ++event_seq;
@@ -2341,30 +2392,34 @@ static bool llama_pc_local_simulate(
         events.push(event);
     };
 
-    const auto enqueue_cpu = [&](const llama_pc_local_sim_task & task) {
-        cpu_q.push_back(task);
-        out.max_cpu_queue =
-            std::max(out.max_cpu_queue, (int) cpu_q.size());
-    };
-
-    const auto enqueue_gpu = [&](const llama_pc_local_sim_task & task) {
-        if (weight_state[(size_t) task.layer] == 2) {
-            gpu_q.push_back(task);
-            out.max_gpu_queue =
-                std::max(out.max_gpu_queue, (int) gpu_q.size());
-        } else {
+    const auto enqueue_task = [&](const llama_pc_local_sim_task & task) {
+        const int bi = backend_index(task.backend);
+        if (bi < 0) {
+            return;
+        }
+        if (bi == 1 && weight_state[(size_t) task.layer] != 2) {
             gpu_pending[(size_t) task.layer].push_back(task);
+            return;
+        }
+
+        queues[(size_t) bi].push_back(task);
+        if (bi == 0) {
+            out.max_cpu_queue =
+                std::max(out.max_cpu_queue, (int) queues[0].size());
+        } else {
+            out.max_gpu_queue =
+                std::max(out.max_gpu_queue, (int) queues[1].size());
         }
     };
 
     const auto release_gpu_pending = [&](int layer) {
         auto & pending = gpu_pending[(size_t) layer];
         while (!pending.empty()) {
-            gpu_q.push_back(pending.front());
+            queues[1].push_back(pending.front());
             pending.pop_front();
         }
         out.max_gpu_queue =
-            std::max(out.max_gpu_queue, (int) gpu_q.size());
+            std::max(out.max_gpu_queue, (int) queues[1].size());
     };
 
     const auto has_gpu_pending = [&]() {
@@ -2384,20 +2439,14 @@ static bool llama_pc_local_simulate(
             task.enqueue_ms = now;
 
             if (pattern[(size_t) layer] ==
-                    llama_pc_local_layer_mode::GPU_FULL) {
-                task.kind = llama_pc_local_sim_task_kind::GPU_FULL;
-                enqueue_gpu(task);
-                return;
-            }
-
-            if (split ==
-                    llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN) {
-                task.kind = llama_pc_local_sim_task_kind::CPU_ATTN;
-                enqueue_cpu(task);
+                    llama_pc_local_layer_mode::FULL) {
+                task.stage = llama_pc_local_sim_task_stage::FULL;
+                task.backend = mapping.full;
             } else {
-                task.kind = llama_pc_local_sim_task_kind::GPU_ATTN;
-                enqueue_gpu(task);
+                task.stage = llama_pc_local_sim_task_stage::ATTN;
+                task.backend = mapping.attn;
             }
+            enqueue_task(task);
         };
 
     for (int ci = 0; ci < n_chunks; ++ci) {
@@ -2431,58 +2480,47 @@ static bool llama_pc_local_simulate(
             dummy, layer);
     };
 
-    auto try_start_cpu = [&](double now) mutable {
-        if (cpu_busy || cpu_q.empty()) {
+    auto try_start_backend = [&](int bi, double now) mutable {
+        if (backend_busy[(size_t) bi]) {
             return;
         }
-        const auto task = cpu_q.front();
-        cpu_q.pop_front();
-        const double dur = cpu_duration(task);
-        if (dur <= 0.0) {
-            return;
-        }
-        cpu_busy = true;
-        out.cpu_busy_ms += dur;
-        push_event(
-            now + dur,
-            llama_pc_local_sim_event_kind::CPU_DONE,
-            task, task.layer);
-    };
-
-    auto try_start_gpu = [&](double now) mutable {
-        if (gpu_busy) {
-            return;
-        }
-        if (gpu_q.empty()) {
-            if (has_gpu_pending() && gpu_blocked_since < 0.0) {
+        if (queues[(size_t) bi].empty()) {
+            if (bi == 1 && has_gpu_pending() &&
+                gpu_blocked_since < 0.0) {
                 gpu_blocked_since = now;
             }
             return;
         }
 
-        if (gpu_blocked_since >= 0.0) {
+        if (bi == 1 && gpu_blocked_since >= 0.0) {
             out.weight_stall_ms += now - gpu_blocked_since;
             gpu_blocked_since = -1.0;
         }
 
-        const auto task = gpu_q.front();
-        gpu_q.pop_front();
-        const double dur = gpu_duration(task);
+        const auto task = queues[(size_t) bi].front();
+        queues[(size_t) bi].pop_front();
+        const double dur = task_duration(task);
         if (dur <= 0.0) {
             return;
         }
-        gpu_busy = true;
-        out.gpu_busy_ms += dur;
+        backend_busy[(size_t) bi] = true;
+        if (bi == 0) {
+            out.cpu_busy_ms += dur;
+        } else {
+            out.gpu_busy_ms += dur;
+        }
         push_event(
             now + dur,
-            llama_pc_local_sim_event_kind::GPU_DONE,
+            bi == 0 ?
+                llama_pc_local_sim_event_kind::BACKEND_0_DONE :
+                llama_pc_local_sim_event_kind::BACKEND_1_DONE,
             task, task.layer);
     };
 
     auto dispatch = [&](double now) mutable {
         try_start_transfer(now);
-        try_start_cpu(now);
-        try_start_gpu(now);
+        try_start_backend(0, now);
+        try_start_backend(1, now);
     };
 
     dispatch(0.0);
@@ -2511,64 +2549,44 @@ static bool llama_pc_local_simulate(
                 continue;
             }
 
-            if (event.kind ==
-                    llama_pc_local_sim_event_kind::CPU_DONE) {
-                cpu_busy = false;
-                const auto & task = event.task;
-                if (task.kind ==
-                        llama_pc_local_sim_task_kind::CPU_ATTN) {
-                    llama_pc_local_sim_task next = task;
-                    next.kind =
-                        llama_pc_local_sim_task_kind::GPU_FFN;
-                    next.enqueue_ms = now;
-                    enqueue_gpu(next);
-                } else {
-                    // GPU_ATTN -> CPU_FFN completes a split layer.
-                    const int next_layer = task.layer + 1;
-                    if (next_layer >= n_layers) {
-                        ++finished_chunks;
-                    } else {
-                        enqueue_layer_entry(
-                            next_layer, task.chunk, now);
+            const int bi =
+                event.kind ==
+                    llama_pc_local_sim_event_kind::BACKEND_0_DONE ?
+                    0 : 1;
+            backend_busy[(size_t) bi] = false;
+            const auto & task = event.task;
+
+            if (task.backend ==
+                    llama_hybrid_local_backend_slot::BACKEND_1) {
+                const int layer = task.layer;
+                ++gpu_done[(size_t) layer];
+                if (gpu_done[(size_t) layer] ==
+                        gpu_consumers_target[(size_t) layer]) {
+                    if (weight_state[(size_t) layer] != 2) {
+                        return false;
                     }
+                    weight_state[(size_t) layer] = 3;
+                    live_weight_bytes -=
+                        layer_weight_bytes[(size_t) layer];
                 }
+            }
+
+            if (task.stage ==
+                    llama_pc_local_sim_task_stage::ATTN) {
+                llama_pc_local_sim_task next = task;
+                next.stage = llama_pc_local_sim_task_stage::FFN;
+                next.backend = mapping.ffn;
+                next.enqueue_ms = now;
+                enqueue_task(next);
                 continue;
             }
 
-            gpu_busy = false;
-            const auto & task = event.task;
-
-            // Every layer has exactly one GPU-side task per chunk:
-            // FFN in CPU_ATTN_GPU_FFN, ATTN in GPU_ATTN_CPU_FFN,
-            // or FULL.  Once the final chunk leaves that GPU stage the
-            // layer's GPU weights can never be touched again.
-            const int layer = task.layer;
-            ++gpu_done[(size_t) layer];
-            if (gpu_done[(size_t) layer] == n_chunks) {
-                if (weight_state[(size_t) layer] != 2) {
-                    return false;
-                }
-                weight_state[(size_t) layer] = 3;
-                live_weight_bytes -=
-                    layer_weight_bytes[(size_t) layer];
-            }
-
-            if (task.kind ==
-                    llama_pc_local_sim_task_kind::GPU_ATTN) {
-                llama_pc_local_sim_task next = task;
-                next.kind =
-                    llama_pc_local_sim_task_kind::CPU_FFN;
-                next.enqueue_ms = now;
-                enqueue_cpu(next);
+            const int next_layer = task.layer + 1;
+            if (next_layer >= n_layers) {
+                ++finished_chunks;
             } else {
-                // GPU_FFN or GPU_FULL completes the layer.
-                const int next_layer = layer + 1;
-                if (next_layer >= n_layers) {
-                    ++finished_chunks;
-                } else {
-                    enqueue_layer_entry(
-                        next_layer, task.chunk, now);
-                }
+                enqueue_layer_entry(
+                    next_layer, task.chunk, now);
             }
         }
 
@@ -2641,14 +2659,24 @@ static bool llama_hybrid_plan_pc_local(
     bool found = false;
     llama_pc_local_sim_result best_sim;
 
-    std::array<llama_hybrid_pc_local_plan, 2> best_by_split {};
-    std::array<llama_pc_local_sim_result, 2>  best_sim_by_split {};
-    std::array<bool, 2> found_by_split { false, false };
+    std::array<llama_hybrid_pc_local_plan, 2> best_by_mapping {};
+    std::array<llama_pc_local_sim_result, 2>  best_sim_by_mapping {};
+    std::array<bool, 2> found_by_mapping { false, false };
 
-    const auto split_index = [](llama_pc_local_split_orientation split) {
-        return split ==
-            llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN ? 0 : 1;
-    };
+    const std::array<llama_hybrid_local_stage_backends, 2> mappings {{
+        {
+            llama_hybrid_local_backend_slot::BACKEND_0,
+            llama_hybrid_local_backend_slot::BACKEND_1,
+            llama_hybrid_local_backend_slot::BACKEND_1,
+            llama_hybrid_local_backend_slot::BACKEND_1,
+        },
+        {
+            llama_hybrid_local_backend_slot::BACKEND_1,
+            llama_hybrid_local_backend_slot::BACKEND_0,
+            llama_hybrid_local_backend_slot::BACKEND_1,
+            llama_hybrid_local_backend_slot::BACKEND_1,
+        },
+    }};
 
     const auto sim_better = [](
             const llama_pc_local_sim_result & sim,
@@ -2667,19 +2695,19 @@ static bool llama_hybrid_plan_pc_local(
     const auto assign_plan = [&](
             llama_hybrid_pc_local_plan & dst,
             const llama_pc_local_sim_result & sim,
-            llama_pc_local_split_orientation split,
+            const llama_hybrid_local_stage_backends & mapping,
             std::vector<llama_pc_local_layer_mode> pattern,
-            int gpu_full) {
+            int full_layers) {
         dst = {};
         dst.valid = true;
         dst.applied = false;
         dst.layer_begin = layer_begin;
         dst.layer_end = layer_begin + n_layers;
         dst.chunk_tokens = chunk_tokens;
-        dst.split = split;
+        dst.stage_backends = mapping;
         dst.layer_modes = std::move(pattern);
-        dst.split_layers = n_layers - gpu_full;
-        dst.gpu_full_layers = gpu_full;
+        dst.split_layers = n_layers - full_layers;
+        dst.full_layers = full_layers;
         dst.gpu_weight_budget_bytes = gpu_weight_budget;
         dst.initial_resident_layers = sim.initial_resident_layers;
         dst.initial_resident_bytes = sim.initial_resident_bytes;
@@ -2693,41 +2721,39 @@ static bool llama_hybrid_plan_pc_local(
         dst.max_gpu_queue = sim.max_gpu_queue;
     };
 
-    for (const auto split : {
-            llama_pc_local_split_orientation::CPU_ATTN_GPU_FFN,
-            llama_pc_local_split_orientation::GPU_ATTN_CPU_FFN }) {
-        for (int gpu_full = 0; gpu_full <= n_layers; ++gpu_full) {
+    for (size_t mi = 0; mi < mappings.size(); ++mi) {
+        const auto & mapping = mappings[mi];
+        for (int full_layers = 0; full_layers <= n_layers; ++full_layers) {
             const int phases =
-                gpu_full > 0 && gpu_full < n_layers ? n_layers : 1;
+                full_layers > 0 && full_layers < n_layers ? n_layers : 1;
             for (int phase = 0; phase < phases; ++phase) {
                 auto pattern =
                     llama_pc_local_even_pattern(
-                        n_layers, gpu_full, phase);
+                        n_layers, full_layers, phase);
 
                 llama_pc_local_sim_result sim;
                 if (!llama_pc_local_simulate(
-                        profile, layer_begin, pattern, split,
+                        profile, layer_begin, pattern, mapping,
                         chunk_costs, gpu_weight_budget, sim)) {
                     continue;
                 }
 
-                const int si = split_index(split);
                 if (sim_better(
-                        sim, best_sim_by_split[(size_t) si],
-                        found_by_split[(size_t) si])) {
-                    found_by_split[(size_t) si] = true;
-                    best_sim_by_split[(size_t) si] = sim;
+                        sim, best_sim_by_mapping[mi],
+                        found_by_mapping[mi])) {
+                    found_by_mapping[mi] = true;
+                    best_sim_by_mapping[mi] = sim;
                     assign_plan(
-                        best_by_split[(size_t) si],
-                        sim, split, pattern, gpu_full);
+                        best_by_mapping[mi],
+                        sim, mapping, pattern, full_layers);
                 }
 
                 if (sim_better(sim, best_sim, found)) {
                     found = true;
                     best_sim = sim;
                     assign_plan(
-                        best, sim, split, std::move(pattern),
-                        gpu_full);
+                        best, sim, mapping, std::move(pattern),
+                        full_layers);
                 }
             }
         }
@@ -2781,7 +2807,8 @@ static bool llama_hybrid_plan_pc_local(
                         llama_pc_local_layer_mode::SPLIT) {
                     reference_weight =
                         llama_pc_local_layer_gpu_weight_bytes(
-                            profile, layer_begin + il, plan.split,
+                            profile, layer_begin + il,
+                            plan.stage_backends,
                             llama_pc_local_layer_mode::SPLIT);
                     break;
                 }
@@ -2789,7 +2816,8 @@ static bool llama_hybrid_plan_pc_local(
             if (reference_weight == 0 && n_layers > 0) {
                 reference_weight =
                     llama_pc_local_layer_gpu_weight_bytes(
-                        profile, layer_begin, plan.split,
+                        profile, layer_begin,
+                        plan.stage_backends,
                         plan.layer_modes.front());
             }
 
@@ -2806,26 +2834,27 @@ static bool llama_hybrid_plan_pc_local(
         };
 
     finalize_metrics(best);
-    for (auto & candidate : best_by_split) {
+    for (auto & candidate : best_by_mapping) {
         finalize_metrics(candidate);
     }
 
-    // Always expose the best candidate for each split direction before
-    // printing the globally selected candidate.  This keeps the search broad
-    // while making it obvious whether the original CPU_ATTN_GPU_FFN design is
-    // close to or far from the reverse orientation.
-    for (size_t i = 0; i < best_by_split.size(); ++i) {
-        const auto & candidate = best_by_split[i];
+    // Always expose the best candidate for each local backend mapping before
+    // printing the globally selected candidate.  B0/B1 are abstract slots;
+    // the PC adapter currently resolves B0=CPU and B1=CUDA.
+    for (size_t i = 0; i < best_by_mapping.size(); ++i) {
+        const auto & candidate = best_by_mapping[i];
         if (!candidate.valid) {
             continue;
         }
+        const std::string mapping =
+            llama_pc_local_mapping_string(candidate.stage_backends);
         LLAMA_LOG_ERROR(
-            "[PC_LOCAL_PLAN_CANDIDATE] orientation=%s split=%d full=%d "
+            "[PC_LOCAL_PLAN_CANDIDATE] mapping=%s split=%d full=%d "
             "makespan_ms=%.3f cpu_ms=%.3f gpu_ms=%.3f xfer_ms=%.3f "
             "stall_ms=%.3f initial_layers=%d peak_mib=%.1f\n",
-            llama_pc_local_split_name(candidate.split),
+            mapping.c_str(),
             candidate.split_layers,
-            candidate.gpu_full_layers,
+            candidate.full_layers,
             candidate.predicted_ms,
             candidate.predicted_cpu_busy_ms,
             candidate.predicted_gpu_busy_ms,
@@ -2834,8 +2863,8 @@ static bool llama_hybrid_plan_pc_local(
             candidate.initial_resident_layers,
             candidate.predicted_peak_weight_bytes / 1048576.0);
         LLAMA_LOG_ERROR(
-            "[PC_LOCAL_PLAN_CANDIDATE_PATTERN] orientation=%s pattern=%s\n",
-            llama_pc_local_split_name(candidate.split),
+            "[PC_LOCAL_PLAN_CANDIDATE_PATTERN] mapping=%s pattern=%s\n",
+            mapping.c_str(),
             llama_pc_local_pattern_string(
                 candidate.layer_modes).c_str());
     }
@@ -2858,15 +2887,21 @@ static void llama_hybrid_pc_local_plan_print(
     // paths visually truncate long prefixed log lines even though the llama
     // logger itself dynamically expands its message buffer.
     LLAMA_LOG_ERROR(
-        "[PC_LOCAL_PLAN] status=OK applied=%d orientation=%s layers=[%d,%d)\n",
+        "[PC_LOCAL_PLAN] status=OK applied=%d mapping=%s layers=[%d,%d)\n",
         plan.applied ? 1 : 0,
-        llama_pc_local_split_name(plan.split),
+        llama_pc_local_mapping_string(plan.stage_backends).c_str(),
         plan.layer_begin, plan.layer_end);
+    LLAMA_LOG_ERROR(
+        "[PC_LOCAL_PLAN_BACKENDS] B0=CPU B1=CUDA ATTN=%s FFN=%s REDUCE=%s FULL=%s\n",
+        llama_hybrid_local_backend_slot_name(plan.stage_backends.attn),
+        llama_hybrid_local_backend_slot_name(plan.stage_backends.ffn),
+        llama_hybrid_local_backend_slot_name(plan.stage_backends.reduce),
+        llama_hybrid_local_backend_slot_name(plan.stage_backends.full));
     LLAMA_LOG_ERROR(
         "[PC_LOCAL_PLAN_LAYOUT] chunk=%d split=%d full=%d\n",
         plan.chunk_tokens,
         plan.split_layers,
-        plan.gpu_full_layers);
+        plan.full_layers);
     LLAMA_LOG_ERROR(
         "[PC_LOCAL_PLAN_PATTERN] %s\n",
         pattern.c_str());
