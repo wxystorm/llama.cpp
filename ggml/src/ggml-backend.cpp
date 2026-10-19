@@ -2128,10 +2128,107 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
     int                               split_backend_id = split->backend_id;
     ggml_backend_t                    split_backend    = sched->backends[split_backend_id];
 
+    // Decode zero-logits triage: snapshot the LM-head input while it is still
+    // live, immediately before the split that computes result_output.  Reading
+    // result_norm after the entire graph completes can be misleading because
+    // the graph allocator may legally reuse its activation buffer.
+    const bool output_head_diag =
+        getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != NULL &&
+        atoi(getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0;
+    ggml_tensor * output_head_node = NULL;
+    ggml_tensor * output_head_input = NULL;
+
+    auto print_output_head_stats = [&](const char * phase,
+                                       ggml_tensor * tensor) {
+        if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
+            return;
+        }
+
+        const size_t n = ggml_nelements(tensor);
+        std::vector<float> values(n);
+        ggml_backend_tensor_get(
+            tensor,
+            values.data(),
+            0,
+            n * sizeof(float));
+
+        size_t zero = 0;
+        size_t nonfinite = 0;
+        double l2 = 0.0;
+        double max_abs = 0.0;
+        for (float x : values) {
+            zero += x == 0.0f;
+            if (!std::isfinite(x)) {
+                ++nonfinite;
+                continue;
+            }
+            const double xd = x;
+            l2 += xd * xd;
+            max_abs = std::max(max_abs, std::abs(xd));
+        }
+
+        GGML_LOG_ERROR(
+            "[OUTPUT_HEAD_DIAG] phase=%s split=%d/%d backend=%s "
+            "tensor=%s op=%s n=%zu zero=%zu nf=%zu "
+            "l2=%.9g max=%.9g data=%p\n",
+            phase,
+            split_id,
+            sched->n_splits,
+            ggml_backend_name(split_backend),
+            tensor->name,
+            ggml_op_name(tensor->op),
+            n,
+            zero,
+            nonfinite,
+            std::sqrt(l2),
+            max_abs,
+            tensor->data);
+    };
+
+    if (output_head_diag) {
+        for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
+            ggml_tensor * node = split->graph.nodes[node_id];
+            if (node != NULL && strcmp(node->name, "result_output") == 0) {
+                output_head_node = node;
+                output_head_input = node->src[1];
+                break;
+            }
+        }
+
+        if (output_head_node != NULL) {
+            // All dependency copies/earlier work queued on this backend must
+            // be visible before reading the live LM-head input.
+            ggml_backend_synchronize(split_backend);
+            print_output_head_stats("PRE_INPUT", output_head_input);
+            GGML_LOG_ERROR(
+                "[OUTPUT_HEAD_ID] split=%d/%d backend=%s out=%s op=%s "
+                "src0=%s src1=%s out_data=%p src0_data=%p src1_data=%p\n",
+                split_id,
+                sched->n_splits,
+                ggml_backend_name(split_backend),
+                output_head_node->name,
+                ggml_op_name(output_head_node->op),
+                output_head_node->src[0] != NULL ?
+                    output_head_node->src[0]->name : "-",
+                output_head_input != NULL ?
+                    output_head_input->name : "-",
+                output_head_node->data,
+                output_head_node->src[0] != NULL ?
+                    output_head_node->src[0]->data : NULL,
+                output_head_input != NULL ?
+                    output_head_input->data : NULL);
+        }
+    }
+
     if (!sched->callback_eval) {
         enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
+        }
+
+        if (output_head_node != NULL) {
+            ggml_backend_synchronize(split_backend);
+            print_output_head_stats("POST_OUTPUT", output_head_node);
         }
     } else {
         // similar to ggml_backend_compare_graph_backend
