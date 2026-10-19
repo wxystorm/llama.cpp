@@ -14836,6 +14836,90 @@ auto prefill_norm_sg_has_prework =
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
         }
+        const bool phone_output_diag =
+            std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0;
+
+        std::array<ggml_tensor *, 2> phone_output_nodes { nullptr, nullptr };
+
+        auto print_phone_output_stats =
+            [&](const char * phase, size_t backend_index,
+                ggml_tensor * output, bool read_input) {
+                if (output == nullptr || backend_index >= n_backends) {
+                    return;
+                }
+
+                ggml_tensor * tensor =
+                    read_input ? output->src[1] : output;
+                if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+                    return;
+                }
+
+                ggml_backend_t simple_backend =
+                    backend_ctx->backend_configs[backend_index].backend;
+                ggml_backend_synchronize(simple_backend);
+
+                const size_t n = ggml_nelements(tensor);
+                std::vector<float> values(n);
+                ggml_backend_tensor_get(
+                    tensor,
+                    values.data(),
+                    0,
+                    n * sizeof(float));
+
+                size_t zero = 0;
+                size_t nonfinite = 0;
+                double l2 = 0.0;
+                double max_abs = 0.0;
+                for (float x : values) {
+                    zero += x == 0.0f;
+                    if (!std::isfinite(x)) {
+                        ++nonfinite;
+                        continue;
+                    }
+                    const double xd = x;
+                    l2 += xd * xd;
+                    max_abs = std::max(max_abs, std::abs(xd));
+                }
+
+                GGML_LOG_ERROR(
+                    "[META_PHONE_OUT] %s sg=%zu j=%zu b=%s "
+                    "comp=%d t=%s n=%zu z=%zu nf=%zu "
+                    "l2=%.6g max=%.6g\n",
+                    phase,
+                    i,
+                    backend_index,
+                    ggml_backend_name(simple_backend),
+                    !!(output->flags & GGML_TENSOR_FLAG_COMPUTE),
+                    tensor->name,
+                    n,
+                    zero,
+                    nonfinite,
+                    std::sqrt(l2),
+                    max_abs);
+            };
+
+        if (phone_output_diag && n_backends == 2) {
+            for (size_t j = 0; j < 2; ++j) {
+                ggml_cgraph * g =
+                    backend_ctx->backend_configs[j].
+                        cgraphs[i].cgraph_main;
+                if (g == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < g->n_nodes; ++k) {
+                    ggml_tensor * node = g->nodes[k];
+                    if (node != nullptr &&
+                            std::strcmp(node->name, "result_output") == 0) {
+                        phone_output_nodes[j] = node;
+                        print_phone_output_stats(
+                            "PRE_IN", j, node, true);
+                        break;
+                    }
+                }
+            }
+        }
+
         const int64_t phone_worker_submit_begin_us = ggml_time_us();
         compute_workers.start_graph(1, phone_graph);
         const int64_t phone_worker_submit_us =
@@ -14844,6 +14928,17 @@ auto prefill_norm_sg_has_prework =
         compute_status = compute_workers.wait(1);
         const int64_t phone_worker_wait_us =
             ggml_time_us() - phone_worker_wait_begin_us;
+
+        if (phone_output_diag &&
+                n_backends == 2 &&
+                compute_status == GGML_STATUS_SUCCESS) {
+            for (size_t j = 0; j < 2; ++j) {
+                if (phone_output_nodes[j] != nullptr) {
+                    print_phone_output_stats(
+                        "POST_OUT", j, phone_output_nodes[j], false);
+                }
+            }
+        }
         if (phone_exit_profile) {
             printf(
                 "[PHONE_ASYNC_META_WORKER] sg=%zu fused=%d layers=%d..%d "
