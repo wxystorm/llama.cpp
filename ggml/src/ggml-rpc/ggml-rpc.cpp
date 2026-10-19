@@ -2233,44 +2233,9 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     rpc_msg_synchronize_req request {};
     request.device = rpc_ctx->device;
 
-    const bool fence_diag = rpc_xlayer_boundary_diag_enabled();
-    uint64_t diag_submit_seq = 0;
-    uint64_t diag_graph_uid = 0;
-    int diag_nodes = 0;
-    std::string diag_cmd;
-    std::string diag_first_node;
-    std::string diag_marker_node;
-    std::string diag_last_node;
-
-    if (fence_diag) {
-        std::lock_guard<std::mutex> lock(rpc_ctx->fence_diag_mutex);
-        diag_submit_seq = rpc_ctx->fence_diag_submit_seq;
-        diag_graph_uid = rpc_ctx->fence_diag_graph_uid;
-        diag_nodes = rpc_ctx->fence_diag_nodes;
-        diag_cmd = rpc_ctx->fence_diag_cmd;
-        diag_first_node = rpc_ctx->fence_diag_first_node;
-        diag_marker_node = rpc_ctx->fence_diag_marker_node;
-        diag_last_node = rpc_ctx->fence_diag_last_node;
-
-        GGML_LOG_ERROR(
-            "[RPC_PHONE_FENCE_DIAG] event=BEGIN endpoint=%s device=%u "
-            "last_submit_seq=%" PRIu64 " graph_uid=%" PRIu64 " cmd=%s "
-            "nodes=%d first=%s marker=%s last=%s\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            diag_submit_seq,
-            diag_graph_uid,
-            diag_cmd.empty() ? "none" : diag_cmd.c_str(),
-            diag_nodes,
-            diag_first_node.empty() ? "none" : diag_first_node.c_str(),
-            diag_marker_node.empty() ? "none" : diag_marker_node.c_str(),
-            diag_last_node.empty() ? "none" : diag_last_node.c_str());
-    }
-
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    const int64_t fence_begin_us = fence_diag ? ggml_time_us() : 0;
     const bool status = send_rpc_cmd(
         sock,
         RPC_CMD_SYNCHRONIZE,
@@ -2278,22 +2243,8 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
         sizeof(request),
         nullptr,
         0);
-    const int64_t fence_us =
-        fence_diag ? ggml_time_us() - fence_begin_us : 0;
 
     RPC_STATUS_ASSERT(status);
-
-    if (fence_diag) {
-        GGML_LOG_ERROR(
-            "[RPC_PHONE_FENCE_DIAG] event=END endpoint=%s device=%u "
-            "last_submit_seq=%" PRIu64 " graph_uid=%" PRIu64
-            " wait_ms=%.3f\n",
-            rpc_ctx->endpoint.c_str(),
-            rpc_ctx->device,
-            diag_submit_seq,
-            diag_graph_uid,
-            fence_us / 1000.0);
-    }
 }
 
 static bool ggml_backend_rpc_route_mark_ready(
