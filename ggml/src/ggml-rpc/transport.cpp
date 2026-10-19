@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 
@@ -702,6 +703,24 @@ static bool is_valid_fd(sockfd_t sockfd) {
 #endif
 }
 
+static int socket_last_error() {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+static const char * socket_error_string(int err) {
+#ifdef _WIN32
+    static thread_local char buf[64];
+    snprintf(buf, sizeof(buf), "winsock_error=%d", err);
+    return buf;
+#else
+    return std::strerror(err);
+#endif
+}
+
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
     // set TCP_NODELAY to disable Nagle's algorithm
@@ -718,6 +737,8 @@ static bool set_reuse_addr(sockfd_t sockfd) {
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
+        const int err = socket_last_error();
+        GGML_LOG_ERROR("accept failed: err=%d (%s)\n", err, socket_error_string(err));
         return nullptr;
     }
     if (!set_no_delay(client_socket_fd)) {
@@ -730,10 +751,13 @@ socket_ptr socket_t::accept() {
 socket_ptr socket_t::create_server(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
+        const int err = socket_last_error();
+        GGML_LOG_ERROR("socket() failed: err=%d (%s)\n", err, socket_error_string(err));
         return nullptr;
     }
     if (!set_reuse_addr(sockfd)) {
-        GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
+        const int err = socket_last_error();
+        GGML_LOG_ERROR("setsockopt(SO_REUSEADDR) failed: err=%d (%s)\n", err, socket_error_string(err));
         return nullptr;
     }
     if (inet_addr(host) == INADDR_NONE) {
@@ -746,9 +770,15 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     serv_addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        const int err = socket_last_error();
+        GGML_LOG_ERROR("bind failed: host=%s port=%d err=%d (%s)\n",
+                       host, port, err, socket_error_string(err));
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, 16) < 0) {
+        const int err = socket_last_error();
+        GGML_LOG_ERROR("listen failed: host=%s port=%d err=%d (%s)\n",
+                       host, port, err, socket_error_string(err));
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
