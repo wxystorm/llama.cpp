@@ -8589,6 +8589,269 @@ void rpc_server::phone_npu_async_loop() {
     }
 }
 
+
+static bool rpc_phone_l47_legacy_target_name(
+        const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    static const char * targets[] = {
+        "ffn_inp-47",
+        "ffn_norm-47",
+        "ffn_moe_logits-47",
+        "ffn_moe_weights-47",
+        "ffn_moe_weights_norm-47",
+        "ffn_moe_topk-47",
+        "phone_moe_route_topk-47",
+        "phone_moe_route_weights-47",
+        "ffn_moe_gate_up-47",
+        "ffn_moe_up-47",
+        "ffn_moe_gate-47",
+        "ffn_moe_silu-47",
+        "ffn_moe_swiglu-47",
+        "ffn_moe_swiglu_limited-47",
+        "ffn_moe_down-47",
+        "ffn_moe_down_scaled-47",
+        "ffn_moe_down_biased-47",
+        "ffn_moe_weighted-47",
+        "ffn_moe_out-47",
+    };
+
+    for (const char * target : targets) {
+        if (std::strcmp(name, target) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rpc_phone_l47_graph_contains_moe_out(
+        const ggml_cgraph * graph) {
+    if (graph == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node != nullptr &&
+                std::strcmp(node->name, "ffn_moe_out-47") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rpc_phone_l47_diag_f32_tensor(
+        ggml_tensor * tensor,
+        int node_index,
+        uint64_t graph_uid) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    const size_t count = (size_t) ggml_nelements(tensor);
+    if (count == 0) {
+        return;
+    }
+
+    std::vector<float> data(count);
+    ggml_backend_tensor_get(
+        tensor,
+        data.data(),
+        0,
+        count * sizeof(float));
+
+    size_t nonfinite = 0;
+    size_t first_nonfinite = count;
+    double sum = 0.0;
+    double l2 = 0.0;
+    float max_abs = 0.0f;
+
+    for (size_t i = 0; i < count; ++i) {
+        const float v = data[i];
+        if (!std::isfinite(v)) {
+            if (first_nonfinite == count) {
+                first_nonfinite = i;
+            }
+            ++nonfinite;
+            continue;
+        }
+        sum += (double) v;
+        l2 += (double) v * (double) v;
+        max_abs = std::max(max_abs, std::fabs(v));
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_LEGACY_PRODUCER] uid=%" PRIu64
+        " idx=%d name=%s op=%s type=%d "
+        "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+        "count=%zu nonfinite=%zu first_nf=%zu "
+        "sum=%.9f l2=%.9f max=%.9f "
+        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+        graph_uid,
+        node_index,
+        tensor->name,
+        ggml_op_name(tensor->op),
+        (int) tensor->type,
+        tensor->ne[0],
+        tensor->ne[1],
+        tensor->ne[2],
+        tensor->ne[3],
+        count,
+        nonfinite,
+        first_nonfinite,
+        sum,
+        std::sqrt(l2),
+        max_abs,
+        count > 0 ? data[0] : 0.0f,
+        count > 1 ? data[1] : 0.0f,
+        count > 2 ? data[2] : 0.0f,
+        count > 3 ? data[3] : 0.0f);
+}
+
+static void rpc_phone_l47_diag_i32_tensor(
+        ggml_tensor * tensor,
+        int node_index,
+        uint64_t graph_uid) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_I32) {
+        return;
+    }
+
+    const size_t count = (size_t) ggml_nelements(tensor);
+    if (count == 0) {
+        return;
+    }
+
+    std::vector<int32_t> data(count);
+    ggml_backend_tensor_get(
+        tensor,
+        data.data(),
+        0,
+        count * sizeof(int32_t));
+
+    int32_t min_v = data[0];
+    int32_t max_v = data[0];
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < count; ++i) {
+        min_v = std::min(min_v, data[i]);
+        max_v = std::max(max_v, data[i]);
+        const uint32_t raw = (uint32_t) data[i];
+        for (int b = 0; b < 4; ++b) {
+            hash ^= (raw >> (8 * b)) & 0xffu;
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_LEGACY_PRODUCER_I32] uid=%" PRIu64
+        " idx=%d name=%s op=%s count=%zu min=%d max=%d "
+        "hash=%" PRIu64 " v0=%d v1=%d v2=%d v3=%d\n",
+        graph_uid,
+        node_index,
+        tensor->name,
+        ggml_op_name(tensor->op),
+        count,
+        min_v,
+        max_v,
+        hash,
+        count > 0 ? data[0] : 0,
+        count > 1 ? data[1] : 0,
+        count > 2 ? data[2] : 0,
+        count > 3 ? data[3] : 0);
+}
+
+static ggml_status rpc_phone_l47_compute_with_producer_diag(
+        ggml_backend_t gpu,
+        uint64_t graph_uid,
+        ggml_cgraph * graph) {
+    GGML_ASSERT(gpu != nullptr);
+    GGML_ASSERT(graph != nullptr);
+
+    GGML_LOG_ERROR(
+        "[L47_LEGACY_PATH] uid=%" PRIu64
+        " nodes=%d action=SEGMENTED_PRODUCER_DIAG_BEGIN\n",
+        graph_uid,
+        graph->n_nodes);
+
+    int cursor = 0;
+    int targets = 0;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr ||
+                !rpc_phone_l47_legacy_target_name(node->name)) {
+            continue;
+        }
+
+        if (cursor <= i) {
+            ggml_cgraph part = rpc_graph_view(
+                graph,
+                cursor,
+                i + 1);
+            const ggml_status status =
+                ggml_backend_graph_compute(gpu, &part);
+            if (status != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR(
+                    "[L47_LEGACY_PATH] uid=%" PRIu64
+                    " idx=%d name=%s status=%d action=SEGMENT_FAIL\n",
+                    graph_uid,
+                    i,
+                    node->name,
+                    (int) status);
+                return status;
+            }
+            cursor = i + 1;
+        }
+
+        ++targets;
+        if (node->type == GGML_TYPE_F32) {
+            rpc_phone_l47_diag_f32_tensor(
+                node,
+                i,
+                graph_uid);
+        } else if (node->type == GGML_TYPE_I32) {
+            rpc_phone_l47_diag_i32_tensor(
+                node,
+                i,
+                graph_uid);
+        } else {
+            GGML_LOG_ERROR(
+                "[L47_LEGACY_PRODUCER_META] uid=%" PRIu64
+                " idx=%d name=%s op=%s type=%d "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                graph_uid,
+                i,
+                node->name,
+                ggml_op_name(node->op),
+                (int) node->type,
+                node->ne[0],
+                node->ne[1],
+                node->ne[2],
+                node->ne[3]);
+        }
+    }
+
+    if (cursor < graph->n_nodes) {
+        ggml_cgraph tail = rpc_graph_view(
+            graph,
+            cursor,
+            graph->n_nodes);
+        const ggml_status status =
+            ggml_backend_graph_compute(gpu, &tail);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_LEGACY_PATH] uid=%" PRIu64
+        " nodes=%d targets=%d action=SEGMENTED_PRODUCER_DIAG_END\n",
+        graph_uid,
+        graph->n_nodes,
+        targets);
+    return GGML_STATUS_SUCCESS;
+}
+
 ggml_status rpc_server::graph_compute_phone_npu_ffn(
         uint32_t device,
         uint64_t graph_uid,
@@ -8678,13 +8941,20 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     if (stages.empty()) {
-        if (graph_id.layer == 47) {
+        const bool l47_legacy_diag =
+            std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+            rpc_phone_l47_graph_contains_moe_out(graph);
+
+        if (graph_id.layer == 47 || l47_legacy_diag) {
             GGML_LOG_ERROR(
                 "[L47_RING_TRACE_PHONE] phase=GRAPH_PATH path=GPU_NO_FFN_STAGE "
-                "uid=%" PRIu64 " chunk=%d cpu_reduce_seq=%" PRIu64 "\n",
+                "uid=%" PRIu64 " chunk=%d cpu_reduce_seq=%" PRIu64
+                " contains_moe_out=%d legacy_diag=%d\n",
                 graph_uid,
                 graph_id.chunk,
-                cpu_reduce_seq);
+                cpu_reduce_seq,
+                l47_legacy_diag ? 1 : 0,
+                l47_legacy_diag ? 1 : 0);
         }
         if (cpu_reduce_seq != 0) {
             GGML_LOG_ERROR(
@@ -8692,6 +8962,12 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
                 " status=FAIL reason=armed_graph_has_no_htp_stage\n",
                 cpu_reduce_seq);
             return GGML_STATUS_FAILED;
+        }
+        if (l47_legacy_diag) {
+            return rpc_phone_l47_compute_with_producer_diag(
+                gpu,
+                graph_uid,
+                graph);
         }
         return ggml_backend_graph_compute(gpu, graph);
     }
