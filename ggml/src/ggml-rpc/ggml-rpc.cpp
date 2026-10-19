@@ -6279,6 +6279,84 @@ bool rpc_server::set_tensor_async_return_wait(
             return false;
         }
 
+        if (cpu_entry.layer == 47) {
+            std::vector<float> readback(
+                cpu_entry.phone_partial.size());
+            rpc_msg_get_tensor_req verify_req {};
+            verify_req.tensor = request.tensor;
+            verify_req.offset = request.offset;
+            verify_req.size = original_size;
+
+            const bool read_ok = get_tensor_into(
+                verify_req,
+                readback.data());
+            if (!read_ok) {
+                GGML_LOG_ERROR(
+                    "[L47_NPU_RETURN_VERIFY] seq=%" PRIu64
+                    " chunk=%d dst=%s status=FAIL reason=readback\n",
+                    request.phone_ffn_seq,
+                    cpu_entry.chunk,
+                    request.tensor.name);
+            } else {
+                size_t exact = 0;
+                size_t mismatch = 0;
+                float max_abs_diff = 0.0f;
+                size_t first_mismatch = readback.size();
+                float first_expected = 0.0f;
+                float first_actual = 0.0f;
+
+                for (size_t i = 0; i < readback.size(); ++i) {
+                    const float expected =
+                        cpu_entry.phone_partial[i];
+                    const float actual = readback[i];
+                    if (memcmp(
+                            &expected,
+                            &actual,
+                            sizeof(float)) == 0) {
+                        ++exact;
+                    } else {
+                        ++mismatch;
+                        if (first_mismatch == readback.size()) {
+                            first_mismatch = i;
+                            first_expected = expected;
+                            first_actual = actual;
+                        }
+                        if (std::isfinite(expected) &&
+                                std::isfinite(actual)) {
+                            max_abs_diff = std::max(
+                                max_abs_diff,
+                                std::fabs(expected - actual));
+                        }
+                    }
+                }
+
+                rpc_phone_npu_diag_f32_nonfinite(
+                    "stable_return_readback",
+                    request.phone_ffn_seq,
+                    cpu_entry.layer,
+                    cpu_entry.chunk,
+                    readback.data(),
+                    readback.size());
+
+                GGML_LOG_ERROR(
+                    "[L47_NPU_RETURN_VERIFY] seq=%" PRIu64
+                    " chunk=%d dst=%s count=%zu exact=%zu mismatch=%zu "
+                    "max_abs_diff=%g first=%zu expected=%g actual=%g "
+                    "status=%s\n",
+                    request.phone_ffn_seq,
+                    cpu_entry.chunk,
+                    request.tensor.name,
+                    readback.size(),
+                    exact,
+                    mismatch,
+                    max_abs_diff,
+                    first_mismatch,
+                    first_expected,
+                    first_actual,
+                    mismatch == 0 ? "EXACT" : "MISMATCH");
+            }
+        }
+
         {
             std::lock_guard<std::mutex> lock(
                 phone_npu_cpu_reduce_mutex);
