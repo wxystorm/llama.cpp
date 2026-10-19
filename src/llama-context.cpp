@@ -3347,6 +3347,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             int fail_split = -1;
             int fail_expected_backend = -1;
             int fail_actual_backend = -1;
+            int fail_range_begin = -1;
+            int fail_range_end = -1;
+            int fail_task_kind = -1;
+            int fail_task_layer = -1;
+            int fail_task_chunk = -1;
 
             if (expected_primitive_tasks <= 0 ||
                 (int) markers.size() !=
@@ -3412,6 +3417,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             expected_backend;
                         fail_actual_backend =
                             actual_backend;
+                        fail_range_begin = range_begin;
+                        fail_range_end = range_end;
+                        fail_task_kind = marker.job.kind;
+                        fail_task_layer = marker.job.layer;
+                        fail_task_chunk = marker.job.chunk;
                         break;
                     }
                 }
@@ -3446,6 +3456,82 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     markers.back().split;
             }
 
+            if (!ring_ok &&
+                task_map_fail != nullptr &&
+                std::strcmp(task_map_fail, "BACKEND_RANGE") == 0 &&
+                fail_split >= 0) {
+                const char * fail_kind_name =
+                    fail_task_kind == PC_RING_ATTN ? "ATTN" :
+                    fail_task_kind == PC_RING_FFN ? "FFN" :
+                    fail_task_kind == PC_RING_REDUCE ? "REDUCE" :
+                    fail_task_kind == PC_RING_FULL ? "FULL" : "UNKNOWN";
+                LLAMA_LOG_ERROR(
+                    "[PC_LOCAL_RING_MAP_FAIL] task=%s layer=%d chunk=%d "
+                    "range=[%d,%d) fail_split=%d expected=B%d actual=B%d\n",
+                    fail_kind_name,
+                    fail_task_layer,
+                    fail_task_chunk,
+                    fail_range_begin,
+                    fail_range_end,
+                    fail_split,
+                    fail_expected_backend,
+                    fail_actual_backend);
+
+                const int diag_begin =
+                    std::max(0, fail_split - 1);
+                const int diag_end =
+                    std::min(n_splits, fail_split + 2);
+                for (int split = diag_begin;
+                     split < diag_end;
+                     ++split) {
+                    const int i_start =
+                        ggml_backend_sched_get_split_start(
+                            sched_use, split);
+                    const int i_end =
+                        ggml_backend_sched_get_split_end(
+                            sched_use, split);
+                    ggml_backend_t split_backend =
+                        ggml_backend_sched_get_split_backend(
+                            sched_use, split);
+                    LLAMA_LOG_ERROR(
+                        "[PC_LOCAL_RING_SPLIT_DIAG] split=%d backend=%s "
+                        "B=%d nodes=[%d,%d) count=%d%s\n",
+                        split,
+                        ggml_backend_name(split_backend),
+                        split_backend_index(split),
+                        i_start,
+                        i_end,
+                        i_end - i_start,
+                        split == fail_split ? " FAIL" : "");
+
+                    for (int node_id = i_start;
+                         node_id < i_end;
+                         ++node_id) {
+                        ggml_tensor * diag_node =
+                            ggml_graph_node(
+                                ring_graph, node_id);
+                        const char * view_name =
+                            diag_node->view_src != nullptr ?
+                                diag_node->view_src->name :
+                                "(none)";
+                        ggml_backend_t node_backend =
+                            ggml_backend_sched_get_tensor_backend(
+                                sched_use, diag_node);
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_NODE_DIAG] split=%d node=%d "
+                            "name=%s op=%s view_src=%s assigned=%s\n",
+                            split,
+                            node_id,
+                            diag_node->name,
+                            ggml_op_name(diag_node->op),
+                            view_name,
+                            node_backend != nullptr ?
+                                ggml_backend_name(node_backend) :
+                                "(none)");
+                    }
+                }
+            }
+
             int expected_jobs = 0;
             for (const auto mode : ring_plan.pc_local.layer_modes) {
                 expected_jobs +=
@@ -3460,7 +3546,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "splits=%d markers=%zu expected_markers=%d "
                     "entry_split=%d first=%d last=%d "
                     "layers=%d chunks=%d jobs=%d "
-                    "fail_split=%d expected_backend=%d actual_backend=%d\n",
+                    "fail_split=%d expected_backend=%d actual_backend=%d "
+                    "fail_task=%d/%d/%d fail_range=[%d,%d)\n",
                     task_map_fail != nullptr ?
                         task_map_fail :
                         (expected_jobs <= 0 ?
@@ -3476,7 +3563,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     expected_jobs,
                     fail_split,
                     fail_expected_backend,
-                    fail_actual_backend);
+                    fail_actual_backend,
+                    fail_task_kind,
+                    fail_task_layer,
+                    fail_task_chunk,
+                    fail_range_begin,
+                    fail_range_end);
                 ret = GGML_STATUS_FAILED;
             } else {
                 if (first_task_split > 0) {
