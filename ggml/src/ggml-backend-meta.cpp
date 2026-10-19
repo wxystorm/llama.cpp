@@ -11715,6 +11715,83 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     };
                     print_pre("PC", tp_numeric_pre_pc);
                     print_pre("PHONE", tp_numeric_pre_phone);
+
+                    if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                        char norm_name[64];
+                        std::snprintf(
+                            norm_name,
+                            sizeof(norm_name),
+                            "ffn_norm-%d",
+                            tp_numeric_layer);
+                        ggml_tensor * pc_norm =
+                            find_exact_named_tensor(0, norm_name);
+
+                        if (pc_norm != nullptr &&
+                                pc_norm->type == GGML_TYPE_F32 &&
+                                ggml_nelements(pc_norm) == n) {
+                            std::vector<float> norm_values(n);
+                            ggml_backend_tensor_get(
+                                pc_norm,
+                                norm_values.data(),
+                                0,
+                                n * sizeof(float));
+
+                            size_t equal = 0;
+                            float maxdiff = 0.0f;
+                            for (size_t k = 0; k < n; ++k) {
+                                const float d = std::fabs(
+                                    tp_numeric_pre_pc[k] - norm_values[k]);
+                                equal += d == 0.0f;
+                                maxdiff = std::max(maxdiff, d);
+                            }
+
+                            printf(
+                                "[TP_PC_ALIAS] L=%d C=%d "
+                                "out=%s op=%s compute=%d "
+                                "out_data=%p norm_data=%p "
+                                "same_data=%d equal=%zu/%zu maxdiff=%.6g\n",
+                                tp_numeric_layer,
+                                tp_numeric_chunk,
+                                pc_node->name,
+                                ggml_op_name(pc_node->op),
+                                !!(pc_node->flags & GGML_TENSOR_FLAG_COMPUTE),
+                                pc_node->data,
+                                pc_norm->data,
+                                pc_node->data == pc_norm->data ? 1 : 0,
+                                equal,
+                                n,
+                                maxdiff);
+                        } else {
+                            printf(
+                                "[TP_PC_ALIAS] L=%d C=%d status=NO_NORM\n",
+                                tp_numeric_layer,
+                                tp_numeric_chunk);
+                        }
+
+                        ggml_cgraph * pc_trace_graph =
+                            pc_cfg.cgraphs[i].cgraph_main;
+                        for (int ni = 0; ni < pc_trace_graph->n_nodes; ++ni) {
+                            ggml_tensor * t = pc_trace_graph->nodes[ni];
+                            if (t == nullptr) {
+                                continue;
+                            }
+                            const std::string lname =
+                                std::to_string(tp_numeric_layer);
+                            if (std::strstr(t->name, "ffn_moe_") == nullptr ||
+                                    std::strstr(t->name, lname.c_str()) == nullptr) {
+                                continue;
+                            }
+                            printf(
+                                "[TP_PC_NODE] L=%d idx=%d name=%s op=%s "
+                                "compute=%d data=%p\n",
+                                tp_numeric_layer,
+                                ni,
+                                t->name,
+                                ggml_op_name(t->op),
+                                !!(t->flags & GGML_TENSOR_FLAG_COMPUTE),
+                                t->data);
+                        }
+                    }
                 }
             }
         }
