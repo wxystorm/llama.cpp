@@ -5948,6 +5948,11 @@ bool rpc_server::phone_ffn_mark_ready(
     if ((request.seq & RPC_PHONE_FFN_CPU_REDUCE_ARM) != 0) {
         const uint64_t seq =
             request.seq & ~RPC_PHONE_FFN_CPU_REDUCE_ARM;
+
+        GGML_LOG_ERROR(
+            "[RING_TRACE_PHONE] phase=ARM_RECV device=%u seq=%" PRIu64 "\n",
+            request.device,
+            seq);
         if (seq == 0) {
             return false;
         }
@@ -5978,6 +5983,11 @@ bool rpc_server::phone_ffn_mark_ready(
         return true;
     }
 
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=MARK_RECV device=%u seq=%" PRIu64 "\n",
+        request.device,
+        request.seq);
+
     bool ring_graph_marker = false;
     {
         std::lock_guard<std::mutex> join_lock(
@@ -6000,6 +6010,13 @@ bool rpc_server::phone_ffn_mark_ready(
         const bool ring_npu_async =
             std::getenv("GGML_RPC_DISABLE_CHUNK_RING_NPU_ASYNC") == nullptr;
 
+        GGML_LOG_ERROR(
+            "[RING_TRACE_PHONE] phase=MARK_MATCH_RING device=%u seq=%" PRIu64
+            " ring_async=%d\n",
+            request.device,
+            request.seq,
+            ring_npu_async ? 1 : 0);
+
         if (!ring_npu_async) {
             {
                 std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
@@ -6019,6 +6036,11 @@ bool rpc_server::phone_ffn_mark_ready(
         }
         return true;
     }
+
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=MARK_LEGACY_READY device=%u seq=%" PRIu64 "\n",
+        request.device,
+        request.seq);
 
     {
         std::lock_guard<std::mutex> lock(phone_ffn_ready_mutex);
@@ -6079,6 +6101,16 @@ bool rpc_server::set_tensor_async_return_wait(
         return false;
     }
 
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=RETURN_WAIT_ENTER device=%u seq=%" PRIu64
+        " dst=%s offset=%" PRIu64 " original_bytes=%zu wire=%u\n",
+        request.device,
+        request.phone_ffn_seq,
+        request.tensor.name,
+        request.offset,
+        original_size,
+        wire_type);
+
     const size_t wire_size =
         input.size() - header_size;
     if (wire_type == RPC_RETURN_WIRE_RAW) {
@@ -6120,6 +6152,13 @@ bool rpc_server::set_tensor_async_return_wait(
         }
     }
     const int64_t wait_us = ggml_time_us() - wait_begin_us;
+
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=RETURN_WAIT_READY device=%u seq=%" PRIu64
+        " wait_ms=%.3f\n",
+        request.device,
+        request.phone_ffn_seq,
+        wait_us / 1000.0);
 
     rpc_phone_npu_cpu_reduce_entry cpu_entry;
     bool cpu_reduce = false;
@@ -6168,6 +6207,16 @@ bool rpc_server::set_tensor_async_return_wait(
             }
         }
     }
+
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=RETURN_WAIT_MATCH device=%u seq=%" PRIu64
+        " cpu_reduce=%d failed=%d layer=%d chunk=%d\n",
+        request.device,
+        request.phone_ffn_seq,
+        cpu_reduce ? 1 : 0,
+        cpu_reduce_failed ? 1 : 0,
+        cpu_reduce ? cpu_entry.layer : -1,
+        cpu_reduce ? cpu_entry.chunk : -1);
 
     if (cpu_reduce_failed) {
         GGML_LOG_ERROR(
@@ -6219,20 +6268,33 @@ bool rpc_server::set_tensor_async_return_wait(
                 original_size);
         }
 
-        rpc_phone_npu_diag_f32_nonfinite(
-            "cpu_phone_partial",
-            request.phone_ffn_seq,
-            cpu_entry.layer,
-            cpu_entry.chunk,
-            cpu_entry.phone_partial.data(),
-            cpu_entry.phone_partial.size());
-        rpc_phone_npu_diag_f32_nonfinite(
-            "cpu_pc_partial",
-            request.phone_ffn_seq,
-            cpu_entry.layer,
-            cpu_entry.chunk,
-            pc_partial.data(),
-            pc_partial.size());
+        const bool phone_partial_nonfinite =
+            rpc_phone_npu_diag_f32_nonfinite(
+                "cpu_phone_partial",
+                request.phone_ffn_seq,
+                cpu_entry.layer,
+                cpu_entry.chunk,
+                cpu_entry.phone_partial.data(),
+                cpu_entry.phone_partial.size());
+        const bool pc_partial_nonfinite =
+            rpc_phone_npu_diag_f32_nonfinite(
+                "cpu_pc_partial",
+                request.phone_ffn_seq,
+                cpu_entry.layer,
+                cpu_entry.chunk,
+                pc_partial.data(),
+                pc_partial.size());
+
+        if (cpu_entry.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=CPU_JOIN_INPUTS seq=%" PRIu64
+                " chunk=%d phone_nf=%d pc_nf=%d count=%zu\n",
+                request.phone_ffn_seq,
+                cpu_entry.chunk,
+                phone_partial_nonfinite ? 1 : 0,
+                pc_partial_nonfinite ? 1 : 0,
+                cpu_entry.phone_partial.size());
+        }
 
         const int64_t reduce_begin_us =
             ggml_time_us();
@@ -6245,13 +6307,24 @@ bool rpc_server::set_tensor_async_return_wait(
         const int64_t reduce_us =
             ggml_time_us() - reduce_begin_us;
 
-        rpc_phone_npu_diag_f32_nonfinite(
-            "cpu_joined",
-            request.phone_ffn_seq,
-            cpu_entry.layer,
-            cpu_entry.chunk,
-            cpu_entry.phone_partial.data(),
-            cpu_entry.phone_partial.size());
+        const bool joined_nonfinite =
+            rpc_phone_npu_diag_f32_nonfinite(
+                "cpu_joined",
+                request.phone_ffn_seq,
+                cpu_entry.layer,
+                cpu_entry.chunk,
+                cpu_entry.phone_partial.data(),
+                cpu_entry.phone_partial.size());
+
+        if (cpu_entry.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=CPU_JOIN_DONE seq=%" PRIu64
+                " chunk=%d joined_nf=%d count=%zu\n",
+                request.phone_ffn_seq,
+                cpu_entry.chunk,
+                joined_nonfinite ? 1 : 0,
+                cpu_entry.phone_partial.size());
+        }
 
         const int64_t upload_begin_us =
             ggml_time_us();
@@ -6389,6 +6462,14 @@ bool rpc_server::set_tensor_async_return_wait(
             request.tensor.name);
         return true;
     }
+
+    GGML_LOG_ERROR(
+        "[RING_TRACE_PHONE] phase=RETURN_WAIT_LEGACY device=%u seq=%" PRIu64
+        " dst=%s bytes=%zu\n",
+        request.device,
+        request.phone_ffn_seq,
+        request.tensor.name,
+        original_size);
 
     std::vector<uint8_t> legacy_input(
         sizeof(rpc_tensor) +
@@ -8184,24 +8265,41 @@ bool rpc_server::prepare_phone_npu_async_job(
         return false;
     }
 
-    rpc_phone_npu_diag_f32_bytes_nonfinite(
-        "hidden_snapshot",
-        seq,
-        stage.layer,
-        stage.chunk,
-        prepared.hidden_dense);
-    rpc_phone_npu_diag_f32_bytes_nonfinite(
-        "route_snapshot",
-        seq,
-        stage.layer,
-        stage.chunk,
-        prepared.route_dense);
-    rpc_phone_npu_diag_topk_invalid(
-        seq,
-        stage.layer,
-        stage.chunk,
-        prepared.topk_dense,
-        cache->w_up->ne[2]);
+    const bool hidden_nonfinite =
+        rpc_phone_npu_diag_f32_bytes_nonfinite(
+            "hidden_snapshot",
+            seq,
+            stage.layer,
+            stage.chunk,
+            prepared.hidden_dense);
+    const bool route_nonfinite =
+        rpc_phone_npu_diag_f32_bytes_nonfinite(
+            "route_snapshot",
+            seq,
+            stage.layer,
+            stage.chunk,
+            prepared.route_dense);
+    const bool topk_invalid =
+        rpc_phone_npu_diag_topk_invalid(
+            seq,
+            stage.layer,
+            stage.chunk,
+            prepared.topk_dense,
+            cache->w_up->ne[2]);
+
+    if (stage.layer == 47) {
+        GGML_LOG_ERROR(
+            "[L47_RING_TRACE_PHONE] phase=ASYNC_SNAPSHOT seq=%" PRIu64
+            " chunk=%d hidden_nf=%d route_nf=%d topk_invalid=%d "
+            "tokens=%" PRId64 " used=%" PRId64 "\n",
+            seq,
+            stage.chunk,
+            hidden_nonfinite ? 1 : 0,
+            route_nonfinite ? 1 : 0,
+            topk_invalid ? 1 : 0,
+            n_tokens,
+            n_expert_used);
+    }
 
     prepared.enqueue_us = ggml_time_us();
     job = std::move(prepared);
@@ -8330,13 +8428,23 @@ bool rpc_server::execute_phone_npu_async_job(
         0,
         output_bytes);
 
-    rpc_phone_npu_diag_f32_nonfinite(
-        "npu_output",
-        job.seq,
-        job.layer,
-        job.chunk,
-        output.data(),
-        output.size());
+    const bool output_nonfinite =
+        rpc_phone_npu_diag_f32_nonfinite(
+            "npu_output",
+            job.seq,
+            job.layer,
+            job.chunk,
+            output.data(),
+            output.size());
+    if (job.layer == 47) {
+        GGML_LOG_ERROR(
+            "[L47_RING_TRACE_PHONE] phase=NPU_OUTPUT seq=%" PRIu64
+            " chunk=%d count=%zu nonfinite=%d\n",
+            job.seq,
+            job.chunk,
+            output.size(),
+            output_nonfinite ? 1 : 0);
+    }
     return true;
 }
 
@@ -8376,6 +8484,15 @@ void rpc_server::phone_npu_async_loop() {
             phone_npu_async_jobs.pop_front();
         }
 
+        if (job.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=WORKER_POP seq=%" PRIu64
+                " chunk=%d tokens=%" PRId64 "\n",
+                job.seq,
+                job.chunk,
+                job.n_tokens);
+        }
+
         const int64_t start_us = ggml_time_us();
         std::vector<float> output;
         bool ok = false;
@@ -8389,6 +8506,17 @@ void rpc_server::phone_npu_async_loop() {
                 job, output);
         }
         const int64_t done_us = ggml_time_us();
+
+        if (job.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=WORKER_EXEC_DONE seq=%" PRIu64
+                " chunk=%d ok=%d output_count=%zu compute_ms=%.3f\n",
+                job.seq,
+                job.chunk,
+                ok ? 1 : 0,
+                output.size(),
+                (done_us - start_us) / 1000.0);
+        }
 
         {
             std::lock_guard<std::mutex> join_lock(
@@ -8420,6 +8548,15 @@ void rpc_server::phone_npu_async_loop() {
             }
         }
 
+        if (job.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=WORKER_PENDING seq=%" PRIu64
+                " chunk=%d ok=%d\n",
+                job.seq,
+                job.chunk,
+                ok ? 1 : 0);
+        }
+
         // NPU completion, not the client-side post-graph marker, releases the
         // PC return waiter for Ring-owned seqs.
         {
@@ -8429,6 +8566,14 @@ void rpc_server::phone_npu_async_loop() {
                 job.device].insert(job.seq);
         }
         phone_ffn_ready_cv.notify_all();
+
+        if (job.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=WORKER_READY_SIGNAL seq=%" PRIu64
+                " chunk=%d\n",
+                job.seq,
+                job.chunk);
+        }
 
         GGML_LOG_INFO(
             "[CHUNK_RING_NPU_ASYNC_DONE] "
@@ -8453,6 +8598,8 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     ggml_backend_t gpu = backends[device];
+    const rpc_tensor_phone_graph_stage graph_id =
+        rpc_tensor_phone_graph_stage_identity(graph);
 
     uint64_t cpu_reduce_seq = 0;
     {
@@ -8470,7 +8617,28 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
         }
     }
 
+    if (graph_id.layer == 47) {
+        GGML_LOG_ERROR(
+            "[L47_RING_TRACE_PHONE] phase=GRAPH_ENTER device=%u uid=%" PRIu64
+            " nodes=%d stage=%s mode=%s chunk=%d cpu_reduce_seq=%" PRIu64 "\n",
+            device,
+            graph_uid,
+            graph->n_nodes,
+            graph_id.stage,
+            graph_id.mode,
+            graph_id.chunk,
+            cpu_reduce_seq);
+    }
+
     if (phone_npu_backend == nullptr) {
+        if (graph_id.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=GRAPH_PATH path=GPU_NO_PRIVATE_HTP "
+                "uid=%" PRIu64 " chunk=%d cpu_reduce_seq=%" PRIu64 "\n",
+                graph_uid,
+                graph_id.chunk,
+                cpu_reduce_seq);
+        }
         if (cpu_reduce_seq != 0) {
             GGML_LOG_ERROR(
                 "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
@@ -8487,7 +8655,37 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     std::vector<rpc_phone_npu_ffn_stage> stages =
         rpc_phone_npu_find_ffn_stages(graph);
 
+    bool has_l47_stage = false;
+    for (const auto & stage : stages) {
+        if (stage.layer == 47) {
+            has_l47_stage = true;
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=STAGE_FOUND uid=%" PRIu64
+                " chunk=%d prefill=%d front=%d down=%d nodes=%d "
+                "cpu_reduce_seq=%" PRIu64 " norm=%s topk=%s route=%s out=%s\n",
+                graph_uid,
+                stage.chunk,
+                stage.prefill ? 1 : 0,
+                stage.front_end,
+                stage.down_index,
+                graph->n_nodes,
+                cpu_reduce_seq,
+                stage.norm != nullptr ? stage.norm->name : "<null>",
+                stage.topk != nullptr ? stage.topk->name : "<null>",
+                stage.route_weights != nullptr ? stage.route_weights->name : "<null>",
+                stage.down != nullptr ? stage.down->name : "<null>");
+        }
+    }
+
     if (stages.empty()) {
+        if (graph_id.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=GRAPH_PATH path=GPU_NO_FFN_STAGE "
+                "uid=%" PRIu64 " chunk=%d cpu_reduce_seq=%" PRIu64 "\n",
+                graph_uid,
+                graph_id.chunk,
+                cpu_reduce_seq);
+        }
         if (cpu_reduce_seq != 0) {
             GGML_LOG_ERROR(
                 "[CHUNK_RING_CPU_JOIN] seq=%" PRIu64
@@ -8541,6 +8739,18 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     const bool ring_npu_async =
         std::getenv("GGML_RPC_DISABLE_CHUNK_RING_NPU_ASYNC") == nullptr;
 
+    if (graph_id.layer == 47 || has_l47_stage) {
+        GGML_LOG_ERROR(
+            "[L47_RING_TRACE_PHONE] phase=GRAPH_DECIDE uid=%" PRIu64
+            " stages=%zu cpu_reduce_seq=%" PRIu64 " ring_async=%d path=%s\n",
+            graph_uid,
+            stages.size(),
+            cpu_reduce_seq,
+            ring_npu_async ? 1 : 0,
+            (cpu_reduce_seq != 0 && ring_npu_async) ?
+                "ASYNC_NPU_CPU_JOIN" : "SYNC_OR_LEGACY_NPU");
+    }
+
     if (cpu_reduce_seq != 0 && ring_npu_async) {
         GGML_ASSERT(stages.size() == 1);
         const rpc_phone_npu_ffn_stage & stage = stages[0];
@@ -8550,6 +8760,15 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
                 graph, 0, stage.front_end);
             const ggml_status front_status =
                 ggml_backend_graph_compute(gpu, &front);
+            if (stage.layer == 47) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PHONE] phase=ASYNC_FRONT_DONE seq=%" PRIu64
+                    " chunk=%d status=%d front_nodes=%d\n",
+                    cpu_reduce_seq,
+                    stage.chunk,
+                    (int) front_status,
+                    stage.front_end);
+            }
             if (front_status != GGML_STATUS_SUCCESS) {
                 return front_status;
             }
@@ -8572,6 +8791,16 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             return GGML_STATUS_FAILED;
         }
 
+        if (stage.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=ASYNC_PREPARED seq=%" PRIu64
+                " chunk=%d output_bytes=%zu tokens=%" PRId64 "\n",
+                cpu_reduce_seq,
+                stage.chunk,
+                job.output_bytes,
+                job.n_tokens);
+        }
+
         ensure_phone_npu_async_worker();
         size_t queue_depth = 0;
         {
@@ -8585,6 +8814,15 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             queue_depth = phone_npu_async_jobs.size();
         }
         phone_npu_async_cv.notify_one();
+
+        if (stage.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=ASYNC_ENQUEUED seq=%" PRIu64
+                " chunk=%d queue_depth=%zu\n",
+                cpu_reduce_seq,
+                stage.chunk,
+                queue_depth);
+        }
 
         GGML_LOG_INFO(
             "[CHUNK_RING_NPU_ASYNC_ENQUEUE] "
@@ -8606,6 +8844,16 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
 
     cursor = 0;
     for (const auto & stage : stages) {
+        if (stage.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=SYNC_STAGE_BEGIN uid=%" PRIu64
+                " chunk=%d cpu_reduce_seq=%" PRIu64 " front=%d down=%d\n",
+                graph_uid,
+                stage.chunk,
+                cpu_reduce_seq,
+                stage.front_end,
+                stage.down_index);
+        }
         if (cursor < stage.front_end) {
             ggml_cgraph front = rpc_graph_view(
                 graph, cursor, stage.front_end);
@@ -8624,6 +8872,17 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
                 cpu_reduce_seq != 0 ?
                     &ring_phone_partial :
                     nullptr);
+
+        if (stage.layer == 47) {
+            GGML_LOG_ERROR(
+                "[L47_RING_TRACE_PHONE] phase=SYNC_HTP_RESULT uid=%" PRIu64
+                " chunk=%d cpu_reduce_seq=%" PRIu64 " htp_ok=%d partial_count=%zu\n",
+                graph_uid,
+                stage.chunk,
+                cpu_reduce_seq,
+                htp_ok ? 1 : 0,
+                ring_phone_partial.size());
+        }
 
         if (!htp_ok) {
             GGML_LOG_ERROR(
@@ -8697,6 +8956,15 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
                 pending.emplace(
                     cpu_reduce_seq,
                     std::move(entry));
+            }
+
+            if (stage.layer == 47) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PHONE] phase=SYNC_PENDING_INSERT seq=%" PRIu64
+                    " chunk=%d bytes=%zu\n",
+                    cpu_reduce_seq,
+                    stage.chunk,
+                    ggml_nbytes(stage.down));
             }
 
             GGML_LOG_INFO(
