@@ -14,7 +14,9 @@ struct socket_t {
     ~socket_t();
 
     bool send_data(const void * data, size_t size);
+    bool send_data_pair(const void * data0, size_t size0, const void * data1, size_t size1);
     bool recv_data(void * data, size_t size);
+    void shutdown();
 
     socket_ptr accept();
 
