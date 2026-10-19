@@ -3641,6 +3641,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 int64_t idle_wait_us[2] = { 0, 0 };
                 int64_t backend_exec_us[2] = { 0, 0 };
                 int queue_peak[2] = { 0, 0 };
+                const bool ring_exec_trace =
+                    std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_EXEC_TRACE") != nullptr &&
+                    std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_EXEC_TRACE")) != 0;
                 const int64_t ring_wall_begin_us =
                     ggml_time_us();
 
@@ -3715,9 +3718,41 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         // instance is unsafe until proven otherwise.
                         std::lock_guard<std::mutex> scheduler_lock(
                             scheduler_exec_mutex);
+                        if (ring_exec_trace) {
+                            const char * kind_name =
+                                kind == PC_RING_ATTN ? "ATTN" :
+                                kind == PC_RING_FFN ? "FFN" :
+                                kind == PC_RING_REDUCE ? "REDUCE" :
+                                kind == PC_RING_FULL ? "FULL" : "UNKNOWN";
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_EXEC] event=PRIMITIVE_BEGIN "
+                                "kind=%s layer=%d chunk=%d range=[%d,%d)\n",
+                                kind_name, layer, chunk,
+                                range.begin, range.end);
+                        }
+
                         for (int split = range.begin;
                              split < range.end;
                              ++split) {
+                            ggml_backend_t split_backend =
+                                ggml_backend_sched_get_split_backend(
+                                    sched_use, split);
+                            const int i_start =
+                                ggml_backend_sched_get_split_start(
+                                    sched_use, split);
+                            const int i_end =
+                                ggml_backend_sched_get_split_end(
+                                    sched_use, split);
+                            if (ring_exec_trace) {
+                                LLAMA_LOG_ERROR(
+                                    "[PC_LOCAL_RING_EXEC] event=SPLIT_BEGIN "
+                                    "kind=%d layer=%d chunk=%d split=%d "
+                                    "backend=%s nodes=[%d,%d)\n",
+                                    kind, layer, chunk, split,
+                                    ggml_backend_name(split_backend),
+                                    i_start, i_end);
+                            }
+
                             ggml_status status =
                                 ggml_backend_sched_prepare_split(
                                     sched_use, split);
@@ -3735,9 +3770,29 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             // Bootstrap correctness path: synchronize each
                             // internal split. Weight Manager/prefetch will later
                             // remove this intentionally conservative barrier.
-                            ggml_backend_synchronize(
-                                ggml_backend_sched_get_split_backend(
-                                    sched_use, split));
+                            ggml_backend_synchronize(split_backend);
+
+                            if (ring_exec_trace) {
+                                LLAMA_LOG_ERROR(
+                                    "[PC_LOCAL_RING_EXEC] event=SPLIT_END "
+                                    "kind=%d layer=%d chunk=%d split=%d "
+                                    "backend=%s\n",
+                                    kind, layer, chunk, split,
+                                    ggml_backend_name(split_backend));
+                            }
+                        }
+
+                        if (ring_exec_trace) {
+                            const char * kind_name =
+                                kind == PC_RING_ATTN ? "ATTN" :
+                                kind == PC_RING_FFN ? "FFN" :
+                                kind == PC_RING_REDUCE ? "REDUCE" :
+                                kind == PC_RING_FULL ? "FULL" : "UNKNOWN";
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_EXEC] event=PRIMITIVE_END "
+                                "kind=%s layer=%d chunk=%d range=[%d,%d)\n",
+                                kind_name, layer, chunk,
+                                range.begin, range.end);
                         }
                         return GGML_STATUS_SUCCESS;
                     };
