@@ -4919,17 +4919,48 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .context = */ ctx
     };
 
+    const char * inference_env =
+        std::getenv("GGML_INFERENCE_TRANSPORT");
+    const bool inference_new =
+        inference_env != nullptr &&
+        (std::strcmp(inference_env, "new") == 0 ||
+         std::strcmp(inference_env, "force-new") == 0);
+
     const char * probe_env =
         std::getenv("GGML_INFERENCE_TRANSPORT_PROBE");
-    if (probe_env != nullptr && std::atoi(probe_env) != 0) {
+    const bool probe =
+        probe_env != nullptr && std::atoi(probe_env) != 0;
+
+    if (inference_env != nullptr || probe) {
+        GGML_LOG_INFO(
+            "[INFERENCE_TRANSPORT_CONFIG] endpoint=%s device=%u "
+            "mode=%s probe=%d\n",
+            endpoint,
+            device,
+            inference_env != nullptr ? inference_env : "legacy",
+            probe ? 1 : 0);
+    }
+
+    if (inference_new || probe) {
         const bool opened =
             get_inference_transport(endpoint) != nullptr;
         GGML_LOG_INFO(
             "[INFERENCE_DATA_PLANE_PROBE] endpoint=%s device=%u "
-            "status=%s\n",
+            "mode=%s status=%s\n",
             endpoint,
             device,
+            inference_env != nullptr ? inference_env : "legacy",
             opened ? "OK" : "FAIL");
+
+        if (!opened &&
+            inference_env != nullptr &&
+            std::strcmp(inference_env, "force-new") == 0) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_TRANSPORT_CONFIG] endpoint=%s device=%u "
+                "mode=force-new status=FAIL reason=open_failed\n",
+                endpoint,
+                device);
+        }
     }
 
     return backend;
