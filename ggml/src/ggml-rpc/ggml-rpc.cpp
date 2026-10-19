@@ -3953,9 +3953,42 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         return false;
     }
 
+    const char * inference_transport_env =
+        std::getenv("GGML_INFERENCE_TRANSPORT");
+    const bool inference_force_new =
+        inference_transport_env != nullptr &&
+        std::strcmp(
+            inference_transport_env,
+            "force-new") == 0;
+    const bool inference_new =
+        inference_force_new ||
+        (inference_transport_env != nullptr &&
+         std::strcmp(
+             inference_transport_env,
+             "new") == 0);
+    constexpr uint8_t RPC_INFERENCE_RETURN_MIN_PATCH = 21;
+
     if (dst == nullptr && data == nullptr &&
             data_size == 0 && phone_ffn_seq == 0) {
-        return return_lane < RPC_RETURN_TRANSFER_LANES;
+        if (return_lane >= RPC_RETURN_TRANSFER_LANES) {
+            return false;
+        }
+        if (!inference_new) {
+            return true;
+        }
+
+        const bool available =
+            remote_patch >= RPC_INFERENCE_RETURN_MIN_PATCH &&
+            get_inference_transport(rpc_ctx->endpoint) != nullptr;
+        if (!available && !inference_force_new) {
+            GGML_LOG_INFO(
+                "[INFERENCE_RETURN] side=client status=FALLBACK "
+                "reason=capability endpoint=%s patch=%u\n",
+                rpc_ctx->endpoint.c_str(),
+                static_cast<unsigned>(remote_patch));
+            return true;
+        }
+        return available;
     }
 
     if (dst == nullptr || data == nullptr ||
@@ -4019,6 +4052,159 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
         wire_data = f16_payload.data();
         wire_size =
             n_elements * sizeof(ggml_fp16_t);
+    }
+
+    if (inference_new) {
+        bool new_available =
+            remote_patch >= RPC_INFERENCE_RETURN_MIN_PATCH;
+        std::shared_ptr<inference_transport> transport;
+        if (new_available) {
+            transport =
+                get_inference_transport(rpc_ctx->endpoint);
+            new_available = transport != nullptr;
+        }
+
+        if (!new_available) {
+            if (inference_force_new) {
+                GGML_LOG_ERROR(
+                    "[INFERENCE_RETURN] side=client status=FAIL "
+                    "reason=force_new_unavailable endpoint=%s patch=%u\n",
+                    rpc_ctx->endpoint.c_str(),
+                    static_cast<unsigned>(remote_patch));
+                return false;
+            }
+
+            GGML_LOG_INFO(
+                "[INFERENCE_RETURN] side=client status=FALLBACK "
+                "reason=unavailable endpoint=%s patch=%u\n",
+                rpc_ctx->endpoint.c_str(),
+                static_cast<unsigned>(remote_patch));
+        } else {
+            std::unique_lock<std::mutex> lane_lock(
+                rpc_dev_ctx->return_lane_mutex[return_lane]);
+
+            rpc_msg_inference_return_bind_req bind {};
+            bind.return_req.device = rpc_ctx->device;
+            bind.return_req.phone_ffn_seq =
+                phone_ffn_seq;
+            bind.return_req.tensor =
+                serialize_tensor(dst);
+            bind.return_req.offset = 0;
+            bind.return_req.wire_magic =
+                RPC_RETURN_WIRE_MAGIC;
+            bind.return_req.wire_type =
+                use_f16 ?
+                    RPC_RETURN_WIRE_F16 :
+                    RPC_RETURN_WIRE_RAW;
+            bind.return_req.reserved = 0;
+            bind.return_req.original_size =
+                data_size;
+            bind.graph_id = 0;
+            bind.wire_size = wire_size;
+            bind.layer = -1;
+            bind.chunk = -1;
+
+            const bool stage_profile =
+                rpc_tensor_phone_stage_profile_enabled();
+            const bool throttle_profile =
+                std::getenv(
+                    "GGML_META_XLAYER_THROTTLE_PROFILE") != nullptr;
+            const bool measure_profile =
+                stage_profile || throttle_profile;
+            const int64_t begin_us =
+                measure_profile ? ggml_time_us() : 0;
+
+            const int64_t bind_begin_us =
+                measure_profile ? ggml_time_us() : 0;
+            bool status = send_rpc_cmd(
+                sock,
+                RPC_CMD_INFERENCE_RETURN_BIND,
+                &bind,
+                sizeof(bind));
+            const int64_t bind_done_us =
+                measure_profile ? ggml_time_us() : 0;
+
+            if (status) {
+                inference_tx_buffer tx =
+                    transport->acquire_tx(wire_size);
+                status = static_cast<bool>(tx);
+                if (status && wire_size > 0) {
+                    std::memcpy(
+                        tx.data,
+                        wire_data,
+                        wire_size);
+                }
+
+                if (status) {
+                    inference_frame_header header =
+                        inference_make_header(
+                            INFERENCE_FRAME_DATA);
+                    header.stage =
+                        INFERENCE_STAGE_RETURN;
+                    header.stream_id =
+                        rpc_ctx->device;
+                    header.seq = phone_ffn_seq;
+                    header.graph_id = 0;
+                    header.layer = -1;
+                    header.chunk = -1;
+
+                    status = transport->submit_tx(
+                        std::move(tx),
+                        header,
+                        wire_size);
+                } else if (tx) {
+                    transport->release_tx(
+                        std::move(tx));
+                }
+            }
+
+            const int64_t submit_done_us =
+                measure_profile ? ggml_time_us() : 0;
+
+            rpc_msg_inference_return_bind_rsp response {};
+            if (status) {
+                status = recv_msg(
+                    sock,
+                    &response,
+                    sizeof(response));
+                if (status && response.result == 0) {
+                    status = false;
+                }
+            } else {
+                // A bind may already be waiting on the server. Closing the
+                // data plane wakes all pending bindings as failed instead of
+                // leaving a control thread blocked indefinitely.
+                transport->stop();
+            }
+
+            const int64_t done_us =
+                measure_profile ? ggml_time_us() : 0;
+
+            if (stage_profile || throttle_profile) {
+                GGML_LOG_INFO(
+                    "[INFERENCE_RETURN] side=client "
+                    "seq=%" PRIu64 " lane=%zu "
+                    "bytes=%zu wire=%zu wire_type=%s "
+                    "bind_ms=%.3f submit_ms=%.3f "
+                    "completion_ms=%.3f total_ms=%.3f "
+                    "status=%s\n",
+                    phone_ffn_seq,
+                    return_lane,
+                    data_size,
+                    wire_size,
+                    use_f16 ? "f16" : "raw",
+                    (bind_done_us - bind_begin_us) /
+                        1000.0,
+                    (submit_done_us - bind_done_us) /
+                        1000.0,
+                    (done_us - submit_done_us) /
+                        1000.0,
+                    (done_us - begin_us) / 1000.0,
+                    status ? "OK" : "FAIL");
+            }
+
+            return status;
+        }
     }
 
     std::vector<uint8_t> input;
