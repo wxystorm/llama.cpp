@@ -13529,6 +13529,119 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
+    const bool output_path_diag =
+        std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+        std::atoi(std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0;
+
+    if (output_path_diag) {
+        ggml_tensor * original_output = nullptr;
+        for (int k = 0; k < cgraph->n_nodes; ++k) {
+            ggml_tensor * node = cgraph->nodes[k];
+            if (node != nullptr &&
+                    std::strcmp(node->name, "result_output") == 0) {
+                original_output = node;
+                break;
+            }
+        }
+
+        if (original_output != nullptr) {
+            ggml_tensor * pc_output = nullptr;
+            ggml_tensor * phone_output = nullptr;
+            ggml_tensor * pc_last = nullptr;
+            ggml_tensor * phone_last = nullptr;
+
+            if (n_backends > 0) {
+                ggml_cgraph * g =
+                    backend_ctx->backend_configs[0].
+                        cgraphs[i].cgraph_main;
+                if (g != nullptr && g->n_nodes > 0) {
+                    pc_last = g->nodes[g->n_nodes - 1];
+                    for (int k = 0; k < g->n_nodes; ++k) {
+                        if (g->nodes[k] != nullptr &&
+                                std::strcmp(
+                                    g->nodes[k]->name,
+                                    "result_output") == 0) {
+                            pc_output = g->nodes[k];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (n_backends > 1) {
+                ggml_cgraph * g =
+                    backend_ctx->backend_configs[1].
+                        cgraphs[i].cgraph_main;
+                if (g != nullptr && g->n_nodes > 0) {
+                    phone_last = g->nodes[g->n_nodes - 1];
+                    for (int k = 0; k < g->n_nodes; ++k) {
+                        if (g->nodes[k] != nullptr &&
+                                std::strcmp(
+                                    g->nodes[k]->name,
+                                    "result_output") == 0) {
+                            phone_output = g->nodes[k];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            const bool path_prefill_down = is_prefill_down_sg;
+            const bool path_prefill_norm = is_prefill_norm_sg;
+            const bool path_prefill_pc =
+                subgraph_is_prefill_pc_only(i);
+            const bool path_decode_norm =
+                is_decode_pc_only_norm_sg(i);
+            const bool path_decode_ffn =
+                subgraph_is_decode_pc_only_ffn(i);
+            const bool path_phone =
+                subgraph_is_phone_only(i);
+
+            const char * selected_path =
+                path_prefill_down ? "PREFILL_DOWN" :
+                path_prefill_norm ? "PREFILL_NORM" :
+                path_prefill_pc ? "PREFILL_PC" :
+                path_decode_norm ? "DECODE_PC_NORM" :
+                path_decode_ffn ? "DECODE_PC_FFN" :
+                path_phone ? "PHONE_ONLY" :
+                "GENERIC";
+
+            const ggml_backend_meta_split_state out_ss =
+                ggml_backend_meta_get_split_state(
+                    original_output,
+                    false);
+
+            GGML_LOG_ERROR(
+                "[OUT_PATH] sg=%zu/%zu uid=%" PRIu64
+                " path=%s flags={pd=%d,pn=%d,ppc=%d,dn=%d,df=%d,ph=%d} "
+                "ss=%s pc={last=%s lc=%d outc=%d ne0=%" PRId64 "} "
+                "ph={last=%s lc=%d outc=%d ne0=%" PRId64 "}\n",
+                i,
+                backend_ctx->n_subgraphs,
+                cgraph->uid,
+                selected_path,
+                path_prefill_down ? 1 : 0,
+                path_prefill_norm ? 1 : 0,
+                path_prefill_pc ? 1 : 0,
+                path_decode_norm ? 1 : 0,
+                path_decode_ffn ? 1 : 0,
+                path_phone ? 1 : 0,
+                ggml_backend_meta_split_axis_name(out_ss.axis),
+                pc_last != nullptr ? pc_last->name : "-",
+                pc_last != nullptr ?
+                    !!(pc_last->flags & GGML_TENSOR_FLAG_COMPUTE) : -1,
+                pc_output != nullptr ?
+                    !!(pc_output->flags & GGML_TENSOR_FLAG_COMPUTE) : -1,
+                pc_output != nullptr ? pc_output->ne[0] : 0,
+                phone_last != nullptr ? phone_last->name : "-",
+                phone_last != nullptr ?
+                    !!(phone_last->flags & GGML_TENSOR_FLAG_COMPUTE) : -1,
+                phone_output != nullptr ?
+                    !!(phone_output->flags & GGML_TENSOR_FLAG_COMPUTE) : -1,
+                phone_output != nullptr ? phone_output->ne[0] : 0);
+        }
+    }
+
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
         if (wave_crash_trace) {
