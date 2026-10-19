@@ -10735,10 +10735,32 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_synchronize(bcj_dst.backend);
                     ggml_backend_tensor_copy_async(
                         bcj_dst.backend, bcj_dst.backend, node_dst, pc_output_chunk);
+
+                    // pc_output_chunk is allocator-visible storage used to
+                    // assemble the full layer output. Every chunk must finish
+                    // materializing before this worker publishes completion;
+                    // otherwise node_dst may be reused by the next chunk while
+                    // the async local copy still consumes it. The old code only
+                    // synchronized the final chunk, which made a single-chunk
+                    // prefill safe but left multi-chunk prefill racy.
+                    const int64_t materialize_sync_start_us = ggml_time_us();
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    const int64_t materialize_sync_us =
+                        ggml_time_us() - materialize_sync_start_us;
+                    if (pipeline_debug) {
+                        GGML_LOG_INFO(
+                            "[PREFILL_CHUNK_MATERIALIZED] "
+                            "layer=%d chunk=%d lane=%zu wait_ms=%.3f last=%d\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            return_lane,
+                            materialize_sync_us / 1000.0,
+                            layer_handoff ? 1 : 0);
+                    }
+
                     if (!layer_handoff) {
                         return finish_return(status);
                     }
-                    ggml_backend_synchronize(bcj_dst.backend);
 
                     const int64_t handoff_start_us = ggml_time_us();
                     ggml_backend_tensor_copy_async(
