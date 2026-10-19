@@ -14089,6 +14089,21 @@ auto prefill_norm_sg_has_prework =
                 phone_prefill_chunk_join_active ?
                     backend_ctx->next_phone_prefill_ffn_seq++ : 0;
 
+            if (prefill_down_layer == 47) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PC] phase=SEQ_CREATE layer=%d chunk=%d sg=%zu "
+                    "seq=%" PRIu64 " chunk_ring=%d xlayer=%d pipeline=%d "
+                    "producer_route=%d async_return=%d ordered_return=%d chunk_join=%d\n",
+                    prefill_down_layer, prefill_down_chunk, i, phone_ffn_seq,
+                    phone_primary_chunk_ring_active ? 1 : 0,
+                    phone_primary_xlayer_wave ? 1 : 0,
+                    phone_prefill_chunk_pipeline ? 1 : 0,
+                    phone_prefill_producer_route ? 1 : 0,
+                    phone_prefill_async_return_active ? 1 : 0,
+                    phone_prefill_ordered_return_active ? 1 : 0,
+                    phone_prefill_chunk_join_active ? 1 : 0);
+            }
+
             ggml_tensor * pc_return_src = nullptr;
             ggml_tensor * phone_return_dst = nullptr;
             ggml_tensor * phone_return_stage = nullptr;
@@ -14151,6 +14166,18 @@ auto prefill_norm_sg_has_prework =
                     return_buf.get();
                 phone_return_stage->data =
                     ggml_backend_buffer_get_base(return_buf.get());
+
+                if (prefill_down_layer == 47) {
+                    GGML_LOG_ERROR(
+                        "[L47_RING_TRACE_PC] phase=RETURN_STAGE_PREP chunk=%d sg=%zu "
+                        "seq=%" PRIu64 " src=%s dst=%s stage=%s bytes=%zu stage_data=%p\n",
+                        prefill_down_chunk, i, phone_ffn_seq,
+                        pc_return_src != nullptr ? pc_return_src->name : "<null>",
+                        phone_return_dst != nullptr ? phone_return_dst->name : "<null>",
+                        phone_return_stage != nullptr ? phone_return_stage->name : "<null>",
+                        return_bytes,
+                        phone_return_stage != nullptr ? phone_return_stage->data : nullptr);
+                }
 
                 auto & host_payloads =
                     backend_ctx->prefill_pc_return_host_payloads;
@@ -14353,6 +14380,21 @@ auto prefill_norm_sg_has_prework =
                         const int64_t pc_compute_us =
                             ggml_time_us() - pc_begin_us;
 
+                        if (prefill_down_layer == 47) {
+                            GGML_LOG_ERROR(
+                                "[L47_RING_TRACE_PC] phase=PC_COMPUTE_DONE chunk=%d "
+                                "sg=%zu task=%" PRIu64 " status=%d compute_ms=%.3f return_src=%s\n",
+                                prefill_down_chunk, i, task_id, (int) status,
+                                pc_compute_us / 1000.0,
+                                pc_return_src != nullptr ? pc_return_src->name : "<null>");
+                            if (status == GGML_STATUS_SUCCESS && pc_return_src != nullptr) {
+                                meta_debug_tensor(
+                                    pc_backend,
+                                    pc_return_src,
+                                    "L47_RING_PC_RETURN_SRC_PRE_GET");
+                            }
+                        }
+
                         int64_t return_stage_us = 0;
                         if (status == GGML_STATUS_SUCCESS &&
                                 return_payload != nullptr) {
@@ -14370,6 +14412,15 @@ auto prefill_norm_sg_has_prework =
                             return_stage_us =
                                 ggml_time_us() -
                                 return_stage_begin_us;
+                        }
+
+                        if (prefill_down_layer == 47) {
+                            GGML_LOG_ERROR(
+                                "[L47_RING_TRACE_PC] phase=PC_RETURN_CAPTURE chunk=%d "
+                                "sg=%zu task=%" PRIu64 " status=%d bytes=%zu capture_ms=%.3f\n",
+                                prefill_down_chunk, i, task_id, (int) status,
+                                return_payload != nullptr ? return_payload->size() : 0,
+                                return_stage_us / 1000.0);
                         }
 
                         return_timing->pc_route_wait_us =
@@ -14568,6 +14619,16 @@ auto prefill_norm_sg_has_prework =
                             ggml_time_us();
                         return_timing->return_send_begin_us =
                             send_begin_us;
+
+                        if (prefill_down_layer == 47) {
+                            GGML_LOG_ERROR(
+                                "[L47_RING_TRACE_PC] phase=RETURN_SEND_BEGIN chunk=%d "
+                                "sg=%zu task=%" PRIu64 " seq=%" PRIu64
+                                " lane=%zu join=%d bytes=%zu\n",
+                                prefill_down_chunk, i, task_id, phone_ffn_seq,
+                                return_lane, use_chunk_join_return ? 1 : 0,
+                                return_payload != nullptr ? return_payload->size() : 0);
+                        }
                         const bool sent =
                             use_chunk_join_return ?
                                 async_return_wait(
@@ -14586,6 +14647,16 @@ auto prefill_norm_sg_has_prework =
                             ggml_time_us();
                         const int64_t send_us =
                             send_end_us - send_begin_us;
+
+                        if (prefill_down_layer == 47) {
+                            GGML_LOG_ERROR(
+                                "[L47_RING_TRACE_PC] phase=RETURN_SEND_END chunk=%d "
+                                "sg=%zu task=%" PRIu64 " seq=%" PRIu64
+                                " lane=%zu join=%d sent=%d send_ms=%.3f\n",
+                                prefill_down_chunk, i, task_id, phone_ffn_seq,
+                                return_lane, use_chunk_join_return ? 1 : 0,
+                                sent ? 1 : 0, send_us / 1000.0);
+                        }
                         return_timing->return_send_end_us =
                             send_end_us;
 
@@ -14722,6 +14793,19 @@ auto prefill_norm_sg_has_prework =
                 xlayer_direct_bound &&
                 return_task != 0;
 
+            if (prefill_down_layer == 47) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PC] phase=RING_DECIDE chunk=%d sg=%zu "
+                    "seq=%" PRIu64 " direct_bound=%d return_task=%" PRIu64
+                    " chunk_ring_active=%d use_cpu_reduce=%d defer=%d phone_graph_uid=%" PRIu64 "\n",
+                    prefill_down_chunk, i, phone_ffn_seq,
+                    xlayer_direct_bound ? 1 : 0, return_task,
+                    phone_primary_chunk_ring_active ? 1 : 0,
+                    use_ring_cpu_reduce ? 1 : 0,
+                    defer_local_phone_ffn ? 1 : 0,
+                    saved_phone_ffn_uid);
+            }
+
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             int64_t phone_wall_us = 0;
             if (defer_local_phone_ffn) {
@@ -14750,12 +14834,26 @@ auto prefill_norm_sg_has_prework =
                 if (use_ring_cpu_reduce) {
                     GGML_ASSERT(phone_ffn_seq != 0);
                     GGML_ASSERT(phone_prefill_ffn_mark_ready != nullptr);
+
+                    if (prefill_down_layer == 47) {
+                        GGML_LOG_ERROR(
+                            "[L47_RING_TRACE_PC] phase=ARM_SEND chunk=%d sg=%zu seq=%" PRIu64 "\n",
+                            prefill_down_chunk, i, phone_ffn_seq);
+                    }
+
                     const bool armed =
                         phone_prefill_ffn_mark_ready(
                             phone_backend,
                             phone_ffn_seq |
                                 PHONE_FFN_CPU_REDUCE_ARM);
                     GGML_ASSERT(armed);
+
+                    if (prefill_down_layer == 47) {
+                        GGML_LOG_ERROR(
+                            "[L47_RING_TRACE_PC] phase=ARM_RESULT chunk=%d sg=%zu "
+                            "seq=%" PRIu64 " armed=%d\n",
+                            prefill_down_chunk, i, phone_ffn_seq, armed ? 1 : 0);
+                    }
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
@@ -14769,10 +14867,27 @@ auto prefill_norm_sg_has_prework =
                     }
                 }
 
+                if (prefill_down_layer == 47) {
+                    GGML_LOG_ERROR(
+                        "[L47_RING_TRACE_PC] phase=PHONE_COMPUTE_BEGIN chunk=%d "
+                        "sg=%zu seq=%" PRIu64 " use_cpu_reduce=%d\n",
+                        prefill_down_chunk, i, phone_ffn_seq,
+                        use_ring_cpu_reduce ? 1 : 0);
+                }
+
                 const int64_t phone_begin_us = ggml_time_us();
                 compute_workers.start(1, i);
                 phone_status = compute_workers.wait(1);
                 phone_wall_us = ggml_time_us() - phone_begin_us;
+
+                if (prefill_down_layer == 47) {
+                    GGML_LOG_ERROR(
+                        "[L47_RING_TRACE_PC] phase=PHONE_COMPUTE_END chunk=%d "
+                        "sg=%zu seq=%" PRIu64 " status=%d wall_ms=%.3f\n",
+                        prefill_down_chunk, i, phone_ffn_seq,
+                        (int) phone_status, phone_wall_us / 1000.0);
+                }
+
                 if (phone_status != GGML_STATUS_SUCCESS) {
                     if (xlayer_direct_bound) {
                         phone_graph->uid = saved_phone_ffn_uid;
@@ -14783,11 +14898,25 @@ auto prefill_norm_sg_has_prework =
                 if (phone_prefill_chunk_join_active) {
                     GGML_ASSERT(phone_ffn_seq != 0);
                     GGML_ASSERT(phone_prefill_ffn_mark_ready != nullptr);
+
+                    if (prefill_down_layer == 47) {
+                        GGML_LOG_ERROR(
+                            "[L47_RING_TRACE_PC] phase=MARK_SEND chunk=%d sg=%zu seq=%" PRIu64 "\n",
+                            prefill_down_chunk, i, phone_ffn_seq);
+                    }
+
                     const bool marked =
                         phone_prefill_ffn_mark_ready(
                             phone_backend,
                             phone_ffn_seq);
                     GGML_ASSERT(marked);
+
+                    if (prefill_down_layer == 47) {
+                        GGML_LOG_ERROR(
+                            "[L47_RING_TRACE_PC] phase=MARK_RESULT chunk=%d sg=%zu "
+                            "seq=%" PRIu64 " marked=%d\n",
+                            prefill_down_chunk, i, phone_ffn_seq, marked ? 1 : 0);
+                    }
 
                     if (pipeline_debug ||
                             tensor_phone_stage_profile) {
@@ -14804,6 +14933,18 @@ auto prefill_norm_sg_has_prework =
 
             if (xlayer_direct_bound) {
                 phone_graph->uid = saved_phone_ffn_uid;
+            }
+
+            if (prefill_down_layer == 47 && !use_ring_cpu_reduce) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PC] phase=CPU_REDUCE_BYPASS chunk=%d sg=%zu "
+                    "seq=%" PRIu64 " chunk_ring_active=%d direct_bound=%d "
+                    "return_task=%" PRIu64 " defer=%d\n",
+                    prefill_down_chunk, i, phone_ffn_seq,
+                    phone_primary_chunk_ring_active ? 1 : 0,
+                    xlayer_direct_bound ? 1 : 0,
+                    return_task,
+                    defer_local_phone_ffn ? 1 : 0);
             }
 
             if (phone_primary_chunk_ring_active &&
@@ -14858,6 +14999,15 @@ auto prefill_norm_sg_has_prework =
                         const int64_t return_wait_us =
                             ggml_time_us() - wait_begin_us;
 
+                        if (prefill_down_layer == 47) {
+                            GGML_LOG_ERROR(
+                                "[L47_RING_TRACE_PC] phase=RING_ACK chunk=%d sg=%zu "
+                                "task=%" PRIu64 " return_task=%" PRIu64
+                                " status=%d wait_ms=%.3f\n",
+                                prefill_down_chunk, i, task_id, return_task,
+                                (int) return_status, return_wait_us / 1000.0);
+                        }
+
                         if (return_timing != nullptr) {
                             return_timing->add_submit_begin_us = 0;
                             return_timing->add_submit_end_us = 0;
@@ -14878,6 +15028,15 @@ auto prefill_norm_sg_has_prework =
                         }
                         return return_status;
                     });
+            }
+
+            if (prefill_down_layer == 47) {
+                GGML_LOG_ERROR(
+                    "[L47_RING_TRACE_PC] phase=BRANCH_REGISTER chunk=%d sg=%zu "
+                    "seq=%" PRIu64 " pc_task=%" PRIu64 " return_task=%" PRIu64
+                    " ring_reduce_task=%" PRIu64 " lane=%zu\n",
+                    prefill_down_chunk, i, phone_ffn_seq, pc_task,
+                    return_task, ring_reduce_task, return_lane);
             }
 
             pending_phone_prefill_pc_branches.push_back({
