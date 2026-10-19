@@ -9626,12 +9626,54 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_primary_tensor_sg ||
                 inferred_phone_primary_tensor ||
                 forced_phone_primary_tensor;
-            const bool internal_pc_handoff =
+            const bool internal_pc_handoff_candidate =
                 n_backends == 2 && active_backend == 1 &&
                 !tp_layer_context &&
                 i + 1 < backend_ctx->n_subgraphs &&
                 (subgraph_is_prefill_pc_only(i + 1) ||
                  subgraph_is_decode_pc_only_norm(i + 1));
+
+            // If the Phone terminal node is the MoE FFN output and the next
+            // PC subgraph already owns the real l_out producer, keep that
+            // producer alive.  The old handoff path disabled it and rebuilt
+            // l_out on Phone from find_recent_ffn_inp_layer().  That pointer
+            // refers to an older intermediate whose allocator storage may
+            // already have been reused by the time the Phone FFN finishes.
+            // A large prefill makes this visible as stale NaNs which then
+            // poison l_out and every following decode token.
+            int terminal_moe_layer = -1;
+            int terminal_moe_parsed = 0;
+            const bool terminal_moe_out =
+                nodes[1] != nullptr &&
+                std::sscanf(
+                    nodes[1]->name,
+                    "ffn_moe_out-%d%n",
+                    &terminal_moe_layer,
+                    &terminal_moe_parsed) == 1 &&
+                nodes[1]->name[terminal_moe_parsed] == '\0';
+
+            const bool preserve_pc_lout_producer =
+                internal_pc_handoff_candidate &&
+                terminal_moe_out &&
+                terminal_moe_layer >= 0 &&
+                has_layer_output_producer(
+                    0, i + 1, terminal_moe_layer);
+
+            const bool internal_pc_handoff =
+                internal_pc_handoff_candidate &&
+                !preserve_pc_lout_producer;
+
+            if (preserve_pc_lout_producer &&
+                    std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[META_PRESERVE_PC_LOUT] sg=%zu next=%zu "
+                    "layer=%d src=%s action=COPY_FFN_KEEP_PC_LOUT\n",
+                    i,
+                    i + 1,
+                    terminal_moe_layer,
+                    nodes[1]->name);
+            }
+
             int layer = force_phone_block_exit ? force_phone_block_layer : -1;
             ggml_tensor * src_residual = nullptr;
             if (internal_pc_handoff || phone_owner_exit) {
@@ -9651,6 +9693,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(ggml_nbytes(dst_l_out) == ggml_nbytes(nodes[1]));
             }
             const bool external_handoff_candidate =
+                !preserve_pc_lout_producer &&
                 !tp_layer_context &&
                 phone_owner_exit && !internal_pc_handoff &&
                 src_residual != nullptr && dst_l_out != nullptr &&
