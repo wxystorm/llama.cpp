@@ -3623,7 +3623,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 std::deque<pc_ring_job> queues[2];
 
                 std::mutex queue_mutex;
-                std::mutex prepare_mutex;
+                // Correctness probe: ggml_backend_sched_* and the CUDA backend
+                // are driven from two FIFO workers below, but the scheduler is
+                // not assumed to be thread-safe for concurrent split
+                // prepare/compute/synchronize calls. Serialize the complete
+                // primitive submission path while keeping FIFO/task ordering
+                // unchanged.
+                std::mutex scheduler_exec_mutex;
                 std::condition_variable queue_cv;
                 ggml_status ring_status = ret;
                 int completed = 0;
@@ -3700,18 +3706,21 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         // A primitive may contain several scheduler splits
                         // because the scheduler subdivides host-weight copies.
                         // Keep all of those splits inside the logical FIFO task.
+                        //
+                        // Correctness probe: serialize the COMPLETE scheduler
+                        // interaction, not merely prepare_split(). prepare_split()
+                        // can touch cross-backend copies/events and synchronize
+                        // CUDA while another worker is computing a different
+                        // split, so concurrent access to one scheduler/backend
+                        // instance is unsafe until proven otherwise.
+                        std::lock_guard<std::mutex> scheduler_lock(
+                            scheduler_exec_mutex);
                         for (int split = range.begin;
                              split < range.end;
                              ++split) {
                             ggml_status status =
-                                GGML_STATUS_SUCCESS;
-                            {
-                                std::lock_guard<std::mutex> lock(
-                                    prepare_mutex);
-                                status =
-                                    ggml_backend_sched_prepare_split(
-                                        sched_use, split);
-                            }
+                                ggml_backend_sched_prepare_split(
+                                    sched_use, split);
                             if (status != GGML_STATUS_SUCCESS) {
                                 return status;
                             }
@@ -3883,7 +3892,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "layers=[%d,%d) chunks=%d "
                     "primitive_tasks=%d jobs=%d "
                     "split_range=[%d,%d] internal_splits=%d "
-                    "B0=CPU B1=ACCEL\n",
+                    "B0=CPU B1=ACCEL scheduler_exec=SERIAL_PROBE\n",
                     stage.layer_begin,
                     stage.layer_end,
                     n_chunks,
