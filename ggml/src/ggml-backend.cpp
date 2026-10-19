@@ -2022,7 +2022,10 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             int input_id,
             const ggml_tensor * input,
             const ggml_tensor * input_cpy) {
-            if (!pc_ring_copy_diag) {
+            if (!pc_ring_copy_diag ||
+                ggml_backend_dev_type(
+                    ggml_backend_get_device(split_backend)) !=
+                    GGML_BACKEND_DEVICE_TYPE_GPU) {
                 return;
             }
 

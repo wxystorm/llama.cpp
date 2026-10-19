@@ -3644,6 +3644,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const bool ring_exec_trace =
                     std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_EXEC_TRACE") != nullptr &&
                     std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_EXEC_TRACE")) != 0;
+                const bool ring_copy_diag =
+                    std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_COPY_DIAG") != nullptr &&
+                    std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING_COPY_DIAG")) != 0;
                 const int64_t ring_wall_begin_us =
                     ggml_time_us();
 
@@ -4746,6 +4749,40 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                     kind, layer, chunk, split,
                                     ggml_backend_name(split_backend),
                                     i_start, i_end);
+                            }
+
+                            if (ring_copy_diag &&
+                                ggml_backend_dev_type(
+                                    ggml_backend_get_device(
+                                        split_backend)) ==
+                                    GGML_BACKEND_DEVICE_TYPE_GPU) {
+                                size_t mem_free = 0;
+                                size_t mem_total = 0;
+                                ggml_backend_dev_memory(
+                                    ggml_backend_get_device(
+                                        split_backend),
+                                    &mem_free,
+                                    &mem_total);
+                                LLAMA_LOG_ERROR(
+                                    "[PC_RING_COPY_TASK] "
+                                    "kind=%d layer=%d chunk=%d split=%d "
+                                    "backend=%s nodes=[%d,%d) "
+                                    "free_mib=%.2f total_mib=%.2f "
+                                    "used_mib=%.2f\n",
+                                    kind,
+                                    layer,
+                                    chunk,
+                                    split,
+                                    ggml_backend_name(
+                                        split_backend),
+                                    i_start,
+                                    i_end,
+                                    mem_free /
+                                        (1024.0 * 1024.0),
+                                    mem_total /
+                                        (1024.0 * 1024.0),
+                                    (mem_total - mem_free) /
+                                        (1024.0 * 1024.0));
                             }
 
                             primitive_status =
