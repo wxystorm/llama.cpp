@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    19
+#define RPC_PROTO_PATCH_VERSION    20
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -102,6 +102,18 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC \
     "ggml_backend_rpc_set_tensor_async_return_wait"
 
+#define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC \
+    "ggml_backend_rpc_inference_transport_open"
+
+#define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_SUBMIT_PROC \
+    "ggml_backend_rpc_inference_transport_submit"
+
+#define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC \
+    "ggml_backend_rpc_inference_transport_receive"
+
+#define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_STATS_PROC \
+    "ggml_backend_rpc_inference_transport_stats"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -143,6 +155,59 @@ using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         size_t size,
         uint64_t phone_ffn_seq,
         size_t return_lane);
+
+struct ggml_backend_rpc_inference_task {
+    uint64_t graph_id;
+    uint64_t seq;
+    int32_t  layer;
+    int32_t  chunk;
+    uint32_t stream_id;
+    uint16_t stage;
+    uint16_t tensor_role;
+    uint16_t priority;
+    uint16_t flags;
+};
+
+struct ggml_backend_rpc_inference_transport_stats {
+    uint64_t frames_sent;
+    uint64_t frames_received;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t tx_acquire_wait_count;
+    uint64_t rx_slot_wait_count;
+    double   tx_acquire_wait_ms;
+    double   rx_slot_wait_ms;
+    double   tx_queue_wait_ms;
+    double   tx_queue_wait_max_ms;
+    double   tx_send_ms;
+    double   rx_recv_ms;
+    double   rx_ready_wait_ms;
+    double   rx_ready_wait_max_ms;
+    size_t   tx_queue_max;
+    size_t   tx_inflight_max;
+    size_t   rx_ready_max;
+};
+
+using ggml_backend_rpc_inference_transport_open_t = bool (*)(
+        ggml_backend_t backend);
+
+using ggml_backend_rpc_inference_transport_submit_t = bool (*)(
+        ggml_backend_t backend,
+        const struct ggml_backend_rpc_inference_task * task,
+        const void * data,
+        size_t size);
+
+using ggml_backend_rpc_inference_transport_receive_t = bool (*)(
+        ggml_backend_t backend,
+        struct ggml_backend_rpc_inference_task * task,
+        void * data,
+        size_t capacity,
+        size_t * size,
+        int timeout_ms);
+
+using ggml_backend_rpc_inference_transport_stats_t = bool (*)(
+        ggml_backend_t backend,
+        struct ggml_backend_rpc_inference_transport_stats * stats);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
