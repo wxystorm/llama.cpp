@@ -2142,35 +2142,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             int bind_layer = stage->layer_begin;
             bool ring_bind_active = false;
             bool force_next_split = false;
-            int dynamic_scratch_nodes = 0;
-
-            const auto pc_ring_dynamic_scratch_candidate =
-                [](ggml_tensor * node) -> bool {
-                    if ((node->flags &
-                            (GGML_TENSOR_FLAG_INPUT |
-                             GGML_TENSOR_FLAG_OUTPUT |
-                             GGML_TENSOR_FLAG_PARAM)) != 0) {
-                        return false;
-                    }
-
-                    ggml_tensor * root = node;
-                    while (root->view_src != nullptr) {
-                        root = root->view_src;
-                    }
-
-                    // Preallocated roots belong to persistent/model/KV/input
-                    // storage. Only scheduler-owned compute temporaries are
-                    // rebound into the task-local scratch arena.
-                    if (root->buffer != nullptr ||
-                        root->data != nullptr ||
-                        (root->flags &
-                            (GGML_TENSOR_FLAG_INPUT |
-                             GGML_TENSOR_FLAG_OUTPUT |
-                             GGML_TENSOR_FLAG_PARAM)) != 0) {
-                        return false;
-                    }
-                    return true;
-                };
 
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 ggml_tensor * node =
@@ -2180,14 +2151,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         node->name,
                         "pc_ring_entry",
                         13) == 0;
-
-                if (ring_bind_active &&
-                    bind_layer < stage->layer_end &&
-                    pc_ring_dynamic_scratch_candidate(node)) {
-                    ggml_backend_sched_mark_dynamic_scratch(
-                        sched_use, node);
-                    ++dynamic_scratch_nodes;
-                }
 
                 // Match scheduler semantics exactly: a tensor can
                 // be view-backed and still be an executable node, and
@@ -2293,7 +2256,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 "[PC_LOCAL_RING_BIND] status=OK layers=[%d,%d) "
                 "primitive_tasks=%d B0=%s B1=%s "
                 "attn=%d ffn=%d reduce=%d full=%d "
-                "lifetime=TASK_SCRATCH scratch_nodes=%d\n",
+                "lifetime=EXPLICIT_RING_OWNERSHIP\n",
                 stage->layer_begin,
                 stage->layer_end,
                 attn_markers * 3,
@@ -2302,8 +2265,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.attn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.ffn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.reduce,
-                (int) pc_ring_runtime_plan.pc_local.stage_backends.full,
-                dynamic_scratch_nodes);
+                (int) pc_ring_runtime_plan.pc_local.stage_backends.full);
         }
 
         if (strict_cpu_stage) {
