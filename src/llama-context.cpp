@@ -2140,9 +2140,17 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             pc_ring_bind_stage bind_stage =
                 pc_ring_bind_stage::ATTN;
             int bind_layer = stage->layer_begin;
+            int bind_chunk = 0;
             bool ring_bind_active = false;
             bool force_next_split = false;
-            int ring_output_nodes = 0;
+
+            // Targeted allocator-lifetime correctness probe. Keep only one
+            // logical primitive alive instead of the entire Ring graph.
+            const int lifetime_probe_layer = 27;
+            const int lifetime_probe_chunk = 2;
+            const pc_ring_bind_stage lifetime_probe_stage =
+                pc_ring_bind_stage::ATTN;
+            int lifetime_probe_nodes = 0;
 
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 ggml_tensor * node =
@@ -2153,15 +2161,16 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         "pc_ring_entry",
                         13) == 0;
 
-                // OUTPUT_ALL correctness probe: keep every tensor
-                // owned by the Ring alive across non-monotonic split execution.
-                // This includes view/reshape nodes because their backing
-                // storage must not be recycled while a future FIFO task can
-                // still refer to them.
+                // Targeted lifetime probe: preserve every tensor
+                // in layer 27 / chunk 2 / ATTN, including view/reshape nodes.
+                // If the later backward jump to this primitive stops crashing,
+                // static allocator reuse is the confirmed failure mode.
                 if (ring_bind_active &&
-                    bind_layer < stage->layer_end) {
+                    bind_layer == lifetime_probe_layer &&
+                    bind_chunk == lifetime_probe_chunk &&
+                    bind_stage == lifetime_probe_stage) {
                     ggml_set_output(node);
-                    ++ring_output_nodes;
+                    ++lifetime_probe_nodes;
                 }
 
                 // Match scheduler semantics exactly: a tensor can
@@ -2214,19 +2223,13 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 }
 
                 if (ring_entry_node) {
-                    // Correctness probe for dynamic FIFO execution: preserve
-                    // the Ring entry and every Ring-owned intermediate tensor
-                    // for the full graph allocation lifetime. ggml_gallocr
-                    // normally frees/reuses buffers according to static graph
-                    // order, but the FIFO runtime can execute an earlier split
-                    // after a later split.
-                    ggml_set_output(node);
-                    ++ring_output_nodes;
-
                     // Prefix graph work (embedding/input preparation) remains
-                    // under the normal scheduler.  Ring ownership starts only
+                    // under the normal scheduler. Ring ownership starts only
                     // after this explicit graph boundary.
                     ring_bind_active = true;
+                    bind_layer = stage->layer_begin;
+                    bind_chunk = 0;
+                    bind_stage = pc_ring_bind_stage::ATTN;
                     force_next_split = true;
                     continue;
                 }
@@ -2239,6 +2242,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk,
                         marker_layer)) {
                     bind_layer = marker_layer;
+                    bind_chunk = marker_chunk;
                     bind_stage = pc_ring_bind_stage::FFN;
                     force_next_split = true;
                 } else if (parse_ring_marker(
@@ -2247,6 +2251,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk,
                         marker_layer)) {
                     bind_layer = marker_layer;
+                    bind_chunk = marker_chunk;
                     bind_stage = pc_ring_bind_stage::REDUCE;
                     force_next_split = true;
                 } else if (parse_ring_marker(
@@ -2259,6 +2264,10 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk + 1 < ring_chunks ?
                             marker_layer :
                             marker_layer + 1;
+                    bind_chunk =
+                        marker_chunk + 1 < ring_chunks ?
+                            marker_chunk + 1 :
+                            0;
                     force_next_split = true;
                 }
             }
@@ -2271,7 +2280,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 "[PC_LOCAL_RING_BIND] status=OK layers=[%d,%d) "
                 "primitive_tasks=%d B0=%s B1=%s "
                 "attn=%d ffn=%d reduce=%d full=%d "
-                "lifetime=OUTPUT_ALL_PROBE output_nodes=%d\n",
+                "lifetime=TARGETED_PROBE probe=%d/%d/ATTN output_nodes=%d\n",
                 stage->layer_begin,
                 stage->layer_end,
                 attn_markers * 3,
@@ -2281,7 +2290,9 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.ffn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.reduce,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.full,
-                ring_output_nodes);
+                lifetime_probe_layer,
+                lifetime_probe_chunk,
+                lifetime_probe_nodes);
         }
 
         if (strict_cpu_stage) {
@@ -3752,6 +3763,40 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 "kind=%s layer=%d chunk=%d range=[%d,%d)\n",
                                 kind_name, layer, chunk,
                                 range.begin, range.end);
+
+                            if (kind == PC_RING_ATTN &&
+                                layer == 27 &&
+                                chunk == 2) {
+                                for (int diag_split = range.begin;
+                                     diag_split < range.end;
+                                     ++diag_split) {
+                                    const int diag_start =
+                                        ggml_backend_sched_get_split_start(
+                                            sched_use, diag_split);
+                                    const int diag_end =
+                                        ggml_backend_sched_get_split_end(
+                                            sched_use, diag_split);
+                                    for (int node_id = diag_start;
+                                         node_id < diag_end;
+                                         ++node_id) {
+                                        ggml_tensor * diag_node =
+                                            ggml_graph_node(
+                                                ring_graph, node_id);
+                                        LLAMA_LOG_ERROR(
+                                            "[PC_LOCAL_RING_TARGET_NODE] "
+                                            "layer=27 chunk=2 stage=ATTN "
+                                            "split=%d node=%d name=%s op=%s "
+                                            "view=%s\n",
+                                            diag_split,
+                                            node_id,
+                                            diag_node->name,
+                                            ggml_op_name(diag_node->op),
+                                            diag_node->view_src != nullptr ?
+                                                diag_node->view_src->name :
+                                                "(none)");
+                                    }
+                                }
+                            }
                         }
 
                         for (int split = range.begin;
