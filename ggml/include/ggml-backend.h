@@ -351,6 +351,14 @@ extern "C" {
     GGML_API void           ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched,
                                                                   struct ggml_tensor * node,
                                                                   ggml_backend_t       backend);
+
+    // Strong backend assignment for higher-level execution plans. Unlike the
+    // ordinary assignment above, a pinned node is not upgraded to a higher
+    // priority backend during scheduler pass 3.
+    GGML_API void           ggml_backend_sched_pin_tensor_backend(ggml_backend_sched_t sched,
+                                                                  struct ggml_tensor * node,
+                                                                  ggml_backend_t       backend);
+
     GGML_API ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
                                                                   struct ggml_tensor * node);
 

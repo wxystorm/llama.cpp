@@ -937,8 +937,9 @@ struct ggml_backend_sched {
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
-    int                 * hv_tensor_backend_ids; // [hash_set.size]
-    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+    int                 * hv_tensor_backend_ids;    // [hash_set.size]
+    uint8_t             * hv_tensor_backend_pinned; // [hash_set.size]
+    struct ggml_tensor ** hv_tensor_copies;         // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1347,7 +1348,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
         } else {
-            // assigned node: upgrade to higher prio backend if possible
+            // Assigned nodes are normally still eligible for priority
+            // upgrades. Explicitly pinned nodes are different: their backend
+            // is part of a higher-level execution plan and must be preserved.
+            const size_t node_id = hash_id(node);
+            if (sched->hv_tensor_backend_pinned[node_id]) {
+                continue;
+            }
+
             for (int b = 0; b < *node_backend_id; b++) {
                 if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
                     bool supported = true;
@@ -2335,8 +2343,12 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
-    sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->hv_tensor_backend_ids    = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_backend_pinned = (uint8_t *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_backend_pinned[0]));
+    sched->hv_tensor_copies         = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    GGML_ASSERT(sched->hv_tensor_backend_ids != NULL);
+    GGML_ASSERT(sched->hv_tensor_backend_pinned != NULL);
+    GGML_ASSERT(sched->hv_tensor_copies != NULL);
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size =
@@ -2413,6 +2425,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->splits);
     free(sched->forced_split_nodes);
     free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_backend_pinned);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -2431,8 +2444,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        memset(sched->hv_tensor_backend_ids,    -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_backend_pinned, 0, sched->hash_set.size * sizeof(sched->hv_tensor_backend_pinned[0]));
+        memset(sched->hv_tensor_copies,          0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2673,6 +2687,18 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
+    sched->is_reset = false;
+}
+
+void ggml_backend_sched_pin_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(node);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    const size_t id = hash_id(node);
+    sched->hv_tensor_backend_ids[id] = backend_index;
+    sched->hv_tensor_backend_pinned[id] = 1;
+    SET_CAUSE(node, "pin");
     sched->is_reset = false;
 }
 

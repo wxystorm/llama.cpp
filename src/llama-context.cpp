@@ -2194,7 +2194,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                             ret = GGML_STATUS_FAILED;
                             return nullptr;
                         }
-                        ggml_backend_sched_set_tensor_backend(
+                        ggml_backend_sched_pin_tensor_backend(
                             sched_use,
                             node,
                             target);
