@@ -11215,6 +11215,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     // keeping the trace small.  Decode-single also maps here.
                     if (current_layer == trace_layer &&
                             current_chunk == 0) {
+                        const bool compact_trace =
+                            std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr;
                         const bool phone_primary_owner =
                             backend_ctx->tensor_phone_first_layer >= 0 &&
                             trace_layer >=
@@ -11282,7 +11284,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 double sum = 0.0;
                                 double l2 = 0.0;
                                 double max_abs = 0.0;
+                                size_t zero = 0;
+                                size_t nonfinite = 0;
                                 for (float x : data) {
+                                    zero += x == 0.0f;
+                                    if (!std::isfinite(x)) {
+                                        ++nonfinite;
+                                        continue;
+                                    }
                                     const double xd = x;
                                     sum += xd;
                                     l2 += xd * xd;
@@ -11292,42 +11301,56 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                             std::abs(xd));
                                 }
 
-                                printf(
-                                    "[TP_CONTROL_F32] layer=%d chunk=%d "
-                                    "mode=%s primary=%s owner=%zu "
-                                    "logical=%s tensor=%s "
-                                    "ne=[%" PRId64 ",%" PRId64
-                                    ",%" PRId64 ",%" PRId64 "] "
-                                    "n=%zu sum=%.9f l2=%.9f "
-                                    "max=%.9f "
-                                    "v0=%.9f v1=%.9f v2=%.9f "
-                                    "v3=%.9f v4=%.9f v5=%.9f "
-                                    "v6=%.9f v7=%.9f\n",
-                                    trace_layer,
-                                    current_chunk,
-                                    current_mode != nullptr ?
-                                        current_mode : "unknown",
-                                    phone_primary_owner ?
-                                        "PHONE" : "PC",
-                                    owner,
-                                    logical,
-                                    tensor->name,
-                                    tensor->ne[0],
-                                    tensor->ne[1],
-                                    tensor->ne[2],
-                                    tensor->ne[3],
-                                    n,
-                                    sum,
-                                    std::sqrt(l2),
-                                    max_abs,
-                                    n > 0 ? data[0] : 0.0f,
-                                    n > 1 ? data[1] : 0.0f,
-                                    n > 2 ? data[2] : 0.0f,
-                                    n > 3 ? data[3] : 0.0f,
-                                    n > 4 ? data[4] : 0.0f,
-                                    n > 5 ? data[5] : 0.0f,
-                                    n > 6 ? data[6] : 0.0f,
-                                    n > 7 ? data[7] : 0.0f);
+                                if (compact_trace) {
+                                    printf(
+                                        "[TP_CTL_F32] L=%d C=%d %s "
+                                        "n=%zu z=%zu nf=%zu max=%.6g l2=%.6g\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        logical,
+                                        n,
+                                        zero,
+                                        nonfinite,
+                                        max_abs,
+                                        std::sqrt(l2));
+                                } else {
+                                    printf(
+                                        "[TP_CONTROL_F32] layer=%d chunk=%d "
+                                        "mode=%s primary=%s owner=%zu "
+                                        "logical=%s tensor=%s "
+                                        "ne=[%" PRId64 ",%" PRId64
+                                        ",%" PRId64 ",%" PRId64 "] "
+                                        "n=%zu sum=%.9f l2=%.9f "
+                                        "max=%.9f "
+                                        "v0=%.9f v1=%.9f v2=%.9f "
+                                        "v3=%.9f v4=%.9f v5=%.9f "
+                                        "v6=%.9f v7=%.9f\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        current_mode != nullptr ?
+                                            current_mode : "unknown",
+                                        phone_primary_owner ?
+                                            "PHONE" : "PC",
+                                        owner,
+                                        logical,
+                                        tensor->name,
+                                        tensor->ne[0],
+                                        tensor->ne[1],
+                                        tensor->ne[2],
+                                        tensor->ne[3],
+                                        n,
+                                        sum,
+                                        std::sqrt(l2),
+                                        max_abs,
+                                        n > 0 ? data[0] : 0.0f,
+                                        n > 1 ? data[1] : 0.0f,
+                                        n > 2 ? data[2] : 0.0f,
+                                        n > 3 ? data[3] : 0.0f,
+                                        n > 4 ? data[4] : 0.0f,
+                                        n > 5 ? data[5] : 0.0f,
+                                        n > 6 ? data[6] : 0.0f,
+                                        n > 7 ? data[7] : 0.0f);
+                                }
                             };
 
                         auto trace_i32 =
@@ -11389,42 +11412,55 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     }
                                 }
 
-                                printf(
-                                    "[TP_CONTROL_I32] layer=%d chunk=%d "
-                                    "mode=%s primary=%s owner=%zu "
-                                    "logical=%s tensor=%s "
-                                    "ne=[%" PRId64 ",%" PRId64
-                                    ",%" PRId64 ",%" PRId64 "] "
-                                    "n=%zu sum=%" PRId64
-                                    " min=%d max=%d hash=%" PRIu64
-                                    " v0=%d v1=%d v2=%d v3=%d "
-                                    "v4=%d v5=%d v6=%d v7=%d\n",
-                                    trace_layer,
-                                    current_chunk,
-                                    current_mode != nullptr ?
-                                        current_mode : "unknown",
-                                    phone_primary_owner ?
-                                        "PHONE" : "PC",
-                                    owner,
-                                    logical,
-                                    tensor->name,
-                                    tensor->ne[0],
-                                    tensor->ne[1],
-                                    tensor->ne[2],
-                                    tensor->ne[3],
-                                    n,
-                                    sum,
-                                    min_v,
-                                    max_v,
-                                    hash,
-                                    n > 0 ? data[0] : 0,
-                                    n > 1 ? data[1] : 0,
-                                    n > 2 ? data[2] : 0,
-                                    n > 3 ? data[3] : 0,
-                                    n > 4 ? data[4] : 0,
-                                    n > 5 ? data[5] : 0,
-                                    n > 6 ? data[6] : 0,
-                                    n > 7 ? data[7] : 0);
+                                if (compact_trace) {
+                                    printf(
+                                        "[TP_CTL_I32] L=%d C=%d %s "
+                                        "n=%zu min=%d max=%d hash=%" PRIu64 "\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        logical,
+                                        n,
+                                        min_v,
+                                        max_v,
+                                        hash);
+                                } else {
+                                    printf(
+                                        "[TP_CONTROL_I32] layer=%d chunk=%d "
+                                        "mode=%s primary=%s owner=%zu "
+                                        "logical=%s tensor=%s "
+                                        "ne=[%" PRId64 ",%" PRId64
+                                        ",%" PRId64 ",%" PRId64 "] "
+                                        "n=%zu sum=%" PRId64
+                                        " min=%d max=%d hash=%" PRIu64
+                                        " v0=%d v1=%d v2=%d v3=%d "
+                                        "v4=%d v5=%d v6=%d v7=%d\n",
+                                        trace_layer,
+                                        current_chunk,
+                                        current_mode != nullptr ?
+                                            current_mode : "unknown",
+                                        phone_primary_owner ?
+                                            "PHONE" : "PC",
+                                        owner,
+                                        logical,
+                                        tensor->name,
+                                        tensor->ne[0],
+                                        tensor->ne[1],
+                                        tensor->ne[2],
+                                        tensor->ne[3],
+                                        n,
+                                        sum,
+                                        min_v,
+                                        max_v,
+                                        hash,
+                                        n > 0 ? data[0] : 0,
+                                        n > 1 ? data[1] : 0,
+                                        n > 2 ? data[2] : 0,
+                                        n > 3 ? data[3] : 0,
+                                        n > 4 ? data[4] : 0,
+                                        n > 5 ? data[5] : 0,
+                                        n > 6 ? data[6] : 0,
+                                        n > 7 ? data[7] : 0);
+                                }
                             };
 
                         char residual_name[64];
