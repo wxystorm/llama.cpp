@@ -271,6 +271,7 @@ enum rpc_cmd {
     RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC,
     RPC_CMD_RETURN_BULK_ACQUIRE,
     RPC_CMD_INFERENCE_DATA_PLANE_OPEN,
+    RPC_CMD_INFERENCE_RETURN_BIND,
     RPC_CMD_COUNT,
 };
 
@@ -294,6 +295,7 @@ static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_AS
 static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_DATA_PLANE_OPEN == 35, "RPC_CMD_INFERENCE_DATA_PLANE_OPEN must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INFERENCE_RETURN_BIND == 36, "RPC_CMD_INFERENCE_RETURN_BIND must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -471,6 +473,18 @@ struct rpc_msg_set_tensor_async_return_wait_req {
     uint32_t wire_type;
     uint32_t reserved;
     uint64_t original_size;
+};
+
+struct rpc_msg_inference_return_bind_req {
+    rpc_msg_set_tensor_async_return_wait_req return_req;
+    uint64_t graph_id;
+    uint64_t wire_size;
+    int32_t layer;
+    int32_t chunk;
+};
+
+struct rpc_msg_inference_return_bind_rsp {
+    uint8_t result;
 };
 
 static_assert(
