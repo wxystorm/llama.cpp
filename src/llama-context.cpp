@@ -3654,14 +3654,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const int64_t ring_wall_begin_us =
                     ggml_time_us();
 
-                ggml_backend_buffer_t scratch_buffers[2] = {
-                    nullptr, nullptr,
-                };
-                ggml_backend_t scratch_backends[2] = {
-                    nullptr, nullptr,
-                };
-                size_t scratch_bytes[2] = { 0, 0 };
-
                 const auto align_up_size =
                     [](size_t value, size_t alignment) -> size_t {
                         if (alignment <= 1) {
@@ -3671,15 +3663,389 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             alignment * alignment;
                     };
 
-                const auto scratch_bytes_for_range =
+                const auto boundary_kind =
+                    [&](ggml_tensor * tensor) -> int {
+                        int chunk = -1;
+                        int layer = -1;
+                        if (parse_marker(
+                                tensor->name,
+                                "pc_ring_attn_out_chunk_%d-%d%n",
+                                chunk, layer)) {
+                            return PC_RING_ATTN;
+                        }
+                        if (parse_marker(
+                                tensor->name,
+                                "pc_ring_ffn_out_chunk_%d-%d%n",
+                                chunk, layer)) {
+                            return PC_RING_FFN;
+                        }
+                        if (parse_marker(
+                                tensor->name,
+                                "pc_ring_reduce_chunk_%d-%d%n",
+                                chunk, layer)) {
+                            return PC_RING_REDUCE;
+                        }
+                        return -1;
+                    };
+
+                struct pc_ring_tensor_saved {
+                    ggml_tensor * tensor = nullptr;
+                    ggml_backend_buffer_t buffer = nullptr;
+                    void * data = nullptr;
+                    void * extra = nullptr;
+                };
+
+                // -------------------------------------------------------------
+                // Explicit Ring boundary ownership.
+                //
+                // Each chunk owns three reusable logical slots per backend:
+                //   ATTN   -> H_attn (consumed by FFN and REDUCE)
+                //   FFN    -> F      (consumed by REDUCE)
+                //   REDUCE -> H_main (consumed by next-layer ATTN)
+                //
+                // A FULL layer is still one FIFO job. Its internal
+                // ATTN->FFN->REDUCE sequence uses the same three slots on the
+                // FULL backend, and only H_main remains live when the FULL job
+                // completes.
+                // -------------------------------------------------------------
+                struct pc_ring_boundary_slot {
+                    size_t bytes = 0;
+                    size_t offset = 0;
+                    int owner_layer = -1;
+                };
+                struct pc_ring_boundary_binding {
+                    ggml_tensor * tensor = nullptr;
+                    int backend_index = -1;
+                    int kind = -1;
+                    int layer = -1;
+                    int chunk = -1;
+                    pc_ring_tensor_saved saved;
+                };
+
+                const auto boundary_slot_index =
+                    [&](int bi, int chunk, int kind) -> int {
+                        if (bi < 0 || bi > 1 ||
+                            chunk < 0 || chunk >= n_chunks ||
+                            kind < PC_RING_ATTN ||
+                            kind > PC_RING_REDUCE) {
+                            return -1;
+                        }
+                        return (bi * n_chunks + chunk) * 3 + kind;
+                    };
+
+                std::vector<pc_ring_boundary_slot> boundary_slots(
+                    (size_t) 2 * n_chunks * 3);
+                std::vector<pc_ring_boundary_binding> boundary_bindings;
+                boundary_bindings.reserve(markers.size());
+
+                ggml_backend_t boundary_backends[2] = {
+                    nullptr, nullptr,
+                };
+                ggml_backend_buffer_t boundary_buffers[2] = {
+                    nullptr, nullptr,
+                };
+                size_t boundary_bytes[2] = { 0, 0 };
+
+                bool boundary_ok = true;
+                for (const pc_ring_marker & marker : markers) {
+                    ggml_tensor * marker_tensor = nullptr;
+                    const int i_start =
+                        ggml_backend_sched_get_split_start(
+                            sched_use, marker.split);
+                    const int i_end =
+                        ggml_backend_sched_get_split_end(
+                            sched_use, marker.split);
+
+                    for (int node_id = i_start;
+                         node_id < i_end;
+                         ++node_id) {
+                        ggml_tensor * node =
+                            ggml_graph_node(
+                                ring_graph, node_id);
+                        int node_chunk = -1;
+                        int node_layer = -1;
+                        bool match = false;
+                        if (marker.job.kind == PC_RING_ATTN) {
+                            match = parse_marker(
+                                node->name,
+                                "pc_ring_attn_out_chunk_%d-%d%n",
+                                node_chunk, node_layer);
+                        } else if (marker.job.kind == PC_RING_FFN) {
+                            match = parse_marker(
+                                node->name,
+                                "pc_ring_ffn_out_chunk_%d-%d%n",
+                                node_chunk, node_layer);
+                        } else if (marker.job.kind == PC_RING_REDUCE) {
+                            match = parse_marker(
+                                node->name,
+                                "pc_ring_reduce_chunk_%d-%d%n",
+                                node_chunk, node_layer);
+                        }
+                        if (match &&
+                            node_chunk == marker.job.chunk &&
+                            node_layer == marker.job.layer) {
+                            marker_tensor = node;
+                            break;
+                        }
+                    }
+
+                    const int bi =
+                        split_backend_index(marker.split);
+                    if (marker_tensor == nullptr ||
+                        marker_tensor->view_src != nullptr ||
+                        bi < 0 || bi > 1) {
+                        boundary_ok = false;
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_BOUNDARY] status=FAIL "
+                            "reason=MARKER_BIND kind=%d layer=%d chunk=%d "
+                            "split=%d backend=%d tensor=%s view=%s\n",
+                            marker.job.kind,
+                            marker.job.layer,
+                            marker.job.chunk,
+                            marker.split,
+                            bi,
+                            marker_tensor != nullptr ?
+                                marker_tensor->name : "(none)",
+                            marker_tensor != nullptr &&
+                                marker_tensor->view_src != nullptr ?
+                                marker_tensor->view_src->name : "(none)");
+                        break;
+                    }
+
+                    ggml_backend_t backend =
+                        ggml_backend_sched_get_split_backend(
+                            sched_use, marker.split);
+                    if (boundary_backends[bi] == nullptr) {
+                        boundary_backends[bi] = backend;
+                    } else if (boundary_backends[bi] != backend) {
+                        boundary_ok = false;
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_BOUNDARY] status=FAIL "
+                            "reason=MULTI_BACKEND slot=B%d first=%s now=%s\n",
+                            bi,
+                            ggml_backend_name(
+                                boundary_backends[bi]),
+                            ggml_backend_name(backend));
+                        break;
+                    }
+
+                    const int si =
+                        boundary_slot_index(
+                            bi,
+                            marker.job.chunk,
+                            marker.job.kind);
+                    GGML_ASSERT(si >= 0);
+                    const ggml_backend_buffer_type_t buft =
+                        ggml_backend_sched_get_buffer_type(
+                            sched_use, backend);
+                    boundary_slots[(size_t) si].bytes =
+                        std::max(
+                            boundary_slots[(size_t) si].bytes,
+                            ggml_backend_buft_get_alloc_size(
+                                buft, marker_tensor));
+
+                    pc_ring_boundary_binding binding;
+                    binding.tensor = marker_tensor;
+                    binding.backend_index = bi;
+                    binding.kind = marker.job.kind;
+                    binding.layer = marker.job.layer;
+                    binding.chunk = marker.job.chunk;
+                    binding.saved = {
+                        marker_tensor,
+                        marker_tensor->buffer,
+                        marker_tensor->data,
+                        marker_tensor->extra,
+                    };
+                    boundary_bindings.push_back(binding);
+                }
+
+                if (!boundary_ok) {
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+
+                for (int bi = 0; bi < 2; ++bi) {
+                    if (boundary_backends[bi] == nullptr) {
+                        continue;
+                    }
+                    const ggml_backend_buffer_type_t buft =
+                        ggml_backend_sched_get_buffer_type(
+                            sched_use, boundary_backends[bi]);
+                    const size_t alignment =
+                        ggml_backend_buft_get_alignment(buft);
+                    size_t offset = 0;
+
+                    for (int chunk = 0;
+                         chunk < n_chunks;
+                         ++chunk) {
+                        for (int kind = PC_RING_ATTN;
+                             kind <= PC_RING_REDUCE;
+                             ++kind) {
+                            const int si =
+                                boundary_slot_index(
+                                    bi, chunk, kind);
+                            auto & slot =
+                                boundary_slots[(size_t) si];
+                            if (slot.bytes == 0) {
+                                continue;
+                            }
+                            offset =
+                                align_up_size(
+                                    offset, alignment);
+                            slot.offset = offset;
+                            offset += slot.bytes;
+                        }
+                    }
+                    boundary_bytes[bi] = offset;
+
+                    if (offset > 0) {
+                        boundary_buffers[bi] =
+                            ggml_backend_buft_alloc_buffer(
+                                buft, offset);
+                        if (boundary_buffers[bi] == nullptr) {
+                            boundary_ok = false;
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_BOUNDARY] status=FAIL "
+                                "reason=ALLOC slot=B%d backend=%s bytes=%zu\n",
+                                bi,
+                                ggml_backend_name(
+                                    boundary_backends[bi]),
+                                offset);
+                            break;
+                        }
+                        ggml_backend_buffer_set_usage(
+                            boundary_buffers[bi],
+                            GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                    }
+                }
+
+                const auto restore_boundary_bindings =
+                    [&]() {
+                        for (auto it =
+                                 boundary_bindings.rbegin();
+                             it != boundary_bindings.rend();
+                             ++it) {
+                            it->tensor->buffer =
+                                it->saved.buffer;
+                            it->tensor->data =
+                                it->saved.data;
+                            it->tensor->extra =
+                                it->saved.extra;
+                        }
+                    };
+
+                const auto free_boundary_buffers =
+                    [&]() {
+                        for (int bi = 0; bi < 2; ++bi) {
+                            if (boundary_buffers[bi] != nullptr) {
+                                ggml_backend_buffer_free(
+                                    boundary_buffers[bi]);
+                                boundary_buffers[bi] = nullptr;
+                            }
+                        }
+                    };
+
+                if (!boundary_ok) {
+                    restore_boundary_bindings();
+                    free_boundary_buffers();
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+
+                for (pc_ring_boundary_binding & binding :
+                        boundary_bindings) {
+                    const int si =
+                        boundary_slot_index(
+                            binding.backend_index,
+                            binding.chunk,
+                            binding.kind);
+                    GGML_ASSERT(si >= 0);
+                    auto & slot =
+                        boundary_slots[(size_t) si];
+                    ggml_backend_buffer_t buffer =
+                        boundary_buffers[
+                            binding.backend_index];
+                    GGML_ASSERT(buffer != nullptr);
+                    char * base =
+                        (char *)
+                        ggml_backend_buffer_get_base(
+                            buffer);
+
+                    binding.tensor->buffer = nullptr;
+                    binding.tensor->data = nullptr;
+                    binding.tensor->extra = nullptr;
+                    const ggml_status status =
+                        ggml_backend_tensor_alloc(
+                            buffer,
+                            binding.tensor,
+                            base + slot.offset);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        restore_boundary_bindings();
+                        free_boundary_buffers();
+                        ret = status;
+                        return nullptr;
+                    }
+                }
+
+                LLAMA_LOG_INFO(
+                    "[PC_LOCAL_RING_BOUNDARY] status=OK "
+                    "policy=CHUNK_H_ATTN_F_H_MAIN "
+                    "B0=%s bytes=%zu mib=%.2f "
+                    "B1=%s bytes=%zu mib=%.2f "
+                    "chunks=%d bindings=%zu\n",
+                    boundary_backends[0] != nullptr ?
+                        ggml_backend_name(boundary_backends[0]) :
+                        "(none)",
+                    boundary_bytes[0],
+                    boundary_bytes[0] / (1024.0 * 1024.0),
+                    boundary_backends[1] != nullptr ?
+                        ggml_backend_name(boundary_backends[1]) :
+                        "(none)",
+                    boundary_bytes[1],
+                    boundary_bytes[1] / (1024.0 * 1024.0),
+                    n_chunks,
+                    boundary_bindings.size());
+
+                // -------------------------------------------------------------
+                // Task-local scratch.
+                //
+                // Only tensors whose storage root belongs to the current
+                // primitive range are rebound. External inputs, weights, KV
+                // storage, scheduler-created cross-backend copies and explicit
+                // Ring boundary tensors remain outside the task scratch.
+                // -------------------------------------------------------------
+                const auto add_unique_tensor =
+                    [](std::vector<ggml_tensor *> & list,
+                       ggml_tensor * tensor) {
+                        if (tensor == nullptr) {
+                            return;
+                        }
+                        for (ggml_tensor * existing : list) {
+                            if (existing == tensor) {
+                                return;
+                            }
+                        }
+                        list.push_back(tensor);
+                    };
+
+                const auto tensor_in_list =
+                    [](const std::vector<ggml_tensor *> & list,
+                       ggml_tensor * tensor) -> bool {
+                        for (ggml_tensor * existing : list) {
+                            if (existing == tensor) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                const auto collect_range_scratch =
                     [&](const pc_ring_split_range & range,
-                        ggml_backend_t backend) -> size_t {
-                        const ggml_backend_buffer_type_t buft =
-                            ggml_backend_sched_get_buffer_type(
-                                sched_use, backend);
-                        const size_t alignment =
-                            ggml_backend_buft_get_alignment(buft);
-                        size_t offset = 0;
+                        std::vector<ggml_tensor *> & roots,
+                        std::vector<ggml_tensor *> & views) {
+                        roots.clear();
+                        views.clear();
+                        std::vector<ggml_tensor *> range_nodes;
 
                         for (int split = range.begin;
                              split < range.end;
@@ -3693,25 +4059,98 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             for (int node_id = i_start;
                                  node_id < i_end;
                                  ++node_id) {
-                                ggml_tensor * node =
+                                add_unique_tensor(
+                                    range_nodes,
                                     ggml_graph_node(
-                                        ring_graph, node_id);
-                                if (!ggml_backend_sched_is_dynamic_scratch(
-                                        sched_use, node) ||
-                                    node->view_src != nullptr) {
-                                    continue;
-                                }
-
-                                offset =
-                                    align_up_size(
-                                        offset, alignment);
-                                offset +=
-                                    ggml_backend_buft_get_alloc_size(
-                                        buft, node);
+                                        ring_graph, node_id));
                             }
                         }
-                        return offset;
+
+                        const auto root_of =
+                            [](ggml_tensor * tensor) {
+                                ggml_tensor * root = tensor;
+                                while (root != nullptr &&
+                                       root->view_src != nullptr) {
+                                    root = root->view_src;
+                                }
+                                return root;
+                            };
+
+                        const auto maybe_add_view_chain =
+                            [&](ggml_tensor * tensor) {
+                                if (tensor == nullptr ||
+                                    tensor->view_src == nullptr) {
+                                    return;
+                                }
+                                ggml_tensor * root =
+                                    root_of(tensor);
+                                if (root == nullptr ||
+                                    !tensor_in_list(
+                                        range_nodes, root) ||
+                                    boundary_kind(root) >= 0) {
+                                    return;
+                                }
+
+                                std::vector<ggml_tensor *> chain;
+                                ggml_tensor * cur = tensor;
+                                while (cur != nullptr &&
+                                       cur->view_src != nullptr) {
+                                    chain.push_back(cur);
+                                    cur = cur->view_src;
+                                }
+                                for (auto it = chain.rbegin();
+                                     it != chain.rend();
+                                     ++it) {
+                                    add_unique_tensor(
+                                        views, *it);
+                                }
+                            };
+
+                        for (ggml_tensor * node :
+                                range_nodes) {
+                            const int kind =
+                                boundary_kind(node);
+                            if (kind >= 0) {
+                                // The boundary itself is persistent, but its
+                                // producer inputs are ordinary range nodes and
+                                // are handled independently below.
+                                continue;
+                            }
+
+                            if (node->view_src != nullptr) {
+                                maybe_add_view_chain(node);
+                            } else {
+                                if ((node->flags &
+                                        (GGML_TENSOR_FLAG_INPUT |
+                                         GGML_TENSOR_FLAG_PARAM)) == 0) {
+                                    const bool is_weight =
+                                        node->buffer != nullptr &&
+                                        ggml_backend_buffer_get_usage(
+                                            node->buffer) ==
+                                            GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                                    if (!is_weight) {
+                                        add_unique_tensor(
+                                            roots, node);
+                                    }
+                                }
+                            }
+
+                            for (int src = 0;
+                                 src < GGML_MAX_SRC;
+                                 ++src) {
+                                maybe_add_view_chain(
+                                    node->src[src]);
+                            }
+                        }
                     };
+
+                ggml_backend_buffer_t scratch_buffers[2] = {
+                    nullptr, nullptr,
+                };
+                ggml_backend_t scratch_backends[2] = {
+                    nullptr, nullptr,
+                };
+                size_t scratch_bytes[2] = { 0, 0 };
 
                 for (const pc_ring_split_range & range :
                         task_ranges) {
@@ -3723,43 +4162,51 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     const int bi =
                         split_backend_index(range.begin);
                     if (bi < 0 || bi > 1) {
-                        LLAMA_LOG_ERROR(
-                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
-                            "reason=BACKEND split=%d backend=%d\n",
-                            range.begin, bi);
+                        restore_boundary_bindings();
+                        free_boundary_buffers();
                         ret = GGML_STATUS_FAILED;
                         return nullptr;
                     }
-
                     ggml_backend_t backend =
                         ggml_backend_sched_get_split_backend(
                             sched_use, range.begin);
                     if (scratch_backends[bi] == nullptr) {
                         scratch_backends[bi] = backend;
                     } else if (scratch_backends[bi] != backend) {
-                        LLAMA_LOG_ERROR(
-                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
-                            "reason=MULTI_BACKEND slot=B%d first=%s now=%s\n",
-                            bi,
-                            ggml_backend_name(
-                                scratch_backends[bi]),
-                            ggml_backend_name(backend));
+                        restore_boundary_bindings();
+                        free_boundary_buffers();
                         ret = GGML_STATUS_FAILED;
                         return nullptr;
                     }
 
+                    std::vector<ggml_tensor *> roots;
+                    std::vector<ggml_tensor *> views;
+                    collect_range_scratch(
+                        range, roots, views);
+
+                    const ggml_backend_buffer_type_t buft =
+                        ggml_backend_sched_get_buffer_type(
+                            sched_use, backend);
+                    const size_t alignment =
+                        ggml_backend_buft_get_alignment(buft);
+                    size_t bytes = 0;
+                    for (ggml_tensor * root : roots) {
+                        bytes =
+                            align_up_size(
+                                bytes, alignment);
+                        bytes +=
+                            ggml_backend_buft_get_alloc_size(
+                                buft, root);
+                    }
                     scratch_bytes[bi] =
                         std::max(
-                            scratch_bytes[bi],
-                            scratch_bytes_for_range(
-                                range, backend));
+                            scratch_bytes[bi], bytes);
                 }
 
                 for (int bi = 0; bi < 2; ++bi) {
                     if (scratch_bytes[bi] == 0) {
                         continue;
                     }
-                    GGML_ASSERT(scratch_backends[bi] != nullptr);
                     const ggml_backend_buffer_type_t buft =
                         ggml_backend_sched_get_buffer_type(
                             sched_use, scratch_backends[bi]);
@@ -3774,13 +4221,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 scratch_buffers[bj] = nullptr;
                             }
                         }
-                        LLAMA_LOG_ERROR(
-                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
-                            "reason=ALLOC slot=B%d backend=%s bytes=%zu\n",
-                            bi,
-                            ggml_backend_name(
-                                scratch_backends[bi]),
-                            scratch_bytes[bi]);
+                        restore_boundary_bindings();
+                        free_boundary_buffers();
                         ret = GGML_STATUS_ALLOC_FAILED;
                         return nullptr;
                     }
@@ -3791,9 +4233,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
                 LLAMA_LOG_INFO(
                     "[PC_LOCAL_RING_SCRATCH] status=OK "
+                    "policy=TASK_LOCAL_RANGE_ROOTS "
                     "B0=%s bytes=%zu mib=%.2f "
-                    "B1=%s bytes=%zu mib=%.2f "
-                    "policy=TASK_LOCAL_ARENA\n",
+                    "B1=%s bytes=%zu mib=%.2f\n",
                     scratch_backends[0] != nullptr ?
                         ggml_backend_name(scratch_backends[0]) :
                         "(none)",
@@ -3805,15 +4247,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     scratch_bytes[1],
                     scratch_bytes[1] / (1024.0 * 1024.0));
 
-                struct pc_ring_scratch_saved {
-                    ggml_tensor * tensor;
-                    ggml_backend_buffer_t buffer;
-                    void * data;
-                    void * extra;
-                };
-
                 const auto restore_primitive_scratch =
-                    [](std::vector<pc_ring_scratch_saved> & saved) {
+                    [](std::vector<pc_ring_tensor_saved> & saved) {
                         for (auto it = saved.rbegin();
                              it != saved.rend();
                              ++it) {
@@ -3827,18 +4262,22 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const auto bind_primitive_scratch =
                     [&](const pc_ring_split_range & range,
                         int bi,
-                        std::vector<pc_ring_scratch_saved> & saved)
+                        std::vector<pc_ring_tensor_saved> & saved)
                         -> ggml_status {
                         saved.clear();
                         if (bi < 0 || bi > 1) {
                             return GGML_STATUS_FAILED;
                         }
-
                         ggml_backend_buffer_t scratch =
                             scratch_buffers[bi];
                         if (scratch == nullptr) {
                             return GGML_STATUS_SUCCESS;
                         }
+
+                        std::vector<ggml_tensor *> roots;
+                        std::vector<ggml_tensor *> views;
+                        collect_range_scratch(
+                            range, roots, views);
 
                         const size_t alignment =
                             ggml_backend_buffer_get_alignment(
@@ -3852,73 +4291,190 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 scratch);
                         size_t offset = 0;
 
-                        for (int split = range.begin;
-                             split < range.end;
-                             ++split) {
-                            const int i_start =
-                                ggml_backend_sched_get_split_start(
-                                    sched_use, split);
-                            const int i_end =
-                                ggml_backend_sched_get_split_end(
-                                    sched_use, split);
-                            for (int node_id = i_start;
-                                 node_id < i_end;
-                                 ++node_id) {
-                                ggml_tensor * node =
-                                    ggml_graph_node(
-                                        ring_graph, node_id);
-                                if (!ggml_backend_sched_is_dynamic_scratch(
-                                        sched_use, node)) {
+                        for (ggml_tensor * root : roots) {
+                            saved.push_back({
+                                root,
+                                root->buffer,
+                                root->data,
+                                root->extra,
+                            });
+                            root->buffer = nullptr;
+                            root->data = nullptr;
+                            root->extra = nullptr;
+
+                            offset =
+                                align_up_size(
+                                    offset, alignment);
+                            const size_t alloc_size =
+                                ggml_backend_buffer_get_alloc_size(
+                                    scratch, root);
+                            if (offset + alloc_size >
+                                    capacity) {
+                                restore_primitive_scratch(
+                                    saved);
+                                return GGML_STATUS_ALLOC_FAILED;
+                            }
+                            const ggml_status status =
+                                ggml_backend_tensor_alloc(
+                                    scratch,
+                                    root,
+                                    base + offset);
+                            if (status !=
+                                    GGML_STATUS_SUCCESS) {
+                                restore_primitive_scratch(
+                                    saved);
+                                return status;
+                            }
+                            offset += alloc_size;
+                        }
+
+                        for (ggml_tensor * view : views) {
+                            saved.push_back({
+                                view,
+                                view->buffer,
+                                view->data,
+                                view->extra,
+                            });
+                            view->buffer = nullptr;
+                            view->data = nullptr;
+                            view->extra = nullptr;
+                        }
+
+                        size_t initialized = 0;
+                        while (initialized < views.size()) {
+                            bool progress = false;
+                            for (ggml_tensor * view : views) {
+                                if (view->buffer != nullptr) {
                                     continue;
                                 }
-
-                                saved.push_back({
-                                    node,
-                                    node->buffer,
-                                    node->data,
-                                    node->extra,
-                                });
-
-                                node->buffer = nullptr;
-                                node->data = nullptr;
-                                node->extra = nullptr;
-
-                                ggml_status status =
-                                    GGML_STATUS_SUCCESS;
-                                if (node->view_src != nullptr) {
-                                    status =
-                                        ggml_backend_view_init(
-                                            node);
-                                } else {
-                                    offset =
-                                        align_up_size(
-                                            offset, alignment);
-                                    const size_t alloc_size =
-                                        ggml_backend_buffer_get_alloc_size(
-                                            scratch, node);
-                                    if (offset + alloc_size >
-                                            capacity) {
-                                        restore_primitive_scratch(
-                                            saved);
-                                        return GGML_STATUS_ALLOC_FAILED;
-                                    }
-                                    status =
-                                        ggml_backend_tensor_alloc(
-                                            scratch,
-                                            node,
-                                            base + offset);
-                                    offset += alloc_size;
+                                if (view->view_src == nullptr ||
+                                    view->view_src->buffer == nullptr ||
+                                    view->view_src->data == nullptr) {
+                                    continue;
                                 }
-
+                                const ggml_status status =
+                                    ggml_backend_view_init(
+                                        view);
                                 if (status !=
                                         GGML_STATUS_SUCCESS) {
                                     restore_primitive_scratch(
                                         saved);
                                     return status;
                                 }
+                                ++initialized;
+                                progress = true;
+                            }
+                            if (!progress) {
+                                restore_primitive_scratch(
+                                    saved);
+                                return GGML_STATUS_FAILED;
                             }
                         }
+
                         return GGML_STATUS_SUCCESS;
+                    };
+
+                const auto boundary_slot_for =
+                    [&](int layer, int chunk, int kind) -> int {
+                        const int bi =
+                            backend_index(
+                                slot_for_kind(layer, kind));
+                        return boundary_slot_index(
+                            bi, chunk, kind);
+                    };
+
+                const auto boundary_output_is_free =
+                    [&](int layer, int chunk, int kind) -> bool {
+                        const int si =
+                            boundary_slot_for(
+                                layer, chunk, kind);
+                        return si >= 0 &&
+                            boundary_slots[(size_t) si].
+                                owner_layer < 0;
+                    };
+
+                const auto commit_boundary_ownership =
+                    [&](int layer, int chunk, int kind)
+                        -> bool {
+                        const int out_si =
+                            boundary_slot_for(
+                                layer, chunk, kind);
+                        if (out_si < 0) {
+                            return false;
+                        }
+                        auto & out_slot =
+                            boundary_slots[(size_t) out_si];
+
+                        if (kind == PC_RING_ATTN) {
+                            if (out_slot.owner_layer >= 0) {
+                                return false;
+                            }
+
+                            // The previous H_main has now had its final
+                            // consumer (this ATTN), so it can be reused by the
+                            // current layer's REDUCE later.
+                            if (layer > stage.layer_begin) {
+                                const int prev_si =
+                                    boundary_slot_for(
+                                        layer - 1,
+                                        chunk,
+                                        PC_RING_REDUCE);
+                                if (prev_si < 0 ||
+                                    boundary_slots[
+                                        (size_t) prev_si].
+                                        owner_layer !=
+                                        layer - 1) {
+                                    return false;
+                                }
+                                boundary_slots[
+                                    (size_t) prev_si].
+                                    owner_layer = -1;
+                            }
+                            out_slot.owner_layer = layer;
+                            return true;
+                        }
+
+                        if (kind == PC_RING_FFN) {
+                            if (out_slot.owner_layer >= 0) {
+                                return false;
+                            }
+                            out_slot.owner_layer = layer;
+                            return true;
+                        }
+
+                        if (kind == PC_RING_REDUCE) {
+                            const int attn_si =
+                                boundary_slot_for(
+                                    layer, chunk,
+                                    PC_RING_ATTN);
+                            const int ffn_si =
+                                boundary_slot_for(
+                                    layer, chunk,
+                                    PC_RING_FFN);
+                            if (attn_si < 0 ||
+                                ffn_si < 0 ||
+                                boundary_slots[
+                                    (size_t) attn_si].
+                                    owner_layer != layer ||
+                                boundary_slots[
+                                    (size_t) ffn_si].
+                                    owner_layer != layer ||
+                                out_slot.owner_layer >= 0) {
+                                return false;
+                            }
+
+                            // REDUCE is the last consumer of H_attn and F.
+                            boundary_slots[
+                                (size_t) attn_si].
+                                owner_layer = -1;
+                            boundary_slots[
+                                (size_t) ffn_si].
+                                owner_layer = -1;
+                            out_slot.owner_layer = layer;
+                            return true;
+                        }
+
+                        return false;
                     };
 
                 const auto enqueue_job =
