@@ -15097,7 +15097,137 @@ auto prefill_norm_sg_has_prework =
             }
         }
     } else {
+        const bool output_shard_diag =
+            std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0;
+
+        std::vector<ggml_tensor *> output_shards(n_backends, nullptr);
+
+        auto print_output_shard_stats =
+            [&](const char * phase, size_t backend_index,
+                ggml_tensor * output) {
+                if (output == nullptr) {
+                    return;
+                }
+
+                auto & cfg = backend_ctx->backend_configs[backend_index];
+                ggml_backend_t simple_backend = cfg.backend;
+                ggml_backend_synchronize(simple_backend);
+
+                ggml_tensor * input = output->src[1];
+
+                auto stats = [&](ggml_tensor * tensor,
+                                 size_t & zero,
+                                 size_t & nonfinite,
+                                 double & l2,
+                                 double & max_abs) {
+                    zero = 0;
+                    nonfinite = 0;
+                    l2 = 0.0;
+                    max_abs = 0.0;
+                    if (tensor == nullptr ||
+                            tensor->type != GGML_TYPE_F32) {
+                        return;
+                    }
+
+                    const size_t n = ggml_nelements(tensor);
+                    std::vector<float> values(n);
+                    ggml_backend_tensor_get(
+                        tensor,
+                        values.data(),
+                        0,
+                        n * sizeof(float));
+                    for (float x : values) {
+                        zero += x == 0.0f;
+                        if (!std::isfinite(x)) {
+                            ++nonfinite;
+                            continue;
+                        }
+                        const double xd = x;
+                        l2 += xd * xd;
+                        max_abs =
+                            std::max(max_abs, std::abs(xd));
+                    }
+                    l2 = std::sqrt(l2);
+                };
+
+                size_t zero = 0;
+                size_t nonfinite = 0;
+                double l2 = 0.0;
+                double max_abs = 0.0;
+                ggml_tensor * measured =
+                    std::strcmp(phase, "PRE") == 0 ?
+                        input : output;
+                stats(
+                    measured,
+                    zero,
+                    nonfinite,
+                    l2,
+                    max_abs);
+
+                ggml_tensor * weight = output->src[0];
+                GGML_LOG_ERROR(
+                    "[META_OUT_SHARD] %s sg=%zu j=%zu b=%s "
+                    "comp=%d out_ne=[%" PRId64 ",%" PRId64 "] "
+                    "in_ne=[%" PRId64 ",%" PRId64 "] "
+                    "w_ne=[%" PRId64 ",%" PRId64 "] wt=%d "
+                    "z=%zu nf=%zu l2=%.6g max=%.6g\n",
+                    phase,
+                    i,
+                    backend_index,
+                    ggml_backend_name(simple_backend),
+                    !!(output->flags & GGML_TENSOR_FLAG_COMPUTE),
+                    output->ne[0],
+                    output->ne[1],
+                    input != nullptr ? input->ne[0] : 0,
+                    input != nullptr ? input->ne[1] : 0,
+                    weight != nullptr ? weight->ne[0] : 0,
+                    weight != nullptr ? weight->ne[1] : 0,
+                    weight != nullptr ? (int) weight->type : -1,
+                    zero,
+                    nonfinite,
+                    l2,
+                    max_abs);
+            };
+
+        if (output_shard_diag) {
+            for (size_t j = 0; j < n_backends; ++j) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[j].
+                        cgraphs[i].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+
+                for (int node_index = 0;
+                     node_index < graph->n_nodes;
+                     ++node_index) {
+                    ggml_tensor * node =
+                        graph->nodes[node_index];
+                    if (node != nullptr &&
+                            std::strcmp(
+                                node->name,
+                                "result_output") == 0) {
+                        output_shards[j] = node;
+                        print_output_shard_stats(
+                            "PRE", j, node);
+                        break;
+                    }
+                }
+            }
+        }
+
         compute_status = compute_workers.compute(i);
+
+        if (output_shard_diag &&
+                compute_status == GGML_STATUS_SUCCESS) {
+            for (size_t j = 0; j < n_backends; ++j) {
+                if (output_shards[j] != nullptr) {
+                    print_output_shard_stats(
+                        "POST", j, output_shards[j]);
+                }
+            }
+        }
     }
 
     subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
