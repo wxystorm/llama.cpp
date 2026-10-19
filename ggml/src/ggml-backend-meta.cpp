@@ -15146,6 +15146,29 @@ auto prefill_norm_sg_has_prework =
                 backend_ctx->backend_configs[0].backend,
                 final_norm_weight_pc,
                 "FINAL_NORM_WEIGHT_PC");
+
+            if (final_norm_input_pc != nullptr &&
+                    std::strcmp(final_norm_input_pc->name, "l_out-47") == 0) {
+                GGML_LOG_ERROR(
+                    "[L47_ADD_CHAIN] sg=%zu out=%s op=%s "
+                    "src0=%s src1=%s\n",
+                    i,
+                    final_norm_input_pc->name,
+                    ggml_op_name(final_norm_input_pc->op),
+                    final_norm_input_pc->src[0] != nullptr ?
+                        final_norm_input_pc->src[0]->name : "-",
+                    final_norm_input_pc->src[1] != nullptr ?
+                        final_norm_input_pc->src[1]->name : "-");
+
+                meta_debug_tensor(
+                    backend_ctx->backend_configs[0].backend,
+                    final_norm_input_pc->src[0],
+                    "L47_ADD_SRC0_PRE_PC");
+                meta_debug_tensor(
+                    backend_ctx->backend_configs[0].backend,
+                    final_norm_input_pc->src[1],
+                    "L47_ADD_SRC1_PRE_PC");
+            }
         }
 
         compute_workers.start(0, i);
@@ -15153,6 +15176,14 @@ auto prefill_norm_sg_has_prework =
 
         if (compute_status == GGML_STATUS_SUCCESS &&
                 final_norm_diag_pc != nullptr) {
+            if (final_norm_input_pc != nullptr &&
+                    std::strcmp(final_norm_input_pc->name, "l_out-47") == 0) {
+                meta_debug_tensor(
+                    backend_ctx->backend_configs[0].backend,
+                    final_norm_input_pc,
+                    "L47_ADD_OUT_POST_PC");
+            }
+
             meta_debug_tensor(
                 backend_ctx->backend_configs[0].backend,
                 final_norm_rms_pc,
