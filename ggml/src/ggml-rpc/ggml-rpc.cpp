@@ -5209,6 +5209,11 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
 
+    bool inference_data_plane_available() {
+        std::lock_guard<std::mutex> lock(inference_data_plane_mutex);
+        return !inference_data_plane || !inference_data_plane->healthy();
+    }
+
     bool attach_inference_data_plane(
         const std::shared_ptr<inference_transport> & transport) {
         if (!transport) {
@@ -10660,6 +10665,87 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 break;
+            }
+            case RPC_CMD_INFERENCE_DATA_PLANE_OPEN: {
+                rpc_msg_inference_data_plane_open_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+
+                rpc_msg_inference_data_plane_open_rsp response {};
+                const bool config_ok =
+                    request.tx_slots >= 1 &&
+                    request.tx_slots <= 64 &&
+                    request.rx_slots >= 1 &&
+                    request.rx_slots <= 64 &&
+                    request.max_payload_bytes >= 1024 &&
+                    request.max_payload_bytes <=
+                        UINT64_C(256) * 1024 * 1024;
+
+                if (!config_ok ||
+                    !server.inference_data_plane_available()) {
+                    response.result = 0;
+                    if (!send_msg(sock, &response, sizeof(response))) {
+                        return;
+                    }
+                    break;
+                }
+
+                inference_transport_config config;
+                // The peer's TX capacity is this side's RX capacity and vice
+                // versa. Keep the same bounded in-flight contract in both
+                // directions.
+                config.tx_slots = request.rx_slots;
+                config.rx_slots = request.tx_slots;
+                config.max_payload_bytes =
+                    static_cast<size_t>(request.max_payload_bytes);
+
+                response.result = 1;
+                response.tx_slots =
+                    static_cast<uint32_t>(config.tx_slots);
+                response.rx_slots =
+                    static_cast<uint32_t>(config.rx_slots);
+                response.max_payload_bytes =
+                    config.max_payload_bytes;
+
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+
+                auto adopted =
+                    inference_transport::adopt(sock, config);
+                if (!adopted) {
+                    return;
+                }
+
+                std::shared_ptr<inference_transport> transport =
+                    std::move(adopted);
+                if (!server.attach_inference_data_plane(transport)) {
+                    transport->stop();
+                    return;
+                }
+
+                GGML_LOG_INFO(
+                    "[INFERENCE_DATA_PLANE] side=server status=OPEN "
+                    "tx_slots=%zu rx_slots=%zu max_payload_mib=%.3f\n",
+                    config.tx_slots,
+                    config.rx_slots,
+                    config.max_payload_bytes /
+                        (1024.0 * 1024.0));
+
+                transport->wait_closed(-1);
+                server.detach_inference_data_plane(transport);
+
+                const auto stats = transport->stats();
+                GGML_LOG_INFO(
+                    "[INFERENCE_DATA_PLANE] side=server status=CLOSED "
+                    "tx_frames=%" PRIu64 " rx_frames=%" PRIu64
+                    " tx_mib=%.3f rx_mib=%.3f\n",
+                    stats.frames_sent,
+                    stats.frames_received,
+                    stats.bytes_sent / (1024.0 * 1024.0),
+                    stats.bytes_received / (1024.0 * 1024.0));
+                return;
             }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
