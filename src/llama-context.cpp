@@ -2074,10 +2074,14 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             int ffn_markers = 0;
             int reduce_markers = 0;
             int ring_chunks = 0;
+            bool have_ring_entry = false;
             const int n_nodes = ggml_graph_n_nodes(gf);
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 const char * name =
                     ggml_graph_node(gf, node_id)->name;
+                if (std::strncmp(name, "pc_ring_entry", 13) == 0) {
+                    have_ring_entry = true;
+                }
                 int marker_chunk = -1;
                 int marker_layer = -1;
                 if (parse_ring_marker(
@@ -2105,13 +2109,15 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 }
             }
 
-            if (ring_chunks <= 0 ||
+            if (!have_ring_entry ||
+                ring_chunks <= 0 ||
                 attn_markers == 0 ||
                 attn_markers != ffn_markers ||
                 attn_markers != reduce_markers) {
                 LLAMA_LOG_ERROR(
                     "[PC_LOCAL_RING_BIND] status=FAIL reason=MARKERS "
-                    "chunks=%d attn=%d ffn=%d reduce=%d\n",
+                    "entry=%d chunks=%d attn=%d ffn=%d reduce=%d\n",
+                    have_ring_entry ? 1 : 0,
                     ring_chunks,
                     attn_markers,
                     ffn_markers,
@@ -2123,11 +2129,17 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             pc_ring_bind_stage bind_stage =
                 pc_ring_bind_stage::ATTN;
             int bind_layer = stage->layer_begin;
+            bool ring_bind_active = false;
             bool force_next_split = false;
 
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 ggml_tensor * node =
                     ggml_graph_node(gf, node_id);
+                const bool ring_entry_node =
+                    std::strncmp(
+                        node->name,
+                        "pc_ring_entry",
+                        13) == 0;
 
                 if (node->view_src == nullptr) {
                     if (force_next_split) {
@@ -2141,7 +2153,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                     // belong to the suffix split rather than a fictitious next
                     // Ring layer. Leave those nodes to normal scheduler
                     // placement after creating the boundary above.
-                    if (bind_layer < stage->layer_end) {
+                    if (ring_bind_active &&
+                        bind_layer < stage->layer_end) {
                         const llama_hybrid_local_backend_slot slot =
                             slot_for_stage(bind_layer, bind_stage);
                         ggml_backend_t target =
@@ -2171,6 +2184,15 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                             node,
                             target);
                     }
+                }
+
+                if (ring_entry_node) {
+                    // Prefix graph work (embedding/input preparation) remains
+                    // under the normal scheduler.  Ring ownership starts only
+                    // after this explicit graph boundary.
+                    ring_bind_active = true;
+                    force_next_split = true;
+                    continue;
                 }
 
                 int marker_chunk = -1;
