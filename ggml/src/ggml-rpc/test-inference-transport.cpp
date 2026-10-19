@@ -302,7 +302,11 @@ static bool run_new(
         sender.join();
     }
 
-    if (receiver_ok && ack_sent) {
+    // The sender thread already drains all DATA frames before it exits.
+    // Only a side that received DATA may have a separately queued final ACK
+    // that still needs to be flushed here. Re-waiting on a send-only client
+    // creates a shutdown race with the peer closing after its ACK.
+    if (receiver_ok && need_recv && ack_sent) {
         receiver_ok = transport->wait_tx_idle(-1);
     }
 
