@@ -1545,6 +1545,7 @@ struct rpc_inference_owned_frame {
 
 struct rpc_inference_receive_state {
     std::mutex mutex;
+    const inference_transport * transport_id = nullptr;
     std::deque<rpc_inference_owned_frame> pending;
 };
 
@@ -1589,6 +1590,11 @@ static bool rpc_inference_receive_matching(
 
     auto state = rpc_inference_get_receive_state(endpoint);
     std::unique_lock<std::mutex> dispatch_lock(state->mutex);
+
+    if (state->transport_id != transport.get()) {
+        state->pending.clear();
+        state->transport_id = transport.get();
+    }
 
     auto consume_owned =
         [&](rpc_inference_owned_frame && owned) -> bool {
