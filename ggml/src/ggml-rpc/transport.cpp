@@ -476,8 +476,25 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
         ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
         if (n < 0) {
-            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                           bytes_sent, size_to_send);
+            const int err = socket_last_error();
+#ifdef _WIN32
+            if (err == WSAEINTR) {
+                continue;
+            }
+#else
+            if (err == EINTR) {
+                continue;
+            }
+#endif
+            GGML_LOG_ERROR(
+                "send failed: bytes_sent=%zu size_to_send=%zu err=%d (%s)\n",
+                bytes_sent, size_to_send, err, socket_error_string(err));
+            return false;
+        }
+        if (n == 0) {
+            GGML_LOG_ERROR(
+                "send returned 0: bytes_sent=%zu size_to_send=%zu\n",
+                bytes_sent, size_to_send);
             return false;
         }
         bytes_sent += (size_t)n;
@@ -496,40 +513,18 @@ bool socket_t::impl::send_data_pair(
     }
 #endif
 
+#ifdef _WIN32
+    // Keep the first Windows V1 path deliberately conservative.
+    // The async pipeline comes from the dedicated TX worker and buffer ring;
+    // gathered I/O is an optional optimization, not a correctness requirement.
+    return send_data(data0, size0) && send_data(data1, size1);
+#else
     const uint8_t * p0 = static_cast<const uint8_t *>(data0);
     const uint8_t * p1 = static_cast<const uint8_t *>(data1);
     size_t off0 = 0;
     size_t off1 = 0;
 
     while (off0 < size0 || off1 < size1) {
-#ifdef _WIN32
-        WSABUF bufs[2] = {};
-        DWORD nbufs = 0;
-
-        if (off0 < size0) {
-            bufs[nbufs].buf = reinterpret_cast<CHAR *>(const_cast<uint8_t *>(p0 + off0));
-            bufs[nbufs].len = static_cast<ULONG>(
-                std::min(size0 - off0, static_cast<size_t>(ULONG_MAX)));
-            ++nbufs;
-        }
-
-        if (off1 < size1) {
-            bufs[nbufs].buf = reinterpret_cast<CHAR *>(const_cast<uint8_t *>(p1 + off1));
-            bufs[nbufs].len = static_cast<ULONG>(
-                std::min(size1 - off1, static_cast<size_t>(ULONG_MAX)));
-            ++nbufs;
-        }
-
-        DWORD sent = 0;
-        if (WSASend(fd, bufs, nbufs, &sent, 0, nullptr, nullptr) != 0) {
-            if (WSAGetLastError() == WSAEINTR) {
-                continue;
-            }
-            GGML_LOG_ERROR("WSASend failed in send_data_pair\n");
-            return false;
-        }
-        const size_t n = static_cast<size_t>(sent);
-#else
         struct iovec iov[2] = {};
         int iovcnt = 0;
 
@@ -550,12 +545,13 @@ bool socket_t::impl::send_data_pair(
             if (errno == EINTR) {
                 continue;
             }
-            GGML_LOG_ERROR("writev failed in send_data_pair\n");
+            GGML_LOG_ERROR(
+                "writev failed in send_data_pair: err=%d (%s)\n",
+                errno, std::strerror(errno));
             return false;
         }
-        const size_t n = static_cast<size_t>(sent);
-#endif
 
+        const size_t n = static_cast<size_t>(sent);
         if (n == 0) {
             return false;
         }
@@ -570,6 +566,7 @@ bool socket_t::impl::send_data_pair(
     }
 
     return true;
+#endif
 }
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
