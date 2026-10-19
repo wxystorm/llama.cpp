@@ -207,6 +207,9 @@ static bool run_new(
     if (need_send) {
         sender = std::thread([&]() {
             sender_ok = new_send_data_frames(*transport, opt);
+            if (!sender_ok) {
+                transport->stop();
+            }
         });
     }
 
@@ -255,6 +258,10 @@ static bool run_new(
                 receiver_ok = false;
             }
         }
+    }
+
+    if (!receiver_ok) {
+        transport->stop();
     }
 
     if (sender.joinable()) {
