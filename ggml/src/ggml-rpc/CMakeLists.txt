@@ -3,7 +3,27 @@ message(STATUS "Using RPC backend")
 ggml_add_backend_library(ggml-rpc
                          ggml-rpc.cpp
                          transport.cpp
+                         inference-transport.cpp
                         )
+
+target_compile_features(ggml-rpc PRIVATE cxx_std_17)
+
+option(GGML_RPC_BUILD_TRANSPORT_BENCH "ggml: build inference transport microbenchmark" ON)
+
+if (GGML_RPC_BUILD_TRANSPORT_BENCH)
+    add_executable(test-inference-transport
+                   test-inference-transport.cpp
+                   inference-transport.cpp
+                   transport.cpp)
+
+    target_link_libraries(test-inference-transport PRIVATE ggml-base Threads::Threads)
+    target_compile_features(test-inference-transport PRIVATE cxx_std_17)
+    target_include_directories(test-inference-transport PRIVATE ..)
+
+    if (WIN32)
+        target_link_libraries(test-inference-transport PRIVATE ws2_32)
+    endif()
+endif()
 
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
