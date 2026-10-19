@@ -11748,61 +11748,95 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     print_pre("PC", tp_numeric_pre_pc);
                     print_pre("PHONE", tp_numeric_pre_phone);
 
-                    if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr &&
-                            pc_node->op == GGML_OP_ADD &&
-                            pc_node->src[0] != nullptr &&
-                            pc_node->src[1] != nullptr &&
-                            pc_node->src[0]->type == GGML_TYPE_F32 &&
-                            pc_node->src[1]->type == GGML_TYPE_F32 &&
-                            ggml_nelements(pc_node->src[0]) == n &&
-                            ggml_nelements(pc_node->src[1]) == n) {
-                        std::vector<float> src0_values(n);
-                        std::vector<float> src1_values(n);
-                        ggml_backend_tensor_get(
-                            pc_node->src[0],
-                            src0_values.data(),
-                            0,
-                            n * sizeof(float));
-                        ggml_backend_tensor_get(
-                            pc_node->src[1],
-                            src1_values.data(),
-                            0,
-                            n * sizeof(float));
+                    if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                        // Reconstruct the PC MoE partial from the immutable
+                        // weighted expert leaf views.  Do not use the final
+                        // ADD accumulator inputs here: graph allocation is
+                        // allowed to reuse the accumulator buffer in-place,
+                        // so reading src[0] after execution can simply read
+                        // the already-written output.
+                        ggml_cgraph * pc_graph =
+                            pc_cfg.cgraphs[i].cgraph_main;
+                        char expert_view_name[96];
+                        std::snprintf(
+                            expert_view_name,
+                            sizeof(expert_view_name),
+                            "ffn_moe_weighted-%d (view)",
+                            tp_numeric_layer);
 
-                        double diff_l2 = 0.0;
-                        double max_abs_diff = 0.0;
-                        size_t exact = 0;
-                        for (size_t k = 0; k < n; ++k) {
-                            const float expected =
-                                src0_values[k] + src1_values[k];
-                            const double diff =
-                                (double) tp_numeric_pre_pc[k] -
-                                (double) expected;
-                            exact += tp_numeric_pre_pc[k] == expected;
-                            diff_l2 += diff * diff;
-                            max_abs_diff =
-                                std::max(max_abs_diff, std::abs(diff));
+                        std::vector<ggml_tensor *> expert_views;
+                        for (int ni = 0; ni < pc_graph->n_nodes; ++ni) {
+                            ggml_tensor * t = pc_graph->nodes[ni];
+                            if (t == nullptr ||
+                                    t->op != GGML_OP_VIEW ||
+                                    t->type != GGML_TYPE_F32 ||
+                                    ggml_nelements(t) != n ||
+                                    std::strcmp(t->name, expert_view_name) != 0) {
+                                continue;
+                            }
+                            expert_views.push_back(t);
                         }
 
-                        printf(
-                            "[TP_PC_OUT_PROOF] L=%d C=%d out=%s "
-                            "src0=%s src1=%s "
-                            "out_data=%p src0_data=%p src1_data=%p "
-                            "exact=%zu/%zu maxdiff=%.9g rmsdiff=%.9g\n",
-                            tp_numeric_layer,
-                            tp_numeric_chunk,
-                            pc_node->name,
-                            pc_node->src[0]->name,
-                            pc_node->src[1]->name,
-                            pc_node->data,
-                            pc_node->src[0]->data,
-                            pc_node->src[1]->data,
-                            exact,
-                            n,
-                            max_abs_diff,
-                            n > 0 ?
-                                std::sqrt(diff_l2 / (double) n) :
-                                0.0);
+                        if (!expert_views.empty()) {
+                            std::vector<float> expected(n);
+                            std::vector<float> leaf(n);
+
+                            ggml_backend_tensor_get(
+                                expert_views[0],
+                                expected.data(),
+                                0,
+                                n * sizeof(float));
+
+                            for (size_t ei = 1;
+                                    ei < expert_views.size();
+                                    ++ei) {
+                                ggml_backend_tensor_get(
+                                    expert_views[ei],
+                                    leaf.data(),
+                                    0,
+                                    n * sizeof(float));
+                                for (size_t k = 0; k < n; ++k) {
+                                    expected[k] += leaf[k];
+                                }
+                            }
+
+                            double diff_l2 = 0.0;
+                            double max_abs_diff = 0.0;
+                            size_t exact = 0;
+                            for (size_t k = 0; k < n; ++k) {
+                                const double diff =
+                                    (double) tp_numeric_pre_pc[k] -
+                                    (double) expected[k];
+                                exact +=
+                                    tp_numeric_pre_pc[k] == expected[k];
+                                diff_l2 += diff * diff;
+                                max_abs_diff =
+                                    std::max(
+                                        max_abs_diff,
+                                        std::abs(diff));
+                            }
+
+                            printf(
+                                "[TP_PC_MOE_SUM_PROOF] L=%d C=%d "
+                                "experts=%zu exact=%zu/%zu "
+                                "maxdiff=%.9g rmsdiff=%.9g\n",
+                                tp_numeric_layer,
+                                tp_numeric_chunk,
+                                expert_views.size(),
+                                exact,
+                                n,
+                                max_abs_diff,
+                                n > 0 ?
+                                    std::sqrt(
+                                        diff_l2 / (double) n) :
+                                    0.0);
+                        } else {
+                            printf(
+                                "[TP_PC_MOE_SUM_PROOF] L=%d C=%d "
+                                "status=NO_EXPERT_VIEWS\n",
+                                tp_numeric_layer,
+                                tp_numeric_chunk);
+                        }
                     }
 
                     if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
