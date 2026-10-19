@@ -10474,7 +10474,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_meta_get_snapshot_arm(bcj_src.backend);
             const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
                 ggml_backend_meta_get_snapshot_read_setter(bcj_src.backend);
+            // Dense FFN prefill chunks terminate directly at MUL_MAT and are
+            // compatible with the current RPC snapshot fast path. Qwen3-MoE
+            // prefill chunks terminate after expert aggregation (typically ADD),
+            // so snapshotting that boundary can expose an incomplete dependency
+            // chain when multiple chunks are in flight.
+            const bool snapshot_compatible_prefill_chunk =
+                node_src->op == GGML_OP_MUL_MAT &&
+                node_dst->op == GGML_OP_MUL_MAT;
             const bool use_snapshot_pipeline =
+                snapshot_compatible_prefill_chunk &&
                 snapshot_prepares[i].prepared &&
                 snapshot_arm != nullptr &&
                 set_snapshot_read != nullptr;
@@ -10694,6 +10703,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 "[RETURN_WAVEFRONT_DOWN_READY] layer=%d chunk=%d lane=%zu\n",
                                 prefill_down_layer_0, prefill_down_chunk_0, return_lane);
                         }
+                    } else if (!use_snapshot_pipeline && !handoff_to_phone) {
+                        // Conservative MoE prefill returns reuse the same
+                        // temporary storage on the next worker task. The ADD
+                        // above is asynchronous, so task completion alone does
+                        // not prove that node_tmp is no longer being consumed.
+                        const int64_t reduce_sync_start_us = ggml_time_us();
+                        ggml_backend_synchronize(bcj_dst.backend);
+                        reduce_sync_us = ggml_time_us() - reduce_sync_start_us;
+                        if (pipeline_debug) {
+                            GGML_LOG_INFO(
+                                "[PREFILL_CONSERVATIVE_REDUCE_SYNC] "
+                                "layer=%d chunk=%d lane=%zu wait_ms=%.3f\n",
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                return_lane,
+                                reduce_sync_us / 1000.0);
+                        }
                     }
 
                     if (!handoff_to_phone) {
@@ -10734,6 +10760,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pending_prefill_reduce_layer[return_lane]  = prefill_down_layer_0;
             pending_prefill_reduce_chunk[return_lane]  = prefill_down_chunk_0;
             pending_prefill_reduce_worker[return_lane] = reduce_worker;
+
+            if (!use_snapshot_pipeline) {
+                // Correctness-first MoE prefill path: keep the PC partial and
+                // shared temporary storage alive until the Phone payload has
+                // arrived and the reduce ADD has fully materialized. This also
+                // makes a final Tensor->Phone handoff depend on all prior
+                // chunks having completed.
+                const int64_t conservative_wait_start_us = ggml_time_us();
+                const ggml_status conservative_status =
+                    wait_prefill_reduce_lane(return_lane);
+                const int64_t conservative_wait_us =
+                    ggml_time_us() - conservative_wait_start_us;
+                if (pipeline_debug) {
+                    GGML_LOG_INFO(
+                        "[PREFILL_CONSERVATIVE_CHUNK_BARRIER] "
+                        "layer=%d chunk=%d wait_ms=%.3f status=%d\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        conservative_wait_us / 1000.0,
+                        (int) conservative_status);
+                }
+                if (conservative_status != GGML_STATUS_SUCCESS) {
+                    return conservative_status;
+                }
+            }
 
             if (use_snapshot_pipeline) {
                 const int64_t snapshot_arm_start_us = ggml_time_us();
@@ -13477,8 +13528,15 @@ auto prefill_norm_sg_has_prework =
             !layer_attention_phone_owned(prefill_down_layer)) {
         ggml_tensor * phone_prefill_down = get_prefill_down_boundary_node(1, i);
         ggml_tensor * pc_prefill_down = get_prefill_down_boundary_node(0, i);
+        const bool snapshot_compatible_prefill_chunk =
+            phone_prefill_down != nullptr &&
+            pc_prefill_down != nullptr &&
+            phone_prefill_down->op == GGML_OP_MUL_MAT &&
+            pc_prefill_down->op == GGML_OP_MUL_MAT;
+
         if (phone_prefill_down != nullptr && pc_prefill_down != nullptr &&
-                (phone_prefill_down->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                (phone_prefill_down->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                snapshot_compatible_prefill_chunk) {
             prepare_graph_snapshot(i, phone_prefill_down);
 
             if (pipeline_debug) {
@@ -13487,6 +13545,17 @@ auto prefill_norm_sg_has_prework =
                        i, prefill_down_layer, prefill_down_chunk,
                        phone_prefill_down->name, ggml_nbytes(phone_prefill_down));
             }
+        } else if (pipeline_debug &&
+                phone_prefill_down != nullptr &&
+                pc_prefill_down != nullptr &&
+                !snapshot_compatible_prefill_chunk) {
+            GGML_LOG_INFO(
+                "[PREFILL_SNAPSHOT_PREPARE_SKIP] layer=%d chunk=%d "
+                "phone_op=%s pc_op=%s\n",
+                prefill_down_layer,
+                prefill_down_chunk,
+                ggml_op_name(phone_prefill_down->op),
+                ggml_op_name(pc_prefill_down->op));
         }
     }
 
