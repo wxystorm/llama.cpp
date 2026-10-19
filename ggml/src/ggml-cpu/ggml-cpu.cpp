@@ -64,7 +64,12 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #endif
 
 #ifdef GGML_USE_CPU_REPACK
-        if (ggml_backend_cpu_repack_buffer_type()) {
+        // Large-model diagnostic tools may only need the original mmap-backed
+        // weights as a staging source for another backend. In that case a full
+        // CPU_REPACK copy is pure overhead (and can exceed phone RAM).
+        const char * disable_repack = std::getenv("GGML_CPU_DISABLE_REPACK");
+        if ((disable_repack == nullptr || std::atoi(disable_repack) == 0) &&
+                ggml_backend_cpu_repack_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
         }
 #endif
