@@ -11115,29 +11115,55 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         !!(n1->flags & GGML_TENSOR_FLAG_COMPUTE),
         ggml_nbytes(n1));
 }
-        // Zero out nodes that were disabled due to having a zero-sized slice:
-        for (size_t j = 0; j < n_backends; j++) {
+        // Zero out nodes that were disabled due to having a zero-sized slice.
+        //
+        // Do not implement this as SCALE(node, 0). IEEE-754 preserves NaN for
+        // 0 * NaN, so stale NaNs in allocator-reused storage survive the
+        // "zeroing" step and then poison the following all-reduce. This is
+        // especially visible after a large prefill changes/reuses the backing
+        // buffers before decode.
+        //
+        // RPC buffers do not implement memset_tensor, so use tensor_set with
+        // explicit zero bytes. This is correctness-first and works for both
+        // local and RPC-backed tensors.
+        size_t max_zero_bytes = 0;
+        for (size_t j = 0; j < n_backends; ++j) {
             auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node =
+                bcj.cgraphs[i].cgraph_main->nodes[
+                    bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                max_zero_bytes =
+                    std::max(max_zero_bytes, ggml_nbytes(node));
+            }
+        }
+
+        std::vector<uint8_t> zero_bytes(max_zero_bytes, 0);
+        for (size_t j = 0; j < n_backends; ++j) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node =
+                bcj.cgraphs[i].cgraph_main->nodes[
+                    bcj.cgraphs[i].cgraph_main->n_nodes - 1];
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
+            const size_t nbytes = ggml_nbytes(node);
             const int64_t zero_start_us = ggml_time_us();
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            ggml_backend_tensor_set(
+                node,
+                zero_bytes.data(),
+                0,
+                nbytes);
             reduce_zero_us += ggml_time_us() - zero_start_us;
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+
+            if (std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr) {
+                GGML_LOG_ERROR(
+                    "[META_REAL_ZERO] sg=%zu j=%zu t=%s bytes=%zu\n",
+                    i,
+                    j,
+                    node->name,
+                    nbytes);
             }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
