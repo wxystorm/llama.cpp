@@ -11578,6 +11578,88 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_INFERENCE_ROUTE_PULL: {
+                rpc_msg_inference_route_pull_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+
+                rpc_msg_inference_route_pull_rsp response {};
+                auto transport =
+                    server.get_inference_data_plane();
+
+                std::vector<uint8_t> payload;
+                bool status =
+                    transport != nullptr &&
+                    transport->healthy() &&
+                    server.get_route_snapshot(
+                        request.snapshot,
+                        payload);
+
+                if (status) {
+                    inference_tx_buffer tx =
+                        transport->acquire_tx(payload.size());
+                    status = static_cast<bool>(tx);
+
+                    if (status && !payload.empty()) {
+                        std::memcpy(
+                            tx.data,
+                            payload.data(),
+                            payload.size());
+                    }
+
+                    if (status) {
+                        inference_frame_header header =
+                            inference_make_header(
+                                INFERENCE_FRAME_DATA);
+                        header.stage =
+                            INFERENCE_STAGE_ROUTE;
+                        header.stream_id =
+                            request.snapshot.device;
+                        header.seq =
+                            request.snapshot.seq;
+                        header.graph_id = 0;
+                        header.layer = request.layer;
+                        header.chunk = request.chunk;
+
+                        status = transport->submit_tx(
+                            std::move(tx),
+                            header,
+                            payload.size());
+                    } else if (tx) {
+                        transport->release_tx(
+                            std::move(tx));
+                    }
+                }
+
+                response.result = status ? 1 : 0;
+                response.wire_size =
+                    status ?
+                        static_cast<uint64_t>(
+                            payload.size()) :
+                        0;
+
+                GGML_LOG_INFO(
+                    "[INFERENCE_ROUTE] side=server "
+                    "device=%u lane=%u seq=%" PRIu64
+                    " layer=%d chunk=%d bytes=%zu "
+                    "status=%s\n",
+                    request.snapshot.device,
+                    request.snapshot.lane,
+                    request.snapshot.seq,
+                    request.layer,
+                    request.chunk,
+                    payload.size(),
+                    status ? "OK" : "FAIL");
+
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_INFERENCE_DATA_PLANE_OPEN: {
                 rpc_msg_inference_data_plane_open_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
