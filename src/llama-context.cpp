@@ -4084,10 +4084,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 }
                                 ggml_tensor * root =
                                     root_of(tensor);
-                                if (root == nullptr ||
-                                    !tensor_in_list(
-                                        range_nodes, root) ||
-                                    boundary_kind(root) >= 0) {
+                                if (root == nullptr) {
+                                    return;
+                                }
+                                const bool root_is_local =
+                                    tensor_in_list(
+                                        range_nodes, root);
+                                const bool root_is_boundary =
+                                    boundary_kind(root) >= 0;
+                                if (!root_is_local &&
+                                    !root_is_boundary) {
                                     return;
                                 }
 
@@ -4122,6 +4128,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             } else {
                                 if ((node->flags &
                                         (GGML_TENSOR_FLAG_INPUT |
+                                         GGML_TENSOR_FLAG_OUTPUT |
                                          GGML_TENSOR_FLAG_PARAM)) == 0) {
                                     const bool is_weight =
                                         node->buffer != nullptr &&
