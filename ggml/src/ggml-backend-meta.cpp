@@ -11585,10 +11585,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
 
-        // Numeric proof for the first Phone-primary Tensor layer.  This is
-        // deliberately diagnostic-only: it does not change graph ownership or
-        // reduction semantics.  Capture the two FFN partials before reduction
-        // so we can prove whether each backend later contains their exact sum.
+        // Numeric proof for a selected Tensor layer.  This is diagnostic-only:
+        // it does not change graph ownership or reduction semantics. Capture
+        // both FFN partials before reduction and verify both post-reduce copies
+        // equal their exact sum.
         bool tp_numeric_trace = false;
         int tp_numeric_layer = -1;
         int tp_numeric_chunk = -1;
@@ -11596,9 +11596,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         std::vector<float> tp_numeric_pre_pc;
         std::vector<float> tp_numeric_pre_phone;
 
-        if (std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr &&
-                n_backends == 2 &&
+        int tp_numeric_target_layer = -1;
+        const char * tp_numeric_layer_env =
+            std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE_LAYER");
+        if (tp_numeric_layer_env != nullptr) {
+            char * end = nullptr;
+            const long parsed = std::strtol(
+                tp_numeric_layer_env, &end, 10);
+            if (end != tp_numeric_layer_env &&
+                    *end == '\0' &&
+                    parsed >= 0 &&
+                    parsed <= INT_MAX) {
+                tp_numeric_target_layer = (int) parsed;
+            }
+        } else if (std::getenv("GGML_META_TP_FFN_NUMERIC_TRACE") != nullptr &&
                 backend_ctx->tensor_phone_first_layer >= 0) {
+            // Preserve the original diagnostic behavior.
+            tp_numeric_target_layer =
+                backend_ctx->tensor_phone_first_layer;
+        }
+
+        if (n_backends == 2 &&
+                tp_numeric_target_layer >= 0) {
             ggml_tensor * trace_node =
                 backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
                     backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
@@ -11628,7 +11647,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             tp_numeric_trace =
-                tp_numeric_layer == backend_ctx->tensor_phone_first_layer &&
+                tp_numeric_layer == tp_numeric_target_layer &&
                 backend_ctx->backend_configs[0].cgraphs[i].cgraph_main
                     ->nodes[backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1]->type == GGML_TYPE_F32 &&
                 backend_ctx->backend_configs[1].cgraphs[i].cgraph_main
@@ -11670,17 +11689,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             l2 += (double) x * x;
                             max_abs = std::max(max_abs, std::abs((double) x));
                         }
-                        printf(
-                            "[TP_ALLREDUCE_NUMERIC] phase=PRE layer=%d chunk=%d "
-                            "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
-                            "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
-                            tp_numeric_layer, tp_numeric_chunk,
-                            tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
-                            side, values.size(), sum, std::sqrt(l2), max_abs,
-                            values.size() > 0 ? values[0] : 0.0f,
-                            values.size() > 1 ? values[1] : 0.0f,
-                            values.size() > 2 ? values[2] : 0.0f,
-                            values.size() > 3 ? values[3] : 0.0f);
+                        if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                            printf(
+                                "[TP_AR_PRE] L=%d C=%d side=%s "
+                                "n=%zu l2=%.6g max=%.6g\n",
+                                tp_numeric_layer,
+                                tp_numeric_chunk,
+                                side,
+                                values.size(),
+                                std::sqrt(l2),
+                                max_abs);
+                        } else {
+                            printf(
+                                "[TP_ALLREDUCE_NUMERIC] phase=PRE layer=%d chunk=%d "
+                                "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
+                                "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                                tp_numeric_layer, tp_numeric_chunk,
+                                tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                                side, values.size(), sum, std::sqrt(l2), max_abs,
+                                values.size() > 0 ? values[0] : 0.0f,
+                                values.size() > 1 ? values[1] : 0.0f,
+                                values.size() > 2 ? values[2] : 0.0f,
+                                values.size() > 3 ? values[3] : 0.0f);
+                        }
                     };
                     print_pre("PC", tp_numeric_pre_pc);
                     print_pre("PHONE", tp_numeric_pre_phone);
@@ -11861,19 +11892,32 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
                 const double rms_diff =
                     n > 0 ? std::sqrt(diff_l2 / (double) n) : 0.0;
-                printf(
-                    "[TP_ALLREDUCE_NUMERIC] phase=POST layer=%d chunk=%d "
-                    "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
-                    "max_abs_diff=%.9g rms_diff=%.9g max_diff_index=%zu "
-                    "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
-                    tp_numeric_layer, tp_numeric_chunk,
-                    tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
-                    side, values.size(), sum, std::sqrt(l2), max_abs,
-                    max_abs_diff, rms_diff, max_diff_index,
-                    values.size() > 0 ? values[0] : 0.0f,
-                    values.size() > 1 ? values[1] : 0.0f,
-                    values.size() > 2 ? values[2] : 0.0f,
-                    values.size() > 3 ? values[3] : 0.0f);
+                if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                    printf(
+                        "[TP_AR_POST] L=%d C=%d side=%s "
+                        "l2=%.6g max=%.6g maxdiff=%.6g rmsdiff=%.6g\n",
+                        tp_numeric_layer,
+                        tp_numeric_chunk,
+                        side,
+                        std::sqrt(l2),
+                        max_abs,
+                        max_abs_diff,
+                        rms_diff);
+                } else {
+                    printf(
+                        "[TP_ALLREDUCE_NUMERIC] phase=POST layer=%d chunk=%d "
+                        "mode=%s side=%s n=%zu sum=%.9f l2=%.9f max=%.9f "
+                        "max_abs_diff=%.9g rms_diff=%.9g max_diff_index=%zu "
+                        "v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                        tp_numeric_layer, tp_numeric_chunk,
+                        tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                        side, values.size(), sum, std::sqrt(l2), max_abs,
+                        max_abs_diff, rms_diff, max_diff_index,
+                        values.size() > 0 ? values[0] : 0.0f,
+                        values.size() > 1 ? values[1] : 0.0f,
+                        values.size() > 2 ? values[2] : 0.0f,
+                        values.size() > 3 ? values[3] : 0.0f);
+                }
             };
 
             print_post("PC", post_pc);
@@ -11887,14 +11931,23 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 cross_l2 += diff * diff;
                 cross_max = std::max(cross_max, std::abs(diff));
             }
-            printf(
-                "[TP_ALLREDUCE_NUMERIC] phase=CROSS layer=%d chunk=%d "
-                "mode=%s pc_phone_max_abs_diff=%.9g "
-                "pc_phone_rms_diff=%.9g\n",
-                tp_numeric_layer, tp_numeric_chunk,
-                tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
-                cross_max,
-                n > 0 ? std::sqrt(cross_l2 / (double) n) : 0.0);
+            if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                printf(
+                    "[TP_AR_CROSS] L=%d C=%d maxdiff=%.6g rmsdiff=%.6g\n",
+                    tp_numeric_layer,
+                    tp_numeric_chunk,
+                    cross_max,
+                    n > 0 ? std::sqrt(cross_l2 / (double) n) : 0.0);
+            } else {
+                printf(
+                    "[TP_ALLREDUCE_NUMERIC] phase=CROSS layer=%d chunk=%d "
+                    "mode=%s pc_phone_max_abs_diff=%.9g "
+                    "pc_phone_rms_diff=%.9g\n",
+                    tp_numeric_layer, tp_numeric_chunk,
+                    tp_numeric_mode != nullptr ? tp_numeric_mode : "unknown",
+                    cross_max,
+                    n > 0 ? std::sqrt(cross_l2 / (double) n) : 0.0);
+            }
         }
 
         if (pipeline_debug && i == 1 && n_backends == 2) {
