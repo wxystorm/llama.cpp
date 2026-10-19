@@ -8626,18 +8626,90 @@ static bool rpc_phone_l47_legacy_target_name(
     return false;
 }
 
-static bool rpc_phone_l47_graph_contains_moe_out(
+static bool rpc_phone_graph_contains_layer_suffix(
+        const ggml_cgraph * graph,
+        int layer) {
+    if (graph == nullptr) {
+        return false;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || node->name[0] == '\0') {
+            continue;
+        }
+
+        const char * dash = std::strrchr(node->name, '-');
+        if (dash == nullptr || dash[1] == '\0') {
+            continue;
+        }
+
+        char * end = nullptr;
+        const long parsed_layer = std::strtol(
+            dash + 1,
+            &end,
+            10);
+        if (end != dash + 1 &&
+                *end == '\0' &&
+                parsed_layer == layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rpc_phone_l47_graph_has_multitoken_output(
         const ggml_cgraph * graph) {
     if (graph == nullptr) {
         return false;
     }
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * node = graph->nodes[i];
-        if (node != nullptr &&
-                std::strcmp(node->name, "ffn_moe_out-47") == 0) {
+        if (node == nullptr || node->name[0] == '\0') {
+            continue;
+        }
+
+        int chunk = -1;
+        int layer = -1;
+        int parsed = 0;
+        const bool down_chunk =
+            std::sscanf(
+                node->name,
+                "ffn_down_chunk_%d-%d%n",
+                &chunk,
+                &layer,
+                &parsed) == 2 &&
+            node->name[parsed] == '\0' &&
+            layer == 47;
+
+        parsed = 0;
+        const bool prefill_down_chunk =
+            std::sscanf(
+                node->name,
+                "prefill_ffn_down_chunk_%d-%d%n",
+                &chunk,
+                &layer,
+                &parsed) == 2 &&
+            node->name[parsed] == '\0' &&
+            layer == 47;
+
+        parsed = 0;
+        const bool moe_out =
+            std::sscanf(
+                node->name,
+                "ffn_moe_out-%d%n",
+                &layer,
+                &parsed) == 1 &&
+            node->name[parsed] == '\0' &&
+            layer == 47;
+
+        if ((down_chunk || prefill_down_chunk || moe_out) &&
+                node->ne[1] > 1) {
             return true;
         }
     }
+
     return false;
 }
 
@@ -8769,41 +8841,58 @@ static ggml_status rpc_phone_l47_compute_with_producer_diag(
 
     GGML_LOG_ERROR(
         "[L47_LEGACY_PATH] uid=%" PRIu64
-        " nodes=%d action=SEGMENTED_PRODUCER_DIAG_BEGIN\n",
+        " nodes=%d action=SEGMENTED_ALL_NODES_BEGIN\n",
         graph_uid,
         graph->n_nodes);
 
-    int cursor = 0;
-    int targets = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        GGML_LOG_ERROR(
+            "[L47_GRAPH_NODE] uid=%" PRIu64
+            " idx=%d name=%s op=%s type=%d "
+            "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+            "src0=%s src1=%s view=%s\n",
+            graph_uid,
+            i,
+            node != nullptr && node->name[0] != '\0' ?
+                node->name : "<unnamed>",
+            node != nullptr ? ggml_op_name(node->op) : "<null>",
+            node != nullptr ? (int) node->type : -1,
+            node != nullptr ? node->ne[0] : 0,
+            node != nullptr ? node->ne[1] : 0,
+            node != nullptr ? node->ne[2] : 0,
+            node != nullptr ? node->ne[3] : 0,
+            node != nullptr && node->src[0] != nullptr ?
+                node->src[0]->name : "-",
+            node != nullptr && node->src[1] != nullptr ?
+                node->src[1]->name : "-",
+            node != nullptr && node->view_src != nullptr ?
+                node->view_src->name : "-");
+    }
 
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
-        if (node == nullptr ||
-                !rpc_phone_l47_legacy_target_name(node->name)) {
+        if (node == nullptr) {
             continue;
         }
 
-        if (cursor <= i) {
-            ggml_cgraph part = rpc_graph_view(
-                graph,
-                cursor,
-                i + 1);
-            const ggml_status status =
-                ggml_backend_graph_compute(gpu, &part);
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR(
-                    "[L47_LEGACY_PATH] uid=%" PRIu64
-                    " idx=%d name=%s status=%d action=SEGMENT_FAIL\n",
-                    graph_uid,
-                    i,
-                    node->name,
-                    (int) status);
-                return status;
-            }
-            cursor = i + 1;
+        ggml_cgraph part = rpc_graph_view(
+            graph,
+            i,
+            i + 1);
+        const ggml_status status =
+            ggml_backend_graph_compute(gpu, &part);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR(
+                "[L47_LEGACY_PATH] uid=%" PRIu64
+                " idx=%d name=%s status=%d action=NODE_FAIL\n",
+                graph_uid,
+                i,
+                node->name,
+                (int) status);
+            return status;
         }
 
-        ++targets;
         if (node->type == GGML_TYPE_F32) {
             rpc_phone_l47_diag_f32_tensor(
                 node,
@@ -8831,24 +8920,11 @@ static ggml_status rpc_phone_l47_compute_with_producer_diag(
         }
     }
 
-    if (cursor < graph->n_nodes) {
-        ggml_cgraph tail = rpc_graph_view(
-            graph,
-            cursor,
-            graph->n_nodes);
-        const ggml_status status =
-            ggml_backend_graph_compute(gpu, &tail);
-        if (status != GGML_STATUS_SUCCESS) {
-            return status;
-        }
-    }
-
     GGML_LOG_ERROR(
         "[L47_LEGACY_PATH] uid=%" PRIu64
-        " nodes=%d targets=%d action=SEGMENTED_PRODUCER_DIAG_END\n",
+        " nodes=%d action=SEGMENTED_ALL_NODES_END\n",
         graph_uid,
-        graph->n_nodes,
-        targets);
+        graph->n_nodes);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -8941,19 +9017,29 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     }
 
     if (stages.empty()) {
+        const bool l47_graph =
+            graph_id.layer == 47 ||
+            rpc_phone_graph_contains_layer_suffix(
+                graph,
+                47);
+        const bool l47_multitoken =
+            rpc_phone_l47_graph_has_multitoken_output(
+                graph);
         const bool l47_legacy_diag =
             std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
-            rpc_phone_l47_graph_contains_moe_out(graph);
+            l47_graph &&
+            l47_multitoken;
 
-        if (graph_id.layer == 47 || l47_legacy_diag) {
+        if (l47_graph) {
             GGML_LOG_ERROR(
                 "[L47_RING_TRACE_PHONE] phase=GRAPH_PATH path=GPU_NO_FFN_STAGE "
                 "uid=%" PRIu64 " chunk=%d cpu_reduce_seq=%" PRIu64
-                " contains_moe_out=%d legacy_diag=%d\n",
+                " l47_graph=%d multitoken=%d legacy_diag=%d\n",
                 graph_uid,
                 graph_id.chunk,
                 cpu_reduce_seq,
-                l47_legacy_diag ? 1 : 0,
+                l47_graph ? 1 : 0,
+                l47_multitoken ? 1 : 0,
                 l47_legacy_diag ? 1 : 0);
         }
         if (cpu_reduce_seq != 0) {
