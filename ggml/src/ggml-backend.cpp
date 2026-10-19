@@ -2715,7 +2715,7 @@ void ggml_backend_sched_mark_dynamic_scratch(ggml_backend_sched_t sched, struct 
     sched->is_reset = false;
 }
 
-bool ggml_backend_sched_is_dynamic_scratch(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
+bool ggml_backend_sched_is_dynamic_scratch(ggml_backend_sched_t sched, struct ggml_tensor * node) {
     GGML_ASSERT(sched);
     GGML_ASSERT(node);
     if (!ggml_hash_contains(&sched->hash_set, node)) {

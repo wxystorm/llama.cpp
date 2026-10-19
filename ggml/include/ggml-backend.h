@@ -365,7 +365,7 @@ extern "C" {
     GGML_API void ggml_backend_sched_mark_dynamic_scratch(ggml_backend_sched_t sched,
                                                           struct ggml_tensor * node);
     GGML_API bool ggml_backend_sched_is_dynamic_scratch(ggml_backend_sched_t sched,
-                                                        const struct ggml_tensor * node);
+                                                        struct ggml_tensor * node);
 
     GGML_API ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
                                                                   struct ggml_tensor * node);
