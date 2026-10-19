@@ -14876,8 +14876,155 @@ auto prefill_norm_sg_has_prework =
     } else if (is_decode_pc_only_norm_sg(i) ||
                subgraph_is_decode_pc_only_ffn(i)) {
         // 整个 Attention/tail -> ffn_norm 区域只让 PC 执行。
+        const bool pc_head_diag =
+            std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG")) != 0 &&
+            subgraph_is_decode_pc_only_ffn(i);
+
+        ggml_tensor * pc_head_output = nullptr;
+        ggml_tensor * pc_head_input = nullptr;
+        ggml_tensor * pc_head_weight = nullptr;
+
+        auto print_pc_f32_stats =
+            [&](const char * tag, ggml_tensor * tensor) {
+                if (tensor == nullptr ||
+                        tensor->type != GGML_TYPE_F32) {
+                    return;
+                }
+
+                ggml_backend_t pc_backend =
+                    backend_ctx->backend_configs[0].backend;
+                ggml_backend_synchronize(pc_backend);
+
+                const size_t n = ggml_nelements(tensor);
+                std::vector<float> values(n);
+                ggml_backend_tensor_get(
+                    tensor,
+                    values.data(),
+                    0,
+                    n * sizeof(float));
+
+                size_t zero = 0;
+                size_t nonfinite = 0;
+                double l2 = 0.0;
+                double max_abs = 0.0;
+                for (float x : values) {
+                    zero += x == 0.0f;
+                    if (!std::isfinite(x)) {
+                        ++nonfinite;
+                        continue;
+                    }
+                    const double xd = x;
+                    l2 += xd * xd;
+                    max_abs = std::max(max_abs, std::abs(xd));
+                }
+
+                GGML_LOG_ERROR(
+                    "[PC_HEAD_%s] sg=%zu t=%s n=%zu z=%zu nf=%zu "
+                    "l2=%.6g max=%.6g data=%p\n",
+                    tag,
+                    i,
+                    tensor->name,
+                    n,
+                    zero,
+                    nonfinite,
+                    std::sqrt(l2),
+                    max_abs,
+                    tensor->data);
+            };
+
+        auto print_pc_weight_fingerprint =
+            [&](ggml_tensor * tensor) {
+                if (tensor == nullptr) {
+                    return;
+                }
+
+                ggml_backend_t pc_backend =
+                    backend_ctx->backend_configs[0].backend;
+                ggml_backend_synchronize(pc_backend);
+
+                const size_t total_bytes = ggml_nbytes(tensor);
+                const size_t sample_bytes =
+                    std::min<size_t>(total_bytes, 4096);
+                std::vector<uint8_t> bytes(sample_bytes);
+                if (sample_bytes > 0) {
+                    ggml_backend_tensor_get(
+                        tensor,
+                        bytes.data(),
+                        0,
+                        sample_bytes);
+                }
+
+                uint64_t hash = UINT64_C(1469598103934665603);
+                size_t nonzero = 0;
+                for (uint8_t byte : bytes) {
+                    nonzero += byte != 0;
+                    hash ^= byte;
+                    hash *= UINT64_C(1099511628211);
+                }
+
+                GGML_LOG_ERROR(
+                    "[PC_HEAD_W] sg=%zu t=%s type=%d "
+                    "ne=[%" PRId64 ",%" PRId64 "] "
+                    "bytes=%zu sample=%zu nz=%zu hash=%" PRIu64
+                    " data=%p\n",
+                    i,
+                    tensor->name,
+                    (int) tensor->type,
+                    tensor->ne[0],
+                    tensor->ne[1],
+                    total_bytes,
+                    sample_bytes,
+                    nonzero,
+                    hash,
+                    tensor->data);
+            };
+
+        if (pc_head_diag) {
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0].
+                    cgraphs[i].cgraph_main;
+            if (pc_graph != nullptr) {
+                for (int k = 0; k < pc_graph->n_nodes; ++k) {
+                    ggml_tensor * node = pc_graph->nodes[k];
+                    if (node != nullptr &&
+                            std::strcmp(
+                                node->name,
+                                "result_output") == 0) {
+                        pc_head_output = node;
+                        pc_head_weight = node->src[0];
+                        pc_head_input = node->src[1];
+                        break;
+                    }
+                }
+            }
+
+            if (pc_head_output != nullptr) {
+                GGML_LOG_ERROR(
+                    "[PC_HEAD_ID] sg=%zu out_ne=[%" PRId64 ",%" PRId64
+                    "] comp=%d in=%s w=%s\n",
+                    i,
+                    pc_head_output->ne[0],
+                    pc_head_output->ne[1],
+                    !!(pc_head_output->flags &
+                       GGML_TENSOR_FLAG_COMPUTE),
+                    pc_head_input != nullptr ?
+                        pc_head_input->name : "-",
+                    pc_head_weight != nullptr ?
+                        pc_head_weight->name : "-");
+                print_pc_f32_stats("IN", pc_head_input);
+                print_pc_weight_fingerprint(pc_head_weight);
+            }
+        }
+
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
+
+        if (pc_head_diag &&
+                compute_status == GGML_STATUS_SUCCESS &&
+                pc_head_output != nullptr) {
+            print_pc_f32_stats("OUT", pc_head_output);
+        }
 
         if (pipeline_debug) {
             auto * g =
