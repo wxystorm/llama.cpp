@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cinttypes>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -786,26 +787,68 @@ struct layer_stage_stats {
     stats total;
 };
 
+static bool contains_icase(const std::string & haystack, const std::string & needle) {
+    if (needle.empty()) return true;
+    auto lower = [](unsigned char c) { return (char) std::tolower(c); };
+    std::string h = haystack;
+    std::string n = needle;
+    std::transform(h.begin(), h.end(), h.begin(), lower);
+    std::transform(n.begin(), n.end(), n.begin(), lower);
+    return h.find(n) != std::string::npos;
+}
+
 static ggml_backend_dev_t find_device(const std::string & selector) {
     ggml_backend_dev_t partial = nullptr;
+
+    std::string effective = selector;
+    // Keep compatibility with the logical role name used by the hybrid logs.
+    if (effective == "GPUOpenCL") {
+        effective = "OpenCL";
+    }
+
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const char * name = ggml_backend_dev_name(dev);
         const char * desc = ggml_backend_dev_description(dev);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+
         if (name != nullptr && selector == name) {
             return dev;
         }
-        if (partial == nullptr) {
-            const bool name_match =
-                name != nullptr && std::string(name).find(selector) != std::string::npos;
-            const bool desc_match =
-                desc != nullptr && std::string(desc).find(selector) != std::string::npos;
-            if (name_match || desc_match) {
-                partial = dev;
-            }
+
+        const bool name_match =
+            name != nullptr && contains_icase(name, effective);
+        const bool desc_match =
+            desc != nullptr && contains_icase(desc, effective);
+        const bool reg_match =
+            reg_name != nullptr && contains_icase(reg_name, effective);
+
+        if (partial == nullptr && (name_match || desc_match || reg_match)) {
+            partial = dev;
         }
     }
     return partial;
+}
+
+static void print_registered_devices() {
+    std::printf(
+        "[PHONE_LAYER_BENCH_DEVICES] count=%zu\n",
+        ggml_backend_dev_count());
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        std::printf(
+            "[PHONE_LAYER_BENCH_DEVICE] index=%zu name=%s reg=%s description=\"%s\"\n",
+            i,
+            ggml_backend_dev_name(dev) != nullptr ?
+                ggml_backend_dev_name(dev) : "(null)",
+            reg != nullptr && ggml_backend_reg_name(reg) != nullptr ?
+                ggml_backend_reg_name(reg) : "(null)",
+            ggml_backend_dev_description(dev) != nullptr ?
+                ggml_backend_dev_description(dev) : "");
+    }
 }
 
 static bool measure_full_graph(
@@ -956,6 +999,26 @@ int main(int argc, char ** argv) {
     // source for copying the selected layers to GPUOpenCL/HTP0. Do not create
     // a second, fully repacked 30B CPU weight copy before the actual test.
     set_env_flag("GGML_CPU_DISABLE_REPACK", "1");
+
+    // Phone builds use dynamic backend libraries. test-backend-ops does the
+    // same thing before enumerating devices; without it only CPU is visible.
+    ggml_backend_load_all();
+    print_registered_devices();
+
+    ggml_backend_dev_t gpu_dev_probe = find_device(opt.gpu_device);
+    ggml_backend_dev_t npu_dev_probe = find_device(opt.npu_device);
+    if (gpu_dev_probe == nullptr || npu_dev_probe == nullptr) {
+        std::fprintf(
+            stderr,
+            "[PHONE_LAYER_BENCH_DEVICE_CHECK] gpu=%s found=%d npu=%s found=%d status=FAILED\n",
+            opt.gpu_device.c_str(), gpu_dev_probe != nullptr ? 1 : 0,
+            opt.npu_device.c_str(), npu_dev_probe != nullptr ? 1 : 0);
+        return 6;
+    }
+
+    std::printf(
+        "[PHONE_LAYER_BENCH_DEVICE_CHECK] gpu=%s found=1 npu=%s found=1 status=OK\n",
+        opt.gpu_device.c_str(), opt.npu_device.c_str());
 
     llama_backend_init();
 
