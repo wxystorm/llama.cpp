@@ -278,6 +278,7 @@ static bool legacy_recv_one(
         socket_t & socket,
         const bench_options & opt,
         uint64_t expected_seq,
+        std::vector<uint8_t> & payload,
         inference_transport_stats & stats) {
     inference_frame_header h = {};
 
@@ -294,7 +295,6 @@ static bool legacy_recv_one(
         return false;
     }
 
-    std::vector<uint8_t> payload(opt.bytes);
     if (!socket.recv_data(payload.data(), payload.size())) {
         return false;
     }
@@ -324,11 +324,8 @@ static bool legacy_send_one(
     inference_frame_header h = make_data_header(seq);
     h.payload_bytes = payload.size();
 
-    if (!socket.send_data_pair(
-            &h,
-            sizeof(h),
-            payload.data(),
-            payload.size())) {
+    if (!socket.send_data(&h, sizeof(h)) ||
+        !socket.send_data(payload.data(), payload.size())) {
         return false;
     }
 
@@ -385,7 +382,7 @@ static bool run_legacy(
 
     if (opt.mode == "recv") {
         for (size_t i = 0; i < opt.frames; ++i) {
-            if (!legacy_recv_one(*socket, opt, i, stats)) {
+            if (!legacy_recv_one(*socket, opt, i, payload, stats)) {
                 return false;
             }
         }
@@ -394,13 +391,13 @@ static bool run_legacy(
 
     for (size_t i = 0; i < opt.frames; ++i) {
         if (opt.server) {
-            if (!legacy_recv_one(*socket, opt, i, stats) ||
+            if (!legacy_recv_one(*socket, opt, i, payload, stats) ||
                 !legacy_send_one(*socket, opt, i, payload, stats)) {
                 return false;
             }
         } else {
             if (!legacy_send_one(*socket, opt, i, payload, stats) ||
-                !legacy_recv_one(*socket, opt, i, stats)) {
+                !legacy_recv_one(*socket, opt, i, payload, stats)) {
                 return false;
             }
         }
