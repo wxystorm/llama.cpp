@@ -14,13 +14,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 using clock_type = std::chrono::steady_clock;
 
@@ -851,6 +857,111 @@ static void print_registered_devices() {
     }
 }
 
+
+static std::filesystem::path phone_bench_executable_dir() {
+#if defined(__linux__)
+    std::vector<char> path(1024);
+    while (true) {
+        const ssize_t len = readlink("/proc/self/exe", path.data(), path.size());
+        if (len < 0) break;
+        if ((size_t) len < path.size()) {
+            return std::filesystem::path(
+                std::string(path.data(), (size_t) len)).parent_path();
+        }
+        path.resize(path.size() * 2);
+    }
+#endif
+    std::error_code ec;
+    return std::filesystem::current_path(ec);
+}
+
+static void print_phone_bench_build_config() {
+    std::printf(
+        "[PHONE_LAYER_BENCH_BUILD_CONFIG] backend_dl=%d opencl=%d hexagon=%d\n",
+#ifdef GGML_BACKEND_DL
+        1,
+#else
+        0,
+#endif
+#ifdef PHONE_BENCH_HAS_OPENCL
+        1,
+#else
+        0,
+#endif
+#ifdef PHONE_BENCH_HAS_HEXAGON
+        1
+#else
+        0
+#endif
+    );
+}
+
+static void try_load_phone_plugin(
+        const std::filesystem::path & dir,
+        const char * base_name) {
+#if defined(_WIN32)
+    const std::string filename = std::string("ggml-") + base_name + ".dll";
+#else
+    const std::string filename = std::string("libggml-") + base_name + ".so";
+#endif
+    const std::filesystem::path path = dir / filename;
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    std::printf(
+        "[PHONE_LAYER_BENCH_PLUGIN] backend=%s path=%s exists=%d",
+        base_name, path.string().c_str(), exists ? 1 : 0);
+    if (ec) {
+        std::printf(" stat_error=\"%s\"\n", ec.message().c_str());
+        return;
+    }
+    if (!exists) {
+        std::printf(" loaded=0\n");
+        return;
+    }
+
+    // Unlike ggml_backend_load_all() this is intentionally non-silent, so a
+    // dlopen/dependency/API error is visible in Release builds.
+    ggml_backend_reg_t reg = ggml_backend_load(path.string().c_str());
+    std::printf(
+        " loaded=%d reg=%s\n",
+        reg != nullptr ? 1 : 0,
+        reg != nullptr && ggml_backend_reg_name(reg) != nullptr ?
+            ggml_backend_reg_name(reg) : "(null)");
+}
+
+static void load_phone_bench_backends() {
+    print_phone_bench_build_config();
+
+    const std::filesystem::path exe_dir = phone_bench_executable_dir();
+    std::error_code ec;
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+
+    std::printf(
+        "[PHONE_LAYER_BENCH_PLUGIN_DIR] exe_dir=%s cwd=%s\n",
+        exe_dir.string().c_str(),
+        ec ? "(unknown)" : cwd.string().c_str());
+
+    ggml_backend_load_all();
+    print_registered_devices();
+
+    if (find_device("GPUOpenCL") != nullptr &&
+            find_device("HTP0") != nullptr) {
+        return;
+    }
+
+    // load_all() is silent in Release mode. Retry the two phone plugins by
+    // exact path so missing files and loader failures are visible.
+    try_load_phone_plugin(exe_dir, "opencl");
+    try_load_phone_plugin(exe_dir, "hexagon");
+
+    if (!ec && cwd != exe_dir) {
+        try_load_phone_plugin(cwd, "opencl");
+        try_load_phone_plugin(cwd, "hexagon");
+    }
+
+    print_registered_devices();
+}
+
 static bool measure_full_graph(
         layer_graph & g,
         ggml_backend_t backend,
@@ -1000,10 +1111,9 @@ int main(int argc, char ** argv) {
     // a second, fully repacked 30B CPU weight copy before the actual test.
     set_env_flag("GGML_CPU_DISABLE_REPACK", "1");
 
-    // Phone builds use dynamic backend libraries. test-backend-ops does the
-    // same thing before enumerating devices; without it only CPU is visible.
-    ggml_backend_load_all();
-    print_registered_devices();
+    // Phone builds may use dynamic backend libraries. Load them and, if the
+    // normal loader cannot see them, retry exact plugin paths with diagnostics.
+    load_phone_bench_backends();
 
     ggml_backend_dev_t gpu_dev_probe = find_device(opt.gpu_device);
     ggml_backend_dev_t npu_dev_probe = find_device(opt.npu_device);
