@@ -3987,6 +3987,152 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     }
                 }
 
+                // Any view rooted at a Ring boundary must follow the boundary
+                // pool address as well. This includes suffix/concat views that
+                // are outside the Ring task ranges.
+                std::vector<pc_ring_tensor_saved> boundary_view_saved;
+                std::vector<ggml_tensor *> boundary_views;
+
+                const auto add_boundary_view =
+                    [&](ggml_tensor * view) {
+                        if (view == nullptr ||
+                            view->view_src == nullptr) {
+                            return;
+                        }
+                        ggml_tensor * root = view;
+                        while (root->view_src != nullptr) {
+                            root = root->view_src;
+                        }
+                        if (boundary_kind(root) < 0) {
+                            return;
+                        }
+
+                        std::vector<ggml_tensor *> chain;
+                        ggml_tensor * cur = view;
+                        while (cur != nullptr &&
+                               cur->view_src != nullptr) {
+                            chain.push_back(cur);
+                            cur = cur->view_src;
+                        }
+                        for (auto it = chain.rbegin();
+                             it != chain.rend();
+                             ++it) {
+                            bool exists = false;
+                            for (ggml_tensor * existing :
+                                    boundary_views) {
+                                if (existing == *it) {
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) {
+                                boundary_views.push_back(*it);
+                            }
+                        }
+                    };
+
+                for (int node_id = 0;
+                     node_id < ring_graph_nodes;
+                     ++node_id) {
+                    ggml_tensor * node =
+                        ggml_graph_node(
+                            ring_graph, node_id);
+                    add_boundary_view(node);
+                    for (int src = 0;
+                         src < GGML_MAX_SRC;
+                         ++src) {
+                        add_boundary_view(
+                            node->src[src]);
+                    }
+                }
+
+                for (ggml_tensor * view :
+                        boundary_views) {
+                    boundary_view_saved.push_back({
+                        view,
+                        view->buffer,
+                        view->data,
+                        view->extra,
+                    });
+                    view->buffer = nullptr;
+                    view->data = nullptr;
+                    view->extra = nullptr;
+                }
+
+                size_t boundary_views_initialized = 0;
+                while (boundary_views_initialized <
+                        boundary_views.size()) {
+                    bool progress = false;
+                    for (ggml_tensor * view :
+                            boundary_views) {
+                        if (view->buffer != nullptr) {
+                            continue;
+                        }
+                        if (view->view_src == nullptr ||
+                            view->view_src->buffer == nullptr ||
+                            view->view_src->data == nullptr) {
+                            continue;
+                        }
+                        const ggml_status status =
+                            ggml_backend_view_init(view);
+                        if (status !=
+                                GGML_STATUS_SUCCESS) {
+                            for (auto it =
+                                     boundary_view_saved.rbegin();
+                                 it !=
+                                     boundary_view_saved.rend();
+                                 ++it) {
+                                it->tensor->buffer =
+                                    it->buffer;
+                                it->tensor->data =
+                                    it->data;
+                                it->tensor->extra =
+                                    it->extra;
+                            }
+                            restore_boundary_bindings();
+                            free_boundary_buffers();
+                            ret = status;
+                            return nullptr;
+                        }
+                        ++boundary_views_initialized;
+                        progress = true;
+                    }
+                    if (!progress) {
+                        for (auto it =
+                                 boundary_view_saved.rbegin();
+                             it !=
+                                 boundary_view_saved.rend();
+                             ++it) {
+                            it->tensor->buffer =
+                                it->buffer;
+                            it->tensor->data =
+                                it->data;
+                            it->tensor->extra =
+                                it->extra;
+                        }
+                        restore_boundary_bindings();
+                        free_boundary_buffers();
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                }
+
+                const auto restore_boundary_views =
+                    [&]() {
+                        for (auto it =
+                                 boundary_view_saved.rbegin();
+                             it !=
+                                 boundary_view_saved.rend();
+                             ++it) {
+                            it->tensor->buffer =
+                                it->buffer;
+                            it->tensor->data =
+                                it->data;
+                            it->tensor->extra =
+                                it->extra;
+                        }
+                    };
+
                 LLAMA_LOG_INFO(
                     "[PC_LOCAL_RING_BOUNDARY] status=OK "
                     "policy=CHUNK_H_ATTN_F_H_MAIN "
@@ -4922,6 +5068,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 // The suffix (concat/output head) has now consumed the final
                 // H_main of every chunk. Restore graph metadata before freeing
                 // the explicit Ring boundary pools.
+                restore_boundary_views();
                 restore_boundary_bindings();
                 free_boundary_buffers();
 
