@@ -2168,21 +2168,17 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
         }
 
         GGML_LOG_ERROR(
-            "[OUTPUT_HEAD_DIAG] phase=%s split=%d/%d backend=%s "
-            "tensor=%s op=%s n=%zu zero=%zu nf=%zu "
-            "l2=%.9g max=%.9g data=%p\n",
+            "[OUT_HEAD] %s s=%d/%d t=%s n=%zu "
+            "z=%zu nf=%zu l2=%.6g max=%.6g\n",
             phase,
             split_id,
             sched->n_splits,
-            ggml_backend_name(split_backend),
             tensor->name,
-            ggml_op_name(tensor->op),
             n,
             zero,
             nonfinite,
             std::sqrt(l2),
-            max_abs,
-            tensor->data);
+            max_abs);
     };
 
     if (output_head_diag) {
@@ -2201,22 +2197,14 @@ enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, in
             ggml_backend_synchronize(split_backend);
             print_output_head_stats("PRE_INPUT", output_head_input);
             GGML_LOG_ERROR(
-                "[OUTPUT_HEAD_ID] split=%d/%d backend=%s out=%s op=%s "
-                "src0=%s src1=%s out_data=%p src0_data=%p src1_data=%p\n",
+                "[OUT_HEAD_ID] s=%d/%d out=%s src0=%s src1=%s\n",
                 split_id,
                 sched->n_splits,
-                ggml_backend_name(split_backend),
                 output_head_node->name,
-                ggml_op_name(output_head_node->op),
                 output_head_node->src[0] != NULL ?
                     output_head_node->src[0]->name : "-",
                 output_head_input != NULL ?
-                    output_head_input->name : "-",
-                output_head_node->data,
-                output_head_node->src[0] != NULL ?
-                    output_head_node->src[0]->data : NULL,
-                output_head_input != NULL ?
-                    output_head_input->data : NULL);
+                    output_head_input->name : "-");
         }
     }
 
