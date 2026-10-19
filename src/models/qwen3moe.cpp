@@ -403,7 +403,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     "pc_ring_attn_out_chunk_" +
                     std::to_string(ci);
                 cb(ffn_inp, attn_out_name.c_str(), il);
-                ggml_set_output(ffn_inp);
+                // PC Ring owns this boundary storage explicitly at runtime.
+                // Do not extend static gallocr lifetime across all layers.
                 ggml_build_forward_expand(gf, ffn_inp);
 
                 // ---- CPU / FFN --------------------------------------------------
@@ -444,7 +445,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     "pc_ring_ffn_out_chunk_" +
                     std::to_string(ci);
                 cb(moe_out, ffn_out_name.c_str(), il);
-                ggml_set_output(moe_out);
+                // PC Ring owns this boundary storage explicitly at runtime.
                 ggml_build_forward_expand(gf, moe_out);
 
                 // ---- GPU / REDUCE -----------------------------------------------
@@ -454,7 +455,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     "pc_ring_reduce_chunk_" +
                     std::to_string(ci);
                 cb(l_out, reduce_name.c_str(), il);
-                ggml_set_output(l_out);
+                // PC Ring owns this boundary storage explicitly at runtime.
                 ggml_build_forward_expand(gf, l_out);
 
                 hidden_chunks[ci] = l_out;
