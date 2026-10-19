@@ -5208,6 +5208,35 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
+
+    bool attach_inference_data_plane(
+        const std::shared_ptr<inference_transport> & transport) {
+        if (!transport) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(inference_data_plane_mutex);
+        if (inference_data_plane && inference_data_plane->healthy()) {
+            return false;
+        }
+
+        inference_data_plane = transport;
+        return true;
+    }
+
+    void detach_inference_data_plane(
+        const std::shared_ptr<inference_transport> & transport) {
+        std::lock_guard<std::mutex> lock(inference_data_plane_mutex);
+        if (inference_data_plane == transport) {
+            inference_data_plane.reset();
+        }
+    }
+
+    std::shared_ptr<inference_transport> get_inference_data_plane() {
+        std::lock_guard<std::mutex> lock(inference_data_plane_mutex);
+        return inference_data_plane;
+    }
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -5346,6 +5375,12 @@ private:
 
     // Legacy v18 shared-credit state. New v19 clients do not use it.
     bool network_bulk_shared = false;
+
+    // V20 inference data plane. Control RPC keeps its request/response socket;
+    // one separate connection is upgraded after HELLO and then owned solely by
+    // inference_transport TX/RX workers.
+    std::mutex inference_data_plane_mutex;
+    std::shared_ptr<inference_transport> inference_data_plane;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
