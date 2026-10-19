@@ -11194,6 +11194,29 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_INFERENCE_RETURN_BIND: {
+                rpc_msg_inference_return_bind_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+
+                rpc_msg_inference_return_bind_rsp response {};
+                if (server.bind_inference_return(request)) {
+                    response.result =
+                        server.wait_inference_return_complete(
+                            request.return_req.device,
+                            request.return_req.phone_ffn_seq) ?
+                            1 : 0;
+                }
+
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_INFERENCE_DATA_PLANE_OPEN: {
                 rpc_msg_inference_data_plane_open_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -11261,7 +11284,26 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     config.max_payload_bytes /
                         (1024.0 * 1024.0));
 
-                transport->wait_closed(-1);
+                while (transport->healthy()) {
+                    inference_rx_frame frame;
+                    if (!transport->receive(frame, -1)) {
+                        break;
+                    }
+
+                    const bool handled =
+                        server.handle_inference_frame(
+                            frame.header,
+                            frame.data,
+                            frame.size);
+                    transport->release_rx(std::move(frame));
+
+                    if (!handled) {
+                        transport->stop();
+                        break;
+                    }
+                }
+
+                server.fail_inference_returns();
                 server.detach_inference_data_plane(transport);
 
                 const auto stats = transport->stats();
