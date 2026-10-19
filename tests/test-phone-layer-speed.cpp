@@ -62,6 +62,14 @@ static bool parse_i32(const char * s, int & v) {
     return true;
 }
 
+static void set_env_flag(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 static bool parse_options(int argc, char ** argv, options & opt) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -944,14 +952,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // This benchmark only needs the original mmap-backed GGUF weights as a
+    // source for copying the selected layers to GPUOpenCL/HTP0. Do not create
+    // a second, fully repacked 30B CPU weight copy before the actual test.
+    set_env_flag("GGML_CPU_DISABLE_REPACK", "1");
+
     llama_backend_init();
+
+    std::printf(
+        "[PHONE_LAYER_BENCH_HOST] cpu_repack=DISABLED reason=STAGING_ONLY\n");
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     mp.use_mmap = true;
 
     std::printf(
-        "[PHONE_LAYER_BENCH_LOAD] model=%s mode=CPU_MMAP\n",
+        "[PHONE_LAYER_BENCH_LOAD] model=%s mode=CPU_MMAP_NO_REPACK\n",
         opt.model_path.c_str());
 
     llama_model * model =
