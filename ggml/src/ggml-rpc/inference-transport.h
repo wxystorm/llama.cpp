@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inference-transport-protocol.h"
+#include "transport.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +74,13 @@ public:
         int port,
         const inference_transport_config & config = {});
 
+    // Upgrade an already-connected socket after the control-plane handshake.
+    // Ownership is shared with the caller through socket_ptr; the transport
+    // becomes the only reader/writer once adopted.
+    static std::unique_ptr<inference_transport> adopt(
+        socket_ptr socket,
+        const inference_transport_config & config = {});
+
     // Producer owns the returned slot until submit_tx() or release_tx().
     inference_tx_buffer acquire_tx(size_t payload_bytes);
     void release_tx(inference_tx_buffer && tx);
@@ -87,6 +95,7 @@ public:
     void release_rx(inference_rx_frame && frame);
 
     bool wait_tx_idle(int timeout_ms = -1);
+    bool wait_closed(int timeout_ms = -1);
 
     bool healthy() const;
     void stop();
