@@ -11663,6 +11663,38 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     ph_cfg.cgraphs[i].cgraph_main->nodes[
                         ph_cfg.cgraphs[i].cgraph_main->n_nodes - 1];
 
+                if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
+                    auto print_src_identity = [&](
+                            const char * side,
+                            ggml_tensor * node) {
+                        printf(
+                            "[TP_AR_SRC] L=%d C=%d side=%s "
+                            "name=%s op=%s type=%d compute=%d "
+                            "tensor=%p data=%p view=%s view_ptr=%p view_offs=%zu "
+                            "src0=%s src1=%s ne=[%lld,%lld,%lld,%lld]\n",
+                            tp_numeric_layer,
+                            tp_numeric_chunk,
+                            side,
+                            node->name,
+                            ggml_op_name(node->op),
+                            (int) node->type,
+                            !!(node->flags & GGML_TENSOR_FLAG_COMPUTE),
+                            (void *) node,
+                            node->data,
+                            node->view_src != nullptr ? node->view_src->name : "-",
+                            (void *) node->view_src,
+                            node->view_offs,
+                            node->src[0] != nullptr ? node->src[0]->name : "-",
+                            node->src[1] != nullptr ? node->src[1]->name : "-",
+                            (long long) node->ne[0],
+                            (long long) node->ne[1],
+                            (long long) node->ne[2],
+                            (long long) node->ne[3]);
+                    };
+                    print_src_identity("PC", pc_node);
+                    print_src_identity("PHONE", ph_node);
+                }
+
                 if (ggml_nelements(pc_node) != ggml_nelements(ph_node)) {
                     tp_numeric_trace = false;
                 } else {
