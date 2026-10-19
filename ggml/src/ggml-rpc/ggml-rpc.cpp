@@ -4717,6 +4717,20 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .device  = */ ggml_backend_reg_dev_get(reg, device),
         /* .context = */ ctx
     };
+
+    const char * probe_env =
+        std::getenv("GGML_INFERENCE_TRANSPORT_PROBE");
+    if (probe_env != nullptr && std::atoi(probe_env) != 0) {
+        const bool opened =
+            get_inference_transport(endpoint) != nullptr;
+        GGML_LOG_INFO(
+            "[INFERENCE_DATA_PLANE_PROBE] endpoint=%s device=%u "
+            "status=%s\n",
+            endpoint,
+            device,
+            opened ? "OK" : "FAIL");
+    }
+
     return backend;
 }
 
