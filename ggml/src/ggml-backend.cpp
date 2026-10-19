@@ -2003,6 +2003,11 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
 
+    const bool pc_ring_copy_diag =
+        sched->dynamic_order_lifetime &&
+        getenv("LLAMA_HYBRID_PC_LOCAL_RING_COPY_DIAG") != NULL &&
+        atoi(getenv("LLAMA_HYBRID_PC_LOCAL_RING_COPY_DIAG")) != 0;
+
     ggml_tensor *              prev_ids_tensor = nullptr;
     std::vector<int32_t>       ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -2010,6 +2015,63 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     struct ggml_backend_sched_split * split            = &sched->splits[split_id];
     int                               split_backend_id = split->backend_id;
     ggml_backend_t                    split_backend    = sched->backends[split_backend_id];
+
+    const auto pc_ring_log_copy =
+        [&](const char * phase,
+            const char * mode,
+            int input_id,
+            const ggml_tensor * input,
+            const ggml_tensor * input_cpy) {
+            if (!pc_ring_copy_diag) {
+                return;
+            }
+
+            size_t mem_free = 0;
+            size_t mem_total = 0;
+            ggml_backend_dev_memory(
+                ggml_backend_get_device(split_backend),
+                &mem_free,
+                &mem_total);
+
+            const char * src_buf =
+                input != nullptr && input->buffer != nullptr ?
+                    ggml_backend_buffer_name(input->buffer) :
+                    "(none)";
+            const char * dst_buf =
+                input_cpy != nullptr && input_cpy->buffer != nullptr ?
+                    ggml_backend_buffer_name(input_cpy->buffer) :
+                    "(none)";
+            const bool src_host =
+                input != nullptr && input->buffer != nullptr &&
+                ggml_backend_buffer_is_host(input->buffer);
+            const bool dst_host =
+                input_cpy != nullptr && input_cpy->buffer != nullptr &&
+                ggml_backend_buffer_is_host(input_cpy->buffer);
+
+            GGML_LOG_ERROR(
+                "[PC_RING_CUDA_COPY] phase=%s mode=%s "
+                "split=%d backend=%s input=%d/%d "
+                "src=%s dst=%s bytes=%zu "
+                "src_buf=%s dst_buf=%s "
+                "src_host=%d dst_host=%d "
+                "free_mib=%.2f total_mib=%.2f used_mib=%.2f\n",
+                phase,
+                mode,
+                split_id,
+                ggml_backend_name(split_backend),
+                input_id,
+                split->n_inputs,
+                input != nullptr ? input->name : "(null)",
+                input_cpy != nullptr ? input_cpy->name : "(null)",
+                input != nullptr ? ggml_nbytes(input) : 0,
+                src_buf,
+                dst_buf,
+                src_host ? 1 : 0,
+                dst_host ? 1 : 0,
+                mem_free / (1024.0 * 1024.0),
+                mem_total / (1024.0 * 1024.0),
+                (mem_total - mem_free) / (1024.0 * 1024.0));
+        };
 
     // copy the input tensors to the split backend
     for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2024,7 +2086,13 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             } else {
                 ggml_backend_synchronize(split_backend);
             }
+            pc_ring_log_copy(
+                "BEGIN", "INPUT_SYNC_COPY",
+                input_id, input, input_cpy);
             ggml_backend_tensor_copy(input, input_cpy);
+            pc_ring_log_copy(
+                "END", "INPUT_SYNC_COPY",
+                input_id, input, input_cpy);
         } else {
             // wait for the split backend to finish using the input before overwriting it
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2087,6 +2155,9 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                     const size_t padding          = std::min<size_t>(expert_size, 512);
                     const size_t padding_end      = last_id < n_expert - 1 ? padding : 0;
 
+                    pc_ring_log_copy(
+                        "BEGIN", "MOE_EXPERT_ASYNC_SET",
+                        input_id, input, input_cpy);
                     ggml_backend_tensor_set_async(
                         split_backend, input_cpy, (const uint8_t *) input->data + expert_offset, expert_offset,
                         // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
@@ -2120,15 +2191,40 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             } else {
                 // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                if (!split_backend->iface.cpy_tensor_async ||
-                    !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                bool async_copied = false;
+                if (split_backend->iface.cpy_tensor_async) {
+                    pc_ring_log_copy(
+                        "BEGIN", "TRY_ASYNC_COPY",
+                        input_id, input, input_cpy);
+                    async_copied =
+                        split_backend->iface.cpy_tensor_async(
+                            input_backend,
+                            split_backend,
+                            input,
+                            input_cpy);
+                    pc_ring_log_copy(
+                        "END",
+                        async_copied ?
+                            "ASYNC_COPY_SUBMITTED" :
+                            "ASYNC_COPY_UNAVAILABLE",
+                        input_id, input, input_cpy);
+                }
+
+                if (!async_copied) {
                     ggml_backend_synchronize(input_backend);
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        ggml_backend_event_synchronize(
+                            sched->events[split_backend_id][sched->cur_copy]);
                     } else {
                         ggml_backend_synchronize(split_backend);
                     }
+                    pc_ring_log_copy(
+                        "BEGIN", "SYNC_FALLBACK_COPY",
+                        input_id, input, input_cpy);
                     ggml_backend_tensor_copy(input, input_cpy);
+                    pc_ring_log_copy(
+                        "END", "SYNC_FALLBACK_COPY",
+                        input_id, input, input_cpy);
                 }
             }
         }
