@@ -2126,6 +2126,20 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 return nullptr;
             }
 
+            const auto pc_ring_is_empty_op =
+                [](enum ggml_op op) -> bool {
+                    switch (op) {
+                        case GGML_OP_NONE:
+                        case GGML_OP_RESHAPE:
+                        case GGML_OP_TRANSPOSE:
+                        case GGML_OP_VIEW:
+                        case GGML_OP_PERMUTE:
+                            return true;
+                        default:
+                            return false;
+                    }
+                };
+
             pc_ring_bind_stage bind_stage =
                 pc_ring_bind_stage::ATTN;
             int bind_layer = stage->layer_begin;
@@ -2141,7 +2155,11 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         "pc_ring_entry",
                         13) == 0;
 
-                if (node->view_src == nullptr) {
+                // A tensor can be view-backed and still represent real
+                // computation (for example CPY/SET/in-place ops). Match the
+                // scheduler's semantic split behavior: skip only truly empty
+                // view/shape ops and bind every executable node explicitly.
+                if (!pc_ring_is_empty_op(node->op)) {
                     if (force_next_split) {
                         ggml_backend_sched_set_split_boundary(
                             sched_use,
