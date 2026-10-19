@@ -11748,6 +11748,63 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     print_pre("PC", tp_numeric_pre_pc);
                     print_pre("PHONE", tp_numeric_pre_phone);
 
+                    if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr &&
+                            pc_node->op == GGML_OP_ADD &&
+                            pc_node->src[0] != nullptr &&
+                            pc_node->src[1] != nullptr &&
+                            pc_node->src[0]->type == GGML_TYPE_F32 &&
+                            pc_node->src[1]->type == GGML_TYPE_F32 &&
+                            ggml_nelements(pc_node->src[0]) == n &&
+                            ggml_nelements(pc_node->src[1]) == n) {
+                        std::vector<float> src0_values(n);
+                        std::vector<float> src1_values(n);
+                        ggml_backend_tensor_get(
+                            pc_node->src[0],
+                            src0_values.data(),
+                            0,
+                            n * sizeof(float));
+                        ggml_backend_tensor_get(
+                            pc_node->src[1],
+                            src1_values.data(),
+                            0,
+                            n * sizeof(float));
+
+                        double diff_l2 = 0.0;
+                        double max_abs_diff = 0.0;
+                        size_t exact = 0;
+                        for (size_t k = 0; k < n; ++k) {
+                            const float expected =
+                                src0_values[k] + src1_values[k];
+                            const double diff =
+                                (double) tp_numeric_pre_pc[k] -
+                                (double) expected;
+                            exact += tp_numeric_pre_pc[k] == expected;
+                            diff_l2 += diff * diff;
+                            max_abs_diff =
+                                std::max(max_abs_diff, std::abs(diff));
+                        }
+
+                        printf(
+                            "[TP_PC_OUT_PROOF] L=%d C=%d out=%s "
+                            "src0=%s src1=%s "
+                            "out_data=%p src0_data=%p src1_data=%p "
+                            "exact=%zu/%zu maxdiff=%.9g rmsdiff=%.9g\n",
+                            tp_numeric_layer,
+                            tp_numeric_chunk,
+                            pc_node->name,
+                            pc_node->src[0]->name,
+                            pc_node->src[1]->name,
+                            pc_node->data,
+                            pc_node->src[0]->data,
+                            pc_node->src[1]->data,
+                            exact,
+                            n,
+                            max_abs_diff,
+                            n > 0 ?
+                                std::sqrt(diff_l2 / (double) n) :
+                                0.0);
+                    }
+
                     if (std::getenv("GGML_META_TP_CONTROL_TRACE_COMPACT") != nullptr) {
                         char norm_name[64];
                         std::snprintf(
