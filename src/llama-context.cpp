@@ -4878,6 +4878,46 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         sched_use);
                 }
 
+                if (ret == GGML_STATUS_SUCCESS) {
+                    const int final_layer =
+                        stage.layer_end - 1;
+                    for (int chunk = 0;
+                         chunk < n_chunks;
+                         ++chunk) {
+                        const int final_si =
+                            boundary_slot_for(
+                                final_layer,
+                                chunk,
+                                PC_RING_REDUCE);
+                        if (final_si < 0 ||
+                            boundary_slots[
+                                (size_t) final_si].
+                                owner_layer !=
+                                final_layer) {
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_OWNERSHIP] status=FAIL "
+                                "reason=FINAL_H_MAIN layer=%d chunk=%d "
+                                "slot=%d owner=%d\n",
+                                final_layer,
+                                chunk,
+                                final_si,
+                                final_si >= 0 ?
+                                    boundary_slots[
+                                        (size_t) final_si].
+                                        owner_layer :
+                                    -999);
+                            ret = GGML_STATUS_FAILED;
+                            break;
+                        }
+                    }
+                }
+
+                // The suffix (concat/output head) has now consumed the final
+                // H_main of every chunk. Restore graph metadata before freeing
+                // the explicit Ring boundary pools.
+                restore_boundary_bindings();
+                free_boundary_buffers();
+
                 LLAMA_LOG_INFO(
                     "[PC_LOCAL_RING_SUM] status=%s "
                     "completed=%d expected=%d "
