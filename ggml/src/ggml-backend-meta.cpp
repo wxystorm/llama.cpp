@@ -13643,6 +13643,29 @@ auto prefill_norm_sg_has_prework =
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
+    ggml_tensor * final_norm_diag_pc = nullptr;
+    ggml_tensor * final_norm_diag_phone = nullptr;
+    if (std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+            is_decode_pc_only_norm_sg(i) && n_backends == 2) {
+        auto * g0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        auto * g1 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (g0 != nullptr) {
+            for (int k = 0; k < g0->n_nodes; ++k) {
+                if (std::strcmp(g0->nodes[k]->name, "result_norm") == 0) {
+                    final_norm_diag_pc = g0->nodes[k];
+                    break;
+                }
+            }
+        }
+        if (g1 != nullptr) {
+            for (int k = 0; k < g1->n_nodes; ++k) {
+                if (std::strcmp(g1->nodes[k]->name, "result_norm") == 0) {
+                    final_norm_diag_phone = g1->nodes[k];
+                    break;
+                }
+            }
+        }
+    }
     if (is_prefill_down_sg) {
         if (wave_crash_trace) {
             fprintf(
@@ -15020,6 +15043,18 @@ auto prefill_norm_sg_has_prework =
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
 
+        if (compute_status == GGML_STATUS_SUCCESS &&
+                final_norm_diag_pc != nullptr) {
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                final_norm_diag_pc,
+                "FINAL_NORM_PRECOMM_PC");
+            meta_debug_tensor(
+                backend_ctx->backend_configs[1].backend,
+                final_norm_diag_phone,
+                "FINAL_NORM_PRECOMM_PHONE");
+        }
+
         if (pc_head_diag &&
                 compute_status == GGML_STATUS_SUCCESS &&
                 pc_head_output != nullptr) {
@@ -15897,6 +15932,17 @@ auto prefill_norm_sg_has_prework =
                     subgraph_fallback_used ? 1 : 0,
                     subgraph_comm_unaccounted_us / 1000.0);
             }
+        }
+
+        if (final_norm_diag_pc != nullptr) {
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                final_norm_diag_pc,
+                "FINAL_NORM_POSTCOMM_PC");
+            meta_debug_tensor(
+                backend_ctx->backend_configs[1].backend,
+                final_norm_diag_phone,
+                "FINAL_NORM_POSTCOMM_PHONE");
         }
 
         if (meta_sg_timing) {
