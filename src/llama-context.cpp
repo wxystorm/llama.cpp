@@ -3168,9 +3168,19 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             (int) ring_plan.pc_local.layer_modes.size()) {
                         return llama_hybrid_local_backend_slot::NONE;
                     }
-                    if (kind == PC_RING_FULL) {
+
+                    // FULL is a layer property, not merely a FIFO job kind.
+                    // The graph still contains ATTN/FFN/REDUCE primitive
+                    // markers for a FULL layer, but all three primitive ranges
+                    // belong to the FULL backend and execute inside one FULL
+                    // logical job.
+                    if (ring_plan.pc_local.layer_modes[
+                            (size_t) local_layer] ==
+                            llama_pc_local_layer_mode::FULL ||
+                        kind == PC_RING_FULL) {
                         return ring_plan.pc_local.stage_backends.full;
                     }
+
                     switch (kind) {
                         case PC_RING_ATTN:
                             return ring_plan.pc_local.stage_backends.attn;
