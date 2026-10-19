@@ -306,11 +306,15 @@ static bool run_new(
         receiver_ok = transport->wait_tx_idle(-1);
     }
 
+    // Once all expected data has been delivered and the final peer ACK
+    // has been received, the benchmark protocol is complete. The peer may
+    // immediately close its socket after sending that ACK; the background RX
+    // worker can observe that EOF before this thread calls stop(), which is a
+    // normal shutdown race rather than a transport failure.
     const bool success =
         sender_ok &&
         receiver_ok &&
-        ack_received &&
-        transport->healthy();
+        ack_received;
 
     out_stats = transport->stats();
     const auto end = bench_clock::now();
