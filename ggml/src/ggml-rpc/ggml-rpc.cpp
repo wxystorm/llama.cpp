@@ -1375,6 +1375,296 @@ static std::shared_ptr<socket_t> get_return_transfer_socket(
             rpc_socket_role::RETURN_TRANSFER_1);
 }
 
+static inference_transport_config rpc_inference_transport_config() {
+    inference_transport_config config;
+    config.tx_slots = 4;
+    config.rx_slots = 4;
+    config.max_payload_bytes = 16 * 1024 * 1024;
+
+    if (const char * slots_env =
+            std::getenv("GGML_INFERENCE_TRANSPORT_SLOTS")) {
+        const long value = std::strtol(slots_env, nullptr, 10);
+        if (value >= 1 && value <= 64) {
+            config.tx_slots = static_cast<size_t>(value);
+            config.rx_slots = static_cast<size_t>(value);
+        }
+    }
+
+    if (const char * mib_env =
+            std::getenv("GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB")) {
+        const long value = std::strtol(mib_env, nullptr, 10);
+        if (value >= 1 && value <= 256) {
+            config.max_payload_bytes =
+                static_cast<size_t>(value) * 1024 * 1024;
+        }
+    }
+
+    return config;
+}
+
+static std::shared_ptr<inference_transport>
+get_inference_transport(const std::string & endpoint) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::string,
+        std::weak_ptr<inference_transport>> transports;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto it = transports.find(endpoint);
+    if (it != transports.end()) {
+        if (auto transport = it->second.lock()) {
+            if (transport->healthy()) {
+                return transport;
+            }
+        }
+        transports.erase(it);
+    }
+
+    std::string host;
+    int port = 0;
+    if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR(
+            "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+            "reason=bad_endpoint endpoint=%s\n",
+            endpoint.c_str());
+        return nullptr;
+    }
+
+    if (!rpc_transport_init()) {
+        return nullptr;
+    }
+
+    auto sock = socket_t::connect(host.c_str(), port);
+    if (!sock) {
+        GGML_LOG_ERROR(
+            "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+            "reason=connect endpoint=%s\n",
+            endpoint.c_str());
+        return nullptr;
+    }
+
+    uint8_t remote_patch = 0;
+    if (!negotiate_hello(sock, &remote_patch)) {
+        return nullptr;
+    }
+
+    if (remote_patch < 20) {
+        GGML_LOG_ERROR(
+            "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+            "reason=server_too_old endpoint=%s patch=%u required=20\n",
+            endpoint.c_str(),
+            static_cast<unsigned>(remote_patch));
+        return nullptr;
+    }
+
+    const inference_transport_config config =
+        rpc_inference_transport_config();
+
+    rpc_msg_inference_data_plane_open_req request {};
+    request.tx_slots =
+        static_cast<uint32_t>(config.tx_slots);
+    request.rx_slots =
+        static_cast<uint32_t>(config.rx_slots);
+    request.max_payload_bytes =
+        config.max_payload_bytes;
+
+    rpc_msg_inference_data_plane_open_rsp response {};
+    if (!send_rpc_cmd(
+            sock,
+            RPC_CMD_INFERENCE_DATA_PLANE_OPEN,
+            &request,
+            sizeof(request),
+            &response,
+            sizeof(response)) ||
+        response.result == 0) {
+        GGML_LOG_ERROR(
+            "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+            "reason=open_rejected endpoint=%s\n",
+            endpoint.c_str());
+        return nullptr;
+    }
+
+    auto adopted = inference_transport::adopt(sock, config);
+    if (!adopted) {
+        return nullptr;
+    }
+
+    std::shared_ptr<inference_transport> transport =
+        std::move(adopted);
+    transports[endpoint] = transport;
+
+    GGML_LOG_INFO(
+        "[INFERENCE_DATA_PLANE] side=client status=OPEN "
+        "endpoint=%s tx_slots=%zu rx_slots=%zu "
+        "max_payload_mib=%.3f server_tx_slots=%u "
+        "server_rx_slots=%u\n",
+        endpoint.c_str(),
+        config.tx_slots,
+        config.rx_slots,
+        config.max_payload_bytes / (1024.0 * 1024.0),
+        response.tx_slots,
+        response.rx_slots);
+
+    return transport;
+}
+
+static ggml_backend_rpc_device_context *
+rpc_inference_device_context(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || dev->context == nullptr) {
+        return nullptr;
+    }
+
+    return static_cast<ggml_backend_rpc_device_context *>(
+        dev->context);
+}
+
+static bool ggml_backend_rpc_inference_transport_open(
+        ggml_backend_t backend) {
+    auto * ctx = rpc_inference_device_context(backend);
+    return ctx != nullptr &&
+        get_inference_transport(ctx->endpoint) != nullptr;
+}
+
+static bool ggml_backend_rpc_inference_transport_submit(
+        ggml_backend_t backend,
+        const ggml_backend_rpc_inference_task * task,
+        const void * data,
+        size_t size) {
+    auto * ctx = rpc_inference_device_context(backend);
+    if (ctx == nullptr || task == nullptr ||
+        (size > 0 && data == nullptr)) {
+        return false;
+    }
+
+    auto transport =
+        get_inference_transport(ctx->endpoint);
+    if (!transport) {
+        return false;
+    }
+
+    inference_tx_buffer tx =
+        transport->acquire_tx(size);
+    if (!tx) {
+        return false;
+    }
+
+    if (size > 0) {
+        std::memcpy(tx.data, data, size);
+    }
+
+    inference_frame_header header =
+        inference_make_header(INFERENCE_FRAME_DATA);
+    header.flags = task->flags;
+    header.stage = task->stage;
+    header.tensor_role = task->tensor_role;
+    header.priority = task->priority;
+    header.layer = task->layer;
+    header.chunk = task->chunk;
+    header.stream_id = task->stream_id;
+    header.seq = task->seq;
+    header.graph_id = task->graph_id;
+
+    return transport->submit_tx(
+        std::move(tx),
+        header,
+        size);
+}
+
+static bool ggml_backend_rpc_inference_transport_receive(
+        ggml_backend_t backend,
+        ggml_backend_rpc_inference_task * task,
+        void * data,
+        size_t capacity,
+        size_t * size,
+        int timeout_ms) {
+    auto * ctx = rpc_inference_device_context(backend);
+    if (ctx == nullptr || task == nullptr ||
+        size == nullptr || (capacity > 0 && data == nullptr)) {
+        return false;
+    }
+
+    auto transport =
+        get_inference_transport(ctx->endpoint);
+    if (!transport) {
+        return false;
+    }
+
+    inference_rx_frame frame;
+    if (!transport->receive(frame, timeout_ms)) {
+        return false;
+    }
+
+    const bool fits = frame.size <= capacity;
+    if (fits && frame.size > 0) {
+        std::memcpy(data, frame.data, frame.size);
+    }
+
+    task->graph_id = frame.header.graph_id;
+    task->seq = frame.header.seq;
+    task->layer = frame.header.layer;
+    task->chunk = frame.header.chunk;
+    task->stream_id = frame.header.stream_id;
+    task->stage = frame.header.stage;
+    task->tensor_role = frame.header.tensor_role;
+    task->priority = frame.header.priority;
+    task->flags =
+        static_cast<uint16_t>(frame.header.flags & 0xffffu);
+    *size = frame.size;
+
+    transport->release_rx(std::move(frame));
+    return fits;
+}
+
+static bool ggml_backend_rpc_inference_transport_stats(
+        ggml_backend_t backend,
+        ggml_backend_rpc_inference_transport_stats * out) {
+    auto * ctx = rpc_inference_device_context(backend);
+    if (ctx == nullptr || out == nullptr) {
+        return false;
+    }
+
+    auto transport =
+        get_inference_transport(ctx->endpoint);
+    if (!transport) {
+        return false;
+    }
+
+    const inference_transport_stats stats =
+        transport->stats();
+    out->frames_sent = stats.frames_sent;
+    out->frames_received = stats.frames_received;
+    out->bytes_sent = stats.bytes_sent;
+    out->bytes_received = stats.bytes_received;
+    out->tx_acquire_wait_count =
+        stats.tx_acquire_wait_count;
+    out->rx_slot_wait_count =
+        stats.rx_slot_wait_count;
+    out->tx_acquire_wait_ms =
+        stats.tx_acquire_wait_ms;
+    out->rx_slot_wait_ms =
+        stats.rx_slot_wait_ms;
+    out->tx_queue_wait_ms =
+        stats.tx_queue_wait_ms;
+    out->tx_queue_wait_max_ms =
+        stats.tx_queue_wait_max_ms;
+    out->tx_send_ms = stats.tx_send_ms;
+    out->rx_recv_ms = stats.rx_recv_ms;
+    out->rx_ready_wait_ms =
+        stats.rx_ready_wait_ms;
+    out->rx_ready_wait_max_ms =
+        stats.rx_ready_wait_max_ms;
+    out->tx_queue_max = stats.tx_queue_max;
+    out->tx_inflight_max = stats.tx_inflight_max;
+    out->rx_ready_max = stats.rx_ready_max;
+    return true;
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
