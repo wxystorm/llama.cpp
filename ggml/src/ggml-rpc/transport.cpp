@@ -12,11 +12,14 @@
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <sys/uio.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -117,7 +120,9 @@ struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
+    bool send_data_pair(const void * data0, size_t size0, const void * data1, size_t size1);
     bool recv_data(void * data, size_t size);
+    void shutdown();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -479,6 +484,93 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     return true;
 }
 
+bool socket_t::impl::send_data_pair(
+        const void * data0,
+        size_t size0,
+        const void * data1,
+        size_t size1) {
+#ifdef GGML_RPC_RDMA
+    if (use_rdma) {
+        return send_data(data0, size0) && send_data(data1, size1);
+    }
+#endif
+
+    const uint8_t * p0 = static_cast<const uint8_t *>(data0);
+    const uint8_t * p1 = static_cast<const uint8_t *>(data1);
+    size_t off0 = 0;
+    size_t off1 = 0;
+
+    while (off0 < size0 || off1 < size1) {
+#ifdef _WIN32
+        WSABUF bufs[2] = {};
+        DWORD nbufs = 0;
+
+        if (off0 < size0) {
+            bufs[nbufs].buf = reinterpret_cast<CHAR *>(const_cast<uint8_t *>(p0 + off0));
+            bufs[nbufs].len = static_cast<ULONG>(
+                std::min(size0 - off0, static_cast<size_t>(ULONG_MAX)));
+            ++nbufs;
+        }
+
+        if (off1 < size1) {
+            bufs[nbufs].buf = reinterpret_cast<CHAR *>(const_cast<uint8_t *>(p1 + off1));
+            bufs[nbufs].len = static_cast<ULONG>(
+                std::min(size1 - off1, static_cast<size_t>(ULONG_MAX)));
+            ++nbufs;
+        }
+
+        DWORD sent = 0;
+        if (WSASend(fd, bufs, nbufs, &sent, 0, nullptr, nullptr) != 0) {
+            if (WSAGetLastError() == WSAEINTR) {
+                continue;
+            }
+            GGML_LOG_ERROR("WSASend failed in send_data_pair\n");
+            return false;
+        }
+        const size_t n = static_cast<size_t>(sent);
+#else
+        struct iovec iov[2] = {};
+        int iovcnt = 0;
+
+        if (off0 < size0) {
+            iov[iovcnt].iov_base = const_cast<uint8_t *>(p0 + off0);
+            iov[iovcnt].iov_len = size0 - off0;
+            ++iovcnt;
+        }
+
+        if (off1 < size1) {
+            iov[iovcnt].iov_base = const_cast<uint8_t *>(p1 + off1);
+            iov[iovcnt].iov_len = size1 - off1;
+            ++iovcnt;
+        }
+
+        const ssize_t sent = writev(fd, iov, iovcnt);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            GGML_LOG_ERROR("writev failed in send_data_pair\n");
+            return false;
+        }
+        const size_t n = static_cast<size_t>(sent);
+#endif
+
+        if (n == 0) {
+            return false;
+        }
+
+        const size_t remaining0 = size0 - off0;
+        if (n <= remaining0) {
+            off0 += n;
+        } else {
+            off0 = size0;
+            off1 += n - remaining0;
+        }
+    }
+
+    return true;
+}
+
 bool socket_t::impl::recv_data(void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
@@ -515,6 +607,18 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
             (recv_done_us - first_recv_done_us) / 1000.0,
             (recv_done_us - recv_start_us) / 1000.0);
     return true;
+}
+
+void socket_t::impl::shutdown() {
+#ifdef _WIN32
+    if (fd != INVALID_SOCKET) {
+        ::shutdown(fd, SD_BOTH);
+    }
+#else
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+    }
+#endif
 }
 
 void socket_t::impl::get_caps(uint8_t * local_caps) {
@@ -566,8 +670,20 @@ bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
 }
 
+bool socket_t::send_data_pair(
+        const void * data0,
+        size_t size0,
+        const void * data1,
+        size_t size1) {
+    return pimpl->send_data_pair(data0, size0, data1, size1);
+}
+
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+void socket_t::shutdown() {
+    pimpl->shutdown();
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
