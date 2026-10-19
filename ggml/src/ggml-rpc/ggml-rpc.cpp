@@ -1421,16 +1421,17 @@ get_inference_transport(const std::string & endpoint) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
-        std::weak_ptr<inference_transport>> transports;
+        std::shared_ptr<inference_transport>> transports;
 
     std::lock_guard<std::mutex> lock(mutex);
 
     auto it = transports.find(endpoint);
     if (it != transports.end()) {
-        if (auto transport = it->second.lock()) {
-            if (transport->healthy()) {
-                return transport;
-            }
+        if (it->second && it->second->healthy()) {
+            return it->second;
+        }
+        if (it->second) {
+            it->second->stop();
         }
         transports.erase(it);
     }
