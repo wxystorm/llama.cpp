@@ -2142,6 +2142,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             int bind_layer = stage->layer_begin;
             bool ring_bind_active = false;
             bool force_next_split = false;
+            int ring_output_nodes = 0;
 
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 ggml_tensor * node =
@@ -2151,6 +2152,17 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         node->name,
                         "pc_ring_entry",
                         13) == 0;
+
+                // OUTPUT_ALL correctness probe: keep every tensor
+                // owned by the Ring alive across non-monotonic split execution.
+                // This includes view/reshape nodes because their backing
+                // storage must not be recycled while a future FIFO task can
+                // still refer to them.
+                if (ring_bind_active &&
+                    bind_layer < stage->layer_end) {
+                    ggml_set_output(node);
+                    ++ring_output_nodes;
+                }
 
                 // Match scheduler semantics exactly: a tensor can
                 // be view-backed and still be an executable node, and
@@ -2202,6 +2214,15 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 }
 
                 if (ring_entry_node) {
+                    // Correctness probe for dynamic FIFO execution: preserve
+                    // the Ring entry and every Ring-owned intermediate tensor
+                    // for the full graph allocation lifetime. ggml_gallocr
+                    // normally frees/reuses buffers according to static graph
+                    // order, but the FIFO runtime can execute an earlier split
+                    // after a later split.
+                    ggml_set_output(node);
+                    ++ring_output_nodes;
+
                     // Prefix graph work (embedding/input preparation) remains
                     // under the normal scheduler.  Ring ownership starts only
                     // after this explicit graph boundary.
@@ -2249,7 +2270,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             LLAMA_LOG_INFO(
                 "[PC_LOCAL_RING_BIND] status=OK layers=[%d,%d) "
                 "primitive_tasks=%d B0=%s B1=%s "
-                "attn=%d ffn=%d reduce=%d full=%d\n",
+                "attn=%d ffn=%d reduce=%d full=%d "
+                "lifetime=OUTPUT_ALL_PROBE output_nodes=%d\n",
                 stage->layer_begin,
                 stage->layer_end,
                 attn_markers * 3,
@@ -2258,7 +2280,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.attn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.ffn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.reduce,
-                (int) pc_ring_runtime_plan.pc_local.stage_backends.full);
+                (int) pc_ring_runtime_plan.pc_local.stage_backends.full,
+                ring_output_nodes);
         }
 
         if (strict_cpu_stage) {
