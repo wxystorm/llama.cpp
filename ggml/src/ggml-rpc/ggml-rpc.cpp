@@ -4353,7 +4353,7 @@ struct rpc_phone_npu_ffn_cache {
 struct rpc_phone_npu_cpu_reduce_entry {
     int layer = -1;
     int chunk = -1;
-    ggml_tensor * down = nullptr;
+    size_t output_bytes = 0;
     std::vector<float> phone_partial;
 };
 
@@ -4364,9 +4364,10 @@ struct rpc_phone_npu_async_job {
     int chunk = -1;
     bool prefill = false;
 
-    // Stable direct-bound destination owned by the Ring.  The NPU worker does
-    // not write it; CPU reduce writes the complete PC+NPU result once.
-    ggml_tensor * down = nullptr;
+    // The async worker must not retain allocator-backed graph tensors.
+    // Keep only the expected output byte count; the actual stable destination
+    // is supplied later by SET_TENSOR_ASYNC_RETURN_WAIT in request.tensor.
+    size_t output_bytes = 0;
 
     // Per-layer resident private-HTP weights.  The pointee remains stable even
     // if the unordered_map holding the unique_ptr rehashes.
@@ -6026,16 +6027,14 @@ bool rpc_server::set_tensor_async_return_wait(
         input.data() + header_size;
 
     if (cpu_reduce) {
-        if (cpu_entry.down == nullptr ||
-                cpu_entry.down->type != GGML_TYPE_F32 ||
-                request.tensor.type !=
+        if (request.tensor.type !=
                     static_cast<uint32_t>(GGML_TYPE_F32) ||
                 request.offset != 0 ||
                 original_size !=
                     cpu_entry.phone_partial.size() *
                         sizeof(float) ||
                 original_size !=
-                    ggml_nbytes(cpu_entry.down)) {
+                    cpu_entry.output_bytes) {
             GGML_LOG_ERROR(
                 "[CHUNK_RING_CPU_REDUCE] seq=%" PRIu64
                 " layer=%d chunk=%d status=FAIL "
@@ -6077,13 +6076,29 @@ bool rpc_server::set_tensor_async_return_wait(
 
         const int64_t upload_begin_us =
             ggml_time_us();
-        ggml_backend_tensor_set(
-            cpu_entry.down,
+
+        // request.tensor is the stable Phone return-stage destination created
+        // by Meta for this (layer, chunk).  Do not write through the old
+        // stage.down pointer here: that tensor belongs to the already-returned
+        // graph and its allocator storage may have been reused while the NPU
+        // job was running asynchronously.
+        const bool upload_ok = set_tensor_direct(
+            request.tensor,
+            request.offset,
             cpu_entry.phone_partial.data(),
-            0,
             original_size);
         const int64_t upload_us =
             ggml_time_us() - upload_begin_us;
+        if (!upload_ok) {
+            GGML_LOG_ERROR(
+                "[CHUNK_RING_CPU_REDUCE] seq=%" PRIu64
+                " layer=%d chunk=%d status=FAIL "
+                "reason=stable_return_stage_write\n",
+                request.phone_ffn_seq,
+                cpu_entry.layer,
+                cpu_entry.chunk);
+            return false;
+        }
 
         {
             std::lock_guard<std::mutex> lock(
@@ -6106,14 +6121,15 @@ bool rpc_server::set_tensor_async_return_wait(
             "[CHUNK_RING_CPU_REDUCE] "
             "seq=%" PRIu64 " layer=%d chunk=%d bytes=%zu "
             "ffn_wait_ms=%.3f reduce_ms=%.3f upload_ms=%.3f "
-            "status=OK\n",
+            "dst=%s storage=stable_request status=OK\n",
             request.phone_ffn_seq,
             cpu_entry.layer,
             cpu_entry.chunk,
             original_size,
             wait_us / 1000.0,
             reduce_us / 1000.0,
-            upload_us / 1000.0);
+            upload_us / 1000.0,
+            request.tensor.name);
         return true;
     }
 
@@ -7882,7 +7898,7 @@ bool rpc_server::prepare_phone_npu_async_job(
     prepared.layer = stage.layer;
     prepared.chunk = stage.chunk;
     prepared.prefill = stage.prefill;
-    prepared.down = stage.down;
+    prepared.output_bytes = ggml_nbytes(stage.down);
     prepared.cache = cache;
     prepared.n_embd = n_embd;
     prepared.n_tokens = n_tokens;
@@ -7921,7 +7937,7 @@ bool rpc_server::execute_phone_npu_async_job(
         std::vector<float> & output) {
     if (phone_npu_backend == nullptr ||
             job.cache == nullptr ||
-            job.down == nullptr ||
+            job.output_bytes == 0 ||
             job.n_embd <= 0 ||
             job.n_tokens <= 0 ||
             job.n_expert_used <= 0) {
@@ -8027,7 +8043,7 @@ bool rpc_server::execute_phone_npu_async_job(
 
     const size_t output_bytes =
         (size_t) ggml_nelements(out) * sizeof(float);
-    if (output_bytes != ggml_nbytes(job.down)) {
+    if (output_bytes != job.output_bytes) {
         return false;
     }
 
@@ -8098,7 +8114,7 @@ void rpc_server::phone_npu_async_loop() {
                 rpc_phone_npu_cpu_reduce_entry entry;
                 entry.layer = job.layer;
                 entry.chunk = job.chunk;
-                entry.down = job.down;
+                entry.output_bytes = job.output_bytes;
                 entry.phone_partial = std::move(output);
 
                 auto & pending =
@@ -8377,7 +8393,7 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
             rpc_phone_npu_cpu_reduce_entry entry;
             entry.layer = stage.layer;
             entry.chunk = stage.chunk;
-            entry.down = stage.down;
+            entry.output_bytes = ggml_nbytes(stage.down);
             entry.phone_partial =
                 std::move(ring_phone_partial);
 
