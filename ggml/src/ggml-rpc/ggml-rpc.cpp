@@ -3081,12 +3081,28 @@ static bool ggml_backend_rpc_get_route_snapshot(
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH = 13;
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_WIRE_ACK_MIN_PATCH = 17;
+    constexpr uint8_t RPC_INFERENCE_ROUTE_MIN_PATCH = 22;
+
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch =
         rpc_get_remote_patch(compute_key);
     if (remote_patch < RPC_ROUTE_SNAPSHOT_MIN_PATCH) {
         return false;
     }
+
+    const char * inference_transport_env =
+        std::getenv("GGML_INFERENCE_TRANSPORT");
+    const bool inference_force_new =
+        inference_transport_env != nullptr &&
+        std::strcmp(
+            inference_transport_env,
+            "force-new") == 0;
+    const bool inference_new =
+        inference_force_new ||
+        (inference_transport_env != nullptr &&
+         std::strcmp(
+             inference_transport_env,
+             "new") == 0);
 
     ggml_tensor * dsts[3] = { dst0, dst1, dst2 };
     rpc_msg_get_route_snapshot_req request {};
@@ -3162,7 +3178,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     const bool measure_profile =
         stage_profile || route_profile;
     const int64_t client_begin_us =
-        measure_profile ? ggml_time_us() : 0;
+        ggml_time_us();
 
     // Destination staging is private per chunk/lane. Keep the generic
     // destination-safety contract explicit for correctness.
@@ -3172,74 +3188,226 @@ static bool ggml_backend_rpc_get_route_snapshot(
     const int64_t dst_sync_us =
         measure_profile ? ggml_time_us() - dst_sync_begin_us : 0;
 
-    std::vector<uint8_t> response(wire_total_size);
-    const int64_t rpc_begin_us = ggml_time_us();
-
-    bool status = send_rpc_cmd(
-        route_sock,
-        RPC_CMD_GET_ROUTE_SNAPSHOT,
-        &request,
-        sizeof(request));
-    const int64_t request_done_us = ggml_time_us();
-
-    uint64_t wire_out_size = 0;
-    if (status) {
-        status = route_sock->recv_data(
-            &wire_out_size,
-            sizeof(wire_out_size));
-    }
-    const int64_t response_header_us = ggml_time_us();
-
-    const bool wire_ack_required =
-        (wire_out_size &
-         RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG) != 0;
-    const uint64_t out_size =
-        wire_out_size &
-        ~RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG;
-
-    if (status && out_size != response.size()) {
-        status = false;
+    bool use_inference_route = false;
+    std::shared_ptr<inference_transport> inference_transport_ptr;
+    if (inference_new &&
+            remote_patch >= RPC_INFERENCE_ROUTE_MIN_PATCH) {
+        inference_transport_ptr =
+            get_inference_transport(rpc_ctx->endpoint);
+        use_inference_route =
+            inference_transport_ptr != nullptr &&
+            inference_transport_ptr->healthy();
     }
 
-    if (status && rpc_stage_ready_callback != nullptr) {
-        rpc_stage_ready_callback(
-            rpc_stage_ready_user_data);
+    if (inference_new && !use_inference_route) {
+        if (inference_force_new) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_ROUTE] side=client status=FAIL "
+                "reason=force_new_unavailable endpoint=%s patch=%u "
+                "seq=%" PRIu64 " lane=%u\n",
+                rpc_ctx->endpoint.c_str(),
+                static_cast<unsigned>(remote_patch),
+                seq,
+                lane);
+            return false;
+        }
+
+        GGML_LOG_INFO(
+            "[INFERENCE_ROUTE] side=client status=FALLBACK "
+            "reason=unavailable endpoint=%s patch=%u "
+            "seq=%" PRIu64 " lane=%u\n",
+            rpc_ctx->endpoint.c_str(),
+            static_cast<unsigned>(remote_patch),
+            seq,
+            lane);
     }
 
-    if (status && !response.empty()) {
-        status = route_sock->recv_data(
-            response.data(),
-            response.size());
+    std::vector<uint8_t> response;
+    int64_t request_send_us = 0;
+    int64_t response_header_wait_us = 0;
+    int64_t payload_recv_us = 0;
+    int64_t ack_send_us = 0;
+
+    if (use_inference_route) {
+        int route_layer = -1;
+        int route_chunk = -1;
+        if (dst0 != nullptr && dst0->name[0] != '\0') {
+            int parsed = 0;
+            if (std::sscanf(
+                    dst0->name,
+                    "prefill_ffn_norm_chunk_%d-%d%n",
+                    &route_chunk,
+                    &route_layer,
+                    &parsed) != 2 ||
+                    dst0->name[parsed] != '\0') {
+                route_layer = -1;
+                route_chunk = -1;
+            }
+        }
+
+        rpc_msg_inference_route_pull_req pull {};
+        pull.snapshot = request;
+        pull.layer = route_layer;
+        pull.chunk = route_chunk;
+
+        rpc_msg_inference_route_pull_rsp pull_response {};
+        rpc_cmd_roundtrip_profile roundtrip_profile {};
+        rpc_cmd_roundtrip_profile * const previous_profile =
+            rpc_cmd_roundtrip_profile_active;
+        if (measure_profile) {
+            rpc_cmd_roundtrip_profile_active =
+                &roundtrip_profile;
+        }
+
+        const int64_t control_begin_us = ggml_time_us();
+        bool status = send_rpc_cmd(
+            route_sock,
+            RPC_CMD_INFERENCE_ROUTE_PULL,
+            &pull,
+            sizeof(pull),
+            &pull_response,
+            sizeof(pull_response));
+        const int64_t control_done_us = ggml_time_us();
+
+        if (measure_profile) {
+            rpc_cmd_roundtrip_profile_active =
+                previous_profile;
+            request_send_us =
+                roundtrip_profile.request_send_us;
+            response_header_wait_us =
+                roundtrip_profile.response_header_wait_us +
+                roundtrip_profile.response_body_wait_us;
+        }
+
+        if (status) {
+            status =
+                pull_response.result != 0 &&
+                pull_response.wire_size ==
+                    static_cast<uint64_t>(
+                        wire_total_size);
+        }
+
+        if (status && rpc_stage_ready_callback != nullptr) {
+            rpc_stage_ready_callback(
+                rpc_stage_ready_user_data);
+        }
+
+        const int64_t recv_begin_us = ggml_time_us();
+        inference_frame_header received_header {};
+        if (status) {
+            status = rpc_inference_receive_matching(
+                rpc_ctx->endpoint,
+                INFERENCE_STAGE_ROUTE,
+                rpc_ctx->device,
+                seq,
+                wire_total_size,
+                response,
+                &received_header);
+        }
+        const int64_t recv_done_us = ggml_time_us();
+        payload_recv_us = recv_done_us - recv_begin_us;
+
+        if (status &&
+                route_layer >= 0 &&
+                (received_header.layer != route_layer ||
+                 received_header.chunk != route_chunk)) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_ROUTE] side=client status=FAIL "
+                "reason=identity_mismatch seq=%" PRIu64
+                " expected=%d/%d actual=%d/%d\n",
+                seq,
+                route_layer,
+                route_chunk,
+                received_header.layer,
+                received_header.chunk);
+            status = false;
+        }
+
+        if (!status) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_ROUTE] side=client "
+                "seq=%" PRIu64 " lane=%u layer=%d chunk=%d "
+                "bytes=%zu control_ms=%.3f recv_ms=%.3f "
+                "status=FAIL\n",
+                seq,
+                lane,
+                route_layer,
+                route_chunk,
+                wire_total_size,
+                (control_done_us - control_begin_us) / 1000.0,
+                payload_recv_us / 1000.0);
+            return false;
+        }
+    } else {
+        response.resize(wire_total_size);
+        const int64_t rpc_begin_us = ggml_time_us();
+
+        bool status = send_rpc_cmd(
+            route_sock,
+            RPC_CMD_GET_ROUTE_SNAPSHOT,
+            &request,
+            sizeof(request));
+        const int64_t request_done_us = ggml_time_us();
+
+        uint64_t wire_out_size = 0;
+        if (status) {
+            status = route_sock->recv_data(
+                &wire_out_size,
+                sizeof(wire_out_size));
+        }
+        const int64_t response_header_us = ggml_time_us();
+
+        const bool wire_ack_required =
+            (wire_out_size &
+             RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG) != 0;
+        const uint64_t out_size =
+            wire_out_size &
+            ~RPC_ROUTE_SNAPSHOT_WIRE_ACK_FLAG;
+
+        if (status && out_size != response.size()) {
+            status = false;
+        }
+
+        if (status && rpc_stage_ready_callback != nullptr) {
+            rpc_stage_ready_callback(
+                rpc_stage_ready_user_data);
+        }
+
+        if (status && !response.empty()) {
+            status = route_sock->recv_data(
+                response.data(),
+                response.size());
+        }
+        const int64_t payload_done_us = ggml_time_us();
+
+        // Legacy route credit release is driven by PC userspace receive
+        // completion. The new data plane uses its bounded RX/TX rings instead.
+        const int64_t ack_send_begin_us =
+            measure_profile ? ggml_time_us() : 0;
+        if (status && wire_ack_required) {
+            const uint64_t ack_seq = seq;
+            status = route_sock->send_data(
+                &ack_seq,
+                sizeof(ack_seq));
+        }
+        const int64_t ack_send_done_us =
+            measure_profile ? ggml_time_us() : 0;
+
+        const int64_t rpc_done_us = ggml_time_us();
+        GGML_UNUSED(rpc_done_us);
+        RPC_STATUS_ASSERT(status);
+
+        request_send_us =
+            request_done_us - rpc_begin_us;
+        response_header_wait_us =
+            response_header_us - request_done_us;
+        payload_recv_us =
+            payload_done_us - response_header_us;
+        ack_send_us =
+            wire_ack_required ?
+                ack_send_done_us - ack_send_begin_us :
+                0;
     }
-    const int64_t payload_done_us = ggml_time_us();
-
-    // Release is driven by PC userspace receive completion, not by Phone
-    // send() completion. ACK immediately before any destination tensor upload.
-    const int64_t ack_send_begin_us =
-        measure_profile ? ggml_time_us() : 0;
-    if (status && wire_ack_required) {
-        const uint64_t ack_seq = seq;
-        status = route_sock->send_data(
-            &ack_seq,
-            sizeof(ack_seq));
-    }
-    const int64_t ack_send_done_us =
-        measure_profile ? ggml_time_us() : 0;
-
-    const int64_t rpc_done_us = ggml_time_us();
-    const int64_t rpc_us = rpc_done_us - rpc_begin_us;
-    RPC_STATUS_ASSERT(status);
-
-    const int64_t request_send_us =
-        request_done_us - rpc_begin_us;
-    const int64_t response_header_wait_us =
-        response_header_us - request_done_us;
-    const int64_t payload_recv_us =
-        payload_done_us - response_header_us;
-    const int64_t ack_send_us =
-        wire_ack_required ?
-            ack_send_done_us - ack_send_begin_us :
-            0;
 
     const int64_t dst_set_begin_us =
         measure_profile ? ggml_time_us() : 0;
@@ -3291,41 +3459,62 @@ static bool ggml_backend_rpc_get_route_snapshot(
 
     GGML_ASSERT(offset == response.size());
     const int64_t dst_set_us =
-        measure_profile ? ggml_time_us() - dst_set_begin_us : 0;
+        measure_profile ?
+            ggml_time_us() - dst_set_begin_us :
+            0;
 
-    if (route_profile) {
-        std::fprintf(
-            stderr,
-            "[ROUTE_RPC_RAW] seq=%" PRIu64 " lane=%u bytes=%zu "
-            "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
-            "ack=%.3f set=%.3f total=%.3f\n",
-            seq,
-            lane,
-            wire_total_size,
-            dst_sync_us / 1000.0,
-            request_send_us / 1000.0,
-            response_header_wait_us / 1000.0,
-            payload_recv_us / 1000.0,
-            ack_send_us / 1000.0,
-            dst_set_us / 1000.0,
-            (ggml_time_us() - client_begin_us) / 1000.0);
-    }
-
-    if (stage_profile) {
+    if (use_inference_route) {
         GGML_LOG_INFO(
-            "[ROUTE_RPC] seq=%" PRIu64 " lane=%u bytes=%zu "
-            "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
-            "ack=%.3f set=%.3f total=%.3f\n",
+            "[INFERENCE_ROUTE] side=client "
+            "seq=%" PRIu64 " lane=%u bytes=%zu "
+            "sync=%.3f control=%.3f recv=%.3f "
+            "set=%.3f total=%.3f status=OK\n",
             seq,
             lane,
             wire_total_size,
             dst_sync_us / 1000.0,
-            request_send_us / 1000.0,
-            response_header_wait_us / 1000.0,
+            (request_send_us +
+             response_header_wait_us) / 1000.0,
             payload_recv_us / 1000.0,
-            ack_send_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
+    } else {
+        if (route_profile) {
+            std::fprintf(
+                stderr,
+                "[ROUTE_RPC_RAW] seq=%" PRIu64
+                " lane=%u bytes=%zu "
+                "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
+                "ack=%.3f set=%.3f total=%.3f\n",
+                seq,
+                lane,
+                wire_total_size,
+                dst_sync_us / 1000.0,
+                request_send_us / 1000.0,
+                response_header_wait_us / 1000.0,
+                payload_recv_us / 1000.0,
+                ack_send_us / 1000.0,
+                dst_set_us / 1000.0,
+                (ggml_time_us() - client_begin_us) / 1000.0);
+        }
+
+        if (stage_profile) {
+            GGML_LOG_INFO(
+                "[ROUTE_RPC] seq=%" PRIu64
+                " lane=%u bytes=%zu "
+                "sync=%.3f req=%.3f hdr=%.3f recv=%.3f "
+                "ack=%.3f set=%.3f total=%.3f\n",
+                seq,
+                lane,
+                wire_total_size,
+                dst_sync_us / 1000.0,
+                request_send_us / 1000.0,
+                response_header_wait_us / 1000.0,
+                payload_recv_us / 1000.0,
+                ack_send_us / 1000.0,
+                dst_set_us / 1000.0,
+                (ggml_time_us() - client_begin_us) / 1000.0);
+        }
     }
 
     return true;
