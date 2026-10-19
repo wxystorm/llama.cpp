@@ -15041,11 +15041,53 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
+        ggml_tensor * final_norm_rms_pc = nullptr;
+        ggml_tensor * final_norm_input_pc = nullptr;
+        ggml_tensor * final_norm_weight_pc = nullptr;
+        if (final_norm_diag_pc != nullptr) {
+            final_norm_rms_pc = final_norm_diag_pc->src[0];
+            final_norm_weight_pc = final_norm_diag_pc->src[1];
+            if (final_norm_rms_pc != nullptr) {
+                final_norm_input_pc = final_norm_rms_pc->src[0];
+            }
+
+            GGML_LOG_ERROR(
+                "[FINAL_NORM_CHAIN] sg=%zu out=%s op=%s "
+                "rms=%s rop=%s inp=%s w=%s "
+                "same_out_rms=%d\n",
+                i,
+                final_norm_diag_pc->name,
+                ggml_op_name(final_norm_diag_pc->op),
+                final_norm_rms_pc != nullptr ?
+                    final_norm_rms_pc->name : "-",
+                final_norm_rms_pc != nullptr ?
+                    ggml_op_name(final_norm_rms_pc->op) : "-",
+                final_norm_input_pc != nullptr ?
+                    final_norm_input_pc->name : "-",
+                final_norm_weight_pc != nullptr ?
+                    final_norm_weight_pc->name : "-",
+                final_norm_rms_pc != nullptr &&
+                final_norm_rms_pc->data == final_norm_diag_pc->data ? 1 : 0);
+
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                final_norm_input_pc,
+                "FINAL_NORM_INPUT_PRE_PC");
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                final_norm_weight_pc,
+                "FINAL_NORM_WEIGHT_PC");
+        }
+
         compute_workers.start(0, i);
         compute_status = compute_workers.wait(0);
 
         if (compute_status == GGML_STATUS_SUCCESS &&
                 final_norm_diag_pc != nullptr) {
+            meta_debug_tensor(
+                backend_ctx->backend_configs[0].backend,
+                final_norm_rms_pc,
+                "FINAL_NORM_RMS_POST_PC");
             meta_debug_tensor(
                 backend_ctx->backend_configs[0].backend,
                 final_norm_diag_pc,
