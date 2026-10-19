@@ -10044,6 +10044,54 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         bcj_src.backend,
                         nodes[active_backend],
                         "L47_MOE_PHONE_OWNER_PRE_COPY");
+
+                    ggml_tensor * l47_src0 =
+                        nodes[active_backend]->src[0];
+                    ggml_tensor * l47_src1 =
+                        nodes[active_backend]->src[1];
+
+                    GGML_LOG_ERROR(
+                        "[L47_MOE_FINAL_ADD] sg=%zu out=%s "
+                        "out_data=%p src0=%s src0_data=%p "
+                        "src1=%s src1_data=%p "
+                        "alias0=%d alias1=%d "
+                        "src0_view=%s src1_view=%s\n",
+                        i,
+                        nodes[active_backend]->name,
+                        nodes[active_backend]->data,
+                        l47_src0 != nullptr ? l47_src0->name : "-",
+                        l47_src0 != nullptr ? l47_src0->data : nullptr,
+                        l47_src1 != nullptr ? l47_src1->name : "-",
+                        l47_src1 != nullptr ? l47_src1->data : nullptr,
+                        l47_src0 != nullptr &&
+                            l47_src0->data ==
+                                nodes[active_backend]->data ? 1 : 0,
+                        l47_src1 != nullptr &&
+                            l47_src1->data ==
+                                nodes[active_backend]->data ? 1 : 0,
+                        l47_src0 != nullptr &&
+                                l47_src0->view_src != nullptr ?
+                            l47_src0->view_src->name : "-",
+                        l47_src1 != nullptr &&
+                                l47_src1->view_src != nullptr ?
+                            l47_src1->view_src->name : "-");
+
+                    meta_debug_tensor(
+                        bcj_src.backend,
+                        l47_src0,
+                        "L47_MOE_FINAL_ADD_SRC0");
+                    meta_debug_tensor(
+                        bcj_src.backend,
+                        l47_src1,
+                        "L47_MOE_FINAL_ADD_SRC1");
+
+                    if (l47_src1 != nullptr &&
+                            l47_src1->view_src != nullptr) {
+                        meta_debug_tensor(
+                            bcj_src.backend,
+                            l47_src1->view_src,
+                            "L47_MOE_WEIGHTED_BASE");
+                    }
                 }
 
                 const int64_t copy_start_us = ggml_time_us();
