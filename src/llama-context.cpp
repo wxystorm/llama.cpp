@@ -2140,17 +2140,37 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             pc_ring_bind_stage bind_stage =
                 pc_ring_bind_stage::ATTN;
             int bind_layer = stage->layer_begin;
-            int bind_chunk = 0;
             bool ring_bind_active = false;
             bool force_next_split = false;
+            int dynamic_scratch_nodes = 0;
 
-            // Targeted allocator-lifetime correctness probe. Keep only one
-            // logical primitive alive instead of the entire Ring graph.
-            const int lifetime_probe_layer = 27;
-            const int lifetime_probe_chunk = 2;
-            const pc_ring_bind_stage lifetime_probe_stage =
-                pc_ring_bind_stage::ATTN;
-            int lifetime_probe_nodes = 0;
+            const auto pc_ring_dynamic_scratch_candidate =
+                [](ggml_tensor * node) -> bool {
+                    if ((node->flags &
+                            (GGML_TENSOR_FLAG_INPUT |
+                             GGML_TENSOR_FLAG_OUTPUT |
+                             GGML_TENSOR_FLAG_PARAM)) != 0) {
+                        return false;
+                    }
+
+                    ggml_tensor * root = node;
+                    while (root->view_src != nullptr) {
+                        root = root->view_src;
+                    }
+
+                    // Preallocated roots belong to persistent/model/KV/input
+                    // storage. Only scheduler-owned compute temporaries are
+                    // rebound into the task-local scratch arena.
+                    if (root->buffer != nullptr ||
+                        root->data != nullptr ||
+                        (root->flags &
+                            (GGML_TENSOR_FLAG_INPUT |
+                             GGML_TENSOR_FLAG_OUTPUT |
+                             GGML_TENSOR_FLAG_PARAM)) != 0) {
+                        return false;
+                    }
+                    return true;
+                };
 
             for (int node_id = 0; node_id < n_nodes; ++node_id) {
                 ggml_tensor * node =
@@ -2161,16 +2181,12 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         "pc_ring_entry",
                         13) == 0;
 
-                // Targeted lifetime probe: preserve every tensor
-                // in layer 27 / chunk 2 / ATTN, including view/reshape nodes.
-                // If the later backward jump to this primitive stops crashing,
-                // static allocator reuse is the confirmed failure mode.
                 if (ring_bind_active &&
-                    bind_layer == lifetime_probe_layer &&
-                    bind_chunk == lifetime_probe_chunk &&
-                    bind_stage == lifetime_probe_stage) {
-                    ggml_set_output(node);
-                    ++lifetime_probe_nodes;
+                    bind_layer < stage->layer_end &&
+                    pc_ring_dynamic_scratch_candidate(node)) {
+                    ggml_backend_sched_mark_dynamic_scratch(
+                        sched_use, node);
+                    ++dynamic_scratch_nodes;
                 }
 
                 // Match scheduler semantics exactly: a tensor can
@@ -2223,12 +2239,15 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 }
 
                 if (ring_entry_node) {
+                    // Boundary storage must survive arbitrary FIFO ordering.
+                    // The per-chunk layer-0 views all reference this tensor.
+                    ggml_set_output(node);
+
                     // Prefix graph work (embedding/input preparation) remains
                     // under the normal scheduler. Ring ownership starts only
                     // after this explicit graph boundary.
                     ring_bind_active = true;
                     bind_layer = stage->layer_begin;
-                    bind_chunk = 0;
                     bind_stage = pc_ring_bind_stage::ATTN;
                     force_next_split = true;
                     continue;
@@ -2242,7 +2261,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk,
                         marker_layer)) {
                     bind_layer = marker_layer;
-                    bind_chunk = marker_chunk;
                     bind_stage = pc_ring_bind_stage::FFN;
                     force_next_split = true;
                 } else if (parse_ring_marker(
@@ -2251,7 +2269,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk,
                         marker_layer)) {
                     bind_layer = marker_layer;
-                    bind_chunk = marker_chunk;
                     bind_stage = pc_ring_bind_stage::REDUCE;
                     force_next_split = true;
                 } else if (parse_ring_marker(
@@ -2264,10 +2281,6 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         marker_chunk + 1 < ring_chunks ?
                             marker_layer :
                             marker_layer + 1;
-                    bind_chunk =
-                        marker_chunk + 1 < ring_chunks ?
-                            marker_chunk + 1 :
-                            0;
                     force_next_split = true;
                 }
             }
@@ -2280,7 +2293,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 "[PC_LOCAL_RING_BIND] status=OK layers=[%d,%d) "
                 "primitive_tasks=%d B0=%s B1=%s "
                 "attn=%d ffn=%d reduce=%d full=%d "
-                "lifetime=TARGETED_PROBE probe=%d/%d/ATTN output_nodes=%d\n",
+                "lifetime=TASK_SCRATCH scratch_nodes=%d\n",
                 stage->layer_begin,
                 stage->layer_end,
                 attn_markers * 3,
@@ -2290,9 +2303,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.ffn,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.reduce,
                 (int) pc_ring_runtime_plan.pc_local.stage_backends.full,
-                lifetime_probe_layer,
-                lifetime_probe_chunk,
-                lifetime_probe_nodes);
+                dynamic_scratch_nodes);
         }
 
         if (strict_cpu_stage) {
@@ -3681,6 +3692,273 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const int64_t ring_wall_begin_us =
                     ggml_time_us();
 
+                ggml_backend_buffer_t scratch_buffers[2] = {
+                    nullptr, nullptr,
+                };
+                ggml_backend_t scratch_backends[2] = {
+                    nullptr, nullptr,
+                };
+                size_t scratch_bytes[2] = { 0, 0 };
+
+                const auto align_up_size =
+                    [](size_t value, size_t alignment) -> size_t {
+                        if (alignment <= 1) {
+                            return value;
+                        }
+                        return (value + alignment - 1) /
+                            alignment * alignment;
+                    };
+
+                const auto scratch_bytes_for_range =
+                    [&](const pc_ring_split_range & range,
+                        ggml_backend_t backend) -> size_t {
+                        const ggml_backend_buffer_type_t buft =
+                            ggml_backend_sched_get_buffer_type(
+                                sched_use, backend);
+                        const size_t alignment =
+                            ggml_backend_buft_get_alignment(buft);
+                        size_t offset = 0;
+
+                        for (int split = range.begin;
+                             split < range.end;
+                             ++split) {
+                            const int i_start =
+                                ggml_backend_sched_get_split_start(
+                                    sched_use, split);
+                            const int i_end =
+                                ggml_backend_sched_get_split_end(
+                                    sched_use, split);
+                            for (int node_id = i_start;
+                                 node_id < i_end;
+                                 ++node_id) {
+                                ggml_tensor * node =
+                                    ggml_graph_node(
+                                        ring_graph, node_id);
+                                if (!ggml_backend_sched_is_dynamic_scratch(
+                                        sched_use, node) ||
+                                    node->view_src != nullptr) {
+                                    continue;
+                                }
+
+                                offset =
+                                    align_up_size(
+                                        offset, alignment);
+                                offset +=
+                                    ggml_backend_buft_get_alloc_size(
+                                        buft, node);
+                            }
+                        }
+                        return offset;
+                    };
+
+                for (const pc_ring_split_range & range :
+                        task_ranges) {
+                    if (range.begin < 0 ||
+                        range.end <= range.begin) {
+                        continue;
+                    }
+
+                    const int bi =
+                        split_backend_index(range.begin);
+                    if (bi < 0 || bi > 1) {
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
+                            "reason=BACKEND split=%d backend=%d\n",
+                            range.begin, bi);
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+
+                    ggml_backend_t backend =
+                        ggml_backend_sched_get_split_backend(
+                            sched_use, range.begin);
+                    if (scratch_backends[bi] == nullptr) {
+                        scratch_backends[bi] = backend;
+                    } else if (scratch_backends[bi] != backend) {
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
+                            "reason=MULTI_BACKEND slot=B%d first=%s now=%s\n",
+                            bi,
+                            ggml_backend_name(
+                                scratch_backends[bi]),
+                            ggml_backend_name(backend));
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+
+                    scratch_bytes[bi] =
+                        std::max(
+                            scratch_bytes[bi],
+                            scratch_bytes_for_range(
+                                range, backend));
+                }
+
+                for (int bi = 0; bi < 2; ++bi) {
+                    if (scratch_bytes[bi] == 0) {
+                        continue;
+                    }
+                    GGML_ASSERT(scratch_backends[bi] != nullptr);
+                    const ggml_backend_buffer_type_t buft =
+                        ggml_backend_sched_get_buffer_type(
+                            sched_use, scratch_backends[bi]);
+                    scratch_buffers[bi] =
+                        ggml_backend_buft_alloc_buffer(
+                            buft, scratch_bytes[bi]);
+                    if (scratch_buffers[bi] == nullptr) {
+                        for (int bj = 0; bj < bi; ++bj) {
+                            if (scratch_buffers[bj] != nullptr) {
+                                ggml_backend_buffer_free(
+                                    scratch_buffers[bj]);
+                                scratch_buffers[bj] = nullptr;
+                            }
+                        }
+                        LLAMA_LOG_ERROR(
+                            "[PC_LOCAL_RING_SCRATCH] status=FAIL "
+                            "reason=ALLOC slot=B%d backend=%s bytes=%zu\n",
+                            bi,
+                            ggml_backend_name(
+                                scratch_backends[bi]),
+                            scratch_bytes[bi]);
+                        ret = GGML_STATUS_ALLOC_FAILED;
+                        return nullptr;
+                    }
+                    ggml_backend_buffer_set_usage(
+                        scratch_buffers[bi],
+                        GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                }
+
+                LLAMA_LOG_INFO(
+                    "[PC_LOCAL_RING_SCRATCH] status=OK "
+                    "B0=%s bytes=%zu mib=%.2f "
+                    "B1=%s bytes=%zu mib=%.2f "
+                    "policy=TASK_LOCAL_ARENA\n",
+                    scratch_backends[0] != nullptr ?
+                        ggml_backend_name(scratch_backends[0]) :
+                        "(none)",
+                    scratch_bytes[0],
+                    scratch_bytes[0] / (1024.0 * 1024.0),
+                    scratch_backends[1] != nullptr ?
+                        ggml_backend_name(scratch_backends[1]) :
+                        "(none)",
+                    scratch_bytes[1],
+                    scratch_bytes[1] / (1024.0 * 1024.0));
+
+                struct pc_ring_scratch_saved {
+                    ggml_tensor * tensor;
+                    ggml_backend_buffer_t buffer;
+                    void * data;
+                    void * extra;
+                };
+
+                const auto restore_primitive_scratch =
+                    [](std::vector<pc_ring_scratch_saved> & saved) {
+                        for (auto it = saved.rbegin();
+                             it != saved.rend();
+                             ++it) {
+                            it->tensor->buffer = it->buffer;
+                            it->tensor->data = it->data;
+                            it->tensor->extra = it->extra;
+                        }
+                        saved.clear();
+                    };
+
+                const auto bind_primitive_scratch =
+                    [&](const pc_ring_split_range & range,
+                        int bi,
+                        std::vector<pc_ring_scratch_saved> & saved)
+                        -> ggml_status {
+                        saved.clear();
+                        if (bi < 0 || bi > 1) {
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        ggml_backend_buffer_t scratch =
+                            scratch_buffers[bi];
+                        if (scratch == nullptr) {
+                            return GGML_STATUS_SUCCESS;
+                        }
+
+                        const size_t alignment =
+                            ggml_backend_buffer_get_alignment(
+                                scratch);
+                        const size_t capacity =
+                            ggml_backend_buffer_get_size(
+                                scratch);
+                        char * base =
+                            (char *)
+                            ggml_backend_buffer_get_base(
+                                scratch);
+                        size_t offset = 0;
+
+                        for (int split = range.begin;
+                             split < range.end;
+                             ++split) {
+                            const int i_start =
+                                ggml_backend_sched_get_split_start(
+                                    sched_use, split);
+                            const int i_end =
+                                ggml_backend_sched_get_split_end(
+                                    sched_use, split);
+                            for (int node_id = i_start;
+                                 node_id < i_end;
+                                 ++node_id) {
+                                ggml_tensor * node =
+                                    ggml_graph_node(
+                                        ring_graph, node_id);
+                                if (!ggml_backend_sched_is_dynamic_scratch(
+                                        sched_use, node)) {
+                                    continue;
+                                }
+
+                                saved.push_back({
+                                    node,
+                                    node->buffer,
+                                    node->data,
+                                    node->extra,
+                                });
+
+                                node->buffer = nullptr;
+                                node->data = nullptr;
+                                node->extra = nullptr;
+
+                                ggml_status status =
+                                    GGML_STATUS_SUCCESS;
+                                if (node->view_src != nullptr) {
+                                    status =
+                                        ggml_backend_view_init(
+                                            node);
+                                } else {
+                                    offset =
+                                        align_up_size(
+                                            offset, alignment);
+                                    const size_t alloc_size =
+                                        ggml_backend_buffer_get_alloc_size(
+                                            scratch, node);
+                                    if (offset + alloc_size >
+                                            capacity) {
+                                        restore_primitive_scratch(
+                                            saved);
+                                        return GGML_STATUS_ALLOC_FAILED;
+                                    }
+                                    status =
+                                        ggml_backend_tensor_alloc(
+                                            scratch,
+                                            node,
+                                            base + offset);
+                                    offset += alloc_size;
+                                }
+
+                                if (status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    restore_primitive_scratch(
+                                        saved);
+                                    return status;
+                                }
+                            }
+                        }
+                        return GGML_STATUS_SUCCESS;
+                    };
+
                 const auto enqueue_job =
                     [&](int kind, int layer, int chunk) {
                         const int bi =
@@ -3740,18 +4018,26 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             return GGML_STATUS_FAILED;
                         }
 
-                        // A primitive may contain several scheduler splits
-                        // because the scheduler subdivides host-weight copies.
-                        // Keep all of those splits inside the logical FIFO task.
-                        //
-                        // Correctness probe: serialize the COMPLETE scheduler
-                        // interaction, not merely prepare_split(). prepare_split()
-                        // can touch cross-backend copies/events and synchronize
-                        // CUDA while another worker is computing a different
-                        // split, so concurrent access to one scheduler/backend
-                        // instance is unsafe until proven otherwise.
+                        // A primitive may contain several scheduler splits.
+                        // Its ordinary compute temporaries are rebound to a
+                        // backend-local scratch arena so non-monotonic FIFO
+                        // execution does not depend on ggml_gallocr's static
+                        // graph lifetime/reuse decisions. Boundary tensors and
+                        // preallocated model/KV/input storage remain persistent.
                         std::lock_guard<std::mutex> scheduler_lock(
                             scheduler_exec_mutex);
+
+                        const int bi =
+                            split_backend_index(range.begin);
+                        std::vector<pc_ring_scratch_saved> scratch_saved;
+                        ggml_status primitive_status =
+                            bind_primitive_scratch(
+                                range, bi, scratch_saved);
+                        if (primitive_status !=
+                                GGML_STATUS_SUCCESS) {
+                            return primitive_status;
+                        }
+
                         if (ring_exec_trace) {
                             const char * kind_name =
                                 kind == PC_RING_ATTN ? "ATTN" :
@@ -3760,43 +4046,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 kind == PC_RING_FULL ? "FULL" : "UNKNOWN";
                             LLAMA_LOG_ERROR(
                                 "[PC_LOCAL_RING_EXEC] event=PRIMITIVE_BEGIN "
-                                "kind=%s layer=%d chunk=%d range=[%d,%d)\n",
+                                "kind=%s layer=%d chunk=%d range=[%d,%d) "
+                                "scratch=B%d\n",
                                 kind_name, layer, chunk,
-                                range.begin, range.end);
-
-                            if (kind == PC_RING_ATTN &&
-                                layer == 27 &&
-                                chunk == 2) {
-                                for (int diag_split = range.begin;
-                                     diag_split < range.end;
-                                     ++diag_split) {
-                                    const int diag_start =
-                                        ggml_backend_sched_get_split_start(
-                                            sched_use, diag_split);
-                                    const int diag_end =
-                                        ggml_backend_sched_get_split_end(
-                                            sched_use, diag_split);
-                                    for (int node_id = diag_start;
-                                         node_id < diag_end;
-                                         ++node_id) {
-                                        ggml_tensor * diag_node =
-                                            ggml_graph_node(
-                                                ring_graph, node_id);
-                                        LLAMA_LOG_ERROR(
-                                            "[PC_LOCAL_RING_TARGET_NODE] "
-                                            "layer=27 chunk=2 stage=ATTN "
-                                            "split=%d node=%d name=%s op=%s "
-                                            "view=%s\n",
-                                            diag_split,
-                                            node_id,
-                                            diag_node->name,
-                                            ggml_op_name(diag_node->op),
-                                            diag_node->view_src != nullptr ?
-                                                diag_node->view_src->name :
-                                                "(none)");
-                                    }
-                                }
-                            }
+                                range.begin, range.end, bi);
                         }
 
                         for (int split = range.begin;
@@ -3821,18 +4074,20 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                     i_start, i_end);
                             }
 
-                            ggml_status status =
+                            primitive_status =
                                 ggml_backend_sched_prepare_split(
                                     sched_use, split);
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
+                            if (primitive_status !=
+                                    GGML_STATUS_SUCCESS) {
+                                break;
                             }
 
-                            status =
+                            primitive_status =
                                 ggml_backend_sched_compute_split(
                                     sched_use, split);
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
+                            if (primitive_status !=
+                                    GGML_STATUS_SUCCESS) {
+                                break;
                             }
 
                             // Bootstrap correctness path: synchronize each
@@ -3850,6 +4105,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                             }
                         }
 
+                        restore_primitive_scratch(
+                            scratch_saved);
+
                         if (ring_exec_trace) {
                             const char * kind_name =
                                 kind == PC_RING_ATTN ? "ATTN" :
@@ -3858,11 +4116,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                                 kind == PC_RING_FULL ? "FULL" : "UNKNOWN";
                             LLAMA_LOG_ERROR(
                                 "[PC_LOCAL_RING_EXEC] event=PRIMITIVE_END "
-                                "kind=%s layer=%d chunk=%d range=[%d,%d)\n",
+                                "kind=%s layer=%d chunk=%d range=[%d,%d) "
+                                "status=%d\n",
                                 kind_name, layer, chunk,
-                                range.begin, range.end);
+                                range.begin, range.end,
+                                (int) primitive_status);
                         }
-                        return GGML_STATUS_SUCCESS;
+                        return primitive_status;
                     };
 
                 const auto run_job =
@@ -4015,7 +4275,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "layers=[%d,%d) chunks=%d "
                     "primitive_tasks=%d jobs=%d "
                     "split_range=[%d,%d] internal_splits=%d "
-                    "B0=CPU B1=ACCEL scheduler_exec=SERIAL_PROBE\n",
+                    "B0=CPU B1=ACCEL lifetime=TASK_SCRATCH "
+                    "scheduler_exec=SERIAL_PROBE\n",
                     stage.layer_begin,
                     stage.layer_end,
                     n_chunks,
@@ -4036,6 +4297,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 }
                 queue_cv.notify_all();
                 backend_0_worker.join();
+
+                for (int bi = 0; bi < 2; ++bi) {
+                    if (scratch_buffers[bi] != nullptr) {
+                        ggml_backend_buffer_free(
+                            scratch_buffers[bi]);
+                        scratch_buffers[bi] = nullptr;
+                    }
+                }
 
                 const int64_t ring_wall_us =
                     ggml_time_us() -
