@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <cmath>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -4385,6 +4386,161 @@ struct rpc_phone_npu_async_job {
     std::vector<uint8_t> route_dense;
 };
 
+static bool rpc_phone_npu_diag_f32_nonfinite(
+        const char * stage,
+        uint64_t seq,
+        int layer,
+        int chunk,
+        const float * data,
+        size_t count) {
+    if (layer != 47 || data == nullptr || count == 0) {
+        return false;
+    }
+
+    size_t nonfinite = 0;
+    size_t first = count;
+    float first_value = 0.0f;
+    float max_abs_finite = 0.0f;
+
+    for (size_t i = 0; i < count; ++i) {
+        const float v = data[i];
+        if (!std::isfinite(v)) {
+            if (first == count) {
+                first = i;
+                first_value = v;
+            }
+            ++nonfinite;
+            continue;
+        }
+        max_abs_finite = std::max(
+            max_abs_finite,
+            std::fabs(v));
+    }
+
+    if (nonfinite == 0) {
+        return false;
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_NPU_NUMERIC] stage=%s seq=%" PRIu64
+        " chunk=%d count=%zu nonfinite=%zu first=%zu "
+        "first_value=%g max_abs_finite=%g\n",
+        stage,
+        seq,
+        chunk,
+        count,
+        nonfinite,
+        first,
+        first_value,
+        max_abs_finite);
+    return true;
+}
+
+static bool rpc_phone_npu_diag_f32_bytes_nonfinite(
+        const char * stage,
+        uint64_t seq,
+        int layer,
+        int chunk,
+        const std::vector<uint8_t> & bytes) {
+    if (layer != 47 || bytes.empty() ||
+            bytes.size() % sizeof(float) != 0) {
+        return false;
+    }
+
+    const size_t count = bytes.size() / sizeof(float);
+    size_t nonfinite = 0;
+    size_t first = count;
+    float first_value = 0.0f;
+    float max_abs_finite = 0.0f;
+
+    for (size_t i = 0; i < count; ++i) {
+        float v = 0.0f;
+        memcpy(
+            &v,
+            bytes.data() + i * sizeof(float),
+            sizeof(v));
+        if (!std::isfinite(v)) {
+            if (first == count) {
+                first = i;
+                first_value = v;
+            }
+            ++nonfinite;
+            continue;
+        }
+        max_abs_finite = std::max(
+            max_abs_finite,
+            std::fabs(v));
+    }
+
+    if (nonfinite == 0) {
+        return false;
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_NPU_NUMERIC] stage=%s seq=%" PRIu64
+        " chunk=%d count=%zu nonfinite=%zu first=%zu "
+        "first_value=%g max_abs_finite=%g\n",
+        stage,
+        seq,
+        chunk,
+        count,
+        nonfinite,
+        first,
+        first_value,
+        max_abs_finite);
+    return true;
+}
+
+static bool rpc_phone_npu_diag_topk_invalid(
+        uint64_t seq,
+        int layer,
+        int chunk,
+        const std::vector<uint8_t> & bytes,
+        int64_t n_experts) {
+    if (layer != 47 || bytes.empty() ||
+            bytes.size() % sizeof(int32_t) != 0 ||
+            n_experts <= 0) {
+        return false;
+    }
+
+    const size_t count = bytes.size() / sizeof(int32_t);
+    size_t invalid = 0;
+    size_t first = count;
+    int32_t first_value = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        int32_t v = 0;
+        memcpy(
+            &v,
+            bytes.data() + i * sizeof(int32_t),
+            sizeof(v));
+        if (v < 0 || v >= n_experts) {
+            if (first == count) {
+                first = i;
+                first_value = v;
+            }
+            ++invalid;
+        }
+    }
+
+    if (invalid == 0) {
+        return false;
+    }
+
+    GGML_LOG_ERROR(
+        "[L47_NPU_NUMERIC] stage=topk_snapshot seq=%" PRIu64
+        " chunk=%d count=%zu invalid=%zu first=%zu "
+        "first_value=%d n_experts=%" PRId64 "\n",
+        seq,
+        chunk,
+        count,
+        invalid,
+        first,
+        first_value,
+        n_experts);
+    return true;
+}
+
 static ggml_backend_buffer_type_t rpc_phone_npu_repack_buft(
         ggml_backend_t backend) {
     if (backend == nullptr) {
@@ -6063,6 +6219,21 @@ bool rpc_server::set_tensor_async_return_wait(
                 original_size);
         }
 
+        rpc_phone_npu_diag_f32_nonfinite(
+            "cpu_phone_partial",
+            request.phone_ffn_seq,
+            cpu_entry.layer,
+            cpu_entry.chunk,
+            cpu_entry.phone_partial.data(),
+            cpu_entry.phone_partial.size());
+        rpc_phone_npu_diag_f32_nonfinite(
+            "cpu_pc_partial",
+            request.phone_ffn_seq,
+            cpu_entry.layer,
+            cpu_entry.chunk,
+            pc_partial.data(),
+            pc_partial.size());
+
         const int64_t reduce_begin_us =
             ggml_time_us();
         for (size_t i = 0;
@@ -6073,6 +6244,14 @@ bool rpc_server::set_tensor_async_return_wait(
         }
         const int64_t reduce_us =
             ggml_time_us() - reduce_begin_us;
+
+        rpc_phone_npu_diag_f32_nonfinite(
+            "cpu_joined",
+            request.phone_ffn_seq,
+            cpu_entry.layer,
+            cpu_entry.chunk,
+            cpu_entry.phone_partial.data(),
+            cpu_entry.phone_partial.size());
 
         const int64_t upload_begin_us =
             ggml_time_us();
@@ -7927,6 +8106,25 @@ bool rpc_server::prepare_phone_npu_async_job(
         return false;
     }
 
+    rpc_phone_npu_diag_f32_bytes_nonfinite(
+        "hidden_snapshot",
+        seq,
+        stage.layer,
+        stage.chunk,
+        prepared.hidden_dense);
+    rpc_phone_npu_diag_f32_bytes_nonfinite(
+        "route_snapshot",
+        seq,
+        stage.layer,
+        stage.chunk,
+        prepared.route_dense);
+    rpc_phone_npu_diag_topk_invalid(
+        seq,
+        stage.layer,
+        stage.chunk,
+        prepared.topk_dense,
+        cache->w_up->ne[2]);
+
     prepared.enqueue_us = ggml_time_us();
     job = std::move(prepared);
     return true;
@@ -8053,6 +8251,14 @@ bool rpc_server::execute_phone_npu_async_job(
         output.data(),
         0,
         output_bytes);
+
+    rpc_phone_npu_diag_f32_nonfinite(
+        "npu_output",
+        job.seq,
+        job.layer,
+        job.chunk,
+        output.data(),
+        output.size());
     return true;
 }
 
