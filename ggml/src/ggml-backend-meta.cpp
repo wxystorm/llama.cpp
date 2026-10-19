@@ -10004,9 +10004,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     source_fence_us = ggml_time_us() - source_fence_start_us;
                 }
 
+                int l47_moe_single_parsed = 0;
+                int l47_moe_single_layer = -1;
+                const bool l47_phone_owner_copy_diag =
+                    std::getenv("LLAMA_HYBRID_ZERO_LOGITS_DIAG") != nullptr &&
+                    active_backend == 1 &&
+                    j_dst == 0 &&
+                    std::sscanf(
+                        nodes[active_backend]->name,
+                        "ffn_moe_out-%d%n",
+                        &l47_moe_single_layer,
+                        &l47_moe_single_parsed) == 1 &&
+                    nodes[active_backend]->name[l47_moe_single_parsed] == '\0' &&
+                    l47_moe_single_layer == 47;
+
+                if (l47_phone_owner_copy_diag) {
+                    const ggml_backend_rpc_fence_t src_fence =
+                        ggml_backend_meta_get_rpc_fence(bcj_src.backend);
+                    if (src_fence != nullptr) {
+                        src_fence(bcj_src.backend);
+                    } else {
+                        ggml_backend_synchronize(bcj_src.backend);
+                    }
+
+                    GGML_LOG_ERROR(
+                        "[L47_MOE_OWNER_COPY] sg=%zu active=%zu src=%s "
+                        "src_op=%s src0=%s src1=%s dst=%s action=PRE_COPY\n",
+                        i,
+                        active_count,
+                        nodes[active_backend]->name,
+                        ggml_op_name(nodes[active_backend]->op),
+                        nodes[active_backend]->src[0] != nullptr ?
+                            nodes[active_backend]->src[0]->name : "-",
+                        nodes[active_backend]->src[1] != nullptr ?
+                            nodes[active_backend]->src[1]->name : "-",
+                        nodes[j_dst]->name);
+
+                    meta_debug_tensor(
+                        bcj_src.backend,
+                        nodes[active_backend],
+                        "L47_MOE_PHONE_OWNER_PRE_COPY");
+                }
+
                 const int64_t copy_start_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                         bcj_src.backend, bcj_dst.backend, nodes[active_backend], nodes[j_dst]);
+
+                if (l47_phone_owner_copy_diag) {
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    meta_debug_tensor(
+                        bcj_dst.backend,
+                        nodes[j_dst],
+                        "L47_MOE_PC_AFTER_COPY");
+                    GGML_LOG_ERROR(
+                        "[L47_MOE_OWNER_COPY] sg=%zu src=%s dst=%s "
+                        "action=POST_COPY\n",
+                        i,
+                        nodes[active_backend]->name,
+                        nodes[j_dst]->name);
+                }
 
                 if (pc_full_ffn_to_phone && strict_phone_primary_fence) {
                     const ggml_backend_rpc_fence_t rpc_fence =
