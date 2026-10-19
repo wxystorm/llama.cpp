@@ -20,6 +20,7 @@ enum inference_stage : uint16_t {
     INFERENCE_STAGE_FFN_OUT     = 3,
     INFERENCE_STAGE_RETURN      = 4,
     INFERENCE_STAGE_REDUCE_IN   = 5,
+    INFERENCE_STAGE_ROUTE       = 6,
 };
 
 struct inference_frame_header {
