@@ -525,6 +525,13 @@ struct rpc_msg_inference_route_pull_rsp {
     uint64_t wire_size;
 };
 
+static_assert(
+    sizeof(rpc_msg_inference_route_pull_req) == 48,
+    "inference route pull request wire size changed");
+static_assert(
+    sizeof(rpc_msg_inference_route_pull_rsp) == 16,
+    "inference route pull response wire size changed");
+
 struct rpc_msg_return_bulk_acquire_req {
     uint64_t seq;
 };
