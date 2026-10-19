@@ -44,12 +44,14 @@ struct inference_transport::impl {
     mutable std::mutex tx_mu;
     mutable std::mutex rx_mu;
     mutable std::mutex stats_mu;
+    mutable std::mutex state_mu;
 
     std::condition_variable tx_free_cv;
     std::condition_variable tx_pending_cv;
     std::condition_variable tx_idle_cv;
     std::condition_variable rx_free_cv;
     std::condition_variable rx_ready_cv;
+    std::condition_variable state_cv;
 
     std::deque<uint32_t> tx_free;
     std::deque<uint32_t> tx_pending;
@@ -101,6 +103,7 @@ struct inference_transport::impl {
         tx_idle_cv.notify_all();
         rx_free_cv.notify_all();
         rx_ready_cv.notify_all();
+        state_cv.notify_all();
     }
 
     void fail() {
@@ -526,6 +529,23 @@ struct inference_transport::impl {
                tx_in_progress == 0;
     }
 
+    bool wait_closed(int timeout_ms) {
+        std::unique_lock<std::mutex> lock(state_mu);
+        const auto closed = [this]() {
+            return stopping.load(std::memory_order_acquire);
+        };
+
+        if (timeout_ms < 0) {
+            state_cv.wait(lock, closed);
+            return true;
+        }
+
+        return state_cv.wait_for(
+            lock,
+            std::chrono::milliseconds(timeout_ms),
+            closed);
+    }
+
     inference_transport_stats snapshot_stats() const {
         std::lock_guard<std::mutex> lock(stats_mu);
         return stats;
@@ -583,6 +603,20 @@ std::unique_ptr<inference_transport> inference_transport::accept(
     return result;
 }
 
+std::unique_ptr<inference_transport> inference_transport::adopt(
+        socket_ptr socket,
+        const inference_transport_config & config) {
+    if (!socket) {
+        return nullptr;
+    }
+
+    auto pimpl = std::make_unique<impl>(std::move(socket), config);
+    auto result = std::unique_ptr<inference_transport>(
+        new inference_transport(std::move(pimpl)));
+    result->pimpl->start();
+    return result;
+}
+
 inference_tx_buffer inference_transport::acquire_tx(size_t payload_bytes) {
     return pimpl ? pimpl->acquire_tx(payload_bytes) : inference_tx_buffer {};
 }
@@ -612,6 +646,10 @@ void inference_transport::release_rx(inference_rx_frame && frame) {
 
 bool inference_transport::wait_tx_idle(int timeout_ms) {
     return pimpl && pimpl->wait_tx_idle(timeout_ms);
+}
+
+bool inference_transport::wait_closed(int timeout_ms) {
+    return pimpl && pimpl->wait_closed(timeout_ms);
 }
 
 bool inference_transport::healthy() const {
