@@ -272,6 +272,7 @@ enum rpc_cmd {
     RPC_CMD_RETURN_BULK_ACQUIRE,
     RPC_CMD_INFERENCE_DATA_PLANE_OPEN,
     RPC_CMD_INFERENCE_RETURN_BIND,
+    RPC_CMD_INFERENCE_ROUTE_PULL,
     RPC_CMD_COUNT,
 };
 
@@ -296,6 +297,7 @@ static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_
 static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_DATA_PLANE_OPEN == 35, "RPC_CMD_INFERENCE_DATA_PLANE_OPEN must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_RETURN_BIND == 36, "RPC_CMD_INFERENCE_RETURN_BIND must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INFERENCE_ROUTE_PULL == 37, "RPC_CMD_INFERENCE_ROUTE_PULL must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -509,6 +511,18 @@ struct rpc_msg_get_route_snapshot_req {
     uint32_t lane;
     uint64_t seq;
     uint64_t sizes[3];
+};
+
+struct rpc_msg_inference_route_pull_req {
+    rpc_msg_get_route_snapshot_req snapshot;
+    int32_t layer;
+    int32_t chunk;
+};
+
+struct rpc_msg_inference_route_pull_rsp {
+    uint8_t result;
+    uint8_t reserved[7];
+    uint64_t wire_size;
 };
 
 struct rpc_msg_return_bulk_acquire_req {
