@@ -937,10 +937,9 @@ struct ggml_backend_sched {
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
-    int                 * hv_tensor_backend_ids;      // [hash_set.size]
-    uint8_t             * hv_tensor_backend_pinned;   // [hash_set.size]
-    uint8_t             * hv_tensor_dynamic_scratch;  // [hash_set.size]
-    struct ggml_tensor ** hv_tensor_copies;           // [hash_set.size][n_backends][n_copies]
+    int                 * hv_tensor_backend_ids;    // [hash_set.size]
+    uint8_t             * hv_tensor_backend_pinned; // [hash_set.size]
+    struct ggml_tensor ** hv_tensor_copies;         // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -2344,13 +2343,11 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
-    sched->hv_tensor_backend_ids      = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_backend_pinned   = (uint8_t *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_backend_pinned[0]));
-    sched->hv_tensor_dynamic_scratch  = (uint8_t *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_dynamic_scratch[0]));
-    sched->hv_tensor_copies           = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->hv_tensor_backend_ids    = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_backend_pinned = (uint8_t *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_backend_pinned[0]));
+    sched->hv_tensor_copies         = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     GGML_ASSERT(sched->hv_tensor_backend_ids != NULL);
     GGML_ASSERT(sched->hv_tensor_backend_pinned != NULL);
-    GGML_ASSERT(sched->hv_tensor_dynamic_scratch != NULL);
     GGML_ASSERT(sched->hv_tensor_copies != NULL);
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
@@ -2429,7 +2426,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->forced_split_nodes);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_backend_pinned);
-    free(sched->hv_tensor_dynamic_scratch);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -2448,10 +2444,9 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids,       -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_backend_pinned,     0, sched->hash_set.size * sizeof(sched->hv_tensor_backend_pinned[0]));
-        memset(sched->hv_tensor_dynamic_scratch,    0, sched->hash_set.size * sizeof(sched->hv_tensor_dynamic_scratch[0]));
-        memset(sched->hv_tensor_copies,              0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        memset(sched->hv_tensor_backend_ids,    -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_backend_pinned, 0, sched->hash_set.size * sizeof(sched->hv_tensor_backend_pinned[0]));
+        memset(sched->hv_tensor_copies,          0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2705,25 +2700,6 @@ void ggml_backend_sched_pin_tensor_backend(ggml_backend_sched_t sched, struct gg
     sched->hv_tensor_backend_pinned[id] = 1;
     SET_CAUSE(node, "pin");
     sched->is_reset = false;
-}
-
-void ggml_backend_sched_mark_dynamic_scratch(ggml_backend_sched_t sched, struct ggml_tensor * node) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(node);
-    const size_t id = hash_id(node);
-    sched->hv_tensor_dynamic_scratch[id] = 1;
-    sched->is_reset = false;
-}
-
-bool ggml_backend_sched_is_dynamic_scratch(ggml_backend_sched_t sched, struct ggml_tensor * node) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(node);
-    if (!ggml_hash_contains(&sched->hash_set, node)) {
-        return false;
-    }
-    const size_t id = ggml_hash_find(&sched->hash_set, node);
-    GGML_ASSERT(id != GGML_HASHSET_FULL);
-    return sched->hv_tensor_dynamic_scratch[id] != 0;
 }
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {

@@ -359,14 +359,6 @@ extern "C" {
                                                                   struct ggml_tensor * node,
                                                                   ggml_backend_t       backend);
 
-    // Mark/query graph tensors whose storage may be rebound to a task-local
-    // scratch arena by a dynamic-order runtime. This is metadata only; normal
-    // scheduler allocation remains unchanged.
-    GGML_API void ggml_backend_sched_mark_dynamic_scratch(ggml_backend_sched_t sched,
-                                                          struct ggml_tensor * node);
-    GGML_API bool ggml_backend_sched_is_dynamic_scratch(ggml_backend_sched_t sched,
-                                                        struct ggml_tensor * node);
-
     GGML_API ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
                                                                   struct ggml_tensor * node);
 
