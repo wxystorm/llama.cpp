@@ -5560,6 +5560,204 @@ public:
         return inference_data_plane;
     }
 
+    bool bind_inference_return(
+        const rpc_msg_inference_return_bind_req & request) {
+        auto transport = get_inference_data_plane();
+        if (!transport || !transport->healthy() ||
+            request.return_req.device >= backends.size() ||
+            request.return_req.phone_ffn_seq == 0 ||
+            request.wire_size == 0) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(
+            inference_return_mutex);
+        auto & by_seq =
+            inference_return_bindings[
+                request.return_req.device];
+        if (by_seq.find(
+                request.return_req.phone_ffn_seq) !=
+                by_seq.end()) {
+            return false;
+        }
+
+        inference_return_binding binding;
+        binding.request = request;
+        by_seq.emplace(
+            request.return_req.phone_ffn_seq,
+            std::move(binding));
+        inference_return_cv.notify_all();
+        return true;
+    }
+
+    bool wait_inference_return_complete(
+        uint32_t device,
+        uint64_t seq) {
+        std::unique_lock<std::mutex> lock(
+            inference_return_mutex);
+        inference_return_cv.wait(
+            lock,
+            [&]() {
+                auto device_it =
+                    inference_return_bindings.find(device);
+                if (device_it ==
+                        inference_return_bindings.end()) {
+                    return false;
+                }
+                auto seq_it =
+                    device_it->second.find(seq);
+                return seq_it != device_it->second.end() &&
+                    seq_it->second.completed;
+            });
+
+        auto device_it =
+            inference_return_bindings.find(device);
+        if (device_it ==
+                inference_return_bindings.end()) {
+            return false;
+        }
+
+        auto seq_it = device_it->second.find(seq);
+        if (seq_it == device_it->second.end()) {
+            return false;
+        }
+
+        const bool success = seq_it->second.success;
+        device_it->second.erase(seq_it);
+        if (device_it->second.empty()) {
+            inference_return_bindings.erase(device_it);
+        }
+        return success;
+    }
+
+    void fail_inference_returns() {
+        {
+            std::lock_guard<std::mutex> lock(
+                inference_return_mutex);
+            for (auto & device_entry :
+                    inference_return_bindings) {
+                for (auto & seq_entry :
+                        device_entry.second) {
+                    seq_entry.second.completed = true;
+                    seq_entry.second.success = false;
+                }
+            }
+        }
+        inference_return_cv.notify_all();
+    }
+
+    bool handle_inference_frame(
+        const inference_frame_header & header,
+        const uint8_t * data,
+        size_t size) {
+        if (header.type != INFERENCE_FRAME_DATA ||
+            header.stage != INFERENCE_STAGE_RETURN) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_DATA_PLANE] side=server "
+                "status=FAIL reason=unsupported_frame "
+                "type=%u stage=%u seq=%" PRIu64 "\n",
+                static_cast<unsigned>(header.type),
+                static_cast<unsigned>(header.stage),
+                header.seq);
+            return false;
+        }
+
+        const uint32_t device = header.stream_id;
+        rpc_msg_inference_return_bind_req binding_request {};
+
+        {
+            std::unique_lock<std::mutex> lock(
+                inference_return_mutex);
+            inference_return_cv.wait(
+                lock,
+                [&]() {
+                    auto device_it =
+                        inference_return_bindings.find(device);
+                    return device_it !=
+                            inference_return_bindings.end() &&
+                        device_it->second.find(header.seq) !=
+                            device_it->second.end();
+                });
+
+            auto & binding =
+                inference_return_bindings[device][header.seq];
+            binding_request = binding.request;
+        }
+
+        bool success = true;
+        if (binding_request.return_req.phone_ffn_seq !=
+                header.seq ||
+            binding_request.graph_id != header.graph_id ||
+            binding_request.wire_size != size) {
+            success = false;
+            GGML_LOG_ERROR(
+                "[INFERENCE_RETURN] side=server "
+                "status=FAIL reason=metadata_mismatch "
+                "device=%u seq=%" PRIu64
+                " graph=%" PRIu64 "/%" PRIu64
+                " bytes=%zu/%" PRIu64 "\n",
+                device,
+                header.seq,
+                header.graph_id,
+                binding_request.graph_id,
+                size,
+                binding_request.wire_size);
+        }
+
+        if (success) {
+            std::vector<uint8_t> input(
+                sizeof(
+                    rpc_msg_set_tensor_async_return_wait_req) +
+                size);
+            std::memcpy(
+                input.data(),
+                &binding_request.return_req,
+                sizeof(
+                    rpc_msg_set_tensor_async_return_wait_req));
+            if (size > 0) {
+                std::memcpy(
+                    input.data() +
+                        sizeof(
+                            rpc_msg_set_tensor_async_return_wait_req),
+                    data,
+                    size);
+            }
+
+            success =
+                set_tensor_async_return_wait(input);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                inference_return_mutex);
+            auto device_it =
+                inference_return_bindings.find(device);
+            if (device_it !=
+                    inference_return_bindings.end()) {
+                auto seq_it =
+                    device_it->second.find(header.seq);
+                if (seq_it != device_it->second.end()) {
+                    seq_it->second.completed = true;
+                    seq_it->second.success = success;
+                }
+            }
+        }
+        inference_return_cv.notify_all();
+
+        GGML_LOG_INFO(
+            "[INFERENCE_RETURN] side=server "
+            "device=%u seq=%" PRIu64
+            " layer=%d chunk=%d bytes=%zu status=%s\n",
+            device,
+            header.seq,
+            binding_request.layer,
+            binding_request.chunk,
+            size,
+            success ? "OK" : "FAIL");
+
+        return success;
+    }
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -5704,6 +5902,18 @@ private:
     // inference_transport TX/RX workers.
     std::mutex inference_data_plane_mutex;
     std::shared_ptr<inference_transport> inference_data_plane;
+
+    struct inference_return_binding {
+        rpc_msg_inference_return_bind_req request {};
+        bool completed = false;
+        bool success = false;
+    };
+    std::mutex inference_return_mutex;
+    std::condition_variable inference_return_cv;
+    std::unordered_map<
+        uint32_t,
+        std::unordered_map<uint64_t, inference_return_binding>>
+        inference_return_bindings;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
