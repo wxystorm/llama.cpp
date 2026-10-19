@@ -6833,164 +6833,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
 
                     LLAMA_LOG_ERROR(
-                        "[ZERO_LOGITS_DIAG] stage=LOGITS pos=%" PRId64
-                        " backend=%s sync_ms=%.3f count=%zu "
-                        "host_zero=%zu source_zero=%zu "
-                        "host_nonfinite=%zu source_nonfinite=%zu "
-                        "host_min=%.9g host_max=%.9g "
-                        "source_min=%.9g source_max=%.9g "
-                        "mismatch=%zu max_abs_diff=%.9g\n",
+                        "[ZERO_LOGITS_LOGITS] pos=%" PRId64
+                        " hz=%zu sz=%zu mm=%zu diff=%.6g\n",
                         ubatch.pos != nullptr ? ubatch.pos[0] : -1,
-                        ggml_backend_name(backend_res),
-                        diag_sync_us / 1000.0,
-                        diag_count,
                         host_zero,
                         source_zero,
+                        mismatch,
+                        max_abs_diff);
+                    LLAMA_LOG_ERROR(
+                        "[ZERO_LOGITS_RANGE] pos=%" PRId64
+                        " hnf=%zu snf=%zu hmin=%.6g hmax=%.6g "
+                        "smin=%.6g smax=%.6g\n",
+                        ubatch.pos != nullptr ? ubatch.pos[0] : -1,
                         host_nonfinite,
                         source_nonfinite,
                         host_min,
                         host_max,
                         source_min,
-                        source_max,
-                        mismatch,
-                        max_abs_diff);
-
-                    const int last_layer =
-                        (int) model.hparams.n_layer() - 1;
-                    int last_tensor_layer = -1;
-                    for (int il = 0; il <= last_layer; ++il) {
-                        const llama_hybrid_layer_mode mode =
-                            model.hybrid_layer_mode(il);
-                        if (mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
-                            mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
-                            last_tensor_layer = il;
-                        }
-                    }
-
-                    std::vector<std::string> diag_names {
-                        "result_norm",
-                    };
-                    const auto add_layer_diag_names =
-                        [&](int il) {
-                            if (il < 0 || il > last_layer) {
-                                return;
-                            }
-                            for (const char * base : {
-                                     "attn_out",
-                                     "ffn_inp",
-                                     "l_out" }) {
-                                const std::string name =
-                                    std::string(base) + "-" +
-                                    std::to_string(il);
-                                if (std::find(
-                                        diag_names.begin(),
-                                        diag_names.end(),
-                                        name) == diag_names.end()) {
-                                    diag_names.push_back(name);
-                                }
-                            }
-                        };
-
-                    add_layer_diag_names(last_tensor_layer);
-                    add_layer_diag_names(last_tensor_layer + 1);
-                    add_layer_diag_names(last_layer);
-
-                    ggml_cgraph * diag_gf = res->get_gf();
-                    for (const std::string & wanted : diag_names) {
-                        ggml_tensor * tensor = nullptr;
-                        if (diag_gf != nullptr) {
-                            for (int ni = 0;
-                                 ni < ggml_graph_n_nodes(diag_gf);
-                                 ++ni) {
-                                ggml_tensor * candidate =
-                                    ggml_graph_node(diag_gf, ni);
-                                if (candidate != nullptr &&
-                                    wanted == candidate->name) {
-                                    tensor = candidate;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (tensor == nullptr) {
-                            LLAMA_LOG_ERROR(
-                                "[ZERO_LOGITS_DIAG] stage=%s status=MISSING\n",
-                                wanted.c_str());
-                            continue;
-                        }
-
-                        ggml_backend_t tensor_backend =
-                            ggml_backend_sched_get_tensor_backend(
-                                sched_use, tensor);
-                        if (tensor_backend == nullptr) {
-                            LLAMA_LOG_ERROR(
-                                "[ZERO_LOGITS_DIAG] stage=%s "
-                                "status=NO_BACKEND op=%s\n",
-                                wanted.c_str(),
-                                ggml_op_name(tensor->op));
-                            continue;
-                        }
-
-                        if (tensor->type != GGML_TYPE_F32 ||
-                            !ggml_is_contiguous(tensor)) {
-                            LLAMA_LOG_ERROR(
-                                "[ZERO_LOGITS_DIAG] stage=%s "
-                                "status=SKIP type=%s contiguous=%d "
-                                "ne=[%" PRId64 ",%" PRId64
-                                ",%" PRId64 ",%" PRId64 "] backend=%s\n",
-                                wanted.c_str(),
-                                ggml_type_name(tensor->type),
-                                ggml_is_contiguous(tensor) ? 1 : 0,
-                                tensor->ne[0], tensor->ne[1],
-                                tensor->ne[2], tensor->ne[3],
-                                ggml_backend_name(tensor_backend));
-                            continue;
-                        }
-
-                        ggml_backend_synchronize(tensor_backend);
-                        const size_t n =
-                            std::min<size_t>(
-                                (size_t) ggml_nelements(tensor),
-                                4096);
-                        std::vector<float> values(n);
-                        ggml_backend_tensor_get(
-                            tensor,
-                            values.data(),
-                            0,
-                            n * sizeof(float));
-
-                        size_t zero = 0;
-                        size_t nonfinite = 0;
-                        float min_value = 0.0f;
-                        float max_value = 0.0f;
-                        float max_abs = 0.0f;
-                        collect_f32_stats(
-                            values.data(),
-                            n,
-                            zero,
-                            nonfinite,
-                            min_value,
-                            max_value,
-                            max_abs);
-
-                        LLAMA_LOG_ERROR(
-                            "[ZERO_LOGITS_DIAG] stage=%s status=OK "
-                            "backend=%s op=%s sample=%zu zero=%zu "
-                            "nonfinite=%zu min=%.9g max=%.9g max_abs=%.9g "
-                            "ne=[%" PRId64 ",%" PRId64
-                            ",%" PRId64 ",%" PRId64 "]\n",
-                            wanted.c_str(),
-                            ggml_backend_name(tensor_backend),
-                            ggml_op_name(tensor->op),
-                            n,
-                            zero,
-                            nonfinite,
-                            min_value,
-                            max_value,
-                            max_abs,
-                            tensor->ne[0], tensor->ne[1],
-                            tensor->ne[2], tensor->ne[3]);
-                    }
+                        source_max);
                 }
 
                 // The server samples the first generated token from the raw
