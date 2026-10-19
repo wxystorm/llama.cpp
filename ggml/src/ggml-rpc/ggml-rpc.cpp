@@ -1621,7 +1621,7 @@ static bool ggml_backend_rpc_inference_transport_receive(
     return fits;
 }
 
-static bool ggml_backend_rpc_inference_transport_stats(
+static bool ggml_backend_rpc_inference_transport_get_stats(
         ggml_backend_t backend,
         ggml_backend_rpc_inference_transport_stats * out) {
     auto * ctx = rpc_inference_device_context(backend);
@@ -11497,7 +11497,7 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_INFERENCE_TRANSPORT_STATS_PROC) == 0) {
         return reinterpret_cast<void *>(
-            ggml_backend_rpc_inference_transport_stats);
+            ggml_backend_rpc_inference_transport_get_stats);
     }
     GGML_UNUSED(reg);
 
