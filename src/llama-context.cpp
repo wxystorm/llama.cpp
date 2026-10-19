@@ -3630,13 +3630,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 std::deque<pc_ring_job> queues[2];
 
                 std::mutex queue_mutex;
-                // Correctness probe: ggml_backend_sched_* and the CUDA backend
-                // are driven from two FIFO workers below, but the scheduler is
-                // not assumed to be thread-safe for concurrent split
-                // prepare/compute/synchronize calls. Serialize the complete
-                // primitive submission path while keeping FIFO/task ordering
-                // unchanged.
-                std::mutex scheduler_exec_mutex;
                 std::condition_variable queue_cv;
                 ggml_status ring_status = ret;
                 int completed = 0;
@@ -4693,14 +4686,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                         }
 
                         // A primitive may contain several scheduler splits.
-                        // Its ordinary compute temporaries are rebound to a
-                        // backend-local scratch arena so non-monotonic FIFO
-                        // execution does not depend on ggml_gallocr's static
-                        // graph lifetime/reuse decisions. Boundary tensors and
-                        // preallocated model/KV/input storage remain persistent.
-                        std::lock_guard<std::mutex> scheduler_lock(
-                            scheduler_exec_mutex);
-
+                        // Each backend has exactly one FIFO worker and one
+                        // task-local scratch arena, so primitives on the same
+                        // backend remain serialized while B0 and B1 may execute
+                        // concurrently. Dynamic boundary ownership preserves the
+                        // cross-backend producer/consumer lifetimes.
                         const int bi =
                             split_backend_index(range.begin);
                         if (!boundary_output_is_free(
@@ -4981,7 +4971,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "split_range=[%d,%d] internal_splits=%d "
                     "B0=CPU B1=ACCEL "
                     "lifetime=EXPLICIT_BOUNDARY_POOL+TASK_SCRATCH "
-                    "full=ATOMIC_JOB scheduler_exec=SERIAL_PROBE\n",
+                    "full=ATOMIC_JOB scheduler_exec=PARALLEL_BACKENDS\n",
                     stage.layer_begin,
                     stage.layer_end,
                     n_chunks,
@@ -5084,6 +5074,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "reduce_ms=%.3f(%d) "
                     "full_ms=%.3f(%d) "
                     "b0_exec_ms=%.3f b1_exec_ms=%.3f "
+                    "overlap_est_ms=%.3f overlap_ratio=%.3f "
                     "b0_idle_ms=%.3f b1_idle_ms=%.3f "
                     "b0_qwait_ms=%.3f b1_qwait_ms=%.3f "
                     "b0_qpeak=%d b1_qpeak=%d\n",
@@ -5102,6 +5093,19 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     stage_count[PC_RING_FULL],
                     backend_exec_us[0] / 1000.0,
                     backend_exec_us[1] / 1000.0,
+                    std::max<int64_t>(
+                        0,
+                        backend_exec_us[0] +
+                            backend_exec_us[1] -
+                            ring_wall_us) / 1000.0,
+                    ring_wall_us > 0 ?
+                        (double) std::max<int64_t>(
+                            0,
+                            backend_exec_us[0] +
+                                backend_exec_us[1] -
+                                ring_wall_us) /
+                            (double) ring_wall_us :
+                        0.0,
                     idle_wait_us[0] / 1000.0,
                     idle_wait_us[1] / 1000.0,
                     queue_wait_us[0] / 1000.0,
