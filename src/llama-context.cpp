@@ -2126,18 +2126,15 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 return nullptr;
             }
 
-            const auto pc_ring_is_empty_op =
+            // Keep this predicate exactly aligned with
+            // ggml-backend.cpp::ggml_is_view_op().  In particular,
+            // GGML_OP_NONE is NOT a view op for scheduler splitting.
+            const auto pc_ring_is_view_op =
                 [](enum ggml_op op) -> bool {
-                    switch (op) {
-                        case GGML_OP_NONE:
-                        case GGML_OP_RESHAPE:
-                        case GGML_OP_TRANSPOSE:
-                        case GGML_OP_VIEW:
-                        case GGML_OP_PERMUTE:
-                            return true;
-                        default:
-                            return false;
-                    }
+                    return op == GGML_OP_VIEW ||
+                           op == GGML_OP_RESHAPE ||
+                           op == GGML_OP_PERMUTE ||
+                           op == GGML_OP_TRANSPOSE;
                 };
 
             pc_ring_bind_stage bind_stage =
@@ -2155,11 +2152,11 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         "pc_ring_entry",
                         13) == 0;
 
-                // A tensor can be view-backed and still represent real
-                // computation (for example CPY/SET/in-place ops). Match the
-                // scheduler's semantic split behavior: skip only truly empty
-                // view/shape ops and bind every executable node explicitly.
-                if (!pc_ring_is_empty_op(node->op)) {
+                // Match scheduler semantics exactly: a tensor can
+                // be view-backed and still be an executable node, and
+                // GGML_OP_NONE is also considered during scheduler splitting.
+                // Skip only the four true view/shape ops above.
+                if (!pc_ring_is_view_op(node->op)) {
                     if (force_next_split) {
                         ggml_backend_sched_set_split_boundary(
                             sched_use,
