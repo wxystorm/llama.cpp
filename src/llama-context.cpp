@@ -2137,34 +2137,40 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                         force_next_split = false;
                     }
 
-                    const llama_hybrid_local_backend_slot slot =
-                        slot_for_stage(bind_layer, bind_stage);
-                    ggml_backend_t target =
-                        backend_for_slot(slot);
-                    if (target == nullptr ||
-                        !ggml_backend_supports_op(target, node)) {
-                        LLAMA_LOG_ERROR(
-                            "[PC_LOCAL_RING_BIND] status=FAIL "
-                            "reason=UNSUPPORTED node=%d tensor=%s op=%s "
-                            "layer=%d stage=%s slot=%d backend=%s\n",
-                            node_id,
-                            node->name,
-                            ggml_op_name(node->op),
-                            bind_layer,
-                            bind_stage == pc_ring_bind_stage::ATTN ?
-                                "ATTN" :
-                            bind_stage == pc_ring_bind_stage::FFN ?
-                                "FFN" : "REDUCE",
-                            (int) slot,
-                            target != nullptr ?
-                                ggml_backend_name(target) : "(null)");
-                        ret = GGML_STATUS_FAILED;
-                        return nullptr;
+                    // After the final REDUCE marker, concat/stage-output nodes
+                    // belong to the suffix split rather than a fictitious next
+                    // Ring layer. Leave those nodes to normal scheduler
+                    // placement after creating the boundary above.
+                    if (bind_layer < stage->layer_end) {
+                        const llama_hybrid_local_backend_slot slot =
+                            slot_for_stage(bind_layer, bind_stage);
+                        ggml_backend_t target =
+                            backend_for_slot(slot);
+                        if (target == nullptr ||
+                            !ggml_backend_supports_op(target, node)) {
+                            LLAMA_LOG_ERROR(
+                                "[PC_LOCAL_RING_BIND] status=FAIL "
+                                "reason=UNSUPPORTED node=%d tensor=%s op=%s "
+                                "layer=%d stage=%s slot=%d backend=%s\n",
+                                node_id,
+                                node->name,
+                                ggml_op_name(node->op),
+                                bind_layer,
+                                bind_stage == pc_ring_bind_stage::ATTN ?
+                                    "ATTN" :
+                                bind_stage == pc_ring_bind_stage::FFN ?
+                                    "FFN" : "REDUCE",
+                                (int) slot,
+                                target != nullptr ?
+                                    ggml_backend_name(target) : "(null)");
+                            ret = GGML_STATUS_FAILED;
+                            return nullptr;
+                        }
+                        ggml_backend_sched_set_tensor_backend(
+                            sched_use,
+                            node,
+                            target);
                     }
-                    ggml_backend_sched_set_tensor_backend(
-                        sched_use,
-                        node,
-                        target);
                 }
 
                 int marker_chunk = -1;
@@ -5571,42 +5577,44 @@ int llama_context::decode(const llama_batch & batch_inp) {
         pc_local_ring_entry_env != nullptr &&
         std::atoi(pc_local_ring_entry_env) != 0;
 
-    // Dedicated entry for the PC-local Ring. Do not reuse the old generalized
-    // Stage Queue because that would also stage the Tensor suffix. Instead:
+    // Dedicated entry for the PC-local Ring. The Inner Planner owns the
+    // complete PC region, including layers that the legacy Outer plan called
+    // a GPU prefix. Do not preserve that old prefix as a separate runtime
+    // stage: it would bypass the per-layer SPLIT/FULL map.
     //
-    //   GPU prefix -> full-ubatch PC_LOCAL_RING -> original full suffix
+    //   PC_LOCAL_RING [0, pc_layers) -> original Tensor/Phone suffix
     //
-    // The suffix starts at the first Tensor layer and retains the model's
-    // existing per-layer Tensor/Phone ownership policy.
+    // The stage kind remains CPU only as an existing runtime-stage tag; actual
+    // ATTN/FFN/REDUCE/FULL ownership comes exclusively from backend slots.
     const bool pc_local_ring_prefix_topology =
         pc_local_ring_entry_requested &&
         has_runtime_plan &&
+        runtime_plan.pc_local.valid &&
+        runtime_plan.pc_local.layer_begin == 0 &&
+        runtime_plan.pc_local.layer_end == runtime_plan.pc_layers &&
+        (int) runtime_plan.pc_local.layer_modes.size() ==
+            runtime_plan.pc_layers &&
         model.arch == LLM_ARCH_QWEN3MOE &&
-        runtime_stages.size() >= 3 &&
-        runtime_stages[0].kind == llama_hybrid_runtime_stage_kind::GPU &&
-        runtime_stages[1].kind == llama_hybrid_runtime_stage_kind::CPU &&
-        runtime_stages[2].kind == llama_hybrid_runtime_stage_kind::TENSOR &&
-        runtime_stages[1].layer_end == runtime_stages[2].layer_begin;
+        runtime_plan.pc_layers > 0 &&
+        runtime_plan.tensor_layers > 0;
 
     std::vector<llama_hybrid_runtime_stage>
         pc_local_ring_prefix_stages;
     if (pc_local_ring_prefix_topology) {
-        pc_local_ring_prefix_stages.push_back(runtime_stages[0]);
-
         const int full_macro =
             std::max(1, (int) cparams.n_ubatch);
 
         pc_local_ring_prefix_stages.push_back({
             llama_hybrid_runtime_stage_kind::CPU,
-            runtime_stages[1].layer_begin,
-            runtime_stages[1].layer_end,
+            runtime_plan.pc_local.layer_begin,
+            runtime_plan.pc_local.layer_end,
             full_macro,
-            0,
+            runtime_plan.pc_local.chunk_tokens,
         });
 
         pc_local_ring_prefix_stages.push_back({
             llama_hybrid_runtime_stage_kind::TENSOR,
-            runtime_stages[2].layer_begin,
+            runtime_plan.pc_local.layer_end,
             (int) hparams.n_layer(),
             full_macro,
             runtime_plan.tensor_chunk_tokens,
@@ -5614,24 +5622,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         LLAMA_LOG_INFO(
             "[PC_LOCAL_RING_ENTRY] enabled=1 "
-            "GPU=[%d,%d) XG=%d "
-            "CPU=[%d,%d) macro=%d "
+            "PC_RING=[%d,%d) macro=%d inner=%d "
             "SUFFIX=[%d,%d) macro=%d XT=%d\n",
             pc_local_ring_prefix_stages[0].layer_begin,
             pc_local_ring_prefix_stages[0].layer_end,
             pc_local_ring_prefix_stages[0].macro_tokens,
+            pc_local_ring_prefix_stages[0].inner_chunk_tokens,
             pc_local_ring_prefix_stages[1].layer_begin,
             pc_local_ring_prefix_stages[1].layer_end,
             pc_local_ring_prefix_stages[1].macro_tokens,
-            pc_local_ring_prefix_stages[2].layer_begin,
-            pc_local_ring_prefix_stages[2].layer_end,
-            pc_local_ring_prefix_stages[2].macro_tokens,
-            pc_local_ring_prefix_stages[2].inner_chunk_tokens);
+            pc_local_ring_prefix_stages[1].inner_chunk_tokens);
     } else if (pc_local_ring_entry_requested) {
         LLAMA_LOG_WARN(
             "[PC_LOCAL_RING_ENTRY] enabled=0 reason=UNSUPPORTED_TOPOLOGY "
-            "has_plan=%d phone_primary=%d stages=%zu\n",
+            "has_plan=%d pc_local_valid=%d pc=[%d,%d) pc_layers=%d "
+            "tensor_layers=%d phone_primary=%d stages=%zu\n",
             has_runtime_plan ? 1 : 0,
+            has_runtime_plan && runtime_plan.pc_local.valid ? 1 : 0,
+            has_runtime_plan ? runtime_plan.pc_local.layer_begin : -1,
+            has_runtime_plan ? runtime_plan.pc_local.layer_end : -1,
+            has_runtime_plan ? runtime_plan.pc_layers : -1,
+            has_runtime_plan ? runtime_plan.tensor_layers : -1,
             tensor_phone_primary_exec ? 1 : 0,
             runtime_stages.size());
     }

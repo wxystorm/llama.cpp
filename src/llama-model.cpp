@@ -1830,6 +1830,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
+    if (pc_local_ring_requested) {
+        LLAMA_LOG_INFO(
+            "[PC_LOCAL_RING_RESIDENCY] mode=BOOTSTRAP_HOST_CANONICAL "
+            "persistent_streaming=0\n");
+    }
     // assign the output layer
     if (!hybrid_layer_modes.empty()) {
         if (meta_dev == nullptr) {
@@ -2176,68 +2181,25 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     const buft_list_t * buft_list_layer =
         tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
 
-    // PC local Ring weight ownership follows the Inner Planner's abstract
-    // backend mapping.  The PC adapter resolves BACKEND_0 -> CPU and
-    // BACKEND_1 -> CUDA, but the plan itself contains no device-class names.
+    // Runtime-v1 keeps PC Ring weights host-canonical.  Stage/backend
+    // assignment is already driven by the Inner Plan, but persistent
+    // accelerator residency is deliberately deferred to the Weight Manager.
+    // This avoids pretending that every FULL layer can reside at once and
+    // keeps correctness independent from the final sliding-residency policy.
     llama_hybrid_plan runtime_plan;
-    const bool pc_local_ring_requested =
+    const bool pc_local_ring_weight =
         arch == LLM_ARCH_QWEN3MOE &&
+        tn.bid >= 0 &&
         std::getenv("LLAMA_HYBRID_PC_LOCAL_RING") != nullptr &&
-        std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0;
-    const bool have_pc_local_plan =
-        pc_local_ring_requested &&
+        std::atoi(std::getenv("LLAMA_HYBRID_PC_LOCAL_RING")) != 0 &&
         llama_hybrid_runtime_plan_get(runtime_plan) &&
         runtime_plan.pc_local.valid &&
         tn.bid >= runtime_plan.pc_local.layer_begin &&
         tn.bid < runtime_plan.pc_local.layer_end &&
-        tn.bid >= 0 &&
         hybrid_layer_mode(tn.bid) == llama_hybrid_layer_mode::PC_ONLY;
 
-    if (have_pc_local_plan) {
-        const int local_layer =
-            tn.bid - runtime_plan.pc_local.layer_begin;
-        const llama_pc_local_layer_mode layer_mode =
-            runtime_plan.pc_local.layer_modes.at((size_t) local_layer);
-
-        bool ffn_weight = false;
-        switch (tn.tensor) {
-            case LLM_TENSOR_FFN_NORM:
-            case LLM_TENSOR_FFN_NORM_EXPS:
-            case LLM_TENSOR_FFN_GATE_INP:
-            case LLM_TENSOR_FFN_GATE_INP_SHEXP:
-            case LLM_TENSOR_FFN_GATE:
-            case LLM_TENSOR_FFN_UP:
-            case LLM_TENSOR_FFN_DOWN:
-            case LLM_TENSOR_FFN_GATE_EXPS:
-            case LLM_TENSOR_FFN_UP_EXPS:
-            case LLM_TENSOR_FFN_DOWN_EXPS:
-            case LLM_TENSOR_FFN_GATE_UP_EXPS:
-            case LLM_TENSOR_FFN_GATE_SHEXP:
-            case LLM_TENSOR_FFN_UP_SHEXP:
-            case LLM_TENSOR_FFN_DOWN_SHEXP:
-                ffn_weight = true;
-                break;
-            default:
-                break;
-        }
-
-        llama_hybrid_local_backend_slot slot =
-            llama_hybrid_local_backend_slot::NONE;
-        if (layer_mode == llama_pc_local_layer_mode::FULL) {
-            slot = runtime_plan.pc_local.stage_backends.full;
-        } else {
-            slot = ffn_weight ?
-                runtime_plan.pc_local.stage_backends.ffn :
-                runtime_plan.pc_local.stage_backends.attn;
-        }
-
-        if (slot == llama_hybrid_local_backend_slot::BACKEND_0) {
-            buft_list_layer = &pimpl->cpu_buft_list;
-        } else if (slot == llama_hybrid_local_backend_slot::BACKEND_1) {
-            // PC Ring layers keep CUDA as their nominal owner so this points
-            // at the accelerator buffer list selected in get_layer_buft_list().
-            buft_list_layer = pimpl->dev_layer.at(tn.bid).buft_list;
-        }
+    if (pc_local_ring_weight) {
+        buft_list_layer = &pimpl->cpu_buft_list;
     }
 
     return ml.create_tensor(
