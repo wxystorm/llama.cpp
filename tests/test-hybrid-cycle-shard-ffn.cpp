@@ -77,7 +77,7 @@ static std::vector<float> run_ffn_shard(
 
 static void print_cycle_shard(const char * group, const char * name, const ggml_tensor * t) {
     if (!t) {
-        std::fprintf(stderr, "[CYCLE_SHARD_DIAG] group=%s tensor=%s status=NULL\\n", group, name);
+        std::fprintf(stderr, "[CYCLE_SHARD_DIAG] group=%s tensor=%s status=NULL\n", group, name);
         return;
     }
     const auto buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
@@ -85,7 +85,7 @@ static void print_cycle_shard(const char * group, const char * name, const ggml_
     std::fprintf(stderr,
         "[CYCLE_SHARD_DIAG] group=%s tensor=%s type=%s "
         "ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
-        "contiguous=%d buffer=%p buft=%s dev=%s dev_type=%d\\n",
+        "contiguous=%d buffer=%p buft=%s dev=%s dev_type=%d\n",
         group, name, ggml_type_name(t->type),
         (long long)t->ne[0], (long long)t->ne[1],
         (long long)t->ne[2], (long long)t->ne[3],
@@ -101,7 +101,7 @@ static void verify_cycle_shard(const char * group, const llama_hybrid_cycle_ffn_
     if (llama_hybrid_cycle_ffn_shard_weights_valid(w, hidden, experts)) {
         return;
     }
-    std::fprintf(stderr, "[CYCLE_SHARD_INVALID] group=%s hidden=%lld experts=%lld\\n",
+    std::fprintf(stderr, "[CYCLE_SHARD_INVALID] group=%s hidden=%lld experts=%lld\n",
         group, (long long)hidden, (long long)experts);
     print_cycle_shard(group, "up", w.up);
     print_cycle_shard(group, "gate", w.gate);
