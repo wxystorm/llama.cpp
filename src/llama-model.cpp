@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-hybrid-cycle.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1470,6 +1471,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         arch == LLM_ARCH_QWEN3MOE;
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
+        llama_hybrid_cycle_layout cycle_layout;
+        const bool cycle_requested = llama_hybrid_cycle_layout_from_env(n_layer, cycle_layout);
         llama_hybrid_plan runtime_plan;
         const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
         const bool force_phone_primary =
@@ -1507,17 +1510,43 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
+        if (cycle_requested && has_runtime_plan) {
+            LLAMA_LOG_INFO("[HYBRID_CYCLE] overriding legacy planner layout with fixed x/y cycle\n");
+        }
+
         hybrid_layer_modes = has_runtime_plan ?
             llama_build_hybrid_plan_policy(
                 n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
                 runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
             llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
 
+        if (cycle_requested) {
+            for (int il = 0; il < n_layer; ++il) {
+                switch (cycle_layout.kinds[il]) {
+                    case llama_hybrid_cycle_layer_kind::PC_CPU:
+                    case llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL:
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::PC_ONLY; break;
+                    case llama_hybrid_cycle_layer_kind::PHONE_GPU:
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::PHONE_ONLY; break;
+                    case llama_hybrid_cycle_layer_kind::TENSOR_C2P:
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_SPLIT; break;
+                    case llama_hybrid_cycle_layer_kind::TENSOR_P2C:
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY; break;
+                }
+                LLAMA_LOG_INFO("[HYBRID_CYCLE_LAYER] layer=%d kind=%s attn=%s output=%s\n", il,
+                    llama_hybrid_cycle_kind_name(cycle_layout.kinds[il]),
+                    llama_hybrid_cycle_owner_name(llama_hybrid_cycle_attn_owner(cycle_layout.kinds[il])),
+                    llama_hybrid_cycle_owner_name(llama_hybrid_cycle_output_owner(cycle_layout.kinds[il])));
+            }
+            LLAMA_LOG_INFO("[HYBRID_CYCLE_LAYOUT] x=%d y=%d period=%d cycles=%d tail=[%d,%d) status=PLACEMENT_ONLY\n",
+                cycle_layout.x, cycle_layout.y, cycle_layout.cycle_size, cycle_layout.cycles,
+                cycle_layout.tail_begin, n_layer);
+        }
+
         hybrid_tensor_pc_ratios.assign(
             n_layer,
-            has_runtime_plan ?
-                runtime_plan.tensor_pc_ratio :
-                0.0f);
+            cycle_requested ? 0.5f :
+            has_runtime_plan ? runtime_plan.tensor_pc_ratio : 0.0f);
         if (has_runtime_plan &&
             runtime_plan.tensor_phone_primary &&
             runtime_plan.tensor_layers > 0) {
@@ -1583,10 +1612,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
-        const int n_gpu_pc = std::min<int>(
-            gpu_pc_layers, pc_layer_ids.size());
-        for (int k = 0; k < n_gpu_pc; ++k) {
-            pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+        const int n_gpu_pc = cycle_requested ? cycle_layout.remainder() :
+            std::min<int>(gpu_pc_layers, pc_layer_ids.size());
+        if (cycle_requested) {
+            for (int il = cycle_layout.tail_begin; il < n_layer; ++il) {
+                pc_layer_backends[il] = llama_pc_layer_backend::CUDA;
+            }
+        } else {
+            for (int k = 0; k < n_gpu_pc; ++k) {
+                pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+            }
         }
 
         if (n_gpu_pc > 0) {
