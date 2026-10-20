@@ -811,9 +811,19 @@ ggml_tensor * ggml_backend_meta_get_static_weight_shard(
     ggml_tensor * shard = it->second[device_index];
     if (shard == nullptr || shard->buffer == nullptr ||
         ggml_backend_buffer_is_meta(shard->buffer) ||
-        shard->buffer != buf_ctx->bufs[device_index].get() ||
         shard->op != GGML_OP_NONE || shard->view_src != nullptr ||
         ggml_nelements(shard) == 0) {
+        return nullptr;
+    }
+    // The GGML allocator may return a multi-buffer or a wrapper for the
+    // collection of physical allocations. The tensor owns a constituent
+    // buffer, not necessarily buf_ctx->bufs[device_index].get() itself.
+    // Check its backing buffer type/device instead of pointer identity.
+    const auto expected_buft = ggml_backend_meta_buft_simple_buft(
+        ggml_backend_buffer_get_type(tensor->buffer), device_index);
+    const auto actual_buft = ggml_backend_buffer_get_type(shard->buffer);
+    if (expected_buft == nullptr || actual_buft != expected_buft ||
+        ggml_backend_buft_get_device(actual_buft) == nullptr) {
         return nullptr;
     }
     return shard;
