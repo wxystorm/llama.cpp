@@ -75,6 +75,41 @@ static std::vector<float> run_ffn_shard(
     return values;
 }
 
+static void print_cycle_shard(const char * group, const char * name, const ggml_tensor * t) {
+    if (!t) {
+        std::fprintf(stderr, "[CYCLE_SHARD_DIAG] group=%s tensor=%s status=NULL\\n", group, name);
+        return;
+    }
+    const auto buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
+    const auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    std::fprintf(stderr,
+        "[CYCLE_SHARD_DIAG] group=%s tensor=%s type=%s "
+        "ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
+        "contiguous=%d buffer=%p buft=%s dev=%s dev_type=%d\\n",
+        group, name, ggml_type_name(t->type),
+        (long long)t->ne[0], (long long)t->ne[1],
+        (long long)t->ne[2], (long long)t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+        ggml_is_contiguous(t) ? 1 : 0, (void*)t->buffer,
+        buft ? ggml_backend_buft_name(buft) : "(null)",
+        dev ? ggml_backend_dev_name(dev) : "(null)",
+        dev ? int(ggml_backend_dev_type(dev)) : -1);
+}
+
+static void verify_cycle_shard(const char * group, const llama_hybrid_cycle_ffn_shard_weights & w,
+        int64_t hidden, int64_t experts) {
+    if (llama_hybrid_cycle_ffn_shard_weights_valid(w, hidden, experts)) {
+        return;
+    }
+    std::fprintf(stderr, "[CYCLE_SHARD_INVALID] group=%s hidden=%lld experts=%lld\\n",
+        group, (long long)hidden, (long long)experts);
+    print_cycle_shard(group, "up", w.up);
+    print_cycle_shard(group, "gate", w.gate);
+    print_cycle_shard(group, "down", w.down);
+    std::fflush(stderr);
+    assert(false && "physical FFN weight shard invalid; see CYCLE_SHARD_DIAG above");
+}
+
 static void test_quantized_q4k_shard_shapes(ggml_backend_dev_t meta) {
     // Model Q4_K_M stores intermediate-neuron shards quantized. Each DOWN
     // fragment must preserve a full Q4_K block along dimension 0.
@@ -99,8 +134,8 @@ static void test_quantized_q4k_shard_shapes(ggml_backend_dev_t meta) {
     assert(buf);
     const auto pc = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 0);
     const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
-    assert(llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts));
-    assert(llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts));
+    verify_cycle_shard("PC", pc, hidden, experts);
+    verify_cycle_shard("PHONE", phone, hidden, experts);
     assert(llama_hybrid_cycle_ffn_partition_valid(up, gate, down, hidden, experts));
     assert(pc.up->ne[1] + phone.up->ne[1] == channels);
     assert(pc.down->ne[0] + phone.down->ne[0] == channels);
@@ -157,8 +192,8 @@ int main() {
 
     const auto pc = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 0);
     const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
-    assert(llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts));
-    assert(llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts));
+    verify_cycle_shard("PC", pc, hidden, experts);
+    verify_cycle_shard("PHONE", phone, hidden, experts);
     assert(llama_hybrid_cycle_ffn_partition_valid(up, gate, down, hidden, experts));
     assert(pc.up->ne[1] + phone.up->ne[1] == channels);
     assert(pc.down->ne[0] + phone.down->ne[0] == channels);
