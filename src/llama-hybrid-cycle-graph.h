@@ -150,17 +150,21 @@ inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
     if (!w.up->buffer || !w.gate->buffer || !w.down->buffer) {
         return false;
     }
-    // Public GGML backend API: compare actual buffer devices, not internal
-    // ggml_backend_buffer_is_meta() (which is intentionally not public).
-    // A local CPU/Phone compute graph must never be bound to Meta weights.
-    const auto up_dev = ggml_backend_buft_get_device(
-        ggml_backend_buffer_get_type(w.up->buffer));
-    const auto gate_dev = ggml_backend_buft_get_device(
-        ggml_backend_buffer_get_type(w.gate->buffer));
-    const auto down_dev = ggml_backend_buft_get_device(
-        ggml_backend_buffer_get_type(w.down->buffer));
-    return up_dev != nullptr && up_dev == gate_dev && up_dev == down_dev &&
-           ggml_backend_dev_type(up_dev) != GGML_BACKEND_DEVICE_TYPE_META;
+    // All three weights must be from one physical backend. The legacy
+    // default CPU buffer type has device=nullptr by design, so recognize it
+    // by its exact singleton type identity rather than rejecting the CPU.
+    // GPU/RPC still require a real non-Meta backend device.
+    const auto up_buft = ggml_backend_buffer_get_type(w.up->buffer);
+    const auto gate_buft = ggml_backend_buffer_get_type(w.gate->buffer);
+    const auto down_buft = ggml_backend_buffer_get_type(w.down->buffer);
+    if (up_buft == nullptr || up_buft != gate_buft || up_buft != down_buft) {
+        return false;
+    }
+    if (up_buft == ggml_backend_cpu_buffer_type()) {
+        return true;
+    }
+    const auto dev = ggml_backend_buft_get_device(up_buft);
+    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META;
 }
 
 
