@@ -114,20 +114,27 @@ static bool cycle_real_check_phone_weight(
             "[CYCLE_REAL_OWNER] role=%s status=FAIL reason=MISSING_WEIGHT\n", role);
         return false;
     }
+    // The Meta shard accessor deliberately returns nullptr for an empty
+    // physical shard. A P2C source-only weight must have NO PC allocation,
+    // while its Phone shard must contain the whole original tensor.
     const auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
     const auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
+    bool same_shape = phone != nullptr && phone->type == tensor->type;
+    if (same_shape) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            same_shape = same_shape && phone->ne[d] == tensor->ne[d];
+        }
+    }
     const bool valid =
-        pc && phone &&
-        pc->buffer && phone->buffer &&
-        ggml_nelements(pc) == 0 &&
-        ggml_nelements(phone) == ggml_nelements(tensor) &&
+        pc == nullptr && phone != nullptr && phone->buffer != nullptr &&
+        same_shape &&
         ggml_backend_buft_get_device(
             ggml_backend_buffer_get_type(phone->buffer)) == phone_device;
     std::printf(
         "[CYCLE_REAL_OWNER] role=%s source=PHONE_GPU "
-        "pc_elements=%lld phone_elements=%lld expected=%lld status=%s\n",
+        "pc_shard=%s phone_elements=%lld expected=%lld status=%s\n",
         role,
-        (long long)(pc ? ggml_nelements(pc) : -1),
+        pc == nullptr ? "EMPTY_EXPECTED" : "UNEXPECTED_PRESENT",
         (long long)(phone ? ggml_nelements(phone) : -1),
         (long long)ggml_nelements(tensor),
         valid ? "PASS" : "FAIL");
