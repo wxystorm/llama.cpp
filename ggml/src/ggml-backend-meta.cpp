@@ -788,10 +788,21 @@ static bool ggml_backend_meta_tensor_is_static(
 
 ggml_tensor * ggml_backend_meta_get_static_weight_shard(
         const ggml_tensor * tensor, size_t device_index) {
+    // Opt-in inspection for failed unit tests only; do not increase normal
+    // weight-loading logs or expose any remote transport state.
+    auto reject = [&](const char * reason) -> ggml_tensor * {
+        if (std::getenv("GGML_CYCLE_SHARD_DIAG") != nullptr) {
+            GGML_LOG_ERROR(
+                "[CYCLE_SHARD_GET] weight=%s index=%zu status=REJECT reason=%s\n",
+                tensor != nullptr ? tensor->name : "(null)",
+                device_index, reason);
+        }
+        return nullptr;
+    };
     if (tensor == nullptr || tensor->buffer == nullptr ||
         !ggml_backend_buffer_is_meta(tensor->buffer) ||
         tensor->op != GGML_OP_NONE || tensor->view_src != nullptr) {
-        return nullptr;
+        return reject("NOT_STATIC_META_WEIGHT");
     }
 
     // Do not fall back to STC_COMPUTE: those borrowed tensors are destroyed
@@ -799,13 +810,13 @@ ggml_tensor * ggml_backend_meta_get_static_weight_shard(
     auto * buf_ctx = static_cast<ggml_backend_meta_buffer_context *>(
         tensor->buffer->context);
     if (device_index >= buf_ctx->bufs.size()) {
-        return nullptr;
+        return reject("DEVICE_INDEX_OUT_OF_RANGE");
     }
 
     const auto it = buf_ctx->stc_static.simple_tensors.find(tensor);
     if (it == buf_ctx->stc_static.simple_tensors.end() ||
         device_index >= it->second.size()) {
-        return nullptr;
+        return reject("NOT_IN_STATIC_TENSOR_MAP");
     }
 
     ggml_tensor * shard = it->second[device_index];
@@ -813,7 +824,7 @@ ggml_tensor * ggml_backend_meta_get_static_weight_shard(
         ggml_backend_buffer_is_meta(shard->buffer) ||
         shard->op != GGML_OP_NONE || shard->view_src != nullptr ||
         ggml_nelements(shard) == 0) {
-        return nullptr;
+        return reject("SIMPLE_TENSOR_INVALID_OR_EMPTY");
     }
     // The GGML allocator may return a multi-buffer or a wrapper for the
     // collection of physical allocations. The tensor owns a constituent
@@ -824,7 +835,7 @@ ggml_tensor * ggml_backend_meta_get_static_weight_shard(
     const auto actual_buft = ggml_backend_buffer_get_type(shard->buffer);
     if (expected_buft == nullptr || actual_buft != expected_buft ||
         ggml_backend_buft_get_device(actual_buft) == nullptr) {
-        return nullptr;
+        return reject("BACKING_BUFFER_TYPE_MISMATCH");
     }
     return shard;
 }
