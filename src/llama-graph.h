@@ -745,6 +745,9 @@ struct llm_graph_params {
     // One-layer MoE FFN graph fed from precomputed READY tensors. Per-device
     // FFN weight shard binding is a separate step in the cycle executor.
     bool hybrid_cycle_p2c_ffn_graph = false;
+    // Physical Meta simple backend shard: 0=PC CPU, 1=Phone GPU RPC.
+    // Explicitly -1 unless the isolated FFN graph is requested.
+    int32_t hybrid_cycle_p2c_ffn_shard_index = -1;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -790,7 +793,8 @@ struct llm_graph_params {
             hybrid_output_head  != other.hybrid_output_head  ||
             hybrid_wave_probe   != other.hybrid_wave_probe   ||
             hybrid_cycle_p2c_attn_pre != other.hybrid_cycle_p2c_attn_pre ||
-            hybrid_cycle_p2c_ffn_graph != other.hybrid_cycle_p2c_ffn_graph) {
+            hybrid_cycle_p2c_ffn_graph != other.hybrid_cycle_p2c_ffn_graph ||
+            hybrid_cycle_p2c_ffn_shard_index != other.hybrid_cycle_p2c_ffn_shard_index) {
             return false;
         }
 
