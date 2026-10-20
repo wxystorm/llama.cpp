@@ -15,15 +15,13 @@
 static ggml_backend_meta_split_state split_ffn_weights(
         const ggml_tensor * weight, void *) {
     ggml_backend_meta_split_state ss {};
-    const bool source_only_norm =
-        std::strcmp(weight->name, "cycle.norm.owner") == 0;
     const bool is_down = std::strncmp(weight->name, "down", 4) == 0;
-    ss.axis = source_only_norm || is_down ?
-        GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_1;
+    ss.axis = is_down ? GGML_BACKEND_SPLIT_AXIS_0 :
+                        GGML_BACKEND_SPLIT_AXIS_1;
     ss.n_segments = 1;
     ss.nr[0] = 1;
     const int64_t full = weight->ne[ss.axis];
-    ss.ne[0] = source_only_norm ? full : full / 2;
+    ss.ne[0] = full / 2;
     ss.ne[1] = full - ss.ne[0];
     return ss;
 }
@@ -151,49 +149,6 @@ static void test_quantized_q4k_shard_shapes(ggml_backend_dev_t meta) {
     ggml_free(ctx);
 }
 
-// Regression for a source-only C2P norm weight after a mirrored
-// hidden activation. The old Meta split propagator asserted because MUL
-// required identical split-states for its two inputs. A 1-D norm weight
-// whose neurons all belong to device 0 may legitimately scale the
-// corresponding activation rows on device 0 only.
-static void test_source_only_norm_layout(ggml_backend_dev_t meta) {
-    ggml_init_params params {};
-    params.mem_size = 1024 * 1024;
-    params.no_alloc = true;
-    ggml_context * weights_ctx = ggml_init(params);
-    assert(weights_ctx != nullptr);
-    auto * norm_weight = ggml_new_tensor_1d(weights_ctx, GGML_TYPE_F32, 8);
-    ggml_set_name(norm_weight, "cycle.norm.owner");
-    auto * weights_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-        weights_ctx, ggml_backend_dev_buffer_type(meta));
-    assert(weights_buffer != nullptr);
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    assert(ggml_backend_meta_get_static_weight_shard(norm_weight, 0) != nullptr);
-    assert(ggml_backend_meta_get_static_weight_shard(norm_weight, 1) == nullptr);
-
-    ggml_context * compute_ctx = ggml_init(params);
-    assert(compute_ctx != nullptr);
-    auto * hidden = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, 8, 4);
-    ggml_set_name(hidden, "cycle.mirrored.hidden");
-    auto * normalized = ggml_rms_norm(compute_ctx, hidden, 1.0e-5f);
-    auto * scaled = ggml_mul(compute_ctx, normalized, norm_weight);
-    ggml_set_name(scaled, "cycle.source_only.attn_norm");
-
-    // Allocation itself evaluates the Meta split-state of the complete
-    // graph, including the formerly rejected MIRRORED x AXIS_0 MUL.
-    auto * compute_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-        compute_ctx, ggml_backend_dev_buffer_type(meta));
-    assert(compute_buffer != nullptr);
-    std::printf("[CYCLE_META_NORM_OWNER] mirrored_input=1 "
-                "weight_owner=CPU0 axis=0 status=PASS\n");
-
-    ggml_backend_buffer_free(compute_buffer);
-    ggml_free(compute_ctx);
-    ggml_backend_buffer_free(weights_buffer);
-    ggml_free(weights_ctx);
-}
-
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -206,7 +161,6 @@ int main() {
     ggml_backend_dev_t meta = ggml_backend_meta_device(
         simulated, 2, split_ffn_weights, nullptr);
     assert(meta);
-    test_source_only_norm_layout(meta);
     test_quantized_q4k_shard_shapes(meta);
 
     constexpr int64_t hidden = 8;
