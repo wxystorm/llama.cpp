@@ -1503,10 +1503,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const std::string pc_layout = has_runtime_plan ? "gpu-cpu-tensor-phone" :
             (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
 
-        if (has_runtime_plan) {
+        if (has_runtime_plan || cycle_requested) {
             pimpl->tensor_split_owned.assign(llama_max_devices(), 0.0f);
-            pimpl->tensor_split_owned[0] = runtime_plan.tensor_pc_ratio;
-            pimpl->tensor_split_owned[1] = 1.0f - runtime_plan.tensor_pc_ratio;
+            const float ratio = cycle_requested ? 0.5f : runtime_plan.tensor_pc_ratio;
+            pimpl->tensor_split_owned[0] = ratio;
+            pimpl->tensor_split_owned[1] = 1.0f - ratio;
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
@@ -1547,7 +1548,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             n_layer,
             cycle_requested ? 0.5f :
             has_runtime_plan ? runtime_plan.tensor_pc_ratio : 0.0f);
-        if (has_runtime_plan &&
+        if (!cycle_requested && has_runtime_plan &&
             runtime_plan.tensor_phone_primary &&
             runtime_plan.tensor_layers > 0) {
             const float low_ratio =
