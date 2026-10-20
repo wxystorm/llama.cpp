@@ -454,6 +454,27 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
                 "status=RELEASED_BEFORE_CYCLE_LOAD\n");
 
+    // Fail on a malformed/uncaptured CPU baseline before allocating the
+    // much larger distributed PC/Phone weight buffers.
+    if (!cycle_real_check_capture(
+            capture, residual_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
+        !cycle_real_check_capture(
+            capture, norm_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
+        !cycle_real_check_capture(
+            capture, ids_name, GGML_TYPE_I32, reference_topk, ntokens, 1) ||
+        !cycle_real_check_capture(
+            capture, routing_name, GGML_TYPE_F32, 1, reference_topk, ntokens) ||
+        !cycle_real_check_capture(
+            capture, ffn_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
+        !cycle_real_check_capture(
+            capture, output_name, GGML_TYPE_F32, reference_hidden, ntokens, 1)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=CPU_REFERENCE_CAPTURE_MISSING\n");
+        return 1;
+    }
+    std::printf("[CYCLE_REAL_REFERENCE] "
+                "capture_fields=6 status=PASS\n");
+
     // A new model instance holds only the *real* physical Cycle weights:
     // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
     // weights resident on Phone. No llama_context/full-graph Meta execution
@@ -534,17 +555,6 @@ int main(int argc, char ** argv) {
                 (long long)experts, (long long)pc_weights.up->ne[1],
                 (long long)phone_weights.up->ne[1],
                 ggml_type_name(lw.ffn_up_exps->type));
-
-    if (!cycle_real_check_capture(capture, residual_name, GGML_TYPE_F32, hidden, ntokens, 1) ||
-        !cycle_real_check_capture(capture, norm_name, GGML_TYPE_F32, hidden, ntokens, 1) ||
-        !cycle_real_check_capture(capture, ids_name, GGML_TYPE_I32, topk, ntokens, 1) ||
-        !cycle_real_check_capture(capture, routing_name, GGML_TYPE_F32, 1, topk, ntokens) ||
-        !cycle_real_check_capture(capture, ffn_name, GGML_TYPE_F32, hidden, ntokens, 1) ||
-        !cycle_real_check_capture(capture, output_name, GGML_TYPE_F32, hidden, ntokens, 1)) {
-        std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=REAL_READY_OR_REFERENCE_MISSING\n");
-        return 1;
-    }
 
     const auto residual = cycle_real_read<float>(capture, residual_name);
     const auto norm = cycle_real_read<float>(capture, norm_name);
