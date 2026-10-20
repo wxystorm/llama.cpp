@@ -2801,6 +2801,18 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         }
 
         rpc_msg_get_alloc_size_rsp response {};
+        const bool cycle_ffn_diag = std::getenv("GGML_CYCLE_LIVE_FFN_DIAG") != nullptr;
+        if (cycle_ffn_diag) {
+            GGML_LOG_INFO(
+                "[CYCLE_LIVE_FFN_RPC] side=client cmd=GET_ALLOC_SIZE stage=BEGIN "
+                "tensor=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "src0=%s src1=%s src2=%s\n",
+                tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2],
+                tensor->src[0] ? tensor->src[0]->name : "none",
+                tensor->src[1] ? tensor->src[1]->name : "none",
+                tensor->src[2] ? tensor->src[2]->name : "none");
+        }
         const int64_t rpc_begin_us = ggml_time_us();
         bool status = send_rpc_cmd(
             sock,
@@ -2810,6 +2822,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             &response,
             sizeof(response));
         const int64_t rpc_us = ggml_time_us() - rpc_begin_us;
+        if (cycle_ffn_diag) {
+            GGML_LOG_INFO(
+                "[CYCLE_LIVE_FFN_RPC] side=client cmd=GET_ALLOC_SIZE stage=END "
+                "tensor=%s ok=%d bytes=%" PRIu64 " ms=%.3f\n",
+                tensor->name, status ? 1 : 0,
+                status ? response.alloc_size : uint64_t(0), rpc_us / 1000.0);
+        }
         RPC_STATUS_ASSERT(status);
 
         if (cache_enabled) {
@@ -7115,6 +7134,15 @@ void rpc_server::erase_opencl_tensor_extras_for_buffer(
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
+    const bool cycle_ffn_diag = std::getenv("GGML_CYCLE_LIVE_FFN_DIAG") != nullptr;
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=BEGIN "
+            "device=%u tensor=%.*s type=%u op=%u ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            request.device, (int) GGML_MAX_NAME, request.tensor.name,
+            (unsigned) request.tensor.type, (unsigned) request.tensor.op,
+            request.tensor.ne[0], request.tensor.ne[1], request.tensor.ne[2]);
+    }
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
         return false;
@@ -7149,7 +7177,20 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
         buft = tensor->buffer->buft;
     }
 
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=BACKEND_BEGIN "
+            "tensor=%s op=%s type=%s buft=%s\n",
+            tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+            ggml_backend_buft_name(buft));
+    }
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=END "
+            "tensor=%s bytes=%" PRIu64 "\n",
+            tensor->name, response.alloc_size);
+    }
 
     return true;
 }
@@ -7314,6 +7355,15 @@ bool rpc_server::set_tensor_direct(
         const void * data,
         size_t size) {
 
+    const bool cycle_ffn_diag = std::getenv("GGML_CYCLE_LIVE_FFN_DIAG") != nullptr;
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=BEGIN "
+            "tensor=%.*s type=%u offset=%" PRIu64 " bytes=%zu\n",
+            (int) GGML_MAX_NAME, in_tensor.name, (unsigned) in_tensor.type,
+            offset, size);
+    }
+
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -7366,14 +7416,36 @@ bool rpc_server::set_tensor_direct(
         }
     }
 
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=INIT_BEGIN "
+            "tensor=%s type=%s\n",
+            tensor->name, ggml_type_name(tensor->type));
+    }
     if (!ensure_opencl_tensor_extra(tensor)) {
         GGML_LOG_ERROR(
             "[%s] failed to initialize OpenCL tensor state for '%s'\n",
             __func__, tensor->name);
         return false;
     }
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=INIT_END "
+            "tensor=%s extra=%p\n",
+            tensor->name, tensor->extra);
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=WRITE_BEGIN "
+            "tensor=%s bytes=%zu\n",
+            tensor->name, size);
+    }
 
     ggml_backend_tensor_set(tensor, data, offset, size);
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=WRITE_END "
+            "tensor=%s\n",
+            tensor->name);
+    }
 
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
@@ -7389,6 +7461,11 @@ bool rpc_server::set_tensor_direct(
     // OpenCL quantized set_tensor may replace the generic extra with a
     // type-specific object. Preserve the post-write pointer.
     remember_opencl_tensor_extra(tensor);
+    if (cycle_ffn_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=SET_TENSOR stage=END tensor=%s\n",
+            tensor->name);
+    }
 
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
