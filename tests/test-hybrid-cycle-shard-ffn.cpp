@@ -150,6 +150,10 @@ int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     assert(device);
+    // Regression: GGML's standard CPU buffer type has no associated device
+    // pointer. It is nevertheless a valid weight-shard backing allocation.
+    assert(ggml_backend_dev_buffer_type(device) == ggml_backend_cpu_buffer_type());
+    assert(ggml_backend_buft_get_device(ggml_backend_cpu_buffer_type()) == nullptr);
     ggml_backend_dev_t simulated[2] = {device, device};
     ggml_backend_dev_t meta = ggml_backend_meta_device(
         simulated, 2, split_ffn_weights, nullptr);
