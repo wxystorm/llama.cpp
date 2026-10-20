@@ -191,6 +191,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
     GGML_ASSERT(hidden_input == (layer_begin > 0));
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
+    if (params.hybrid_cycle_p2c_attn_pre) {
+        // P2C front graph must contain exactly one real Phone-primary layer,
+        // with its original attention state/KV on Phone. The separate FFN
+        // shard graphs and PC-only Reduce will consume its READY outputs.
+        GGML_ASSERT(stage_graph && layer_end == layer_begin + 1);
+        GGML_ASSERT(!build_output_head);
+        GGML_ASSERT(model.hybrid_layer_mode(layer_begin) ==
+                    llama_hybrid_layer_mode::TENSOR_P2C);
+    }
     // Device-resident staged handoff may provide the hidden activation
     // directly after graph allocation, so a hidden-input stage can
     // intentionally have neither host tokens nor host embeddings here.
@@ -859,7 +868,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         const bool defer_last_output_rows =
             il == n_layer - 1 &&
             inp_out_ids != nullptr &&
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+            (hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY ||
+             params.hybrid_cycle_p2c_attn_pre);
 
         // Normally the last layer is pruned to only the requested output rows
         // before the FFN.  TENSOR_PHONE_PRIMARY needs the same full-token
@@ -879,6 +889,56 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
+
+        if (params.hybrid_cycle_p2c_attn_pre) {
+            // Real Qwen3-MoE AttentionPreGraph. Routing is computed ONCE
+            // where Attention/KV live (Phone GPU), before any PC transfer.
+            // The receiver gets all four FFN-ready tensors and can launch
+            // its expert shard without doing a second Router/Top-K.
+            const llm_graph_moe_routing route = build_moe_routing(
+                cur, model.layers[il].ffn_gate_inp,
+                nullptr, nullptr,
+                n_expert, n_expert_used,
+                true, hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+
+            // Network protocol V1 expects token-major packed arrays.
+            // GGML dimensions are [hidden,token] and [1,topk,token].
+            // Materialize views before exporting; the runtime will read the
+            // allocated tensors to preallocated Transport TX buffers.
+            ggml_tensor * route_ids = ggml_cont(ctx0, route.selected_experts);
+            ggml_tensor * route_weights = ggml_cont(ctx0, route.weights);
+
+            GGML_ASSERT(ffn_inp->type == GGML_TYPE_F32 &&
+                        cur->type == GGML_TYPE_F32 &&
+                        route_ids->type == GGML_TYPE_I32 &&
+                        route_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(ffn_inp->ne[0] == n_embd &&
+                        ffn_inp->ne[1] == n_tokens &&
+                        cur->ne[0] == n_embd &&
+                        cur->ne[1] == n_tokens);
+            GGML_ASSERT(route_ids->ne[0] == n_expert_used &&
+                        route_ids->ne[1] == n_tokens &&
+                        route_weights->ne[0] == 1 &&
+                        route_weights->ne[1] == n_expert_used &&
+                        route_weights->ne[2] == n_tokens);
+
+            cb(ffn_inp,      "cycle_p2c_ready_residual", il);
+            cb(cur,          "cycle_p2c_ready_norm", il);
+            cb(route_ids,    "cycle_p2c_ready_topk_ids", il);
+            cb(route_weights,"cycle_p2c_ready_topk_weights", il);
+
+            res->t_cycle_ready_residual = ffn_inp;
+            res->t_cycle_ready_norm = cur;
+            res->t_cycle_ready_topk_ids = route_ids;
+            res->t_cycle_ready_topk_weights = route_weights;
+
+            ggml_build_forward_expand(gf, ffn_inp);
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, route_ids);
+            ggml_build_forward_expand(gf, route_weights);
+            return;
+        }
 
         const int n_decode_chunks =
             std::min<int64_t>(qwen3moe_ffn_chunk_count(), n_embd);
