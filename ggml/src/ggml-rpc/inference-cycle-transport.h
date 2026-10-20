@@ -128,6 +128,90 @@ inline bool inference_cycle_decode_frame(
     return true;
 }
 
+// ACKs are small reverse-direction control frames, NOT an additional Tensor
+// payload transfer. The receiver sends an ACK only after the destination
+// compute backend can safely consume the received activation or partial.
+// A successful submit_tx() or receive() is NOT a device-ready completion.
+enum inference_cycle_ack_status : uint32_t {
+    INFERENCE_CYCLE_ACK_DEVICE_READY = 1,
+    INFERENCE_CYCLE_ACK_DEVICE_FAILED = 2,
+};
+
+struct inference_cycle_ack {
+    inference_cycle_direction direction = INFERENCE_CYCLE_PHONE_TO_PC;
+    inference_cycle_payload_kind kind = INFERENCE_CYCLE_READY;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint64_t seq = 0;
+    uint64_t graph_id = 0;
+    bool device_ready = false;
+};
+
+// Safe to call only after the destination's upload/host copy and required
+// backend fence are complete. For a failed upload, set device_ready=false so
+// the source does not release/reuse its dependency as successful.
+inline bool inference_cycle_send_ack(
+        inference_transport & transport,
+        const inference_cycle_message & received,
+        bool device_ready) {
+    if (received.layer < 0 || received.chunk < 0 || received.seq == 0 ||
+        (received.direction != INFERENCE_CYCLE_PC_TO_PHONE &&
+         received.direction != INFERENCE_CYCLE_PHONE_TO_PC) ||
+        (received.kind != INFERENCE_CYCLE_READY &&
+         received.kind != INFERENCE_CYCLE_PARTIAL)) {
+        return false;
+    }
+    inference_tx_buffer tx = transport.acquire_tx(0);
+    if (!tx) {
+        return false;
+    }
+    inference_frame_header header = inference_make_header(INFERENCE_FRAME_ACK);
+    header.stage = received.kind == INFERENCE_CYCLE_READY ?
+        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
+    // tensor_role describes the ORIGINAL tensor direction, not the small
+    // reverse ACK direction. The origin can therefore match its send task.
+    header.tensor_role = received.direction;
+    header.flags = device_ready ?
+        INFERENCE_CYCLE_ACK_DEVICE_READY : INFERENCE_CYCLE_ACK_DEVICE_FAILED;
+    header.layer = received.layer;
+    header.chunk = received.chunk;
+    header.seq = received.seq;
+    header.graph_id = received.graph_id;
+    return transport.submit_tx(std::move(tx), header, 0);
+}
+
+inline bool inference_cycle_decode_ack(
+        const inference_frame_header & header,
+        size_t payload_bytes,
+        inference_cycle_ack & output) {
+    if (header.magic != INFERENCE_TRANSPORT_MAGIC ||
+        header.version != INFERENCE_TRANSPORT_VERSION ||
+        header.header_bytes != sizeof(inference_frame_header) ||
+        header.type != INFERENCE_FRAME_ACK ||
+        header.payload_bytes != 0 || payload_bytes != 0 ||
+        header.layer < 0 || header.chunk < 0 || header.seq == 0 ||
+        (header.tensor_role != INFERENCE_CYCLE_PC_TO_PHONE &&
+         header.tensor_role != INFERENCE_CYCLE_PHONE_TO_PC) ||
+        (header.stage != INFERENCE_STAGE_CYCLE_READY &&
+         header.stage != INFERENCE_STAGE_CYCLE_PARTIAL) ||
+        (header.flags != INFERENCE_CYCLE_ACK_DEVICE_READY &&
+         header.flags != INFERENCE_CYCLE_ACK_DEVICE_FAILED)) {
+        return false;
+    }
+
+    inference_cycle_ack result;
+    result.direction = static_cast<inference_cycle_direction>(header.tensor_role);
+    result.kind = header.stage == INFERENCE_STAGE_CYCLE_READY ?
+        INFERENCE_CYCLE_READY : INFERENCE_CYCLE_PARTIAL;
+    result.layer = header.layer;
+    result.chunk = header.chunk;
+    result.seq = header.seq;
+    result.graph_id = header.graph_id;
+    result.device_ready = header.flags == INFERENCE_CYCLE_ACK_DEVICE_READY;
+    output = result;
+    return true;
+}
+
 // Dedicated cycle-only socket convenience. Successfully decoding a frame
 // means that its data is HOST-ready. Ring task completion must be delayed
 // until the destination CPU tensor or Phone GPU input buffer is DEVICE-ready.
