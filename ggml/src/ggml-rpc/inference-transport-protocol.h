@@ -21,6 +21,8 @@ enum inference_stage : uint16_t {
     INFERENCE_STAGE_RETURN      = 4,
     INFERENCE_STAGE_REDUCE_IN   = 5,
     INFERENCE_STAGE_ROUTE       = 6,
+    INFERENCE_STAGE_CYCLE_READY   = 7,
+    INFERENCE_STAGE_CYCLE_PARTIAL = 8,
 };
 
 struct inference_frame_header {
