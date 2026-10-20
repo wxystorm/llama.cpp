@@ -336,6 +336,13 @@ if (TARGET ggml-rpc)
     llama_build(test-hybrid-cycle-live-ffn.cpp)
     target_include_directories(test-hybrid-cycle-live-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-hybrid-cycle-live-ffn PRIVATE ggml-rpc)
+
+    # Opt-in REAL Qwen3-MoE full-forward reference against the two physical
+    # PC CPU + Phone GPU FFN shards. Requires a model and live Phone RPC;
+    # never run by automatic CTest/CI.
+    llama_build(test-hybrid-cycle-real-p2c.cpp)
+    target_include_directories(test-hybrid-cycle-real-p2c PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-hybrid-cycle-real-p2c PRIVATE ggml-rpc)
 endif()
 
 # ggml-rpc may be configured before the top-level include(CTest), so its
