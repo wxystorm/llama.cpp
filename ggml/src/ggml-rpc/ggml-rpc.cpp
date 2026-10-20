@@ -4425,7 +4425,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
          std::strcmp(
              inference_transport_env,
              "new") == 0);
-    constexpr uint8_t RPC_INFERENCE_RETURN_MIN_PATCH = 21;
+    constexpr uint8_t RPC_INFERENCE_RETURN_MIN_PATCH = 24;
 
     if (dst == nullptr && data == nullptr &&
             data_size == 0 && phone_ffn_seq == 0) {
@@ -4575,11 +4575,17 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
             const int64_t bind_begin_us =
                 measure_profile ? ggml_time_us() : 0;
+            rpc_msg_inference_return_bind_rsp response {};
             bool status = send_rpc_cmd(
                 sock,
                 RPC_CMD_INFERENCE_RETURN_BIND,
                 &bind,
-                sizeof(bind));
+                sizeof(bind),
+                &response,
+                sizeof(response));
+            if (status && response.result == 0) {
+                status = false;
+            }
             const int64_t bind_done_us =
                 measure_profile ? ggml_time_us() : 0;
 
@@ -4620,24 +4626,12 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             const int64_t submit_done_us =
                 measure_profile ? ggml_time_us() : 0;
 
-            rpc_msg_inference_return_bind_rsp response {};
-            if (status) {
-                status = recv_msg(
-                    sock,
-                    &response,
-                    sizeof(response));
-                if (status && response.result == 0) {
-                    status = false;
-                }
-            } else {
-                // A bind may already be waiting on the server. Closing the
-                // data plane wakes all pending bindings as failed instead of
-                // leaving a control thread blocked indefinitely.
+            if (!status) {
+                // Once BIND is accepted, a missing DATA frame would leave a
+                // server-side dependency pending. Fail the data plane loudly
+                // instead of silently reverting to legacy semantics.
                 transport->stop();
             }
-
-            const int64_t done_us =
-                measure_profile ? ggml_time_us() : 0;
 
             if (stage_profile || throttle_profile) {
                 GGML_LOG_INFO(
@@ -4645,7 +4639,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
                     "seq=%" PRIu64 " lane=%zu "
                     "bytes=%zu wire=%zu wire_type=%s "
                     "bind_ms=%.3f submit_ms=%.3f "
-                    "completion_ms=%.3f total_ms=%.3f "
+                    "completion_wait_ms=0.000 total_ms=%.3f "
                     "status=%s\n",
                     phone_ffn_seq,
                     return_lane,
@@ -4656,10 +4650,8 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
                         1000.0,
                     (submit_done_us - bind_done_us) /
                         1000.0,
-                    (done_us - submit_done_us) /
-                        1000.0,
-                    (done_us - begin_us) / 1000.0,
-                    status ? "OK" : "FAIL");
+                    (submit_done_us - begin_us) / 1000.0,
+                    status ? "QUEUED" : "FAIL");
             }
 
             return status;
@@ -12176,13 +12168,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
 
                 rpc_msg_inference_return_bind_rsp response {};
-                if (server.bind_inference_return(request)) {
-                    response.result =
-                        server.wait_inference_return_complete(
-                            request.return_req.device,
-                            request.return_req.phone_ffn_seq) ?
-                            1 : 0;
-                }
+                response.result =
+                    server.bind_inference_return(request) ?
+                        1 : 0;
 
                 if (!send_msg(
                         sock,
