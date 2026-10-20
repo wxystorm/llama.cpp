@@ -327,9 +327,15 @@ int main(int argc, char ** argv) {
     mp.hybrid_auto = false;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
         llama_model_load_from_file(argv[1], mp), &llama_model_free);
+    // The probe is a separate executable on Windows: llama_hparams::n_layer()
+    // and llama_model::hybrid_layer_mode() are internal, non-exported C++
+    // methods in llama.dll. Use the exported C API for the layer count and
+    // inspect the already-public model placement vector directly.
+    const int32_t model_layers = model ? llama_model_n_layer(model.get()) : 0;
     if (!model || model->arch != LLM_ARCH_QWEN3MOE ||
-        layer >= model->hparams.n_layer() - 1 ||
-        model->hybrid_layer_mode(layer) != llama_hybrid_layer_mode::TENSOR_P2C) {
+        model_layers <= 1 || layer >= model_layers - 1 ||
+        model->hybrid_layer_modes.size() != size_t(model_layers) ||
+        model->hybrid_layer_modes[size_t(layer)] != llama_hybrid_layer_mode::TENSOR_P2C) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL reason=MODEL_OR_NOT_P2C_LAYER layer=%d\n",
             layer);
