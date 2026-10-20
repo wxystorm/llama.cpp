@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
 
@@ -98,4 +99,64 @@ inline bool llama_hybrid_cycle_ffn_graph_valid(
            ggml_is_contiguous(g.topk_ids) &&
            ggml_is_contiguous(g.topk_weights) &&
            ggml_is_contiguous(g.ffn_output);
+}
+
+ 
+// Qwen3-MoE Expert weights are partitioned along the intermediate-neuron
+// dimension, not expert IDs:
+//   gate/up: [hidden, local_ffn, experts]
+//   down:    [local_ffn, hidden, experts]
+// Thus each device runs the same Top-K expert IDs, but only its own local
+// intermediate channels. Their F32 down-projection results ADD to the full
+// FFN output. Splitting expert IDs instead would require remapping Top-K.
+struct llama_hybrid_cycle_ffn_shard_weights {
+    ggml_tensor * up   = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * down = nullptr;
+
+    bool available() const { return up && gate && down; }
+};
+
+inline llama_hybrid_cycle_ffn_shard_weights llama_hybrid_cycle_get_physical_ffn_weights(
+        const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * down, size_t device_index) {
+    return {
+        ggml_backend_meta_get_static_weight_shard(up, device_index),
+        ggml_backend_meta_get_static_weight_shard(gate, device_index),
+        ggml_backend_meta_get_static_weight_shard(down, device_index),
+    };
+}
+
+inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
+        const llama_hybrid_cycle_ffn_shard_weights & w,
+        int64_t hidden, int64_t experts) {
+    if (hidden <= 0 || experts <= 0 || !w.available()) {
+        return false;
+    }
+    const int64_t channels = w.up->ne[1];
+    if (channels <= 0 ||
+        w.up->ne[0] != hidden || w.up->ne[2] != experts ||
+        w.gate->ne[0] != hidden || w.gate->ne[1] != channels ||
+        w.gate->ne[2] != experts ||
+        w.down->ne[0] != channels || w.down->ne[1] != hidden ||
+        w.down->ne[2] != experts ||
+        w.up->ne[3] != 1 || w.gate->ne[3] != 1 ||
+        w.down->ne[3] != 1 ||
+        !ggml_is_contiguous(w.up) ||
+        !ggml_is_contiguous(w.gate) ||
+        !ggml_is_contiguous(w.down)) {
+        return false;
+    }
+    return w.up->buffer != nullptr &&
+           w.gate->buffer != nullptr &&
+           w.down->buffer != nullptr &&
+           !ggml_backend_buffer_is_meta(w.up->buffer) &&
+           !ggml_backend_buffer_is_meta(w.gate->buffer) &&
+           !ggml_backend_buffer_is_meta(w.down->buffer) &&
+           // All three fragments must be physical weights from exactly one
+           // device, not accidentally a mixture of PC and Phone shards.
+           ggml_backend_buffer_get_type(w.up->buffer) ==
+               ggml_backend_buffer_get_type(w.gate->buffer) &&
+           ggml_backend_buffer_get_type(w.up->buffer) ==
+               ggml_backend_buffer_get_type(w.down->buffer);
 }
