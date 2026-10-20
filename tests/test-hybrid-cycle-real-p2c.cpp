@@ -102,6 +102,38 @@ static bool cycle_real_set_compare_layer(int layer) {
 #endif
 }
 
+// The chosen P2C layer must keep Attention, both norms and MoE Router
+// exclusively on the sender. A numerically matching FFN is not sufficient
+// if the reference graph silently computes its Attention on the PC.
+static bool cycle_real_check_phone_weight(
+        const char * role,
+        const ggml_tensor * tensor,
+        ggml_backend_dev_t phone_device) {
+    if (!tensor || !phone_device) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_OWNER] role=%s status=FAIL reason=MISSING_WEIGHT\n", role);
+        return false;
+    }
+    const auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
+    const auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
+    const bool valid =
+        pc && phone &&
+        pc->buffer && phone->buffer &&
+        ggml_nelements(pc) == 0 &&
+        ggml_nelements(phone) == ggml_nelements(tensor) &&
+        ggml_backend_buft_get_device(
+            ggml_backend_buffer_get_type(phone->buffer)) == phone_device;
+    std::printf(
+        "[CYCLE_REAL_OWNER] role=%s source=PHONE_GPU "
+        "pc_elements=%lld phone_elements=%lld expected=%lld status=%s\n",
+        role,
+        (long long)(pc ? ggml_nelements(pc) : -1),
+        (long long)(phone ? ggml_nelements(phone) : -1),
+        (long long)ggml_nelements(tensor),
+        valid ? "PASS" : "FAIL");
+    return valid;
+}
+
 static bool cycle_real_check_capture(
         const cycle_real_capture & state,
         const std::string & name,
@@ -305,6 +337,14 @@ int main(int argc, char ** argv) {
     }
 
     const auto & lw = model->layers[size_t(layer)];
+    if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_OUT", lw.wo, phone_dev) ||
+        !cycle_real_check_phone_weight("FFN_NORM", lw.ffn_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("MOE_ROUTER", lw.ffn_gate_inp, phone_dev)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=ATTENTION_ROUTER_NOT_PHONE_OWNED\n");
+        return 1;
+    }
     const int64_t hidden = model->hparams.n_embd;
     const int64_t topk = model->hparams.n_expert_used;
     const int64_t experts = model->hparams.n_expert;
@@ -418,6 +458,31 @@ int main(int argc, char ** argv) {
     const auto routing = cycle_real_read<float>(capture, routing_name);
     const auto baseline_ffn = cycle_real_read<float>(capture, ffn_name);
     const auto baseline_output = cycle_real_read<float>(capture, output_name);
+
+    // Sanity-check the *reference* before comparing any new execution.
+    // For ordinary Qwen3-MoE with no adapters this layer must implement
+    // l_out = AttentionResidual + CompleteFFN. Otherwise a capture label
+    // or a prior graph transformation is not comparing like with like.
+    if (baseline_ffn.size() != residual.size() ||
+        baseline_output.size() != residual.size()) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=BASELINE_SIZE\n");
+        return 1;
+    }
+    std::vector<float> baseline_reconstructed(residual.size());
+    for (size_t i = 0; i < residual.size(); ++i) {
+        baseline_reconstructed[i] = residual[i] + baseline_ffn[i];
+    }
+    const cycle_real_diff baseline_check =
+        cycle_real_compare(baseline_reconstructed, baseline_output);
+    std::printf("[CYCLE_REAL_COMPARE] target=BASELINE_INTERNAL layer=%d "
+                "max_abs=%.8g rms=%.8g cosine=%.8g tolerance=%.8g status=%s\n",
+                layer, baseline_check.max_abs, baseline_check.rms,
+                baseline_check.cosine, baseline_check.tolerance,
+                baseline_check.valid && baseline_check.pass ? "PASS" : "FAIL");
+    if (!baseline_check.valid || !baseline_check.pass) {
+        return 1;
+    }
     for (int32_t id : ids) {
         if (id < 0 || id >= experts) {
             std::fprintf(stderr,
