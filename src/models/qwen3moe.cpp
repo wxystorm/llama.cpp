@@ -226,6 +226,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         // The borrowed GGML weight tensors point DIRECTLY into the model's
         // static PC CPU or Phone GPU buffers; no Meta graph or AllReduce runs.
+        GGML_ASSERT(llama_hybrid_cycle_ffn_partition_valid(
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            n_embd, n_expert));
         const llama_hybrid_cycle_ffn_shard_weights shard =
             llama_hybrid_cycle_get_physical_ffn_weights(
                 model.layers[il].ffn_up_exps,
