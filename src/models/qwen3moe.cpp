@@ -213,11 +213,31 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         GGML_ASSERT(model.hybrid_layer_mode(layer_begin) ==
                     llama_hybrid_layer_mode::TENSOR_P2C);
         GGML_ASSERT(loras->empty());
+        GGML_ASSERT(params.hybrid_cycle_p2c_ffn_shard_index == 0 ||
+                    params.hybrid_cycle_p2c_ffn_shard_index == 1);
+
+        // Weight factors/scales (if any) must also be sharded according to
+        // intermediate neurons. Do not silently apply unsplit scale tensors.
+        // Qwen3-30B-A3B Q4_K_M uses the three basic expert matrices.
+        const int il = layer_begin;
+        GGML_ASSERT(model.layers[il].ffn_up_exps_s == nullptr &&
+                    model.layers[il].ffn_gate_exps_s == nullptr &&
+                    model.layers[il].ffn_down_exps_s == nullptr);
+
+        // The borrowed GGML weight tensors point DIRECTLY into the model's
+        // static PC CPU or Phone GPU buffers; no Meta graph or AllReduce runs.
+        const llama_hybrid_cycle_ffn_shard_weights shard =
+            llama_hybrid_cycle_get_physical_ffn_weights(
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                (size_t) params.hybrid_cycle_p2c_ffn_shard_index);
+        GGML_ASSERT(llama_hybrid_cycle_ffn_shard_weights_valid(
+            shard, n_embd, n_expert));
 
         // Receive the three non-residual fields of the Phone-generated
         // READY tensor. They are externally populated after graph allocation:
         // no Attention, FFN Norm or Router is computed again on the PC.
-        const int il = layer_begin;
         llama_hybrid_cycle_ffn_graph ffn =
             llama_hybrid_cycle_make_ffn_graph_inputs(
                 ctx0, n_embd, n_tokens, n_expert_used);
@@ -229,16 +249,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         // tensors are provided. Do not add the residual here; only PC's
         // final ReduceGraph may add residual and the two FFN partials.
         //
-        // Crucial: this constructs the mathematical FFN, but its output
-        // MUST NOT be labeled a device-local partial until the executor
-        // binds only that device's physical expert shards. A Meta graph
-        // may otherwise execute both shards and silently sum them.
+        // These three weights are physically confined to ONE simple
+        // device: the result is a local intermediate-neuron FFN partial.
         ggml_tensor * moe_out = build_moe_ffn(
             ffn.norm,
             nullptr, // NO second router or gate_inp weight
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            shard.up,
+            shard.gate,
+            shard.down,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
@@ -246,9 +264,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
             il,
             nullptr, nullptr,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            nullptr,
+            nullptr,
             ffn.topk_ids,
             1,
             nullptr,
@@ -259,7 +277,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         GGML_ASSERT(llama_hybrid_cycle_ffn_graph_valid(
             ffn, n_embd, n_tokens, n_expert_used));
 
-        cb(ffn.ffn_output, "cycle_p2c_ffn_graph_output", il);
+        cb(ffn.ffn_output,
+            params.hybrid_cycle_p2c_ffn_shard_index == 0 ?
+                "cycle_p2c_pc_ffn_partial" :
+                "cycle_p2c_phone_ffn_partial", il);
         res->t_cycle_ffn_norm_input = ffn.norm;
         res->t_cycle_ffn_ids_input = ffn.topk_ids;
         res->t_cycle_ffn_weights_input = ffn.topk_weights;
