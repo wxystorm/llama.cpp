@@ -510,6 +510,17 @@ extern "C" {
     };
 
     GGML_API bool ggml_backend_is_meta(ggml_backend_t backend);
+
+    // Borrow a physical, already allocated weight shard from a static Meta
+    // tensor. The returned ggml_tensor is owned by the Meta weight buffer:
+    // NEVER free it, reassign its buffer, or keep it past model unload.
+    // Index is the Meta simple-device index (cycle V1: 0=PC CPU, 1=Phone GPU).
+    // No graph execution or Meta partial-sum reduction is performed.
+    // Returns NULL for compute tensors, unsplit tensors, invalid indexes or
+    // weights not yet allocated/initialized.
+    GGML_API struct ggml_tensor * ggml_backend_meta_get_static_weight_shard(
+        const struct ggml_tensor * tensor, size_t device_index);
+
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer);
