@@ -147,16 +147,18 @@ inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
         !ggml_is_contiguous(w.down)) {
         return false;
     }
-    return w.up->buffer != nullptr &&
-           w.gate->buffer != nullptr &&
-           w.down->buffer != nullptr &&
-           !ggml_backend_buffer_is_meta(w.up->buffer) &&
-           !ggml_backend_buffer_is_meta(w.gate->buffer) &&
-           !ggml_backend_buffer_is_meta(w.down->buffer) &&
-           // All three fragments must be physical weights from exactly one
-           // device, not accidentally a mixture of PC and Phone shards.
-           ggml_backend_buffer_get_type(w.up->buffer) ==
-               ggml_backend_buffer_get_type(w.gate->buffer) &&
-           ggml_backend_buffer_get_type(w.up->buffer) ==
-               ggml_backend_buffer_get_type(w.down->buffer);
+    if (!w.up->buffer || !w.gate->buffer || !w.down->buffer) {
+        return false;
+    }
+    // Public GGML backend API: compare actual buffer devices, not internal
+    // ggml_backend_buffer_is_meta() (which is intentionally not public).
+    // A local CPU/Phone compute graph must never be bound to Meta weights.
+    const auto up_dev = ggml_backend_buft_get_device(
+        ggml_backend_buffer_get_type(w.up->buffer));
+    const auto gate_dev = ggml_backend_buft_get_device(
+        ggml_backend_buffer_get_type(w.gate->buffer));
+    const auto down_dev = ggml_backend_buft_get_device(
+        ggml_backend_buffer_get_type(w.down->buffer));
+    return up_dev != nullptr && up_dev == gate_dev && up_dev == down_dev &&
+           ggml_backend_dev_type(up_dev) != GGML_BACKEND_DEVICE_TYPE_META;
 }
