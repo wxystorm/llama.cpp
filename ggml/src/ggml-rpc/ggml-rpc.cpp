@@ -8425,6 +8425,10 @@ bool rpc_server::queue_inference_route_if_ready(
                 seq,
                 seq_it->second.request.snapshot.lane,
                 lane);
+            device_it->second.erase(seq_it);
+            if (device_it->second.empty()) {
+                inference_route_arms.erase(device_it);
+            }
             return false;
         }
 
@@ -10406,6 +10410,10 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    if (auto transport = get_inference_data_plane()) {
+        transport->stop();
+    }
+
     {
         std::lock_guard<std::mutex> lock(
             inference_route_mutex);
