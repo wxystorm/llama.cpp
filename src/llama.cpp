@@ -140,7 +140,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 // Cycle V1 must never silently include PC CUDA or Phone NPU
                 // in Meta: backend 0=PC CPU, backend 1=Phone GPU RPC. The
                 // local PC CUDA backend is used only for the final tail.
-                const auto * reg = n_devs == 2 ?
+                ggml_backend_reg_t reg = n_devs == 2 ?
                     ggml_backend_dev_backend_reg(params.devices[1]) : nullptr;
                 if (n_devs != 2 ||
                     ggml_backend_dev_type(params.devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU ||
