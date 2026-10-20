@@ -215,7 +215,7 @@ static bool cycle_real_execute_ffn(
         const char * backend_name = ggml_backend_name(backend);
         std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s channels=%lld nodes=%d "
                     "stage=PREPARE_BEGIN\n",
-                    backend_name, (long long)shard.up->ne[1], graph->n_nodes);
+                    backend_name, (long long)shard.up->ne[1], ggml_graph_n_nodes(graph));
         llama_hybrid_cycle_ffn_executor executor;
         if (!executor.prepare(backend, ctx, graph, in, shard,
                               hidden, tokens, topk, experts)) {
