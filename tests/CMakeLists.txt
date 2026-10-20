@@ -330,6 +330,14 @@ target_include_directories(test-hybrid-cycle-ffn-graph PRIVATE ${PROJECT_SOURCE_
 llama_build_and_test(test-hybrid-cycle-shard-ffn.cpp)
 target_include_directories(test-hybrid-cycle-shard-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Explicit opt-in GPU RPC probe. No automatic CTest registration because it
+# requires a live phone server and must never attempt to connect in CI.
+if (TARGET ggml-rpc)
+    llama_build(test-hybrid-cycle-live-ffn.cpp)
+    target_include_directories(test-hybrid-cycle-live-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-hybrid-cycle-live-ffn PRIVATE ggml-rpc)
+endif()
+
 # ggml-rpc may be configured before the top-level include(CTest), so its
 # own add_test() is not necessarily visible from the main build directory.
 # Register the existing RPC socket test in the same top-level CTest tree.
