@@ -5,6 +5,7 @@
 #include "llama-chat.h"
 #include "llama-context.h"
 #include "llama-hybrid.h"
+#include "llama-hybrid-cycle.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -301,6 +302,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+
+        if (llama_hybrid_cycle_requested() && params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+            throw std::runtime_error("fixed hybrid cycle requires tensor split mode");
+        }
+        if (llama_hybrid_cycle_requested() && params.hybrid_auto) {
+            throw std::runtime_error("fixed hybrid cycle cannot be combined with hybrid-auto planner");
+        }
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
