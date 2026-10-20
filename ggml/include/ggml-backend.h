@@ -516,8 +516,9 @@ extern "C" {
     // NEVER free it, reassign its buffer, or keep it past model unload.
     // Index is the Meta simple-device index (cycle V1: 0=PC CPU, 1=Phone GPU).
     // No graph execution or Meta partial-sum reduction is performed.
-    // Returns NULL for compute tensors, unsplit tensors, invalid indexes or
-    // weights not yet allocated/initialized.
+    // Returns NULL for non-Meta or compute tensors, invalid indexes, or
+    // weights not yet allocated/initialized. Callers must validate that any
+    // returned physical copies form the expected disjoint weight partition.
     GGML_API struct ggml_tensor * ggml_backend_meta_get_static_weight_shard(
         const struct ggml_tensor * tensor, size_t device_index);
 
