@@ -7138,7 +7138,7 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     if (cycle_ffn_diag) {
         GGML_LOG_INFO(
             "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=BEGIN "
-            "device=%u tensor=%.*s type=%u op=%u ne=[%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            "device=%u tensor=%.*s type=%u op=%u ne=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]\n",
             request.device, (int) GGML_MAX_NAME, request.tensor.name,
             (unsigned) request.tensor.type, (unsigned) request.tensor.op,
             request.tensor.ne[0], request.tensor.ne[1], request.tensor.ne[2]);
