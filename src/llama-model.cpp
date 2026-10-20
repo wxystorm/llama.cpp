@@ -471,6 +471,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
+    static const std::regex pattern_attn_norm_weight("blk\\.\\d*\\.attn_norm\\.weight");
+    static const std::regex pattern_ffn_norm_weight ("blk\\.\\d*\\.ffn_norm\\.weight");
+    static const std::regex pattern_router_weight   ("blk\\.\\d*\\.ffn_gate_inp\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
@@ -795,6 +798,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool tensor_phone_primary =
         mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+    const bool cycle_c2p = mode == llama_hybrid_layer_mode::TENSOR_C2P;
+    const bool cycle_p2c = mode == llama_hybrid_layer_mode::TENSOR_P2C;
+    const bool cycle_tensor = cycle_c2p || cycle_p2c;
+    // In a one-way Tensor block, Attention, both norms and MoE Router/Top-K
+    // must be owned by the sender. Its Expert FFN weights remain physically
+    // partitioned between PC CPU (backend 0) and Phone GPU (backend 1).
+    const bool is_cycle_prep_tensor = cycle_tensor &&
+        (std::regex_match(tensor_name, pattern_attn_norm_weight) ||
+         std::regex_match(tensor_name, pattern_qk_norm) ||
+         std::regex_match(tensor_name, pattern_ffn_norm_weight) ||
+         std::regex_match(tensor_name, pattern_router_weight));
 
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
@@ -802,9 +816,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // these two heterogeneous roles changes the meaning of R and can collapse
     // the smaller shard after quantized alignment.
     const size_t split_rotation =
-        tensor_phone_primary && is_ffn_split_tensor && ud->n_devices == 2 ?
+        (tensor_phone_primary || cycle_tensor) &&
+        is_ffn_split_tensor && ud->n_devices == 2 ?
             0 : tc.rotation;
 
+    // MIRRORED would keep a second copy of source-only router/norm weights
+    // on the receiver. Make the source-only F32 tensors whole-axis so the
+    // existing force_to_device() logic can allocate them only on the sender.
+    if (is_cycle_prep_tensor && tc.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_0;
+    }
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
@@ -831,7 +852,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 float split_ratio = tensor_split_scan.back() == 0.0f ?
                     (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
 
-                if (tensor_phone_primary &&
+                if ((tensor_phone_primary || cycle_tensor) &&
                     is_ffn_split_tensor &&
                     ud->n_devices == 2 &&
                     j == 0) {
@@ -873,16 +894,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::regex_match(tensor_name, pattern_attn_sinks) ||
         std::regex_match(tensor_name, pattern_attn_out_weight) ||
         std::regex_match(tensor_name, pattern_attn_gate_weight);
+    const bool cycle_source_weight = cycle_tensor &&
+        (is_attention_tensor || is_cycle_prep_tensor);
     const bool force_primary =
-        (is_attention_tensor &&
+        (cycle_c2p && cycle_source_weight) ||
+        (!cycle_tensor && is_attention_tensor &&
          mode != llama_hybrid_layer_mode::PHONE_ONLY &&
          !tensor_phone_primary) ||
         (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY) ||
         is_output_tensor;
     const bool force_phone =
-        (mode == llama_hybrid_layer_mode::PHONE_ONLY &&
+        (cycle_p2c && cycle_source_weight) ||
+        (!cycle_tensor && mode == llama_hybrid_layer_mode::PHONE_ONLY &&
          (is_attention_tensor || is_ffn_split_tensor)) ||
-        (tensor_phone_primary && is_attention_tensor);
+        (!cycle_tensor && tensor_phone_primary && is_attention_tensor);
 
     auto force_to_device = [&](size_t device) {
         GGML_ASSERT(device < ud->n_devices);
@@ -1530,9 +1555,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     case llama_hybrid_cycle_layer_kind::PHONE_GPU:
                         hybrid_layer_modes[il] = llama_hybrid_layer_mode::PHONE_ONLY; break;
                     case llama_hybrid_cycle_layer_kind::TENSOR_C2P:
-                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_SPLIT; break;
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_C2P; break;
                     case llama_hybrid_cycle_layer_kind::TENSOR_P2C:
-                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY; break;
+                        hybrid_layer_modes[il] = llama_hybrid_layer_mode::TENSOR_P2C; break;
                 }
                 LLAMA_LOG_INFO("[HYBRID_CYCLE_LAYER] layer=%d kind=%s attn=%s output=%s\n", il,
                     llama_hybrid_cycle_kind_name(cycle_layout.kinds[il]),
