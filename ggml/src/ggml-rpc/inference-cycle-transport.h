@@ -1,0 +1,145 @@
+#pragma once
+
+#include "inference-cycle-payload.h"
+#include "inference-transport.h"
+
+#include <cstdint>
+#include <utility>
+
+struct inference_cycle_message {
+    inference_cycle_direction direction = INFERENCE_CYCLE_PHONE_TO_PC;
+    inference_cycle_payload_kind kind = INFERENCE_CYCLE_READY;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint64_t seq = 0;
+    uint64_t graph_id = 0;
+    inference_cycle_ready_owned ready;
+    inference_cycle_partial_owned partial;
+};
+
+// The caller must submit from a transport worker, not a compute worker:
+// acquire_tx() can block when all TX slots are in flight. The data is copied
+// into the dedicated preallocated TX slot before this function returns.
+inline bool inference_cycle_send_ready(
+        inference_transport & transport,
+        inference_cycle_direction direction,
+        int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
+        const inference_cycle_ready_view & source) {
+    size_t payload_bytes = 0;
+    if (layer < 0 || chunk < 0 || seq == 0 ||
+        (direction != INFERENCE_CYCLE_PC_TO_PHONE &&
+         direction != INFERENCE_CYCLE_PHONE_TO_PC) ||
+        !inference_cycle_payload_size(
+            INFERENCE_CYCLE_READY, source.tokens, source.hidden, source.topk,
+            payload_bytes)) {
+        return false;
+    }
+    inference_tx_buffer tx = transport.acquire_tx(payload_bytes);
+    if (!tx) {
+        return false;
+    }
+    size_t written = 0;
+    if (!inference_cycle_write_ready(tx.data, tx.capacity, source, written) ||
+        written != payload_bytes) {
+        transport.release_tx(std::move(tx));
+        return false;
+    }
+    inference_frame_header header = inference_make_header(INFERENCE_FRAME_DATA);
+    header.stage = INFERENCE_STAGE_CYCLE_READY;
+    header.tensor_role = direction;
+    header.layer = layer;
+    header.chunk = chunk;
+    header.seq = seq;
+    header.graph_id = graph_id;
+    return transport.submit_tx(std::move(tx), header, written);
+}
+
+inline bool inference_cycle_send_partial(
+        inference_transport & transport,
+        inference_cycle_direction direction,
+        int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
+        const inference_cycle_partial_view & source) {
+    size_t payload_bytes = 0;
+    if (layer < 0 || chunk < 0 || seq == 0 ||
+        (direction != INFERENCE_CYCLE_PC_TO_PHONE &&
+         direction != INFERENCE_CYCLE_PHONE_TO_PC) ||
+        !inference_cycle_payload_size(
+            INFERENCE_CYCLE_PARTIAL, source.tokens, source.hidden, 0,
+            payload_bytes)) {
+        return false;
+    }
+    inference_tx_buffer tx = transport.acquire_tx(payload_bytes);
+    if (!tx) {
+        return false;
+    }
+    size_t written = 0;
+    if (!inference_cycle_write_partial(tx.data, tx.capacity, source, written) ||
+        written != payload_bytes) {
+        transport.release_tx(std::move(tx));
+        return false;
+    }
+    inference_frame_header header = inference_make_header(INFERENCE_FRAME_DATA);
+    header.stage = INFERENCE_STAGE_CYCLE_PARTIAL;
+    header.tensor_role = direction;
+    header.layer = layer;
+    header.chunk = chunk;
+    header.seq = seq;
+    header.graph_id = graph_id;
+    return transport.submit_tx(std::move(tx), header, written);
+}
+
+// Decode a cycle frame AFTER an outer RPC dispatcher selects its stage, or
+// on a dedicated cycle-only socket. Do not create a second receive loop on
+// the existing shared RPC inference socket: it already has one owner.
+inline bool inference_cycle_decode_frame(
+        const inference_frame_header & header,
+        const uint8_t * data, size_t size,
+        inference_cycle_message & output) {
+    if (header.magic != INFERENCE_TRANSPORT_MAGIC ||
+        header.version != INFERENCE_TRANSPORT_VERSION ||
+        header.header_bytes != sizeof(inference_frame_header) ||
+        header.type != INFERENCE_FRAME_DATA ||
+        header.layer < 0 || header.chunk < 0 || header.seq == 0 ||
+        header.payload_bytes != size ||
+        (header.tensor_role != INFERENCE_CYCLE_PC_TO_PHONE &&
+         header.tensor_role != INFERENCE_CYCLE_PHONE_TO_PC)) {
+        return false;
+    }
+    inference_cycle_message msg;
+    msg.direction = static_cast<inference_cycle_direction>(header.tensor_role);
+    msg.layer = header.layer;
+    msg.chunk = header.chunk;
+    msg.seq = header.seq;
+    msg.graph_id = header.graph_id;
+    if (header.stage == INFERENCE_STAGE_CYCLE_READY) {
+        msg.kind = INFERENCE_CYCLE_READY;
+        if (!inference_cycle_read_ready(data, size, msg.ready)) {
+            return false;
+        }
+    } else if (header.stage == INFERENCE_STAGE_CYCLE_PARTIAL) {
+        msg.kind = INFERENCE_CYCLE_PARTIAL;
+        if (!inference_cycle_read_partial(data, size, msg.partial)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    output = std::move(msg);
+    return true;
+}
+
+// Dedicated cycle-only socket convenience. Successfully decoding a frame
+// means that its data is HOST-ready. Ring task completion must be delayed
+// until the destination CPU tensor or Phone GPU input buffer is DEVICE-ready.
+inline bool inference_cycle_receive(
+        inference_transport & transport,
+        inference_cycle_message & output, int timeout_ms = -1) {
+    inference_rx_frame frame;
+    if (!transport.receive(frame, timeout_ms)) {
+        return false;
+    }
+    const bool ok = inference_cycle_decode_frame(
+        frame.header, frame.data, frame.size, output);
+    transport.release_rx(std::move(frame));
+    return ok;
+}
