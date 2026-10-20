@@ -27,35 +27,120 @@
 // unsupported OpenCL path while the RPC device stub reported all ops as
 // supported. Pack the generated weights just as a real quantized model does.
 // Dequantize into ref for an apples-to-apples full-FFN numeric comparison.
+// The Meta buffer's generic set_tensor path scatters one MoE expert at a
+// time. That is correct for raw buffers, but an OpenCL Q4_0/Q4_K weight set
+// converts the *entire* physical tensor to a device-specific quantized layout.
+// Re-entering set_tensor for the next expert would interpret its converted
+// tensor->extra as an ordinary OpenCL buffer descriptor (CL_INVALID_MEM_OBJECT).
+//
+// Keep Meta responsible for allocating the actual physical weight shards;
+// gather their packed bytes on the host and upload each complete shard ONCE.
+// This probe never invokes the old Meta graph executor or its AllReduce.
 static bool upload_cycle_test_weight(
         ggml_tensor * tensor, std::vector<float> & ref) {
-    if (!tensor || int64_t(ref.size()) != ggml_nelements(tensor)) {
+    if (!tensor || int64_t(ref.size()) != ggml_nelements(tensor) ||
+        tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
         return false;
-    }
-    if (tensor->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_set(tensor, ref.data(), 0, ref.size() * sizeof(float));
-        return true;
     }
 
-    const auto * traits = ggml_get_type_traits(tensor->type);
-    if (!traits || !traits->to_float || !ggml_is_quantized(tensor->type)) {
+    const auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
+    const auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
+    if (!pc || !phone || !pc->buffer || !phone->buffer ||
+        pc->type != tensor->type || phone->type != tensor->type ||
+        pc->ne[2] != tensor->ne[2] || phone->ne[2] != tensor->ne[2] ||
+        pc->ne[3] != 1 || phone->ne[3] != 1 ||
+        !ggml_is_contiguous(pc) || !ggml_is_contiguous(phone)) {
         return false;
     }
-    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
-    const int64_t rows = ggml_nrows(tensor);
+
+    // Quantize first, then use the dequantized values as the numerical
+    // reference. Physical shard extraction below operates on the exact
+    // packed bytes, so it cannot introduce another quantization difference.
     std::vector<uint8_t> packed(ggml_nbytes(tensor));
-    const size_t wrote = ggml_quantize_chunk(tensor->type, ref.data(),
-        packed.data(), 0, rows, tensor->ne[0], nullptr);
-    if (wrote != packed.size() || packed.size() != row_bytes * size_t(rows)) {
-        return false;
+    if (tensor->type == GGML_TYPE_F32) {
+        std::memcpy(packed.data(), ref.data(), packed.size());
+    } else {
+        const auto * traits = ggml_get_type_traits(tensor->type);
+        if (!traits || !traits->to_float || !ggml_is_quantized(tensor->type)) {
+            return false;
+        }
+        const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+        const int64_t rows = ggml_nrows(tensor);
+        const size_t wrote = ggml_quantize_chunk(tensor->type, ref.data(),
+            packed.data(), 0, rows, tensor->ne[0], nullptr);
+        if (wrote != packed.size() ||
+            packed.size() != row_bytes * size_t(rows)) {
+            return false;
+        }
+        for (int64_t row = 0; row < rows; ++row) {
+            traits->to_float(
+                packed.data() + size_t(row) * row_bytes,
+                ref.data() + size_t(row) * size_t(tensor->ne[0]),
+                tensor->ne[0]);
+        }
     }
-    for (int64_t row = 0; row < rows; ++row) {
-        traits->to_float(
-            packed.data() + size_t(row) * row_bytes,
-            ref.data() + size_t(row) * size_t(tensor->ne[0]),
-            tensor->ne[0]);
+
+    std::vector<uint8_t> pc_bytes(ggml_nbytes(pc));
+    std::vector<uint8_t> phone_bytes(ggml_nbytes(phone));
+    const bool split_axis_0 = std::strncmp(tensor->name, "down.", 5) == 0;
+    const size_t experts = size_t(tensor->ne[2]);
+    if (split_axis_0) {
+        // down: [full_channels, hidden, experts]; split the quantized blocks
+        // of each row along dimension 0. Each physical shard remains aligned
+        // to its quantization block size (Q4_0:32, Q4_K:256).
+        if (pc->ne[0] + phone->ne[0] != tensor->ne[0] ||
+            pc->ne[1] != tensor->ne[1] ||
+            phone->ne[1] != tensor->ne[1]) {
+            return false;
+        }
+        const size_t rows = size_t(tensor->ne[1]) * experts;
+        const size_t full_row = ggml_row_size(tensor->type, tensor->ne[0]);
+        const size_t pc_row = ggml_row_size(pc->type, pc->ne[0]);
+        const size_t phone_row = ggml_row_size(phone->type, phone->ne[0]);
+        if (pc_row + phone_row != full_row ||
+            pc_bytes.size() != rows * pc_row ||
+            phone_bytes.size() != rows * phone_row) {
+            return false;
+        }
+        for (size_t row = 0; row < rows; ++row) {
+            const uint8_t * src = packed.data() + row * full_row;
+            std::memcpy(pc_bytes.data() + row * pc_row, src, pc_row);
+            std::memcpy(phone_bytes.data() + row * phone_row,
+                        src + pc_row, phone_row);
+        }
+    } else {
+        // gate/up: [hidden, full_channels, experts]; rows belonging to
+        // adjacent intermediate channels are contiguous within each expert.
+        if (pc->ne[0] != tensor->ne[0] ||
+            phone->ne[0] != tensor->ne[0] ||
+            pc->ne[1] + phone->ne[1] != tensor->ne[1]) {
+            return false;
+        }
+        const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+        const size_t pc_expert_bytes = size_t(pc->ne[1]) * row_bytes;
+        const size_t phone_expert_bytes = size_t(phone->ne[1]) * row_bytes;
+        const size_t full_expert_bytes = size_t(tensor->ne[1]) * row_bytes;
+        if (pc_expert_bytes + phone_expert_bytes != full_expert_bytes ||
+            pc_bytes.size() != experts * pc_expert_bytes ||
+            phone_bytes.size() != experts * phone_expert_bytes) {
+            return false;
+        }
+        for (size_t e = 0; e < experts; ++e) {
+            const uint8_t * src = packed.data() + e * full_expert_bytes;
+            std::memcpy(pc_bytes.data() + e * pc_expert_bytes,
+                        src, pc_expert_bytes);
+            std::memcpy(phone_bytes.data() + e * phone_expert_bytes,
+                        src + pc_expert_bytes, phone_expert_bytes);
+        }
     }
-    ggml_backend_tensor_set(tensor, packed.data(), 0, packed.size());
+
+    // No Meta scatter / sub-tensor partial writes reach the OpenCL backend.
+    ggml_backend_tensor_set(pc, pc_bytes.data(), 0, pc_bytes.size());
+    ggml_backend_tensor_set(phone, phone_bytes.data(), 0, phone_bytes.size());
+    std::printf("[CYCLE_LIVE_FFN_WEIGHT] tensor=%s type=%s "
+                "pc_bytes=%zu phone_bytes=%zu upload=FULL_PHYSICAL_SHARD\n",
+                tensor->name, ggml_type_name(tensor->type),
+                pc_bytes.size(), phone_bytes.size());
     return true;
 }
 
