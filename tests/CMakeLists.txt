@@ -341,7 +341,9 @@ if (TARGET ggml-rpc)
     # PC CPU + Phone GPU FFN shards. Requires a model and live Phone RPC;
     # never run by automatic CTest/CI.
     llama_build(test-hybrid-cycle-real-p2c.cpp)
-    target_include_directories(test-hybrid-cycle-real-p2c PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_include_directories(test-hybrid-cycle-real-p2c PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
     target_link_libraries(test-hybrid-cycle-real-p2c PRIVATE ggml-rpc)
 endif()
 
