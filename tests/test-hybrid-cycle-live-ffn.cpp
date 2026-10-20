@@ -4,7 +4,7 @@
 // PC CPU sum against a full-FFN reference. No old Meta AllReduce is invoked.
 //
 // Run manually with an RPC server exposing ONLY the phone GPU:
-//   test-hybrid-cycle-live-ffn.exe <phone-ip:port> [remote-device-index]
+//   test-hybrid-cycle-live-ffn.exe <phone-ip:port> [remote-device-index] [q4_0|q4_k|f32]
 //
 // The READY data below is deterministic host-side test data. Actual Phone
 // Attention/Router production and READY/PARTIAL data-plane wiring are next.
@@ -21,6 +21,43 @@
 #include <future>
 #include <string>
 #include <vector>
+
+// GGML OpenCL MoE MUL_MAT_ID kernels are principally designed for
+// quantized expert weights. The former F32-only live test could trigger an
+// unsupported OpenCL path while the RPC device stub reported all ops as
+// supported. Pack the generated weights just as a real quantized model does.
+// Dequantize into ref for an apples-to-apples full-FFN numeric comparison.
+static bool upload_cycle_test_weight(
+        ggml_tensor * tensor, std::vector<float> & ref) {
+    if (!tensor || int64_t(ref.size()) != ggml_nelements(tensor)) {
+        return false;
+    }
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(tensor, ref.data(), 0, ref.size() * sizeof(float));
+        return true;
+    }
+
+    const auto * traits = ggml_get_type_traits(tensor->type);
+    if (!traits || !traits->to_float || !ggml_is_quantized(tensor->type)) {
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    const int64_t rows = ggml_nrows(tensor);
+    std::vector<uint8_t> packed(ggml_nbytes(tensor));
+    const size_t wrote = ggml_quantize_chunk(tensor->type, ref.data(),
+        packed.data(), 0, rows, tensor->ne[0], nullptr);
+    if (wrote != packed.size() || packed.size() != row_bytes * size_t(rows)) {
+        return false;
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        traits->to_float(
+            packed.data() + size_t(row) * row_bytes,
+            ref.data() + size_t(row) * size_t(tensor->ne[0]),
+            tensor->ne[0]);
+    }
+    ggml_backend_tensor_set(tensor, packed.data(), 0, packed.size());
+    return true;
+}
 
 static ggml_backend_meta_split_state split_weights(
         const ggml_tensor * tensor, void *) {
@@ -118,20 +155,30 @@ static float reference_ffn(
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2 && argc != 3) {
+    if (argc < 2 || argc > 4) {
         std::fprintf(stderr,
-            "Usage: test-hybrid-cycle-live-ffn <phone-ip:rpc-port> [phone-gpu-device-index]\n"
-            "Run a compatible Phone OpenCL-only RPC server first. Not a full P2C decode.\n");
+            "Usage: test-hybrid-cycle-live-ffn <phone-ip:rpc-port> [phone-gpu-device-index] [q4_0|q4_k|f32]\n"
+            "Default q4_0 exercises OpenCL's quantized MoE kernel. Not a full P2C decode.\n");
         return 2;
     }
     const char * endpoint = argv[1];
     char * end = nullptr;
-    const long index = argc == 3 ? std::strtol(argv[2], &end, 10) : 0;
-    if (index < 0 || index > 15 || (argc == 3 && (!end || *end != '\0'))) {
+    const long index = argc >= 3 ? std::strtol(argv[2], &end, 10) : 0;
+    if (index < 0 || index > 15 || (argc >= 3 && (!end || *end != '\0'))) {
         std::fprintf(stderr, "Bad RPC device index\n");
         return 2;
     }
 
+    const char * mode = argc == 4 ? argv[3] : "q4_0";
+    const ggml_type expert_type =
+        std::strcmp(mode, "q4_0") == 0 ? GGML_TYPE_Q4_0 :
+        std::strcmp(mode, "q4_k") == 0 ? GGML_TYPE_Q4_K :
+        std::strcmp(mode, "f32") == 0 ? GGML_TYPE_F32 :
+        GGML_TYPE_COUNT;
+    if (expert_type == GGML_TYPE_COUNT) {
+        std::fprintf(stderr, "Unrecognized expert weight type: %s\n", mode);
+        return 2;
+    }
     ggml_backend_load_all();
     const auto cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     const auto remote_reg = ggml_backend_rpc_add_server(endpoint);
@@ -162,11 +209,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    constexpr int64_t hidden = 64;
-    constexpr int64_t channels = 128;
+    const int64_t hidden   = expert_type == GGML_TYPE_Q4_K ? 256 : 64;
+    const int64_t channels = expert_type == GGML_TYPE_Q4_K ? 512 : 128;
     constexpr int64_t experts = 4;
-    constexpr int64_t tokens = 4;
+    const int64_t tokens = expert_type == GGML_TYPE_Q4_K ? 1 : 4;
     constexpr int64_t topk = 2;
+    std::printf("[CYCLE_LIVE_FFN_CONFIG] weight_type=%s hidden=%lld channels=%lld tokens=%lld\n",
+        ggml_type_name(expert_type), (long long)hidden,
+        (long long)channels, (long long)tokens);
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -175,9 +225,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    auto * up = ggml_new_tensor_3d(model_ctx, GGML_TYPE_F32, hidden, channels, experts);
-    auto * gate = ggml_new_tensor_3d(model_ctx, GGML_TYPE_F32, hidden, channels, experts);
-    auto * down = ggml_new_tensor_3d(model_ctx, GGML_TYPE_F32, channels, hidden, experts);
+    auto * up = ggml_new_tensor_3d(model_ctx, expert_type, hidden, channels, experts);
+    auto * gate = ggml_new_tensor_3d(model_ctx, expert_type, hidden, channels, experts);
+    auto * down = ggml_new_tensor_3d(model_ctx, expert_type, channels, hidden, experts);
     ggml_set_name(up, "up.exps");
     ggml_set_name(gate, "gate.exps");
     ggml_set_name(down, "down.exps");
@@ -197,9 +247,12 @@ int main(int argc, char ** argv) {
         gate_host[i] = (int(i % 31) - 15) * 0.006f;
         down_host[i] = (int(i % 37) - 18) * 0.007f;
     }
-    ggml_backend_tensor_set(up, up_host.data(), 0, up_host.size() * sizeof(float));
-    ggml_backend_tensor_set(gate, gate_host.data(), 0, gate_host.size() * sizeof(float));
-    ggml_backend_tensor_set(down, down_host.data(), 0, down_host.size() * sizeof(float));
+    if (!upload_cycle_test_weight(up, up_host) ||
+        !upload_cycle_test_weight(gate, gate_host) ||
+        !upload_cycle_test_weight(down, down_host)) {
+        std::fprintf(stderr, "[CYCLE_LIVE_FFN] status=FAIL reason=WEIGHT_QUANTIZE_OR_UPLOAD\n");
+        return 1;
+    }
 
     if (!llama_hybrid_cycle_ffn_partition_valid(up, gate, down, hidden, experts)) {
         std::fprintf(stderr, "[CYCLE_LIVE_FFN] status=FAIL reason=SHARD_PARTITION\n");
@@ -212,8 +265,12 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < norm.size(); ++i) {
         norm[i] = (int(i % 13) - 6) * 0.045f;
     }
-    const std::vector<int32_t> ids {0, 2, 1, 3, 2, 0, 3, 1};
-    const std::vector<float> routing {0.75f, 0.25f, 0.3f, 0.7f, 0.55f, 0.45f, 0.2f, 0.8f};
+    const std::vector<int32_t> ids = tokens == 1 ?
+        std::vector<int32_t>{0, 2} :
+        std::vector<int32_t>{0, 2, 1, 3, 2, 0, 3, 1};
+    const std::vector<float> routing = tokens == 1 ?
+        std::vector<float>{0.75f, 0.25f} :
+        std::vector<float>{0.75f, 0.25f, 0.3f, 0.7f, 0.55f, 0.45f, 0.2f, 0.8f};
     std::vector<float> residual(norm.size(), 0.125f);
 
     const auto start = std::chrono::steady_clock::now();
