@@ -8159,7 +8159,17 @@ bool rpc_server::route_snapshot_ready(
         std::fflush(stderr);
     }
 
-    response.result = ok ? 1 : 0;
+    bool route_dispatch_ok = true;
+    if (ok) {
+        route_dispatch_ok =
+            queue_inference_route_if_ready(
+                request.device,
+                request.lane,
+                request.seq);
+    }
+
+    response.result =
+        ok && route_dispatch_ok ? 1 : 0;
     return true;
 }
 
@@ -8368,6 +8378,201 @@ bool rpc_server::get_route_snapshot(
     }
 
     return true;
+}
+
+bool rpc_server::queue_inference_route_if_ready(
+        uint32_t device,
+        uint32_t lane,
+        uint64_t seq) {
+    if (device >= route_snapshot_devices.size() ||
+            lane >= RPC_ROUTE_TRANSFER_LANES ||
+            seq == 0) {
+        return false;
+    }
+
+    rpc_route_snapshot_slot & slot =
+        route_snapshot_devices[device]->slots[lane];
+
+    {
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        if (slot.state != rpc_snapshot_state::READY ||
+                slot.seq != seq) {
+            // ARM can legitimately arrive before READY.
+            return true;
+        }
+    }
+
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(
+            inference_route_mutex);
+
+        auto device_it =
+            inference_route_arms.find(device);
+        if (device_it == inference_route_arms.end()) {
+            // READY can legitimately arrive before ARM.
+            return true;
+        }
+
+        auto seq_it =
+            device_it->second.find(seq);
+        if (seq_it == device_it->second.end()) {
+            return true;
+        }
+
+        if (seq_it->second.request.snapshot.lane != lane) {
+            GGML_LOG_ERROR(
+                "[INFERENCE_ROUTE_ARM] side=server status=FAIL "
+                "reason=lane_mismatch device=%u seq=%" PRIu64
+                " expected=%u actual=%u\n",
+                device,
+                seq,
+                seq_it->second.request.snapshot.lane,
+                lane);
+            return false;
+        }
+
+        inference_route_send_job job;
+        job.request = seq_it->second.request;
+        job.arm_us = seq_it->second.arm_us;
+        job.ready_us = ggml_time_us();
+
+        inference_route_jobs.push_back(std::move(job));
+        device_it->second.erase(seq_it);
+        if (device_it->second.empty()) {
+            inference_route_arms.erase(device_it);
+        }
+        queued = true;
+    }
+
+    if (queued) {
+        inference_route_cv.notify_one();
+    }
+    return true;
+}
+
+void rpc_server::inference_route_sender_loop() {
+    for (;;) {
+        inference_route_send_job job;
+        size_t queue_depth = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(
+                inference_route_mutex);
+            inference_route_cv.wait(
+                lock,
+                [&]() {
+                    return inference_route_stop ||
+                        !inference_route_jobs.empty();
+                });
+
+            if (inference_route_stop &&
+                    inference_route_jobs.empty()) {
+                return;
+            }
+
+            job = std::move(
+                inference_route_jobs.front());
+            inference_route_jobs.pop_front();
+            queue_depth = inference_route_jobs.size();
+        }
+
+        const int64_t worker_begin_us =
+            ggml_time_us();
+
+        std::vector<uint8_t> payload;
+        bool status =
+            get_route_snapshot(
+                job.request.snapshot,
+                payload);
+        const int64_t snapshot_done_us =
+            ggml_time_us();
+
+        auto transport =
+            status ?
+                get_inference_data_plane() :
+                nullptr;
+        status =
+            status &&
+            transport != nullptr &&
+            transport->healthy();
+
+        inference_tx_buffer tx;
+        const int64_t acquire_begin_us =
+            ggml_time_us();
+        if (status) {
+            tx = transport->acquire_tx(
+                payload.size());
+            status = static_cast<bool>(tx);
+        }
+        const int64_t acquire_done_us =
+            ggml_time_us();
+
+        if (status && !payload.empty()) {
+            std::memcpy(
+                tx.data,
+                payload.data(),
+                payload.size());
+        }
+
+        const int64_t submit_begin_us =
+            ggml_time_us();
+        if (status) {
+            inference_frame_header header =
+                inference_make_header(
+                    INFERENCE_FRAME_DATA);
+            header.stage =
+                INFERENCE_STAGE_ROUTE;
+            header.stream_id =
+                job.request.snapshot.device;
+            header.seq =
+                job.request.snapshot.seq;
+            header.graph_id = 0;
+            header.layer = job.request.layer;
+            header.chunk = job.request.chunk;
+
+            status = transport->submit_tx(
+                std::move(tx),
+                header,
+                payload.size());
+        } else if (tx) {
+            transport->release_tx(
+                std::move(tx));
+        }
+        const int64_t submit_done_us =
+            ggml_time_us();
+
+        GGML_LOG_INFO(
+            "[INFERENCE_ROUTE_SEND] side=server "
+            "device=%u lane=%u seq=%" PRIu64
+            " layer=%d chunk=%d bytes=%zu "
+            "arm_to_ready_ms=%.3f queue_ms=%.3f "
+            "snapshot_ms=%.3f acquire_ms=%.3f "
+            "submit_ms=%.3f pending_jobs=%zu status=%s\n",
+            job.request.snapshot.device,
+            job.request.snapshot.lane,
+            job.request.snapshot.seq,
+            job.request.layer,
+            job.request.chunk,
+            payload.size(),
+            (job.ready_us - job.arm_us) / 1000.0,
+            (worker_begin_us - job.ready_us) / 1000.0,
+            (snapshot_done_us - worker_begin_us) / 1000.0,
+            (acquire_done_us - acquire_begin_us) / 1000.0,
+            (submit_done_us - submit_begin_us) / 1000.0,
+            queue_depth,
+            status ? "OK" : "FAIL");
+
+        if (!status) {
+            if (transport) {
+                transport->stop();
+            }
+            // A failed data-plane send makes any waiting PC route consumer
+            // fail via the transport rather than silently falling back after
+            // ARM was accepted.
+            return;
+        }
+    }
 }
 
 bool rpc_server::route_mark_ready(
@@ -10205,6 +10410,16 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    {
+        std::lock_guard<std::mutex> lock(
+            inference_route_mutex);
+        inference_route_stop = true;
+    }
+    inference_route_cv.notify_all();
+    if (inference_route_thread.joinable()) {
+        inference_route_thread.join();
+    }
+
     {
         std::lock_guard<std::mutex> lock(
             phone_npu_async_mutex);
