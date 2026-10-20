@@ -154,9 +154,9 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_LIVE_FFN] endpoint=%s device=%ld cpu=%s phone=%s\n",
         endpoint, index, ggml_backend_name(cpu), ggml_backend_name(phone));
 
-    const ggml_backend_dev_t devices[] = {cpu_dev, phone_dev};
+    ggml_backend_dev_t devices[] = {cpu_dev, phone_dev};
     const auto meta = ggml_backend_meta_device(
-        const_cast<ggml_backend_dev_t *>(devices), 2, split_weights, nullptr);
+        devices, 2, split_weights, nullptr);
     if (!meta) {
         std::fprintf(stderr, "[CYCLE_LIVE_FFN] status=FAIL reason=META_DEVICE\n");
         return 1;
