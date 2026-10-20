@@ -49,10 +49,10 @@ inline bool llama_hybrid_cycle_ready_graph_valid(
 // One-way P2C FFN input boundary. The raw model MoE graph consumes these
 // tensors directly; it must NOT recompute the Router or add the residual.
 //
-// IMPORTANT: until the per-backend weight-shard binding is implemented, the
-// output of the model FFN graph is NOT YET guaranteed to be a *local* partial.
-// An executor must isolate the PC/Phone expert weight fragments and choose the
-// appropriate backend before publishing FFN_SOURCE or FFN_DESTINATION done.
+// The graph builder selects a specific physical CPU/Phone shard of all three
+// MoE expert matrices. The executor must run the result on that same physical
+// backend and wait for the output buffer to become device-ready before
+// publishing FFN_SOURCE or FFN_DESTINATION completion.
 struct llama_hybrid_cycle_ffn_graph {
     ggml_tensor * norm          = nullptr; // F32 [hidden, tokens]
     ggml_tensor * topk_ids      = nullptr; // I32 [topk, tokens]
@@ -161,4 +161,27 @@ inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
         ggml_backend_buffer_get_type(w.down->buffer));
     return up_dev != nullptr && up_dev == gate_dev && up_dev == down_dev &&
            ggml_backend_dev_type(up_dev) != GGML_BACKEND_DEVICE_TYPE_META;
+}
+
+
+// Ensure two independently borrowed device-local weight sets form a complete
+// disjoint intermediate-neuron partition. Both down projections must sum to
+// the original hidden dimension, with no missing or repeated channels.
+inline bool llama_hybrid_cycle_ffn_partition_valid(
+        const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * down, int64_t hidden, int64_t experts) {
+    if (!up || !gate || !down ||
+        up->ne[0] != hidden || up->ne[2] != experts ||
+        gate->ne[0] != hidden || gate->ne[2] != experts ||
+        down->ne[1] != hidden || down->ne[2] != experts ||
+        up->ne[1] != gate->ne[1] || up->ne[1] != down->ne[0]) {
+        return false;
+    }
+    const auto pc = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 0);
+    const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
+    return llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts) &&
+           llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts) &&
+           pc.up->ne[1] + phone.up->ne[1] == up->ne[1] &&
+           pc.gate->ne[1] + phone.gate->ne[1] == gate->ne[1] &&
+           pc.down->ne[0] + phone.down->ne[0] == down->ne[0];
 }
