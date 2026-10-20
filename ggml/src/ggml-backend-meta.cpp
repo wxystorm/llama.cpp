@@ -833,9 +833,15 @@ ggml_tensor * ggml_backend_meta_get_static_weight_shard(
     const auto expected_buft = ggml_backend_meta_buft_simple_buft(
         ggml_backend_buffer_get_type(tensor->buffer), device_index);
     const auto actual_buft = ggml_backend_buffer_get_type(shard->buffer);
-    if (expected_buft == nullptr || actual_buft != expected_buft ||
-        ggml_backend_buft_get_device(actual_buft) == nullptr) {
+    // Legacy ggml_backend_cpu_buffer_type() deliberately has device=nullptr.
+    // Exact buffer-type identity is authoritative for that CPU backend.
+    // For RPC/GPU, require the expected type AND its physical device.
+    if (expected_buft == nullptr || actual_buft != expected_buft) {
         return reject("BACKING_BUFFER_TYPE_MISMATCH");
+    }
+    if (ggml_backend_buft_get_device(actual_buft) == nullptr &&
+        actual_buft != ggml_backend_cpu_buffer_type()) {
+        return reject("UNRECOGNIZED_DEVICELESS_BUFFER_TYPE");
     }
     return shard;
 }
