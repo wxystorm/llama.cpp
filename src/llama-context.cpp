@@ -238,13 +238,31 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
-    // The fixed cycle layout already controls weight placement, but the
-    // one-way C2P/P2C executors are not connected yet. Fail closed instead
-    // of silently running the old bidirectional Tensor path.
+    // The fixed cycle layout currently places weights only. Production
+    // llama_context runs must not silently execute the old bidirectional
+    // Meta Tensor path in place of the unfinished C2P/P2C Cycle executor.
+    //
+    // Exception: the opt-in real-model numerical probe supplies BOTH a
+    // captured reference-layer index and an evaluation callback. It runs
+    // the ordinary full-model forward pass only as a baseline, then executes
+    // PC/Phone physical FFN shards separately for comparison. This is not
+    // permission to enable the Cycle scheduler for normal inference.
+    const char * cycle_reference_layer =
+        std::getenv("LLAMA_HYBRID_CYCLE_REAL_COMPARE_LAYER");
+    const bool cycle_reference_probe =
+        cycle_reference_layer != nullptr &&
+        *cycle_reference_layer != '\0' &&
+        params.cb_eval != nullptr;
     if (llama_hybrid_cycle_requested()) {
-        throw std::runtime_error(
-            "fixed hybrid cycle layout is placement-only: "
-            "C2P/P2C execution is not implemented yet");
+        if (!cycle_reference_probe) {
+            throw std::runtime_error(
+                "fixed hybrid cycle layout is placement-only: "
+                "C2P/P2C execution is not implemented yet");
+        }
+        LLAMA_LOG_WARN(
+            "[HYBRID_CYCLE_REFERENCE_ONLY] layer=%s mode=FULL_MODEL_CAPTURE "
+            "cycle_executor=DISABLED status=ENABLED\n",
+            cycle_reference_layer);
     }
 
     t_start_us = model.t_start_us;
