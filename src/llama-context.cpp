@@ -5,6 +5,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
+#include "llama-hybrid-cycle.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -237,6 +238,14 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    // The fixed cycle layout already controls weight placement, but the
+    // one-way C2P/P2C executors are not connected yet. Fail closed instead
+    // of silently running the old bidirectional Tensor path.
+    if (llama_hybrid_cycle_requested()) {
+        throw std::runtime_error(
+            "fixed hybrid cycle layout is placement-only: "
+            "C2P/P2C execution is not implemented yet");
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
