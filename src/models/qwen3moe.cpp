@@ -1,4 +1,5 @@
 #include "llama-hybrid.h"
+#include "llama-hybrid-cycle-graph.h"
 #include "models.h"
 
 #include <algorithm>
@@ -909,19 +910,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * route_ids = ggml_cont(ctx0, route.selected_experts);
             ggml_tensor * route_weights = ggml_cont(ctx0, route.weights);
 
-            GGML_ASSERT(ffn_inp->type == GGML_TYPE_F32 &&
-                        cur->type == GGML_TYPE_F32 &&
-                        route_ids->type == GGML_TYPE_I32 &&
-                        route_weights->type == GGML_TYPE_F32);
-            GGML_ASSERT(ffn_inp->ne[0] == n_embd &&
-                        ffn_inp->ne[1] == n_tokens &&
-                        cur->ne[0] == n_embd &&
-                        cur->ne[1] == n_tokens);
-            GGML_ASSERT(route_ids->ne[0] == n_expert_used &&
-                        route_ids->ne[1] == n_tokens &&
-                        route_weights->ne[0] == 1 &&
-                        route_weights->ne[1] == n_expert_used &&
-                        route_weights->ne[2] == n_tokens);
+            GGML_ASSERT(llama_hybrid_cycle_ready_graph_valid(
+                { ffn_inp, cur, route_ids, route_weights },
+                n_embd, n_tokens, n_expert_used));
 
             cb(ffn_inp,      "cycle_p2c_ready_residual", il);
             cb(cur,          "cycle_p2c_ready_norm", il);
