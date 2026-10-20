@@ -272,7 +272,7 @@ enum rpc_cmd {
     RPC_CMD_RETURN_BULK_ACQUIRE,
     RPC_CMD_INFERENCE_DATA_PLANE_OPEN,
     RPC_CMD_INFERENCE_RETURN_BIND,
-    RPC_CMD_INFERENCE_ROUTE_PULL,
+    RPC_CMD_INFERENCE_ROUTE_ARM,
     RPC_CMD_COUNT,
 };
 
@@ -297,7 +297,7 @@ static_assert(RPC_CMD_ROUTE_SNAPSHOT_READY_ASYNC == 33, "RPC_CMD_ROUTE_SNAPSHOT_
 static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_DATA_PLANE_OPEN == 35, "RPC_CMD_INFERENCE_DATA_PLANE_OPEN must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_RETURN_BIND == 36, "RPC_CMD_INFERENCE_RETURN_BIND must be before RPC_CMD_COUNT");
-static_assert(RPC_CMD_INFERENCE_ROUTE_PULL == 37, "RPC_CMD_INFERENCE_ROUTE_PULL must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INFERENCE_ROUTE_ARM == 37, "RPC_CMD_INFERENCE_ROUTE_ARM must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -513,24 +513,24 @@ struct rpc_msg_get_route_snapshot_req {
     uint64_t sizes[3];
 };
 
-struct rpc_msg_inference_route_pull_req {
+struct rpc_msg_inference_route_arm_req {
     rpc_msg_get_route_snapshot_req snapshot;
     int32_t layer;
     int32_t chunk;
 };
 
-struct rpc_msg_inference_route_pull_rsp {
+struct rpc_msg_inference_route_arm_rsp {
     uint8_t result;
     uint8_t reserved[7];
     uint64_t wire_size;
 };
 
 static_assert(
-    sizeof(rpc_msg_inference_route_pull_req) == 48,
-    "inference route pull request wire size changed");
+    sizeof(rpc_msg_inference_route_arm_req) == 48,
+    "inference route arm request wire size changed");
 static_assert(
-    sizeof(rpc_msg_inference_route_pull_rsp) == 16,
-    "inference route pull response wire size changed");
+    sizeof(rpc_msg_inference_route_arm_rsp) == 16,
+    "inference route arm response wire size changed");
 
 struct rpc_msg_return_bulk_acquire_req {
     uint64_t seq;
@@ -3094,7 +3094,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_MIN_PATCH = 12;
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_COMPACT_TOPK_MIN_PATCH = 13;
     constexpr uint8_t RPC_ROUTE_SNAPSHOT_WIRE_ACK_MIN_PATCH = 17;
-    constexpr uint8_t RPC_INFERENCE_ROUTE_MIN_PATCH = 22;
+    constexpr uint8_t RPC_INFERENCE_ROUTE_MIN_PATCH = 23;
 
     const std::string compute_key = rpc_ctx->endpoint + "_compute";
     const uint8_t remote_patch =
@@ -3258,12 +3258,12 @@ static bool ggml_backend_rpc_get_route_snapshot(
             }
         }
 
-        rpc_msg_inference_route_pull_req pull {};
+        rpc_msg_inference_route_arm_req pull {};
         pull.snapshot = request;
         pull.layer = route_layer;
         pull.chunk = route_chunk;
 
-        rpc_msg_inference_route_pull_rsp pull_response {};
+        rpc_msg_inference_route_arm_rsp pull_response {};
         rpc_cmd_roundtrip_profile roundtrip_profile {};
         rpc_cmd_roundtrip_profile * const previous_profile =
             rpc_cmd_roundtrip_profile_active;
@@ -3275,7 +3275,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         const int64_t control_begin_us = ggml_time_us();
         bool status = send_rpc_cmd(
             route_sock,
-            RPC_CMD_INFERENCE_ROUTE_PULL,
+            RPC_CMD_INFERENCE_ROUTE_ARM,
             &pull,
             sizeof(pull),
             &pull_response,
@@ -11780,13 +11780,13 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
-            case RPC_CMD_INFERENCE_ROUTE_PULL: {
-                rpc_msg_inference_route_pull_req request {};
+            case RPC_CMD_INFERENCE_ROUTE_ARM: {
+                rpc_msg_inference_route_arm_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
 
-                rpc_msg_inference_route_pull_rsp response {};
+                rpc_msg_inference_route_arm_rsp response {};
                 auto transport =
                     server.get_inference_data_plane();
 
