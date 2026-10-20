@@ -106,6 +106,69 @@ static bool cycle_real_set_compare_layer(int layer) {
 #endif
 }
 
+// The fixed Cycle placement variables are process-global and the production
+// llama_model_load path intentionally rejects them with split_mode=LAYER.
+// Hide only the placement variables while running the independent CPU
+// reference. Keep LLAMA_HYBRID_CYCLE_REAL_COMPARE_LAYER active so the full
+// Qwen3-MoE graph still exposes its captured Router/FFN outputs.
+//
+// Both original values are copied before mutating the environment and are
+// restored on scope exit, including on any early return.
+static bool cycle_real_set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    return _putenv_s(name, value ? value : "") == 0;
+#else
+    return value ? setenv(name, value, 1) == 0 : unsetenv(name) == 0;
+#endif
+}
+
+class cycle_real_cpu_reference_env {
+public:
+    cycle_real_cpu_reference_env() {
+        const char * pc = std::getenv("LLAMA_HYBRID_CYCLE_PC_LAYERS");
+        const char * phone = std::getenv("LLAMA_HYBRID_CYCLE_PHONE_LAYERS");
+        had_pc_ = pc != nullptr;
+        had_phone_ = phone != nullptr;
+        if (had_pc_) {
+            saved_pc_ = pc;
+        }
+        if (had_phone_) {
+            saved_phone_ = phone;
+        }
+        const bool pc_cleared =
+            cycle_real_set_env("LLAMA_HYBRID_CYCLE_PC_LAYERS", nullptr);
+        const bool phone_cleared =
+            cycle_real_set_env("LLAMA_HYBRID_CYCLE_PHONE_LAYERS", nullptr);
+        disabled_ = pc_cleared && phone_cleared &&
+            !llama_hybrid_cycle_requested();
+    }
+
+    cycle_real_cpu_reference_env(const cycle_real_cpu_reference_env &) = delete;
+    cycle_real_cpu_reference_env & operator=(const cycle_real_cpu_reference_env &) = delete;
+
+    ~cycle_real_cpu_reference_env() {
+        const bool pc_restored = cycle_real_set_env(
+            "LLAMA_HYBRID_CYCLE_PC_LAYERS",
+            had_pc_ ? saved_pc_.c_str() : nullptr);
+        const bool phone_restored = cycle_real_set_env(
+            "LLAMA_HYBRID_CYCLE_PHONE_LAYERS",
+            had_phone_ ? saved_phone_.c_str() : nullptr);
+        if (!pc_restored || !phone_restored) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_REFERENCE] status=FAIL reason=RESTORE_CYCLE_ENV\n");
+        }
+    }
+
+    bool disabled() const { return disabled_; }
+
+private:
+    std::string saved_pc_;
+    std::string saved_phone_;
+    bool had_pc_ = false;
+    bool had_phone_ = false;
+    bool disabled_ = false;
+};
+
 // The chosen P2C layer must keep Attention, both norms and MoE Router
 // exclusively on the sender. A numerically matching FFN is not sufficient
 // if the reference graph silently computes its Attention on the PC.
@@ -354,6 +417,14 @@ int main(int argc, char ** argv) {
     // resources are freed before loading the physical PC/Phone Cycle shards,
     // so the two copies of a 30B model never coexist in memory.
     {
+        cycle_real_cpu_reference_env cpu_reference_env;
+        if (!cpu_reference_env.disabled()) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_P2C] status=FAIL reason=DISABLE_CYCLE_ENV\n");
+            return 1;
+        }
+        std::printf("[CYCLE_REAL_REFERENCE] cycle_placement_env=DISABLED "
+                    "router_capture_env=PRESERVED status=OK\n");
         ggml_backend_dev_t reference_devices[2] = {cpu_dev, nullptr};
         llama_model_params reference_params = llama_model_default_params();
         reference_params.devices = reference_devices;
@@ -367,14 +438,9 @@ int main(int argc, char ** argv) {
             llama_model_load_from_file(argv[1], reference_params), &llama_model_free);
         reference_layers = reference_model ?
             llama_model_n_layer(reference_model.get()) : 0;
-        llama_hybrid_cycle_layout expected_layout;
         if (!reference_model ||
             reference_model->arch != LLM_ARCH_QWEN3MOE ||
-            reference_layers <= 1 || layer >= reference_layers - 1 ||
-            !llama_hybrid_cycle_layout_from_env(
-                reference_layers, expected_layout) ||
-            expected_layout.kinds[size_t(layer)] !=
-                llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            reference_layers <= 1 || layer >= reference_layers - 1) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_P2C] status=FAIL reason=REFERENCE_MODEL_OR_LAYER\n");
             return 1;
@@ -453,6 +519,20 @@ int main(int argc, char ** argv) {
     }
     std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
                 "status=RELEASED_BEFORE_CYCLE_LOAD\n");
+
+    // The RAII guard restored the physical Cycle placement policy. Verify
+    // the requested P2C layer before loading the distributed model.
+    llama_hybrid_cycle_layout expected_layout;
+    if (!llama_hybrid_cycle_layout_from_env(
+            reference_layers, expected_layout) ||
+        expected_layout.kinds[size_t(layer)] !=
+            llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=RESTORED_LAYOUT_OR_NOT_P2C\n");
+        return 1;
+    }
+    std::printf("[CYCLE_REAL_REFERENCE] cycle_placement_env=RESTORED "
+                "target_layer=%d kind=P2C status=OK\n", layer);
 
     // Fail on a malformed/uncaptured CPU baseline before allocating the
     // much larger distributed PC/Phone weight buffers.
