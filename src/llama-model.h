@@ -543,6 +543,13 @@ enum class llama_hybrid_layer_mode {
     TENSOR_SPLIT,
     TENSOR_PHONE_PRIMARY,
     PHONE_ONLY,
+
+    // Fixed PC<->Phone cycle Tensor roles. These must remain distinct from
+    // legacy TENSOR_SPLIT / TENSOR_PHONE_PRIMARY so their graph boundaries,
+    // router ownership and Reduce owner cannot silently fall through to the
+    // previous Route/Return execution path.
+    TENSOR_C2P,
+    TENSOR_P2C,
 };
 
 enum class llama_pc_layer_backend {
