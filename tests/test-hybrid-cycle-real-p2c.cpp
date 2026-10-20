@@ -6,8 +6,10 @@
 // This does NOT yet execute Attention/Router on Phone: that requires the
 // separate Phone AttentionPre stage, NOT the legacy Meta full-model graph.
 //
-// READY/PARTIAL use the existing RPC backend tensor transport in this test;
-// the dedicated Cycle inference data plane / FIFO send tasks are NOT active.
+// READY/PARTIAL are serialized/deserialized IN PROCESS as wire-format
+// checks only. The Phone FFN input/output still travel through ordinary
+// RPC backend tensor set/get; the dedicated P2C network queues, actual two
+// sender messages and FIFO stage executor are NOT active.
 //
 // Usage (choose a TENSOR_P2C layer in the fixed cycle):
 //   test-hybrid-cycle-real-p2c <Qwen3-MoE.gguf> <phone:rpc-port> <layer> [prompt]
@@ -667,8 +669,10 @@ int main(int argc, char ** argv) {
         return part;
     });
     std::vector<float> pc_part;
-    // The receiving PC consumes only the decoded READY, not its source arrays.
-    // The Phone FFN above continues to use the sender's original inputs.
+    // The receiving PC consumes only the decoded READY, not its original
+    // source arrays. This test's READY comes from a CPU reference; the Phone
+    // FFN consumes the same reference values until the actual Phone
+    // AttentionPre graph and two-send network task are connected.
     const bool pc_ok = cycle_real_execute_ffn(
         cpu, pc_weights,
         ready_msg.ready.ffn_norm, ready_msg.ready.topk_ids,
