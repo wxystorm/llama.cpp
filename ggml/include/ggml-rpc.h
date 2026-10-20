@@ -102,6 +102,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC \
     "ggml_backend_rpc_set_tensor_async_return_wait"
 
+#define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_ENQUEUE_PROC \
+    "ggml_backend_rpc_set_tensor_async_return_enqueue"
+
 #define GGML_BACKEND_RPC_INFERENCE_RETURN_WAIT_PROC \
     "ggml_backend_rpc_inference_return_wait"
 
