@@ -2216,6 +2216,20 @@ ggml_backend_rpc_set_tensor_from_local_file_2d(
         return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
     }
 
+    // An allocated static tensor is not necessarily a GGUF model weight.
+    // The Cycle FFN probe creates up.exps/gate.exps/down.exps in memory on PC.
+    // The Phone RPC server has no corresponding local-file source; never
+    // dispatch a SET_TENSOR_FROM_LOCAL_FILE request for such a tensor.
+    // Preserve local GGUF fast-path loading for actual model weight names.
+    if (!should_use_local_file_tensor(tensor)) {
+        if (std::getenv("GGML_CYCLE_LIVE_FFN_DIAG") != nullptr) {
+            GGML_LOG_INFO(
+                "[CYCLE_WEIGHT_UPLOAD] tensor=%s route=HOST_RPC "
+                "reason=NOT_GGUF_MODEL_WEIGHT\n", tensor->name);
+        }
+        return GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED;
+    }
+
     auto * ctx =
         static_cast<ggml_backend_rpc_buffer_context *>(
             tensor->buffer->context);
