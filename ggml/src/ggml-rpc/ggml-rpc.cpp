@@ -6321,6 +6321,59 @@ public:
         return success;
     }
 
+    bool arm_inference_route(
+        const rpc_msg_inference_route_arm_req & request) {
+        if (request.snapshot.device >= backends.size() ||
+                request.snapshot.lane >= RPC_ROUTE_TRANSFER_LANES ||
+                request.snapshot.seq == 0) {
+            return false;
+        }
+
+        auto transport = get_inference_data_plane();
+        if (!transport || !transport->healthy()) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                inference_route_mutex);
+
+            auto & by_seq =
+                inference_route_arms[
+                    request.snapshot.device];
+            if (by_seq.find(request.snapshot.seq) !=
+                    by_seq.end()) {
+                return false;
+            }
+
+            inference_route_arm_entry entry;
+            entry.request = request;
+            entry.arm_us = ggml_time_us();
+            by_seq.emplace(
+                request.snapshot.seq,
+                std::move(entry));
+
+            if (!inference_route_thread.joinable()) {
+                inference_route_stop = false;
+                inference_route_thread =
+                    std::thread(
+                        &rpc_server::inference_route_sender_loop,
+                        this);
+            }
+        }
+
+        // Normally ARM arrives before the producer graph. Handle the inverse
+        // race as well: if the immutable snapshot is already READY, queue it
+        // immediately. Exact-once removal from inference_route_arms prevents
+        // duplicate jobs when READY and ARM race each other.
+        queue_inference_route_if_ready(
+            request.snapshot.device,
+            request.snapshot.lane,
+            request.snapshot.seq);
+
+        return true;
+    }
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -6365,6 +6418,11 @@ private:
         uint64_t graph_uid,
         ggml_cgraph * graph);
 
+    bool queue_inference_route_if_ready(
+        uint32_t device,
+        uint32_t lane,
+        uint64_t seq);
+    void inference_route_sender_loop();
 
     std::vector<ggml_backend_t> backends;
     // Private phone-local execution backend. It is deliberately not part of
@@ -6465,6 +6523,26 @@ private:
     // inference_transport TX/RX workers.
     std::mutex inference_data_plane_mutex;
     std::shared_ptr<inference_transport> inference_data_plane;
+
+    struct inference_route_arm_entry {
+        rpc_msg_inference_route_arm_req request {};
+        int64_t arm_us = 0;
+    };
+    struct inference_route_send_job {
+        rpc_msg_inference_route_arm_req request {};
+        int64_t arm_us = 0;
+        int64_t ready_us = 0;
+    };
+    std::mutex inference_route_mutex;
+    std::condition_variable inference_route_cv;
+    std::unordered_map<
+        uint32_t,
+        std::unordered_map<uint64_t, inference_route_arm_entry>>
+        inference_route_arms;
+    std::deque<inference_route_send_job>
+        inference_route_jobs;
+    bool inference_route_stop = false;
+    std::thread inference_route_thread;
 
     struct inference_return_binding {
         rpc_msg_inference_return_bind_req request {};
