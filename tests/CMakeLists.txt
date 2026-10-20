@@ -327,6 +327,9 @@ target_include_directories(test-hybrid-cycle-ready-graph PRIVATE ${PROJECT_SOURC
 llama_build_and_test(test-hybrid-cycle-ffn-graph.cpp)
 target_include_directories(test-hybrid-cycle-ffn-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-hybrid-cycle-shard-ffn.cpp)
+target_include_directories(test-hybrid-cycle-shard-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # ggml-rpc may be configured before the top-level include(CTest), so its
 # own add_test() is not necessarily visible from the main build directory.
 # Register the existing RPC socket test in the same top-level CTest tree.
