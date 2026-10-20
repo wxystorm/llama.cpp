@@ -1152,16 +1152,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         } else {
             std::vector<ggml_tensor *> decode_down_chunks;
             llm_graph_moe_routing phone_routing;
-            // Opt-in real-model P2C verification: export the router results
-            // from the SAME unmodified full-layer graph used as the reference.
-            // The FFN receives those exact selected experts and weights, so
-            // no second router is inserted just for the comparison.
+            // Opt-in real-model Cycle numerical reference. Compute the
+            // untouched complete Qwen3-MoE layer using a *non-Tensor* model
+            // (CPU-only for the current probe). Export the very same Router
+            // Top-K and weights consumed by its full FFN. NEVER attempt to
+            // reuse the placement-only C2P/P2C Meta graph as a reference.
             const char * cycle_compare_layer =
                 std::getenv("LLAMA_HYBRID_CYCLE_REAL_COMPARE_LAYER");
             const bool cycle_real_compare =
                 cycle_compare_layer != nullptr &&
                 std::atoi(cycle_compare_layer) == il &&
-                hybrid_mode == llama_hybrid_layer_mode::TENSOR_P2C;
+                model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
             if (phone_primary_router || cycle_real_compare) {
                 phone_routing = build_moe_routing(
                     cur,
