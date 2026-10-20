@@ -742,6 +742,10 @@ struct llm_graph_params {
     // payload outputs; it never executes an implicit old Meta FFN/Reduce.
     bool hybrid_cycle_p2c_attn_pre = false;
 
+    // One-layer MoE FFN graph fed from precomputed READY tensors. Per-device
+    // FFN weight shard binding is a separate step in the cycle executor.
+    bool hybrid_cycle_p2c_ffn_graph = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -785,7 +789,8 @@ struct llm_graph_params {
             hybrid_hidden_input != other.hybrid_hidden_input ||
             hybrid_output_head  != other.hybrid_output_head  ||
             hybrid_wave_probe   != other.hybrid_wave_probe   ||
-            hybrid_cycle_p2c_attn_pre != other.hybrid_cycle_p2c_attn_pre) {
+            hybrid_cycle_p2c_attn_pre != other.hybrid_cycle_p2c_attn_pre ||
+            hybrid_cycle_p2c_ffn_graph != other.hybrid_cycle_p2c_ffn_graph) {
             return false;
         }
 
@@ -850,6 +855,11 @@ public:
     ggml_tensor * get_cycle_ready_topk_ids() const { return t_cycle_ready_topk_ids; }
     ggml_tensor * get_cycle_ready_topk_weights() const { return t_cycle_ready_topk_weights; }
 
+    ggml_tensor * get_cycle_ffn_norm_input() const { return t_cycle_ffn_norm_input; }
+    ggml_tensor * get_cycle_ffn_ids_input() const { return t_cycle_ffn_ids_input; }
+    ggml_tensor * get_cycle_ffn_weights_input() const { return t_cycle_ffn_weights_input; }
+    ggml_tensor * get_cycle_ffn_output() const { return t_cycle_ffn_output; }
+
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
@@ -891,6 +901,14 @@ public:
     ggml_tensor * t_cycle_ready_norm         = nullptr; // F32 [hidden, tokens]
     ggml_tensor * t_cycle_ready_topk_ids     = nullptr; // I32 [topk, tokens]
     ggml_tensor * t_cycle_ready_topk_weights = nullptr; // F32 [1, topk, tokens]
+
+    // Dedicated MoE FFN subgraph: three externally uploaded inputs, no
+    // Attention, Router or residual ADD. The graph executor must bind a
+    // single physical FFN shard before treating the output as a partial.
+    ggml_tensor * t_cycle_ffn_norm_input    = nullptr;
+    ggml_tensor * t_cycle_ffn_ids_input     = nullptr;
+    ggml_tensor * t_cycle_ffn_weights_input = nullptr;
+    ggml_tensor * t_cycle_ffn_output        = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
