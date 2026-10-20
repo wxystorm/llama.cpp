@@ -786,6 +786,39 @@ static bool ggml_backend_meta_tensor_is_static(
            buf_ctx->stc_static.simple_tensors.end();
 }
 
+ggml_tensor * ggml_backend_meta_get_static_weight_shard(
+        const ggml_tensor * tensor, size_t device_index) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_meta(tensor->buffer) ||
+        tensor->op != GGML_OP_NONE || tensor->view_src != nullptr) {
+        return nullptr;
+    }
+
+    // Do not fall back to STC_COMPUTE: those borrowed tensors are destroyed
+    // and recreated during graph rebuild, while model weights survive.
+    auto * buf_ctx = static_cast<ggml_backend_meta_buffer_context *>(
+        tensor->buffer->context);
+    if (device_index >= buf_ctx->bufs.size()) {
+        return nullptr;
+    }
+
+    const auto it = buf_ctx->stc_static.simple_tensors.find(tensor);
+    if (it == buf_ctx->stc_static.simple_tensors.end() ||
+        device_index >= it->second.size()) {
+        return nullptr;
+    }
+
+    ggml_tensor * shard = it->second[device_index];
+    if (shard == nullptr || shard->buffer == nullptr ||
+        ggml_backend_buffer_is_meta(shard->buffer) ||
+        shard->buffer != buf_ctx->bufs[device_index].get() ||
+        shard->op != GGML_OP_NONE || shard->view_src != nullptr ||
+        ggml_nelements(shard) == 0) {
+        return nullptr;
+    }
+    return shard;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
