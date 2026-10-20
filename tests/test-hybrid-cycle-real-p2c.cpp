@@ -180,15 +180,31 @@ static bool cycle_real_execute_ffn(
 
     bool ok = false;
     {
+        const char * backend_name = ggml_backend_name(backend);
+        std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s channels=%lld nodes=%d "
+                    "stage=PREPARE_BEGIN\n",
+                    backend_name, (long long)shard.up->ne[1], graph->n_nodes);
         llama_hybrid_cycle_ffn_executor executor;
-        if (executor.prepare(backend, ctx, graph, in, shard,
-                             hidden, tokens, topk, experts)) {
+        if (!executor.prepare(backend, ctx, graph, in, shard,
+                              hidden, tokens, topk, experts)) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_FFN_SHARD] backend=%s stage=PREPARE_FAIL "
+                "weight_buft=%s compute_buft=%s\n",
+                backend_name,
+                shard.up->buffer != nullptr ?
+                    ggml_backend_buft_name(ggml_backend_buffer_get_type(shard.up->buffer)) :
+                    "(unallocated)",
+                ggml_backend_buft_name(ggml_backend_get_default_buffer_type(backend)));
+        } else {
             partial.resize(size_t(hidden * tokens));
             ok = executor.execute(
                 norm.data(), norm.size(),
                 ids.data(), ids.size(),
                 routing.data(), routing.size(),
                 partial.data(), partial.size());
+            std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
+                        "elements=%zu status=%s\n",
+                        backend_name, partial.size(), ok ? "OK" : "FAIL");
         }
     }
     ggml_free(ctx);
@@ -280,7 +296,7 @@ int main(int argc, char ** argv) {
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
         llama_model_load_from_file(argv[1], mp), &llama_model_free);
     if (!model || model->arch != LLM_ARCH_QWEN3MOE ||
-        layer >= model->hparams.n_layer() ||
+        layer >= model->hparams.n_layer() - 1 ||
         model->hybrid_layer_mode(layer) != llama_hybrid_layer_mode::TENSOR_P2C) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL reason=MODEL_OR_NOT_P2C_LAYER layer=%d\n",
@@ -292,7 +308,11 @@ int main(int argc, char ** argv) {
     const int64_t hidden = model->hparams.n_embd;
     const int64_t topk = model->hparams.n_expert_used;
     const int64_t experts = model->hparams.n_expert;
-    if (lw.ffn_gate_exps_s || lw.ffn_up_exps_s || lw.ffn_down_exps_s ||
+    // The first real comparison intentionally covers ordinary Qwen3-MoE
+    // SwiGLU without extra expert scaling/clamping. Reject unsupported
+    // architectures/layouts rather than silently comparing unlike formulas.
+    if (model->hparams.swiglu_clamp_exp[size_t(layer)] > 1.0e-6f ||
+        lw.ffn_gate_exps_s || lw.ffn_up_exps_s || lw.ffn_down_exps_s ||
         !llama_hybrid_cycle_ffn_partition_valid(
             lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps,
             hidden, experts)) {
@@ -584,7 +604,7 @@ int main(int argc, char ** argv) {
                       ffn_diff.pass && out_diff.pass;
     std::printf("[CYCLE_REAL_P2C_SUM] layer=%d tokens=%d "
                 "forward_ms=%.3f ffn_parallel_ms=%.3f "
-                "real_attention=1 real_ffn_weights=1 "
+                "real_attention=FULL_MODEL_REFERENCE real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
                 "reference=FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
                 "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
