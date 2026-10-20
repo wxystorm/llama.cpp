@@ -432,8 +432,14 @@ int main(int argc, char ** argv) {
         reference_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         reference_params.hybrid_auto = false;
         reference_params.use_mmap = true;
+        // A complete 30B Q4_K CPU reference is loaded only to capture
+        // numerical intermediates. CPU_REPACK duplicates many mapped weights
+        // (~13 GiB in this GGUF) and is unnecessary for this correctness
+        // probe. Keep the model's original quantization and mmap buffers.
+        // This does not change the second PC+Phone Cycle model's policy.
+        reference_params.use_extra_bufts = false;
         std::printf("[CYCLE_REAL_REFERENCE] backend=CPU_ONLY "
-                    "split_mode=LAYER model_load=BEGIN\n");
+                    "split_mode=LAYER cpu_repack=DISABLED model_load=BEGIN\n");
         std::unique_ptr<llama_model, decltype(&llama_model_free)> reference_model(
             llama_model_load_from_file(argv[1], reference_params), &llama_model_free);
         reference_layers = reference_model ?
