@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    23
+#define RPC_PROTO_PATCH_VERSION    24
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -102,6 +102,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC \
     "ggml_backend_rpc_set_tensor_async_return_wait"
 
+#define GGML_BACKEND_RPC_INFERENCE_RETURN_WAIT_PROC \
+    "ggml_backend_rpc_inference_return_wait"
+
 #define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC \
     "ggml_backend_rpc_inference_transport_open"
 
@@ -155,6 +158,10 @@ using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         size_t size,
         uint64_t phone_ffn_seq,
         size_t return_lane);
+
+using ggml_backend_rpc_inference_return_wait_t = bool (*)(
+        ggml_backend_t backend,
+        uint64_t phone_ffn_seq);
 
 struct ggml_backend_rpc_inference_task {
     uint64_t graph_id;
