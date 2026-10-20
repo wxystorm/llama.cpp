@@ -180,7 +180,10 @@ static bool run_socket_test() {
         recv_acks(*io, INFERENCE_CYCLE_PHONE_TO_PC, 19, 100);
     const bool c2p_ok = p2c_ok &&
         recv_pair(*io, fixture, INFERENCE_CYCLE_PC_TO_PHONE, 10, 101, false);
-    const bool client_ok = p2c_ok && c2p_ok && io->wait_tx_idle(3000);
+    // The server verifies receipt of both final ACKs. Do not require the
+    // client's transport to remain healthy after the peer legitimately closes
+    // the socket; EOF can race with wait_tx_idle() after the last ACK.
+    const bool client_ok = p2c_ok && c2p_ok;
     server.join();
     io->stop();
 
