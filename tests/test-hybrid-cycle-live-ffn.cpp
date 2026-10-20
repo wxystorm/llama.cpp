@@ -313,9 +313,16 @@ int main(int argc, char ** argv) {
     auto * up = ggml_new_tensor_3d(model_ctx, expert_type, hidden, channels, experts);
     auto * gate = ggml_new_tensor_3d(model_ctx, expert_type, hidden, channels, experts);
     auto * down = ggml_new_tensor_3d(model_ctx, expert_type, channels, hidden, experts);
-    ggml_set_name(up, "up.exps");
-    ggml_set_name(gate, "gate.exps");
-    ggml_set_name(down, "down.exps");
+    // Q4_K MUL_MAT_ID has no generic OpenCL fallback. The Adreno MoE
+    // support and upload paths currently recognize expert weights by the
+    // joint presence of "ffn" and "exps" in the physical tensor name
+    // (plus ne[1] % 32 == 0). Keep the Q4_0 control names unchanged.
+    // Retain the "down." prefix because split_weights() uses it to select
+    // dimension 0 for the down projection.
+    const bool adreno_moe_name = expert_type == GGML_TYPE_Q4_K;
+    ggml_set_name(up, adreno_moe_name ? "up.ffn.exps" : "up.exps");
+    ggml_set_name(gate, adreno_moe_name ? "gate.ffn.exps" : "gate.exps");
+    ggml_set_name(down, adreno_moe_name ? "down.ffn.exps" : "down.exps");
 
     auto * weight_buf = ggml_backend_alloc_ctx_tensors_from_buft(
         model_ctx, ggml_backend_dev_buffer_type(meta));
