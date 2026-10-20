@@ -10430,6 +10430,39 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+
+    // Only for the Cycle live-FFN test. The PC RPC device stub advertises
+    // all GGML ops as supported. Validate on the REAL OpenCL device.
+    const bool cycle_probe_diag =
+        std::getenv("GGML_CYCLE_LIVE_FFN_DIAG") != nullptr;
+    if (cycle_probe_diag) {
+        const auto real_device = ggml_backend_get_device(backends[device]);
+        bool supported = true;
+        for (uint32_t i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            const bool node_ok =
+                node != nullptr &&
+                ggml_backend_dev_supports_op(real_device, node);
+            GGML_LOG_INFO(
+                "[CYCLE_LIVE_FFN_REMOTE_OP] uid=%" PRIu64
+                " node=%u op=%s type=%s supported=%d tensor=%s\n",
+                graph_uid, i,
+                node != nullptr ? ggml_op_name(node->op) : "(null)",
+                node != nullptr ? ggml_type_name(node->type) : "(null)",
+                node_ok ? 1 : 0,
+                node != nullptr ? node->name : "(null)");
+            supported = supported && node_ok;
+        }
+        if (!supported) {
+            GGML_LOG_ERROR(
+                "[CYCLE_LIVE_FFN_REMOTE] uid=%" PRIu64
+                " status=REJECT reason=UNSUPPORTED_GPU_OP\n", graph_uid);
+            return false;
+        }
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_REMOTE] uid=%" PRIu64
+            " stage=COMPUTE_BEGIN nodes=%u\n", graph_uid, n_nodes);
+    }
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
@@ -10437,6 +10470,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             device,
             graph_uid,
             graph);
+
+    if (cycle_probe_diag) {
+        GGML_LOG_INFO(
+            "[CYCLE_LIVE_FFN_REMOTE] uid=%" PRIu64
+            " stage=COMPUTE_END status=%d ms=%.3f\n",
+            graph_uid, (int) status,
+            (ggml_time_us() - t0) / 1000.0);
+        if (status != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+    }
 
     const int64_t t1 = ggml_time_us();
 
