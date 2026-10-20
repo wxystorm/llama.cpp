@@ -3040,6 +3040,25 @@ ggml_backend_meta_get_set_tensor_async_return_wait(ggml_backend_t backend) {
                 GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC));
 }
 
+static ggml_backend_rpc_inference_return_wait_t
+ggml_backend_meta_get_inference_return_wait(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_inference_return_wait_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_INFERENCE_RETURN_WAIT_PROC));
+}
+
 static ggml_backend_rpc_snapshot_arm_t ggml_backend_meta_get_snapshot_arm(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     if (dev == nullptr) {
@@ -6010,6 +6029,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_backend_meta_get_set_tensor_async_return_wait(
                 backend_ctx->backend_configs[1].backend) :
             nullptr;
+    const ggml_backend_rpc_inference_return_wait_t
+        phone_prefill_inference_return_wait =
+            n_backends > 1 ?
+            ggml_backend_meta_get_inference_return_wait(
+                backend_ctx->backend_configs[1].backend) :
+            nullptr;
 
     const bool phone_prefill_chunk_join_active =
         phone_prefill_chunk_join &&
@@ -6026,6 +6051,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             nullptr,
             0,
             0,
+            0);
+
+    const bool phone_prefill_inference_return_ack_active =
+        phone_prefill_chunk_join_active &&
+        phone_prefill_inference_return_wait != nullptr &&
+        phone_prefill_inference_return_wait(
+            backend_ctx->backend_configs[1].backend,
             0);
 
     const bool phone_prefill_critical_return_active =
@@ -14454,10 +14486,11 @@ auto prefill_norm_sg_has_prework =
                     return_task);
             }
 
-            // The return RPC now performs the join on the Phone CPU:
+            // Phone still performs the join:
             // HTP partial + PC partial -> one write into the stable Phone
-            // down-chunk buffer.  This worker is only the dependency bridge
-            // that turns the return ACK into "next-layer ATT may consume it".
+            // down-chunk buffer. With the inference data plane, the Return
+            // sender completes after enqueue and this dependency bridge waits
+            // for RETURN ACK(seq), emitted only after the Phone join completes.
             if (use_ring_cpu_reduce) {
                 GGML_ASSERT(phone_return_stage != nullptr);
                 GGML_ASSERT(
@@ -14479,6 +14512,10 @@ auto prefill_norm_sg_has_prework =
                     [return_worker,
                      return_task,
                      return_timing,
+                     phone_prefill_inference_return_wait,
+                     phone_prefill_inference_return_ack_active,
+                     phone_backend,
+                     phone_ffn_seq,
                      prefill_down_layer,
                      prefill_down_chunk,
                      i,
@@ -14486,8 +14523,29 @@ auto prefill_norm_sg_has_prework =
                      tensor_phone_stage_profile]
                     (uint64_t task_id) -> ggml_status {
                         const int64_t wait_begin_us = ggml_time_us();
-                        const ggml_status return_status =
+                        ggml_status return_status =
                             return_worker->wait(return_task);
+                        const int64_t submit_wait_done_us =
+                            ggml_time_us();
+
+                        int64_t completion_wait_us = 0;
+                        if (return_status == GGML_STATUS_SUCCESS &&
+                                phone_prefill_inference_return_ack_active) {
+                            const int64_t completion_begin_us =
+                                ggml_time_us();
+                            const bool completed =
+                                phone_prefill_inference_return_wait(
+                                    phone_backend,
+                                    phone_ffn_seq);
+                            completion_wait_us =
+                                ggml_time_us() -
+                                completion_begin_us;
+                            if (!completed) {
+                                return_status =
+                                    GGML_STATUS_FAILED;
+                            }
+                        }
+
                         const int64_t return_wait_us =
                             ggml_time_us() - wait_begin_us;
 
@@ -14501,12 +14559,21 @@ auto prefill_norm_sg_has_prework =
                             GGML_LOG_INFO(
                                 "[CHUNK_RING_CPU_JOIN_WAIT] "
                                 "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                                " return_wait_ms=%.3f status=%d\n",
+                                " submit_wait_ms=%.3f "
+                                "completion_wait_ms=%.3f "
+                                "return_wait_ms=%.3f "
+                                "completion_mode=%s status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
                                 i,
                                 task_id,
+                                (submit_wait_done_us - wait_begin_us) /
+                                    1000.0,
+                                completion_wait_us / 1000.0,
                                 return_wait_us / 1000.0,
+                                phone_prefill_inference_return_ack_active ?
+                                    "DATA_PLANE_ACK" :
+                                    "RETURN_TASK",
                                 (int) return_status);
                         }
                         return return_status;
