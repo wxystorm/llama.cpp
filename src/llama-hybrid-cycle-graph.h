@@ -43,3 +43,59 @@ inline bool llama_hybrid_cycle_ready_graph_valid(
            ggml_is_contiguous(r) && ggml_is_contiguous(n) &&
            ggml_is_contiguous(i) && ggml_is_contiguous(w);
 }
+
+
+// One-way P2C FFN input boundary. The raw model MoE graph consumes these
+// tensors directly; it must NOT recompute the Router or add the residual.
+//
+// IMPORTANT: until the per-backend weight-shard binding is implemented, the
+// output of the model FFN graph is NOT YET guaranteed to be a *local* partial.
+// An executor must isolate the PC/Phone expert weight fragments and choose the
+// appropriate backend before publishing FFN_SOURCE or FFN_DESTINATION done.
+struct llama_hybrid_cycle_ffn_graph {
+    ggml_tensor * norm          = nullptr; // F32 [hidden, tokens]
+    ggml_tensor * topk_ids      = nullptr; // I32 [topk, tokens]
+    ggml_tensor * topk_weights  = nullptr; // F32 [1, topk, tokens]
+    ggml_tensor * ffn_output    = nullptr; // F32 [hidden, tokens]
+};
+
+inline llama_hybrid_cycle_ffn_graph llama_hybrid_cycle_make_ffn_graph_inputs(
+        ggml_context * ctx, int64_t hidden, int64_t tokens, int64_t topk) {
+    if (ctx == nullptr || hidden <= 0 || tokens <= 0 || topk <= 0) {
+        return {};
+    }
+    llama_hybrid_cycle_ffn_graph result;
+    result.norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+    result.topk_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk, tokens);
+    result.topk_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, topk, tokens);
+    ggml_set_input(result.norm);
+    ggml_set_input(result.topk_ids);
+    ggml_set_input(result.topk_weights);
+    return result;
+}
+
+inline bool llama_hybrid_cycle_ffn_graph_valid(
+        const llama_hybrid_cycle_ffn_graph & g,
+        int64_t hidden, int64_t tokens, int64_t topk) {
+    if (hidden <= 0 || tokens <= 0 || topk <= 0 ||
+        !g.norm || !g.topk_ids || !g.topk_weights || !g.ffn_output) {
+        return false;
+    }
+    return g.norm->type == GGML_TYPE_F32 &&
+           g.topk_ids->type == GGML_TYPE_I32 &&
+           g.topk_weights->type == GGML_TYPE_F32 &&
+           g.ffn_output->type == GGML_TYPE_F32 &&
+           g.norm->ne[0] == hidden && g.norm->ne[1] == tokens &&
+           g.topk_ids->ne[0] == topk && g.topk_ids->ne[1] == tokens &&
+           g.topk_weights->ne[0] == 1 && g.topk_weights->ne[1] == topk &&
+           g.topk_weights->ne[2] == tokens &&
+           g.ffn_output->ne[0] == hidden && g.ffn_output->ne[1] == tokens &&
+           g.norm->ne[2] == 1 && g.norm->ne[3] == 1 &&
+           g.topk_ids->ne[2] == 1 && g.topk_ids->ne[3] == 1 &&
+           g.topk_weights->ne[3] == 1 &&
+           g.ffn_output->ne[2] == 1 && g.ffn_output->ne[3] == 1 &&
+           ggml_is_contiguous(g.norm) &&
+           ggml_is_contiguous(g.topk_ids) &&
+           ggml_is_contiguous(g.topk_weights) &&
+           ggml_is_contiguous(g.ffn_output);
+}
