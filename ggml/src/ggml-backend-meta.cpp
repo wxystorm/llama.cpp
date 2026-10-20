@@ -6079,7 +6079,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             0,
             0);
 
+    const char * inference_return_enqueue_env =
+        std::getenv("GGML_INFERENCE_RETURN_ENQUEUE_ONLY");
+    const bool phone_prefill_inference_return_enqueue_requested =
+        inference_return_enqueue_env != nullptr &&
+        std::atoi(inference_return_enqueue_env) != 0;
+
+    // Enqueue-only Return removes the per-lane completion wait and therefore
+    // also removes an important source of backpressure. On a shared Wi-Fi
+    // medium that can flood the bidirectional data plane and inflate Route
+    // ARM / Return BIND latency. Keep the implementation available for
+    // transport-credit experiments, but preserve the completion-throttled
+    // path by default until wire admission is controlled explicitly.
     const bool phone_prefill_inference_return_ack_active =
+        phone_prefill_inference_return_enqueue_requested &&
         phone_prefill_chunk_join_active &&
         phone_prefill_async_return_enqueue != nullptr &&
         phone_prefill_inference_return_wait != nullptr &&
