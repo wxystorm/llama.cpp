@@ -737,6 +737,11 @@ struct llm_graph_params {
     bool hybrid_output_head  = true;
     bool hybrid_wave_probe   = false;
 
+    // Build only Phone Attention -> residual -> FFN Norm -> MoE Router/Top-K
+    // for one P2C Tensor layer. This isolated graph exposes the four READY
+    // payload outputs; it never executes an implicit old Meta FFN/Reduce.
+    bool hybrid_cycle_p2c_attn_pre = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -779,7 +784,8 @@ struct llm_graph_params {
             hybrid_layer_end    != other.hybrid_layer_end   ||
             hybrid_hidden_input != other.hybrid_hidden_input ||
             hybrid_output_head  != other.hybrid_output_head  ||
-            hybrid_wave_probe   != other.hybrid_wave_probe) {
+            hybrid_wave_probe   != other.hybrid_wave_probe   ||
+            hybrid_cycle_p2c_attn_pre != other.hybrid_cycle_p2c_attn_pre) {
             return false;
         }
 
@@ -839,6 +845,11 @@ public:
     ggml_tensor * get_stage_input() const { return t_stage_input; }
     ggml_tensor * get_stage_output() const { return t_stage_output; }
 
+    ggml_tensor * get_cycle_ready_residual() const { return t_cycle_ready_residual; }
+    ggml_tensor * get_cycle_ready_norm() const { return t_cycle_ready_norm; }
+    ggml_tensor * get_cycle_ready_topk_ids() const { return t_cycle_ready_topk_ids; }
+    ggml_tensor * get_cycle_ready_topk_weights() const { return t_cycle_ready_topk_weights; }
+
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
@@ -875,6 +886,11 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_stage_input  = nullptr; // [n_embd, n_tokens]
     ggml_tensor * t_stage_output = nullptr; // [n_embd, n_tokens]
+    // Output tensors for a P2C AttentionPreGraph, not additional model layers.
+    ggml_tensor * t_cycle_ready_residual     = nullptr; // F32 [hidden, tokens]
+    ggml_tensor * t_cycle_ready_norm         = nullptr; // F32 [hidden, tokens]
+    ggml_tensor * t_cycle_ready_topk_ids     = nullptr; // I32 [topk, tokens]
+    ggml_tensor * t_cycle_ready_topk_weights = nullptr; // F32 [1, topk, tokens]
 
     std::vector<ggml_tensor *> t_layer_inp;
 
