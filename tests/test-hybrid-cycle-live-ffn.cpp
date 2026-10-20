@@ -43,8 +43,8 @@ static bool upload_cycle_test_weight(
         return false;
     }
 
-    const auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
-    const auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
+    auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
+    auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
     if (!pc || !phone || !pc->buffer || !phone->buffer ||
         pc->type != tensor->type || phone->type != tensor->type ||
         pc->ne[2] != tensor->ne[2] || phone->ne[2] != tensor->ne[2] ||
