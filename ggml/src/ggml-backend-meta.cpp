@@ -942,6 +942,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // A mirrored activation and a physically partitioned 1-D scale
+        // vector are compatible for elementwise MUL. Each backend multiplies
+        // its own scale-vector slice with the matching activation rows.
+        // This is needed at a full-layer -> Tensor-layer boundary: the
+        // preceding hidden state can be mirrored while the Attention/FFN
+        // norm weight belongs entirely to one device.
+        //
+        // Require an actual one-dimensional scale vector, aligned with the
+        // output axis, and do not apply this to ADD or reduction operations
+        // where using the weight's ownership could change sum semantics.
+        if (tensor->op == GGML_OP_MUL && tensor->src[2] == nullptr &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
+            const int axis = static_cast<int>(src_ss[1].axis);
+            if (ggml_nelements(tensor->src[1]) == tensor->src[1]->ne[axis] &&
+                    tensor->src[1]->ne[axis] == tensor->ne[axis] &&
+                    tensor->src[0]->ne[axis] == tensor->ne[axis]) {
+                return src_ss[1];
+            }
+        }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
