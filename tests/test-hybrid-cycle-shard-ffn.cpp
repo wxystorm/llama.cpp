@@ -6,10 +6,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <vector>
 
 // Pure CPU stand-in for PC CPU + Phone GPU. The actual Meta *weight*
- // partitioner is used, but neither shard executes a Meta graph/AllReduce.
+// partitioner is used, but neither shard executes a Meta graph/AllReduce.
 // Both CPU instances execute independent standard GGML FFN graphs.
 static ggml_backend_meta_split_state split_ffn_weights(
         const ggml_tensor * weight, void *) {
@@ -74,6 +75,41 @@ static std::vector<float> run_ffn_shard(
     return values;
 }
 
+static void test_quantized_q4k_shard_shapes(ggml_backend_dev_t meta) {
+    // Model Q4_K_M stores intermediate-neuron shards quantized. Each DOWN
+    // fragment must preserve a full Q4_K block along dimension 0.
+    ggml_init_params params {};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    assert(ctx);
+
+    constexpr int64_t hidden = 256;
+    constexpr int64_t channels = 512;
+    constexpr int64_t experts = 4;
+    auto * up = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, hidden, channels, experts);
+    auto * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, hidden, channels, experts);
+    auto * down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, channels, hidden, experts);
+    ggml_set_name(up, "up.quant");
+    ggml_set_name(gate, "gate.quant");
+    ggml_set_name(down, "down.quant");
+
+    auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, ggml_backend_dev_buffer_type(meta));
+    assert(buf);
+    const auto pc = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 0);
+    const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
+    assert(llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts));
+    assert(llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts));
+    assert(pc.up->ne[1] + phone.up->ne[1] == channels);
+    assert(pc.down->ne[0] + phone.down->ne[0] == channels);
+    const int64_t qblock = ggml_blck_size(GGML_TYPE_Q4_K);
+    assert(pc.down->ne[0] % qblock == 0);
+    assert(phone.down->ne[0] % qblock == 0);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -82,6 +118,7 @@ int main() {
     ggml_backend_dev_t meta = ggml_backend_meta_device(
         simulated, 2, split_ffn_weights, nullptr);
     assert(meta);
+    test_quantized_q4k_shard_shapes(meta);
 
     constexpr int64_t hidden = 8;
     constexpr int64_t channels = 16;
