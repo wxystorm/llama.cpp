@@ -101,6 +101,7 @@ static void test_quantized_q4k_shard_shapes(ggml_backend_dev_t meta) {
     const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
     assert(llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts));
     assert(llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts));
+    assert(llama_hybrid_cycle_ffn_partition_valid(up, gate, down, hidden, experts));
     assert(pc.up->ne[1] + phone.up->ne[1] == channels);
     assert(pc.down->ne[0] + phone.down->ne[0] == channels);
     const int64_t qblock = ggml_blck_size(GGML_TYPE_Q4_K);
@@ -158,6 +159,7 @@ int main() {
     const auto phone = llama_hybrid_cycle_get_physical_ffn_weights(up, gate, down, 1);
     assert(llama_hybrid_cycle_ffn_shard_weights_valid(pc, hidden, experts));
     assert(llama_hybrid_cycle_ffn_shard_weights_valid(phone, hidden, experts));
+    assert(llama_hybrid_cycle_ffn_partition_valid(up, gate, down, hidden, experts));
     assert(pc.up->ne[1] + phone.up->ne[1] == channels);
     assert(pc.down->ne[0] + phone.down->ne[0] == channels);
     assert(pc.up != phone.up && pc.down != phone.down);
