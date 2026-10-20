@@ -321,6 +321,13 @@ target_include_directories(test-hybrid-cycle-ring PRIVATE ${PROJECT_SOURCE_DIR}/
 llama_build_and_test(test-hybrid-cycle-wire.cpp)
 target_include_directories(test-hybrid-cycle-wire PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
 
+# ggml-rpc may be configured before the top-level include(CTest), so its
+# own add_test() is not necessarily visible from the main build directory.
+# Register the existing RPC socket test in the same top-level CTest tree.
+if (TARGET test-inference-cycle-wire)
+    llama_test(test-inference-cycle-wire)
+endif()
+
 llama_build_and_test(test-meta-return-stall-profile.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
