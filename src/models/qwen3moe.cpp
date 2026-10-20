@@ -206,6 +206,68 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     // intentionally have neither host tokens nor host embeddings here.
     GGML_ASSERT(!hidden_input || ubatch.token == nullptr);
 
+    if (params.hybrid_cycle_p2c_ffn_graph) {
+        GGML_ASSERT(!params.hybrid_cycle_p2c_attn_pre);
+        GGML_ASSERT(stage_graph && layer_end == layer_begin + 1);
+        GGML_ASSERT(!build_output_head);
+        GGML_ASSERT(model.hybrid_layer_mode(layer_begin) ==
+                    llama_hybrid_layer_mode::TENSOR_P2C);
+        GGML_ASSERT(loras->empty());
+
+        // Receive the three non-residual fields of the Phone-generated
+        // READY tensor. They are externally populated after graph allocation:
+        // no Attention, FFN Norm or Router is computed again on the PC.
+        const int il = layer_begin;
+        llama_hybrid_cycle_ffn_graph ffn =
+            llama_hybrid_cycle_make_ffn_graph_inputs(
+                ctx0, n_embd, n_tokens, n_expert_used);
+        cb(ffn.norm,         "cycle_p2c_ffn_norm_input", il);
+        cb(ffn.topk_ids,     "cycle_p2c_ffn_topk_ids_input", il);
+        cb(ffn.topk_weights, "cycle_p2c_ffn_topk_weights_input", il);
+
+        // build_moe_ffn() skips build_moe_routing() when both routing
+        // tensors are provided. Do not add the residual here; only PC's
+        // final ReduceGraph may add residual and the two FFN partials.
+        //
+        // Crucial: this constructs the mathematical FFN, but its output
+        // MUST NOT be labeled a device-local partial until the executor
+        // binds only that device's physical expert shards. A Meta graph
+        // may otherwise execute both shards and silently sum them.
+        ggml_tensor * moe_out = build_moe_ffn(
+            ffn.norm,
+            nullptr, // NO second router or gate_inp weight
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+            il,
+            nullptr, nullptr,
+            model.layers[il].ffn_up_exps_s,
+            model.layers[il].ffn_gate_exps_s,
+            model.layers[il].ffn_down_exps_s,
+            ffn.topk_ids,
+            1,
+            nullptr,
+            ffn.topk_weights);
+
+        ffn.ffn_output = ggml_is_contiguous(moe_out) ?
+            moe_out : ggml_cont(ctx0, moe_out);
+        GGML_ASSERT(llama_hybrid_cycle_ffn_graph_valid(
+            ffn, n_embd, n_tokens, n_expert_used));
+
+        cb(ffn.ffn_output, "cycle_p2c_ffn_graph_output", il);
+        res->t_cycle_ffn_norm_input = ffn.norm;
+        res->t_cycle_ffn_ids_input = ffn.topk_ids;
+        res->t_cycle_ffn_weights_input = ffn.topk_weights;
+        res->t_cycle_ffn_output = ffn.ffn_output;
+        ggml_build_forward_expand(gf, ffn.ffn_output);
+        return;
+    }
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
