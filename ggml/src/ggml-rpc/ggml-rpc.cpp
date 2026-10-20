@@ -3258,12 +3258,12 @@ static bool ggml_backend_rpc_get_route_snapshot(
             }
         }
 
-        rpc_msg_inference_route_arm_req pull {};
-        pull.snapshot = request;
-        pull.layer = route_layer;
-        pull.chunk = route_chunk;
+        rpc_msg_inference_route_arm_req arm {};
+        arm.snapshot = request;
+        arm.layer = route_layer;
+        arm.chunk = route_chunk;
 
-        rpc_msg_inference_route_arm_rsp pull_response {};
+        rpc_msg_inference_route_arm_rsp arm_response {};
         rpc_cmd_roundtrip_profile roundtrip_profile {};
         rpc_cmd_roundtrip_profile * const previous_profile =
             rpc_cmd_roundtrip_profile_active;
@@ -3276,10 +3276,10 @@ static bool ggml_backend_rpc_get_route_snapshot(
         bool status = send_rpc_cmd(
             route_sock,
             RPC_CMD_INFERENCE_ROUTE_ARM,
-            &pull,
-            sizeof(pull),
-            &pull_response,
-            sizeof(pull_response));
+            &arm,
+            sizeof(arm),
+            &arm_response,
+            sizeof(arm_response));
         const int64_t control_done_us = ggml_time_us();
 
         if (measure_profile) {
@@ -3293,11 +3293,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         }
 
         if (status) {
-            status =
-                pull_response.result != 0 &&
-                pull_response.wire_size ==
-                    static_cast<uint64_t>(
-                        wire_total_size);
+            status = arm_response.result != 0;
         }
 
         if (status && rpc_stage_ready_callback != nullptr) {
@@ -12079,72 +12075,26 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
 
+                const int64_t arm_begin_us = ggml_time_us();
                 rpc_msg_inference_route_arm_rsp response {};
-                auto transport =
-                    server.get_inference_data_plane();
-
-                std::vector<uint8_t> payload;
-                bool status =
-                    transport != nullptr &&
-                    transport->healthy() &&
-                    server.get_route_snapshot(
-                        request.snapshot,
-                        payload);
-
-                if (status) {
-                    inference_tx_buffer tx =
-                        transport->acquire_tx(payload.size());
-                    status = static_cast<bool>(tx);
-
-                    if (status && !payload.empty()) {
-                        std::memcpy(
-                            tx.data,
-                            payload.data(),
-                            payload.size());
-                    }
-
-                    if (status) {
-                        inference_frame_header header =
-                            inference_make_header(
-                                INFERENCE_FRAME_DATA);
-                        header.stage =
-                            INFERENCE_STAGE_ROUTE;
-                        header.stream_id =
-                            request.snapshot.device;
-                        header.seq =
-                            request.snapshot.seq;
-                        header.graph_id = 0;
-                        header.layer = request.layer;
-                        header.chunk = request.chunk;
-
-                        status = transport->submit_tx(
-                            std::move(tx),
-                            header,
-                            payload.size());
-                    } else if (tx) {
-                        transport->release_tx(
-                            std::move(tx));
-                    }
-                }
+                const bool status =
+                    server.arm_inference_route(request);
+                const int64_t arm_done_us = ggml_time_us();
 
                 response.result = status ? 1 : 0;
-                response.wire_size =
-                    status ?
-                        static_cast<uint64_t>(
-                            payload.size()) :
-                        0;
+                response.wire_size = 0;
 
                 GGML_LOG_INFO(
-                    "[INFERENCE_ROUTE] side=server "
+                    "[INFERENCE_ROUTE_ARM] side=server "
                     "device=%u lane=%u seq=%" PRIu64
-                    " layer=%d chunk=%d bytes=%zu "
+                    " layer=%d chunk=%d arm_ms=%.3f "
                     "status=%s\n",
                     request.snapshot.device,
                     request.snapshot.lane,
                     request.snapshot.seq,
                     request.layer,
                     request.chunk,
-                    payload.size(),
+                    (arm_done_us - arm_begin_us) / 1000.0,
                     status ? "OK" : "FAIL");
 
                 if (!send_msg(
