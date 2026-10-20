@@ -1152,7 +1152,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         } else {
             std::vector<ggml_tensor *> decode_down_chunks;
             llm_graph_moe_routing phone_routing;
-            if (phone_primary_router) {
+            // Opt-in real-model P2C verification: export the router results
+            // from the SAME unmodified full-layer graph used as the reference.
+            // The FFN receives those exact selected experts and weights, so
+            // no second router is inserted just for the comparison.
+            const char * cycle_compare_layer =
+                std::getenv("LLAMA_HYBRID_CYCLE_REAL_COMPARE_LAYER");
+            const bool cycle_real_compare =
+                cycle_compare_layer != nullptr &&
+                std::atoi(cycle_compare_layer) == il &&
+                hybrid_mode == llama_hybrid_layer_mode::TENSOR_P2C;
+            if (phone_primary_router || cycle_real_compare) {
                 phone_routing = build_moe_routing(
                     cur,
                     model.layers[il].ffn_gate_inp,
@@ -1163,8 +1173,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
-                cb(phone_routing.selected_experts, "phone_moe_route_topk", il);
-                cb(phone_routing.weights, "phone_moe_route_weights", il);
+                if (cycle_real_compare) {
+                    phone_routing.selected_experts =
+                        ggml_cont(ctx0, phone_routing.selected_experts);
+                    phone_routing.weights =
+                        ggml_cont(ctx0, phone_routing.weights);
+                    cb(phone_routing.selected_experts, "cycle_real_topk_ids", il);
+                    cb(phone_routing.weights, "cycle_real_topk_weights", il);
+                } else {
+                    cb(phone_routing.selected_experts, "phone_moe_route_topk", il);
+                    cb(phone_routing.weights, "phone_moe_route_weights", il);
+                }
             }
 
             ggml_tensor * moe_out =
