@@ -3040,6 +3040,26 @@ ggml_backend_meta_get_set_tensor_async_return_wait(ggml_backend_t backend) {
                 GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC));
 }
 
+static ggml_backend_rpc_set_tensor_async_return_wait_t
+ggml_backend_meta_get_set_tensor_async_return_enqueue(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_set_tensor_async_return_wait_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_ENQUEUE_PROC));
+}
+
 static ggml_backend_rpc_inference_return_wait_t
 ggml_backend_meta_get_inference_return_wait(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -6029,6 +6049,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_backend_meta_get_set_tensor_async_return_wait(
                 backend_ctx->backend_configs[1].backend) :
             nullptr;
+    const ggml_backend_rpc_set_tensor_async_return_wait_t
+        phone_prefill_async_return_enqueue =
+            n_backends > 1 ?
+            ggml_backend_meta_get_set_tensor_async_return_enqueue(
+                backend_ctx->backend_configs[1].backend) :
+            nullptr;
     const ggml_backend_rpc_inference_return_wait_t
         phone_prefill_inference_return_wait =
             n_backends > 1 ?
@@ -6055,7 +6081,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     const bool phone_prefill_inference_return_ack_active =
         phone_prefill_chunk_join_active &&
+        phone_prefill_async_return_enqueue != nullptr &&
         phone_prefill_inference_return_wait != nullptr &&
+        phone_prefill_async_return_enqueue(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            0,
+            0) &&
         phone_prefill_inference_return_wait(
             backend_ctx->backend_configs[1].backend,
             0);
@@ -14131,7 +14165,9 @@ auto prefill_norm_sg_has_prework =
                         phone_prefill_async_return_set;
                 const ggml_backend_rpc_set_tensor_async_return_wait_t
                     async_return_wait =
-                        phone_prefill_async_return_wait;
+                        phone_prefill_inference_return_ack_active ?
+                            phone_prefill_async_return_enqueue :
+                            phone_prefill_async_return_wait;
                 return_task = return_worker->enqueue(
                     [pc_worker,
                      pc_task,
