@@ -4383,6 +4383,8 @@ static bool ggml_backend_rpc_phone_ffn_mark_ready(
         request);
 }
 
+static thread_local bool rpc_inference_return_enqueue_only = false;
+
 static bool ggml_backend_rpc_set_tensor_async_return_wait(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -4626,12 +4628,38 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
             const int64_t submit_done_us =
                 measure_profile ? ggml_time_us() : 0;
 
+            int64_t completion_wait_us = 0;
+            if (status &&
+                    !rpc_inference_return_enqueue_only) {
+                const int64_t completion_begin_us =
+                    measure_profile ? ggml_time_us() : 0;
+                std::vector<uint8_t> ack_payload;
+                inference_frame_header ack {};
+                status = rpc_inference_receive_matching(
+                    rpc_ctx->endpoint,
+                    INFERENCE_FRAME_ACK,
+                    INFERENCE_STAGE_RETURN,
+                    rpc_ctx->device,
+                    phone_ffn_seq,
+                    0,
+                    ack_payload,
+                    &ack);
+                if (measure_profile) {
+                    completion_wait_us =
+                        ggml_time_us() -
+                        completion_begin_us;
+                }
+            }
+
             if (!status) {
-                // Once BIND is accepted, a missing DATA frame would leave a
-                // server-side dependency pending. Fail the data plane loudly
-                // instead of silently reverting to legacy semantics.
+                // Once BIND is accepted, a missing DATA/ACK frame would leave
+                // the peer state ambiguous. Fail loudly instead of silently
+                // reverting to legacy semantics.
                 transport->stop();
             }
+
+            const int64_t done_us =
+                measure_profile ? ggml_time_us() : 0;
 
             if (stage_profile || throttle_profile) {
                 GGML_LOG_INFO(
@@ -4639,7 +4667,7 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
                     "seq=%" PRIu64 " lane=%zu "
                     "bytes=%zu wire=%zu wire_type=%s "
                     "bind_ms=%.3f submit_ms=%.3f "
-                    "completion_wait_ms=0.000 total_ms=%.3f "
+                    "completion_wait_ms=%.3f total_ms=%.3f "
                     "status=%s\n",
                     phone_ffn_seq,
                     return_lane,
@@ -4650,8 +4678,12 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
                         1000.0,
                     (submit_done_us - bind_done_us) /
                         1000.0,
-                    (submit_done_us - begin_us) / 1000.0,
-                    status ? "QUEUED" : "FAIL");
+                    completion_wait_us / 1000.0,
+                    (done_us - begin_us) / 1000.0,
+                    status ?
+                        (rpc_inference_return_enqueue_only ?
+                            "QUEUED" : "OK") :
+                        "FAIL");
             }
 
             return status;
@@ -4921,6 +4953,28 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     return status;
 }
+static bool ggml_backend_rpc_set_tensor_async_return_enqueue(
+        ggml_backend_t backend_dst,
+        ggml_tensor * dst,
+        const void * data,
+        size_t data_size,
+        uint64_t phone_ffn_seq,
+        size_t return_lane) {
+    const bool previous =
+        rpc_inference_return_enqueue_only;
+    rpc_inference_return_enqueue_only = true;
+    const bool status =
+        ggml_backend_rpc_set_tensor_async_return_wait(
+            backend_dst,
+            dst,
+            data,
+            data_size,
+            phone_ffn_seq,
+            return_lane);
+    rpc_inference_return_enqueue_only = previous;
+    return status;
+}
+
 static bool ggml_backend_rpc_inference_return_wait(
         ggml_backend_t backend,
         uint64_t phone_ffn_seq) {
@@ -12809,6 +12863,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return_wait);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_ENQUEUE_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_tensor_async_return_enqueue);
     }
     if (std::strcmp(
             name,
