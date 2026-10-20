@@ -1,8 +1,10 @@
 // Opt-in real-Qwen3-MoE P2C numerical comparison, not a production Cycle
-// executor. The regular model forward pass is the independent reference:
-// it supplies REAL Attention/Norm/Router READY values and full-layer output.
-// PC CPU + Phone GPU then run the two borrowed physical FFN weight shards
-// independently. Only PC sums the partials and adds the captured residual.
+// executor. A separate CPU-only GGUF model provides the independent full
+// Attention/Norm/Router/FFN/l_out reference, and is freed before the Cycle
+// model is loaded. PC CPU + Phone GPU then run *real physical FFN shards*
+// independently. Only PC sums both partials and adds the captured residual.
+// This does NOT yet execute Attention/Router on Phone: that requires the
+// separate Phone AttentionPre stage, NOT the legacy Meta full-model graph.
 //
 // READY/PARTIAL use the existing RPC backend tensor transport in this test;
 // the dedicated Cycle inference data plane / FIFO send tasks are NOT active.
@@ -316,73 +318,11 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    const auto reg = ggml_backend_rpc_add_server(argv[2]);
-    if (!cpu_dev || !reg || ggml_backend_reg_dev_count(reg) != 1) {
-        std::fprintf(stderr, "[CYCLE_REAL_P2C] status=FAIL reason=RPC_DEVICE_COUNT\n");
-        return 1;
-    }
-    const auto phone_dev = ggml_backend_reg_dev_get(reg, 0);
-    if (!phone_dev || ggml_backend_dev_type(phone_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-        std::fprintf(stderr, "[CYCLE_REAL_P2C] status=FAIL reason=NOT_PHONE_GPU\n");
-        return 1;
-    }
-
-    ggml_backend_dev_t devices[3] = {cpu_dev, phone_dev, nullptr};
-    llama_model_params mp = llama_model_default_params();
-    mp.devices = devices;
-    mp.split_mode = LLAMA_SPLIT_MODE_TENSOR;
-    mp.hybrid_auto = false;
-    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
-        llama_model_load_from_file(argv[1], mp), &llama_model_free);
-    // The probe is a separate executable on Windows: llama_hparams::n_layer()
-    // and llama_model::hybrid_layer_mode() are internal, non-exported C++
-    // methods in llama.dll. Use the exported C API for the layer count and
-    // inspect the already-public model placement vector directly.
-    const int32_t model_layers = model ? llama_model_n_layer(model.get()) : 0;
-    if (!model || model->arch != LLM_ARCH_QWEN3MOE ||
-        model_layers <= 1 || layer >= model_layers - 1 ||
-        model->hybrid_layer_modes.size() != size_t(model_layers) ||
-        model->hybrid_layer_modes[size_t(layer)] != llama_hybrid_layer_mode::TENSOR_P2C) {
+    if (!cpu_dev) {
         std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=MODEL_OR_NOT_P2C_LAYER layer=%d\n",
-            layer);
+            "[CYCLE_REAL_P2C] status=FAIL reason=CPU_DEVICE_MISSING\n");
         return 1;
     }
-
-    const auto & lw = model->layers[size_t(layer)];
-    if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_OUT", lw.wo, phone_dev) ||
-        !cycle_real_check_phone_weight("FFN_NORM", lw.ffn_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("MOE_ROUTER", lw.ffn_gate_inp, phone_dev)) {
-        std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=ATTENTION_ROUTER_NOT_PHONE_OWNED\n");
-        return 1;
-    }
-    const int64_t hidden = model->hparams.n_embd;
-    const int64_t topk = model->hparams.n_expert_used;
-    const int64_t experts = model->hparams.n_expert;
-    // The first real comparison intentionally covers ordinary Qwen3-MoE
-    // SwiGLU without extra expert scaling/clamping. Reject unsupported
-    // architectures/layouts rather than silently comparing unlike formulas.
-    if (model->hparams.swiglu_clamp_exp[size_t(layer)] > 1.0e-6f ||
-        lw.ffn_gate_exps_s || lw.ffn_up_exps_s || lw.ffn_down_exps_s ||
-        !llama_hybrid_cycle_ffn_partition_valid(
-            lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps,
-            hidden, experts)) {
-        std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=WEIGHT_SHARD_OR_SCALES\n");
-        return 1;
-    }
-    const auto pc_weights = llama_hybrid_cycle_get_physical_ffn_weights(
-        lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps, 0);
-    const auto phone_weights = llama_hybrid_cycle_get_physical_ffn_weights(
-        lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps, 1);
-    std::printf("[CYCLE_REAL_MODEL] layer=%d hidden=%lld topk=%lld experts=%lld "
-                "pc_channels=%lld phone_channels=%lld type=%s status=OK\n",
-                layer, (long long)hidden, (long long)topk, (long long)experts,
-                (long long)pc_weights.up->ne[1],
-                (long long)phone_weights.up->ne[1],
-                ggml_type_name(lw.ffn_up_exps->type));
 
     const std::string suffix = "-" + std::to_string(layer);
     const std::string residual_name = "ffn_inp" + suffix;
@@ -397,63 +337,202 @@ int main(int argc, char ** argv) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512;
-    cp.n_batch = 128;
-    cp.n_ubatch = 128;
-    cp.n_threads = 8;
-    cp.n_threads_batch = 8;
-    cp.cb_eval = cycle_real_capture_cb;
-    cp.cb_eval_user_data = &capture;
-    std::unique_ptr<llama_context, decltype(&llama_free)> context(
-        llama_init_from_model(model.get(), cp), &llama_free);
-    if (!context) {
-        std::fprintf(stderr, "[CYCLE_REAL_P2C] status=FAIL reason=CONTEXT_INIT\n");
-        return 1;
-    }
-
     const std::string prompt = argc == 5 ? argv[4] :
         "The quick brown fox jumps over the lazy dog. Please explain a transformer.";
-    std::vector<llama_token> tokens(4096);
-    int32_t ntokens = llama_tokenize(
-        llama_model_get_vocab(model.get()), prompt.c_str(), int(prompt.size()),
-        tokens.data(), int32_t(tokens.size()), true, true);
-    if (ntokens < 0) {
-        tokens.resize(size_t(-ntokens));
+    int32_t ntokens = 0;
+    int32_t reference_layers = 0;
+    int64_t reference_hidden = 0;
+    int64_t reference_topk = 0;
+    int64_t reference_experts = 0;
+    double forward_ms = 0.0;
+
+    // The Cycle model has a placement-only C2P/P2C policy and MUST NOT run
+    // through the legacy Meta full-model scheduler. Establish an independent
+    // complete-layer reference on ordinary CPU first. Its GGUF mmap and KV
+    // resources are freed before loading the physical PC/Phone Cycle shards,
+    // so the two copies of a 30B model never coexist in memory.
+    {
+        ggml_backend_dev_t reference_devices[2] = {cpu_dev, nullptr};
+        llama_model_params reference_params = llama_model_default_params();
+        reference_params.devices = reference_devices;
+        reference_params.n_gpu_layers = 0;
+        reference_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        reference_params.hybrid_auto = false;
+        reference_params.use_mmap = true;
+        std::printf("[CYCLE_REAL_REFERENCE] backend=CPU_ONLY "
+                    "split_mode=LAYER model_load=BEGIN\n");
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> reference_model(
+            llama_model_load_from_file(argv[1], reference_params), &llama_model_free);
+        reference_layers = reference_model ?
+            llama_model_n_layer(reference_model.get()) : 0;
+        llama_hybrid_cycle_layout expected_layout;
+        if (!reference_model ||
+            reference_model->arch != LLM_ARCH_QWEN3MOE ||
+            reference_layers <= 1 || layer >= reference_layers - 1 ||
+            !llama_hybrid_cycle_layout_from_env(
+                reference_layers, expected_layout) ||
+            expected_layout.kinds[size_t(layer)] !=
+                llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_P2C] status=FAIL reason=REFERENCE_MODEL_OR_LAYER\n");
+            return 1;
+        }
+        reference_hidden = reference_model->hparams.n_embd;
+        reference_topk = reference_model->hparams.n_expert_used;
+        reference_experts = reference_model->hparams.n_expert;
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 512;
+        cp.n_batch = 128;
+        cp.n_ubatch = 128;
+        cp.n_threads = 8;
+        cp.n_threads_batch = 8;
+        cp.cb_eval = cycle_real_capture_cb;
+        cp.cb_eval_user_data = &capture;
+        std::unique_ptr<llama_context, decltype(&llama_free)> reference_context(
+            llama_init_from_model(reference_model.get(), cp), &llama_free);
+        if (!reference_context) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_P2C] status=FAIL reason=REFERENCE_CONTEXT_INIT\n");
+            return 1;
+        }
+        std::vector<llama_token> tokens(4096);
         ntokens = llama_tokenize(
-            llama_model_get_vocab(model.get()), prompt.c_str(), int(prompt.size()),
+            llama_model_get_vocab(reference_model.get()),
+            prompt.c_str(), int(prompt.size()),
             tokens.data(), int32_t(tokens.size()), true, true);
+        if (ntokens < 0) {
+            tokens.resize(size_t(-ntokens));
+            ntokens = llama_tokenize(
+                llama_model_get_vocab(reference_model.get()),
+                prompt.c_str(), int(prompt.size()),
+                tokens.data(), int32_t(tokens.size()), true, true);
+        }
+        if (ntokens < 1 || ntokens > int32_t(cp.n_batch) ||
+            ntokens > int32_t(cp.n_ctx)) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_P2C] status=FAIL reason=TOKEN_COUNT "
+                "tokens=%d max=%u\n",
+                int(ntokens), cp.n_batch);
+            return 1;
+        }
+
+        llama_batch batch = llama_batch_init(ntokens, 0, 1);
+        batch.n_tokens = ntokens;
+        for (int i = 0; i < ntokens; ++i) {
+            batch.token[i] = tokens[size_t(i)];
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = (i == ntokens - 1) ? 1 : 0;
+        }
+        std::printf(
+            "[CYCLE_REAL_FORWARD] layer=%d prompt_tokens=%d "
+            "source=CPU_ONLY_REFERENCE stage=BEGIN\n",
+            layer, int(ntokens));
+        const auto forward_begin = std::chrono::steady_clock::now();
+        const int decode_status =
+            llama_decode(reference_context.get(), batch);
+        llama_synchronize(reference_context.get());
+        forward_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - forward_begin).count();
+        llama_batch_free(batch);
+        if (decode_status != 0 || capture.error) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_FORWARD] status=FAIL "
+                "reason=CPU_REFERENCE_DECODE_OR_CAPTURE code=%d\n",
+                decode_status);
+            return 1;
+        }
+        std::printf(
+            "[CYCLE_REAL_FORWARD] source=CPU_ONLY_REFERENCE "
+            "stage=END wall_ms=%.3f status=PASS\n",
+            forward_ms);
     }
-    if (ntokens < 1 || ntokens > int32_t(cp.n_batch) || ntokens > int32_t(cp.n_ctx)) {
+    std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
+                "status=RELEASED_BEFORE_CYCLE_LOAD\n");
+
+    // A new model instance holds only the *real* physical Cycle weights:
+    // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
+    // weights resident on Phone. No llama_context/full-graph Meta execution
+    // is permitted for this placement-only model.
+    const auto reg = ggml_backend_rpc_add_server(argv[2]);
+    if (!reg || ggml_backend_reg_dev_count(reg) != 1) {
         std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=TOKEN_COUNT tokens=%d max=%u\n",
-            int(ntokens), cp.n_batch);
+            "[CYCLE_REAL_P2C] status=FAIL reason=RPC_DEVICE_COUNT\n");
+        return 1;
+    }
+    const auto phone_dev = ggml_backend_reg_dev_get(reg, 0);
+    if (!phone_dev ||
+        ggml_backend_dev_type(phone_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=NOT_PHONE_GPU\n");
+        return 1;
+    }
+    ggml_backend_dev_t devices[3] = {cpu_dev, phone_dev, nullptr};
+    llama_model_params mp = llama_model_default_params();
+    mp.devices = devices;
+    mp.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    mp.hybrid_auto = false;
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+        llama_model_load_from_file(argv[1], mp), &llama_model_free);
+    const int32_t model_layers =
+        model ? llama_model_n_layer(model.get()) : 0;
+    if (!model || model->arch != LLM_ARCH_QWEN3MOE ||
+        model_layers != reference_layers ||
+        layer >= model_layers - 1 ||
+        model->hybrid_layer_modes.size() != size_t(model_layers) ||
+        model->hybrid_layer_modes[size_t(layer)] !=
+            llama_hybrid_layer_mode::TENSOR_P2C) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL "
+            "reason=MODEL_OR_NOT_P2C_LAYER layer=%d\n", layer);
         return 1;
     }
 
-    llama_batch batch = llama_batch_init(ntokens, 0, 1);
-    batch.n_tokens = ntokens;
-    for (int i = 0; i < ntokens; ++i) {
-        batch.token[i] = tokens[size_t(i)];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == ntokens - 1) ? 1 : 0;
-    }
-    std::printf("[CYCLE_REAL_FORWARD] layer=%d prompt_tokens=%d stage=BEGIN\n",
-                layer, int(ntokens));
-    const auto forward_begin = std::chrono::steady_clock::now();
-    const int decode_status = llama_decode(context.get(), batch);
-    llama_synchronize(context.get());
-    const double forward_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - forward_begin).count();
-    llama_batch_free(batch);
-    if (decode_status != 0 || capture.error) {
+    const auto & lw = model->layers[size_t(layer)];
+    if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_OUT", lw.wo, phone_dev) ||
+        !cycle_real_check_phone_weight("FFN_NORM", lw.ffn_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("MOE_ROUTER", lw.ffn_gate_inp, phone_dev)) {
         std::fprintf(stderr,
-            "[CYCLE_REAL_FORWARD] status=FAIL reason=DECODE_OR_CAPTURE code=%d\n",
-            decode_status);
+            "[CYCLE_REAL_P2C] status=FAIL "
+            "reason=ATTENTION_ROUTER_NOT_PHONE_OWNED\n");
         return 1;
     }
+    const int64_t hidden = model->hparams.n_embd;
+    const int64_t topk = model->hparams.n_expert_used;
+    const int64_t experts = model->hparams.n_expert;
+    if (hidden != reference_hidden || topk != reference_topk ||
+        experts != reference_experts) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL "
+            "reason=REFERENCE_CYCLE_HPARAM_MISMATCH\n");
+        return 1;
+    }
+    // The first real comparison covers ordinary Qwen3-MoE SwiGLU, without
+    // extra per-expert scales or clamping. Reject unsupported formulas.
+    if (model->hparams.swiglu_clamp_exp[size_t(layer)] > 1.0e-6f ||
+        lw.ffn_gate_exps_s || lw.ffn_up_exps_s || lw.ffn_down_exps_s ||
+        !llama_hybrid_cycle_ffn_partition_valid(
+            lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps,
+            hidden, experts)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=WEIGHT_SHARD_OR_SCALES\n");
+        return 1;
+    }
+    const auto pc_weights = llama_hybrid_cycle_get_physical_ffn_weights(
+        lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps, 0);
+    const auto phone_weights = llama_hybrid_cycle_get_physical_ffn_weights(
+        lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps, 1);
+    std::printf("[CYCLE_REAL_MODEL] layer=%d hidden=%lld topk=%lld "
+                "experts=%lld pc_channels=%lld phone_channels=%lld "
+                "type=%s status=OK\n",
+                layer, (long long)hidden, (long long)topk,
+                (long long)experts, (long long)pc_weights.up->ne[1],
+                (long long)phone_weights.up->ne[1],
+                ggml_type_name(lw.ffn_up_exps->type));
+
     if (!cycle_real_check_capture(capture, residual_name, GGML_TYPE_F32, hidden, ntokens, 1) ||
         !cycle_real_check_capture(capture, norm_name, GGML_TYPE_F32, hidden, ntokens, 1) ||
         !cycle_real_check_capture(capture, ids_name, GGML_TYPE_I32, topk, ntokens, 1) ||
@@ -518,7 +597,7 @@ int main(int argc, char ** argv) {
         }
     }
     std::printf("[CYCLE_REAL_READY] layer=%d tokens=%d fields=RESIDUAL,NORM,TOPK,WEIGHTS "
-                "source=REAL_MODEL status=OK\n", layer, int(ntokens));
+                "source=CPU_ONLY_REFERENCE status=OK\n", layer, int(ntokens));
 
     // Exercise the V1 P2C READY wire representation with the *real* tensor
     // values, including frame direction and seq. This is an in-process
@@ -682,9 +761,10 @@ int main(int argc, char ** argv) {
                       ffn_diff.pass && out_diff.pass;
     std::printf("[CYCLE_REAL_P2C_SUM] layer=%d tokens=%d "
                 "forward_ms=%.3f ffn_parallel_ms=%.3f "
-                "real_attention=FULL_MODEL_REFERENCE real_ffn_weights=1 "
+                "real_attention=CPU_ONLY_REFERENCE phone_attention_executed=0 "
+                "real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
-                "reference=FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
+                "reference=CPU_FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
                 "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
                 layer, int(ntokens), forward_ms, parts_ms,
                 pass ? "PASS" : "FAIL");
