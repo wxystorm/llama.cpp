@@ -1,4 +1,4 @@
-#include "llama-hybrid-cycle-graph.h"
+#include "llama-hybrid-cycle-ffn-executor.h"
 #include "ggml-alloc.h"
 
 #include <algorithm>
@@ -59,18 +59,21 @@ static std::vector<float> run_ffn_shard(
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
     ggml_build_forward_expand(graph, out);
 
-    auto * tmp = ggml_backend_alloc_ctx_tensors_from_buft(
-        ctx, ggml_backend_get_default_buffer_type(cpu));
-    assert(tmp);
-    ggml_backend_tensor_set(v.norm, input.data(), 0, input.size() * sizeof(float));
-    ggml_backend_tensor_set(v.topk_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(v.topk_weights, routing.data(), 0, routing.size() * sizeof(float));
-    assert(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
-
     std::vector<float> values(size_t(hidden * tokens));
-    ggml_backend_tensor_get(out, values.data(), 0, values.size() * sizeof(float));
+    {
+        llama_hybrid_cycle_ffn_executor executor;
+        const llama_hybrid_cycle_ffn_graph ffn {
+            v.norm, v.topk_ids, v.topk_weights, out
+        };
+        assert(executor.prepare(cpu, ctx, graph, ffn, w,
+                                hidden, tokens, topk, w.up->ne[2]));
+        assert(executor.execute(
+            input.data(), input.size(),
+            ids.data(), ids.size(),
+            routing.data(), routing.size(),
+            values.data(), values.size()));
+    } // Compute buffer must be released before ctx.
 
-    ggml_backend_buffer_free(tmp);
     ggml_free(ctx);
     return values;
 }
