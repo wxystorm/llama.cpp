@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <optional>
 #include <string>
@@ -1552,7 +1553,10 @@ struct rpc_inference_owned_frame {
 
 struct rpc_inference_receive_state {
     std::mutex mutex;
+    std::condition_variable cv;
     const inference_transport * transport_id = nullptr;
+    uint64_t generation = 0;
+    bool failed = false;
     std::deque<rpc_inference_owned_frame> pending;
 };
 
@@ -1571,12 +1575,97 @@ rpc_inference_get_receive_state(const std::string & endpoint) {
     return state;
 }
 
+static void rpc_inference_ensure_receiver(
+        const std::string & endpoint,
+        const std::shared_ptr<inference_transport> & transport,
+        const std::shared_ptr<rpc_inference_receive_state> & state) {
+    if (!transport || !state) {
+        return;
+    }
+
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->transport_id == transport.get() &&
+                !state->failed) {
+            return;
+        }
+
+        state->transport_id = transport.get();
+        generation = ++state->generation;
+        state->failed = false;
+        state->pending.clear();
+    }
+
+    // One application-level dispatcher per live data-plane connection.
+    // inference_transport already owns the socket RX thread; this dispatcher
+    // only drains ready RX slots and demultiplexes them to Route/Return
+    // waiters so no waiter monopolizes receive().
+    std::thread(
+        [endpoint, transport, state, generation]() {
+            constexpr size_t MAX_PENDING_FRAMES = 256;
+
+            while (transport->healthy()) {
+                inference_rx_frame frame;
+                if (!transport->receive(frame, -1)) {
+                    break;
+                }
+
+                rpc_inference_owned_frame owned;
+                owned.header = frame.header;
+                if (frame.size > 0) {
+                    owned.data.assign(
+                        frame.data,
+                        frame.data + frame.size);
+                }
+                transport->release_rx(std::move(frame));
+
+                bool overflow = false;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->generation != generation ||
+                            state->transport_id != transport.get()) {
+                        return;
+                    }
+
+                    if (state->pending.size() >= MAX_PENDING_FRAMES) {
+                        state->failed = true;
+                        overflow = true;
+                    } else {
+                        state->pending.push_back(std::move(owned));
+                    }
+                }
+                state->cv.notify_all();
+
+                if (overflow) {
+                    GGML_LOG_ERROR(
+                        "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+                        "reason=demux_overflow endpoint=%s pending=%zu\n",
+                        endpoint.c_str(),
+                        MAX_PENDING_FRAMES);
+                    transport->stop();
+                    break;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->generation == generation &&
+                        state->transport_id == transport.get()) {
+                    state->failed = true;
+                }
+            }
+            state->cv.notify_all();
+        }).detach();
+}
+
 static bool rpc_inference_frame_matches(
         const inference_frame_header & header,
+        uint16_t type,
         uint16_t stage,
         uint32_t stream_id,
         uint64_t seq) {
-    return header.type == INFERENCE_FRAME_DATA &&
+    return header.type == type &&
         header.stage == stage &&
         header.stream_id == stream_id &&
         header.seq == seq;
@@ -1584,100 +1673,126 @@ static bool rpc_inference_frame_matches(
 
 static bool rpc_inference_receive_matching(
         const std::string & endpoint,
+        uint16_t type,
         uint16_t stage,
         uint32_t stream_id,
         uint64_t seq,
         size_t expected_size,
         std::vector<uint8_t> & output,
-        inference_frame_header * header_out = nullptr) {
+        inference_frame_header * header_out = nullptr,
+        int timeout_ms = -1) {
     auto transport = get_inference_transport(endpoint);
     if (!transport) {
         return false;
     }
 
     auto state = rpc_inference_get_receive_state(endpoint);
-    std::unique_lock<std::mutex> dispatch_lock(state->mutex);
+    rpc_inference_ensure_receiver(endpoint, transport, state);
 
-    if (state->transport_id != transport.get()) {
-        state->pending.clear();
-        state->transport_id = transport.get();
-    }
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const uint64_t generation = state->generation;
 
-    auto consume_owned =
-        [&](rpc_inference_owned_frame && owned) -> bool {
-            if (owned.data.size() != expected_size) {
-                GGML_LOG_ERROR(
-                    "[INFERENCE_DATA_PLANE] side=client status=FAIL "
-                    "reason=size_mismatch stage=%u stream=%u "
-                    "seq=%" PRIu64 " expected=%zu actual=%zu\n",
-                    static_cast<unsigned>(stage),
+    auto find_match = [&]() {
+        return std::find_if(
+            state->pending.begin(),
+            state->pending.end(),
+            [&](const rpc_inference_owned_frame & owned) {
+                return rpc_inference_frame_matches(
+                    owned.header,
+                    type,
+                    stage,
                     stream_id,
-                    seq,
-                    expected_size,
-                    owned.data.size());
-                return false;
-            }
-            if (header_out != nullptr) {
-                *header_out = owned.header;
-            }
-            output = std::move(owned.data);
-            return true;
-        };
+                    seq);
+            });
+    };
 
-    for (auto it = state->pending.begin();
-            it != state->pending.end();
-            ++it) {
-        if (rpc_inference_frame_matches(
-                it->header, stage, stream_id, seq)) {
-            rpc_inference_owned_frame owned =
-                std::move(*it);
-            state->pending.erase(it);
-            return consume_owned(std::move(owned));
+    auto ready = [&]() {
+        return find_match() != state->pending.end() ||
+            state->failed ||
+            state->generation != generation;
+    };
+
+    if (timeout_ms < 0) {
+        state->cv.wait(lock, ready);
+    } else {
+        const bool woke = state->cv.wait_for(
+            lock,
+            std::chrono::milliseconds(timeout_ms),
+            ready);
+        if (!woke) {
+            return false;
         }
     }
 
-    while (transport->healthy()) {
-        inference_rx_frame frame;
-        if (!transport->receive(frame, -1)) {
-            return false;
-        }
-
-        rpc_inference_owned_frame owned;
-        owned.header = frame.header;
-        if (frame.size > 0) {
-            owned.data.assign(
-                frame.data,
-                frame.data + frame.size);
-        }
-        transport->release_rx(std::move(frame));
-
-        if (rpc_inference_frame_matches(
-                owned.header, stage, stream_id, seq)) {
-            return consume_owned(std::move(owned));
-        }
-
-        if (owned.header.type != INFERENCE_FRAME_DATA) {
-            continue;
-        }
-
-        constexpr size_t MAX_PENDING_FRAMES = 256;
-        if (state->pending.size() >= MAX_PENDING_FRAMES) {
-            GGML_LOG_ERROR(
-                "[INFERENCE_DATA_PLANE] side=client status=FAIL "
-                "reason=demux_overflow pending=%zu stage=%u "
-                "stream=%u seq=%" PRIu64 "\n",
-                state->pending.size(),
-                static_cast<unsigned>(owned.header.stage),
-                owned.header.stream_id,
-                owned.header.seq);
-            transport->stop();
-            return false;
-        }
-
-        state->pending.push_back(std::move(owned));
+    auto it = find_match();
+    if (it == state->pending.end()) {
+        return false;
     }
 
-    return false;
+    rpc_inference_owned_frame owned = std::move(*it);
+    state->pending.erase(it);
+    lock.unlock();
+
+    if (owned.data.size() != expected_size) {
+        GGML_LOG_ERROR(
+            "[INFERENCE_DATA_PLANE] side=client status=FAIL "
+            "reason=size_mismatch type=%u stage=%u stream=%u "
+            "seq=%" PRIu64 " expected=%zu actual=%zu\n",
+            static_cast<unsigned>(type),
+            static_cast<unsigned>(stage),
+            stream_id,
+            seq,
+            expected_size,
+            owned.data.size());
+        return false;
+    }
+
+    if (header_out != nullptr) {
+        *header_out = owned.header;
+    }
+    output = std::move(owned.data);
+    return true;
+}
+
+static bool rpc_inference_receive_any(
+        const std::string & endpoint,
+        rpc_inference_owned_frame & output,
+        int timeout_ms) {
+    auto transport = get_inference_transport(endpoint);
+    if (!transport) {
+        return false;
+    }
+
+    auto state = rpc_inference_get_receive_state(endpoint);
+    rpc_inference_ensure_receiver(endpoint, transport, state);
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const uint64_t generation = state->generation;
+    auto ready = [&]() {
+        return !state->pending.empty() ||
+            state->failed ||
+            state->generation != generation;
+    };
+
+    if (timeout_ms < 0) {
+        state->cv.wait(lock, ready);
+    } else {
+        const bool woke = state->cv.wait_for(
+            lock,
+            std::chrono::milliseconds(timeout_ms),
+            ready);
+        if (!woke) {
+            return false;
+        }
+    }
+
+    if (state->pending.empty()) {
+        return false;
+    }
+
+    output = std::move(state->pending.front());
+    state->pending.pop_front();
+    return true;
 }
 
 static ggml_backend_rpc_device_context *
@@ -1760,20 +1875,20 @@ static bool ggml_backend_rpc_inference_transport_receive(
         return false;
     }
 
-    auto transport =
-        get_inference_transport(ctx->endpoint);
-    if (!transport) {
+    rpc_inference_owned_frame frame;
+    if (!rpc_inference_receive_any(
+            ctx->endpoint,
+            frame,
+            timeout_ms)) {
         return false;
     }
 
-    inference_rx_frame frame;
-    if (!transport->receive(frame, timeout_ms)) {
-        return false;
-    }
-
-    const bool fits = frame.size <= capacity;
-    if (fits && frame.size > 0) {
-        std::memcpy(data, frame.data, frame.size);
+    const bool fits = frame.data.size() <= capacity;
+    if (fits && !frame.data.empty()) {
+        std::memcpy(
+            data,
+            frame.data.data(),
+            frame.data.size());
     }
 
     task->graph_id = frame.header.graph_id;
@@ -1786,9 +1901,8 @@ static bool ggml_backend_rpc_inference_transport_receive(
     task->priority = frame.header.priority;
     task->flags =
         static_cast<uint16_t>(frame.header.flags & 0xffffu);
-    *size = frame.size;
+    *size = frame.data.size();
 
-    transport->release_rx(std::move(frame));
     return fits;
 }
 
@@ -3309,6 +3423,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
         if (status) {
             status = rpc_inference_receive_matching(
                 rpc_ctx->endpoint,
+                INFERENCE_FRAME_DATA,
                 INFERENCE_STAGE_ROUTE,
                 rpc_ctx->device,
                 seq,
