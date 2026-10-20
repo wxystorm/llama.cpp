@@ -136,6 +136,21 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
+            if (llama_hybrid_cycle_requested()) {
+                // Cycle V1 must never silently include PC CUDA or Phone NPU
+                // in Meta: backend 0=PC CPU, backend 1=Phone GPU RPC. The
+                // local PC CUDA backend is used only for the final tail.
+                const auto * reg = n_devs == 2 ?
+                    ggml_backend_dev_backend_reg(params.devices[1]) : nullptr;
+                if (n_devs != 2 ||
+                    ggml_backend_dev_type(params.devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    reg == nullptr ||
+                    std::strcmp(ggml_backend_reg_name(reg), "RPC") != 0) {
+                    LLAMA_LOG_ERROR("%s: fixed cycle requires --device CPU,<Phone-GPU-RPC> "
+                                   "in that exact order (Meta cannot include CUDA/NPU)\n", __func__);
+                    return false;
+                }
+            }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
@@ -174,7 +189,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 if (reg != nullptr && ggml_backend_reg_name(reg) == std::string("RPC")) {
                     has_rpc = true;
                 }
-                if (params.hybrid_auto &&
+                if ((params.hybrid_auto || llama_hybrid_cycle_requested()) &&
                     (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC"))) {
                     continue;
                 }
@@ -188,6 +203,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
+                return false;
+            }
+            if (llama_hybrid_cycle_requested() &&
+                (devs.size() != 2 ||
+                 ggml_backend_dev_type(devs[0]) != GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                LLAMA_LOG_ERROR("%s: fixed cycle needs exactly PC CPU + one Phone GPU RPC. "
+                               "If multiple RPC devices exist, explicitly select CPU and "
+                               "the Phone GPU RPC only; do not include NPU or CUDA.\n", __func__);
                 return false;
             }
 
