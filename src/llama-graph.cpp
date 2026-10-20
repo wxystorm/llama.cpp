@@ -1266,6 +1266,10 @@ void llm_graph_result::reset() {
     t_h_nextn      = nullptr;
     t_stage_input  = nullptr;
     t_stage_output = nullptr;
+    t_cycle_ready_residual     = nullptr;
+    t_cycle_ready_norm         = nullptr;
+    t_cycle_ready_topk_ids     = nullptr;
+    t_cycle_ready_topk_weights = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1314,6 +1318,18 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_stage_output != nullptr) {
         ggml_set_output(t_stage_output);
+    }
+    if (t_cycle_ready_residual != nullptr) {
+        ggml_set_output(t_cycle_ready_residual);
+    }
+    if (t_cycle_ready_norm != nullptr) {
+        ggml_set_output(t_cycle_ready_norm);
+    }
+    if (t_cycle_ready_topk_ids != nullptr) {
+        ggml_set_output(t_cycle_ready_topk_ids);
+    }
+    if (t_cycle_ready_topk_weights != nullptr) {
+        ggml_set_output(t_cycle_ready_topk_weights);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
