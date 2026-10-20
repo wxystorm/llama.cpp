@@ -15,6 +15,8 @@
 #include "llama-model.h"
 #include "llama-hybrid-cycle.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
+#include "inference-cycle-transport.h"
+#include "inference-cycle-reduce.h"
 #include "ggml-rpc.h"
 #include "ggml-backend.h"
 
@@ -420,6 +422,55 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_REAL_READY] layer=%d tokens=%d fields=RESIDUAL,NORM,TOPK,WEIGHTS "
                 "source=REAL_MODEL status=OK\n", layer, int(ntokens));
 
+    // Exercise the V1 P2C READY wire representation with the *real* tensor
+    // values, including frame direction and seq. This is an in-process
+    // encode/decode check, NOT a claim that the new network sender is wired.
+    const inference_cycle_ready_view ready_source {
+        uint32_t(ntokens), uint32_t(hidden), uint32_t(topk),
+        residual.data(), norm.data(), ids.data(), routing.data(),
+    };
+    size_t ready_bytes = 0;
+    if (!inference_cycle_payload_size(
+            INFERENCE_CYCLE_READY, uint32_t(ntokens), uint32_t(hidden),
+            uint32_t(topk), ready_bytes)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=READY_WIRE_SIZE\n");
+        return 1;
+    }
+    std::vector<uint8_t> ready_wire(ready_bytes);
+    size_t ready_written = 0;
+    if (!inference_cycle_write_ready(
+            ready_wire.data(), ready_wire.size(), ready_source, ready_written) ||
+        ready_written != ready_wire.size()) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=READY_WIRE_ENCODE\n");
+        return 1;
+    }
+    inference_frame_header ready_header = inference_make_header(INFERENCE_FRAME_DATA);
+    ready_header.stage = INFERENCE_STAGE_CYCLE_READY;
+    ready_header.tensor_role = INFERENCE_CYCLE_PHONE_TO_PC;
+    ready_header.layer = layer;
+    ready_header.chunk = 0;
+    ready_header.seq = 1;
+    ready_header.graph_id = 1;
+    ready_header.payload_bytes = ready_wire.size();
+    inference_cycle_message ready_msg;
+    if (!inference_cycle_decode_frame(
+            ready_header, ready_wire.data(), ready_wire.size(), ready_msg) ||
+        ready_msg.kind != INFERENCE_CYCLE_READY ||
+        ready_msg.direction != INFERENCE_CYCLE_PHONE_TO_PC ||
+        ready_msg.layer != layer || ready_msg.seq != 1 ||
+        ready_msg.ready.topk_ids != ids ||
+        ready_msg.ready.topk_weights != routing ||
+        ready_msg.ready.ffn_norm != norm ||
+        ready_msg.ready.residual != residual) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=READY_WIRE_DECODE\n");
+        return 1;
+    }
+    std::printf("[CYCLE_REAL_WIRE] stage=READY direction=P2C "
+                "bytes=%zu mode=IN_PROCESS_CODEC status=PASS\n", ready_bytes);
+
     ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
     ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
     if (!cpu || !phone || !ggml_backend_is_rpc(phone)) {
@@ -439,8 +490,12 @@ int main(int argc, char ** argv) {
         return part;
     });
     std::vector<float> pc_part;
+    // The receiving PC consumes only the decoded READY, not its source arrays.
+    // The Phone FFN above continues to use the sender's original inputs.
     const bool pc_ok = cycle_real_execute_ffn(
-        cpu, pc_weights, norm, ids, routing,
+        cpu, pc_weights,
+        ready_msg.ready.ffn_norm, ready_msg.ready.topk_ids,
+        ready_msg.ready.topk_weights,
         hidden, ntokens, topk, experts, pc_part);
     const auto phone_part = phone_task.get();
     const double parts_ms = std::chrono::duration<double, std::milli>(
@@ -456,11 +511,64 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // SEND #2: serialize the actual Phone GPU FFN contribution and decode it
+    // as the PC receiver would. Both payload frames have the SAME direction.
+    const inference_cycle_partial_view partial_source {
+        uint32_t(ntokens), uint32_t(hidden), phone_part.data(),
+    };
+    size_t partial_bytes = 0;
+    if (!inference_cycle_payload_size(
+            INFERENCE_CYCLE_PARTIAL, uint32_t(ntokens), uint32_t(hidden),
+            0, partial_bytes)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=PARTIAL_WIRE_SIZE\n");
+        return 1;
+    }
+    std::vector<uint8_t> partial_wire(partial_bytes);
+    size_t partial_written = 0;
+    if (!inference_cycle_write_partial(
+            partial_wire.data(), partial_wire.size(),
+            partial_source, partial_written) ||
+        partial_written != partial_wire.size()) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=PARTIAL_WIRE_ENCODE\n");
+        return 1;
+    }
+    inference_frame_header partial_header = inference_make_header(INFERENCE_FRAME_DATA);
+    partial_header.stage = INFERENCE_STAGE_CYCLE_PARTIAL;
+    partial_header.tensor_role = INFERENCE_CYCLE_PHONE_TO_PC;
+    partial_header.layer = layer;
+    partial_header.chunk = 0;
+    partial_header.seq = ready_header.seq;
+    partial_header.graph_id = ready_header.graph_id;
+    partial_header.payload_bytes = partial_wire.size();
+    inference_cycle_message partial_msg;
+    if (!inference_cycle_decode_frame(
+            partial_header, partial_wire.data(), partial_wire.size(), partial_msg) ||
+        partial_msg.kind != INFERENCE_CYCLE_PARTIAL ||
+        partial_msg.direction != ready_msg.direction ||
+        partial_msg.layer != ready_msg.layer ||
+        partial_msg.seq != ready_msg.seq ||
+        partial_msg.graph_id != ready_msg.graph_id ||
+        partial_msg.partial.partial != phone_part) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=PARTIAL_WIRE_DECODE\n");
+        return 1;
+    }
+    std::printf("[CYCLE_REAL_WIRE] stage=PARTIAL direction=P2C "
+                "bytes=%zu mode=IN_PROCESS_CODEC status=PASS\n", partial_bytes);
+
     std::vector<float> combined_ffn(residual.size());
     std::vector<float> combined_output(residual.size());
     for (size_t i = 0; i < residual.size(); ++i) {
-        combined_ffn[i] = pc_part[i] + phone_part[i];
-        combined_output[i] = residual[i] + combined_ffn[i];
+        combined_ffn[i] = pc_part[i] + partial_msg.partial.partial[i];
+    }
+    if (!inference_cycle_reduce_p2c_pc_cpu(
+            ready_msg.ready, pc_part.data(), pc_part.size(),
+            partial_msg.partial, combined_output.data(), combined_output.size())) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_P2C] status=FAIL reason=PC_REDUCE\n");
+        return 1;
     }
     const cycle_real_diff ffn_diff = cycle_real_compare(combined_ffn, baseline_ffn);
     const cycle_real_diff out_diff = cycle_real_compare(combined_output, baseline_output);
@@ -479,7 +587,7 @@ int main(int argc, char ** argv) {
                 "real_attention=1 real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
                 "reference=FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
-                "cycle_wire=NOT_CONNECTED status=%s\n",
+                "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
                 layer, int(ntokens), forward_ms, parts_ms,
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
