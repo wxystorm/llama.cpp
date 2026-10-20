@@ -4921,6 +4921,75 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
 
     return status;
 }
+static bool ggml_backend_rpc_inference_return_wait(
+        ggml_backend_t backend,
+        uint64_t phone_ffn_seq) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    const char * inference_transport_env =
+        std::getenv("GGML_INFERENCE_TRANSPORT");
+    const bool inference_new =
+        inference_transport_env != nullptr &&
+        (std::strcmp(inference_transport_env, "new") == 0 ||
+         std::strcmp(inference_transport_env, "force-new") == 0);
+    if (!inference_new) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_INFERENCE_RETURN_ACK_MIN_PATCH = 24;
+    const std::string compute_key =
+        rpc_ctx->endpoint + "_compute";
+    const uint8_t remote_patch =
+        rpc_get_remote_patch(compute_key);
+
+    if (phone_ffn_seq == 0) {
+        return remote_patch >=
+                RPC_INFERENCE_RETURN_ACK_MIN_PATCH &&
+            get_inference_transport(
+                rpc_ctx->endpoint) != nullptr;
+    }
+
+    if (remote_patch <
+            RPC_INFERENCE_RETURN_ACK_MIN_PATCH) {
+        return false;
+    }
+
+    const int64_t begin_us = ggml_time_us();
+    std::vector<uint8_t> payload;
+    inference_frame_header ack {};
+    const bool status =
+        rpc_inference_receive_matching(
+            rpc_ctx->endpoint,
+            INFERENCE_FRAME_ACK,
+            INFERENCE_STAGE_RETURN,
+            rpc_ctx->device,
+            phone_ffn_seq,
+            0,
+            payload,
+            &ack);
+
+    if (rpc_tensor_phone_stage_profile_enabled() ||
+            std::getenv(
+                "GGML_META_XLAYER_THROTTLE_PROFILE") != nullptr) {
+        GGML_LOG_INFO(
+            "[INFERENCE_RETURN_ACK] side=client "
+            "seq=%" PRIu64 " wait_ms=%.3f status=%s\n",
+            phone_ffn_seq,
+            (ggml_time_us() - begin_us) / 1000.0,
+            status ? "OK" : "FAIL");
+    }
+
+    return status;
+}
+
 static bool ggml_backend_rpc_set_tensor_async_return(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -6258,58 +6327,11 @@ public:
         return true;
     }
 
-    bool wait_inference_return_complete(
-        uint32_t device,
-        uint64_t seq) {
-        std::unique_lock<std::mutex> lock(
-            inference_return_mutex);
-        inference_return_cv.wait(
-            lock,
-            [&]() {
-                auto device_it =
-                    inference_return_bindings.find(device);
-                if (device_it ==
-                        inference_return_bindings.end()) {
-                    return false;
-                }
-                auto seq_it =
-                    device_it->second.find(seq);
-                return seq_it != device_it->second.end() &&
-                    seq_it->second.completed;
-            });
-
-        auto device_it =
-            inference_return_bindings.find(device);
-        if (device_it ==
-                inference_return_bindings.end()) {
-            return false;
-        }
-
-        auto seq_it = device_it->second.find(seq);
-        if (seq_it == device_it->second.end()) {
-            return false;
-        }
-
-        const bool success = seq_it->second.success;
-        device_it->second.erase(seq_it);
-        if (device_it->second.empty()) {
-            inference_return_bindings.erase(device_it);
-        }
-        return success;
-    }
-
     void fail_inference_returns() {
         {
             std::lock_guard<std::mutex> lock(
                 inference_return_mutex);
-            for (auto & device_entry :
-                    inference_return_bindings) {
-                for (auto & seq_entry :
-                        device_entry.second) {
-                    seq_entry.second.completed = true;
-                    seq_entry.second.success = false;
-                }
-            }
+            inference_return_bindings.clear();
         }
         inference_return_cv.notify_all();
     }
@@ -6402,25 +6424,61 @@ public:
                 inference_return_bindings.find(device);
             if (device_it !=
                     inference_return_bindings.end()) {
-                auto seq_it =
-                    device_it->second.find(header.seq);
-                if (seq_it != device_it->second.end()) {
-                    seq_it->second.completed = true;
-                    seq_it->second.success = success;
+                device_it->second.erase(header.seq);
+                if (device_it->second.empty()) {
+                    inference_return_bindings.erase(device_it);
                 }
             }
         }
         inference_return_cv.notify_all();
 
+        int64_t ack_submit_us = 0;
+        if (success) {
+            auto transport = get_inference_data_plane();
+            const int64_t ack_begin_us = ggml_time_us();
+            inference_tx_buffer ack_tx =
+                transport ?
+                    transport->acquire_tx(0) :
+                    inference_tx_buffer {};
+            success =
+                transport != nullptr &&
+                transport->healthy() &&
+                static_cast<bool>(ack_tx);
+
+            if (success) {
+                inference_frame_header ack =
+                    inference_make_header(
+                        INFERENCE_FRAME_ACK);
+                ack.stage = INFERENCE_STAGE_RETURN;
+                ack.stream_id = device;
+                ack.seq = header.seq;
+                ack.graph_id = header.graph_id;
+                ack.layer = binding_request.layer;
+                ack.chunk = binding_request.chunk;
+
+                success = transport->submit_tx(
+                    std::move(ack_tx),
+                    ack,
+                    0);
+            } else if (ack_tx && transport) {
+                transport->release_tx(
+                    std::move(ack_tx));
+            }
+            ack_submit_us =
+                ggml_time_us() - ack_begin_us;
+        }
+
         GGML_LOG_INFO(
             "[INFERENCE_RETURN] side=server "
             "device=%u seq=%" PRIu64
-            " layer=%d chunk=%d bytes=%zu status=%s\n",
+            " layer=%d chunk=%d bytes=%zu "
+            "ack_submit_ms=%.3f status=%s\n",
             device,
             header.seq,
             binding_request.layer,
             binding_request.chunk,
             size,
+            ack_submit_us / 1000.0,
             success ? "OK" : "FAIL");
 
         return success;
@@ -6649,8 +6707,6 @@ private:
 
     struct inference_return_binding {
         rpc_msg_inference_return_bind_req request {};
-        bool completed = false;
-        bool success = false;
     };
     std::mutex inference_return_mutex;
     std::condition_variable inference_return_cv;
@@ -12753,6 +12809,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_WAIT_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return_wait);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_RETURN_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_return_wait);
     }
     if (std::strcmp(
             name,
