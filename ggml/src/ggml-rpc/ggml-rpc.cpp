@@ -3240,6 +3240,7 @@ static bool ggml_backend_rpc_get_route_snapshot(
     int64_t response_header_wait_us = 0;
     int64_t payload_recv_us = 0;
     int64_t ack_send_us = 0;
+    int64_t inference_arm_us = 0;
 
     if (use_inference_route) {
         int route_layer = -1;
@@ -3281,6 +3282,8 @@ static bool ggml_backend_rpc_get_route_snapshot(
             &arm_response,
             sizeof(arm_response));
         const int64_t control_done_us = ggml_time_us();
+        inference_arm_us =
+            control_done_us - control_begin_us;
 
         if (measure_profile) {
             rpc_cmd_roundtrip_profile_active =
@@ -3336,14 +3339,14 @@ static bool ggml_backend_rpc_get_route_snapshot(
             GGML_LOG_ERROR(
                 "[INFERENCE_ROUTE] side=client "
                 "seq=%" PRIu64 " lane=%u layer=%d chunk=%d "
-                "bytes=%zu control_ms=%.3f recv_ms=%.3f "
+                "bytes=%zu arm_ms=%.3f wait_recv_ms=%.3f "
                 "status=FAIL\n",
                 seq,
                 lane,
                 route_layer,
                 route_chunk,
                 wire_total_size,
-                (control_done_us - control_begin_us) / 1000.0,
+                inference_arm_us / 1000.0,
                 payload_recv_us / 1000.0);
             return false;
         }
@@ -3476,14 +3479,13 @@ static bool ggml_backend_rpc_get_route_snapshot(
         GGML_LOG_INFO(
             "[INFERENCE_ROUTE] side=client "
             "seq=%" PRIu64 " lane=%u bytes=%zu "
-            "sync=%.3f control=%.3f recv=%.3f "
+            "sync=%.3f arm=%.3f wait_recv=%.3f "
             "set=%.3f total=%.3f status=OK\n",
             seq,
             lane,
             wire_total_size,
             dst_sync_us / 1000.0,
-            (request_send_us +
-             response_header_wait_us) / 1000.0,
+            inference_arm_us / 1000.0,
             payload_recv_us / 1000.0,
             dst_set_us / 1000.0,
             (ggml_time_us() - client_begin_us) / 1000.0);
@@ -6362,12 +6364,10 @@ public:
         // race as well: if the immutable snapshot is already READY, queue it
         // immediately. Exact-once removal from inference_route_arms prevents
         // duplicate jobs when READY and ARM race each other.
-        queue_inference_route_if_ready(
+        return queue_inference_route_if_ready(
             request.snapshot.device,
             request.snapshot.lane,
             request.snapshot.seq);
-
-        return true;
     }
 
     struct stored_graph {
