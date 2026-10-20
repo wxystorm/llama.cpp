@@ -1053,6 +1053,8 @@ void llama_context::synchronize() {
                         break;
                     case llama_hybrid_layer_mode::TENSOR_SPLIT:
                     case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
+                    case llama_hybrid_layer_mode::TENSOR_C2P:
+                    case llama_hybrid_layer_mode::TENSOR_P2C:
                         ++n_tensor;
                         break;
                 }
@@ -7619,7 +7621,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                     model.hybrid_layer_modes.end(),
                     [](llama_hybrid_layer_mode mode) {
                         return mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
-                               mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+                               mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY ||
+                               mode == llama_hybrid_layer_mode::TENSOR_C2P ||
+                               mode == llama_hybrid_layer_mode::TENSOR_P2C;
                     });
             const uint64_t n_layers = model.hparams.n_layer();
             const uint64_t base_nodes_per_layer = (base + n_layers - 1) / n_layers;
