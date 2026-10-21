@@ -946,16 +946,18 @@ static cycle_real_diff cycle_real_compare(
 // by the GGUF weight (without quantizing the activation to Q8_K). It is an
 // independent mathematical oracle for interpreting CPU(Q4_K x Q8_K) vs
 // GPU(Q4_K x F32) dot-product differences.
-static bool cycle_real_dequantize_q4k_expert_on_cpu(
+static bool cycle_real_dequantize_k_expert_on_cpu(
         ggml_backend_t cpu_backend,
+        enum ggml_type weight_type,
         const std::vector<uint8_t> & packed,
         int64_t hidden, int64_t channels,
         std::vector<float> & dequantized) {
     if (!cpu_backend ||
+        (weight_type != GGML_TYPE_Q4_K && weight_type != GGML_TYPE_Q6_K) ||
         hidden <= 0 || channels <= 0 ||
-        hidden % ggml_blck_size(GGML_TYPE_Q4_K) != 0 ||
+        hidden % ggml_blck_size(weight_type) != 0 ||
         packed.size() !=
-            ggml_row_size(GGML_TYPE_Q4_K, hidden) * size_t(channels)) {
+            ggml_row_size(weight_type, hidden) * size_t(channels)) {
         return false;
     }
     ggml_init_params p {};
@@ -966,7 +968,7 @@ static bool cycle_real_dequantize_q4k_expert_on_cpu(
         return false;
     }
     ggml_tensor * w = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_Q4_K, hidden, channels);
+        ctx, weight_type, hidden, channels);
     ggml_tensor * rows = ggml_new_tensor_1d(
         ctx, GGML_TYPE_I32, channels);
     ggml_set_input(rows);
@@ -1034,8 +1036,8 @@ static bool cycle_real_probe_q4k_dense_f64_oracle(
         return false;
     }
     std::vector<float> dense_weights;
-    if (!cycle_real_dequantize_q4k_expert_on_cpu(
-            cpu_backend, packed, hidden, channels, dense_weights)) {
+    if (!cycle_real_dequantize_k_expert_on_cpu(
+            cpu_backend, GGML_TYPE_Q4_K, packed, hidden, channels, dense_weights)) {
         std::fprintf(stderr,
             "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
             "reason=CPU_DEQUANT\n", stage);
@@ -1577,6 +1579,374 @@ static bool cycle_real_replay_phone_matmul_id_on_cpu(
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return ok;
+}
+
+// Numerical probes below never alter the real PC/Phone Cycle execution or
+// the CPU-parity correctness gate. They use actual physical packed shards,
+// dequantized on CPU, against the same explicitly selected F32 activations.
+struct cycle_real_f64_error {
+    double max_abs = 0.0;
+    double rms = 0.0;
+    bool valid = false;
+};
+
+static cycle_real_f64_error cycle_real_compare_f64(
+        const std::vector<float> & actual,
+        const std::vector<double> & oracle) {
+    cycle_real_f64_error result {};
+    if (actual.empty() || actual.size() != oracle.size()) {
+        return result;
+    }
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (!std::isfinite(actual[i]) || !std::isfinite(oracle[i])) {
+            return result;
+        }
+        const double delta = std::fabs(double(actual[i]) - oracle[i]);
+        result.max_abs = std::max(result.max_abs, delta);
+        sum_sq += delta * delta;
+    }
+    result.rms = std::sqrt(sum_sq / double(actual.size()));
+    result.valid = true;
+    return result;
+}
+
+// Fetch exactly one expert from its physical owner. For Down the first
+// dimension is the INPUT channels of the shard (256 or 512), whereas Gate
+// and Up have hidden=2048 as the first dimension. Q6_K Down is supported
+// alongside Q4_K Gate/Up; both retain their original quantized bytes.
+static bool cycle_real_dequantize_physical_expert_for_f64(
+        ggml_backend_t cpu_backend,
+        const ggml_tensor * weight, int32_t expert,
+        std::vector<float> & dense,
+        std::vector<uint8_t> * packed_out = nullptr) {
+    if (!cpu_backend || !weight || !weight->buffer ||
+        !ggml_is_contiguous(weight) ||
+        (weight->type != GGML_TYPE_Q4_K && weight->type != GGML_TYPE_Q6_K) ||
+        weight->ne[0] <= 0 || weight->ne[1] <= 0 ||
+        expert < 0 || expert >= weight->ne[2] || weight->ne[3] != 1) {
+        return false;
+    }
+    const size_t expert_bytes =
+        ggml_row_size(weight->type, weight->ne[0]) * size_t(weight->ne[1]);
+    if (expert_bytes == 0 ||
+        ggml_nbytes(weight) != expert_bytes * size_t(weight->ne[2])) {
+        return false;
+    }
+    std::vector<uint8_t> packed(expert_bytes);
+    ggml_backend_tensor_get(weight, packed.data(),
+                            size_t(expert) * expert_bytes, expert_bytes);
+    if (!cycle_real_dequantize_k_expert_on_cpu(
+            cpu_backend, weight->type, packed, weight->ne[0],
+            weight->ne[1], dense)) {
+        return false;
+    }
+    if (packed_out) {
+        *packed_out = std::move(packed);
+    }
+    return true;
+}
+
+// One-expert matmul, run only as a controlled diagnostic. A CPU quantized
+// MUL_MAT consumes F32 x but internally may quantize it to Q8_K; the Phone
+// quantized kernels consume the same original F32 x. For moe=true the
+// single selected expert is remapped to local expert ID 0.
+static bool cycle_real_probe_single_matmul_f64_input(
+        ggml_backend_t backend,
+        enum ggml_type weight_type,
+        const void * weight_data, size_t weight_bytes,
+        const float * input, int64_t in_channels, int64_t out_channels,
+        bool moe, std::vector<float> & result) {
+    if (!backend || !weight_data || !input ||
+        in_channels <= 0 || out_channels <= 0) {
+        return false;
+    }
+    ggml_init_params params {};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * w = moe ?
+        ggml_new_tensor_3d(ctx, weight_type, in_channels, out_channels, 1) :
+        ggml_new_tensor_2d(ctx, weight_type, in_channels, out_channels);
+    ggml_tensor * x = moe ?
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in_channels, 1, 1) :
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in_channels, 1);
+    ggml_tensor * ids = moe ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1) : nullptr;
+    ggml_set_input(x);
+    if (ids) {
+        ggml_set_input(ids);
+    }
+    ggml_tensor * y = moe ?
+        ggml_mul_mat_id(ctx, w, x, ids) :
+        ggml_mul_mat(ctx, w, x);
+    if (!moe) {
+        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, y);
+    if (ggml_nbytes(w) != weight_bytes ||
+        !ggml_backend_supports_op(backend, y)) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_tensor_set(w, weight_data, 0, weight_bytes);
+    ggml_backend_tensor_set(x, input, 0, ggml_nbytes(x));
+    if (ids) {
+        const int32_t local_expert_id = 0;
+        ggml_backend_tensor_set(ids, &local_expert_id, 0, sizeof(local_expert_id));
+    }
+    const bool computed =
+        ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    if (computed) {
+        ggml_backend_synchronize(backend);
+        result.resize(size_t(out_channels));
+        ggml_backend_tensor_get(y, result.data(), 0, ggml_nbytes(y));
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return computed;
+}
+
+// Isolate Down from preceding Gate/Up/SwiGLU drift by feeding the SAME
+// captured CPU-reference SwiGLU slice to all four kernels. The selected
+// expert comes from the worst RAW_DOWN discrepancy in CPU_READY_CONTROL.
+// CPU / GPU / F64 use the identical physical Phone Down shard, including
+// any Q6_K format used by Q4_K_M models. No production graph is replaced.
+static bool cycle_real_probe_down_f64_oracle(
+        ggml_backend_t cpu_backend, ggml_backend_t phone_backend,
+        const ggml_tensor * phone_down,
+        const std::vector<float> & baseline_swiglu,
+        const std::vector<int32_t> & selected_ids,
+        int64_t full_channels, int64_t phone_channel_begin,
+        int64_t hidden, int64_t tokens, int64_t topk,
+        int32_t target_token, int32_t target_slot) {
+    if (!phone_down || !cpu_backend || !phone_backend ||
+        target_token < 0 || target_token >= tokens ||
+        target_slot < 0 || target_slot >= topk ||
+        phone_channel_begin < 0 ||
+        phone_down->ne[0] + phone_channel_begin != full_channels ||
+        phone_down->ne[1] != hidden ||
+        selected_ids.size() != size_t(tokens * topk) ||
+        baseline_swiglu.size() != size_t(tokens * topk * full_channels)) {
+        return false;
+    }
+    const size_t pair = size_t(target_token * topk + target_slot);
+    const int32_t expert = selected_ids[pair];
+    const int64_t channels = phone_down->ne[0];
+    std::vector<float> dequantized;
+    std::vector<uint8_t> packed;
+    if (!cycle_real_dequantize_physical_expert_for_f64(
+            cpu_backend, phone_down, expert, dequantized, &packed) ||
+        dequantized.size() != size_t(channels * hidden)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_DOWN_F64_ORACLE] status=NOT_AVAILABLE reason=DEQUANT\n");
+        return false;
+    }
+
+    std::vector<float> activation(size_t(channels));
+    const size_t offset = pair * size_t(full_channels) +
+                          size_t(phone_channel_begin);
+    std::copy_n(baseline_swiglu.data() + offset, size_t(channels),
+                activation.data());
+    std::vector<double> f64(size_t(hidden), 0.0);
+    for (int64_t j = 0; j < hidden; ++j) {
+        const size_t row = size_t(j * channels);
+        for (int64_t k = 0; k < channels; ++k) {
+            f64[size_t(j)] += double(dequantized[row + size_t(k)]) *
+                              double(activation[size_t(k)]);
+        }
+    }
+
+    std::vector<float> cpu_quant, gpu_quant, gpu_moe, gpu_dense;
+    const bool cpu_ok = cycle_real_probe_single_matmul_f64_input(
+        cpu_backend, phone_down->type, packed.data(), packed.size(),
+        activation.data(), channels, hidden, false, cpu_quant);
+    const bool gpu_ok = cycle_real_probe_single_matmul_f64_input(
+        phone_backend, phone_down->type, packed.data(), packed.size(),
+        activation.data(), channels, hidden, false, gpu_quant);
+    const bool moe_ok = cycle_real_probe_single_matmul_f64_input(
+        phone_backend, phone_down->type, packed.data(), packed.size(),
+        activation.data(), channels, hidden, true, gpu_moe);
+    const bool dense_ok = cycle_real_probe_single_matmul_f64_input(
+        phone_backend, GGML_TYPE_F32, dequantized.data(),
+        dequantized.size() * sizeof(float),
+        activation.data(), channels, hidden, false, gpu_dense);
+    const auto cpu_err = cycle_real_compare_f64(cpu_quant, f64);
+    const auto gpu_err = cycle_real_compare_f64(gpu_quant, f64);
+    const auto moe_err = cycle_real_compare_f64(gpu_moe, f64);
+    const auto dense_err = cycle_real_compare_f64(gpu_dense, f64);
+    if (!cpu_ok || !gpu_ok || !moe_ok || !dense_ok ||
+        !cpu_err.valid || !gpu_err.valid || !moe_err.valid ||
+        !dense_err.valid) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d "
+            "expert=%d weight_type=%s status=NOT_AVAILABLE "
+            "cpu=%d gpu_quant=%d gpu_moe=%d gpu_dense=%d\n",
+            int(target_token), int(target_slot), int(expert),
+            ggml_type_name(phone_down->type),
+            cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
+            moe_ok ? 1 : 0, dense_ok ? 1 : 0);
+        return false;
+    }
+    std::printf(
+        "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d expert=%d "
+        "weight_type=%s input_channels=%lld output_channels=%lld "
+        "input=CPU_REFERENCE_SWIGLU_SAME_FOR_ALL "
+        "cpu_quantq8_vs_f64_max_abs=%.8g cpu_quantq8_vs_f64_rms=%.8g "
+        "gpu_quantf32_vs_f64_max_abs=%.8g gpu_quantf32_vs_f64_rms=%.8g "
+        "gpu_moe_vs_f64_max_abs=%.8g gpu_moe_vs_f64_rms=%.8g "
+        "gpu_dense_f32_vs_f64_max_abs=%.8g gpu_dense_f32_vs_f64_rms=%.8g "
+        "status=MEASURED scope=DIAGNOSTIC_ONLY\n",
+        int(target_token), int(target_slot), int(expert),
+        ggml_type_name(phone_down->type),
+        (long long)channels, (long long)hidden,
+        cpu_err.max_abs, cpu_err.rms,
+        gpu_err.max_abs, gpu_err.rms,
+        moe_err.max_abs, moe_err.rms,
+        dense_err.max_abs, dense_err.rms);
+    return true;
+}
+
+// Independently rebuild the FULL selected-expert FFN with F64 dot products
+// and F64 SiLU/SwiGLU/Down/weighted expert summation, using the original
+// F32 CPU_READY_CONTROL Norm and Router weights. Fetch both actual physical
+// PC and Phone quantized shards; no copy of the entire 30B CPU model is
+// retained. This separates CPU numerical approximation from heterogeneous
+// approximation WITHOUT conflating either with Phone Attention input drift.
+static bool cycle_real_probe_full_ffn_f64_oracle(
+        ggml_backend_t cpu_backend,
+        const llama_hybrid_cycle_ffn_shard_weights & pc_weights,
+        const llama_hybrid_cycle_ffn_shard_weights & phone_weights,
+        const std::vector<float> & input_norm,
+        const std::vector<int32_t> & selected_ids,
+        const std::vector<float> & routing_weights,
+        const std::vector<float> & baseline_ffn,
+        const std::vector<float> & physical_control_ffn,
+        int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
+    const int64_t pc_channels = pc_weights.gate->ne[1];
+    const int64_t phone_channels = phone_weights.gate->ne[1];
+    const auto shard_valid = [&](const llama_hybrid_cycle_ffn_shard_weights & shard,
+                                 int64_t width) {
+        return shard.gate && shard.up && shard.down &&
+            shard.gate->ne[0] == hidden && shard.up->ne[0] == hidden &&
+            shard.gate->ne[1] == width && shard.up->ne[1] == width &&
+            shard.down->ne[0] == width && shard.down->ne[1] == hidden &&
+            shard.gate->ne[2] == experts && shard.up->ne[2] == experts &&
+            shard.down->ne[2] == experts;
+    };
+    if (!cpu_backend || hidden <= 0 || tokens <= 0 || tokens > 2 ||
+        topk <= 0 || experts <= 0 ||
+        pc_channels <= 0 || phone_channels <= 0 ||
+        !shard_valid(pc_weights, pc_channels) ||
+        !shard_valid(phone_weights, phone_channels) ||
+        input_norm.size() != size_t(hidden * tokens) ||
+        selected_ids.size() != size_t(topk * tokens) ||
+        routing_weights.size() != size_t(topk * tokens) ||
+        baseline_ffn.size() != size_t(hidden * tokens) ||
+        physical_control_ffn.size() != size_t(hidden * tokens)) {
+        return false;
+    }
+
+    std::vector<double> oracle(size_t(hidden * tokens), 0.0);
+    for (int64_t token = 0; token < tokens; ++token) {
+        const float * x = input_norm.data() + size_t(token * hidden);
+        for (int64_t slot = 0; slot < topk; ++slot) {
+            const size_t pair = size_t(token * topk + slot);
+            const int32_t expert = selected_ids[pair];
+            const double route_weight = double(routing_weights[pair]);
+            if (expert < 0 || expert >= experts || !std::isfinite(route_weight)) {
+                return false;
+            }
+            std::vector<double> expert_down(size_t(hidden), 0.0);
+            for (int owner = 0; owner < 2; ++owner) {
+                const auto & shard = owner == 0 ? pc_weights : phone_weights;
+                const int64_t channels = owner == 0 ? pc_channels : phone_channels;
+                std::vector<float> gate_weights, up_weights, down_weights;
+                if (!cycle_real_dequantize_physical_expert_for_f64(
+                        cpu_backend, shard.gate, expert, gate_weights) ||
+                    !cycle_real_dequantize_physical_expert_for_f64(
+                        cpu_backend, shard.up, expert, up_weights) ||
+                    !cycle_real_dequantize_physical_expert_for_f64(
+                        cpu_backend, shard.down, expert, down_weights) ||
+                    gate_weights.size() != size_t(hidden * channels) ||
+                    up_weights.size() != size_t(hidden * channels) ||
+                    down_weights.size() != size_t(channels * hidden)) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
+                        "reason=PHYSICAL_DEQUANT token=%lld slot=%lld "
+                        "expert=%d owner=%s\n",
+                        (long long)token, (long long)slot, int(expert),
+                        owner == 0 ? "PC_CPU" : "PHONE_GPU");
+                    return false;
+                }
+                std::vector<double> activated(size_t(channels), 0.0);
+                for (int64_t ch = 0; ch < channels; ++ch) {
+                    const size_t row = size_t(ch * hidden);
+                    double gate = 0.0, up = 0.0;
+                    for (int64_t k = 0; k < hidden; ++k) {
+                        gate += double(gate_weights[row + size_t(k)]) *
+                                double(x[size_t(k)]);
+                        up += double(up_weights[row + size_t(k)]) *
+                              double(x[size_t(k)]);
+                    }
+                    const double silu = gate / (1.0 + std::exp(-gate));
+                    activated[size_t(ch)] = silu * up;
+                    if (!std::isfinite(activated[size_t(ch)])) {
+                        return false;
+                    }
+                }
+                for (int64_t j = 0; j < hidden; ++j) {
+                    const size_t row = size_t(j * channels);
+                    double partial = 0.0;
+                    for (int64_t k = 0; k < channels; ++k) {
+                        partial += double(down_weights[row + size_t(k)]) *
+                                   activated[size_t(k)];
+                    }
+                    expert_down[size_t(j)] += partial;
+                }
+            }
+            for (int64_t j = 0; j < hidden; ++j) {
+                oracle[size_t(token * hidden + j)] +=
+                    route_weight * expert_down[size_t(j)];
+            }
+        }
+    }
+
+    const auto cpu_err = cycle_real_compare_f64(baseline_ffn, oracle);
+    const auto physical_err = cycle_real_compare_f64(physical_control_ffn, oracle);
+    if (!cpu_err.valid || !physical_err.valid) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
+            "reason=NONFINITE_OR_SHAPE\n");
+        return false;
+    }
+    const char * closer = physical_err.rms < cpu_err.rms ? "PC_PHONE" :
+                          physical_err.rms > cpu_err.rms ? "CPU_FULL" : "EQUAL";
+    std::printf(
+        "[CYCLE_FFN_FULL_F64_ORACLE] tokens=%lld topk=%lld "
+        "pc_channels=%lld phone_channels=%lld "
+        "input=CPU_READY_CONTROL "
+        "cpu_full_vs_f64_max_abs=%.8g cpu_full_vs_f64_rms=%.8g "
+        "pc_phone_vs_f64_max_abs=%.8g pc_phone_vs_f64_rms=%.8g "
+        "closer_by_rms=%s "
+        "oracle=DEQUANT_PHYSICAL_WEIGHTS_F64_FULL_SWIGLU_DOWN_REDUCE "
+        "status=MEASURED scope=DIAGNOSTIC_ONLY\n",
+        (long long)tokens, (long long)topk,
+        (long long)pc_channels, (long long)phone_channels,
+        cpu_err.max_abs, cpu_err.rms,
+        physical_err.max_abs, physical_err.rms, closer);
+    return true;
 }
 
 int main(int argc, char ** argv) {
