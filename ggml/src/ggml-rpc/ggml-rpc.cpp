@@ -8661,6 +8661,165 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 // packed directly into the existing inference transport TX slots, and sent
 // Phone->PC by its TX worker. The client control RPC contains descriptors
 // only and is not a second host payload transfer.
+// Called on an ordinary RPC control connection after the data-plane worker
+// has received the corresponding real C2P frame. The request contains GPU
+// destination DESCRIPTORS only; no payload is retransmitted by PC RPC.
+bool rpc_server::apply_inference_cycle(
+        const rpc_msg_inference_cycle_send_req & request) {
+    const auto kind = static_cast<inference_cycle_payload_kind>(request.kind);
+    const bool ready = kind == INFERENCE_CYCLE_READY;
+    if ((kind != INFERENCE_CYCLE_READY &&
+         kind != INFERENCE_CYCLE_PARTIAL) ||
+        request.device >= backends.size() ||
+        request.layer < 0 || request.chunk < 0 || request.seq == 0 ||
+        request.tokens == 0 || request.tokens > 128 ||
+        request.hidden == 0 || request.hidden > 65536 ||
+        (ready ? request.topk == 0 || request.topk > 128 :
+                 request.topk != 0)) {
+        return false;
+    }
+    inference_cycle_message msg;
+    const auto key = cycle_key(
+        request.layer, request.chunk, request.seq, request.graph_id,
+        request.kind);
+    {
+        std::unique_lock<std::mutex> lock(cycle_rx_mutex);
+        const bool awoke = cycle_rx_cv.wait_for(
+            lock, std::chrono::seconds(30), [&] {
+                return cycle_rx_failed || cycle_rx_frames.count(key) > 0;
+            });
+        if (!awoke || cycle_rx_failed) {
+            GGML_LOG_ERROR("[CYCLE_C2P_APPLY] status=FAIL reason=RX_TIMEOUT_OR_CLOSED "
+                           "layer=%d chunk=%d seq=%" PRIu64 "\n",
+                           request.layer, request.chunk, request.seq);
+            return false;
+        }
+        auto it = cycle_rx_frames.find(key);
+        if (it == cycle_rx_frames.end()) {
+            return false;
+        }
+        msg = std::move(it->second);
+        cycle_rx_frames.erase(it);
+    }
+
+    const size_t n = size_t(request.tokens) * request.hidden;
+    const size_t routes = size_t(request.tokens) * request.topk;
+    if ((ready &&
+         (msg.ready.tokens != request.tokens ||
+          msg.ready.hidden != request.hidden ||
+          msg.ready.topk != request.topk ||
+          msg.ready.residual.size() != n ||
+          msg.ready.ffn_norm.size() != n ||
+          msg.ready.topk_ids.size() != routes ||
+          msg.ready.topk_weights.size() != routes)) ||
+        (!ready &&
+         (msg.partial.tokens != request.tokens ||
+          msg.partial.hidden != request.hidden ||
+          msg.partial.partial.size() != n))) {
+        return false;
+    }
+
+    const void * source[4] {};
+    if (ready) {
+        source[0] = msg.ready.residual.data();
+        source[1] = msg.ready.ffn_norm.data();
+        source[2] = msg.ready.topk_ids.data();
+        source[3] = msg.ready.topk_weights.data();
+    } else {
+        source[0] = msg.partial.partial.data();
+    }
+
+    const size_t count = ready ? 4 : 1;
+    for (size_t i = 0; i < count; ++i) {
+        const rpc_tensor & dst = request.tensors[i];
+        const uint32_t type = ready && i == 2 ?
+            GGML_TYPE_I32 : GGML_TYPE_F32;
+        const size_t elements = ready && i >= 2 ? routes : n;
+        if (dst.buffer == 0 || dst.data == 0 || dst.type != type ||
+            dst.nb[0] != sizeof(float)) {
+            return false;
+        }
+        uint64_t actual = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (dst.ne[d] == 0 || actual > elements / dst.ne[d]) {
+                return false;
+            }
+            actual *= dst.ne[d];
+            if (d > 0 && dst.nb[d] !=
+                    uint64_t(dst.nb[d - 1]) * dst.ne[d - 1]) {
+                return false;
+            }
+        }
+        if (actual != elements ||
+            !set_tensor_direct(dst, 0, source[i], elements * sizeof(float))) {
+            GGML_LOG_ERROR("[CYCLE_C2P_APPLY] side=phone status=FAIL "
+                           "reason=GPU_BUFFER_SET kind=%s tensor=%zu\n",
+                           ready ? "READY" : "PARTIAL", i);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backends[request.device]);
+    // READY ACK means Phone GPU inputs can be consumed. PARTIAL needs the
+    // subsequent GPU Reduce before ACK may be sent to the PC sender.
+    if (ready) {
+        auto transport = get_inference_data_plane();
+        if (!transport || !inference_cycle_send_ack(*transport, msg, true)) {
+            return false;
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(cycle_rx_mutex);
+        if (!cycle_rx_applied_partial.insert(key).second) {
+            return false;
+        }
+    }
+    GGML_LOG_INFO(
+        "[CYCLE_C2P_APPLY] side=phone kind=%s layer=%d chunk=%d "
+        "seq=%" PRIu64 " bytes=%zu state=PHONE_GPU_DEVICE_READY\n",
+        ready ? "READY" : "PARTIAL",
+        request.layer, request.chunk, request.seq,
+        (ready ? 2 * n + 2 * routes : n) * sizeof(float));
+    return true;
+}
+
+bool rpc_server::finish_inference_cycle(
+        const rpc_msg_inference_cycle_send_req & request) {
+    if (request.device >= backends.size() ||
+        request.kind != INFERENCE_CYCLE_PARTIAL ||
+        request.layer < 0 || request.chunk < 0 || request.seq == 0) {
+        return false;
+    }
+    const auto key = cycle_key(
+        request.layer, request.chunk, request.seq, request.graph_id,
+        INFERENCE_CYCLE_PARTIAL);
+    {
+        std::lock_guard<std::mutex> lock(cycle_rx_mutex);
+        if (cycle_rx_applied_partial.count(key) == 0) {
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backends[request.device]);
+    inference_cycle_message msg;
+    msg.direction = INFERENCE_CYCLE_PC_TO_PHONE;
+    msg.kind = INFERENCE_CYCLE_PARTIAL;
+    msg.layer = request.layer;
+    msg.chunk = request.chunk;
+    msg.seq = request.seq;
+    msg.graph_id = request.graph_id;
+    auto transport = get_inference_data_plane();
+    if (!transport || !inference_cycle_send_ack(*transport, msg, true)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(cycle_rx_mutex);
+        cycle_rx_applied_partial.erase(key);
+    }
+    GGML_LOG_INFO(
+        "[CYCLE_C2P_FINISH] side=phone layer=%d chunk=%d seq=%" PRIu64
+        " reduce=PHONE_GPU ack=PARTIAL_DEVICE_READY status=OK\n",
+        request.layer, request.chunk, request.seq);
+    return true;
+}
+
 bool rpc_server::send_inference_cycle(
         const rpc_msg_inference_cycle_send_req & request) {
     const auto kind =
@@ -13001,6 +13160,30 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.send_inference_cycle(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_APPLY: {
+                rpc_msg_inference_cycle_send_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = server.apply_inference_cycle(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_FINISH: {
+                rpc_msg_inference_cycle_send_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = server.finish_inference_cycle(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
