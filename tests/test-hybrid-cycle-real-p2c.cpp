@@ -253,6 +253,202 @@ static std::vector<T> cycle_real_read(
     return out;
 }
 
+// Diagnostic Q4_K weight-integrity check for the *selected* MoE experts.
+// Store only 64-bit row fingerprints while the independent CPU GGUF model
+// exists. After that model is freed, compare the same packed quantized rows
+// against the PC/Phone physical shards. Thus no two 30B models coexist,
+// and only the selected experts (at most 16 tokens * topk) are transferred.
+//
+// These are byte-level checks of the logical tensor representation returned
+// by the GGML backend, not a replacement for mathematical FFN validation.
+// If a backend intentionally repacks tensor storage, a DIFF requires further
+// inspection rather than automatically implying corrupted GGUF weights.
+struct cycle_real_weight_fingerprints {
+    bool enabled = false;
+    ggml_type type = GGML_TYPE_COUNT;
+    int64_t input = 0;
+    int64_t channels = 0;
+    int64_t experts = 0;
+    std::vector<int32_t> selected;
+    std::vector<std::vector<uint64_t>> gate_rows;
+    std::vector<std::vector<uint64_t>> up_rows;
+};
+
+static uint64_t cycle_real_fnv1a64(const uint8_t * src, size_t n) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= uint64_t(src[i]);
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static bool cycle_real_fingerprint_full_rows(
+        const char * name, const ggml_tensor * tensor,
+        const std::vector<int32_t> & selected,
+        std::vector<std::vector<uint64_t>> & hashes) {
+    if (!tensor || !tensor->buffer || !ggml_is_contiguous(tensor) ||
+        tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+        tensor->ne[2] <= 0 || tensor->ne[3] != 1 ||
+        ggml_blck_size(tensor->type) <= 1) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_WEIGHT_BYTES] tensor=%s backend=CPU_REFERENCE "
+            "status=SKIP reason=INCOMPATIBLE_QUANT_LAYOUT\n", name);
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    const size_t expert_bytes = row_bytes * size_t(tensor->ne[1]);
+    if (row_bytes == 0 || expert_bytes == 0 ||
+        ggml_nbytes(tensor) != expert_bytes * size_t(tensor->ne[2])) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_WEIGHT_BYTES] tensor=%s backend=CPU_REFERENCE "
+            "status=SKIP reason=UNEXPECTED_PACKED_STRIDES\n", name);
+        return false;
+    }
+    hashes.clear();
+    hashes.reserve(selected.size());
+    std::vector<uint8_t> source(expert_bytes);
+    for (int32_t expert : selected) {
+        if (expert < 0 || expert >= tensor->ne[2]) {
+            return false;
+        }
+        ggml_backend_tensor_get(
+            tensor, source.data(), size_t(expert) * expert_bytes,
+            expert_bytes);
+        std::vector<uint64_t> expert_rows;
+        expert_rows.reserve(size_t(tensor->ne[1]));
+        for (int64_t channel = 0; channel < tensor->ne[1]; ++channel) {
+            expert_rows.push_back(cycle_real_fnv1a64(
+                source.data() + size_t(channel) * row_bytes, row_bytes));
+        }
+        hashes.push_back(std::move(expert_rows));
+    }
+    std::printf(
+        "[CYCLE_FFN_WEIGHT_BYTES] tensor=%s backend=CPU_REFERENCE "
+        "selected_experts=%zu rows_per_expert=%lld "
+        "row_bytes=%zu status=CAPTURED\n",
+        name, selected.size(), (long long)tensor->ne[1], row_bytes);
+    return true;
+}
+
+static bool cycle_real_capture_ffn_weight_fingerprints(
+        const llama_layer & layer,
+        const std::vector<int32_t> & selected_topk,
+        int64_t max_experts,
+        cycle_real_weight_fingerprints & result) {
+    const ggml_tensor * gate = layer.ffn_gate_exps;
+    const ggml_tensor * up = layer.ffn_up_exps;
+    if (!gate || !up ||
+        gate->type != up->type ||
+        gate->ne[0] != up->ne[0] ||
+        gate->ne[1] != up->ne[1] ||
+        gate->ne[2] != up->ne[2] ||
+        gate->ne[2] != max_experts) {
+        return false;
+    }
+    result.type = up->type;
+    result.input = up->ne[0];
+    result.channels = up->ne[1];
+    result.experts = up->ne[2];
+    result.selected = selected_topk;
+    std::sort(result.selected.begin(), result.selected.end());
+    result.selected.erase(
+        std::unique(result.selected.begin(), result.selected.end()),
+        result.selected.end());
+    if (result.selected.empty() ||
+        result.selected.front() < 0 ||
+        result.selected.back() >= max_experts) {
+        return false;
+    }
+    if (!cycle_real_fingerprint_full_rows(
+            "GATE", gate, result.selected, result.gate_rows) ||
+        !cycle_real_fingerprint_full_rows(
+            "UP", up, result.selected, result.up_rows)) {
+        return false;
+    }
+    result.enabled = true;
+    return true;
+}
+
+static bool cycle_real_compare_physical_weight_rows(
+        const char * name, const char * backend_name,
+        const ggml_tensor * physical, int64_t channel_base,
+        const cycle_real_weight_fingerprints & reference,
+        const std::vector<std::vector<uint64_t>> & expected) {
+    if (!reference.enabled || !physical || !physical->buffer ||
+        physical->type != reference.type ||
+        !ggml_is_contiguous(physical) ||
+        physical->ne[0] != reference.input ||
+        physical->ne[2] != reference.experts ||
+        physical->ne[3] != 1 ||
+        channel_base < 0 || physical->ne[1] <= 0 ||
+        channel_base + physical->ne[1] > reference.channels ||
+        expected.size() != reference.selected.size()) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_WEIGHT_BYTES] tensor=%s backend=%s "
+            "status=SKIP reason=PHYSICAL_SHAPE_OR_TYPE\n",
+            name, backend_name);
+        return false;
+    }
+    const size_t row_bytes =
+        ggml_row_size(physical->type, physical->ne[0]);
+    const size_t expert_bytes =
+        row_bytes * size_t(physical->ne[1]);
+    if (ggml_nbytes(physical) !=
+        expert_bytes * size_t(physical->ne[2])) {
+        return false;
+    }
+    std::vector<uint8_t> actual(expert_bytes);
+    size_t equal_rows = 0;
+    size_t different_rows = 0;
+    int32_t first_expert = -1;
+    int64_t first_channel = -1;
+    uint64_t first_ref_hash = 0;
+    uint64_t first_shard_hash = 0;
+    for (size_t i = 0; i < reference.selected.size(); ++i) {
+        const int32_t expert = reference.selected[i];
+        if (expected[i].size() != size_t(reference.channels)) {
+            return false;
+        }
+        ggml_backend_tensor_get(
+            physical, actual.data(), size_t(expert) * expert_bytes,
+            expert_bytes);
+        for (int64_t ch = 0; ch < physical->ne[1]; ++ch) {
+            const uint64_t hash = cycle_real_fnv1a64(
+                actual.data() + size_t(ch) * row_bytes, row_bytes);
+            const uint64_t expected_hash =
+                expected[i][size_t(channel_base + ch)];
+            if (hash == expected_hash) {
+                ++equal_rows;
+            } else {
+                ++different_rows;
+                if (first_expert < 0) {
+                    first_expert = expert;
+                    first_channel = channel_base + ch;
+                    first_ref_hash = expected_hash;
+                    first_shard_hash = hash;
+                }
+            }
+        }
+    }
+    std::printf(
+        "[CYCLE_FFN_WEIGHT_BYTES] tensor=%s backend=%s "
+        "selected_experts=%zu channels=[%lld,%lld) "
+        "matched_rows=%zu mismatched_rows=%zu "
+        "first_bad_expert=%d first_bad_channel=%lld "
+        "first_expected_hash=%016llx first_actual_hash=%016llx "
+        "status=%s\n",
+        name, backend_name, reference.selected.size(),
+        (long long)channel_base,
+        (long long)(channel_base + physical->ne[1]),
+        equal_rows, different_rows, first_expert,
+        (long long)first_channel,
+        (unsigned long long)first_ref_hash,
+        (unsigned long long)first_shard_hash,
+        different_rows == 0 ? "MATCH" : "DIFF");
+    return different_rows == 0;
+}
+
 // Correctness-first Phone AttentionPre for ONE contiguous causal prompt
 // ubatch (positions [0, n_tokens)). The current Qwen3-MoE K/V values become
 // an F16 transient KV block in the same graph. Each token attends ONLY
