@@ -6,8 +6,11 @@
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-backend-impl.h" // ggml_backend_buffer_copy_tensor: no host fallback
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 // Executes ONE pre-built physical MoE FFN shard on exactly ONE backend.
 // The full Qwen3-MoE builder constructs the same FFN graph with precomputed
@@ -64,11 +67,15 @@ public:
         // Only independently allocated graph compute tensors live in
         // compute_ctx. Weight shards are borrowed from the model's static
         // Meta allocation and must not be reallocated or copied here.
+        const auto alloc_begin = std::chrono::steady_clock::now();
         ggml_backend_buffer_t compute_buffer =
             ggml_backend_alloc_ctx_tensors_from_buft(compute_ctx, backend_buft);
+        const auto alloc_done = std::chrono::steady_clock::now();
         if (!compute_buffer) {
             return false;
         }
+        alloc_ms_ = std::chrono::duration<double, std::milli>(
+            alloc_done - alloc_begin).count();
 
         backend_ = backend;
         graph_ = graph;
@@ -110,6 +117,7 @@ public:
         // never fall back to ggml_backend_tensor_copy(), which silently
         // performs Phone->PC get + PC->Phone set when cpy_tensor fails.
         // PC FFN continues to consume the received host READY arrays.
+        const auto input_begin = std::chrono::steady_clock::now();
         if (local_phone_ready != nullptr) {
             const auto copy_local = [](const ggml_tensor * src, ggml_tensor * dst) {
                 if (src == nullptr || dst == nullptr ||
@@ -140,10 +148,28 @@ public:
             ggml_backend_tensor_set(ffn_.topk_weights, routing, 0, ggml_nbytes(ffn_.topk_weights));
         }
 
+        const auto input_done = std::chrono::steady_clock::now();
+        const auto compute_begin = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(backend_, graph_) != GGML_STATUS_SUCCESS) {
             return false;
         }
+        const auto submit_done = std::chrono::steady_clock::now();
         ggml_backend_synchronize(backend_);
+        const auto sync_done = std::chrono::steady_clock::now();
+        if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
+            std::printf(
+                "[CYCLE_FFN_PROFILE] backend=%s buffer_alloc_ms=%.3f "
+                "input_copy_ms=%.3f graph_submit_or_compute_ms=%.3f "
+                "backend_sync_ms=%.3f "
+                "rpc_server_gpu_compute_ms=SEE_CYCLE_GPU_SERVER\n",
+                ggml_backend_name(backend_), alloc_ms_,
+                std::chrono::duration<double, std::milli>(
+                    input_done - input_begin).count(),
+                std::chrono::duration<double, std::milli>(
+                    submit_done - compute_begin).count(),
+                std::chrono::duration<double, std::milli>(
+                    sync_done - submit_done).count());
+        }
 
         // The caller owns the output buffer. On the real P2C Phone backend,
         // this is the source FFN partial for Send #2, not a layer output.
@@ -161,10 +187,20 @@ public:
         if (!backend_ || !graph_ || !compute_buffer_) {
             return false;
         }
+        const auto begin = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(backend_, graph_) != GGML_STATUS_SUCCESS) {
             return false;
         }
         ggml_backend_synchronize(backend_);
+        if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
+            std::printf(
+                "[CYCLE_FFN_PROFILE] backend=%s input_copy_ms=PHONE_RX_ALREADY_DONE "
+                "buffer_alloc_ms=%.3f graph_submit_ms=%.3f "
+                "gpu_compute_ms=SEE_PHONE_SERVER\n",
+                ggml_backend_name(backend_), alloc_ms_,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - begin).count());
+        }
         return true;
     }
 
@@ -176,11 +212,13 @@ public:
         backend_ = nullptr;
         graph_ = nullptr;
         ffn_ = {};
+        alloc_ms_ = 0.0;
     }
 
 private:
     ggml_backend_t backend_ = nullptr;
     ggml_cgraph * graph_ = nullptr;
     ggml_backend_buffer_t compute_buffer_ = nullptr;
+    double alloc_ms_ = 0.0;
     llama_hybrid_cycle_ffn_graph ffn_;
 };
