@@ -2335,6 +2335,169 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
 // The immutable GPU K/V cache holds previous chunks on Phone, while the
 // CPU owns the only Reduce. Bounded per-layer ring credits keep at most
 // max_inflight Attention graph buffers alive during this stage.
+// C2P destination: borrow one REAL Phone GPU buffer allocation for both
+// the local physical FFN shard and the FINAL GPU Reduce. The split FFN graph
+// and two-op Reduce graph are independent, so no FFN kernel is recomputed
+// when the PC PARTIAL becomes GPU-ready.
+struct cycle_real_c2p_phone_chunk {
+    ggml_context * ctx = nullptr;
+    ggml_tensor * residual = nullptr;
+    ggml_tensor * pc_partial = nullptr;
+    ggml_tensor * output = nullptr;
+    llama_hybrid_cycle_ffn_graph inputs {};
+    ggml_cgraph * reduce_graph = nullptr;
+    llama_hybrid_cycle_ffn_executor executor;
+
+    cycle_real_c2p_phone_chunk() = default;
+    cycle_real_c2p_phone_chunk(const cycle_real_c2p_phone_chunk &) = delete;
+    cycle_real_c2p_phone_chunk & operator=(const cycle_real_c2p_phone_chunk &) = delete;
+    ~cycle_real_c2p_phone_chunk() { release(); }
+
+    void release() {
+        executor.reset();
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        residual = nullptr;
+        pc_partial = nullptr;
+        output = nullptr;
+        reduce_graph = nullptr;
+        inputs = {};
+    }
+
+    bool prepare(
+            ggml_backend_t phone,
+            const llama_hybrid_cycle_ffn_shard_weights & shard,
+            int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
+        release();
+        ggml_init_params params {};
+        params.mem_size = 2 * 1024 * 1024;
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        if (!ctx) {
+            return false;
+        }
+        inputs = llama_hybrid_cycle_make_ffn_graph_inputs(ctx, hidden, tokens, topk);
+        residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+        pc_partial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+        auto * x = ggml_reshape_3d(ctx, inputs.norm, hidden, 1, tokens);
+        auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, inputs.topk_ids);
+        auto * up = ggml_mul_mat_id(ctx, shard.up, x, inputs.topk_ids);
+        auto * act = ggml_swiglu_split(ctx, gate, up);
+        auto * down = ggml_mul_mat_id(ctx, shard.down, act, inputs.topk_ids);
+        auto * weighted = ggml_mul(ctx, down, inputs.topk_weights);
+        ggml_tensor * sum = nullptr;
+        for (int64_t k = 0; k < topk; ++k) {
+            auto * expert = ggml_view_2d(
+                ctx, weighted, hidden, tokens,
+                weighted->nb[2], size_t(k) * weighted->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, expert) : expert;
+        }
+        inputs.ffn_output = ggml_cont(ctx, sum);
+        auto * ffn_graph = ggml_new_graph_custom(ctx, 512, false);
+        ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
+
+        // Do not include FFN nodes in this second graph. Two GPU ADD nodes
+        // consume the persistent FFN output and the received PC shard.
+        auto * ffnsum = ggml_add(ctx, inputs.ffn_output, pc_partial);
+        output = ggml_add(ctx, residual, ffnsum);
+        reduce_graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_graph_add_node(reduce_graph, ffnsum);
+        ggml_graph_add_node(reduce_graph, output);
+        if (!executor.prepare(
+                phone, ctx, ffn_graph, inputs, shard,
+                hidden, tokens, topk, experts)) {
+            std::fprintf(stderr,
+                "[CYCLE_C2P_GPU] status=FAIL reason=FFN_PREPARE\n");
+            release();
+            return false;
+        }
+        return true;
+    }
+
+    bool execute_ffn() {
+        return executor.execute_device_ready();
+    }
+
+    bool execute_reduce(ggml_backend_t phone) {
+        if (!phone || !reduce_graph || !output || !pc_partial ||
+            !inputs.ffn_output || !residual) {
+            return false;
+        }
+        const bool ok = ggml_backend_graph_compute(phone, reduce_graph) ==
+                        GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_synchronize(phone);
+        }
+        return ok;
+    }
+};
+
+static bool cycle_real_send_c2p_frame(
+        ggml_backend_t phone, const cycle_real_live_wire & wire,
+        inference_cycle_payload_kind kind,
+        const cycle_real_phone_ready & ready,
+        const std::vector<float> & partial,
+        uint32_t tokens, uint32_t hidden, uint32_t topk) {
+    size_t bytes = 0;
+    if (!inference_cycle_payload_size(
+            kind, tokens, hidden,
+            kind == INFERENCE_CYCLE_READY ? topk : 0, bytes)) {
+        return false;
+    }
+    std::vector<uint8_t> frame(bytes);
+    size_t written = 0;
+    bool ok = false;
+    if (kind == INFERENCE_CYCLE_READY) {
+        const inference_cycle_ready_view value {
+            tokens, hidden, topk,
+            ready.residual.data(), ready.norm.data(),
+            ready.ids.data(), ready.routing.data()
+        };
+        ok = ready.residual.size() == size_t(tokens) * hidden &&
+             ready.norm.size() == size_t(tokens) * hidden &&
+             ready.ids.size() == size_t(tokens) * topk &&
+             ready.routing.size() == size_t(tokens) * topk &&
+             inference_cycle_write_ready(
+                 frame.data(), frame.size(), value, written);
+    } else {
+        const inference_cycle_partial_view value {
+            tokens, hidden, partial.data()
+        };
+        ok = partial.size() == size_t(tokens) * hidden &&
+             inference_cycle_write_partial(
+                 frame.data(), frame.size(), value, written);
+    }
+    if (!ok || written != bytes) {
+        return false;
+    }
+    auto * dev = ggml_backend_get_device(phone);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto submit = reg ?
+        reinterpret_cast<ggml_backend_rpc_inference_transport_submit_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_SUBMIT_PROC)) :
+        nullptr;
+    ggml_backend_rpc_inference_task task {};
+    task.layer = wire.layer;
+    task.chunk = wire.chunk;
+    task.seq = wire.seq;
+    task.graph_id = wire.graph_id;
+    task.stage = kind == INFERENCE_CYCLE_READY ?
+        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
+    task.tensor_role = INFERENCE_CYCLE_PC_TO_PHONE;
+    const bool submitted = submit != nullptr &&
+        submit(phone, &task, frame.data(), frame.size());
+    std::printf(
+        "[CYCLE_C2P_WIRE] side=pc action=SEND kind=%s layer=%d chunk=%d "
+        "seq=%llu bytes=%zu direction=PC_TO_PHONE status=%s\n",
+        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+        wire.layer, wire.chunk, (unsigned long long)wire.seq,
+        bytes, submitted ? "QUEUED" : "FAIL");
+    return submitted;
+}
+
 struct cycle_real_p2c_chunk {
     int64_t start = 0;
     int64_t tokens = 0;
