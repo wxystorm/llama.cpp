@@ -409,7 +409,7 @@ static void test_complete_period_fifo_handoffs() {
                 assert(!done[l][c].exchange(true));
             }
             return true;
-        }, 2);
+        }, 2, true);
     assert(ok);
     for (int l = 0; l < n_layers; ++l) {
         assert(entered[l] == chunks);
