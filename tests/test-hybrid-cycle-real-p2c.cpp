@@ -64,6 +64,9 @@ struct cycle_real_period_reference {
     std::vector<std::vector<float>> pc_ffn_outputs;
     std::vector<float> c2p_residual;
     std::vector<float> c2p_full_ffn;
+    std::vector<std::vector<float>> phone_attn_residuals;
+    std::vector<std::vector<float>> phone_ffn_norms;
+    std::vector<std::vector<float>> phone_ffn_outputs;
     std::vector<float> p2c_residual;
     std::vector<float> p2c_norm;
 };
@@ -3716,8 +3719,21 @@ static bool cycle_real_execute_period_fifo(
                         st.ready.router_probs.clear();
                     } else if (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU) {
                         const auto * local_input = take_device_input(l, c);
+                        const bool boundary_trace = cycle_real_env_flag(
+                            "LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK");
                         double attn_ms = 0.0;
                         const std::vector<float> empty;
+                        const auto & attn_ref =
+                            size_t(l) < checkpoints.phone_attn_residuals.size() ?
+                            checkpoints.phone_attn_residuals[size_t(l)] : empty;
+                        const auto & norm_ref =
+                            size_t(l) < checkpoints.phone_ffn_norms.size() ?
+                            checkpoints.phone_ffn_norms[size_t(l)] : empty;
+                        const auto & ffn_ref =
+                            size_t(l) < checkpoints.phone_ffn_outputs.size() ?
+                            checkpoints.phone_ffn_outputs[size_t(l)] : empty;
+                        std::vector<float> attn_values;
+                        std::vector<float> ffn_values;
                         ok = local_input != nullptr &&
                             cycle_real_execute_phone_attention_pre(
                                 phone, layer, model.hparams, empty,
@@ -3729,6 +3745,21 @@ static bool cycle_real_execute_period_fifo(
                             // This is a real RPC fence; the RPC backend's
                             // ordinary synchronize() is a NO-OP.
                             ok = cycle_real_explicit_phone_fence(phone);
+                        }
+                        if (ok && boundary_trace) {
+                            // The Attention tensors are still GPU-owned
+                            // here. Read them BEFORE release_phone_graph().
+                            ok = cycle_real_phone_boundary_probe(
+                                phone, "PHONE_FULL_ATTN_RESIDUAL",
+                                l, c, st.start, hidden,
+                                st.ready.phone_graph.residual,
+                                attn_ref, &attn_values);
+                            if (ok) {
+                                ok = cycle_real_phone_boundary_probe(
+                                    phone, "PHONE_FULL_FFN_NORM",
+                                    l, c, st.start, hidden,
+                                    st.ready.phone_graph.ffn_norm, norm_ref);
+                            }
                         }
                         if (ok) {
                             auto & previous = *states[size_t(l - 1)][size_t(c)];
@@ -3746,6 +3777,16 @@ static bool cycle_real_execute_period_fifo(
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(phone);
                         }
+                        if (ok && boundary_trace) {
+                            // The full-Phone MoE FFN has completed, but the
+                            // Reduce graph has not yet run. This isolates
+                            // FFN error from Attention/input error.
+                            ok = cycle_real_phone_boundary_probe(
+                                phone, "PHONE_FULL_FFN",
+                                l, c, st.start, hidden,
+                                st.phone_output->inputs.ffn_output,
+                                ffn_ref, &ffn_values);
+                        }
                         if (ok) {
                             st.ready.release_phone_graph();
                             ok = st.phone_output->execute_reduce(phone);
@@ -3755,11 +3796,40 @@ static bool cycle_real_execute_period_fifo(
                         }
                         if (ok && st.phone_output &&
                             size_t(l) < checkpoints.layer_outputs.size()) {
+                            std::vector<float> gpu_output;
                             ok = cycle_real_phone_boundary_probe(
                                 phone, "PHONE_FULL_OUTPUT",
                                 l, c, st.start, hidden,
                                 st.phone_output->output,
-                                checkpoints.layer_outputs[size_t(l)]);
+                                checkpoints.layer_outputs[size_t(l)],
+                                boundary_trace ? &gpu_output : nullptr);
+                            if (ok && boundary_trace) {
+                                if (attn_values.size() != ffn_values.size() ||
+                                    gpu_output.size() != attn_values.size()) {
+                                    std::fprintf(stderr,
+                                        "[CYCLE_PHONE_FULL_REDUCE_PARITY] "
+                                        "layer=%d chunk=%d status=FAIL "
+                                        "reason=SHAPE_MISMATCH\n", l, c);
+                                    ok = false;
+                                } else {
+                                    // Distinguish an incorrect GPU ADD from
+                                    // upstream Attention/FFN numerical drift.
+                                    for (size_t i = 0; i < attn_values.size(); ++i) {
+                                        attn_values[i] += ffn_values[i];
+                                    }
+                                    const cycle_real_diff d =
+                                        cycle_real_compare(gpu_output, attn_values);
+                                    std::printf(
+                                        "[CYCLE_PHONE_FULL_REDUCE_PARITY] "
+                                        "layer=%d chunk=%d max_abs=%.9g "
+                                        "rms=%.9g cosine=%.9g "
+                                        "state=%s\n",
+                                        l, c, d.max_abs, d.rms, d.cosine,
+                                        !d.valid ? "INVALID" :
+                                        d.max_abs < 0.0001 ?
+                                            "NUMERICALLY_CLOSE" : "DRIFT");
+                                }
+                            }
                         }
                     }
                     break;
@@ -4195,6 +4265,17 @@ int main(int argc, char ** argv) {
             capture.values.emplace(
                 "ffn_moe_out-" + std::to_string(capture_layout.x),
                 cycle_real_capture_value {});
+            // Capture all full-Phone layers, not only the current Y=1
+            // example. Reference tensors are collected before GPU loading.
+            for (int i = capture_layout.x + 1;
+                 i < capture_layout.cycle_size - 1; ++i) {
+                for (const char * prefix : {
+                         "ffn_inp-", "ffn_norm-", "ffn_moe_out-"}) {
+                    capture.values.emplace(
+                        std::string(prefix) + std::to_string(i),
+                        cycle_real_capture_value {});
+                }
+            }
         }
         capture.values.emplace("embd", cycle_real_capture_value {});
         // Capture all first-period layer outputs for optional numeric probes,
@@ -4778,7 +4859,8 @@ int main(int argc, char ** argv) {
             const auto cpu_reference_output =
                 cycle_real_read<float>(capture, period_reference_output_name);
             cycle_real_period_reference checkpoints;
-            if (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE")) {
+            if (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") ||
+                cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
                 const auto optional_capture =
                     [&](const std::string & name) -> std::vector<float> {
                         const auto it = capture.values.find(name);
@@ -4820,6 +4902,22 @@ int main(int argc, char ** argv) {
                         "LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
                     checkpoints.c2p_full_ffn = optional_capture(
                         "ffn_moe_out-" + std::to_string(expected_layout.x));
+                    const size_t n_layers = size_t(expected_layout.cycle_size);
+                    checkpoints.phone_attn_residuals.resize(n_layers);
+                    checkpoints.phone_ffn_norms.resize(n_layers);
+                    checkpoints.phone_ffn_outputs.resize(n_layers);
+                    for (int l = expected_layout.x + 1;
+                         l < expected_layout.cycle_size - 1; ++l) {
+                        checkpoints.phone_attn_residuals[size_t(l)] =
+                            optional_capture(
+                                "ffn_inp-" + std::to_string(l));
+                        checkpoints.phone_ffn_norms[size_t(l)] =
+                            optional_capture(
+                                "ffn_norm-" + std::to_string(l));
+                        checkpoints.phone_ffn_outputs[size_t(l)] =
+                            optional_capture(
+                                "ffn_moe_out-" + std::to_string(l));
+                    }
                 }
                 checkpoints.p2c_residual = optional_capture(
                     "ffn_inp-" + std::to_string(
