@@ -616,10 +616,11 @@ struct cycle_real_phone_kv_cache {
         }
         std::printf(
             "[CYCLE_PHONE_KV_PERSISTENT] total_tokens=%lld head_dim=%lld "
-            "kv_heads=%lld cache_bytes=%zu residency=PHONE_GPU_F16 "
+            "kv_heads=%lld cache_bytes=%zu residency=%s "
             "status=READY\n",
             (long long)max_tokens, (long long)head_dim,
-            (long long)kv_heads, ggml_nbytes(keys) + ggml_nbytes(values));
+            (long long)kv_heads, ggml_nbytes(keys) + ggml_nbytes(values),
+            source_device == 0 ? "PC_CPU_F16" : "PHONE_GPU_F16");
         return true;
     }
 };
