@@ -282,8 +282,13 @@ static bool cycle_real_execute_phone_attention_pre(
         hp.f_norm_rms_eps <= 0.0f ||
         topk <= 0 || experts < topk ||
         hp.rope_type != LLAMA_ROPE_TYPE_NEOX ||
-        hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_NONE ||
-        hp.yarn_ext_factor > 0.0f || hp.rope_attn_factor != 1.0f ||
+        // The loader defaults to "linear" even when no RoPE scale key is
+        // present. Linear with factor 1 is numerically identical to NONE.
+        (hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_NONE &&
+         hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_LINEAR) ||
+        std::fabs(hp.rope_freq_scale_train - 1.0f) > 1.0e-6f ||
+        hp.yarn_ext_factor > 0.0f ||
+        std::fabs(hp.rope_attn_factor - 1.0f) > 1.0e-6f ||
         hp.use_alibi ||
         layer.wqkv || layer.wq_b || layer.wk_b || layer.wv_b ||
         layer.wo_b || layer.wq_s || layer.wk_s || layer.wv_s ||
