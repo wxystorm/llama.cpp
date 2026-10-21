@@ -941,6 +941,72 @@ static cycle_real_diff cycle_real_compare(
     return result;
 }
 
+// Decode a single selected expert's packed Q4_K rows using the canonical
+// GGML CPU GET_ROWS kernel. This produces the same F32 values represented
+// by the GGUF weight (without quantizing the activation to Q8_K). It is an
+// independent mathematical oracle for interpreting CPU(Q4_K x Q8_K) vs
+// GPU(Q4_K x F32) dot-product differences.
+static bool cycle_real_dequantize_q4k_expert_on_cpu(
+        ggml_backend_t cpu_backend,
+        const std::vector<uint8_t> & packed,
+        int64_t hidden, int64_t channels,
+        std::vector<float> & dequantized) {
+    if (!cpu_backend ||
+        hidden <= 0 || channels <= 0 ||
+        hidden % ggml_blck_size(GGML_TYPE_Q4_K) != 0 ||
+        packed.size() !=
+            ggml_row_size(GGML_TYPE_Q4_K, hidden) * size_t(channels)) {
+        return false;
+    }
+    ggml_init_params p {};
+    p.mem_size = 2 * 1024 * 1024;
+    p.no_alloc = true;
+    ggml_context * ctx = ggml_init(p);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_Q4_K, hidden, channels);
+    ggml_tensor * rows = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, channels);
+    ggml_set_input(rows);
+    ggml_tensor * y = ggml_get_rows(ctx, w, rows);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, y);
+    const bool supported = ggml_backend_supports_op(cpu_backend, y);
+    ggml_backend_buffer_t buffer = supported ?
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_get_default_buffer_type(cpu_backend)) : nullptr;
+    if (!buffer) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] status=FAIL "
+            "reason=CPU_GET_ROWS_UNSUPPORTED_OR_ALLOC\n");
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_tensor_set(w, packed.data(), 0, packed.size());
+    std::vector<int32_t> ids(static_cast<size_t>(channels), 0);
+    for (int64_t j = 0; j < channels; ++j) {
+        ids[size_t(j)] = int32_t(j);
+    }
+    ggml_backend_tensor_set(rows, ids.data(), 0, ggml_nbytes(rows));
+    const bool computed = ggml_backend_graph_compute(cpu_backend, graph) ==
+        GGML_STATUS_SUCCESS;
+    if (computed) {
+        ggml_backend_synchronize(cpu_backend);
+        dequantized.resize(static_cast<size_t>(hidden * channels));
+        ggml_backend_tensor_get(y, dequantized.data(), 0, ggml_nbytes(y));
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    if (!computed) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] status=FAIL "
+            "reason=CPU_DEQUANT_COMPUTE\n");
+    }
+    return computed;
+}
+
 // Discriminate the normal Q4_K MUL_MAT kernel from the fused MoE
 // MUL_MAT_ID kernel on the SAME Phone OpenCL device. A fresh one-expert
 // quantized weight buffer is populated from the already-byte-verified
