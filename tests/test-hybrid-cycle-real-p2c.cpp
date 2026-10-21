@@ -2997,8 +2997,9 @@ static bool cycle_real_execute_c2p_fifo(
         "direction=PC_TO_PHONE payload_sends=%d "
         "attention_owner=PC_CPU ffn_source=PC_CPU "
         "ffn_destination=PHONE_GPU reduce_owner=PHONE_GPU "
-        "phone_ffn_inputs=DEVICE_LOCAL_COPY "
-        "phone_reduce=REAL_GPU_GRAPH phone_output=DEVICE_RESIDENT "
+        "phone_ffn_inputs=PHONE_DATA_PLANE_RX_GPU_UPLOAD "
+        "phone_reduce=REAL_GPU_GRAPH "
+        "phone_output=GPU_COMPUTED_RELEASED_AFTER_ACK "
         "pc_kv=CPU_PERSISTENT phone_duplicate_rpc_readback=0 "
         "attn_ms=%.3f pc_ffn_ms=%.3f phone_ffn_ms=%.3f "
         "ready_total_ms=%.3f partial_total_ms=%.3f "
@@ -3019,10 +3020,11 @@ int main(int argc, char ** argv) {
 #endif
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
-            "Usage: test-hybrid-cycle-real-p2c <model.gguf> <phone-ip:port> "
-            "<P2C-layer> [prompt] [n_tokens=1..128]\n"
+            "Usage: test-hybrid-cycle-real-%s <model.gguf> <phone-ip:port> "
+            "<%s-layer> [prompt] [n_tokens=1..128]\n"
             "Set LLAMA_HYBRID_CYCLE_PC_LAYERS and "
-            "LLAMA_HYBRID_CYCLE_PHONE_LAYERS first.\n");
+            "LLAMA_HYBRID_CYCLE_PHONE_LAYERS first.\n",
+            c2p_mode ? "c2p" : "p2c", c2p_mode ? "C2P" : "P2C");
         return 2;
     }
     char * end = nullptr;
