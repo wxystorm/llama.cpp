@@ -4469,7 +4469,7 @@ static bool cycle_real_execute_period_fifo(
                     "graph_build_sum_ms=%.3f buffer_alloc_sum_ms=%.3f "
                     "input_copy_sum_ms=%.3f "
                     "backend_graph_call_sum_ms=%.3f "
-                    "rpc_gpu_kernel_ms=SERVER_ONLY\n",
+                    "backend_call_semantics=CPU_COMPUTE_OR_RPC_SUBMIT\n",
                     name, (unsigned long long)attn.count,
                     attn.graph_build_ms, attn.alloc_ms,
                     attn.input_copy_ms, attn.graph_call_ms);
@@ -4481,7 +4481,7 @@ static bool cycle_real_execute_period_fifo(
                     "graph_build_sum_ms=%.3f "
                     "backend_prepare_sum_ms=%.3f "
                     "backend_execute_call_sum_ms=%.3f "
-                    "rpc_gpu_kernel_ms=SERVER_ONLY\n",
+                    "backend_call_semantics=CPU_COMPUTE_OR_RPC_SUBMIT\n",
                     name, (unsigned long long)ffn.count,
                     ffn.graph_build_ms, ffn.backend_prepare_ms,
                     ffn.backend_execute_call_ms);
