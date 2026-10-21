@@ -515,6 +515,91 @@ struct cycle_real_phone_ready {
     }
 };
 
+// A single GPU-resident, F16 cache for one physical P2C Attention layer.
+// Shape [head_dim, kv_heads, max_tokens] makes each newly written token
+// interval contiguous across KV heads: no host readback, no materialization
+// of previous chunks and no second cache instance per in-flight chunk.
+// Attention tasks run in causal chunk order on the single PHONE_GPU FIFO.
+struct cycle_real_phone_kv_cache {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * keys = nullptr;
+    ggml_tensor * values = nullptr;
+    int64_t max_tokens = 0;
+    int64_t head_dim = 0;
+    int64_t kv_heads = 0;
+    int64_t committed_tokens = 0;
+
+    cycle_real_phone_kv_cache() = default;
+    cycle_real_phone_kv_cache(const cycle_real_phone_kv_cache &) = delete;
+    cycle_real_phone_kv_cache & operator=(const cycle_real_phone_kv_cache &) = delete;
+    ~cycle_real_phone_kv_cache() { release(); }
+
+    void release() {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        keys = nullptr;
+        values = nullptr;
+        max_tokens = 0;
+        head_dim = 0;
+        kv_heads = 0;
+        committed_tokens = 0;
+    }
+
+    bool init(ggml_backend_t backend,
+              const llama_layer & layer, int64_t total_tokens) {
+        release();
+        const auto * norm = ggml_backend_meta_get_static_weight_shard(
+            layer.attn_k_norm, 1);
+        const auto * wk = ggml_backend_meta_get_static_weight_shard(
+            layer.wk, 1);
+        if (!backend || !norm || !wk ||
+            total_tokens <= 0 || total_tokens > 128 ||
+            norm->ne[0] <= 0 || wk->ne[1] % norm->ne[0] != 0) {
+            return false;
+        }
+        head_dim = norm->ne[0];
+        kv_heads = wk->ne[1] / head_dim;
+        max_tokens = total_tokens;
+        ggml_init_params params {};
+        params.mem_size = 1024 * 1024;
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        if (!ctx) {
+            return false;
+        }
+        keys = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, head_dim, kv_heads, max_tokens);
+        values = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F16, head_dim, kv_heads, max_tokens);
+        if (!keys || !values) {
+            release();
+            return false;
+        }
+        ggml_set_name(keys, "cycle_phone_k_cache_f16");
+        ggml_set_name(values, "cycle_phone_v_cache_f16");
+        buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        if (!buffer) {
+            release();
+            return false;
+        }
+        std::printf(
+            "[CYCLE_PHONE_KV_PERSISTENT] total_tokens=%lld head_dim=%lld "
+            "kv_heads=%lld cache_bytes=%zu residency=PHONE_GPU_F16 "
+            "status=READY\n",
+            (long long)max_tokens, (long long)head_dim,
+            (long long)kv_heads, ggml_nbytes(keys) + ggml_nbytes(values));
+        return true;
+    }
+};
+
 struct cycle_real_live_wire {
     int32_t layer = -1;
     int32_t chunk = 0;
