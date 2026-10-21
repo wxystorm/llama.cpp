@@ -1795,7 +1795,9 @@ static bool cycle_real_probe_down_f64_oracle(
     // particular Q6_K generic kernel. Preserve every available result
     // rather than hiding the F64 and Dense F32 measurements in that case.
     const double na = std::numeric_limits<double>::quiet_NaN();
-    const bool complete = cpu_err.valid && gpu_err.valid &&
+    // All three supported probe kernels must complete, while the
+    // synthetic single-expert MoE comparison remains intentionally N/A.
+    const bool measured = cpu_err.valid && gpu_err.valid &&
                           dense_err.valid;
     std::printf(
         "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d expert=%d "
@@ -1816,15 +1818,14 @@ static bool cycle_real_probe_down_f64_oracle(
         na, na,  // synthetic one-expert MoE comparison intentionally skipped
         dense_err.valid ? dense_err.max_abs : na,
         dense_err.valid ? dense_err.rms : na,
-        complete ? "MEASURED" : "MEASURED_PARTIAL");
-    if (!complete) {
-        std::printf(
-            "[CYCLE_FFN_DOWN_F64_ORACLE_AVAIL] cpu=%d gpu_quant=%d "
-            "gpu_moe=%d gpu_dense=%d status=PARTIAL\n",
-            cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
-            moe_ok ? 1 : 0, dense_ok ? 1 : 0);
-    }
-    return cpu_err.valid && dense_err.valid && gpu_err.valid;
+        measured ? "MEASURED_PARTIAL" : "NOT_AVAILABLE");
+    std::printf(
+        "[CYCLE_FFN_DOWN_F64_ORACLE_AVAIL] cpu=%d gpu_quant=%d "
+        "gpu_moe=%d gpu_dense=%d status=%s\n",
+        cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
+        moe_ok ? 1 : 0, dense_ok ? 1 : 0,
+        measured ? "PARTIAL" : "NOT_AVAILABLE");
+    return measured;
 }
 
 // Independently rebuild the FULL selected-expert FFN with F64 dot products
