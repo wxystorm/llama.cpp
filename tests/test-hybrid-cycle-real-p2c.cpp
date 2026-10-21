@@ -3279,13 +3279,35 @@ int main(int argc, char ** argv) {
     // Independent CPU reference is the same for C2P and P2C. Check the
     // actual requested physical Tensor direction before loading shards.
     llama_hybrid_cycle_layout expected_layout;
-    if (!llama_hybrid_cycle_layout_from_env(
-            reference_layers, expected_layout) ||
-        expected_layout.kinds[size_t(layer)] !=
-            (c2p_mode ? llama_hybrid_cycle_layer_kind::TENSOR_C2P :
-                        llama_hybrid_cycle_layer_kind::TENSOR_P2C)) {
+    const bool layout_ok = llama_hybrid_cycle_layout_from_env(
+        reference_layers, expected_layout);
+    const auto expected_kind = c2p_mode ?
+        llama_hybrid_cycle_layer_kind::TENSOR_C2P :
+        llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+    const bool layer_ok = layout_ok &&
+        layer >= 0 && size_t(layer) < expected_layout.kinds.size();
+    const char * actual_kind = layer_ok ?
+        llama_hybrid_cycle_kind_name(expected_layout.kinds[size_t(layer)]) :
+        "UNAVAILABLE";
+    std::printf(
+        "[CYCLE_REAL_DIRECTION] executable_mode=%s layer=%d "
+        "expected=%s actual=%s x=%d y=%d layout_ok=%d "
+        "status=%s\n",
+        c2p_mode ? "C2P" : "P2C",
+        layer, llama_hybrid_cycle_kind_name(expected_kind),
+        actual_kind,
+        layout_ok ? expected_layout.x : -1,
+        layout_ok ? expected_layout.y : -1,
+        layout_ok ? 1 : 0,
+        layer_ok && expected_layout.kinds[size_t(layer)] == expected_kind ?
+            "PASS" : "FAIL");
+    std::fflush(stdout);
+    if (!layer_ok || expected_layout.kinds[size_t(layer)] != expected_kind) {
         std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL reason=RESTORED_LAYOUT_OR_NOT_P2C\n");
+            "[CYCLE_REAL] status=FAIL reason=LAYOUT_DIRECTION_MISMATCH "
+            "requested=%s layer=%d actual=%s "
+            "hint=USE_REAL_C2P_EXE_FOR_C2P_LAYER\n",
+            c2p_mode ? "C2P" : "P2C", layer, actual_kind);
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] cycle_placement_env=RESTORED "
