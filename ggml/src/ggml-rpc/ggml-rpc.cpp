@@ -9575,6 +9575,39 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
 
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
 
+    // Cycle Phone->Phone FFN handoff: some OpenCL buffers do not provide
+    // a device-native cpy_tensor implementation. Recover ONLY on this RPC
+    // server, never through the generic client's fallback (which would
+    // download Phone->PC and re-upload PC->Phone). For small contiguous
+    // F32/I32 activation tensors this bounded Phone-local staging preserves
+    // one-direction payload semantics and avoids allocating another GPU
+    // graph. Quantized model weights are never copied by this fallback.
+    constexpr size_t cycle_local_copy_max_bytes = 4 * 1024 * 1024;
+    const size_t nbytes = ggml_nbytes(src);
+    const bool phone_local_copy_safe =
+        !response.result &&
+        nbytes != 0 && nbytes <= cycle_local_copy_max_bytes &&
+        (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_I32) &&
+        ggml_are_same_layout(src, dst) &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+        ggml_backend_buffer_get_type(src->buffer) ==
+            ggml_backend_buffer_get_type(dst->buffer) &&
+        ggml_backend_buffer_get_type(src->buffer) !=
+            ggml_backend_cpu_buffer_type();
+
+    if (phone_local_copy_safe) {
+        // Both buffers have been deserialized/validated by this server.
+        // Their read/write happens on the Phone process only.
+        std::vector<uint8_t> local_scratch(nbytes);
+        ggml_backend_tensor_get(src, local_scratch.data(), 0, nbytes);
+        ggml_backend_tensor_set(dst, local_scratch.data(), 0, nbytes);
+        response.result = 1;
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_LOCAL_COPY] path=PHONE_HOST_STAGING "
+            "src=%s dst=%s bytes=%zu cross_network_payload=0 status=OK\n",
+            src->name, dst->name, nbytes);
+    }
+
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_COPY_DONE] result=%d "
