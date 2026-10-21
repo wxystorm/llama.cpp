@@ -3601,9 +3601,8 @@ int main(int argc, char ** argv) {
     // Keep the memory RPC query OUTSIDE ffn_parallel_ms timing.
     cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_REAL_FFN");
 
-    ggml_backend_free(phone);
-    ggml_backend_free(cpu);
-
+    // Keep both backends alive: the PC still needs the Phone RPC
+    // data-plane receiver to consume Send #2 (PARTIAL) below.
     if (!pc_ok || !phone_ok || pc_part.size() != residual.size() ||
         (!live_wire_enabled && phone_part.size() != residual.size())) {
         std::fprintf(stderr,
@@ -3694,6 +3693,9 @@ int main(int argc, char ** argv) {
             "[CYCLE_REAL_P2C] status=FAIL reason=PC_REDUCE\n");
         return 1;
     }
+    // No further RPC input/output or transport reception is required.
+    ggml_backend_free(phone);
+    ggml_backend_free(cpu);
     const cycle_real_diff ffn_diff = cycle_real_compare(combined_ffn, baseline_ffn);
     const cycle_real_diff out_diff = cycle_real_compare(combined_output, baseline_output);
     if (run_ffn_ablation) {
