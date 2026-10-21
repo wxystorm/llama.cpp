@@ -941,6 +941,224 @@ static cycle_real_diff cycle_real_compare(
     return result;
 }
 
+// Replay the EXACT packed quantized Phone shard weights with GGML's CPU
+// MUL_MAT_ID, selecting only experts used by this ubatch. The Phone tensor
+// is read via RPC without re-quantization; selected experts are compacted
+// into [hidden,channels,active_experts] and the TopK IDs are remapped.
+//
+// This distinguishes an OpenCL kernel/input-precision discrepancy from a
+// corrupt packed-weight partition. The second CPU run performs an intentional
+// F32 -> F16 -> F32 roundtrip of the *input*, to test the hypothesis that
+// the OpenCL quantized path internally reduces input precision.
+//
+// Diagnostic only; does not replace the production Phone FFN kernel.
+static bool cycle_real_replay_phone_matmul_id_on_cpu(
+        const char * stage,
+        ggml_backend_t cpu_backend,
+        const ggml_tensor * phone_weight,
+        const std::vector<float> & norm,
+        const std::vector<int32_t> & selected_ids,
+        int64_t hidden, int64_t tokens, int64_t topk,
+        int64_t full_channels, int64_t phone_channel_begin,
+        const std::vector<float> & full_reference,
+        const std::vector<float> & phone_output) {
+    if (!cpu_backend || !phone_weight || !phone_weight->buffer ||
+        !ggml_is_contiguous(phone_weight) ||
+        phone_weight->ne[0] != hidden ||
+        phone_weight->ne[1] <= 0 ||
+        phone_weight->ne[2] <= 0 || phone_weight->ne[3] != 1 ||
+        ggml_blck_size(phone_weight->type) <= 1 ||
+        hidden % ggml_blck_size(phone_weight->type) != 0 ||
+        phone_channel_begin < 0 ||
+        phone_channel_begin + phone_weight->ne[1] > full_channels ||
+        norm.size() != size_t(hidden * tokens) ||
+        selected_ids.size() != size_t(topk * tokens) ||
+        full_reference.size() != size_t(full_channels * topk * tokens) ||
+        phone_output.size() != size_t(phone_weight->ne[1] * topk * tokens)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s status=FAIL "
+            "reason=INVALID_PROBE_SHAPE\n", stage);
+        return false;
+    }
+    const int64_t channels = phone_weight->ne[1];
+    const int64_t experts = phone_weight->ne[2];
+    std::vector<int32_t> active = selected_ids;
+    std::sort(active.begin(), active.end());
+    active.erase(std::unique(active.begin(), active.end()), active.end());
+    if (active.empty() || active.front() < 0 || active.back() >= experts) {
+        return false;
+    }
+    std::vector<int32_t> compact_ids;
+    compact_ids.reserve(selected_ids.size());
+    for (int32_t id : selected_ids) {
+        const auto it = std::lower_bound(active.begin(), active.end(), id);
+        if (it == active.end() || *it != id) {
+            return false;
+        }
+        compact_ids.push_back(int32_t(it - active.begin()));
+    }
+
+    const size_t row_bytes =
+        ggml_row_size(phone_weight->type, hidden);
+    const size_t expert_bytes = row_bytes * size_t(channels);
+    if (row_bytes == 0 || expert_bytes == 0 ||
+        ggml_nbytes(phone_weight) != expert_bytes * size_t(experts)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s status=FAIL "
+            "reason=QUANTIZED_WEIGHT_STRIDES\n", stage);
+        return false;
+    }
+    ggml_init_params params {};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    auto * compact_weight = ggml_new_tensor_3d(
+        ctx, phone_weight->type, hidden, channels, int64_t(active.size()));
+    auto * input_norm = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, hidden, 1, tokens);
+    auto * ids = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, topk, tokens);
+    ggml_set_input(input_norm);
+    ggml_set_input(ids);
+    auto * output = ggml_mul_mat_id(
+        ctx, compact_weight, input_norm, ids);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, output);
+    if (!ggml_backend_supports_op(cpu_backend, output)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s status=FAIL "
+            "reason=CPU_MUL_MAT_ID_UNSUPPORTED\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, ggml_backend_get_default_buffer_type(cpu_backend));
+    if (!buffer) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s status=FAIL "
+            "reason=CPU_ALLOC\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+    std::vector<uint8_t> expert_bytes_buf(expert_bytes);
+    for (size_t j = 0; j < active.size(); ++j) {
+        // Backend tensor_get observes the same logical packed bytes as the
+        // matching FNV fingerprints; CPU receives no dequant/requant pass.
+        ggml_backend_tensor_get(
+            phone_weight, expert_bytes_buf.data(),
+            size_t(active[j]) * expert_bytes, expert_bytes);
+        ggml_backend_tensor_set(
+            compact_weight, expert_bytes_buf.data(),
+            j * expert_bytes, expert_bytes);
+    }
+    ggml_backend_tensor_set(ids, compact_ids.data(), 0, ggml_nbytes(ids));
+    std::printf(
+        "[CYCLE_FFN_KERNEL_REPLAY] stage=%s weight_type=%s "
+        "active_experts=%zu packed_bytes=%zu channels=%lld "
+        "input=PHONE_WEIGHT_BYTES status=PREPARED\n",
+        stage, ggml_type_name(phone_weight->type),
+        active.size(), active.size() * expert_bytes,
+        (long long)channels);
+
+    auto compare = [&](const char * input_label,
+                       const std::vector<float> & values) -> bool {
+        ggml_backend_tensor_set(input_norm,
+            values.data(), 0, ggml_nbytes(input_norm));
+        if (ggml_backend_graph_compute(cpu_backend, graph) !=
+            GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "[CYCLE_FFN_KERNEL_REPLAY] stage=%s input=%s status=FAIL "
+                "reason=CPU_GRAPH_COMPUTE\n", stage, input_label);
+            return false;
+        }
+        ggml_backend_synchronize(cpu_backend);
+        std::vector<float> replay(size_t(channels * topk * tokens));
+        ggml_backend_tensor_get(
+            output, replay.data(), 0, ggml_nbytes(output));
+
+        double max_ref = 0.0;
+        double max_phone = 0.0;
+        double max_cpu_gpu = 0.0;
+        double ref_sq = 0.0;
+        double phone_sq = 0.0;
+        double cpu_gpu_sq = 0.0;
+        size_t worst_flat = 0;
+        for (int64_t token = 0; token < tokens; ++token) {
+            for (int64_t slot = 0; slot < topk; ++slot) {
+                for (int64_t channel = 0; channel < channels; ++channel) {
+                    const size_t index = size_t(
+                        (token * topk + slot) * channels + channel);
+                    const size_t ref_index = size_t(
+                        (token * topk + slot) * full_channels +
+                        phone_channel_begin + channel);
+                    const double ref = full_reference[ref_index];
+                    const double cpu = replay[index];
+                    const double gpu = phone_output[index];
+                    if (!std::isfinite(ref) ||
+                        !std::isfinite(cpu) ||
+                        !std::isfinite(gpu)) {
+                        std::fprintf(stderr,
+                            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s input=%s "
+                            "status=FAIL reason=NONFINITE\n",
+                            stage, input_label);
+                        return false;
+                    }
+                    const double e_ref = std::fabs(cpu - ref);
+                    const double e_phone = std::fabs(gpu - ref);
+                    const double e_cpu_gpu = std::fabs(cpu - gpu);
+                    ref_sq += e_ref * e_ref;
+                    phone_sq += e_phone * e_phone;
+                    cpu_gpu_sq += e_cpu_gpu * e_cpu_gpu;
+                    max_ref = std::max(max_ref, e_ref);
+                    max_phone = std::max(max_phone, e_phone);
+                    if (e_cpu_gpu > max_cpu_gpu) {
+                        max_cpu_gpu = e_cpu_gpu;
+                        worst_flat = index;
+                    }
+                }
+            }
+        }
+        const size_t n = replay.size();
+        const int64_t worst_channel = int64_t(
+            worst_flat % size_t(channels));
+        const int64_t worst_row = int64_t(
+            worst_flat / size_t(channels));
+        const int64_t worst_pos = worst_row / topk;
+        const int64_t worst_slot = worst_row % topk;
+        std::printf(
+            "[CYCLE_FFN_KERNEL_REPLAY] stage=%s input=%s "
+            "cpu_vs_full_max_abs=%.8g cpu_vs_full_rms=%.8g "
+            "gpu_vs_full_max_abs=%.8g gpu_vs_full_rms=%.8g "
+            "gpu_vs_cpu_max_abs=%.8g gpu_vs_cpu_rms=%.8g "
+            "worst_pos=%lld worst_expert=%d worst_channel=%lld "
+            "status=MEASURED\n",
+            stage, input_label,
+            max_ref, std::sqrt(ref_sq / double(n)),
+            max_phone, std::sqrt(phone_sq / double(n)),
+            max_cpu_gpu, std::sqrt(cpu_gpu_sq / double(n)),
+            (long long)worst_pos,
+            selected_ids[size_t(worst_pos * topk + worst_slot)],
+            (long long)(worst_channel + phone_channel_begin));
+        return true;
+    };
+
+    bool ok = compare("F32_UNCHANGED", norm);
+    if (ok) {
+        std::vector<float> f16_roundtrip(norm.size());
+        for (size_t i = 0; i < norm.size(); ++i) {
+            f16_roundtrip[i] =
+                ggml_fp16_to_fp32(ggml_fp32_to_fp16(norm[i]));
+        }
+        ok = compare("F16_ROUNDTRIP", f16_roundtrip);
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
