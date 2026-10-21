@@ -3500,6 +3500,89 @@ int main(int argc, char ** argv) {
     if (!baseline_check.valid || !baseline_check.pass) {
         return 1;
     }
+    if (c2p_mode) {
+        // NEW real C2P path. The host reference is only used to source the
+        // physically correct input hidden state of this particular layer;
+        // thereafter every Attention/FFN/Reduce operation is real.
+        ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
+        if (!phone || !ggml_backend_is_rpc(phone)) {
+            std::fprintf(stderr,
+                "[CYCLE_FIFO_C2P] status=FAIL reason=PHONE_RPC_BACKEND\n");
+            return 1;
+        }
+        size_t payload_bytes = 0;
+        if (!inference_cycle_payload_size(
+                INFERENCE_CYCLE_READY, uint32_t(ntokens),
+                uint32_t(hidden), uint32_t(topk), payload_bytes)) {
+            ggml_backend_free(phone);
+            return 1;
+        }
+        // Small persistent data-plane footprint on LMKD-sensitive Android.
+        if (!std::getenv("GGML_INFERENCE_TRANSPORT_SLOTS") &&
+            !cycle_real_set_env("GGML_INFERENCE_TRANSPORT_SLOTS", "2")) {
+            ggml_backend_free(phone);
+            return 1;
+        }
+        if (!std::getenv("GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB")) {
+            const size_t mib = 1024 * 1024;
+            const auto value = std::to_string(
+                std::max(size_t(1), (payload_bytes + mib - 1) / mib));
+            if (!cycle_real_set_env(
+                    "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB",
+                    value.c_str())) {
+                ggml_backend_free(phone);
+                return 1;
+            }
+        }
+        auto * device = ggml_backend_get_device(phone);
+        auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+        const auto open = reg ?
+            reinterpret_cast<ggml_backend_rpc_inference_transport_open_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC)) :
+            nullptr;
+        if (!open || !open(phone)) {
+            std::fprintf(stderr,
+                "[CYCLE_FIFO_C2P] status=FAIL "
+                "reason=DATA_PLANE_OPEN_OR_PHONE_PATCH26_REQUIRED\n");
+            ggml_backend_free(phone);
+            return 1;
+        }
+        int chunk_tokens = std::min<int32_t>(
+            16, std::max<int32_t>(1, ntokens / 4));
+        int max_inflight = 2;
+        const auto read_positive = [](const char * name, int & value) {
+            const char * env = std::getenv(name);
+            if (!env) {
+                return true;
+            }
+            char * end = nullptr;
+            const long n = std::strtol(env, &end, 10);
+            if (end == env || !end || *end != '\0' ||
+                n < 1 || n > 128) {
+                return false;
+            }
+            value = int(n);
+            return true;
+        };
+        if (!read_positive("LLAMA_HYBRID_CYCLE_REAL_CHUNK_TOKENS", chunk_tokens) ||
+            !read_positive("LLAMA_HYBRID_CYCLE_REAL_MAX_INFLIGHT", max_inflight) ||
+            max_inflight > 2) {
+            std::fprintf(stderr,
+                "[CYCLE_FIFO_C2P] status=FAIL reason=BAD_CHUNK_OR_WINDOW "
+                "allowed_chunk=[1,128] allowed_window=[1,2]\n");
+            ggml_backend_free(phone);
+            return 1;
+        }
+        const cycle_real_live_wire wire {layer, 0, 1, 1};
+        const bool ok = cycle_real_execute_c2p_fifo(
+            phone, cpu_dev, lw, model->hparams,
+            pc_weights, phone_weights, ref_input, wire,
+            hidden, ntokens, topk, experts, chunk_tokens, max_inflight);
+        ggml_backend_free(phone);
+        return ok ? 0 : 1;
+    }
+
     // The CPU reference is read-only from this point on. The READY wire and
     // the two physical FFN shards must consume Phone-generated arrays only.
     ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
