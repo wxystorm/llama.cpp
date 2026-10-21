@@ -3157,7 +3157,15 @@ static bool cycle_real_explicit_phone_fence(ggml_backend_t phone) {
             "[CYCLE_PERIOD_FENCE] status=FAIL reason=RPC_FENCE_MISSING\n");
         return false;
     }
+    const auto start = std::chrono::steady_clock::now();
     fence(phone);
+    if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
+        std::printf(
+            "[CYCLE_PHONE_FENCE_PROFILE] gpu_wait_ms=%.3f "
+            "source=EXPLICIT_RPC_SYNCHRONIZE_ACK\n",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+    }
     return true;
 }
 
