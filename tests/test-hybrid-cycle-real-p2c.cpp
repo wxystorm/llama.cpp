@@ -1422,6 +1422,97 @@ static cycle_real_diff cycle_real_compare(
     return result;
 }
 
+// Full-period oracle: compare the REAL eight-layer (or X+Y+2-layer) FIFO
+// output against the corresponding captured independent CPU l_out tensor.
+// Use the already established strict single-P2C bound, including a tighter
+// per-chunk bound when a chunk has a smaller reference activation scale.
+// This runs AFTER the timed Cycle execution; it does not affect its wall_ms.
+static bool cycle_real_period_cpu_parity(
+        const std::vector<float> & actual,
+        const std::vector<float> & reference,
+        int64_t hidden, int32_t tokens, int chunk_tokens, int final_layer) {
+    if (hidden <= 0 || tokens <= 0 || chunk_tokens <= 0 ||
+        actual.size() != size_t(tokens * hidden) ||
+        reference.size() != actual.size()) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD_PARITY] scope=FULL status=FAIL "
+            "reason=REFERENCE_SHAPE_MISMATCH actual=%zu reference=%zu "
+            "tokens=%d hidden=%lld\n",
+            actual.size(), reference.size(), int(tokens), (long long) hidden);
+        return false;
+    }
+
+    const auto strict_tolerance = [](const cycle_real_diff & d) {
+        // Same strict output tolerance as the single-layer P2C test.
+        return 0.02 + 0.00002 * d.max_ref;
+    };
+    const cycle_real_diff full = cycle_real_compare(actual, reference);
+    const bool full_ok = full.valid &&
+        full.max_abs <= strict_tolerance(full);
+    size_t worst_index = 0;
+    if (full.valid) {
+        double worst = -1.0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double error =
+                std::fabs(double(actual[i]) - double(reference[i]));
+            if (error > worst) {
+                worst = error;
+                worst_index = i;
+            }
+        }
+    }
+    std::printf(
+        "[CYCLE_PERIOD_PARITY] scope=FULL target=l_out-%d "
+        "tokens=%d elements=%zu max_abs=%.9g rms=%.9g "
+        "cosine=%.9g max_ref=%.9g strict_tolerance=%.9g "
+        "worst_token=%lld worst_channel=%lld "
+        "worst_actual=%.9g worst_reference=%.9g "
+        "status=%s\n",
+        final_layer, int(tokens), actual.size(),
+        full.max_abs, full.rms, full.cosine, full.max_ref,
+        strict_tolerance(full),
+        full.valid ? (long long)(worst_index / size_t(hidden)) : -1LL,
+        full.valid ? (long long)(worst_index % size_t(hidden)) : -1LL,
+        full.valid ? double(actual[worst_index]) : 0.0,
+        full.valid ? double(reference[worst_index]) : 0.0,
+        full_ok ? "PASS" : "FAIL");
+
+    bool chunks_ok = true;
+    const int n_chunks = (tokens + chunk_tokens - 1) / chunk_tokens;
+    for (int c = 0; c < n_chunks; ++c) {
+        const int64_t pos_begin = int64_t(c) * chunk_tokens;
+        const int64_t pos_end = std::min<int64_t>(
+            tokens, pos_begin + chunk_tokens);
+        const size_t begin = size_t(pos_begin * hidden);
+        const size_t end = size_t(pos_end * hidden);
+        const std::vector<float> actual_chunk(
+            actual.begin() + begin, actual.begin() + end);
+        const std::vector<float> reference_chunk(
+            reference.begin() + begin, reference.begin() + end);
+        const cycle_real_diff d =
+            cycle_real_compare(actual_chunk, reference_chunk);
+        const bool chunk_ok = d.valid &&
+            d.max_abs <= strict_tolerance(d);
+        chunks_ok = chunks_ok && chunk_ok;
+        std::printf(
+            "[CYCLE_PERIOD_PARITY_CHUNK] layer=%d chunk=%d "
+            "positions=[%lld,%lld] elements=%zu "
+            "max_abs=%.9g rms=%.9g cosine=%.9g "
+            "max_ref=%.9g strict_tolerance=%.9g status=%s\n",
+            final_layer, c, (long long) pos_begin,
+            (long long)(pos_end - 1), d.valid ? actual_chunk.size() : 0,
+            d.max_abs, d.rms, d.cosine, d.max_ref,
+            strict_tolerance(d), chunk_ok ? "PASS" : "FAIL");
+    }
+    const bool ok = full_ok && chunks_ok;
+    std::printf(
+        "[CYCLE_PERIOD_PARITY_SUM] target=l_out-%d "
+        "chunks=%d whole=%s all_chunks=%s cpu_parity=%s\n",
+        final_layer, n_chunks, full_ok ? "PASS" : "FAIL",
+        chunks_ok ? "PASS" : "FAIL", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // Decode a single selected expert's packed Q4_K rows using the canonical
 // GGML CPU GET_ROWS kernel. This produces the same F32 values represented
 // by the GGUF weight (without quantizing the activation to Q8_K). It is an
@@ -3294,6 +3385,7 @@ static bool cycle_real_execute_period_fifo(
         const llama_model & model,
         const llama_hybrid_cycle_layout & layout,
         const std::vector<float> & embedding,
+        const std::vector<float> & cpu_reference_output,
         int32_t tokens, int chunk_tokens, int max_inflight) {
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
@@ -3310,7 +3402,13 @@ static bool cycle_real_execute_period_fifo(
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
     if (embedding.size() != size_t(tokens * hidden) ||
+        cpu_reference_output.size() != embedding.size() ||
         hidden <= 0 || topk <= 0 || experts < topk) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD] status=FAIL reason=CPU_REFERENCE_SHAPE "
+            "embedding=%zu cpu_reference=%zu tokens=%d hidden=%lld\n",
+            embedding.size(), cpu_reference_output.size(),
+            int(tokens), (long long) hidden);
         return false;
     }
     cycle_real_numeric_probe("REFERENCE_EMBEDDING", -1, -1, embedding);
@@ -3734,7 +3832,14 @@ static bool cycle_real_execute_period_fifo(
         }
     }
     const bool output_ok = succeeded && nonfinite == 0 && max_abs > 0.0;
-    const bool ok = succeeded && kv_ok && net_idle && output_ok;
+    const bool execution_ok = succeeded && kv_ok && net_idle && output_ok;
+    // Compare only a COMPLETED period. Never claim CPU parity from a
+    // partially filled final_output after a failed stage or transport.
+    const bool parity_ok = execution_ok &&
+        cycle_real_period_cpu_parity(
+            final_output, cpu_reference_output,
+            hidden, tokens, chunk_tokens, n_layers - 1);
+    const bool ok = execution_ok && parity_ok;
     std::printf(
         "[CYCLE_PERIOD_SUM] layers=%d x=%d y=%d chunks=%d tokens=%d "
         "c2p_payloads=%d p2c_payloads=%d total_payloads=%d "
@@ -3743,10 +3848,11 @@ static bool cycle_real_execute_period_fifo(
         "final_output_owner=PC_CPU "
         "output_credit_release=DOWNSTREAM_CONSUMED "
         "final_max_abs=%.6g final_zero=%zu final_nonfinite=%zu "
-        "wall_ms=%.3f cpu_parity=NOT_CHECKED status=%s\n",
+        "wall_ms=%.3f cpu_parity=%s status=%s\n",
         n_layers, layout.x, layout.y, n_chunks, int(tokens),
         2 * n_chunks, 2 * n_chunks, 4 * n_chunks,
         max_abs, zero, nonfinite, wall_ms,
+        !execution_ok ? "NOT_CHECKED" : parity_ok ? "PASS" : "FAIL",
         ok ? "OK" : "FAIL");
     return ok;
 }
@@ -3829,12 +3935,29 @@ int main(int argc, char ** argv) {
                              raw_down_name, ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
+    std::string period_reference_output_name;
     if (cycle_period_mode) {
-        // The first PC full layer begins at REAL token embeddings. The CPU
-        // reference is only a deterministic source of this starting tensor.
+        // Select the first period's real final layer BEFORE the CPU-only
+        // reference temporarily hides the Cycle placement environment.
+        llama_hybrid_cycle_layout capture_layout;
+        try {
+            if (!llama_hybrid_cycle_layout_from_env(512, capture_layout)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PERIOD] status=FAIL reason=REFERENCE_LAYOUT_MISSING\n");
+                return 1;
+            }
+        } catch (const std::exception & e) {
+            std::fprintf(stderr,
+                "[CYCLE_PERIOD] status=FAIL reason=REFERENCE_LAYOUT_INVALID "
+                "detail=%s\n", e.what());
+            return 1;
+        }
+        period_reference_output_name =
+            "l_out-" + std::to_string(capture_layout.cycle_size - 1);
         capture.values.emplace("embd", cycle_real_capture_value {});
-        // Capture the corresponding independent CPU outputs for diagnostics.
-        for (int i = 0; i < 8; ++i) {
+        // Capture all first-period layer outputs for optional numeric probes,
+        // including the exact last layer used by the mandatory parity gate.
+        for (int i = 0; i < capture_layout.cycle_size; ++i) {
             capture.values.emplace(
                 "l_out-" + std::to_string(i), cycle_real_capture_value {});
         }
@@ -4076,6 +4199,16 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[CYCLE_PERIOD] status=FAIL "
             "reason=REAL_TOKEN_EMBEDDING_CAPTURE_MISSING\n");
+        return 1;
+    }
+    if (cycle_period_mode &&
+        !cycle_real_check_capture(
+            capture, period_reference_output_name, GGML_TYPE_F32,
+            reference_hidden, ntokens, 1)) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD] status=FAIL "
+            "reason=CPU_FINAL_L_OUT_CAPTURE_MISSING tensor=%s\n",
+            period_reference_output_name.c_str());
         return 1;
     }
     if (!cycle_real_check_capture(
@@ -4374,9 +4507,12 @@ int main(int argc, char ** argv) {
                 }
             }
             const auto embeddings = cycle_real_read<float>(capture, "embd");
+            const auto cpu_reference_output =
+                cycle_real_read<float>(capture, period_reference_output_name);
             ok = cycle_real_execute_period_fifo(
                 phone, cpu_dev, *model, expected_layout,
-                embeddings, ntokens, chunk_tokens, max_inflight);
+                embeddings, cpu_reference_output,
+                ntokens, chunk_tokens, max_inflight);
         } else {
             const cycle_real_live_wire wire {layer, 0, 1, 1};
             ok = cycle_real_execute_c2p_fifo(
