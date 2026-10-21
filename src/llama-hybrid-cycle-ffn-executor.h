@@ -154,6 +154,20 @@ public:
         return true;
     }
 
+    // C2P: the Phone RPC server has already applied READY into these very
+    // input GPU buffers from its physical data-plane. Never re-upload them
+    // via the PC control socket or download the Phone FFN output.
+    bool execute_device_ready() {
+        if (!backend_ || !graph_ || !compute_buffer_) {
+            return false;
+        }
+        if (ggml_backend_graph_compute(backend_, graph_) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_synchronize(backend_);
+        return true;
+    }
+
     void reset() {
         if (compute_buffer_) {
             ggml_backend_buffer_free(compute_buffer_);
