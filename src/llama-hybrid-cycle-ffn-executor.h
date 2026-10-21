@@ -88,11 +88,17 @@ public:
         // no ordinary RPC tensor_get is allowed: the caller will use the
         // received PARTIAL frame on the PC, not a duplicate host readback.
         const bool read_output = output != nullptr;
+        const bool phone_local = local_phone_ready != nullptr;
+        // Phone GPU consumes Attention/Router tensors through device-local
+        // copies. Do not gate this compute on a redundant PC READY readback:
+        // the sender can run its FFN as soon as Attention has completed.
+        // Host pointers/counts are required only by the PC FFN path.
         if (!backend_ || !graph_ || !compute_buffer_ ||
-            !norm || !ids || !routing ||
-            norm_count != size_t(ggml_nelements(ffn_.norm)) ||
-            ids_count != size_t(ggml_nelements(ffn_.topk_ids)) ||
-            routing_count != size_t(ggml_nelements(ffn_.topk_weights)) ||
+            (!phone_local &&
+                (!norm || !ids || !routing ||
+                 norm_count != size_t(ggml_nelements(ffn_.norm)) ||
+                 ids_count != size_t(ggml_nelements(ffn_.topk_ids)) ||
+                 routing_count != size_t(ggml_nelements(ffn_.topk_weights)))) ||
             (read_output
                 ? output_count != size_t(ggml_nelements(ffn_.ffn_output))
                 : output_count != 0)) {
