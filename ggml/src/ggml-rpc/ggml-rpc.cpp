@@ -979,6 +979,10 @@ static bool send_rpc_cmd_compact_small(
         enum rpc_cmd cmd,
         const T & request) {
 
+    if (!sock) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
     constexpr size_t request_size = sizeof(T);
 
     std::array<uint8_t,
@@ -1019,6 +1023,12 @@ static bool send_rpc_cmd(
         const void * input,
         size_t input_size) {
 
+    if (!sock) {
+        return false;
+    }
+    // Prevent another FIFO worker from inserting a request between this
+    // command's header and payload on the shared COMPUTE socket.
+    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
     std::array<uint8_t, 1 + sizeof(uint64_t)> header {};
 
     header[0] =
@@ -1062,6 +1072,12 @@ static thread_local rpc_cmd_roundtrip_profile *
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    if (!sock) {
+        return false;
+    }
+    // The lock must cover BOTH request and response. A per-send lock cannot
+    // prevent one worker from consuming another worker's reply.
+    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
     rpc_cmd_roundtrip_profile * const profile =
         rpc_cmd_roundtrip_profile_active;
 
@@ -1214,6 +1230,10 @@ static bool send_rpc_cmd_staged(
         size_t output_size,
         rpc_cmd_roundtrip_profile * profile = nullptr) {
 
+    if (!sock) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
     const int64_t t0 = ggml_time_us();
 
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
