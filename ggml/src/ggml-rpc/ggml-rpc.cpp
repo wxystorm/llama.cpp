@@ -8758,6 +8758,90 @@ static void cycle_phone_numeric_tensor(
     cycle_phone_numeric_host(stage, tensor->name, v.data(), v.size(), -1, -1, uid);
 }
 
+// Inspect a manually constructed Cycle GPU Reduce graph at the moment it
+// actually reaches the Phone GPU. The C2P graph has two ADD nodes; PHONE_FULL
+// has one. Probe ALL F32 inputs and both outputs before/after execution, even
+// when input tensor names are anonymous RPC placeholders. Disabled by default.
+static bool cycle_phone_numeric_read_f32(
+        const ggml_tensor * tensor, std::vector<float> & values) {
+    if (!tensor || !tensor->buffer || !tensor->data ||
+        tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    const size_t n = size_t(ggml_nelements(tensor));
+    if (n == 0 || n > 32768 ||
+        ggml_nbytes(tensor) != n * sizeof(float)) {
+        return false;
+    }
+    values.resize(n);
+    ggml_backend_tensor_get(tensor, values.data(), 0, n * sizeof(float));
+    return true;
+}
+
+static bool cycle_phone_numeric_is_reduce_graph(const ggml_cgraph * graph) {
+    if (!graph || graph->n_nodes < 1 || graph->n_nodes > 2) {
+        return false;
+    }
+    const ggml_tensor * output = graph->nodes[graph->n_nodes - 1];
+    return output &&
+        (std::strcmp(output->name, "cycle_num_c2p_lout") == 0 ||
+         std::strcmp(output->name, "cycle_num_phone_full_lout") == 0);
+}
+
+static void cycle_phone_numeric_reduce_edges(
+        const ggml_cgraph * graph, uint64_t uid, bool after) {
+    if (!cycle_phone_numeric_enabled() ||
+        !cycle_phone_numeric_is_reduce_graph(graph)) {
+        return;
+    }
+    const char * phase = after ? "AFTER" : "BEFORE";
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (!node) {
+            continue;
+        }
+        for (int j = 0; j < 2; ++j) {
+            const ggml_tensor * input = node->src[j];
+            if (!input) {
+                continue;
+            }
+            // The output of the previous ADD is undefined before its graph
+            // has executed. Do not confuse an uninitialized intermediate
+            // with the external FFN/Residual/PC-partial inputs.
+            if (!after && i > 0 && input == graph->nodes[i - 1]) {
+                continue;
+            }
+            std::vector<float> values;
+            const bool available = cycle_phone_numeric_read_f32(input, values);
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_REDUCE_EDGE] phase=%s uid=%" PRIu64
+                " node=%d input=%d name=%s op=%s readable=%d "
+                "elements=%" PRId64 "\n",
+                phase, uid, i, j,
+                input->name, ggml_op_name(input->op),
+                available ? 1 : 0, ggml_nelements(input));
+            if (available) {
+                char label[56];
+                std::snprintf(label, sizeof(label), "%s_NODE%d_SRC%d",
+                    phase, i, j);
+                cycle_phone_numeric_host(
+                    label, input->name, values.data(), values.size(),
+                    -1, -1, uid);
+            }
+        }
+        if (after) {
+            std::vector<float> values;
+            if (cycle_phone_numeric_read_f32(node, values)) {
+                char label[56];
+                std::snprintf(label, sizeof(label), "AFTER_NODE%d_OUT", i);
+                cycle_phone_numeric_host(
+                    label, node->name, values.data(), values.size(),
+                    -1, -1, uid);
+            }
+        }
+    }
+}
+
 // Executed in the Phone RPC server process. GPU outputs are read here,
 // packed directly into the existing inference transport TX slots, and sent
 // Phone->PC by its TX worker. The client control RPC contains descriptors
@@ -11417,6 +11501,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             "[CYCLE_LIVE_FFN_REMOTE] uid=%" PRIu64
             " stage=COMPUTE_BEGIN nodes=%u\n", graph_uid, n_nodes);
     }
+    cycle_phone_numeric_reduce_edges(graph, graph_uid, false);
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
@@ -11424,6 +11509,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             device,
             graph_uid,
             graph);
+    if (status == GGML_STATUS_SUCCESS) {
+        cycle_phone_numeric_reduce_edges(graph, graph_uid, true);
+    }
 
     if (cycle_probe_diag) {
         GGML_LOG_INFO(
