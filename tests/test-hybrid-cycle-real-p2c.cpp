@@ -1168,6 +1168,7 @@ static bool cycle_real_probe_q4k_dense_f64_oracle(
 static bool cycle_real_probe_phone_single_expert_mul_mat(
         const char * stage,
         ggml_backend_t phone_backend,
+        ggml_backend_t cpu_backend,
         const ggml_tensor * source_weight,
         const std::vector<float> & input_norm,
         const std::vector<int32_t> & selected_ids,
@@ -1176,7 +1177,8 @@ static bool cycle_real_probe_phone_single_expert_mul_mat(
         int64_t hidden, int64_t tokens, int64_t topk,
         int64_t full_channels, int64_t phone_channel_begin,
         int32_t target_token, int32_t target_slot) {
-    if (!phone_backend || !source_weight || !source_weight->buffer ||
+    if (!phone_backend || !cpu_backend ||
+        !source_weight || !source_weight->buffer ||
         !ggml_is_contiguous(source_weight) ||
         source_weight->type != GGML_TYPE_Q4_K ||
         hidden != source_weight->ne[0] ||
@@ -1323,6 +1325,32 @@ static bool cycle_real_probe_phone_single_expert_mul_mat(
             max_id_cpu, std::sqrt(sum_id_cpu / double(channels)),
             max_single_id, std::sqrt(sum_single_id / double(channels)),
             (long long)worst_channel);
+
+        // The CPU baseline uses Q4_K x Q8_K, while the tested OpenCL
+        // kernels consume F32 activations. Compare ALL of them against an
+        // independently dequantized Q4_K x F32 dot with F64 accumulation
+        // before labeling any GPU/CPU difference a correctness bug.
+        std::vector<float> cpu_q8_slice(static_cast<size_t>(channels));
+        std::vector<float> gpu_moe_slice(static_cast<size_t>(channels));
+        for (int64_t ch = 0; ch < channels; ++ch) {
+            const size_t cpu_idx = size_t(
+                (target_token * topk + target_slot) * full_channels +
+                phone_channel_begin + ch);
+            const size_t phone_idx = size_t(
+                (target_token * topk + target_slot) * channels + ch);
+            cpu_q8_slice[size_t(ch)] = full_cpu_stage[cpu_idx];
+            gpu_moe_slice[size_t(ch)] = phone_id_stage[phone_idx];
+        }
+        const bool oracle_ok = cycle_real_probe_q4k_dense_f64_oracle(
+            stage, cpu_backend, phone_backend,
+            packed, hidden, channels,
+            input_norm.data() + size_t(target_token * hidden),
+            cpu_q8_slice, single_output, gpu_moe_slice);
+        if (!oracle_ok) {
+            std::fprintf(stderr,
+                "[CYCLE_FFN_F32_ORACLE] stage=%s status=NOT_AVAILABLE "
+                "scope=DIAGNOSTIC_ONLY\n", stage);
+        }
     } else {
         std::fprintf(stderr,
             "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
@@ -2570,14 +2598,14 @@ int main(int argc, char ** argv) {
                     // Gate and Up. A probe failure is diagnostic only.
                     const bool gate_gpu_op_ok =
                         cycle_real_probe_phone_single_expert_mul_mat(
-                            "GATE", phone, phone_weights.gate,
+                            "GATE", phone, cpu, phone_weights.gate,
                             input_norm, input_ids,
                             baseline_gate, ph_stages.gate,
                             hidden, ntokens, topk, full_channels, pc_channels,
                             gate_phone_peak.first, gate_phone_peak.second);
                     const bool up_gpu_op_ok =
                         cycle_real_probe_phone_single_expert_mul_mat(
-                            "UP", phone, phone_weights.up,
+                            "UP", phone, cpu, phone_weights.up,
                             input_norm, input_ids,
                             baseline_up, ph_stages.up,
                             hidden, ntokens, topk, full_channels, pc_channels,
