@@ -55,6 +55,16 @@ struct cycle_real_capture {
     bool error = false;
 };
 
+// Optional host-only checkpoint references for localizing numerical drift
+// before it reaches the final CPU parity comparison. The corresponding
+// CPU model has already been released when the physical period begins.
+struct cycle_real_period_reference {
+    std::vector<std::vector<float>> layer_outputs;
+    std::vector<float> c2p_residual;
+    std::vector<float> p2c_residual;
+    std::vector<float> p2c_norm;
+};
+
 // This is the ordinary llama_context scheduler callback. On ask=false,
 // the scheduler has already synchronized the node's producer backend.
 static bool cycle_real_capture_cb(ggml_tensor * tensor, bool ask, void * userdata) {
@@ -1511,6 +1521,59 @@ static bool cycle_real_period_cpu_parity(
         final_layer, n_chunks, full_ok ? "PASS" : "FAIL",
         chunks_ok ? "PASS" : "FAIL", ok ? "PASS" : "FAIL");
     return ok;
+}
+
+// Compare one Chunk of an existing CPU-hosted activation against the same
+// contiguous [hidden, tokens] slice of the independent CPU reference.
+// Diagnostic only: no extra RPC readback and NO impact on pass/fail rules.
+static void cycle_real_period_checkpoint(
+        const char * stage, int layer, int chunk, int64_t start,
+        int64_t hidden, const std::vector<float> & actual,
+        const std::vector<float> & reference) {
+    if (!cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE")) {
+        return;
+    }
+    if (hidden <= 0 || start < 0 || actual.empty() ||
+        actual.size() % size_t(hidden) != 0 ||
+        size_t(start * hidden) > reference.size() ||
+        actual.size() > reference.size() - size_t(start * hidden)) {
+        std::printf(
+            "[CYCLE_LAYER_PARITY] stage=%s layer=%d chunk=%d "
+            "status=NO_REFERENCE actual=%zu reference=%zu\n",
+            stage, layer, chunk, actual.size(), reference.size());
+        return;
+    }
+    const size_t offset = size_t(start * hidden);
+    const std::vector<float> ref_slice(
+        reference.begin() + offset,
+        reference.begin() + offset + actual.size());
+    const cycle_real_diff d = cycle_real_compare(actual, ref_slice);
+    const double tol = 0.02 + 0.00002 * d.max_ref;
+    size_t worst = 0;
+    double worst_abs = -1.0;
+    if (d.valid) {
+        for (size_t i = 0; i < actual.size(); ++i) {
+            const double e = std::fabs(
+                double(actual[i]) - double(ref_slice[i]));
+            if (e > worst_abs) {
+                worst_abs = e;
+                worst = i;
+            }
+        }
+    }
+    std::printf(
+        "[CYCLE_LAYER_PARITY] stage=%s layer=%d chunk=%d "
+        "positions=[%lld,%lld] max_abs=%.9g rms=%.9g "
+        "cosine=%.9g tolerance=%.9g worst_token=%lld "
+        "worst_channel=%lld status=%s\n",
+        stage, layer, chunk,
+        (long long)start,
+        (long long)(start + int64_t(actual.size() / size_t(hidden)) - 1),
+        d.max_abs, d.rms, d.cosine, tol,
+        d.valid ? (long long)(start + worst / size_t(hidden)) : -1LL,
+        d.valid ? (long long)(worst % size_t(hidden)) : -1LL,
+        d.valid ? (d.max_abs <= tol ? "WITHIN_TOLERANCE" : "DRIFT") :
+                  "INVALID");
 }
 
 // Decode a single selected expert's packed Q4_K rows using the canonical
@@ -3386,6 +3449,7 @@ static bool cycle_real_execute_period_fifo(
         const llama_hybrid_cycle_layout & layout,
         const std::vector<float> & embedding,
         const std::vector<float> & cpu_reference_output,
+        const cycle_real_period_reference & checkpoints,
         int32_t tokens, int chunk_tokens, int max_inflight) {
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
@@ -3552,6 +3616,12 @@ static bool cycle_real_execute_period_fifo(
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "PC_FULL_OUTPUT", l, c, st.host_output);
+                            if (size_t(l) < checkpoints.layer_outputs.size()) {
+                                cycle_real_period_checkpoint(
+                                    "PC_FULL_OUTPUT", l, c, st.start, hidden,
+                                    st.host_output,
+                                    checkpoints.layer_outputs[size_t(l)]);
+                            }
                         }
                         st.ready.residual.clear();
                         st.ready.norm.clear();
@@ -3616,6 +3686,9 @@ static bool cycle_real_execute_period_fifo(
                                 "C2P_READY_RESIDUAL", l, c, st.ready.residual);
                             cycle_real_numeric_probe(
                                 "C2P_READY_NORM", l, c, st.ready.norm);
+                            cycle_real_period_checkpoint(
+                                "C2P_ATTN_RESIDUAL", l, c, st.start, hidden,
+                                st.ready.residual, checkpoints.c2p_residual);
                             st.phone_output =
                                 std::make_unique<cycle_real_c2p_phone_chunk>();
                             const auto weights = full_shard(l, 1);
@@ -3678,6 +3751,14 @@ static bool cycle_real_execute_period_fifo(
                             cycle_real_numeric_probe(
                                 "P2C_READY_ROUTING", l, c,
                                 st.recv_ready.ready.topk_weights);
+                            cycle_real_period_checkpoint(
+                                "P2C_ATTN_RESIDUAL", l, c, st.start, hidden,
+                                st.recv_ready.ready.residual,
+                                checkpoints.p2c_residual);
+                            cycle_real_period_checkpoint(
+                                "P2C_FFN_NORM", l, c, st.start, hidden,
+                                st.recv_ready.ready.ffn_norm,
+                                checkpoints.p2c_norm);
                             ok = ggml_backend_rpc_cycle_send_ack(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
@@ -3954,6 +4035,17 @@ int main(int argc, char ** argv) {
         }
         period_reference_output_name =
             "l_out-" + std::to_string(capture_layout.cycle_size - 1);
+        // Compare boundaries adjacent to the GPU-only segment without
+        // adding any cross-device diagnostic activation reads.
+        capture.values.emplace(
+            "ffn_inp-" + std::to_string(capture_layout.x),
+            cycle_real_capture_value {});
+        capture.values.emplace(
+            "ffn_inp-" + std::to_string(capture_layout.cycle_size - 1),
+            cycle_real_capture_value {});
+        capture.values.emplace(
+            "ffn_norm-" + std::to_string(capture_layout.cycle_size - 1),
+            cycle_real_capture_value {});
         capture.values.emplace("embd", cycle_real_capture_value {});
         // Capture all first-period layer outputs for optional numeric probes,
         // including the exact last layer used by the mandatory parity gate.
@@ -4509,9 +4601,45 @@ int main(int argc, char ** argv) {
             const auto embeddings = cycle_real_read<float>(capture, "embd");
             const auto cpu_reference_output =
                 cycle_real_read<float>(capture, period_reference_output_name);
+            cycle_real_period_reference checkpoints;
+            if (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE")) {
+                const auto optional_capture =
+                    [&](const std::string & name) -> std::vector<float> {
+                        const auto it = capture.values.find(name);
+                        if (it == capture.values.end() ||
+                            it->second.count != 1 ||
+                            it->second.type != GGML_TYPE_F32 ||
+                            it->second.ne[0] != reference_hidden ||
+                            it->second.ne[1] != ntokens ||
+                            it->second.ne[2] != 1 ||
+                            it->second.bytes.size() !=
+                                embeddings.size() * sizeof(float)) {
+                            std::printf(
+                                "[CYCLE_LAYER_PARITY] stage=REFERENCE_CAPTURE "
+                                "tensor=%s status=UNAVAILABLE\n",
+                                name.c_str());
+                            return {};
+                        }
+                        return cycle_real_read<float>(capture, name);
+                    };
+                checkpoints.layer_outputs.reserve(
+                    size_t(expected_layout.cycle_size));
+                for (int l = 0; l < expected_layout.cycle_size; ++l) {
+                    checkpoints.layer_outputs.push_back(
+                        optional_capture("l_out-" + std::to_string(l)));
+                }
+                checkpoints.c2p_residual = optional_capture(
+                    "ffn_inp-" + std::to_string(expected_layout.x));
+                checkpoints.p2c_residual = optional_capture(
+                    "ffn_inp-" + std::to_string(
+                        expected_layout.cycle_size - 1));
+                checkpoints.p2c_norm = optional_capture(
+                    "ffn_norm-" + std::to_string(
+                        expected_layout.cycle_size - 1));
+            }
             ok = cycle_real_execute_period_fifo(
                 phone, cpu_dev, *model, expected_layout,
-                embeddings, cpu_reference_output,
+                embeddings, cpu_reference_output, checkpoints,
                 ntokens, chunk_tokens, max_inflight);
         } else {
             const cycle_real_live_wire wire {layer, 0, 1, 1};
