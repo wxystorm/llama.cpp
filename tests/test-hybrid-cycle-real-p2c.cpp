@@ -551,12 +551,13 @@ struct cycle_real_phone_kv_cache {
     }
 
     bool init(ggml_backend_t backend,
-              const llama_layer & layer, int64_t total_tokens) {
+              const llama_layer & layer, int64_t total_tokens,
+              size_t source_device = 1) {
         release();
         const auto * norm = ggml_backend_meta_get_static_weight_shard(
-            layer.attn_k_norm, 1);
+            layer.attn_k_norm, source_device);
         const auto * wk = ggml_backend_meta_get_static_weight_shard(
-            layer.wk, 1);
+            layer.wk, source_device);
         if (!backend || !norm || !wk ||
             total_tokens <= 0 || total_tokens > 128 ||
             norm->ne[0] <= 0 || wk->ne[1] % norm->ne[0] != 0) {
@@ -686,7 +687,8 @@ static bool cycle_real_execute_phone_attention_pre(
         double & elapsed_ms,
         const cycle_real_live_wire * wire = nullptr,
         cycle_real_phone_kv_cache * kv_cache = nullptr,
-        int64_t kv_token_start = 0) {
+        int64_t kv_token_start = 0,
+        size_t source_device = 1) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -715,8 +717,8 @@ static bool cycle_real_execute_phone_attention_pre(
 
     // Meta gives a borrowed tensor on the REAL Phone buffer, not a
     // retransmitted or re-quantized copy. Empty PC shards are expected.
-    auto get_weight = [](const ggml_tensor * t) -> ggml_tensor * {
-        return ggml_backend_meta_get_static_weight_shard(t, 1);
+    auto get_weight = [source_device](const ggml_tensor * t) -> ggml_tensor * {
+        return ggml_backend_meta_get_static_weight_shard(t, source_device);
     };
     ggml_tensor * w_attn_norm = get_weight(layer.attn_norm);
     ggml_tensor * wq = get_weight(layer.wq);
