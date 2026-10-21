@@ -3660,6 +3660,13 @@ struct cycle_real_period_stage_profile {
     double wall_ms = 0.0;
     double max_ms = 0.0;
 };
+// Graph/allocator setup within Phone FFN prepare is separate from its
+// actual GPU kernel execution. All durations here are PC-observed.
+struct cycle_real_phone_prepare_profile {
+    uint64_t count = 0;
+    double graph_build_ms = 0.0;
+    double gpu_buffer_alloc_ms = 0.0;
+};
 
 struct cycle_real_period_chunk {
     int layer = 0;
@@ -3697,6 +3704,17 @@ static bool cycle_real_execute_period_fifo(
     const int64_t hidden = model.hparams.n_embd;
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
+    const bool perf_mode = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PERF_MODE");
+    if (perf_mode &&
+        (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
+         cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD_PERF] status=FAIL "
+            "reason=DIAGNOSTIC_READBACK_OR_NUMERIC_TRACE_ACTIVE "
+            "action=UNSET_DEBUG_ENV\n");
+        return false;
+    }
     if (embedding.size() != size_t(tokens * hidden) ||
         cpu_reference_output.size() != embedding.size() ||
         hidden <= 0 || topk <= 0 || experts < topk) {
@@ -3763,8 +3781,6 @@ static bool cycle_real_execute_period_fifo(
     // Keep strict CPU parity for correctness runs. Performance runs still
     // REPORT parity, but it is independently non-gating: only real compute,
     // causal KV, TX drain and finite nonzero output can succeed the run.
-    const bool perf_mode = cycle_real_env_flag(
-        "LLAMA_HYBRID_CYCLE_PERF_MODE");
     const bool stage_detail = std::getenv(
         "LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr;
     constexpr size_t n_queues =
@@ -3774,6 +3790,9 @@ static bool cycle_real_execute_period_fifo(
     std::array<std::array<cycle_real_period_stage_profile, n_stages>,
         n_queues> stage_profile {};
     llama_hybrid_cycle_fifo_profile fifo_profile {};
+    std::array<cycle_real_attention_phase_profile, n_queues> attn_profile {};
+    std::array<cycle_real_phone_prepare_profile, n_queues> gpu_prepare_profile {};
+    std::array<cycle_real_phone_fence_profile, n_queues> fence_profile {};
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
@@ -3825,6 +3844,7 @@ static bool cycle_real_execute_period_fifo(
             }
             const int l = task.layer;
             const int c = task.chunk;
+            const size_t queue_index = static_cast<size_t>(task.queue);
             auto & st = *states[size_t(l)][size_t(c)];
             const auto kind = period.kinds[size_t(l)];
             const auto & layer = model.layers[size_t(l)];
@@ -3841,7 +3861,8 @@ static bool cycle_real_execute_period_fifo(
                                 hidden, st.tokens, topk, experts,
                                 st.ready, attn_ms, nullptr,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
-                                st.start, 0);
+                                st.start, 0, nullptr, false,
+                                perf_mode ? &attn_profile[queue_index] : nullptr);
                         if (ok) {
                             if (size_t(l) < checkpoints.pc_attn_residuals.size()) {
                                 cycle_real_period_checkpoint(
@@ -3910,11 +3931,13 @@ static bool cycle_real_execute_period_fifo(
                                 hidden, st.tokens, topk, experts,
                                 st.ready, attn_ms, nullptr,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
-                                st.start, 1, local_input, true);
+                                st.start, 1, local_input, true,
+                                perf_mode ? &attn_profile[queue_index] : nullptr);
                         if (ok) {
                             // This is a real RPC fence; the RPC backend's
                             // ordinary synchronize() is a NO-OP.
-                            ok = cycle_real_explicit_phone_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(
+                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
                         }
                         if (ok && boundary_trace) {
                             // The Attention tensors are still GPU-owned
@@ -3958,7 +3981,8 @@ static bool cycle_real_execute_period_fifo(
                             ok = st.phone_output->execute_full_local(st.ready);
                         }
                         if (ok) {
-                            ok = cycle_real_explicit_phone_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(
+                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
                         }
                         if (ok && boundary_trace) {
                             // The full-Phone MoE FFN has completed, but the
@@ -3975,7 +3999,8 @@ static bool cycle_real_execute_period_fifo(
                             ok = st.phone_output->execute_reduce(phone);
                         }
                         if (ok) {
-                            ok = cycle_real_explicit_phone_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(
+                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
                         }
                         if (ok && st.phone_output &&
                             size_t(l) < checkpoints.layer_outputs.size()) {
@@ -4027,7 +4052,8 @@ static bool cycle_real_execute_period_fifo(
                                 hidden, st.tokens, topk, experts,
                                 st.ready, attn_ms, nullptr,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
-                                st.start, 0);
+                                st.start, 0, nullptr, false,
+                                perf_mode ? &attn_profile[queue_index] : nullptr);
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "C2P_READY_RESIDUAL", l, c, st.ready.residual);
@@ -4052,9 +4078,11 @@ static bool cycle_real_execute_period_fifo(
                                 hidden, st.tokens, topk, experts,
                                 st.ready, attn_ms, &st.wire,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
-                                st.start, 1, local_input, true);
+                                st.start, 1, local_input, true,
+                                perf_mode ? &attn_profile[queue_index] : nullptr);
                         if (ok) {
-                            ok = cycle_real_explicit_phone_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(
+                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
                         }
                         if (ok) {
                             states[size_t(l - 1)][size_t(c)]->phone_output.reset();
