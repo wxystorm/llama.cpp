@@ -490,6 +490,28 @@ struct cycle_real_phone_ready {
     // Full pre-TopK Softmax distribution for score-margin diagnosis only.
     // Not serialized in READY and never used by the FFN execution.
     std::vector<float> router_probs;
+
+    // Keep READY's Phone GPU tensors alive through FFN local input copies.
+    ggml_context * phone_ctx = nullptr;
+    ggml_backend_buffer_t phone_compute_buffer = nullptr;
+    llama_hybrid_cycle_ready_graph phone_graph {};
+
+    cycle_real_phone_ready() = default;
+    cycle_real_phone_ready(const cycle_real_phone_ready &) = delete;
+    cycle_real_phone_ready & operator=(const cycle_real_phone_ready &) = delete;
+    ~cycle_real_phone_ready() { release_phone_graph(); }
+
+    void release_phone_graph() {
+        if (phone_compute_buffer != nullptr) {
+            ggml_backend_buffer_free(phone_compute_buffer);
+            phone_compute_buffer = nullptr;
+        }
+        if (phone_ctx != nullptr) {
+            ggml_free(phone_ctx);
+            phone_ctx = nullptr;
+        }
+        phone_graph = {};
+    }
 };
 
 struct cycle_real_live_wire {
@@ -889,6 +911,14 @@ static bool cycle_real_execute_phone_attention_pre(
         ggml_graph_n_nodes(graph), elapsed_ms,
         ok ? "OK" : "FAIL");
 
+    if (ok && wire != nullptr) {
+        // Borrow original Attention tensors until the local Phone FFN
+        // consumes them, preventing a hidden PC->Phone activation upload.
+        result.phone_ctx = ctx;
+        result.phone_compute_buffer = compute_buffer;
+        result.phone_graph = ready;
+        return true;
+    }
     ggml_backend_buffer_free(compute_buffer);
     ggml_free(ctx);
     return ok;
@@ -914,7 +944,8 @@ static bool cycle_real_execute_ffn(
         std::vector<float> & partial,
         std::vector<float> * raw_down_out = nullptr,
         cycle_real_ffn_stages * stages_out = nullptr,
-        const cycle_real_live_wire * wire = nullptr) {
+        const cycle_real_live_wire * wire = nullptr,
+        const llama_hybrid_cycle_ready_graph * local_phone_ready = nullptr) {
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -968,7 +999,8 @@ static bool cycle_real_execute_ffn(
                 ids.data(), ids.size(),
                 routing.data(), routing.size(),
                 wire != nullptr ? nullptr : partial.data(),
-                wire != nullptr ? 0 : partial.size());
+                wire != nullptr ? 0 : partial.size(),
+                local_phone_ready);
             if (ok && stages_out != nullptr) {
                 const int64_t elems = shard.up->ne[1] * topk * tokens;
                 const auto read_stage = [&](const char * stage,
@@ -3544,7 +3576,8 @@ int main(int argc, char ** argv) {
             phone, phone_weights, norm, ids, routing,
             hidden, ntokens, topk, experts, part,
             nullptr, nullptr,
-            live_wire_enabled ? &wire : nullptr);
+            live_wire_enabled ? &wire : nullptr,
+            live_wire_enabled ? &phone_ready.phone_graph : nullptr);
         return std::make_pair(done, std::move(part));
     });
     std::vector<float> pc_part;
@@ -3558,6 +3591,9 @@ int main(int argc, char ** argv) {
         ready_msg.ready.topk_weights,
         hidden, ntokens, topk, experts, pc_part);
     const auto phone_result = phone_task.get();
+    // Device-local copies and Phone FFN execution have completed.
+    // Free the borrowed Attention compute buffer before PC Reduce.
+    phone_ready.release_phone_graph();
     const bool phone_ok = phone_result.first;
     const auto & phone_part = phone_result.second;
     const double parts_ms = std::chrono::duration<double, std::milli>(
