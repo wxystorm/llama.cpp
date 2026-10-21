@@ -866,6 +866,12 @@ int main(int argc, char ** argv) {
         reference_hidden = reference_model->hparams.n_embd;
         reference_topk = reference_model->hparams.n_expert_used;
         reference_experts = reference_model->hparams.n_expert;
+        if (!reference_model->layers[size_t(layer)].ffn_up_exps) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_REFERENCE] status=FAIL "
+                "reason=FFN_UP_REFERENCE_WEIGHT_MISSING\n");
+            return 1;
+        }
         reference_model_ffn_channels =
             reference_model->layers[size_t(layer)].ffn_up_exps->ne[1];
 
@@ -1559,8 +1565,9 @@ int main(int argc, char ** argv) {
                 // original per-expert channel order. Split intervals for
                 // Q4_K_M are contiguous along n_ff:
                 // PC [0,pc_channels), Phone [pc_channels,total_channels).
-                // Q4_K block-alignment has already been validated by the
-                // physical weight partition checks above.
+                // The physical partition shape and backend ownership
+                // were checked above. This stage test does not yet prove
+                // byte-for-byte identity of the quantized shard weights.
                 const int64_t pc_channels = pc_weights.up->ne[1];
                 const int64_t ph_channels = phone_weights.up->ne[1];
                 const int64_t full_channels = reference_model_ffn_channels;
