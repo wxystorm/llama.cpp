@@ -577,6 +577,15 @@ static bool cycle_real_execute_phone_attention_pre(
     return ok;
 }
 
+// Intermediate physical FFN taps are opt-in diagnostics. They are borrowed
+// graph results read back after the existing backend compute; the actual FFN
+// path, final reduction and strict validation thresholds are unchanged.
+struct cycle_real_ffn_stages {
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> swiglu;
+};
+
 static bool cycle_real_execute_ffn(
         ggml_backend_t backend,
         const llama_hybrid_cycle_ffn_shard_weights & shard,
@@ -586,7 +595,8 @@ static bool cycle_real_execute_ffn(
         int64_t hidden, int64_t tokens,
         int64_t topk, int64_t experts,
         std::vector<float> & partial,
-        std::vector<float> * raw_down_out = nullptr) {
+        std::vector<float> * raw_down_out = nullptr,
+        cycle_real_ffn_stages * stages_out = nullptr) {
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -638,6 +648,33 @@ static bool cycle_real_execute_ffn(
                 ids.data(), ids.size(),
                 routing.data(), routing.size(),
                 partial.data(), partial.size());
+            if (ok && stages_out != nullptr) {
+                const int64_t elems = shard.up->ne[1] * topk * tokens;
+                const auto read_stage = [&](const char * stage,
+                                            ggml_tensor * node,
+                                            std::vector<float> & dst) {
+                    if (!node || node->type != GGML_TYPE_F32 ||
+                        !ggml_is_contiguous(node) ||
+                        ggml_nelements(node) != elems) {
+                        std::fprintf(stderr,
+                            "[CYCLE_FFN_STAGE_CAPTURE] backend=%s stage=%s "
+                            "status=FAIL reason=TYPE_OR_SHAPE\n",
+                            backend_name, stage);
+                        return false;
+                    }
+                    dst.resize(size_t(elems));
+                    ggml_backend_tensor_get(
+                        node, dst.data(), 0, ggml_nbytes(node));
+                    std::printf(
+                        "[CYCLE_FFN_STAGE_CAPTURE] backend=%s stage=%s "
+                        "elements=%lld status=OK\n",
+                        backend_name, stage, (long long)elems);
+                    return true;
+                };
+                ok = read_stage("GATE", gate, stages_out->gate) &&
+                     read_stage("UP", up, stages_out->up) &&
+                     read_stage("SWIGLU", activation, stages_out->swiglu);
+            }
             // Diagnostic only: capture the unweighted per-expert Down
             // projection [hidden, topk, tokens] from this physical shard.
             // This is the exact same tensor as canonical ffn_moe_down
@@ -764,10 +801,14 @@ int main(int argc, char ** argv) {
     const std::string probs_name = "ffn_moe_probs" + suffix;
     const std::string ffn_name = "ffn_moe_out" + suffix;
     const std::string raw_down_name = "ffn_moe_down" + suffix;
+    const std::string raw_gate_name = "ffn_moe_gate" + suffix;
+    const std::string raw_up_name = "ffn_moe_up" + suffix;
+    const std::string raw_swiglu_name = "ffn_moe_swiglu" + suffix;
     const std::string output_name = "l_out" + suffix;
     cycle_real_capture capture;
     for (const auto & name : {attn_input_name, residual_name, norm_name,
                              ids_name, routing_name, probs_name,
+                             raw_gate_name, raw_up_name, raw_swiglu_name,
                              raw_down_name, ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
@@ -779,6 +820,7 @@ int main(int argc, char ** argv) {
     int64_t reference_hidden = 0;
     int64_t reference_topk = 0;
     int64_t reference_experts = 0;
+    int64_t reference_model_ffn_channels = 0;
     double forward_ms = 0.0;
 
     // The Cycle model has a placement-only C2P/P2C policy and MUST NOT run
@@ -824,6 +866,8 @@ int main(int argc, char ** argv) {
         reference_hidden = reference_model->hparams.n_embd;
         reference_topk = reference_model->hparams.n_expert_used;
         reference_experts = reference_model->hparams.n_expert;
+        reference_model_ffn_channels =
+            reference_model->layers[size_t(layer)].ffn_up_exps->ne[1];
 
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 512;
@@ -952,6 +996,15 @@ int main(int argc, char ** argv) {
         !cycle_real_check_capture(
             capture, probs_name, GGML_TYPE_F32, reference_experts, ntokens, 1) ||
         !cycle_real_check_capture(
+            capture, raw_gate_name, GGML_TYPE_F32,
+            reference_model_ffn_channels, reference_topk, ntokens) ||
+        !cycle_real_check_capture(
+            capture, raw_up_name, GGML_TYPE_F32,
+            reference_model_ffn_channels, reference_topk, ntokens) ||
+        !cycle_real_check_capture(
+            capture, raw_swiglu_name, GGML_TYPE_F32,
+            reference_model_ffn_channels, reference_topk, ntokens) ||
+        !cycle_real_check_capture(
             capture, raw_down_name, GGML_TYPE_F32,
             reference_hidden, reference_topk, ntokens) ||
         !cycle_real_check_capture(
@@ -963,7 +1016,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] "
-                "capture_fields=9 status=PASS\n");
+                "capture_fields=12 status=PASS\n");
 
     // A new model instance holds only the *real* physical Cycle weights:
     // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
@@ -1057,6 +1110,12 @@ int main(int argc, char ** argv) {
     const auto ref_ids = cycle_real_read<int32_t>(capture, ids_name);
     const auto ref_routing = cycle_real_read<float>(capture, routing_name);
     const auto ref_router_probs = cycle_real_read<float>(capture, probs_name);
+    const auto baseline_gate =
+        cycle_real_read<float>(capture, raw_gate_name);
+    const auto baseline_up =
+        cycle_real_read<float>(capture, raw_up_name);
+    const auto baseline_swiglu =
+        cycle_real_read<float>(capture, raw_swiglu_name);
     const auto baseline_down =
         cycle_real_read<float>(capture, raw_down_name);
     const auto baseline_ffn = cycle_real_read<float>(capture, ffn_name);
