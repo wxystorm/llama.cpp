@@ -2373,6 +2373,10 @@ struct cycle_real_c2p_phone_chunk {
     llama_hybrid_cycle_ffn_graph inputs {};
     ggml_cgraph * reduce_graph = nullptr;
     llama_hybrid_cycle_ffn_executor executor;
+    double graph_build_ms = 0.0;
+    double gpu_alloc_ms = 0.0;
+    double ffn_graph_submit_ms = 0.0;
+    double reduce_graph_submit_ms = 0.0;
 
     cycle_real_c2p_phone_chunk() = default;
     cycle_real_c2p_phone_chunk(const cycle_real_c2p_phone_chunk &) = delete;
@@ -2396,6 +2400,7 @@ struct cycle_real_c2p_phone_chunk {
             ggml_backend_t phone,
             const llama_hybrid_cycle_ffn_shard_weights & shard,
             int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
+        const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
         params.mem_size = 2 * 1024 * 1024;
@@ -2431,6 +2436,7 @@ struct cycle_real_c2p_phone_chunk {
         reduce_graph = ggml_new_graph_custom(ctx, 16, false);
         ggml_graph_add_node(reduce_graph, ffnsum);
         ggml_graph_add_node(reduce_graph, output);
+        const auto build_end = std::chrono::steady_clock::now();
         if (!executor.prepare(
                 phone, ctx, ffn_graph, inputs, shard,
                 hidden, tokens, topk, experts)) {
@@ -2439,11 +2445,28 @@ struct cycle_real_c2p_phone_chunk {
             release();
             return false;
         }
+        const auto alloc_end = std::chrono::steady_clock::now();
+        graph_build_ms = std::chrono::duration<double, std::milli>(
+            build_end - build_begin).count();
+        gpu_alloc_ms = std::chrono::duration<double, std::milli>(
+            alloc_end - build_end).count();
+        std::printf(
+            "[CYCLE_GPU_PREPARE] phase=PHONE_FFN graph_build_ms=%.3f "
+            "gpu_alloc_ms=%.3f source=PC_CLIENT status=OK\n",
+            graph_build_ms, gpu_alloc_ms);
         return true;
     }
 
     bool execute_ffn() {
-        return executor.execute_device_ready();
+        const auto begin = std::chrono::steady_clock::now();
+        const bool ok = executor.execute_device_ready();
+        ffn_graph_submit_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_FFN "
+                    "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
+                    "status=%s\n",
+                    ffn_graph_submit_ms, ok ? "OK" : "FAIL");
+        return ok;
     }
 
     bool execute_reduce(ggml_backend_t phone) {
@@ -2451,11 +2474,18 @@ struct cycle_real_c2p_phone_chunk {
             !inputs.ffn_output || !residual) {
             return false;
         }
+        const auto begin = std::chrono::steady_clock::now();
         const bool ok = ggml_backend_graph_compute(phone, reduce_graph) ==
                         GGML_STATUS_SUCCESS;
         if (ok) {
             ggml_backend_synchronize(phone);
         }
+        reduce_graph_submit_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE "
+                    "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
+                    "status=%s\n",
+                    reduce_graph_submit_ms, ok ? "OK" : "FAIL");
         return ok;
     }
 };
