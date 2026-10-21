@@ -3012,6 +3012,11 @@ static bool cycle_real_execute_c2p_fifo(
 }
 
 int main(int argc, char ** argv) {
+#ifdef LLAMA_CYCLE_C2P_TEST
+    const bool c2p_mode = true;
+#else
+    const bool c2p_mode = cycle_real_env_flag("LLAMA_HYBRID_CYCLE_REAL_C2P");
+#endif
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
             "Usage: test-hybrid-cycle-real-p2c <model.gguf> <phone-ip:port> "
@@ -3268,19 +3273,21 @@ int main(int argc, char ** argv) {
                 "kind=CONTIGUOUS_PROMPT_CACHE source=CPU_REFERENCE "
                 "phone_chunk_kv=SEPARATE_PERSISTENT_BUFFER status=OK\n",
                 int(ntokens), int(ntokens - 1));
-    // The RAII guard restored the physical Cycle placement policy. Verify
-    // the requested P2C layer before loading the distributed model.
+    // Independent CPU reference is the same for C2P and P2C. Check the
+    // actual requested physical Tensor direction before loading shards.
     llama_hybrid_cycle_layout expected_layout;
     if (!llama_hybrid_cycle_layout_from_env(
             reference_layers, expected_layout) ||
         expected_layout.kinds[size_t(layer)] !=
-            llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            (c2p_mode ? llama_hybrid_cycle_layer_kind::TENSOR_C2P :
+                        llama_hybrid_cycle_layer_kind::TENSOR_P2C)) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL reason=RESTORED_LAYOUT_OR_NOT_P2C\n");
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] cycle_placement_env=RESTORED "
-                "target_layer=%d kind=P2C status=OK\n", layer);
+                "target_layer=%d kind=%s status=OK\n",
+                layer, c2p_mode ? "C2P" : "P2C");
 
     // Fail on a malformed/uncaptured CPU baseline before allocating the
     // much larger distributed PC/Phone weight buffers.
@@ -3359,7 +3366,8 @@ int main(int argc, char ** argv) {
         layer >= model_layers - 1 ||
         model->hybrid_layer_modes.size() != size_t(model_layers) ||
         model->hybrid_layer_modes[size_t(layer)] !=
-            llama_hybrid_layer_mode::TENSOR_P2C) {
+            (c2p_mode ? llama_hybrid_layer_mode::TENSOR_C2P :
+                        llama_hybrid_layer_mode::TENSOR_P2C)) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL "
             "reason=MODEL_OR_NOT_P2C_LAYER layer=%d\n", layer);
@@ -3368,18 +3376,23 @@ int main(int argc, char ** argv) {
 
     cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_CYCLE_MODEL_LOAD");
     const auto & lw = model->layers[size_t(layer)];
-    if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_Q", lw.wq, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_K", lw.wk, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_V", lw.wv, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_Q_NORM", lw.attn_q_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_K_NORM", lw.attn_k_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("ATTN_OUT", lw.wo, phone_dev) ||
-        !cycle_real_check_phone_weight("FFN_NORM", lw.ffn_norm, phone_dev) ||
-        !cycle_real_check_phone_weight("MOE_ROUTER", lw.ffn_gate_inp, phone_dev)) {
+    const auto owner_check = [&](const char * role, const ggml_tensor * tensor) {
+        return c2p_mode ?
+            cycle_real_check_pc_weight(role, tensor) :
+            cycle_real_check_phone_weight(role, tensor, phone_dev);
+    };
+    if (!owner_check("ATTN_NORM", lw.attn_norm) ||
+        !owner_check("ATTN_Q", lw.wq) ||
+        !owner_check("ATTN_K", lw.wk) ||
+        !owner_check("ATTN_V", lw.wv) ||
+        !owner_check("ATTN_Q_NORM", lw.attn_q_norm) ||
+        !owner_check("ATTN_K_NORM", lw.attn_k_norm) ||
+        !owner_check("ATTN_OUT", lw.wo) ||
+        !owner_check("FFN_NORM", lw.ffn_norm) ||
+        !owner_check("MOE_ROUTER", lw.ffn_gate_inp)) {
         std::fprintf(stderr,
-            "[CYCLE_REAL_P2C] status=FAIL "
-            "reason=ATTENTION_ROUTER_NOT_PHONE_OWNED\n");
+            "[CYCLE_REAL] status=FAIL reason=ATTENTION_ROUTER_WRONG_OWNER "
+            "direction=%s\n", c2p_mode ? "C2P" : "P2C");
         return 1;
     }
     const int64_t hidden = model->hparams.n_embd;
