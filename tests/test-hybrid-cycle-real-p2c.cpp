@@ -388,8 +388,31 @@ static bool cycle_real_execute_phone_attention_pre(
         ctx, kq, nullptr, 1.0f / std::sqrt(float(head_dim)), 0.0f);
     auto * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
     auto * kqv = ggml_mul_mat(ctx, vt, probs);
+
+    // The concatenated attention width is n_heads * head_dim (4096 on
+    // Qwen3-30B-A3B), NOT the residual/hidden width (2048). The WO
+    // projection is responsible for mapping 4096 -> 2048. Previously,
+    // requesting [hidden,1] in ggml_cont_2d aborted at ggml.c:3594.
+    const int64_t attention_width = wq->ne[1];
+    if (ggml_nelements(kqv) != attention_width) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ATTN_WIDTH "
+            "kqv_elements=%lld expected=%lld hidden=%lld\n",
+            (long long)ggml_nelements(kqv),
+            (long long)attention_width, (long long)hidden);
+        ggml_free(ctx);
+        return false;
+    }
     auto * attn = ggml_cont_2d(ctx,
-        ggml_permute(ctx, kqv, 0, 2, 1, 3), hidden, 1);
+        ggml_permute(ctx, kqv, 0, 2, 1, 3), attention_width, 1);
+
+    std::printf(
+        "[CYCLE_PHONE_ATTN_SHAPE] hidden=%lld head_dim=%lld "
+        "heads=%lld kv_heads=%lld attn_width=%lld wo_out=%lld "
+        "status=PASS\n",
+        (long long)hidden, (long long)head_dim,
+        (long long)n_heads, (long long)n_kv_heads,
+        (long long)attention_width, (long long)wo->ne[1]);
 
     auto * attn_output = ggml_mul_mat(ctx, wo, attn);
     auto * residual = ggml_add(ctx, attn_output, x);
