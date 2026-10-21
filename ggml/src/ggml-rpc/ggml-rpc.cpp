@@ -10183,6 +10183,20 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
             src->name, dst->name, nbytes);
     }
 
+    if (response.result && cycle_phone_numeric_enabled() &&
+        cycle_phone_numeric_named(src->name) &&
+        dst->type == GGML_TYPE_F32 && dst->buffer && dst->data &&
+        ggml_is_contiguous(dst)) {
+        const size_t count = size_t(ggml_nelements(dst));
+        if (count > 0 && count <= 32768 &&
+            ggml_nbytes(dst) == count * sizeof(float)) {
+            std::vector<float> v(count);
+            ggml_backend_tensor_get(dst, v.data(), 0, ggml_nbytes(dst));
+            cycle_phone_numeric_host(
+                "COPY_DEST_AFTER", src->name, v.data(), v.size());
+        }
+    }
+
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
             "[RPC_KQUANT_SERVER_COPY_DONE] result=%d "
