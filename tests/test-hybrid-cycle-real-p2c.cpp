@@ -3206,7 +3206,7 @@ static bool cycle_real_execute_period_fifo(
     }
 
     using state_ptr = std::unique_ptr<cycle_real_period_chunk>;
-    std::vector<std::vector<state_ptr>> states(size_t(n_layers));
+    std::vector<std::vector<state_ptr>> states(static_cast<size_t>(n_layers));
     for (int l = 0; l < n_layers; ++l) {
         auto & row = states[size_t(l)];
         row.reserve(size_t(n_chunks));
@@ -3556,10 +3556,15 @@ static bool cycle_real_execute_period_fifo(
 }
 
 int main(int argc, char ** argv) {
-#ifdef LLAMA_CYCLE_C2P_TEST
+#ifdef LLAMA_CYCLE_LOOP_TEST
     const bool c2p_mode = true;
+    const bool cycle_period_mode = true;
+#elif defined(LLAMA_CYCLE_C2P_TEST)
+    const bool c2p_mode = true;
+    const bool cycle_period_mode = false;
 #else
     const bool c2p_mode = cycle_real_env_flag("LLAMA_HYBRID_CYCLE_REAL_C2P");
+    const bool cycle_period_mode = false;
 #endif
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
@@ -3627,6 +3632,11 @@ int main(int argc, char ** argv) {
                              raw_gate_name, raw_up_name, raw_swiglu_name,
                              raw_down_name, ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
+    }
+    if (cycle_period_mode) {
+        // The first PC full layer begins at REAL token embeddings. The CPU
+        // reference is only a deterministic source of this starting tensor.
+        capture.values.emplace("embd", cycle_real_capture_value {});
     }
 
     const std::string prompt = argc >= 5 ? argv[4] :
@@ -3858,6 +3868,15 @@ int main(int argc, char ** argv) {
 
     // Fail on a malformed/uncaptured CPU baseline before allocating the
     // much larger distributed PC/Phone weight buffers.
+    if (cycle_period_mode &&
+        !cycle_real_check_capture(
+            capture, "embd", GGML_TYPE_F32,
+            reference_hidden, ntokens, 1)) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD] status=FAIL "
+            "reason=REAL_TOKEN_EMBEDDING_CAPTURE_MISSING\n");
+        return 1;
+    }
     if (!cycle_real_check_capture(
             capture, attn_input_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
         !cycle_real_check_capture(
@@ -4141,11 +4160,19 @@ int main(int argc, char ** argv) {
             ggml_backend_free(phone);
             return 1;
         }
-        const cycle_real_live_wire wire {layer, 0, 1, 1};
-        const bool ok = cycle_real_execute_c2p_fifo(
-            phone, cpu_dev, lw, model->hparams,
-            pc_weights, phone_weights, ref_input, wire,
-            hidden, ntokens, topk, experts, chunk_tokens, max_inflight);
+        bool ok = false;
+        if (cycle_period_mode) {
+            const auto embeddings = cycle_real_read<float>(capture, "embd");
+            ok = cycle_real_execute_period_fifo(
+                phone, cpu_dev, *model, expected_layout,
+                embeddings, ntokens, chunk_tokens, max_inflight);
+        } else {
+            const cycle_real_live_wire wire {layer, 0, 1, 1};
+            ok = cycle_real_execute_c2p_fifo(
+                phone, cpu_dev, lw, model->hparams,
+                pc_weights, phone_weights, ref_input, wire,
+                hidden, ntokens, topk, experts, chunk_tokens, max_inflight);
+        }
         ggml_backend_free(phone);
         return ok ? 0 : 1;
     }
