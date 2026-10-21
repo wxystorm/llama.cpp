@@ -3573,7 +3573,7 @@ static bool cycle_real_execute_period_fifo(
                 stage_ms, ok ? "OK" : "FAIL");
             std::fflush(stdout);
             return ok;
-        }, window);
+        }, window, true);
     bool kv_ok = true;
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
