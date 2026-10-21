@@ -345,6 +345,15 @@ if (TARGET ggml-rpc)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
     target_link_libraries(test-hybrid-cycle-real-p2c PRIVATE ggml-rpc)
+
+    # Real C2P reverses the same fixed Tensor boundary: PC owns Attention,
+    # READY/PARTIAL travel PC->Phone on the data-plane, and Phone GPU owns
+    # the only final Reduce. Requires a Phone RPC server using protocol 26.
+    llama_build(test-hybrid-cycle-real-c2p.cpp)
+    target_include_directories(test-hybrid-cycle-real-c2p PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+    target_link_libraries(test-hybrid-cycle-real-c2p PRIVATE ggml-rpc)
 endif()
 
 # ggml-rpc may be configured before the top-level include(CTest), so its
