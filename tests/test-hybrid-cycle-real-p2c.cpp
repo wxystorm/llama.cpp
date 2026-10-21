@@ -1786,19 +1786,21 @@ static bool cycle_real_probe_down_f64_oracle(
     const auto gpu_err = cycle_real_compare_f64(gpu_quant, f64);
     const auto moe_err = cycle_real_compare_f64(gpu_moe, f64);
     const auto dense_err = cycle_real_compare_f64(gpu_dense, f64);
-    if (!cpu_ok || !gpu_ok || !moe_ok || !dense_ok ||
-        !cpu_err.valid || !gpu_err.valid || !moe_err.valid ||
-        !dense_err.valid) {
+    if ((cpu_ok && !cpu_err.valid) ||
+        (gpu_ok && !gpu_err.valid) ||
+        (moe_ok && !moe_err.valid) ||
+        (dense_ok && !dense_err.valid)) {
         std::fprintf(stderr,
-            "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d "
-            "expert=%d weight_type=%s status=NOT_AVAILABLE "
-            "cpu=%d gpu_quant=%d gpu_moe=%d gpu_dense=%d\n",
-            int(target_token), int(target_slot), int(expert),
-            ggml_type_name(phone_down->type),
-            cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
-            moe_ok ? 1 : 0, dense_ok ? 1 : 0);
+            "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN status=NOT_AVAILABLE "
+            "reason=NONFINITE\n");
         return false;
     }
+    // Some OpenCL installations cannot run one-expert MUL_MAT_ID or a
+    // particular Q6_K generic kernel. Preserve every available result
+    // rather than hiding the F64 and Dense F32 measurements in that case.
+    const double na = std::numeric_limits<double>::quiet_NaN();
+    const bool complete = cpu_err.valid && gpu_err.valid &&
+                          moe_err.valid && dense_err.valid;
     std::printf(
         "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d expert=%d "
         "weight_type=%s input_channels=%lld output_channels=%lld "
@@ -1807,15 +1809,28 @@ static bool cycle_real_probe_down_f64_oracle(
         "gpu_quantf32_vs_f64_max_abs=%.8g gpu_quantf32_vs_f64_rms=%.8g "
         "gpu_moe_vs_f64_max_abs=%.8g gpu_moe_vs_f64_rms=%.8g "
         "gpu_dense_f32_vs_f64_max_abs=%.8g gpu_dense_f32_vs_f64_rms=%.8g "
-        "status=MEASURED scope=DIAGNOSTIC_ONLY\n",
+        "status=%s scope=DIAGNOSTIC_ONLY\n",
         int(target_token), int(target_slot), int(expert),
         ggml_type_name(phone_down->type),
         (long long)channels, (long long)hidden,
-        cpu_err.max_abs, cpu_err.rms,
-        gpu_err.max_abs, gpu_err.rms,
-        moe_err.max_abs, moe_err.rms,
-        dense_err.max_abs, dense_err.rms);
-    return true;
+        cpu_err.valid ? cpu_err.max_abs : na,
+        cpu_err.valid ? cpu_err.rms : na,
+        gpu_err.valid ? gpu_err.max_abs : na,
+        gpu_err.valid ? gpu_err.rms : na,
+        moe_err.valid ? moe_err.max_abs : na,
+        moe_err.valid ? moe_err.rms : na,
+        dense_err.valid ? dense_err.max_abs : na,
+        dense_err.valid ? dense_err.rms : na,
+        complete ? "MEASURED" : "MEASURED_PARTIAL");
+    if (!complete) {
+        std::printf(
+            "[CYCLE_FFN_DOWN_F64_ORACLE_AVAIL] cpu=%d gpu_quant=%d "
+            "gpu_moe=%d gpu_dense=%d status=PARTIAL\n",
+            cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
+            moe_ok ? 1 : 0, dense_ok ? 1 : 0);
+    }
+    return cpu_err.valid && dense_err.valid &&
+           (gpu_err.valid || moe_err.valid);
 }
 
 // Independently rebuild the FULL selected-expert FFN with F64 dot products
@@ -1833,6 +1848,8 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
         const std::vector<float> & routing_weights,
         const std::vector<float> & baseline_ffn,
         const std::vector<float> & physical_control_ffn,
+        const std::vector<float> & cpu_residual,
+        const std::vector<float> & baseline_layer_output,
         int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
     if (!pc_weights.gate || !phone_weights.gate) {
         return false;
@@ -1857,7 +1874,9 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
         selected_ids.size() != size_t(topk * tokens) ||
         routing_weights.size() != size_t(topk * tokens) ||
         baseline_ffn.size() != size_t(hidden * tokens) ||
-        physical_control_ffn.size() != size_t(hidden * tokens)) {
+        physical_control_ffn.size() != size_t(hidden * tokens) ||
+        cpu_residual.size() != size_t(hidden * tokens) ||
+        baseline_layer_output.size() != size_t(hidden * tokens)) {
         return false;
     }
 
@@ -1934,6 +1953,22 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
             "reason=NONFINITE_OR_SHAPE\n");
         return false;
     }
+    // Compare both whole-layer outputs with the same residual, not the
+    // Phone-generated residual, so this isolates FFN numerical behavior.
+    std::vector<double> layer_oracle(oracle.size());
+    std::vector<float> physical_control_layer(oracle.size());
+    for (size_t i = 0; i < oracle.size(); ++i) {
+        layer_oracle[i] = double(cpu_residual[i]) + oracle[i];
+        physical_control_layer[i] =
+            cpu_residual[i] + physical_control_ffn[i];
+    }
+    const auto cpu_layer_err =
+        cycle_real_compare_f64(baseline_layer_output, layer_oracle);
+    const auto physical_layer_err =
+        cycle_real_compare_f64(physical_control_layer, layer_oracle);
+    if (!cpu_layer_err.valid || !physical_layer_err.valid) {
+        return false;
+    }
     const char * closer = physical_err.rms < cpu_err.rms ? "PC_PHONE" :
                           physical_err.rms > cpu_err.rms ? "CPU_FULL" : "EQUAL";
     std::printf(
@@ -1949,6 +1984,14 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
         (long long)pc_channels, (long long)phone_channels,
         cpu_err.max_abs, cpu_err.rms,
         physical_err.max_abs, physical_err.rms, closer);
+    std::printf(
+        "[CYCLE_LAYER_F64_ORACLE] layer_input=CPU_REFERENCE_RESIDUAL "
+        "input=CPU_READY_CONTROL "
+        "cpu_full_vs_f64_max_abs=%.8g cpu_full_vs_f64_rms=%.8g "
+        "pc_phone_vs_f64_max_abs=%.8g pc_phone_vs_f64_rms=%.8g "
+        "status=MEASURED scope=DIAGNOSTIC_ONLY\n",
+        cpu_layer_err.max_abs, cpu_layer_err.rms,
+        physical_layer_err.max_abs, physical_layer_err.rms);
     return true;
 }
 
@@ -3160,6 +3203,7 @@ int main(int argc, char ** argv) {
                 cpu, pc_weights, phone_weights,
                 ref_norm, ref_ids, ref_routing,
                 baseline_ffn, cpu_ready_control_ffn,
+                ref_residual, baseline_output,
                 hidden, ntokens, topk, experts)) {
             std::fprintf(stderr,
                 "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
