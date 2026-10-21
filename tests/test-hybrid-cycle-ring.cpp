@@ -1,7 +1,9 @@
 #include "llama-hybrid-cycle-ring.h"
+#include "llama-hybrid-cycle-fifo-executor.h"
 
 #include <array>
 #include <cassert>
+#include <atomic>
 #include <stdexcept>
 
 static llama_hybrid_cycle_task take(
@@ -170,8 +172,65 @@ static void test_reject_invalid_completions() {
     }
 }
 
+// The real P2C diagnostic binds these tasks to Phone GPU and RPC. This
+// CPU-only unit test exercises the SAME per-queue worker runtime without
+// importing any model, validating the stage dependency boundary.
+static void test_p2c_fifo_worker_runtime() {
+    llama_hybrid_cycle_layout fragment;
+    fragment.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    std::array<std::atomic<int>, 7> completed {};
+    for (auto & count : completed) {
+        count.store(0);
+    }
+    const auto done = [&](llama_hybrid_cycle_stage stage) {
+        return completed[static_cast<size_t>(stage)].load();
+    };
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        fragment, 1, [&](const llama_hybrid_cycle_task & task) {
+            assert(task.layer == 0 && task.chunk == 0);
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    break;
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_TO_PC);
+                    assert(done(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    assert(done(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::FFN_DESTINATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(done(llama_hybrid_cycle_stage::SEND_ACTIVATION));
+                    break;
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_TO_PC);
+                    assert(done(llama_hybrid_cycle_stage::FFN_SOURCE));
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(done(llama_hybrid_cycle_stage::FFN_DESTINATION));
+                    assert(done(llama_hybrid_cycle_stage::SEND_PARTIAL));
+                    break;
+                case llama_hybrid_cycle_stage::FULL_LAYER:
+                    assert(false && "P2C must not dispatch FULL_LAYER");
+                    return false;
+            }
+            ++completed[static_cast<size_t>(task.stage)];
+            return true;
+        });
+    assert(ok);
+    assert(done(llama_hybrid_cycle_stage::REDUCE) == 1);
+    assert(done(llama_hybrid_cycle_stage::SEND_ACTIVATION) == 1);
+    assert(done(llama_hybrid_cycle_stage::SEND_PARTIAL) == 1);
+    assert(done(llama_hybrid_cycle_stage::FFN_SOURCE) == 1);
+    assert(done(llama_hybrid_cycle_stage::FFN_DESTINATION) == 1);
+}
+
 int main() {
     test_one_cycle();
+    test_p2c_fifo_worker_runtime();
     test_causal_entry_order();
     test_two_cycles_and_cuda_tail();
     test_reject_invalid_completions();
