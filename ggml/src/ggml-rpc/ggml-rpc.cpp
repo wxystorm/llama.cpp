@@ -2117,14 +2117,16 @@ static bool rpc_cycle_apply_inbound_tensors(
         return false;
     }
     rpc_msg_inference_cycle_send_rsp response {};
-    const bool ok = send_rpc_cmd(
+    const bool rpc_ok = send_rpc_cmd(
         sock, RPC_CMD_INFERENCE_CYCLE_APPLY,
-        &request, sizeof(request), &response, sizeof(response)) &&
-        response.result == 1;
+        &request, sizeof(request), &response, sizeof(response));
+    const bool ok = rpc_ok && response.result == 1;
     GGML_LOG_INFO("[CYCLE_C2P] side=pc action=PHONE_GPU_APPLY kind=%s "
-                  "layer=%d chunk=%d seq=%" PRIu64 " status=%s\n",
+                  "layer=%d chunk=%d seq=%" PRIu64
+                  " rpc_ok=%d server_result=%u status=%s\n",
                   kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
-                  layer, chunk, seq, ok ? "DEVICE_READY" : "FAIL");
+                  layer, chunk, seq, rpc_ok ? 1 : 0,
+                  (unsigned) response.result, ok ? "DEVICE_READY" : "FAIL");
     return ok;
 }
 
