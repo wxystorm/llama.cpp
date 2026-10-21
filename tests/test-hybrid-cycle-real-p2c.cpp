@@ -543,6 +543,26 @@ struct cycle_real_phone_ready {
 // interval contiguous across KV heads: no host readback, no materialization
 // of previous chunks and no second cache instance per in-flight chunk.
 // Attention tasks run in causal chunk order on the single PHONE_GPU FIFO.
+// Complete PC layers keep native CPU weight tensors, while Tensor and Phone
+// layers borrow their physical static weight shards from Meta. Only accept
+// native weights whose buffer type matches the actual compute backend.
+// Never return the parent Meta tensor or perform an implicit device transfer.
+static ggml_tensor * cycle_real_resolve_physical_weight(
+        const ggml_tensor * weight, ggml_backend_t backend,
+        size_t source_device) {
+    if (!weight || !weight->buffer || !backend ||
+        weight->op != GGML_OP_NONE || weight->view_src != nullptr) {
+        return nullptr;
+    }
+    const auto native_buft = ggml_backend_get_default_buffer_type(backend);
+    if (native_buft &&
+        ggml_backend_buffer_get_type(weight->buffer) == native_buft) {
+        // Borrowed model tensor: it remains owned by the model until unload.
+        return const_cast<ggml_tensor *>(weight);
+    }
+    return ggml_backend_meta_get_static_weight_shard(weight, source_device);
+}
+
 struct cycle_real_phone_kv_cache {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -579,10 +599,10 @@ struct cycle_real_phone_kv_cache {
               const llama_layer & layer, int64_t total_tokens,
               size_t source_device = 1) {
         release();
-        const auto * norm = ggml_backend_meta_get_static_weight_shard(
-            layer.attn_k_norm, source_device);
-        const auto * wk = ggml_backend_meta_get_static_weight_shard(
-            layer.wk, source_device);
+        const auto * norm = cycle_real_resolve_physical_weight(
+            layer.attn_k_norm, backend, source_device);
+        const auto * wk = cycle_real_resolve_physical_weight(
+            layer.wk, backend, source_device);
         if (!backend || !norm || !wk ||
             total_tokens <= 0 || total_tokens > 128 ||
             norm->ne[0] <= 0 || wk->ne[1] % norm->ne[0] != 0) {
@@ -747,10 +767,10 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
 
-    // Meta gives a borrowed tensor on the REAL Phone buffer, not a
-    // retransmitted or re-quantized copy. Empty PC shards are expected.
-    auto get_weight = [source_device](const ggml_tensor * t) -> ggml_tensor * {
-        return ggml_backend_meta_get_static_weight_shard(t, source_device);
+    // PC complete layers use their native CPU model weights. Tensor and
+    // Phone layers still borrow physical Meta shards without host transfers.
+    auto get_weight = [backend, source_device](const ggml_tensor * t) -> ggml_tensor * {
+        return cycle_real_resolve_physical_weight(t, backend, source_device);
     };
     ggml_tensor * w_attn_norm = get_weight(layer.attn_norm);
     ggml_tensor * wq = get_weight(layer.wq);
@@ -3292,9 +3312,14 @@ static bool cycle_real_execute_period_fifo(
     };
     const auto full_shard = [&](int l, size_t device) {
         const auto & weights = model.layers[size_t(l)];
-        return llama_hybrid_cycle_get_physical_ffn_weights(
-            weights.ffn_up_exps, weights.ffn_gate_exps,
-            weights.ffn_down_exps, device);
+        ggml_backend_t backend = device == 0 ? cpu : phone;
+        // PC_FULL uses the complete native CPU MoE weights. PHONE_FULL
+        // borrows its complete Phone GPU physical Meta shard.
+        return llama_hybrid_cycle_ffn_shard_weights {
+            cycle_real_resolve_physical_weight(weights.ffn_up_exps, backend, device),
+            cycle_real_resolve_physical_weight(weights.ffn_gate_exps, backend, device),
+            cycle_real_resolve_physical_weight(weights.ffn_down_exps, backend, device),
+        };
     };
     const auto take_device_input = [&](int l, int c) -> const ggml_tensor * {
         if (l <= layout.x || c < 0 || l >= n_layers) {
