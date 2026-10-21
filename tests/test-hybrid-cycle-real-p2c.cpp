@@ -3791,7 +3791,7 @@ static bool cycle_real_execute_period_fifo(
             return false;
         }
         cpu_threads = int(parsed);
-        const auto * cpu_backend_dev = ggml_backend_get_device(cpu);
+        auto * cpu_backend_dev = ggml_backend_get_device(cpu);
         auto * cpu_reg = cpu_backend_dev ?
             ggml_backend_dev_backend_reg(cpu_backend_dev) : nullptr;
         const auto set_threads = cpu_reg ?
