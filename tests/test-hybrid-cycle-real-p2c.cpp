@@ -1055,7 +1055,7 @@ static bool cycle_real_probe_phone_single_expert_mul_mat(
     const bool ok = compute_status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_synchronize(phone_backend);
-        std::vector<float> single_output(size_t(channels));
+        std::vector<float> single_output(static_cast<size_t>(channels), 0.0f);
         ggml_backend_tensor_get(
             y, single_output.data(), 0, ggml_nbytes(y));
         double max_single_cpu = 0;
