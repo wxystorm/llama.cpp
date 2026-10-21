@@ -3,8 +3,9 @@
 // Attention/Norm/Router/FFN/l_out reference, and is freed before the Cycle
 // model is loaded. PC CPU + Phone GPU then run *real physical FFN shards*
 // independently. Only PC sums both partials and adds the captured residual.
-// This does NOT yet execute Attention/Router on Phone: that requires the
-// separate Phone AttentionPre stage, NOT the legacy Meta full-model graph.
+// Phone GPU executes a real first-token AttentionPre (no historical KV)
+// and we compare its four READY outputs against that CPU reference before
+// using them for either FFN shard. Multi-token KV-aware stages come next.
 //
 // READY/PARTIAL are serialized/deserialized IN PROCESS as wire-format
 // checks only. The Phone FFN input/output still travel through ordinary
@@ -629,6 +630,11 @@ int main(int argc, char ** argv) {
     }
 
     const std::string suffix = "-" + std::to_string(layer);
+    // The previous layer's complete output is the exact input of Layer 7
+    // Attention (Qwen3-MoE's inpL). Capture it from the independent CPU
+    // baseline; do not substitute an arbitrary activation.
+    const std::string attn_input_name =
+        "l_out-" + std::to_string(layer - 1);
     const std::string residual_name = "ffn_inp" + suffix;
     const std::string norm_name = "ffn_norm" + suffix;
     const std::string ids_name = "cycle_real_topk_ids" + suffix;
@@ -636,8 +642,8 @@ int main(int argc, char ** argv) {
     const std::string ffn_name = "ffn_moe_out" + suffix;
     const std::string output_name = "l_out" + suffix;
     cycle_real_capture capture;
-    for (const auto & name : {residual_name, norm_name, ids_name,
-                             routing_name, ffn_name, output_name}) {
+    for (const auto & name : {attn_input_name, residual_name, norm_name,
+                             ids_name, routing_name, ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
 
@@ -765,6 +771,16 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
                 "status=RELEASED_BEFORE_CYCLE_LOAD\n");
 
+    // This first Phone AttentionPre probe has no prior-KV history. If the
+    // prompt contains multiple tokens, run the next KV-aware stage instead;
+    // never silently compare a position-0 graph with full causal attention.
+    if (ntokens != 1) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
+            "reason=REQUIRES_ONE_TOKEN_POSITION_ZERO tokens=%d\n",
+            int(ntokens));
+        return 1;
+    }
     // The RAII guard restored the physical Cycle placement policy. Verify
     // the requested P2C layer before loading the distributed model.
     llama_hybrid_cycle_layout expected_layout;
@@ -782,6 +798,8 @@ int main(int argc, char ** argv) {
     // Fail on a malformed/uncaptured CPU baseline before allocating the
     // much larger distributed PC/Phone weight buffers.
     if (!cycle_real_check_capture(
+            capture, attn_input_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
+        !cycle_real_check_capture(
             capture, residual_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
         !cycle_real_check_capture(
             capture, norm_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
@@ -798,7 +816,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] "
-                "capture_fields=6 status=PASS\n");
+                "capture_fields=7 status=PASS\n");
 
     // A new model instance holds only the *real* physical Cycle weights:
     // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
@@ -840,6 +858,11 @@ int main(int argc, char ** argv) {
 
     const auto & lw = model->layers[size_t(layer)];
     if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_Q", lw.wq, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_K", lw.wk, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_V", lw.wv, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_Q_NORM", lw.attn_q_norm, phone_dev) ||
+        !cycle_real_check_phone_weight("ATTN_K_NORM", lw.attn_k_norm, phone_dev) ||
         !cycle_real_check_phone_weight("ATTN_OUT", lw.wo, phone_dev) ||
         !cycle_real_check_phone_weight("FFN_NORM", lw.ffn_norm, phone_dev) ||
         !cycle_real_check_phone_weight("MOE_ROUTER", lw.ffn_gate_inp, phone_dev)) {
@@ -881,10 +904,11 @@ int main(int argc, char ** argv) {
                 (long long)phone_weights.up->ne[1],
                 ggml_type_name(lw.ffn_up_exps->type));
 
-    const auto residual = cycle_real_read<float>(capture, residual_name);
-    const auto norm = cycle_real_read<float>(capture, norm_name);
-    const auto ids = cycle_real_read<int32_t>(capture, ids_name);
-    const auto routing = cycle_real_read<float>(capture, routing_name);
+    const auto ref_input = cycle_real_read<float>(capture, attn_input_name);
+    const auto ref_residual = cycle_real_read<float>(capture, residual_name);
+    const auto ref_norm = cycle_real_read<float>(capture, norm_name);
+    const auto ref_ids = cycle_real_read<int32_t>(capture, ids_name);
+    const auto ref_routing = cycle_real_read<float>(capture, routing_name);
     const auto baseline_ffn = cycle_real_read<float>(capture, ffn_name);
     const auto baseline_output = cycle_real_read<float>(capture, output_name);
 
@@ -892,15 +916,15 @@ int main(int argc, char ** argv) {
     // For ordinary Qwen3-MoE with no adapters this layer must implement
     // l_out = AttentionResidual + CompleteFFN. Otherwise a capture label
     // or a prior graph transformation is not comparing like with like.
-    if (baseline_ffn.size() != residual.size() ||
-        baseline_output.size() != residual.size()) {
+    if (baseline_ffn.size() != ref_residual.size() ||
+        baseline_output.size() != ref_residual.size()) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL reason=BASELINE_SIZE\n");
         return 1;
     }
-    std::vector<float> baseline_reconstructed(residual.size());
-    for (size_t i = 0; i < residual.size(); ++i) {
-        baseline_reconstructed[i] = residual[i] + baseline_ffn[i];
+    std::vector<float> baseline_reconstructed(ref_residual.size());
+    for (size_t i = 0; i < ref_residual.size(); ++i) {
+        baseline_reconstructed[i] = ref_residual[i] + baseline_ffn[i];
     }
     const cycle_real_diff baseline_check =
         cycle_real_compare(baseline_reconstructed, baseline_output);
@@ -912,10 +936,88 @@ int main(int argc, char ** argv) {
     if (!baseline_check.valid || !baseline_check.pass) {
         return 1;
     }
+    // The CPU reference is read-only from this point on. The READY wire and
+    // the two physical FFN shards must consume Phone-generated arrays only.
+    ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
+    if (!phone || !ggml_backend_is_rpc(phone)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=PHONE_RPC_BACKEND\n");
+        return 1;
+    }
+    cycle_real_phone_ready phone_ready;
+    double phone_attn_ms = 0.0;
+    if (!cycle_real_execute_phone_attention_pre(
+            phone, lw, model->hparams, ref_input,
+            hidden, topk, experts, phone_ready, phone_attn_ms)) {
+        ggml_backend_free(phone);
+        return 1;
+    }
+
+    const cycle_real_diff residual_diff =
+        cycle_real_compare(phone_ready.residual, ref_residual);
+    const cycle_real_diff norm_diff =
+        cycle_real_compare(phone_ready.norm, ref_norm);
+    const cycle_real_diff routing_diff =
+        cycle_real_compare(phone_ready.routing, ref_routing);
+    const bool topk_equal = phone_ready.ids == ref_ids;
+
+    // Do NOT reuse the relaxed full-layer tolerance here. The residual
+    // contains large activations; requiring its comparison to pass only
+    // via 0.005*max_ref would hide significant Attention errors.
+    const auto strict_ok = [](const cycle_real_diff & d,
+                              double floor, double relative) {
+        return d.valid && d.max_abs <= floor + relative * d.max_ref;
+    };
+    const bool residual_ok = strict_ok(residual_diff, 0.02, 0.001);
+    const bool norm_ok = strict_ok(norm_diff, 0.01, 0.001);
+    const bool routing_ok = strict_ok(routing_diff, 0.003, 0.001);
+
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=RESIDUAL "
+                "max_abs=%.8g rms=%.8g cosine=%.8g "
+                "strict_tolerance=%.8g status=%s\n",
+                residual_diff.max_abs, residual_diff.rms,
+                residual_diff.cosine,
+                0.02 + 0.001 * residual_diff.max_ref,
+                residual_ok ? "PASS" : "FAIL");
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=FFN_NORM "
+                "max_abs=%.8g rms=%.8g cosine=%.8g "
+                "strict_tolerance=%.8g status=%s\n",
+                norm_diff.max_abs, norm_diff.rms,
+                norm_diff.cosine, 0.01 + 0.001 * norm_diff.max_ref,
+                norm_ok ? "PASS" : "FAIL");
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=TOPK "
+                "ids_exact=%d status=%s\n",
+                topk_equal ? 1 : 0, topk_equal ? "PASS" : "FAIL");
+    if (!topk_equal) {
+        for (size_t j = 0; j < ref_ids.size(); ++j) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_TOPK_MISMATCH] idx=%zu reference=%d phone=%d\n",
+                j, ref_ids[j], phone_ready.ids[j]);
+        }
+    }
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS "
+                "max_abs=%.8g rms=%.8g cosine=%.8g "
+                "strict_tolerance=%.8g status=%s\n",
+                routing_diff.max_abs, routing_diff.rms,
+                routing_diff.cosine, 0.003 + 0.001 * routing_diff.max_ref,
+                routing_ok ? "PASS" : "FAIL");
+    if (!residual_ok || !norm_ok || !topk_equal || !routing_ok) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
+            "reason=CPU_REFERENCE_MISMATCH\n");
+        ggml_backend_free(phone);
+        return 1;
+    }
+
+    const auto & residual = phone_ready.residual;
+    const auto & norm = phone_ready.norm;
+    const auto & ids = phone_ready.ids;
+    const auto & routing = phone_ready.routing;
     for (int32_t id : ids) {
         if (id < 0 || id >= experts) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_READY] status=FAIL reason=INVALID_TOPK id=%d\n", id);
+            ggml_backend_free(phone);
             return 1;
         }
     }
@@ -923,6 +1025,7 @@ int main(int argc, char ** argv) {
         if (!std::isfinite(v)) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_READY] status=FAIL reason=NONFINITE_NORM\n");
+            ggml_backend_free(phone);
             return 1;
         }
     }
@@ -930,11 +1033,13 @@ int main(int argc, char ** argv) {
         if (!std::isfinite(w)) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_READY] status=FAIL reason=NONFINITE_ROUTING\n");
+            ggml_backend_free(phone);
             return 1;
         }
     }
-    std::printf("[CYCLE_REAL_READY] layer=%d tokens=%d fields=RESIDUAL,NORM,TOPK,WEIGHTS "
-                "source=CPU_ONLY_REFERENCE status=OK\n", layer, int(ntokens));
+    std::printf("[CYCLE_REAL_READY] layer=%d tokens=%d "
+                "fields=RESIDUAL,NORM,TOPK,WEIGHTS "
+                "source=PHONE_GPU_ATTN_PRE status=OK\n", layer, int(ntokens));
 
     // Exercise the V1 P2C READY wire representation with the *real* tensor
     // values, including frame direction and seq. This is an in-process
@@ -986,8 +1091,7 @@ int main(int argc, char ** argv) {
                 "bytes=%zu mode=IN_PROCESS_CODEC status=PASS\n", ready_bytes);
 
     ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
-    ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
-    if (!cpu || !phone || !ggml_backend_is_rpc(phone)) {
+    if (!cpu) {
         std::fprintf(stderr,
             "[CYCLE_REAL_P2C] status=FAIL reason=PHYSICAL_BACKENDS\n");
         return 1;
@@ -1004,10 +1108,9 @@ int main(int argc, char ** argv) {
         return part;
     });
     std::vector<float> pc_part;
-    // The receiving PC consumes only the decoded READY, not its original
-    // source arrays. This test's READY comes from a CPU reference; the Phone
-    // FFN consumes the same reference values until the actual Phone
-    // AttentionPre graph and two-send network task are connected.
+    // PC FFN consumes the decoded Phone READY while the Phone FFN runs on
+    // the same Phone backend after its own AttentionPre is complete.
+    // The dedicated network two-send FIFO remains a separate next step.
     const bool pc_ok = cycle_real_execute_ffn(
         cpu, pc_weights,
         ready_msg.ready.ffn_norm, ready_msg.ready.topk_ids,
@@ -1100,12 +1203,12 @@ int main(int argc, char ** argv) {
                       ffn_diff.pass && out_diff.pass;
     std::printf("[CYCLE_REAL_P2C_SUM] layer=%d tokens=%d "
                 "forward_ms=%.3f ffn_parallel_ms=%.3f "
-                "real_attention=CPU_ONLY_REFERENCE phone_attention_executed=0 "
-                "real_ffn_weights=1 "
+                "real_attention=PHONE_GPU_FIRST_TOKEN phone_attention_executed=1 "
+                "phone_attn_ms=%.3f real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
                 "reference=CPU_FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
                 "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
                 layer, int(ntokens), forward_ms, parts_ms,
-                pass ? "PASS" : "FAIL");
+                phone_attn_ms, pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
