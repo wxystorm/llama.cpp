@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
