@@ -119,6 +119,11 @@ static bool cycle_real_set_compare_layer(int layer) {
 //
 // Both original values are copied before mutating the environment and are
 // restored on scope exit, including on any early return.
+static bool cycle_real_env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static bool cycle_real_set_env(const char * name, const char * value) {
 #ifdef _WIN32
     return _putenv_s(name, value ? value : "") == 0;
@@ -2818,10 +2823,26 @@ int main(int argc, char ** argv) {
     // reference inputs. This separates shard/kernel error from Attention
     // Norm drift, Router weight drift, and mere TopK slot permutations.
     //
-    // Keep the extra runs to small diagnostic ubatches (1..16 tokens):
-    // larger benchmarks must not silently include 4 more FFN forwards.
-    const bool run_ffn_ablation = ntokens <= 16;
+    // LOW_MEMORY is the default: one CPU_READY_CONTROL run (1-2 tokens)
+    // is sufficient to compare the physical FFN against the CPU-only F64
+    // oracle. All repeated Phone GPU kernel replays, per-stage captures,
+    // Down OpenCL probes and additional Phone FFN ablations are opt-in.
+    // Keep production Phone READY / PC+Phone execution and official gates
+    // exactly as before, regardless of this diagnostic selection.
+    const bool extended_diagnostics = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_REAL_EXTENDED_DIAG");
+    const bool run_ffn_ablation =
+        ntokens <= 2 || (extended_diagnostics && ntokens <= 16);
     std::vector<float> cpu_ready_control_ffn;
+    std::printf("[CYCLE_DIAG_MODE] mode=%s tokens=%d "
+                "cpu_ready_control=%d full_cpu_f64_oracle=%d "
+                "phone_extra_gpu_probes=%d extra_phone_ffn_ablations=%d "
+                "env=LLAMA_HYBRID_CYCLE_REAL_EXTENDED_DIAG\n",
+                extended_diagnostics ? "EXTENDED" : "LOW_MEMORY_CPU_F64",
+                int(ntokens), run_ffn_ablation ? 1 : 0,
+                ntokens <= 2 ? 1 : 0,
+                extended_diagnostics && ntokens <= 2 ? 1 : 0,
+                extended_diagnostics && ntokens <= 16 ? 1 : 0);
     std::printf("[CYCLE_FFN_ABLATION] enabled=%d tokens=%d "
                 "scope=DIAGNOSTIC_ONLY gate_unchanged=1\n",
                 run_ffn_ablation ? 1 : 0, int(ntokens));
@@ -3183,7 +3204,7 @@ int main(int argc, char ** argv) {
         // with NO Phone Attention/Router input discrepancy.
         if (!run_case("CPU_READY_CONTROL",
                       ref_norm, ref_ids, ref_routing,
-                      cpu_ready_control_ffn, true)) {
+                      cpu_ready_control_ffn, extended_diagnostics)) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
@@ -3202,6 +3223,7 @@ int main(int argc, char ** argv) {
                 "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
                 "scope=DIAGNOSTIC_ONLY\n");
         }
+        if (extended_diagnostics) {
         // B: change only the pre-FFN hidden vector.
         std::vector<float> phone_norm_cpu_router;
         if (!run_case("PHONE_NORM_CPU_ROUTER",
@@ -3257,6 +3279,12 @@ int main(int argc, char ** argv) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
+        }
+        } else {
+            std::printf("[CYCLE_FFN_ABLATION] "
+                        "cases=PHONE_NORM_CPU_ROUTER,CPU_NORM_PHONE_ROUTER,"
+                        "PHONE_ORDER_CPU_WEIGHTS status=SKIP "
+                        "reason=LOW_MEMORY_DEFAULT\n");
         }
     }
 
