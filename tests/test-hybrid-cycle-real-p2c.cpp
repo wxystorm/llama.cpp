@@ -3773,6 +3773,43 @@ static bool cycle_real_execute_period_fifo(
     if (!cpu) {
         return false;
     }
+    // The standalone Cycle CPU backend otherwise uses ggml's default
+    // GGML_DEFAULT_N_THREADS (currently 4), regardless of how many cores
+    // the PC actually has. Compare per-Cycle settings without modifying the
+    // CPU-only correctness oracle or any Phone backend.
+    const char * thread_env = std::getenv("LLAMA_HYBRID_CYCLE_CPU_THREADS");
+    int cpu_threads = GGML_DEFAULT_N_THREADS;
+    const bool threads_override = thread_env && thread_env[0] != '\0';
+    if (threads_override) {
+        char * end = nullptr;
+        const long parsed = std::strtol(thread_env, &end, 10);
+        if (end == thread_env || *end != '\0' || parsed < 1 || parsed > 64) {
+            std::fprintf(stderr,
+                "[CYCLE_CPU_THREADS] value=%s status=FAIL "
+                "reason=EXPECTED_INTEGER_1_TO_64\n", thread_env);
+            ggml_backend_free(cpu);
+            return false;
+        }
+        cpu_threads = int(parsed);
+        const auto * cpu_backend_dev = ggml_backend_get_device(cpu);
+        auto * cpu_reg = cpu_backend_dev ?
+            ggml_backend_dev_backend_reg(cpu_backend_dev) : nullptr;
+        const auto set_threads = cpu_reg ?
+            reinterpret_cast<ggml_backend_set_n_threads_t>(
+                ggml_backend_reg_get_proc_address(
+                    cpu_reg, "ggml_backend_set_n_threads")) : nullptr;
+        if (!set_threads) {
+            std::fprintf(stderr,
+                "[CYCLE_CPU_THREADS] requested=%d status=FAIL "
+                "reason=CPU_BACKEND_THREAD_CONTROL_UNAVAILABLE\n", cpu_threads);
+            ggml_backend_free(cpu);
+            return false;
+        }
+        set_threads(cpu, cpu_threads);
+    }
+    std::printf(
+        "[CYCLE_CPU_THREADS] threads=%d source=%s status=OK\n",
+        cpu_threads, threads_override ? "ENV" : "GGML_DEFAULT");
     std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> kv;
     kv.reserve(size_t(n_layers));
     for (int l = 0; l < n_layers; ++l) {
