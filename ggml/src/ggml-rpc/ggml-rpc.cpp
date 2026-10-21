@@ -8714,6 +8714,7 @@ bool rpc_server::apply_inference_cycle(
                  request.topk != 0)) {
         return false;
     }
+    const int64_t apply_begin_us = ggml_time_us();
     inference_cycle_message msg;
     const auto key = cycle_key(
         request.layer, request.chunk, request.seq, request.graph_id,
@@ -8737,6 +8738,7 @@ bool rpc_server::apply_inference_cycle(
         msg = std::move(it->second);
         cycle_rx_frames.erase(it);
     }
+    const int64_t rx_ready_us = ggml_time_us();
 
     const size_t n = size_t(request.tokens) * request.hidden;
     const size_t routes = size_t(request.tokens) * request.topk;
@@ -8795,6 +8797,7 @@ bool rpc_server::apply_inference_cycle(
         }
     }
     ggml_backend_synchronize(backends[request.device]);
+    const int64_t gpu_input_ready_us = ggml_time_us();
     // READY ACK means Phone GPU inputs can be consumed. PARTIAL needs the
     // subsequent GPU Reduce before ACK may be sent to the PC sender.
     if (ready) {
@@ -8814,6 +8817,16 @@ bool rpc_server::apply_inference_cycle(
         ready ? "READY" : "PARTIAL",
         request.layer, request.chunk, request.seq,
         (ready ? 2 * n + 2 * routes : n) * sizeof(float));
+    if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        GGML_LOG_INFO(
+            "[CYCLE_C2P_RX_PROFILE] kind=%s layer=%d chunk=%d "
+            "seq=%" PRIu64 " rx_wait_ms=%.3f "
+            "input_copy_ms=%.3f scope=PHONE_SERVER_GPU_UPLOAD\n",
+            ready ? "READY" : "PARTIAL", request.layer,
+            request.chunk, request.seq,
+            (rx_ready_us - apply_begin_us) / 1000.0,
+            (gpu_input_ready_us - rx_ready_us) / 1000.0);
+    }
     return true;
 }
 
@@ -8833,7 +8846,9 @@ bool rpc_server::finish_inference_cycle(
             return false;
         }
     }
+    const int64_t wait_begin_us = ggml_time_us();
     ggml_backend_synchronize(backends[request.device]);
+    const int64_t wait_end_us = ggml_time_us();
     inference_cycle_message msg;
     msg.direction = INFERENCE_CYCLE_PC_TO_PHONE;
     msg.kind = INFERENCE_CYCLE_PARTIAL;
@@ -8853,6 +8868,13 @@ bool rpc_server::finish_inference_cycle(
         "[CYCLE_C2P_FINISH] side=phone layer=%d chunk=%d seq=%" PRIu64
         " reduce=PHONE_GPU ack=PARTIAL_DEVICE_READY status=OK\n",
         request.layer, request.chunk, request.seq);
+    if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        GGML_LOG_INFO(
+            "[CYCLE_C2P_GPU_WAIT] layer=%d chunk=%d seq=%" PRIu64
+            " gpu_wait_ms=%.3f source=PHONE_SERVER_BACKEND_SYNC\n",
+            request.layer, request.chunk, request.seq,
+            (wait_end_us - wait_begin_us) / 1000.0);
+    }
     return true;
 }
 
