@@ -11303,6 +11303,28 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     const int64_t t1 = ggml_time_us();
 
+    // This timer runs on the actual Phone RPC server and includes the
+    // synchronous backend graph execution. Unlike the client-side
+    // FFN_DESTINATION timer, it is NOT merely RPC graph submission.
+    // Classify the single-layer Cycle test graphs by their node shape;
+    // log UNKNOWN rather than attributing a different graph incorrectly.
+    if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        const char * phase = "OTHER";
+        if (n_nodes == 2) {
+            phase = "REDUCE";
+        } else if (n_nodes >= 20 && n_nodes <= 26) {
+            phase = "FFN";
+        } else if (n_nodes >= 40 && n_nodes <= 70) {
+            phase = "ATTN";
+        }
+        GGML_LOG_INFO(
+            "[CYCLE_GPU_SERVER] phase_hint=%s graph_uid=%" PRIu64
+            " nodes=%u gpu_compute_wall_ms=%.3f "
+            "source=PHONE_SERVER_SYNC_BACKEND_GRAPH status=%s\n",
+            phase, graph_uid, n_nodes, (t1 - t0) / 1000.0,
+            status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
+    }
+
     rpc_tensor_phone_log_graph_compute(
         "compute",
         graph_uid,
@@ -11344,6 +11366,15 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
             graph);
 
     const int64_t t1 = ggml_time_us();
+
+    if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        GGML_LOG_INFO(
+            "[CYCLE_GPU_SERVER] phase_hint=RECOMPUTE "
+            "graph_uid=%" PRIu64 " nodes=%d gpu_compute_wall_ms=%.3f "
+            "source=PHONE_SERVER_SYNC_BACKEND_GRAPH status=%s\n",
+            request.graph_uid, graph->n_nodes, (t1 - t0) / 1000.0,
+            status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
+    }
 
     rpc_tensor_phone_log_graph_compute(
         "recompute",
