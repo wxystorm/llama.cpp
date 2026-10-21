@@ -1638,18 +1638,18 @@ static bool cycle_real_dequantize_physical_expert_for_f64(
         ggml_nbytes(weight) != expert_bytes * size_t(weight->ne[2])) {
         return false;
     }
-    std::vector<uint8_t> packed(expert_bytes);
+    // Reuse the RPC receive buffer across Gate / Up / Down and experts.
+    // Only the packed CPU-side bytes are read; no Phone compute buffer is
+    // allocated for the F64 reference.
+    std::vector<uint8_t> local_packed;
+    std::vector<uint8_t> & packed =
+        packed_out != nullptr ? *packed_out : local_packed;
+    packed.resize(expert_bytes);
     ggml_backend_tensor_get(weight, packed.data(),
                             size_t(expert) * expert_bytes, expert_bytes);
-    if (!cycle_real_dequantize_k_expert_on_cpu(
-            cpu_backend, weight->type, packed, weight->ne[0],
-            weight->ne[1], dense)) {
-        return false;
-    }
-    if (packed_out) {
-        *packed_out = std::move(packed);
-    }
-    return true;
+    return cycle_real_dequantize_k_expert_on_cpu(
+        cpu_backend, weight->type, packed, weight->ne[0],
+        weight->ne[1], dense);
 }
 
 // Single-expert MUL_MAT diagnostic. The CPU quantized kernel may convert
@@ -1878,7 +1878,23 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
         return false;
     }
 
+    // Streaming HOST-ONLY oracle. The packed RPC receive bytes, one
+    // dequantized F32 matrix and F64 activation vectors are reused across
+    // stages/experts; Gate/Up/Down are never held as three F32 matrices
+    // simultaneously. Crucially this never creates an OpenCL graph.
+    std::vector<uint8_t> packed_scratch;
+    std::vector<float> weight_scratch;
+    std::vector<double> activated(size_t(std::max(pc_channels, phone_channels)), 0.0);
+    std::vector<double> expert_down(size_t(hidden), 0.0);
     std::vector<double> oracle(size_t(hidden * tokens), 0.0);
+    const double mib = 1024.0 * 1024.0;
+    std::printf(
+        "[CYCLE_FFN_FULL_F64_MEMORY] stage=BEGIN device_compute=PC_CPU_ONLY "
+        "phone_compute_buffers_added=0 host_weight_scratch_max_mib=%.3f "
+        "buffer_policy=REUSED_ONE_MATRIX_AT_A_TIME status=OK\n",
+        double(hidden) * double(std::max(pc_channels, phone_channels)) *
+            double(sizeof(float)) / mib);
+    std::fflush(stdout);
     for (int64_t token = 0; token < tokens; ++token) {
         const float * x = input_norm.data() + size_t(token * hidden);
         for (int64_t slot = 0; slot < topk; ++slot) {
@@ -1888,52 +1904,52 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
             if (expert < 0 || expert >= experts || !std::isfinite(route_weight)) {
                 return false;
             }
-            std::vector<double> expert_down(size_t(hidden), 0.0);
+            std::fill(expert_down.begin(), expert_down.end(), 0.0);
             for (int owner = 0; owner < 2; ++owner) {
                 const auto & shard = owner == 0 ? pc_weights : phone_weights;
                 const int64_t channels = owner == 0 ? pc_channels : phone_channels;
-                std::vector<float> gate_weights, up_weights, down_weights;
-                if (!cycle_real_dequantize_physical_expert_for_f64(
-                        cpu_backend, shard.gate, expert, gate_weights) ||
-                    !cycle_real_dequantize_physical_expert_for_f64(
-                        cpu_backend, shard.up, expert, up_weights) ||
-                    !cycle_real_dequantize_physical_expert_for_f64(
-                        cpu_backend, shard.down, expert, down_weights) ||
-                    gate_weights.size() != size_t(hidden * channels) ||
-                    up_weights.size() != size_t(hidden * channels) ||
-                    down_weights.size() != size_t(channels * hidden)) {
-                    std::fprintf(stderr,
-                        "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
-                        "reason=PHYSICAL_DEQUANT token=%lld slot=%lld "
-                        "expert=%d owner=%s\n",
-                        (long long)token, (long long)slot, int(expert),
-                        owner == 0 ? "PC_CPU" : "PHONE_GPU");
-                    return false;
-                }
-                std::vector<double> activated(size_t(channels), 0.0);
-                for (int64_t ch = 0; ch < channels; ++ch) {
-                    const size_t row = size_t(ch * hidden);
-                    double gate = 0.0, up = 0.0;
-                    for (int64_t k = 0; k < hidden; ++k) {
-                        gate += double(gate_weights[row + size_t(k)]) *
-                                double(x[size_t(k)]);
-                        up += double(up_weights[row + size_t(k)]) *
-                              double(x[size_t(k)]);
-                    }
-                    const double silu = gate / (1.0 + std::exp(-gate));
-                    activated[size_t(ch)] = silu * up;
-                    if (!std::isfinite(activated[size_t(ch)])) {
+                for (int stage = 0; stage < 3; ++stage) {
+                    const ggml_tensor * w = stage == 0 ? shard.gate :
+                                            stage == 1 ? shard.up : shard.down;
+                    const int64_t input_width = stage == 2 ? channels : hidden;
+                    const int64_t output_width = stage == 2 ? hidden : channels;
+                    if (!cycle_real_dequantize_physical_expert_for_f64(
+                            cpu_backend, w, expert, weight_scratch,
+                            &packed_scratch) ||
+                        weight_scratch.size() !=
+                            size_t(input_width * output_width)) {
+                        std::fprintf(stderr,
+                            "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
+                            "reason=PHYSICAL_DEQUANT token=%lld slot=%lld "
+                            "expert=%d owner=%s stage=%s\n",
+                            (long long)token, (long long)slot, int(expert),
+                            owner == 0 ? "PC_CPU" : "PHONE_GPU",
+                            stage == 0 ? "GATE" : stage == 1 ? "UP" : "DOWN");
                         return false;
                     }
-                }
-                for (int64_t j = 0; j < hidden; ++j) {
-                    const size_t row = size_t(j * channels);
-                    double partial = 0.0;
-                    for (int64_t k = 0; k < channels; ++k) {
-                        partial += double(down_weights[row + size_t(k)]) *
-                                   activated[size_t(k)];
+                    // Gate and Up use exactly the same original F32 Norm
+                    // input. For Down, consume the F64 SwiGLU values.
+                    for (int64_t row = 0; row < output_width; ++row) {
+                        const size_t offset = size_t(row * input_width);
+                        double dot = 0.0;
+                        for (int64_t k = 0; k < input_width; ++k) {
+                            dot += double(weight_scratch[offset + size_t(k)]) *
+                                   (stage == 2 ? activated[size_t(k)] :
+                                                 double(x[size_t(k)]));
+                        }
+                        if (stage == 0) {
+                            activated[size_t(row)] = dot;
+                        } else if (stage == 1) {
+                            const double gate = activated[size_t(row)];
+                            const double silu = gate / (1.0 + std::exp(-gate));
+                            activated[size_t(row)] = silu * dot;
+                            if (!std::isfinite(activated[size_t(row)])) {
+                                return false;
+                            }
+                        } else {
+                            expert_down[size_t(row)] += dot;
+                        }
                     }
-                    expert_down[size_t(j)] += partial;
                 }
             }
             for (int64_t j = 0; j < hidden; ++j) {
@@ -1942,6 +1958,13 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
             }
         }
     }
+    std::printf(
+        "[CYCLE_FFN_FULL_F64_MEMORY] stage=END "
+        "host_packed_capacity_bytes=%zu host_weight_capacity_bytes=%zu "
+        "phone_compute_buffers_added=0 status=OK\n",
+        packed_scratch.capacity(),
+        weight_scratch.capacity() * sizeof(float));
+    std::fflush(stdout);
 
     const auto cpu_err = cycle_real_compare_f64(baseline_ffn, oracle);
     const auto physical_err = cycle_real_compare_f64(physical_control_ffn, oracle);
