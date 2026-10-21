@@ -123,6 +123,41 @@ static bool cycle_real_env_flag(const char * name) {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// Host-only numeric checkpoint; never reads back GPU buffers or sends data.
+static void cycle_real_numeric_probe(
+        const char * point, int layer, int chunk,
+        const std::vector<float> & values) {
+    if (!cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE")) {
+        return;
+    }
+    size_t zeros = 0;
+    size_t nonfinite = 0;
+    double max_abs = 0.0;
+    double sum_abs = 0.0;
+    for (float v : values) {
+        if (!std::isfinite(v)) {
+            ++nonfinite;
+        } else {
+            zeros += v == 0.0f ? 1 : 0;
+            const double absolute = std::fabs(double(v));
+            max_abs = std::max(max_abs, absolute);
+            sum_abs += absolute;
+        }
+    }
+    std::printf(
+        "[CYCLE_NUMERIC] point=%s layer=%d chunk=%d elements=%zu "
+        "zeros=%zu nonfinite=%zu max_abs=%.9g sum_abs=%.9g "
+        "first=%.9g last=%.9g state=%s\n",
+        point, layer, chunk, values.size(), zeros, nonfinite,
+        max_abs, sum_abs,
+        values.empty() ? 0.0 : double(values.front()),
+        values.empty() ? 0.0 : double(values.back()),
+        values.empty() ? "EMPTY" :
+            nonfinite ? "NONFINITE" :
+            max_abs == 0.0 ? "ALL_ZERO" : "NONZERO");
+    std::fflush(stdout);
+}
+
 static void cycle_real_phone_mem_checkpoint(
         ggml_backend_dev_t phone_dev, const char * stage) {
     if (!phone_dev) {
@@ -3261,6 +3296,7 @@ static bool cycle_real_execute_period_fifo(
         hidden <= 0 || topk <= 0 || experts < topk) {
         return false;
     }
+    cycle_real_numeric_probe("REFERENCE_EMBEDDING", -1, -1, embedding);
     // First period only: [PC_CPU x X] -> C2P -> [PHONE_GPU x Y] -> P2C.
     for (int l = 0; l < n_layers; ++l) {
         const auto kind = layout.kinds[size_t(l)];
@@ -3398,6 +3434,10 @@ static bool cycle_real_execute_period_fifo(
                                 }
                             }
                         }
+                        if (ok) {
+                            cycle_real_numeric_probe(
+                                "PC_FULL_OUTPUT", l, c, st.host_output);
+                        }
                         st.ready.residual.clear();
                         st.ready.norm.clear();
                         st.ready.ids.clear();
@@ -3457,6 +3497,10 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 0);
                         if (ok) {
+                            cycle_real_numeric_probe(
+                                "C2P_READY_RESIDUAL", l, c, st.ready.residual);
+                            cycle_real_numeric_probe(
+                                "C2P_READY_NORM", l, c, st.ready.norm);
                             st.phone_output =
                                 std::make_unique<cycle_real_c2p_phone_chunk>();
                             const auto weights = full_shard(l, 1);
@@ -3510,6 +3554,15 @@ static bool cycle_real_execute_period_fifo(
                             uint32_t(st.tokens), uint32_t(hidden),
                             uint32_t(topk), st.recv_ready);
                         if (ok) {
+                            cycle_real_numeric_probe(
+                                "P2C_READY_RESIDUAL", l, c,
+                                st.recv_ready.ready.residual);
+                            cycle_real_numeric_probe(
+                                "P2C_READY_NORM", l, c,
+                                st.recv_ready.ready.ffn_norm);
+                            cycle_real_numeric_probe(
+                                "P2C_READY_ROUTING", l, c,
+                                st.recv_ready.ready.topk_weights);
                             ok = ggml_backend_rpc_cycle_send_ack(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
@@ -3552,6 +3605,10 @@ static bool cycle_real_execute_period_fifo(
                             st.recv_ready.ready.topk_weights,
                             hidden, st.tokens, topk, experts,
                             st.partial);
+                        if (ok) {
+                            cycle_real_numeric_probe(
+                                "P2C_PC_FFN", l, c, st.partial);
+                        }
                     }
                     break;
                 }
@@ -3572,6 +3629,11 @@ static bool cycle_real_execute_period_fifo(
                             phone, st.wire, INFERENCE_CYCLE_PARTIAL,
                             uint32_t(st.tokens), uint32_t(hidden), 0,
                             st.recv_partial);
+                        if (ok) {
+                            cycle_real_numeric_probe(
+                                "P2C_PHONE_FFN_RX", l, c,
+                                st.recv_partial.partial.partial);
+                        }
                     }
                     break;
                 }
@@ -3606,6 +3668,8 @@ static bool cycle_real_execute_period_fifo(
                                 INFERENCE_CYCLE_PARTIAL, true);
                         }
                         if (ok) {
+                            cycle_real_numeric_probe(
+                                "P2C_REDUCED", l, c, st.host_output);
                             std::copy(st.host_output.begin(),
                                       st.host_output.end(),
                                       final_output.begin() +
@@ -3638,6 +3702,7 @@ static bool cycle_real_execute_period_fifo(
     const double wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     ggml_backend_free(cpu);
+    cycle_real_numeric_probe("PERIOD_FINAL_OUTPUT", n_layers - 1, -1, final_output);
     size_t nonfinite = 0;
     size_t zero = 0;
     double max_abs = 0.0;
@@ -3751,6 +3816,11 @@ int main(int argc, char ** argv) {
         // The first PC full layer begins at REAL token embeddings. The CPU
         // reference is only a deterministic source of this starting tensor.
         capture.values.emplace("embd", cycle_real_capture_value {});
+        // Capture the corresponding independent CPU outputs for diagnostics.
+        for (int i = 0; i < 8; ++i) {
+            capture.values.emplace(
+                "l_out-" + std::to_string(i), cycle_real_capture_value {});
+        }
     }
 
     const std::string prompt = argc >= 5 ? argv[4] :
@@ -4276,6 +4346,16 @@ int main(int argc, char ** argv) {
         }
         bool ok = false;
         if (cycle_period_mode) {
+            for (int i : {0, 4, 5, 6, 7}) {
+                const auto name = "l_out-" + std::to_string(i);
+                const auto it = capture.values.find(name);
+                if (it != capture.values.end() && it->second.count == 1 &&
+                    it->second.type == GGML_TYPE_F32) {
+                    cycle_real_numeric_probe(
+                        "CPU_REFERENCE_L_OUT", i, -1,
+                        cycle_real_read<float>(capture, name));
+                }
+            }
             const auto embeddings = cycle_real_read<float>(capture, "embd");
             ok = cycle_real_execute_period_fifo(
                 phone, cpu_dev, *model, expected_layout,
