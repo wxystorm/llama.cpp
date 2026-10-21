@@ -714,12 +714,18 @@ static bool cycle_real_execute_phone_attention_pre(
         const cycle_real_live_wire * wire = nullptr,
         cycle_real_phone_kv_cache * kv_cache = nullptr,
         int64_t kv_token_start = 0,
-        size_t source_device = 1) {
+        size_t source_device = 1,
+        const ggml_tensor * device_input = nullptr,
+        bool retain_device_ready = false) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
         (kv_cache == nullptr && kv_token_start != 0) ||
-        layer_input.size() != size_t(hidden * tokens) ||
+        (device_input == nullptr ?
+            layer_input.size() != size_t(hidden * tokens) :
+            (device_input->type != GGML_TYPE_F32 ||
+             ggml_nelements(device_input) != hidden * tokens ||
+             device_input->buffer == nullptr)) ||
         hp.f_norm_rms_eps <= 0.0f ||
         topk <= 0 || experts < topk ||
         hp.rope_type != LLAMA_ROPE_TYPE_NEOX ||
@@ -1016,7 +1022,32 @@ static bool cycle_real_execute_phone_attention_pre(
                 kv_cache != nullptr ? "PHONE_PERSISTENT" : "SINGLE_UBATCH");
 
     const auto begin = std::chrono::steady_clock::now();
-    ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
+    if (device_input != nullptr) {
+        // A FULL Phone layer hands off its computed l_out to the next
+        // layer through a direct Phone-GPU-to-Phone-GPU copy. Never call
+        // ggml_backend_tensor_copy here; that could secretly RPC GET/SET.
+        bool layout_ok = ggml_are_same_shape(device_input, x) &&
+                         device_input->type == x->type;
+        for (int d = 0; d < GGML_MAX_DIMS && layout_ok; ++d) {
+            layout_ok = device_input->nb[d] == x->nb[d];
+        }
+        if (!layout_ok ||
+            !ggml_backend_buffer_copy_tensor(device_input, x)) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_LOCAL_HANDOFF] status=FAIL "
+                "reason=DEVICE_COPY_UNSUPPORTED\n");
+            ggml_backend_buffer_free(compute_buffer);
+            ggml_free(ctx);
+            return false;
+        }
+        std::printf(
+            "[CYCLE_PHONE_LOCAL_HANDOFF] backend=%s "
+            "bytes=%zu source=PHONE_GPU_PREVIOUS_LAYER "
+            "destination=PHONE_GPU_ATTENTION status=OK\n",
+            ggml_backend_name(backend), ggml_nbytes(x));
+    } else {
+        ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
+    }
     ggml_backend_tensor_set(positions, position_data.data(), 0,
                             ggml_nbytes(positions));
     ggml_backend_tensor_set(causal_mask, mask_data.data(), 0,
@@ -1050,7 +1081,7 @@ static bool cycle_real_execute_phone_attention_pre(
             }
         }
     }
-    if (ok && wire == nullptr) {
+    if (ok && wire == nullptr && !retain_device_ready) {
         result.residual.resize(size_t(hidden * tokens));
         result.norm.resize(size_t(hidden * tokens));
         result.ids.resize(size_t(topk * tokens));
@@ -1081,7 +1112,7 @@ static bool cycle_real_execute_phone_attention_pre(
         ggml_graph_n_nodes(graph), elapsed_ms,
         ok ? "OK" : "FAIL");
 
-    if (ok && wire != nullptr) {
+    if (ok && (wire != nullptr || retain_device_ready)) {
         // Borrow original Attention tensors until the local Phone FFN
         // consumes them, preventing a hidden PC->Phone activation upload.
         result.phone_ctx = ctx;
