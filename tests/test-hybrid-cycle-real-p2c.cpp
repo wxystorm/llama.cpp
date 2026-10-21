@@ -3271,6 +3271,7 @@ static bool cycle_real_execute_period_fifo(
         "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
         "tokens=%d chunks=%d chunk_tokens=%d max_inflight=%d "
         "topology=PC_FULL_C2P_PHONE_FULL_P2C "
+        "output_credit_release=DOWNSTREAM_CONSUMED "
         "phone_interlayer_readback=FORBIDDEN status=READY\n",
         layout.x, layout.y, n_layers - 1, int(tokens), n_chunks,
         chunk_tokens, window);
@@ -3606,6 +3607,7 @@ static bool cycle_real_execute_period_fifo(
         "phone_handoffs=DEVICE_LOCAL phone_to_pc_only_at=P2C "
         "gpu_output_owner_at_c2p=PHONE_GPU "
         "final_output_owner=PC_CPU "
+        "output_credit_release=DOWNSTREAM_CONSUMED "
         "final_max_abs=%.6g final_zero=%zu final_nonfinite=%zu "
         "wall_ms=%.3f cpu_parity=NOT_CHECKED status=%s\n",
         n_layers, layout.x, layout.y, n_chunks, int(tokens),
