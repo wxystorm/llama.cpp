@@ -356,11 +356,75 @@ static void test_bounded_multi_chunk_c2p_fifo() {
     assert(attn == chunks && reductions == chunks);
 }
 
+// The full X=5,Y=1 period must NOT run its C2P/P2C boundaries as
+// independent one-layer tests. The output of EACH preceding physical
+// layer's chunk is a dependency on the next layer's matching chunk.
+static void test_complete_period_fifo_handoffs() {
+    const auto layout = llama_hybrid_build_cycle_layout(48, 5, 1);
+    llama_hybrid_cycle_layout period = layout;
+    period.kinds.resize(8);
+    period.tail_begin = 8;
+    constexpr int chunks = 4;
+    constexpr int n_layers = 8;
+    std::array<std::array<std::atomic<bool>, chunks>, n_layers> done {};
+    std::array<std::atomic<int>, n_layers> entered {};
+    for (int l = 0; l < n_layers; ++l) {
+        entered[l].store(0);
+        for (int c = 0; c < chunks; ++c) {
+            done[l][c].store(false);
+        }
+    }
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        period, chunks, [&](const llama_hybrid_cycle_task & task) {
+            const int l = task.layer, c = task.chunk;
+            assert(l >= 0 && l < n_layers && c >= 0 && c < chunks);
+            if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER ||
+                task.stage == llama_hybrid_cycle_stage::ATTN_PRE) {
+                assert(entered[l].fetch_add(1) == c);
+                // Previous layer's COMPLETE has already returned its chunk
+                // output and published it before this task can be enqueued.
+                assert(l == 0 || done[l - 1][c].load());
+            }
+            const auto kind = period.kinds[size_t(l)];
+            if (kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
+                assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                assert(task.stage == llama_hybrid_cycle_stage::FULL_LAYER);
+            } else if (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU) {
+                assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                assert(task.stage == llama_hybrid_cycle_stage::FULL_LAYER);
+            } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+                       kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+                const bool c2p = kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P;
+                if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION ||
+                    task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
+                    assert(task.queue == (c2p ?
+                        llama_hybrid_cycle_queue::PC_TO_PHONE :
+                        llama_hybrid_cycle_queue::PHONE_TO_PC));
+                }
+            } else {
+                assert(false && "unexpected CUDA tail inside first Cycle period");
+            }
+            if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER ||
+                task.stage == llama_hybrid_cycle_stage::REDUCE) {
+                assert(!done[l][c].exchange(true));
+            }
+            return true;
+        }, 2);
+    assert(ok);
+    for (int l = 0; l < n_layers; ++l) {
+        assert(entered[l] == chunks);
+        for (int c = 0; c < chunks; ++c) {
+            assert(done[l][c].load());
+        }
+    }
+}
+
 int main() {
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
     test_bounded_multi_chunk_p2c_fifo();
     test_bounded_multi_chunk_c2p_fifo();
+    test_complete_period_fifo_handoffs();
     test_causal_entry_order();
     test_two_cycles_and_cuda_tail();
     test_reject_invalid_completions();
