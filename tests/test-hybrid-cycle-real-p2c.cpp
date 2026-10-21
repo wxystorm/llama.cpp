@@ -237,6 +237,31 @@ static bool cycle_real_check_phone_weight(
     return valid;
 }
 
+static bool cycle_real_check_pc_weight(
+        const char * role, const ggml_tensor * tensor) {
+    if (!tensor) {
+        return false;
+    }
+    const auto * pc = ggml_backend_meta_get_static_weight_shard(tensor, 0);
+    const auto * phone = ggml_backend_meta_get_static_weight_shard(tensor, 1);
+    bool same_shape = pc && pc->type == tensor->type;
+    if (same_shape) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            same_shape = same_shape && pc->ne[d] == tensor->ne[d];
+        }
+    }
+    const bool ok = phone == nullptr && pc && pc->buffer && same_shape &&
+        ggml_backend_buffer_get_type(pc->buffer) ==
+            ggml_backend_cpu_buffer_type();
+    std::printf(
+        "[CYCLE_REAL_OWNER] role=%s source=PC_CPU "
+        "phone_shard=%s pc_elements=%lld expected=%lld status=%s\n",
+        role, phone == nullptr ? "EMPTY_EXPECTED" : "UNEXPECTED_PRESENT",
+        (long long)(pc ? ggml_nelements(pc) : -1),
+        (long long)ggml_nelements(tensor), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool cycle_real_check_capture(
         const cycle_real_capture & state,
         const std::string & name,
