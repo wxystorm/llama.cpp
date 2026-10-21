@@ -6657,6 +6657,48 @@ public:
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
 
     bool send_inference_cycle(const rpc_msg_inference_cycle_send_req & request);
+    bool apply_inference_cycle(const rpc_msg_inference_cycle_send_req & request);
+    bool finish_inference_cycle(const rpc_msg_inference_cycle_send_req & request);
+    using cycle_rx_key = std::tuple<int32_t, int32_t, uint64_t, uint64_t, uint32_t>;
+    static cycle_rx_key cycle_key(int32_t layer, int32_t chunk,
+                                   uint64_t seq, uint64_t graph_id, uint32_t kind) {
+        return {layer, chunk, seq, graph_id, kind};
+    }
+    bool receive_c2p_inference_frame(const inference_frame_header & header,
+                                      const uint8_t * data, size_t size) {
+        inference_cycle_message msg;
+        if (header.type != INFERENCE_FRAME_DATA ||
+            !inference_cycle_decode_frame(header, data, size, msg) ||
+            msg.direction != INFERENCE_CYCLE_PC_TO_PHONE) {
+            return false;
+        }
+        const auto key = cycle_key(
+            msg.layer, msg.chunk, msg.seq, msg.graph_id, msg.kind);
+        {
+            std::lock_guard<std::mutex> lock(cycle_rx_mutex);
+            if (cycle_rx_failed || cycle_rx_frames.size() >= 32 ||
+                !cycle_rx_frames.emplace(key, std::move(msg)).second) {
+                return false;
+            }
+        }
+        cycle_rx_cv.notify_all();
+        GGML_LOG_INFO(
+            "[CYCLE_C2P_RX] side=phone layer=%d chunk=%d seq=%" PRIu64
+            " kind=%s bytes=%zu state=HOST_READY\n",
+            header.layer, header.chunk, header.seq,
+            header.stage == INFERENCE_STAGE_CYCLE_READY ? "READY" : "PARTIAL",
+            size);
+        return true;
+    }
+    void fail_cycle_inbound() {
+        {
+            std::lock_guard<std::mutex> lock(cycle_rx_mutex);
+            cycle_rx_failed = true;
+            cycle_rx_frames.clear();
+            cycle_rx_applied_partial.clear();
+        }
+        cycle_rx_cv.notify_all();
+    }
 
     bool inference_data_plane_available() {
         std::lock_guard<std::mutex> lock(inference_data_plane_mutex);
@@ -6675,6 +6717,12 @@ public:
         }
 
         inference_data_plane = transport;
+        {
+            std::lock_guard<std::mutex> inbound_lock(cycle_rx_mutex);
+            cycle_rx_failed = false;
+            cycle_rx_frames.clear();
+            cycle_rx_applied_partial.clear();
+        }
         return true;
     }
 
@@ -6734,6 +6782,15 @@ public:
         const inference_frame_header & header,
         const uint8_t * data,
         size_t size) {
+        // REAL C2P frames use the existing sole server-side RX dispatcher.
+        // The control-only APPLY later consumes the HOST-ready frame and
+        // uploads it inside the Phone RPC server, not through the PC.
+        if (header.type == INFERENCE_FRAME_DATA &&
+            (header.stage == INFERENCE_STAGE_CYCLE_READY ||
+             header.stage == INFERENCE_STAGE_CYCLE_PARTIAL)) {
+            return header.tensor_role == INFERENCE_CYCLE_PC_TO_PHONE &&
+                receive_c2p_inference_frame(header, data, size);
+        }
         // Dedicated Cycle ACKs travel only as tiny control frames in the
         // reverse direction. The PC sends one after READY is usable and
         // another after PARTIAL has been consumed by the PC Reduce.
@@ -7130,6 +7187,15 @@ private:
         uint32_t,
         std::unordered_map<uint64_t, inference_return_binding>>
         inference_return_bindings;
+
+    // A bounded HOST-ready mailbox owned by the Phone server's one RX
+    // dispatcher. READY/PARTIAL move to GPU only through control APPLY.
+    // An applied PARTIAL is acknowledged only after GPU Reduce completion.
+    std::mutex cycle_rx_mutex;
+    std::condition_variable cycle_rx_cv;
+    std::map<cycle_rx_key, inference_cycle_message> cycle_rx_frames;
+    std::set<cycle_rx_key> cycle_rx_applied_partial;
+    bool cycle_rx_failed = false;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
@@ -13027,6 +13093,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
 
                 server.fail_inference_returns();
+                server.fail_cycle_inbound();
                 server.detach_inference_data_plane(transport);
 
                 const auto stats = transport->stats();
