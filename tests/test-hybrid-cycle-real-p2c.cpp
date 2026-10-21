@@ -1651,12 +1651,18 @@ static bool cycle_real_dequantize_physical_expert_for_f64(
 // MUL_MAT consumes F32 x but internally may quantize it to Q8_K; the Phone
 // quantized kernels consume the same original F32 x. For moe=true the
 // single selected expert is remapped to local expert ID 0.
+// Controlled single-expert MUL_MAT diagnostic. Do not substitute a
+// one-expert MUL_MAT_ID graph for the real full-expert Phone MoE graph:
+// the OpenCL RPC supports-op check can accept this synthetic shape even
+// though ggml_cl_mul_mat_id subsequently aborts the Phone RPC server.
+// The actual full MoE Down path was already exercised by the real FFN
+// executor; this probe isolates ordinary quantized matmul numerics.
 static bool cycle_real_probe_single_matmul_f64_input(
         ggml_backend_t backend,
         enum ggml_type weight_type,
         const void * weight_data, size_t weight_bytes,
         const float * input, int64_t in_channels, int64_t out_channels,
-        bool moe, std::vector<float> & result) {
+        std::vector<float> & result) {
     if (!backend || !weight_data || !input ||
         in_channels <= 0 || out_channels <= 0) {
         return false;
@@ -1668,24 +1674,13 @@ static bool cycle_real_probe_single_matmul_f64_input(
     if (!ctx) {
         return false;
     }
-    ggml_tensor * w = moe ?
-        ggml_new_tensor_3d(ctx, weight_type, in_channels, out_channels, 1) :
-        ggml_new_tensor_2d(ctx, weight_type, in_channels, out_channels);
-    ggml_tensor * x = moe ?
-        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in_channels, 1, 1) :
-        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in_channels, 1);
-    ggml_tensor * ids = moe ?
-        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1) : nullptr;
+    ggml_tensor * w = ggml_new_tensor_2d(
+        ctx, weight_type, in_channels, out_channels);
+    ggml_tensor * x = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, in_channels, 1);
     ggml_set_input(x);
-    if (ids) {
-        ggml_set_input(ids);
-    }
-    ggml_tensor * y = moe ?
-        ggml_mul_mat_id(ctx, w, x, ids) :
-        ggml_mul_mat(ctx, w, x);
-    if (!moe) {
-        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
-    }
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
     ggml_build_forward_expand(graph, y);
     if (ggml_nbytes(w) != weight_bytes ||
@@ -1702,10 +1697,6 @@ static bool cycle_real_probe_single_matmul_f64_input(
     }
     ggml_backend_tensor_set(w, weight_data, 0, weight_bytes);
     ggml_backend_tensor_set(x, input, 0, ggml_nbytes(x));
-    if (ids) {
-        const int32_t local_expert_id = 0;
-        ggml_backend_tensor_set(ids, &local_expert_id, 0, sizeof(local_expert_id));
-    }
     const bool computed =
         ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     if (computed) {
@@ -1768,27 +1759,32 @@ static bool cycle_real_probe_down_f64_oracle(
         }
     }
 
-    std::vector<float> cpu_quant, gpu_quant, gpu_moe, gpu_dense;
+    std::vector<float> cpu_quant, gpu_quant, gpu_dense;
     const bool cpu_ok = cycle_real_probe_single_matmul_f64_input(
         cpu_backend, phone_down->type, packed.data(), packed.size(),
-        activation.data(), channels, hidden, false, cpu_quant);
+        activation.data(), channels, hidden, cpu_quant);
     const bool gpu_ok = cycle_real_probe_single_matmul_f64_input(
         phone_backend, phone_down->type, packed.data(), packed.size(),
-        activation.data(), channels, hidden, false, gpu_quant);
-    const bool moe_ok = cycle_real_probe_single_matmul_f64_input(
-        phone_backend, phone_down->type, packed.data(), packed.size(),
-        activation.data(), channels, hidden, true, gpu_moe);
+        activation.data(), channels, hidden, gpu_quant);
+    // The real Phone FFN above has already executed Down MUL_MAT_ID with
+    // 128 experts. A synthetic one-expert MUL_MAT_ID is not a valid
+    // substitute and fatally hits an unsupported OpenCL MoE branch.
+    // Keep the real MoE result for full-FFN evaluation, and mark this
+    // same-input synthetic comparison as not applicable.
+    std::printf(
+        "[CYCLE_FFN_DOWN_F64_ORACLE_PROBE] op=MUL_MAT_ID "
+        "layout=SYNTHETIC_ONE_EXPERT status=SKIP "
+        "reason=UNSUPPORTED_OPENCL_MOE_LAYOUT\n");
+    const bool moe_ok = false;
     const bool dense_ok = cycle_real_probe_single_matmul_f64_input(
         phone_backend, GGML_TYPE_F32, dequantized.data(),
         dequantized.size() * sizeof(float),
-        activation.data(), channels, hidden, false, gpu_dense);
+        activation.data(), channels, hidden, gpu_dense);
     const auto cpu_err = cycle_real_compare_f64(cpu_quant, f64);
     const auto gpu_err = cycle_real_compare_f64(gpu_quant, f64);
-    const auto moe_err = cycle_real_compare_f64(gpu_moe, f64);
     const auto dense_err = cycle_real_compare_f64(gpu_dense, f64);
     if ((cpu_ok && !cpu_err.valid) ||
         (gpu_ok && !gpu_err.valid) ||
-        (moe_ok && !moe_err.valid) ||
         (dense_ok && !dense_err.valid)) {
         std::fprintf(stderr,
             "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN status=NOT_AVAILABLE "
@@ -1800,7 +1796,7 @@ static bool cycle_real_probe_down_f64_oracle(
     // rather than hiding the F64 and Dense F32 measurements in that case.
     const double na = std::numeric_limits<double>::quiet_NaN();
     const bool complete = cpu_err.valid && gpu_err.valid &&
-                          moe_err.valid && dense_err.valid;
+                          dense_err.valid;
     std::printf(
         "[CYCLE_FFN_DOWN_F64_ORACLE] stage=DOWN pos=%d slot=%d expert=%d "
         "weight_type=%s input_channels=%lld output_channels=%lld "
@@ -1817,8 +1813,7 @@ static bool cycle_real_probe_down_f64_oracle(
         cpu_err.valid ? cpu_err.rms : na,
         gpu_err.valid ? gpu_err.max_abs : na,
         gpu_err.valid ? gpu_err.rms : na,
-        moe_err.valid ? moe_err.max_abs : na,
-        moe_err.valid ? moe_err.rms : na,
+        na, na,  // synthetic one-expert MoE comparison intentionally skipped
         dense_err.valid ? dense_err.max_abs : na,
         dense_err.valid ? dense_err.rms : na,
         complete ? "MEASURED" : "MEASURED_PARTIAL");
@@ -1829,8 +1824,7 @@ static bool cycle_real_probe_down_f64_oracle(
             cpu_ok ? 1 : 0, gpu_ok ? 1 : 0,
             moe_ok ? 1 : 0, dense_ok ? 1 : 0);
     }
-    return cpu_err.valid && dense_err.valid &&
-           (gpu_err.valid || moe_err.valid);
+    return cpu_err.valid && dense_err.valid && gpu_err.valid;
 }
 
 // Independently rebuild the FULL selected-expert FFN with F64 dot products
