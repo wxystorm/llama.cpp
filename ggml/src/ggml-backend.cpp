@@ -148,7 +148,21 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     size_t size = ggml_nbytes(tensor);
     if (buft->iface.get_alloc_size) {
         size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        const size_t required = ggml_nbytes(tensor);
+        if (size < required) {
+            // This also catches invalid/undersized RPC GET_ALLOC_SIZE cache
+            // responses. Print the offending tensor before the invariant
+            // fires; do not silently allocate less memory than it needs.
+            GGML_LOG_ERROR(
+                "[BACKEND_ALLOC_SIZE_INVALID] buft=%s tensor=%s "
+                "op=%s type=%s returned=%zu required=%zu "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                ggml_backend_buft_name(buft), tensor->name,
+                ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+                size, required,
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        }
+        assert(size >= required);
     }
 
     if (trace) {
