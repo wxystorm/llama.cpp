@@ -5,7 +5,9 @@
 // independently. Only PC sums both partials and adds the captured residual.
 // Phone GPU executes a real first-token AttentionPre (no historical KV)
 // and we compare its four READY outputs against that CPU reference before
-// using them for either FFN shard. Multi-token KV-aware stages come next.
+// using them for either FFN shard. The Phone graph now supports contiguous
+// multi-token causal KV within one prompt ubatch, but not persistent KV
+// across calls/chunks.
 //
 // READY/PARTIAL are serialized/deserialized IN PROCESS as wire-format
 // checks only. The Phone FFN input/output still travel through ordinary
@@ -13,7 +15,9 @@
 // sender messages and FIFO stage executor are NOT active.
 //
 // Usage (choose a TENSOR_P2C layer in the fixed cycle):
-//   test-hybrid-cycle-real-p2c <Qwen3-MoE.gguf> <phone:rpc-port> <layer> [prompt]
+//   test-hybrid-cycle-real-p2c <Qwen3-MoE.gguf> <phone:rpc-port> <layer> [prompt] [n_tokens]
+// n_tokens=1..128 creates a deterministic token-count case by repeating
+// and truncating the prompt, keeping one causal ubatch with positions 0..N-1.
 // Set LLAMA_HYBRID_CYCLE_PC_LAYERS and LLAMA_HYBRID_CYCLE_PHONE_LAYERS
 // before launching (e.g. 5 and 1, then the first P2C layer is 7).
 #include "llama.h"
@@ -675,10 +679,10 @@ static cycle_real_diff cycle_real_compare(
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 4 || argc > 5 || !llama_hybrid_cycle_requested()) {
+    if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
             "Usage: test-hybrid-cycle-real-p2c <model.gguf> <phone-ip:port> "
-            "<P2C-layer> [prompt]\n"
+            "<P2C-layer> [prompt] [n_tokens=1..128]\n"
             "Set LLAMA_HYBRID_CYCLE_PC_LAYERS and "
             "LLAMA_HYBRID_CYCLE_PHONE_LAYERS first.\n");
         return 2;
@@ -690,6 +694,19 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const int layer = int(layer_long);
+    int32_t target_tokens = 0;
+    if (argc == 6) {
+        char * token_end = nullptr;
+        const long parsed = std::strtol(argv[5], &token_end, 10);
+        if (token_end == argv[5] || !token_end || *token_end != '\0' ||
+            parsed < 1 || parsed > 128) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_P2C] status=FAIL "
+                "reason=BAD_TARGET_TOKENS allowed=[1,128]\n");
+            return 2;
+        }
+        target_tokens = int32_t(parsed);
+    }
     if (!cycle_real_set_compare_layer(layer)) {
         std::fprintf(stderr, "[CYCLE_REAL_P2C] status=FAIL reason=SET_ENV\n");
         return 2;
@@ -789,20 +806,39 @@ int main(int argc, char ** argv) {
                 "[CYCLE_REAL_P2C] status=FAIL reason=REFERENCE_CONTEXT_INIT\n");
             return 1;
         }
+        // A fixed token-count case is more reproducible than relying on
+        // how many BPE tokens a short user-supplied prompt happens to use.
+        // Repeat the seed only when necessary; truncate the resulting token
+        // sequence to exactly the requested length before llama_decode.
         std::vector<llama_token> tokens(4096);
-        ntokens = llama_tokenize(
-            llama_model_get_vocab(reference_model.get()),
-            prompt.c_str(), int(prompt.size()),
-            tokens.data(), int32_t(tokens.size()), true, true);
-        if (ntokens < 0) {
-            tokens.resize(size_t(-ntokens));
+        const auto * vocab = llama_model_get_vocab(reference_model.get());
+        std::string sample = prompt.empty() ? "Hello" : prompt;
+        for (int attempt = 0; attempt < 256; ++attempt) {
             ntokens = llama_tokenize(
-                llama_model_get_vocab(reference_model.get()),
-                prompt.c_str(), int(prompt.size()),
+                vocab, sample.c_str(), int(sample.size()),
                 tokens.data(), int32_t(tokens.size()), true, true);
+            if (ntokens < 0) {
+                tokens.resize(size_t(-ntokens));
+                ntokens = llama_tokenize(
+                    vocab, sample.c_str(), int(sample.size()),
+                    tokens.data(), int32_t(tokens.size()), true, true);
+            }
+            if (ntokens < 0 ||
+                target_tokens == 0 || ntokens >= target_tokens) {
+                break;
+            }
+            if (sample.size() > 65536) {
+                break;
+            }
+            sample.append(" ");
+            sample.append(prompt.empty() ? "Hello" : prompt);
+        }
+        if (target_tokens > 0 && ntokens >= target_tokens) {
+            ntokens = target_tokens;
         }
         if (ntokens < 1 || ntokens > int32_t(cp.n_batch) ||
-            ntokens > int32_t(cp.n_ctx)) {
+            ntokens > int32_t(cp.n_ctx) ||
+            (target_tokens > 0 && ntokens != target_tokens)) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_P2C] status=FAIL reason=TOKEN_COUNT "
                 "tokens=%d max=%u\n",
@@ -821,8 +857,9 @@ int main(int argc, char ** argv) {
         }
         std::printf(
             "[CYCLE_REAL_FORWARD] layer=%d prompt_tokens=%d "
+            "target_tokens=%d positions=[0,%d] "
             "source=CPU_ONLY_REFERENCE stage=BEGIN\n",
-            layer, int(ntokens));
+            layer, int(ntokens), int(target_tokens), int(ntokens - 1));
         const auto forward_begin = std::chrono::steady_clock::now();
         const int decode_status =
             llama_decode(reference_context.get(), batch);
@@ -845,16 +882,13 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
                 "status=RELEASED_BEFORE_CYCLE_LOAD\n");
 
-    // This first Phone AttentionPre probe has no prior-KV history. If the
-    // prompt contains multiple tokens, run the next KV-aware stage instead;
-    // never silently compare a position-0 graph with full causal attention.
-    if (ntokens != 1) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
-            "reason=REQUIRES_ONE_TOKEN_POSITION_ZERO tokens=%d\n",
-            int(ntokens));
-        return 1;
-    }
+    // All N tokens are computed together at positions [0,N); the Phone
+    // stage builds a causal F16 mask and may read earlier tokens' K/V.
+    // This is NOT yet a persistent KV cache across multiple separate
+    // llama_decode calls or distributed Cycle chunks.
+    std::printf("[CYCLE_REAL_KV_SCOPE] tokens=%d position_end=%d "
+                "kind=CONTIGUOUS_PROMPT_CACHE persistent=0 status=OK\n",
+                int(ntokens), int(ntokens - 1));
     // The RAII guard restored the physical Cycle placement policy. Verify
     // the requested P2C layer before loading the distributed model.
     llama_hybrid_cycle_layout expected_layout;
@@ -1022,7 +1056,7 @@ int main(int argc, char ** argv) {
     double phone_attn_ms = 0.0;
     if (!cycle_real_execute_phone_attention_pre(
             phone, lw, model->hparams, ref_input,
-            hidden, topk, experts, phone_ready, phone_attn_ms)) {
+            hidden, ntokens, topk, experts, phone_ready, phone_attn_ms)) {
         ggml_backend_free(phone);
         return 1;
     }
@@ -1277,8 +1311,9 @@ int main(int argc, char ** argv) {
                       ffn_diff.pass && out_diff.pass;
     std::printf("[CYCLE_REAL_P2C_SUM] layer=%d tokens=%d "
                 "forward_ms=%.3f ffn_parallel_ms=%.3f "
-                "real_attention=PHONE_GPU_FIRST_TOKEN phone_attention_executed=1 "
-                "phone_attn_ms=%.3f real_ffn_weights=1 "
+                "real_attention=PHONE_GPU_CAUSAL_MULTI_KV phone_attention_executed=1 "
+                "phone_attn_ms=%.3f kv_scope=ONE_UBATCH kv_persistent=0 "
+                "real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
                 "reference=CPU_FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
                 "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
