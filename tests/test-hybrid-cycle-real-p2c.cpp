@@ -1082,9 +1082,125 @@ int main(int argc, char ** argv) {
         cycle_real_compare(phone_ready.residual, ref_residual);
     const cycle_real_diff norm_diff =
         cycle_real_compare(phone_ready.norm, ref_norm);
-    const cycle_real_diff routing_diff =
+    const cycle_real_diff routing_slot_diff =
         cycle_real_compare(phone_ready.routing, ref_routing);
+    const cycle_real_diff probs_diff =
+        cycle_real_compare(phone_ready.router_probs, ref_router_probs);
     const bool topk_equal = phone_ready.ids == ref_ids;
+
+    // Experts are a weighted SET, not an ordered semantic vector. argsort
+    // can permute two close-scoring experts between CPU and OpenCL without
+    // changing the selected expert set. Every weight is attached to its
+    // Expert ID: never compare or reorder weights independently of IDs.
+    const size_t expected_slots = size_t(ntokens) * size_t(topk);
+    const size_t expected_probs = size_t(ntokens) * size_t(experts);
+    if (phone_ready.ids.size() != expected_slots ||
+        ref_ids.size() != expected_slots ||
+        phone_ready.routing.size() != expected_slots ||
+        ref_routing.size() != expected_slots ||
+        phone_ready.router_probs.size() != expected_probs ||
+        ref_router_probs.size() != expected_probs) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ROUTER_SEMANTIC] status=FAIL reason=SHAPE_MISMATCH\n");
+        ggml_backend_free(phone);
+        return 1;
+    }
+    std::vector<float> aligned_phone_weights;
+    std::vector<float> aligned_ref_weights;
+    aligned_phone_weights.reserve(expected_slots);
+    aligned_ref_weights.reserve(expected_slots);
+    bool topk_set_equal = true;
+    bool topk_ids_valid = true;
+    int32_t permuted_tokens = 0;
+    size_t changed_slots = 0;
+    constexpr size_t max_printed_router_diff = 16;
+    for (int32_t token = 0; token < ntokens; ++token) {
+        std::vector<std::pair<int32_t, float>> ref_pairs;
+        std::vector<std::pair<int32_t, float>> phone_pairs;
+        ref_pairs.reserve(size_t(topk));
+        phone_pairs.reserve(size_t(topk));
+        bool token_reordered = false;
+        for (int64_t slot = 0; slot < topk; ++slot) {
+            const size_t index = size_t(token) * size_t(topk) + size_t(slot);
+            const int32_t ref_id = ref_ids[index];
+            const int32_t phone_id = phone_ready.ids[index];
+            const float ref_weight = ref_routing[index];
+            const float phone_weight = phone_ready.routing[index];
+            if (ref_id < 0 || ref_id >= experts ||
+                phone_id < 0 || phone_id >= experts ||
+                !std::isfinite(ref_weight) || !std::isfinite(phone_weight)) {
+                topk_ids_valid = false;
+                continue;
+            }
+            ref_pairs.emplace_back(ref_id, ref_weight);
+            phone_pairs.emplace_back(phone_id, phone_weight);
+            if (ref_id != phone_id) {
+                token_reordered = true;
+                if (changed_slots < max_printed_router_diff) {
+                    // Show whether the scores are nearly tied or genuinely
+                    // rank-inverted. Softmax distributions have [expert,token]
+                    // layout; use the FULL scores, not normalized TopK slots.
+                    const size_t off = size_t(token) * size_t(experts);
+                    const float ref_a = ref_router_probs[off + size_t(ref_id)];
+                    const float ref_b = ref_router_probs[off + size_t(phone_id)];
+                    const float ph_a = phone_ready.router_probs[off + size_t(ref_id)];
+                    const float ph_b = phone_ready.router_probs[off + size_t(phone_id)];
+                    std::printf(
+                        "[CYCLE_PHONE_ROUTER_RANK] pos=%d slot=%lld "
+                        "reference_id=%d phone_id=%d "
+                        "ref_gap=%.8g phone_gap=%.8g "
+                        "ref_scores=[%.8g,%.8g] phone_scores=[%.8g,%.8g]\n",
+                        token, (long long)slot, ref_id, phone_id,
+                        double(ref_a) - double(ref_b),
+                        double(ph_a) - double(ph_b),
+                        ref_a, ref_b, ph_a, ph_b);
+                }
+                ++changed_slots;
+            }
+        }
+        if (token_reordered) {
+            ++permuted_tokens;
+        }
+        if (ref_pairs.size() != size_t(topk) ||
+            phone_pairs.size() != size_t(topk)) {
+            topk_set_equal = false;
+            continue;
+        }
+        const auto by_id = [](const std::pair<int32_t, float> & a,
+                              const std::pair<int32_t, float> & b) {
+            return a.first < b.first;
+        };
+        std::sort(ref_pairs.begin(), ref_pairs.end(), by_id);
+        std::sort(phone_pairs.begin(), phone_pairs.end(), by_id);
+        bool this_set_equal = true;
+        for (size_t slot = 0; slot < size_t(topk); ++slot) {
+            // Duplicate IDs make an expert set ambiguous; fail closed.
+            if (slot > 0 && (ref_pairs[slot].first == ref_pairs[slot - 1].first ||
+                             phone_pairs[slot].first == phone_pairs[slot - 1].first)) {
+                topk_ids_valid = false;
+            }
+            if (ref_pairs[slot].first != phone_pairs[slot].first) {
+                this_set_equal = false;
+            }
+        }
+        if (!this_set_equal) {
+            topk_set_equal = false;
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_TOPK_SET] pos=%d status=FAIL reason=CHANGED_EXPERT_SET\n",
+                token);
+            continue;
+        }
+        // Compare matched Expert ID + normalized weight, in sorted-ID order
+        // only for numerical diagnosis. FFN still consumes phone-original
+        // ID/weight pairs without modifying their original slot order.
+        for (size_t slot = 0; slot < size_t(topk); ++slot) {
+            aligned_ref_weights.push_back(ref_pairs[slot].second);
+            aligned_phone_weights.push_back(phone_pairs[slot].second);
+        }
+    }
+    const cycle_real_diff routing_aligned_diff =
+        cycle_real_compare(aligned_phone_weights, aligned_ref_weights);
+
 
     // Print which *position* diverges, not just one pooled statistic.
     // In a causal multi-KV test, a future-mask or RoPE error can be local
@@ -1127,7 +1243,8 @@ int main(int argc, char ** argv) {
     report_token_errors(
         "FFN_NORM", phone_ready.norm, ref_norm, hidden);
     report_token_errors(
-        "ROUTING_WEIGHTS", phone_ready.routing, ref_routing, topk);
+        "ROUTING_WEIGHTS_SLOT_ORDER",
+        phone_ready.routing, ref_routing, topk);
 
     // Do NOT reuse the relaxed full-layer tolerance here. The residual
     // contains large activations; requiring its comparison to pass only
@@ -1138,7 +1255,10 @@ int main(int argc, char ** argv) {
     };
     const bool residual_ok = strict_ok(residual_diff, 0.02, 0.00001);
     const bool norm_ok = strict_ok(norm_diff, 0.01, 0.001);
-    const bool routing_ok = strict_ok(routing_diff, 0.003, 0.001);
+    const bool routing_ok =
+        topk_set_equal && topk_ids_valid &&
+        aligned_ref_weights.size() == expected_slots &&
+        strict_ok(routing_aligned_diff, 0.003, 0.001);
 
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=RESIDUAL "
                 "max_abs=%.8g rms=%.8g cosine=%.8g "
@@ -1154,8 +1274,11 @@ int main(int argc, char ** argv) {
                 norm_diff.cosine, 0.01 + 0.001 * norm_diff.max_ref,
                 norm_ok ? "PASS" : "FAIL");
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=TOPK "
-                "ids_exact=%d status=%s\n",
-                topk_equal ? 1 : 0, topk_equal ? "PASS" : "FAIL");
+                "ids_exact=%d set_equal=%d valid_ids=%d "
+                "permuted_tokens=%d changed_slots=%zu status=%s\n",
+                topk_equal ? 1 : 0, topk_set_equal ? 1 : 0,
+                topk_ids_valid ? 1 : 0, int(permuted_tokens), changed_slots,
+                topk_set_equal && topk_ids_valid ? "PASS" : "FAIL");
     if (!topk_equal) {
         size_t mismatch_count = 0;
         constexpr size_t max_printed = 16;
@@ -1177,13 +1300,21 @@ int main(int argc, char ** argv) {
             "total=%zu displayed_max=%zu\n",
             int(ntokens), mismatch_count, max_printed);
     }
-    std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS "
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTER_PROBS "
+                "max_abs=%.8g rms=%.8g status=MEASURED\n",
+                probs_diff.max_abs, probs_diff.rms);
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS_SLOT_ORDER "
+                "max_abs=%.8g rms=%.8g status=DIAGNOSTIC_ONLY\n",
+                routing_slot_diff.max_abs, routing_slot_diff.rms);
+    std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS_BY_EXPERT "
                 "max_abs=%.8g rms=%.8g cosine=%.8g "
                 "strict_tolerance=%.8g status=%s\n",
-                routing_diff.max_abs, routing_diff.rms,
-                routing_diff.cosine, 0.003 + 0.001 * routing_diff.max_ref,
+                routing_aligned_diff.max_abs, routing_aligned_diff.rms,
+                routing_aligned_diff.cosine,
+                0.003 + 0.001 * routing_aligned_diff.max_ref,
                 routing_ok ? "PASS" : "FAIL");
-    if (!residual_ok || !norm_ok || !topk_equal || !routing_ok) {
+    if (!residual_ok || !norm_ok ||
+        !topk_set_equal || !topk_ids_valid || !routing_ok) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
             "reason=CPU_REFERENCE_MISMATCH\n");
