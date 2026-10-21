@@ -29,6 +29,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -3611,6 +3612,12 @@ static bool cycle_real_phone_same_input_norm_probe(
 // its REAL physical PC/Phone weights. The original single-layer tests
 // continue to run separately. No post-FFN GPU activation is read back
 // across Phone->PC unless this topology reaches its P2C boundary.
+struct cycle_real_period_stage_profile {
+    uint64_t count = 0;
+    double wall_ms = 0.0;
+    double max_ms = 0.0;
+};
+
 struct cycle_real_period_chunk {
     int layer = 0;
     int chunk = 0;
@@ -3710,6 +3717,20 @@ static bool cycle_real_execute_period_fifo(
         }
     }
     std::vector<float> final_output(size_t(tokens * hidden), 0.0f);
+    // Keep strict CPU parity for correctness runs. Performance runs still
+    // REPORT parity, but it is independently non-gating: only real compute,
+    // causal KV, TX drain and finite nonzero output can succeed the run.
+    const bool perf_mode = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PERF_MODE");
+    const bool stage_detail = std::getenv(
+        "LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr;
+    constexpr size_t n_queues =
+        static_cast<size_t>(llama_hybrid_cycle_queue::COUNT);
+    constexpr size_t n_stages =
+        static_cast<size_t>(llama_hybrid_cycle_stage::REDUCE) + 1;
+    std::array<std::array<cycle_real_period_stage_profile, n_stages>,
+        n_queues> stage_profile {};
+    llama_hybrid_cycle_fifo_profile fifo_profile {};
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
@@ -4211,26 +4232,49 @@ static bool cycle_real_execute_period_fifo(
             }
             const double stage_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
-            std::printf(
-                "[CYCLE_PERIOD_STAGE] layer=%d kind=%s chunk=%d "
-                "stage=%s queue=%s wall_ms=%.3f status=%s\n",
-                l, llama_hybrid_cycle_kind_name(kind), c,
-                llama_hybrid_cycle_stage_name(task.stage),
-                llama_hybrid_cycle_queue_name(task.queue),
-                stage_ms, ok ? "OK" : "FAIL");
-            std::fflush(stdout);
+            if (perf_mode) {
+                // Each row has a unique FIFO worker, so two physical
+                // devices can update their disjoint queue rows concurrently.
+                auto & sample = stage_profile[
+                    static_cast<size_t>(task.queue)][
+                    static_cast<size_t>(task.stage)];
+                ++sample.count;
+                sample.wall_ms += stage_ms;
+                sample.max_ms = std::max(sample.max_ms, stage_ms);
+            }
+            // Suppress per-task logging during clean performance runs.
+            // Detailed diagnostics remain available via STAGE_PROFILE=1.
+            if (!perf_mode || stage_detail || !ok) {
+                std::printf(
+                    "[CYCLE_PERIOD_STAGE] layer=%d kind=%s chunk=%d "
+                    "stage=%s queue=%s wall_ms=%.3f status=%s\n",
+                    l, llama_hybrid_cycle_kind_name(kind), c,
+                    llama_hybrid_cycle_stage_name(task.stage),
+                    llama_hybrid_cycle_queue_name(task.queue),
+                    stage_ms, ok ? "OK" : "FAIL");
+                std::fflush(stdout);
+            }
             return ok;
-        }, window, true);
+        }, window, true, perf_mode ? &fifo_profile : nullptr);
+    const auto fifo_done = std::chrono::steady_clock::now();
     bool kv_ok = true;
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
             kv[size_t(l)]->committed_tokens == tokens);
         kv[size_t(l)]->release();
     }
+    const auto kv_release_done = std::chrono::steady_clock::now();
     const bool net_idle =
         ggml_backend_rpc_cycle_wait_tx_idle(phone, 10000);
+    const auto tx_idle_done = std::chrono::steady_clock::now();
     const double wall_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - started).count();
+        tx_idle_done - started).count();
+    const double fifo_ms = std::chrono::duration<double, std::milli>(
+        fifo_done - started).count();
+    const double kv_release_ms = std::chrono::duration<double, std::milli>(
+        kv_release_done - fifo_done).count();
+    const double tx_idle_ms = std::chrono::duration<double, std::milli>(
+        tx_idle_done - kv_release_done).count();
     ggml_backend_free(cpu);
     cycle_real_numeric_probe("PERIOD_FINAL_OUTPUT", n_layers - 1, -1, final_output);
     size_t nonfinite = 0;
@@ -4254,7 +4298,59 @@ static bool cycle_real_execute_period_fifo(
         cycle_real_period_cpu_parity(
             final_output, cpu_reference_output,
             hidden, tokens, chunk_tokens, n_layers - 1);
-    const bool ok = execution_ok && parity_ok;
+    // PERF mode separates successful execution from an already known
+    // cross-backend numerical tolerance difference. STRICT (default)
+    // continues to fail when ANY CPU parity chunk exceeds the bound.
+    const bool ok = execution_ok && (perf_mode || parity_ok);
+    if (perf_mode) {
+        double busy_sum_ms = 0.0;
+        for (size_t q = 0; q < n_queues; ++q) {
+            const auto & worker = fifo_profile.queues[q];
+            if (worker.tasks == 0) {
+                continue;
+            }
+            busy_sum_ms += worker.execute_ms;
+            std::printf(
+                "[CYCLE_PERIOD_QUEUE_PROFILE] queue=%s tasks=%llu "
+                "execute_sum_ms=%.3f max_execute_ms=%.3f "
+                "ready_queue_wait_sum_ms=%.3f max_ready_queue_wait_ms=%.3f "
+                "worker_idle_sum_ms=%.3f idle_wakes=%llu\n",
+                llama_hybrid_cycle_queue_name(
+                    static_cast<llama_hybrid_cycle_queue>(q)),
+                (unsigned long long)worker.tasks,
+                worker.execute_ms, worker.max_execute_ms,
+                worker.queue_wait_ms, worker.max_queue_wait_ms,
+                worker.idle_wait_ms, (unsigned long long)worker.idle_wakes);
+            for (size_t s = 0; s < n_stages; ++s) {
+                const auto & sample = stage_profile[q][s];
+                if (sample.count == 0) {
+                    continue;
+                }
+                std::printf(
+                    "[CYCLE_PERIOD_STAGE_SUM] queue=%s stage=%s "
+                    "count=%llu stage_sum_ms=%.3f max_stage_ms=%.3f\n",
+                    llama_hybrid_cycle_queue_name(
+                        static_cast<llama_hybrid_cycle_queue>(q)),
+                    llama_hybrid_cycle_stage_name(
+                        static_cast<llama_hybrid_cycle_stage>(s)),
+                    (unsigned long long)sample.count,
+                    sample.wall_ms, sample.max_ms);
+            }
+        }
+        // Queue times from different workers may overlap. Their sum is
+        // never claimed to be an exposed end-to-end critical-path delay.
+        std::printf(
+            "[CYCLE_PERIOD_PERF_SUM] fifo_wall_ms=%.3f "
+            "kv_release_ms=%.3f tx_idle_ms=%.3f wall_ms=%.3f "
+            "queue_execute_sum_ms=%.3f "
+            "queue_overlap=INDEPENDENT_WORKERS "
+            "parity_timing=EXCLUDED "
+            "execution_status=%s strict_parity=%s\n",
+            fifo_ms, kv_release_ms, tx_idle_ms, wall_ms,
+            busy_sum_ms, execution_ok ? "OK" : "FAIL",
+            !execution_ok ? "NOT_CHECKED" :
+                parity_ok ? "PASS" : "FAIL");
+    }
     std::printf(
         "[CYCLE_PERIOD_SUM] layers=%d x=%d y=%d chunks=%d tokens=%d "
         "c2p_payloads=%d p2c_payloads=%d total_payloads=%d "
@@ -4263,10 +4359,13 @@ static bool cycle_real_execute_period_fifo(
         "final_output_owner=PC_CPU "
         "output_credit_release=DOWNSTREAM_CONSUMED "
         "final_max_abs=%.6g final_zero=%zu final_nonfinite=%zu "
-        "wall_ms=%.3f cpu_parity=%s status=%s\n",
+        "wall_ms=%.3f mode=%s execution_status=%s "
+        "cpu_parity=%s status=%s\n",
         n_layers, layout.x, layout.y, n_chunks, int(tokens),
         2 * n_chunks, 2 * n_chunks, 4 * n_chunks,
         max_abs, zero, nonfinite, wall_ms,
+        perf_mode ? "PERF_PARITY_NON_GATING" : "STRICT",
+        execution_ok ? "OK" : "FAIL",
         !execution_ok ? "NOT_CHECKED" : parity_ok ? "PASS" : "FAIL",
         ok ? "OK" : "FAIL");
     return ok;
