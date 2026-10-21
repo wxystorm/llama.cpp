@@ -2144,6 +2144,48 @@ bool ggml_backend_rpc_cycle_send_partial(
         uint32_t(partial->ne[0]), 0);
 }
 
+bool ggml_backend_rpc_cycle_send_ack(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        uint32_t kind, bool device_ready) {
+    if (!ggml_backend_is_rpc(backend) ||
+        layer < 0 || chunk < 0 || seq == 0 ||
+        (kind != INFERENCE_CYCLE_READY &&
+         kind != INFERENCE_CYCLE_PARTIAL)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto transport = ctx ? get_inference_transport(ctx->endpoint) : nullptr;
+    if (!transport) {
+        return false;
+    }
+    inference_cycle_message msg {};
+    msg.direction = INFERENCE_CYCLE_PHONE_TO_PC;
+    msg.kind = static_cast<inference_cycle_payload_kind>(kind);
+    msg.layer = layer;
+    msg.chunk = chunk;
+    msg.seq = seq;
+    msg.graph_id = graph_id;
+    const bool ok = inference_cycle_send_ack(*transport, msg, device_ready);
+    GGML_LOG_INFO(
+        "[CYCLE_REAL_WIRE_ACK] side=pc kind=%s layer=%d chunk=%d "
+        "seq=%" PRIu64 " device_ready=%d status=%s\n",
+        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+        layer, chunk, seq, device_ready ? 1 : 0,
+        ok ? "QUEUED" : "FAIL");
+    return ok;
+}
+
+bool ggml_backend_rpc_cycle_wait_tx_idle(
+        ggml_backend_t backend, int timeout_ms) {
+    if (!ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto transport = ctx ? get_inference_transport(ctx->endpoint) : nullptr;
+    return transport != nullptr && transport->wait_tx_idle(timeout_ms);
+}
+
 static constexpr size_t RPC_ALLOC_SIZE_EXACT_CACHE_MAX      = 16384;
 static constexpr size_t RPC_ALLOC_SIZE_STRUCTURAL_CACHE_MAX = 4096;
 static constexpr uint64_t RPC_ALLOC_SIZE_CACHE_LOG_INTERVAL = 512;
@@ -6563,6 +6605,28 @@ public:
         const inference_frame_header & header,
         const uint8_t * data,
         size_t size) {
+        // Dedicated Cycle ACKs travel only as tiny control frames in the
+        // reverse direction. The PC sends one after READY is usable and
+        // another after PARTIAL has been consumed by the PC Reduce.
+        // Never try to parse them as legacy INFERENCE_STAGE_RETURN data.
+        if (header.type == INFERENCE_FRAME_ACK &&
+            (header.stage == INFERENCE_STAGE_CYCLE_READY ||
+             header.stage == INFERENCE_STAGE_CYCLE_PARTIAL)) {
+            inference_cycle_ack ack {};
+            const bool valid =
+                inference_cycle_decode_ack(header, size, ack) &&
+                ack.direction == INFERENCE_CYCLE_PHONE_TO_PC &&
+                ack.device_ready;
+            GGML_LOG_INFO(
+                "[CYCLE_REAL_WIRE_ACK] side=phone kind=%s "
+                "layer=%d chunk=%d seq=%" PRIu64 " "
+                "host_ready=%d status=%s\n",
+                header.stage == INFERENCE_STAGE_CYCLE_READY ?
+                    "READY" : "PARTIAL",
+                header.layer, header.chunk, header.seq,
+                valid ? 1 : 0, valid ? "RECEIVED" : "FAIL");
+            return valid;
+        }
         if (header.type != INFERENCE_FRAME_DATA ||
             header.stage != INFERENCE_STAGE_RETURN) {
             GGML_LOG_ERROR(
