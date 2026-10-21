@@ -884,7 +884,7 @@ static bool cycle_real_execute_phone_attention_pre(
         (long long)hidden, (long long)head_dim,
         (long long)n_heads, (long long)n_kv_heads,
         (long long)attention_width, (long long)wo->ne[1],
-        (long long)tokens, (long long)tokens);
+        (long long)tokens, (long long)kv_tokens);
 
     auto * attn_output = ggml_mul_mat(ctx, wo, attn);
     auto * residual = ggml_add(ctx, attn_output, x);
@@ -981,11 +981,13 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
     std::printf("[CYCLE_PHONE_KV] query_tokens=%lld kv_tokens=%lld "
-                "position_start=0 position_end=%lld "
-                "masked_future=%lld mask_type=F16 scope=SINGLE_UBATCH "
+                "position_start=%lld position_end=%lld "
+                "masked_future=%lld mask_type=F16 scope=%s "
                 "status=PASS\n",
-                (long long)tokens, (long long)tokens,
-                (long long)(tokens - 1), (long long)masked_future);
+                (long long)tokens, (long long)kv_tokens,
+                (long long)kv_token_start, (long long)(kv_tokens - 1),
+                (long long)masked_future,
+                kv_cache != nullptr ? "PHONE_PERSISTENT" : "SINGLE_UBATCH");
 
     const auto begin = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
@@ -1043,11 +1045,12 @@ static bool cycle_real_execute_phone_attention_pre(
         std::chrono::steady_clock::now() - begin).count();
     std::printf(
         "[CYCLE_PHONE_ATTN_PRE] backend=%s "
-        "positions=[0,%lld] tokens=%lld kv_tokens=%lld "
+        "positions=[%lld,%lld] tokens=%lld kv_tokens=%lld "
         "heads=%lld kv_heads=%lld graph_nodes=%d "
         "wall_ms=%.3f status=%s\n",
         ggml_backend_name(backend),
-        (long long)(tokens - 1), (long long)tokens, (long long)tokens,
+        (long long)kv_token_start, (long long)(kv_tokens - 1),
+        (long long)tokens, (long long)kv_tokens,
         (long long)n_heads, (long long)n_kv_heads,
         ggml_graph_n_nodes(graph), elapsed_ms,
         ok ? "OK" : "FAIL");
