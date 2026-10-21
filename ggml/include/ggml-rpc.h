@@ -350,6 +350,10 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_apply_partial(
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_finish_reduce(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_ack(
+        ggml_backend_t backend, uint32_t kind,
+        int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
+        int timeout_ms);
 
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
