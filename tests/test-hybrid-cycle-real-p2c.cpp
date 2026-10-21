@@ -266,6 +266,9 @@ struct cycle_real_phone_ready {
     std::vector<float> norm;
     std::vector<int32_t> ids;
     std::vector<float> routing;
+    // Full pre-TopK Softmax distribution for score-margin diagnosis only.
+    // Not serialized in READY and never used by the FFN execution.
+    std::vector<float> router_probs;
 };
 
 static bool cycle_real_execute_phone_attention_pre(
@@ -544,6 +547,7 @@ static bool cycle_real_execute_phone_attention_pre(
         result.norm.resize(size_t(hidden * tokens));
         result.ids.resize(size_t(topk * tokens));
         result.routing.resize(size_t(topk * tokens));
+        result.router_probs.resize(size_t(experts * tokens));
         ggml_backend_tensor_get(ready.residual,
             result.residual.data(), 0, ggml_nbytes(ready.residual));
         ggml_backend_tensor_get(ready.ffn_norm,
@@ -552,6 +556,8 @@ static bool cycle_real_execute_phone_attention_pre(
             result.ids.data(), 0, ggml_nbytes(ready.topk_ids));
         ggml_backend_tensor_get(ready.topk_weights,
             result.routing.data(), 0, ggml_nbytes(ready.topk_weights));
+        ggml_backend_tensor_get(router_probs,
+            result.router_probs.data(), 0, ggml_nbytes(router_probs));
     }
     elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - begin).count();
@@ -735,11 +741,14 @@ int main(int argc, char ** argv) {
     const std::string norm_name = "ffn_norm" + suffix;
     const std::string ids_name = "cycle_real_topk_ids" + suffix;
     const std::string routing_name = "cycle_real_topk_weights" + suffix;
+    // Existing canonical Router callback before argsort/topk.
+    const std::string probs_name = "ffn_moe_probs" + suffix;
     const std::string ffn_name = "ffn_moe_out" + suffix;
     const std::string output_name = "l_out" + suffix;
     cycle_real_capture capture;
     for (const auto & name : {attn_input_name, residual_name, norm_name,
-                             ids_name, routing_name, ffn_name, output_name}) {
+                             ids_name, routing_name, probs_name,
+                             ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
 
@@ -921,6 +930,8 @@ int main(int argc, char ** argv) {
         !cycle_real_check_capture(
             capture, routing_name, GGML_TYPE_F32, 1, reference_topk, ntokens) ||
         !cycle_real_check_capture(
+            capture, probs_name, GGML_TYPE_F32, reference_experts, ntokens, 1) ||
+        !cycle_real_check_capture(
             capture, ffn_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
         !cycle_real_check_capture(
             capture, output_name, GGML_TYPE_F32, reference_hidden, ntokens, 1)) {
@@ -929,7 +940,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] "
-                "capture_fields=7 status=PASS\n");
+                "capture_fields=8 status=PASS\n");
 
     // A new model instance holds only the *real* physical Cycle weights:
     // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
@@ -1022,6 +1033,7 @@ int main(int argc, char ** argv) {
     const auto ref_norm = cycle_real_read<float>(capture, norm_name);
     const auto ref_ids = cycle_real_read<int32_t>(capture, ids_name);
     const auto ref_routing = cycle_real_read<float>(capture, routing_name);
+    const auto ref_router_probs = cycle_real_read<float>(capture, probs_name);
     const auto baseline_ffn = cycle_real_read<float>(capture, ffn_name);
     const auto baseline_output = cycle_real_read<float>(capture, output_name);
 
