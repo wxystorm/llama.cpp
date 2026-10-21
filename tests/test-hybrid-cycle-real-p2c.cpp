@@ -3140,10 +3140,53 @@ int main(int argc, char ** argv) {
     const bool fifo_enabled = live_wire_enabled &&
         (fifo_env == nullptr || std::strcmp(fifo_env, "0") != 0);
     if (fifo_enabled) {
+        // Four-ish chunks by default, at most 16 tokens each. The normal
+        // two-token smoke test now runs two REAL 1-token chunks. Env allows
+        // fixed-size experiments without any recompilation.
+        int32_t chunk_tokens = std::min<int32_t>(
+            16, std::max<int32_t>(1, ntokens / 4));
+        int max_inflight = 2;
+        const auto parse_positive = [](const char * value, int & out) {
+            if (!value || *value == '\0') {
+                return false;
+            }
+            char * end = nullptr;
+            const long x = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || x <= 0 || x > 128) {
+                return false;
+            }
+            out = int(x);
+            return true;
+        };
+        if (const char * value = std::getenv(
+                "LLAMA_HYBRID_CYCLE_REAL_CHUNK_TOKENS")) {
+            int parsed = 0;
+            if (!parse_positive(value, parsed)) {
+                std::fprintf(stderr,
+                    "[CYCLE_FIFO_REAL] status=FAIL "
+                    "reason=BAD_CHUNK_TOKENS allowed=[1,128]\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
+            chunk_tokens = int32_t(parsed);
+        }
+        if (const char * value = std::getenv(
+                "LLAMA_HYBRID_CYCLE_REAL_MAX_INFLIGHT")) {
+            int parsed = 0;
+            if (!parse_positive(value, parsed) || parsed > 2) {
+                std::fprintf(stderr,
+                    "[CYCLE_FIFO_REAL] status=FAIL "
+                    "reason=BAD_MAX_INFLIGHT allowed=[1,2]\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
+            max_inflight = parsed;
+        }
         const bool ok = cycle_real_execute_p2c_fifo(
             phone, cpu_dev, lw, model->hparams,
             pc_weights, phone_weights, ref_input, wire,
-            hidden, ntokens, topk, experts);
+            hidden, ntokens, topk, experts,
+            chunk_tokens, max_inflight);
         ggml_backend_free(phone);
         return ok ? 0 : 1;
     }
