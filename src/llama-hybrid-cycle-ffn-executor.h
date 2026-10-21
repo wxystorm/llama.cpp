@@ -80,7 +80,8 @@ public:
             const float * norm, size_t norm_count,
             const int32_t * ids, size_t ids_count,
             const float * routing, size_t routing_count,
-            float * output, size_t output_count) {
+            float * output, size_t output_count,
+            const llama_hybrid_cycle_ready_graph * local_phone_ready = nullptr) {
         // The Phone source may transfer its output directly from the
         // remote GPU through the independent Cycle data-plane. In that case
         // no ordinary RPC tensor_get is allowed: the caller will use the
@@ -97,11 +98,28 @@ public:
             return false;
         }
 
-        // Inputs were already prepared by the Attention/Router owner and
-        // transferred across the one-way READY boundary if necessary.
-        ggml_backend_tensor_set(ffn_.norm, norm, 0, ggml_nbytes(ffn_.norm));
-        ggml_backend_tensor_set(ffn_.topk_ids, ids, 0, ggml_nbytes(ffn_.topk_ids));
-        ggml_backend_tensor_set(ffn_.topk_weights, routing, 0, ggml_nbytes(ffn_.topk_weights));
+        // In P2C the Phone's Attention/Router outputs already reside on
+        // Phone GPU. Use only SAME-RPC-SERVER device-local buffer copies:
+        // never fall back to ggml_backend_tensor_copy(), which silently
+        // performs Phone->PC get + PC->Phone set when cpy_tensor fails.
+        // PC FFN continues to consume the received host READY arrays.
+        if (local_phone_ready != nullptr) {
+            const auto copy_local = [](const ggml_tensor * src, ggml_tensor * dst) {
+                return src != nullptr && src->buffer != nullptr &&
+                       dst != nullptr && dst->buffer != nullptr &&
+                       ggml_are_same_layout(src, dst) &&
+                       ggml_backend_buffer_copy_tensor(src, dst);
+            };
+            if (!copy_local(local_phone_ready->ffn_norm, ffn_.norm) ||
+                !copy_local(local_phone_ready->topk_ids, ffn_.topk_ids) ||
+                !copy_local(local_phone_ready->topk_weights, ffn_.topk_weights)) {
+                return false;
+            }
+        } else {
+            ggml_backend_tensor_set(ffn_.norm, norm, 0, ggml_nbytes(ffn_.norm));
+            ggml_backend_tensor_set(ffn_.topk_ids, ids, 0, ggml_nbytes(ffn_.topk_ids));
+            ggml_backend_tensor_set(ffn_.topk_weights, routing, 0, ggml_nbytes(ffn_.topk_weights));
+        }
 
         if (ggml_backend_graph_compute(backend_, graph_) != GGML_STATUS_SUCCESS) {
             return false;
