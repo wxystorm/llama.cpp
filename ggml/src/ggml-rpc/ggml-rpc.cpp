@@ -11341,10 +11341,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
         GGML_LOG_INFO(
             "[CYCLE_GPU_SERVER] phase_hint=%s graph_uid=%" PRIu64
-            " nodes=%u gpu_compute_wall_ms=%.3f "
+            " nodes=%u gpu_compute_ms=%.3f "
             "source=PHONE_SERVER_SYNC_BACKEND_GRAPH status=%s\n",
             phase, graph_uid, n_nodes, (t1 - t0) / 1000.0,
             status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
+        if (n_nodes == 2 || n_nodes == 1) {
+            GGML_LOG_INFO(
+                "[CYCLE_GPU_REDUCE_PROFILE] graph_uid=%" PRIu64
+                " nodes=%u reduce_compute_ms=%.3f "
+                "source=PHONE_SERVER_SYNC_BACKEND_GRAPH\n",
+                graph_uid, n_nodes, (t1 - t0) / 1000.0);
+        }
     }
 
     rpc_tensor_phone_log_graph_compute(
@@ -11392,7 +11399,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
         GGML_LOG_INFO(
             "[CYCLE_GPU_SERVER] phase_hint=RECOMPUTE "
-            "graph_uid=%" PRIu64 " nodes=%d gpu_compute_wall_ms=%.3f "
+            "graph_uid=%" PRIu64 " nodes=%d gpu_compute_ms=%.3f "
             "source=PHONE_SERVER_SYNC_BACKEND_GRAPH status=%s\n",
             request.graph_uid, graph->n_nodes, (t1 - t0) / 1000.0,
             status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
