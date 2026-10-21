@@ -354,6 +354,16 @@ if (TARGET ggml-rpc)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
     target_link_libraries(test-hybrid-cycle-real-c2p PRIVATE ggml-rpc)
+
+    # First complete physical Cycle period. Exercises the EXISTING five
+    # backend FIFO queues with the actual PC full layers, C2P split,
+    # Phone full layers and final P2C split. Hardware/model required;
+    # never launch by automatic CTest.
+    llama_build(test-hybrid-cycle-real-cycle.cpp)
+    target_include_directories(test-hybrid-cycle-real-cycle PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+    target_link_libraries(test-hybrid-cycle-real-cycle PRIVATE ggml-rpc)
 endif()
 
 # ggml-rpc may be configured before the top-level include(CTest), so its
