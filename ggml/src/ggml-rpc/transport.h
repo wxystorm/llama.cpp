@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -11,6 +12,12 @@ static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
 static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
 
 struct socket_t {
+    // Shared RPC control sockets are used by multiple physical Cycle FIFO
+    // workers. Hold this across the FULL request/response transaction, not
+    // individual send_data/recv_data calls. Recursive because the roundtrip
+    // helper delegates request serialization to the one-way helper.
+    std::recursive_mutex rpc_cmd_mutex;
+
     ~socket_t();
 
     bool send_data(const void * data, size_t size);
