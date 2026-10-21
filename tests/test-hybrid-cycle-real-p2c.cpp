@@ -1145,11 +1145,25 @@ int main(int argc, char ** argv) {
                 "ids_exact=%d status=%s\n",
                 topk_equal ? 1 : 0, topk_equal ? "PASS" : "FAIL");
     if (!topk_equal) {
+        size_t mismatch_count = 0;
+        constexpr size_t max_printed = 16;
         for (size_t j = 0; j < ref_ids.size(); ++j) {
-            std::fprintf(stderr,
-                "[CYCLE_PHONE_TOPK_MISMATCH] idx=%zu reference=%d phone=%d\n",
-                j, ref_ids[j], phone_ready.ids[j]);
+            if (ref_ids[j] == phone_ready.ids[j]) {
+                continue;
+            }
+            if (mismatch_count < max_printed) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_TOPK_MISMATCH] idx=%zu "
+                    "pos=%zu expert_slot=%zu reference=%d phone=%d\n",
+                    j, j / size_t(topk), j % size_t(topk),
+                    ref_ids[j], phone_ready.ids[j]);
+            }
+            ++mismatch_count;
         }
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_TOPK_MISMATCH_SUM] tokens=%d "
+            "total=%zu displayed_max=%zu\n",
+            int(ntokens), mismatch_count, max_printed);
     }
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS "
                 "max_abs=%.8g rms=%.8g cosine=%.8g "
@@ -1355,8 +1369,19 @@ int main(int argc, char ** argv) {
                 "max_abs=%.8g rms=%.8g cosine=%.8g tolerance=%.8g status=%s\n",
                 layer, out_diff.max_abs, out_diff.rms, out_diff.cosine,
                 out_diff.tolerance, out_diff.pass ? "PASS" : "FAIL");
+    // The generic layer metric has a deliberately relaxed scale-based
+    // tolerance inherited from older comparisons; it can exceed 1.0 for
+    // large residuals. A real multi-KV correctness gate must also require
+    // an independent absolute/relative layer bound.
+    const double strict_output_tolerance = 0.02 + 0.00002 * out_diff.max_ref;
+    const bool strict_output_ok = out_diff.valid &&
+        out_diff.max_abs <= strict_output_tolerance;
+    std::printf("[CYCLE_REAL_COMPARE] target=LAYER_OUTPUT_STRICT "
+                "layer=%d max_abs=%.8g tolerance=%.8g status=%s\n",
+                layer, out_diff.max_abs, strict_output_tolerance,
+                strict_output_ok ? "PASS" : "FAIL");
     const bool pass = ffn_diff.valid && out_diff.valid &&
-                      ffn_diff.pass && out_diff.pass;
+                      ffn_diff.pass && out_diff.pass && strict_output_ok;
     std::printf("[CYCLE_REAL_P2C_SUM] layer=%d tokens=%d "
                 "forward_ms=%.3f ffn_parallel_ms=%.3f "
                 "real_attention=PHONE_GPU_CAUSAL_MULTI_KV phone_attention_executed=1 "
