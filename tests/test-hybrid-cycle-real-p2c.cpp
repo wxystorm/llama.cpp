@@ -1017,6 +1017,7 @@ int main(int argc, char ** argv) {
     int64_t reference_topk = 0;
     int64_t reference_experts = 0;
     int64_t reference_model_ffn_channels = 0;
+    cycle_real_weight_fingerprints reference_ffn_weight_rows;
     double forward_ms = 0.0;
 
     // The Cycle model has a placement-only C2P/P2C policy and MUST NOT run
@@ -1153,6 +1154,35 @@ int main(int argc, char ** argv) {
                 "reason=CPU_REFERENCE_DECODE_OR_CAPTURE code=%d\n",
                 decode_status);
             return 1;
+        }
+        // Check actual model weight bytes, not merely tensor shape.
+        // Only keep hashes for selected experts so the CPU reference can
+        // be released before loading the remote model as before.
+        if (ntokens <= 16) {
+            const auto itr = capture.values.find(ids_name);
+            if (itr == capture.values.end() ||
+                itr->second.count != 1 ||
+                itr->second.type != GGML_TYPE_I32) {
+                std::fprintf(stderr,
+                    "[CYCLE_FFN_WEIGHT_BYTES] status=FAIL "
+                    "reason=BASELINE_TOPK_NOT_CAPTURED\n");
+                return 1;
+            }
+            const auto selected_ids = cycle_real_read<int32_t>(
+                capture, ids_name);
+            if (!cycle_real_capture_ffn_weight_fingerprints(
+                    reference_model->layers[size_t(layer)],
+                    selected_ids, reference_experts,
+                    reference_ffn_weight_rows)) {
+                std::fprintf(stderr,
+                    "[CYCLE_FFN_WEIGHT_BYTES] status=FAIL "
+                    "reason=CPU_REFERENCE_ROW_HASHES\n");
+                return 1;
+            }
+        } else {
+            std::printf("[CYCLE_FFN_WEIGHT_BYTES] enabled=0 "
+                        "reason=TOKEN_LIMIT tokens=%d max=16\n",
+                        int(ntokens));
         }
         std::printf(
             "[CYCLE_REAL_FORWARD] source=CPU_ONLY_REFERENCE "
@@ -1305,6 +1335,37 @@ int main(int argc, char ** argv) {
                 (long long)experts, (long long)pc_weights.up->ne[1],
                 (long long)phone_weights.up->ne[1],
                 ggml_type_name(lw.ffn_up_exps->type));
+
+    // Diagnostic-only byte integrity check, executed BEFORE any Phone
+    // Attention/FFN graph. This independently distinguishes a physical
+    // Q4_K weight split/load discrepancy from a backend MUL_MAT_ID
+    // numerical mismatch. A mismatch is reported but does not change the
+    // test's mathematical pass/fail thresholds.
+    if (reference_ffn_weight_rows.enabled) {
+        const int64_t phone_begin = pc_weights.up->ne[1];
+        const bool pc_gate_match = cycle_real_compare_physical_weight_rows(
+            "GATE", "PC_CPU", pc_weights.gate, 0,
+            reference_ffn_weight_rows, reference_ffn_weight_rows.gate_rows);
+        const bool pc_up_match = cycle_real_compare_physical_weight_rows(
+            "UP", "PC_CPU", pc_weights.up, 0,
+            reference_ffn_weight_rows, reference_ffn_weight_rows.up_rows);
+        const bool ph_gate_match = cycle_real_compare_physical_weight_rows(
+            "GATE", "PHONE_GPU", phone_weights.gate, phone_begin,
+            reference_ffn_weight_rows, reference_ffn_weight_rows.gate_rows);
+        const bool ph_up_match = cycle_real_compare_physical_weight_rows(
+            "UP", "PHONE_GPU", phone_weights.up, phone_begin,
+            reference_ffn_weight_rows, reference_ffn_weight_rows.up_rows);
+        std::printf("[CYCLE_FFN_WEIGHT_VERIFY] "
+                    "pc_gate=%s pc_up=%s phone_gate=%s phone_up=%s "
+                    "mode=BYTE_FINGERPRINT_DIAGNOSTIC status=%s\n",
+                    pc_gate_match ? "MATCH" : "DIFF",
+                    pc_up_match ? "MATCH" : "DIFF",
+                    ph_gate_match ? "MATCH" : "DIFF",
+                    ph_up_match ? "MATCH" : "DIFF",
+                    pc_gate_match && pc_up_match &&
+                    ph_gate_match && ph_up_match ?
+                        "ALL_MATCH" : "INVESTIGATE");
+    }
 
     const auto ref_input = cycle_real_read<float>(capture, attn_input_name);
     const auto ref_residual = cycle_real_read<float>(capture, residual_name);
