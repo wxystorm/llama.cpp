@@ -1754,7 +1754,7 @@ static bool cycle_real_probe_down_f64_oracle(
         return false;
     }
 
-    std::vector<float> activation(size_t(channels));
+    std::vector<float> activation(static_cast<size_t>(channels));
     const size_t offset = pair * size_t(full_channels) +
                           size_t(phone_channel_begin);
     std::copy_n(baseline_swiglu.data() + offset, size_t(channels),
@@ -1834,6 +1834,9 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
         const std::vector<float> & baseline_ffn,
         const std::vector<float> & physical_control_ffn,
         int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
+    if (!pc_weights.gate || !phone_weights.gate) {
+        return false;
+    }
     const int64_t pc_channels = pc_weights.gate->ne[1];
     const int64_t phone_channels = phone_weights.gate->ne[1];
     const auto shard_valid = [&](const llama_hybrid_cycle_ffn_shard_weights & shard,
@@ -3027,6 +3030,8 @@ int main(int argc, char ** argv) {
                 // Per-token and per-Expert-slot maxima identify whether
                 // the discrepancy predates Router weighting. The same
                 // selected Expert IDs are used by CPU and both shards.
+                double overall_down_max = -1.0;
+                std::pair<int32_t, int32_t> down_phone_peak {0, 0};
                 for (int32_t token = 0; token < ntokens; ++token) {
                     double token_max = -1.0;
                     int64_t worst_slot = -1;
@@ -3049,6 +3054,10 @@ int main(int argc, char ** argv) {
                             }
                         }
                     }
+                    if (token_max > overall_down_max) {
+                        overall_down_max = token_max;
+                        down_phone_peak = {token, int32_t(worst_slot)};
+                    }
                     std::printf("[CYCLE_FFN_DOWN_TOKEN] pos=%d "
                                 "max_abs=%.8g expert_slot=%lld expert_id=%d "
                                 "hidden=%lld cpu_raw=%.8g shards_raw=%.8g "
@@ -3058,6 +3067,18 @@ int main(int argc, char ** argv) {
                                 input_ids[size_t(token * topk + worst_slot)],
                                 (long long)worst_hidden,
                                 reference_value, physical_value);
+                }
+                if (ntokens <= 2) {
+                    const bool down_oracle_ok = cycle_real_probe_down_f64_oracle(
+                        cpu, phone, phone_weights.down,
+                        baseline_swiglu, input_ids, full_channels, pc_channels,
+                        hidden, ntokens, topk,
+                        down_phone_peak.first, down_phone_peak.second);
+                    if (!down_oracle_ok) {
+                        std::fprintf(stderr,
+                            "[CYCLE_FFN_DOWN_F64_ORACLE] status=NOT_AVAILABLE "
+                            "scope=DIAGNOSTIC_ONLY\n");
+                    }
                 }
 
                 // Reconstruct both weighted FFNs in CPU F32 from the raw
@@ -3130,6 +3151,19 @@ int main(int argc, char ** argv) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
+        }
+        // The complete math oracle uses the same CPU READY inputs as the
+        // physical-control FFN and captures every selected expert. A probe
+        // failure cannot change the existing official CPU-parity gate.
+        if (ntokens <= 2 &&
+            !cycle_real_probe_full_ffn_f64_oracle(
+                cpu, pc_weights, phone_weights,
+                ref_norm, ref_ids, ref_routing,
+                baseline_ffn, cpu_ready_control_ffn,
+                hidden, ntokens, topk, experts)) {
+            std::fprintf(stderr,
+                "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
+                "scope=DIAGNOSTIC_ONLY\n");
         }
         // B: change only the pre-FFN hidden vector.
         std::vector<float> phone_norm_cpu_router;
