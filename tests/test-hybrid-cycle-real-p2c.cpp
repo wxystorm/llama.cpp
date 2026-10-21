@@ -492,6 +492,84 @@ struct cycle_real_phone_ready {
     std::vector<float> router_probs;
 };
 
+struct cycle_real_live_wire {
+    int32_t layer = -1;
+    int32_t chunk = 0;
+    uint64_t seq = 1;
+    uint64_t graph_id = 1;
+};
+
+// The existing RPC data-plane receiver already has a single application RX
+// dispatcher. Do not call transport.receive() a second time on its socket.
+// Fetch exactly one queued frame through the existing exported dispatch proc.
+static bool cycle_real_receive_live_wire(
+        ggml_backend_t phone, const cycle_real_live_wire & wire,
+        inference_cycle_payload_kind kind,
+        uint32_t tokens, uint32_t hidden, uint32_t topk,
+        inference_cycle_message & output) {
+    auto * dev = ggml_backend_get_device(phone);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    auto receive = reinterpret_cast<ggml_backend_rpc_inference_transport_receive_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC));
+    if (!receive) {
+        return false;
+    }
+    size_t bytes = 0;
+    if (!inference_cycle_payload_size(
+            kind, tokens, hidden,
+            kind == INFERENCE_CYCLE_READY ? topk : 0, bytes)) {
+        return false;
+    }
+    std::vector<uint8_t> frame_data(bytes);
+    ggml_backend_rpc_inference_task task {};
+    size_t received = 0;
+    if (!receive(phone, &task, frame_data.data(), frame_data.size(),
+                 &received, 30000) || received != bytes) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_WIRE] side=pc stage=%s status=FAIL "
+            "reason=RECEIVE_OR_SIZE expected=%zu got=%zu\n",
+            kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+            bytes, received);
+        return false;
+    }
+    const uint16_t stage = kind == INFERENCE_CYCLE_READY ?
+        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
+    inference_frame_header header =
+        inference_make_header(INFERENCE_FRAME_DATA);
+    header.stage = task.stage;
+    header.tensor_role = task.tensor_role;
+    header.layer = task.layer;
+    header.chunk = task.chunk;
+    header.seq = task.seq;
+    header.graph_id = task.graph_id;
+    header.payload_bytes = received;
+    if (task.stage != stage ||
+        task.tensor_role != INFERENCE_CYCLE_PHONE_TO_PC ||
+        task.layer != wire.layer || task.chunk != wire.chunk ||
+        task.seq != wire.seq || task.graph_id != wire.graph_id ||
+        !inference_cycle_decode_frame(
+            header, frame_data.data(), frame_data.size(), output) ||
+        output.direction != INFERENCE_CYCLE_PHONE_TO_PC ||
+        output.kind != kind) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_WIRE] side=pc stage=%s status=FAIL "
+            "reason=HEADER_OR_DECODE\n",
+            kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL");
+        return false;
+    }
+    std::printf(
+        "[CYCLE_REAL_WIRE] side=pc stage=%s direction=P2C "
+        "layer=%d chunk=%d seq=%llu bytes=%zu "
+        "source=PHONE_GPU_RPC_TENSORS mode=REAL_RPC_DATA_PLANE status=PASS\n",
+        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+        wire.layer, wire.chunk, (unsigned long long)wire.seq, received);
+    return true;
+}
+
 static bool cycle_real_execute_phone_attention_pre(
         ggml_backend_t backend, const llama_layer & layer,
         const llama_hparams & hp,
@@ -499,7 +577,8 @@ static bool cycle_real_execute_phone_attention_pre(
         int64_t hidden, int64_t tokens,
         int64_t topk, int64_t experts,
         cycle_real_phone_ready & result,
-        double & elapsed_ms) {
+        double & elapsed_ms,
+        const cycle_real_live_wire * wire = nullptr) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         layer_input.size() != size_t(hidden * tokens) ||
@@ -764,6 +843,23 @@ static bool cycle_real_execute_phone_attention_pre(
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_synchronize(backend);
+        if (wire != nullptr) {
+            // GPU tensors remain valid until compute_buffer is destroyed.
+            // The Phone RPC server copies directly into its transport TX
+            // slot; no PC-side retransmission is involved.
+            ok = ggml_backend_rpc_cycle_send_ready(
+                backend, wire->layer, wire->chunk,
+                wire->seq, wire->graph_id,
+                ready.residual, ready.ffn_norm,
+                ready.topk_ids, ready.topk_weights);
+            if (!ok) {
+                std::fprintf(stderr,
+                    "[CYCLE_REAL_WIRE] stage=READY status=FAIL "
+                    "reason=PHONE_REMOTE_SEND\n");
+            }
+        }
+    }
+    if (ok && wire == nullptr) {
         result.residual.resize(size_t(hidden * tokens));
         result.norm.resize(size_t(hidden * tokens));
         result.ids.resize(size_t(topk * tokens));
@@ -817,7 +913,8 @@ static bool cycle_real_execute_ffn(
         int64_t topk, int64_t experts,
         std::vector<float> & partial,
         std::vector<float> * raw_down_out = nullptr,
-        cycle_real_ffn_stages * stages_out = nullptr) {
+        cycle_real_ffn_stages * stages_out = nullptr,
+        const cycle_real_live_wire * wire = nullptr) {
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -863,12 +960,15 @@ static bool cycle_real_execute_ffn(
                     "(unallocated)",
                 ggml_backend_buft_name(ggml_backend_get_default_buffer_type(backend)));
         } else {
-            partial.resize(size_t(hidden * tokens));
+            if (wire == nullptr) {
+                partial.resize(size_t(hidden * tokens));
+            }
             ok = executor.execute(
                 norm.data(), norm.size(),
                 ids.data(), ids.size(),
                 routing.data(), routing.size(),
-                partial.data(), partial.size());
+                wire != nullptr ? nullptr : partial.data(),
+                wire != nullptr ? 0 : partial.size());
             if (ok && stages_out != nullptr) {
                 const int64_t elems = shard.up->ne[1] * topk * tokens;
                 const auto read_stage = [&](const char * stage,
@@ -912,6 +1012,18 @@ static bool cycle_real_execute_ffn(
                     raw_down_out->resize(size_t(hidden * topk * tokens));
                     ggml_backend_tensor_get(
                         down, raw_down_out->data(), 0, ggml_nbytes(down));
+                }
+            }
+            if (ok && wire != nullptr) {
+                // The remote output has no ordinary RPC readback: the Phone
+                // owns it until its Cycle TX worker copies Send #2.
+                ok = ggml_backend_rpc_cycle_send_partial(
+                    backend, wire->layer, wire->chunk,
+                    wire->seq, wire->graph_id, in.ffn_output);
+                if (!ok) {
+                    std::fprintf(stderr,
+                        "[CYCLE_REAL_WIRE] stage=PARTIAL status=FAIL "
+                        "reason=PHONE_REMOTE_SEND\n");
                 }
             }
             std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
