@@ -3976,6 +3976,14 @@ static bool cycle_real_execute_period_fifo(
                             ok = st.phone_output->prepare(
                                 phone, weights, hidden, st.tokens,
                                 topk, experts, true);
+                            if (ok && perf_mode) {
+                                auto & sample = gpu_prepare_profile[queue_index];
+                                ++sample.count;
+                                sample.graph_build_ms +=
+                                    st.phone_output->graph_build_ms;
+                                sample.gpu_buffer_alloc_ms +=
+                                    st.phone_output->gpu_alloc_ms;
+                            }
                         }
                         if (ok) {
                             ok = st.phone_output->execute_full_local(st.ready);
@@ -4068,6 +4076,14 @@ static bool cycle_real_execute_period_fifo(
                             ok = st.phone_output->prepare(
                                 phone, weights, hidden, st.tokens,
                                 topk, experts);
+                            if (ok && perf_mode) {
+                                auto & sample = gpu_prepare_profile[queue_index];
+                                ++sample.count;
+                                sample.graph_build_ms +=
+                                    st.phone_output->graph_build_ms;
+                                sample.gpu_buffer_alloc_ms +=
+                                    st.phone_output->gpu_alloc_ms;
+                            }
                         }
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                         const auto * local_input = take_device_input(l, c);
@@ -4406,6 +4422,62 @@ static bool cycle_real_execute_period_fifo(
                         static_cast<llama_hybrid_cycle_stage>(s)),
                     (unsigned long long)sample.count,
                     sample.wall_ms, sample.max_ms);
+            }
+        }
+        for (size_t q = 0; q < n_queues; ++q) {
+            const char * name = llama_hybrid_cycle_queue_name(
+                static_cast<llama_hybrid_cycle_queue>(q));
+            const auto & attn = attn_profile[q];
+            if (attn.count) {
+                std::printf(
+                    "[CYCLE_PERIOD_ATTN_PREP_SUM] queue=%s count=%llu "
+                    "graph_build_sum_ms=%.3f buffer_alloc_sum_ms=%.3f "
+                    "input_copy_sum_ms=%.3f "
+                    "backend_graph_call_sum_ms=%.3f "
+                    "rpc_gpu_kernel_ms=SERVER_ONLY\n",
+                    name, (unsigned long long)attn.count,
+                    attn.graph_build_ms, attn.alloc_ms,
+                    attn.input_copy_ms, attn.graph_call_ms);
+            }
+            const auto & gpu = gpu_prepare_profile[q];
+            if (gpu.count) {
+                std::printf(
+                    "[CYCLE_PERIOD_PHONE_FFN_PREP_SUM] queue=%s "
+                    "count=%llu graph_build_sum_ms=%.3f "
+                    "gpu_buffer_alloc_sum_ms=%.3f "
+                    "scope=PHONE_GPU_GRAPH_SETUP\n",
+                    name, (unsigned long long)gpu.count,
+                    gpu.graph_build_ms, gpu.gpu_buffer_alloc_ms);
+            }
+            const auto & fence = fence_profile[q];
+            if (fence.calls) {
+                std::printf(
+                    "[CYCLE_PERIOD_PHONE_FENCE_SUM] queue=%s "
+                    "count=%llu rpc_fence_wait_sum_ms=%.3f "
+                    "max_fence_wait_ms=%.3f "
+                    "source=PHONE_SERVER_SYNCHRONIZE_ACK\n",
+                    name, (unsigned long long)fence.calls,
+                    fence.wait_ms, fence.max_wait_ms);
+            }
+            if (q == static_cast<size_t>(
+                        llama_hybrid_cycle_queue::PC_TO_PHONE) ||
+                q == static_cast<size_t>(
+                        llama_hybrid_cycle_queue::PHONE_TO_PC)) {
+                const auto & ready = stage_profile[q][static_cast<size_t>(
+                    llama_hybrid_cycle_stage::SEND_ACTIVATION)];
+                const auto & partial = stage_profile[q][static_cast<size_t>(
+                    llama_hybrid_cycle_stage::SEND_PARTIAL)];
+                if (ready.count || partial.count) {
+                    std::printf(
+                        "[CYCLE_PERIOD_TRANSPORT_SUM] queue=%s "
+                        "ready_count=%llu partial_count=%llu "
+                        "ready_stage_sum_ms=%.3f partial_stage_sum_ms=%.3f "
+                        "semantics=CALLBACK_AND_ACK_NOT_WIRE_ONLY\n",
+                        name,
+                        (unsigned long long)ready.count,
+                        (unsigned long long)partial.count,
+                        ready.wall_ms, partial.wall_ms);
+                }
             }
         }
         // Queue times from different workers may overlap. Their sum is
