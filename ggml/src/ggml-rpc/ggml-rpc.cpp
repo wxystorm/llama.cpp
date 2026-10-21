@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <optional>
 #include <string>
@@ -8715,6 +8716,48 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     return true;
 }
 
+// Opt-in GPU value verification happens inside the Phone process: it does NOT
+// send any additional activation data over PC/Phone RPC.
+static bool cycle_phone_numeric_enabled() {
+    const char * v = std::getenv("GGML_CYCLE_PHONE_NUMERIC_TRACE");
+    return v && std::strcmp(v, "1") == 0;
+}
+static bool cycle_phone_numeric_named(const char * name) {
+    return name && std::strncmp(name, "cycle_num_", 10) == 0;
+}
+static void cycle_phone_numeric_host(
+        const char * stage, const char * name, const float * x, size_t n,
+        int layer = -1, int chunk = -1, uint64_t uid = 0) {
+    if (!cycle_phone_numeric_enabled() || !x || n < 1 || n > 32768) return;
+    size_t zeros = 0, nonfinite = 0;
+    double max_abs = 0.0, sum_abs = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(x[i])) { ++nonfinite; continue; }
+        zeros += x[i] == 0.0f ? 1 : 0;
+        const double a = std::fabs(double(x[i]));
+        max_abs = std::max(max_abs, a); sum_abs += a;
+    }
+    GGML_LOG_INFO("[CYCLE_PHONE_NUMERIC] stage=%s name=%s layer=%d "
+        "chunk=%d uid=%" PRIu64 " n=%zu zeros=%zu nonfinite=%zu "
+        "max_abs=%.9g sum_abs=%.9g state=%s\n",
+        stage, name ? name : "(null)", layer, chunk, uid, n, zeros,
+        nonfinite, max_abs, sum_abs,
+        nonfinite ? "NONFINITE" : max_abs == 0.0 ? "ALL_ZERO" : "NONZERO");
+}
+static void cycle_phone_numeric_tensor(
+        const char * stage, const ggml_tensor * tensor,
+        uint64_t uid = 0) {
+    if (!cycle_phone_numeric_enabled() || !tensor ||
+        !cycle_phone_numeric_named(tensor->name) ||
+        !tensor->buffer || !tensor->data ||
+        tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) return;
+    const size_t n = size_t(ggml_nelements(tensor));
+    if (!n || n > 32768 || ggml_nbytes(tensor) != n*sizeof(float)) return;
+    std::vector<float> v(n);
+    ggml_backend_tensor_get(tensor, v.data(), 0, n*sizeof(float));
+    cycle_phone_numeric_host(stage, tensor->name, v.data(), v.size(), -1, -1, uid);
+}
+
 // Executed in the Phone RPC server process. GPU outputs are read here,
 // packed directly into the existing inference transport TX slots, and sent
 // Phone->PC by its TX worker. The client control RPC contains descriptors
@@ -8779,6 +8822,15 @@ bool rpc_server::apply_inference_cycle(
         return false;
     }
 
+    if (ready) {
+        cycle_phone_numeric_host("C2P_RX_HOST", "residual",
+            msg.ready.residual.data(), n, request.layer, request.chunk);
+        cycle_phone_numeric_host("C2P_RX_HOST", "norm",
+            msg.ready.ffn_norm.data(), n, request.layer, request.chunk);
+    } else {
+        cycle_phone_numeric_host("C2P_RX_HOST", "pc_partial",
+            msg.partial.partial.data(), n, request.layer, request.chunk);
+    }
     const void * source[4] {};
     if (ready) {
         source[0] = msg.ready.residual.data();
@@ -8819,6 +8871,24 @@ bool rpc_server::apply_inference_cycle(
         }
     }
     ggml_backend_synchronize(backends[request.device]);
+    if (cycle_phone_numeric_enabled()) {
+        for (size_t i = 0; i < (ready ? 2u : 1u); ++i) {
+            rpc_msg_get_tensor_req get {};
+            get.tensor = request.tensors[i];
+            get.offset = 0;
+            get.size = n*sizeof(float);
+            std::vector<float> v(n);
+            if (get_tensor_into(get, v.data())) {
+                cycle_phone_numeric_host("C2P_APPLY_GPU",
+                    ready ? (i == 0 ? "residual" : "norm") : "pc_partial",
+                    v.data(), n, request.layer, request.chunk);
+            } else {
+                GGML_LOG_ERROR("[CYCLE_PHONE_NUMERIC] stage=C2P_APPLY_GPU "
+                    "layer=%d chunk=%d index=%zu state=READ_FAILED\n",
+                    request.layer, request.chunk, i);
+            }
+        }
+    }
     const int64_t gpu_input_ready_us = ggml_time_us();
     // READY ACK means Phone GPU inputs can be consumed. PARTIAL needs the
     // subsequent GPU Reduce before ACK may be sent to the PC sender.
@@ -8967,6 +9037,10 @@ bool rpc_server::send_inference_cycle(
              read(2, GGML_TYPE_I32, r, ids.data()) &&
              read(3, GGML_TYPE_F32, r, weights.data());
         if (ok) {
+            cycle_phone_numeric_host("P2C_SEND_GPU_READ", "residual",
+                residual.data(), n, request.layer, request.chunk);
+            cycle_phone_numeric_host("P2C_SEND_GPU_READ", "norm",
+                norm.data(), n, request.layer, request.chunk);
             const inference_cycle_ready_view view {
                 request.tokens, request.hidden, request.topk,
                 residual.data(), norm.data(), ids.data(), weights.data()
@@ -8980,6 +9054,8 @@ bool rpc_server::send_inference_cycle(
         std::vector<float> partial(n);
         ok = read(0, GGML_TYPE_F32, n, partial.data());
         if (ok) {
+            cycle_phone_numeric_host("P2C_SEND_GPU_READ", "phone_partial",
+                partial.data(), n, request.layer, request.chunk);
             const inference_cycle_partial_view view {
                 request.tokens, request.hidden, partial.data()
             };
@@ -10071,6 +10147,7 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
+    cycle_phone_numeric_tensor("COPY_SOURCE_BEFORE", src);
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
 
     // Cycle Phone->Phone FFN handoff: some OpenCL buffers do not provide
@@ -11345,6 +11422,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
 
+    if (status == GGML_STATUS_SUCCESS && cycle_phone_numeric_enabled()) {
+        for (uint32_t i = 0; i < n_nodes; ++i) {
+            cycle_phone_numeric_tensor("GRAPH_OUTPUT", graph->nodes[i], graph_uid);
+        }
+    }
     const int64_t t1 = ggml_time_us();
 
     // This timer runs on the actual Phone RPC server and includes the
