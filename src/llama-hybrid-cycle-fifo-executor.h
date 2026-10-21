@@ -104,8 +104,18 @@ inline bool llama_hybrid_cycle_run_fifo(
 
     std::vector<std::thread> workers;
     workers.reserve(queues.size());
-    for (auto q : queues) {
-        workers.emplace_back(work, q);
+    try {
+        for (auto q : queues) {
+            workers.emplace_back(work, q);
+        }
+    } catch (const std::exception & e) {
+        // Do not std::terminate() on unwinding a vector containing live
+        // std::threads if one of the per-queue worker creations fails.
+        std::fprintf(stderr,
+            "[CYCLE_FIFO] status=FAIL reason=WORKER_START exception=%s\n",
+            e.what());
+        failed.store(true);
+        signal();
     }
     for (auto & worker : workers) {
         worker.join();
