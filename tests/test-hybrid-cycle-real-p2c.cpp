@@ -585,7 +585,8 @@ static bool cycle_real_execute_ffn(
         const std::vector<float> & routing,
         int64_t hidden, int64_t tokens,
         int64_t topk, int64_t experts,
-        std::vector<float> & partial) {
+        std::vector<float> & partial,
+        std::vector<float> * raw_down_out = nullptr) {
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -637,6 +638,24 @@ static bool cycle_real_execute_ffn(
                 ids.data(), ids.size(),
                 routing.data(), routing.size(),
                 partial.data(), partial.size());
+            // Diagnostic only: capture the unweighted per-expert Down
+            // projection [hidden, topk, tokens] from this physical shard.
+            // This is the exact same tensor as canonical ffn_moe_down
+            // before Router weights and the expert reduction.
+            if (ok && raw_down_out != nullptr) {
+                if (down->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(down) ||
+                    ggml_nelements(down) != hidden * topk * tokens) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_INTERMEDIATE] backend=%s status=FAIL "
+                        "reason=DOWN_OUTPUT_SHAPE\n", backend_name);
+                    ok = false;
+                } else {
+                    raw_down_out->resize(size_t(hidden * topk * tokens));
+                    ggml_backend_tensor_get(
+                        down, raw_down_out->data(), 0, ggml_nbytes(down));
+                }
+            }
             std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
                         "elements=%zu status=%s\n",
                         backend_name, partial.size(), ok ? "OK" : "FAIL");
@@ -744,11 +763,12 @@ int main(int argc, char ** argv) {
     // Existing canonical Router callback before argsort/topk.
     const std::string probs_name = "ffn_moe_probs" + suffix;
     const std::string ffn_name = "ffn_moe_out" + suffix;
+    const std::string raw_down_name = "ffn_moe_down" + suffix;
     const std::string output_name = "l_out" + suffix;
     cycle_real_capture capture;
     for (const auto & name : {attn_input_name, residual_name, norm_name,
                              ids_name, routing_name, probs_name,
-                             ffn_name, output_name}) {
+                             raw_down_name, ffn_name, output_name}) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
 
@@ -932,6 +952,9 @@ int main(int argc, char ** argv) {
         !cycle_real_check_capture(
             capture, probs_name, GGML_TYPE_F32, reference_experts, ntokens, 1) ||
         !cycle_real_check_capture(
+            capture, raw_down_name, GGML_TYPE_F32,
+            reference_hidden, reference_topk, ntokens) ||
+        !cycle_real_check_capture(
             capture, ffn_name, GGML_TYPE_F32, reference_hidden, ntokens, 1) ||
         !cycle_real_check_capture(
             capture, output_name, GGML_TYPE_F32, reference_hidden, ntokens, 1)) {
@@ -940,7 +963,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::printf("[CYCLE_REAL_REFERENCE] "
-                "capture_fields=8 status=PASS\n");
+                "capture_fields=9 status=PASS\n");
 
     // A new model instance holds only the *real* physical Cycle weights:
     // PC CPU FFN shard + Phone OpenCL FFN shard, with Attention/Router
@@ -1034,6 +1057,8 @@ int main(int argc, char ** argv) {
     const auto ref_ids = cycle_real_read<int32_t>(capture, ids_name);
     const auto ref_routing = cycle_real_read<float>(capture, routing_name);
     const auto ref_router_probs = cycle_real_read<float>(capture, probs_name);
+    const auto baseline_down =
+        cycle_real_read<float>(capture, raw_down_name);
     const auto baseline_ffn = cycle_real_read<float>(capture, ffn_name);
     const auto baseline_output = cycle_real_read<float>(capture, output_name);
 
