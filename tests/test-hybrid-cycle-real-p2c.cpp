@@ -804,6 +804,7 @@ static bool cycle_real_execute_phone_attention_pre(
             (long long)(kv_cache ? kv_cache->committed_tokens : -1));
         return false;
     }
+    const auto graph_build_begin = std::chrono::steady_clock::now();
     ggml_init_params p {};
     p.mem_size = 16 * 1024 * 1024;
     p.no_alloc = true;
@@ -958,6 +959,7 @@ static bool cycle_real_execute_phone_attention_pre(
     ggml_build_forward_expand(graph, ready.ffn_norm);
     ggml_build_forward_expand(graph, ready.topk_ids);
     ggml_build_forward_expand(graph, ready.topk_weights);
+    const auto graph_build_done = std::chrono::steady_clock::now();
 
     int unsupported = 0;
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
@@ -980,8 +982,10 @@ static bool cycle_real_execute_phone_attention_pre(
     }
 
     const auto buft = ggml_backend_get_default_buffer_type(backend);
+    const auto alloc_begin = std::chrono::steady_clock::now();
     ggml_backend_buffer_t compute_buffer =
         ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    const auto alloc_done = std::chrono::steady_clock::now();
     if (!compute_buffer) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ALLOC_PHONE_GRAPH\n");
@@ -1019,7 +1023,8 @@ static bool cycle_real_execute_phone_attention_pre(
                 (long long)tokens, (long long)kv_tokens,
                 (long long)kv_token_start, (long long)(kv_tokens - 1),
                 (long long)masked_future,
-                kv_cache != nullptr ? "PHONE_PERSISTENT" : "SINGLE_UBATCH");
+                kv_cache == nullptr ? "SINGLE_UBATCH" :
+            source_device == 0 ? "PC_PERSISTENT" : "PHONE_PERSISTENT");
 
     const auto begin = std::chrono::steady_clock::now();
     if (device_input != nullptr) {
@@ -1052,18 +1057,39 @@ static bool cycle_real_execute_phone_attention_pre(
                             ggml_nbytes(positions));
     ggml_backend_tensor_set(causal_mask, mask_data.data(), 0,
                             ggml_nbytes(causal_mask));
+    const auto input_done = std::chrono::steady_clock::now();
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    const auto submit_done = std::chrono::steady_clock::now();
+    if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
+        std::printf(
+            "[CYCLE_ATTN_PROFILE] backend=%s "
+            "graph_build_ms=%.3f gpu_alloc_ms=%.3f "
+            "input_copy_ms=%.3f graph_submit_or_compute_ms=%.3f "
+            "remote_gpu_compute_ms=SEE_CYCLE_GPU_SERVER\n",
+            ggml_backend_name(backend),
+            std::chrono::duration<double, std::milli>(
+                graph_build_done - graph_build_begin).count(),
+            std::chrono::duration<double, std::milli>(
+                alloc_done - alloc_begin).count(),
+            std::chrono::duration<double, std::milli>(
+                input_done - begin).count(),
+            std::chrono::duration<double, std::milli>(
+                submit_done - input_done).count());
+    }
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_synchronize(backend);
         if (kv_cache != nullptr) {
             kv_cache->committed_tokens = kv_tokens;
             std::printf(
-                "[CYCLE_PHONE_KV_PERSISTENT] chunk=%d committed=%lld "
-                "total=%lld status=OK\n",
+                "[CYCLE_PHONE_KV_PERSISTENT] chunk=%d "
+                "position_start=%lld committed=%lld "
+                "total=%lld owner=%s status=OK\n",
                 wire != nullptr ? wire->chunk : -1,
+                (long long)kv_token_start,
                 (long long)kv_cache->committed_tokens,
-                (long long)kv_cache->max_tokens);
+                (long long)kv_cache->max_tokens,
+                source_device == 0 ? "PC_CPU" : "PHONE_GPU");
         }
         if (wire != nullptr) {
             // GPU tensors remain valid until compute_buffer is destroyed.
