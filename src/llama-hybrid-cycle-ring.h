@@ -3,6 +3,7 @@
 #include "llama-hybrid-cycle.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -42,6 +43,9 @@ struct llama_hybrid_cycle_task {
     llama_hybrid_cycle_stage stage = llama_hybrid_cycle_stage::FULL_LAYER;
     llama_hybrid_cycle_owner owner = llama_hybrid_cycle_owner::PC_CPU;
     llama_hybrid_cycle_queue queue = llama_hybrid_cycle_queue::PC_CPU;
+    // Set only when the task enters its real FIFO. It does not alter
+    // scheduling order, dependencies or buffer ownership.
+    std::chrono::steady_clock::time_point queued_at {};
 };
 
 inline const char * llama_hybrid_cycle_stage_name(llama_hybrid_cycle_stage stage) {
@@ -261,7 +265,8 @@ private:
     }
 
     void enqueue(int layer, int chunk, llama_hybrid_cycle_stage stage) {
-        const auto task = make_task(layer, chunk, stage);
+        auto task = make_task(layer, chunk, stage);
+        task.queued_at = std::chrono::steady_clock::now();
         if (!seen_.insert(task_key(task)).second) {
             throw std::logic_error("duplicate cycle task enqueue");
         }
