@@ -3820,6 +3820,7 @@ static bool cycle_real_execute_period_fifo(
         n_queues> stage_profile {};
     llama_hybrid_cycle_fifo_profile fifo_profile {};
     std::array<cycle_real_attention_phase_profile, n_queues> attn_profile {};
+    std::array<cycle_real_ffn_phase_profile, n_queues> ffn_profile {};
     std::array<cycle_real_phone_prepare_profile, n_queues> gpu_prepare_profile {};
     std::array<cycle_real_phone_fence_profile, n_queues> fence_profile {};
     const auto started = std::chrono::steady_clock::now();
@@ -3903,7 +3904,9 @@ static bool cycle_real_execute_period_fifo(
                             ok = cycle_real_execute_ffn(
                                 cpu, weights, st.ready.norm, st.ready.ids,
                                 st.ready.routing, hidden, st.tokens, topk,
-                                experts, st.partial);
+                                experts, st.partial, nullptr, nullptr,
+                                nullptr, nullptr,
+                                perf_mode ? &ffn_profile[queue_index] : nullptr);
                         }
                         if (ok) {
                             if (size_t(l) < checkpoints.pc_ffn_outputs.size()) {
@@ -4194,7 +4197,8 @@ static bool cycle_real_execute_period_fifo(
                             cpu, weights, st.ready.norm,
                             st.ready.ids, st.ready.routing,
                             hidden, st.tokens, topk, experts,
-                            st.partial);
+                            st.partial, nullptr, nullptr, nullptr, nullptr,
+                            perf_mode ? &ffn_profile[queue_index] : nullptr);
                     } else {
                         const auto weights = full_shard(l, 1);
                         const std::vector<float> none_f;
@@ -4204,7 +4208,8 @@ static bool cycle_real_execute_period_fifo(
                             phone, weights, none_f, none_i, none_f,
                             hidden, st.tokens, topk, experts,
                             ignored, nullptr, nullptr,
-                            &st.wire, &st.ready.phone_graph);
+                            &st.wire, &st.ready.phone_graph,
+                            perf_mode ? &ffn_profile[queue_index] : nullptr);
                         st.ready.release_phone_graph();
                     }
                     break;
@@ -4220,7 +4225,8 @@ static bool cycle_real_execute_period_fifo(
                             st.recv_ready.ready.topk_ids,
                             st.recv_ready.ready.topk_weights,
                             hidden, st.tokens, topk, experts,
-                            st.partial);
+                            st.partial, nullptr, nullptr, nullptr, nullptr,
+                            perf_mode ? &ffn_profile[queue_index] : nullptr);
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "P2C_PC_FFN", l, c, st.partial);
@@ -4467,6 +4473,18 @@ static bool cycle_real_execute_period_fifo(
                     name, (unsigned long long)attn.count,
                     attn.graph_build_ms, attn.alloc_ms,
                     attn.input_copy_ms, attn.graph_call_ms);
+            }
+            const auto & ffn = ffn_profile[q];
+            if (ffn.count) {
+                std::printf(
+                    "[CYCLE_PERIOD_FFN_PREP_SUM] queue=%s count=%llu "
+                    "graph_build_sum_ms=%.3f "
+                    "backend_prepare_sum_ms=%.3f "
+                    "backend_execute_call_sum_ms=%.3f "
+                    "rpc_gpu_kernel_ms=SERVER_ONLY\n",
+                    name, (unsigned long long)ffn.count,
+                    ffn.graph_build_ms, ffn.backend_prepare_ms,
+                    ffn.backend_execute_call_ms);
             }
             const auto & gpu = gpu_prepare_profile[q];
             if (gpu.count) {
