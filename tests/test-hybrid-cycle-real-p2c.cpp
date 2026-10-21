@@ -2139,6 +2139,26 @@ int main(int argc, char ** argv) {
                     return false;
                 }
 
+                // Compare OpenCL MUL_MAT_ID to GGML CPU MUL_MAT_ID with
+                // the *same packed Phone weight bytes*. Run twice:
+                // original F32 input and an F16-roundtrip input. Neither
+                // replay modifies the actual Phone/PC FFN calculation.
+                if (!cycle_real_replay_phone_matmul_id_on_cpu(
+                        "GATE", cpu, phone_weights.gate,
+                        input_norm, input_ids,
+                        hidden, ntokens, topk, full_channels, pc_channels,
+                        baseline_gate, ph_stages.gate) ||
+                    !cycle_real_replay_phone_matmul_id_on_cpu(
+                        "UP", cpu, phone_weights.up,
+                        input_norm, input_ids,
+                        hidden, ntokens, topk, full_channels, pc_channels,
+                        baseline_up, ph_stages.up)) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_KERNEL_REPLAY] status=FAIL "
+                        "reason=PROBE_EXECUTION\n");
+                    return false;
+                }
+
                 const size_t n_down = size_t(hidden * topk * ntokens);
                 if (baseline_down.size() != n_down ||
                     pc_raw_down.size() != n_down ||
