@@ -1007,6 +1007,153 @@ static bool cycle_real_dequantize_q4k_expert_on_cpu(
     return computed;
 }
 
+// Establish a third, independent numerical reference: dequantize exactly
+// the selected Phone Q4_K expert into F32 weights on CPU, then form F64
+// dot-products with the ORIGINAL F32 activation. Compare that reference
+// against the CPU Q4_KxQ8_K result, Phone generic Q4_KxF32 result, Phone
+// MoE Q4_KxF32 result, and Phone dense F32xF32 result.
+//
+// A difference from the CPU reference alone cannot prove that OpenCL is
+// wrong: the CPU Q4_K dot path first quantizes its F32 activation to Q8_K.
+// This F64 oracle is intentionally NOT used by the official layer gate.
+static bool cycle_real_probe_q4k_dense_f64_oracle(
+        const char * stage,
+        ggml_backend_t cpu_backend,
+        ggml_backend_t phone_backend,
+        const std::vector<uint8_t> & packed,
+        int64_t hidden, int64_t channels,
+        const float * input,
+        const std::vector<float> & cpu_q8,
+        const std::vector<float> & gpu_q4,
+        const std::vector<float> & gpu_moe) {
+    if (!input || !cpu_backend || !phone_backend ||
+        hidden <= 0 || channels <= 0 ||
+        cpu_q8.size() != size_t(channels) ||
+        gpu_q4.size() != size_t(channels) ||
+        gpu_moe.size() != size_t(channels)) {
+        return false;
+    }
+    std::vector<float> dense_weights;
+    if (!cycle_real_dequantize_q4k_expert_on_cpu(
+            cpu_backend, packed, hidden, channels, dense_weights)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
+            "reason=CPU_DEQUANT\n", stage);
+        return false;
+    }
+
+    // The dequantized F32 values are the actual Q4_K representable
+    // weights; accumulate in double to minimize reference rounding.
+    std::vector<double> f64_reference(static_cast<size_t>(channels), 0.0);
+    for (int64_t ch = 0; ch < channels; ++ch) {
+        double sum = 0.0;
+        const size_t row = size_t(ch * hidden);
+        for (int64_t k = 0; k < hidden; ++k) {
+            sum += double(dense_weights[row + size_t(k)]) *
+                   double(input[size_t(k)]);
+        }
+        f64_reference[size_t(ch)] = sum;
+    }
+
+    // An F32-weight GPU matmul separates Q4_K-specific unpacking /
+    // quantized GEMV numerical behavior from general GPU accumulation.
+    ggml_init_params p {};
+    p.mem_size = 2 * 1024 * 1024;
+    p.no_alloc = true;
+    ggml_context * ctx = ggml_init(p);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, hidden, channels);
+    ggml_tensor * x = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, hidden, 1);
+    ggml_set_input(x);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, y);
+    if (!ggml_backend_supports_op(phone_backend, y)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
+            "reason=PHONE_F32_MUL_MAT_UNSUPPORTED\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx, ggml_backend_get_default_buffer_type(phone_backend));
+    if (!buffer) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
+            "reason=PHONE_F32_ALLOC\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_tensor_set(
+        w, dense_weights.data(), 0, ggml_nbytes(w));
+    ggml_backend_tensor_set(x, input, 0, ggml_nbytes(x));
+    const bool computed =
+        ggml_backend_graph_compute(phone_backend, graph) ==
+        GGML_STATUS_SUCCESS;
+    std::vector<float> gpu_f32;
+    if (computed) {
+        ggml_backend_synchronize(phone_backend);
+        gpu_f32.resize(static_cast<size_t>(channels));
+        ggml_backend_tensor_get(y, gpu_f32.data(), 0, ggml_nbytes(y));
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    if (!computed) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
+            "reason=PHONE_F32_COMPUTE\n", stage);
+        return false;
+    }
+
+    struct err_summary {
+        double max_abs = 0.0;
+        double sum_sq = 0.0;
+    } cpu_err, gpu_q4_err, gpu_moe_err, gpu_f32_err;
+    for (int64_t ch = 0; ch < channels; ++ch) {
+        const size_t i = size_t(ch);
+        const double ref = f64_reference[i];
+        const auto accumulate = [ref](double value, err_summary & acc) {
+            if (!std::isfinite(value) || !std::isfinite(ref)) {
+                return false;
+            }
+            const double delta = std::fabs(value - ref);
+            acc.max_abs = std::max(acc.max_abs, delta);
+            acc.sum_sq += delta * delta;
+            return true;
+        };
+        if (!accumulate(cpu_q8[i], cpu_err) ||
+            !accumulate(gpu_q4[i], gpu_q4_err) ||
+            !accumulate(gpu_moe[i], gpu_moe_err) ||
+            !accumulate(gpu_f32[i], gpu_f32_err)) {
+            std::fprintf(stderr,
+                "[CYCLE_FFN_F32_ORACLE] stage=%s status=FAIL "
+                "reason=NONFINITE\n", stage);
+            return false;
+        }
+    }
+    const double n = double(channels);
+    std::printf(
+        "[CYCLE_FFN_F32_ORACLE] stage=%s channels=%lld "
+        "cpu_q4q8_vs_f64_max_abs=%.8g cpu_q4q8_vs_f64_rms=%.8g "
+        "gpu_q4f32_vs_f64_max_abs=%.8g gpu_q4f32_vs_f64_rms=%.8g "
+        "gpu_moe_vs_f64_max_abs=%.8g gpu_moe_vs_f64_rms=%.8g "
+        "gpu_dense_f32_vs_f64_max_abs=%.8g gpu_dense_f32_vs_f64_rms=%.8g "
+        "oracle=DEQUANT_F32_WEIGHT_TIMES_F32_INPUT_ACCUM_F64 "
+        "status=MEASURED\n",
+        stage, (long long)channels,
+        cpu_err.max_abs, std::sqrt(cpu_err.sum_sq / n),
+        gpu_q4_err.max_abs, std::sqrt(gpu_q4_err.sum_sq / n),
+        gpu_moe_err.max_abs, std::sqrt(gpu_moe_err.sum_sq / n),
+        gpu_f32_err.max_abs, std::sqrt(gpu_f32_err.sum_sq / n));
+    return true;
+}
+
 // Discriminate the normal Q4_K MUL_MAT kernel from the fused MoE
 // MUL_MAT_ID kernel on the SAME Phone OpenCL device. A fresh one-expert
 // quantized weight buffer is populated from the already-byte-verified
