@@ -3,7 +3,7 @@
 // Attention/Norm/Router/FFN/l_out reference, and is freed before the Cycle
 // model is loaded. PC CPU + Phone GPU then run *real physical FFN shards*
 // independently. Only PC sums both partials and adds the captured residual.
-// Phone GPU executes a real first-token AttentionPre (no historical KV)
+// Phone GPU executes a real causal AttentionPre over the prompt's KV tokens
 // and we compare its four READY outputs against that CPU reference before
 // using them for either FFN shard. The Phone graph now supports contiguous
 // multi-token causal KV within one prompt ubatch, but not persistent KV
@@ -738,7 +738,7 @@ int main(int argc, char ** argv) {
         capture.values.emplace(name, cycle_real_capture_value {});
     }
 
-    const std::string prompt = argc == 5 ? argv[4] :
+    const std::string prompt = argc >= 5 ? argv[4] :
         "The quick brown fox jumps over the lazy dog. Please explain a transformer.";
     int32_t ntokens = 0;
     int32_t reference_layers = 0;
@@ -1069,6 +1069,49 @@ int main(int argc, char ** argv) {
         cycle_real_compare(phone_ready.routing, ref_routing);
     const bool topk_equal = phone_ready.ids == ref_ids;
 
+    // Print which *position* diverges, not just one pooled statistic.
+    // In a causal multi-KV test, a future-mask or RoPE error can be local
+    // to later tokens even when the first token matches perfectly.
+    const auto report_token_errors = [&](const char * field,
+                                         const std::vector<float> & actual,
+                                         const std::vector<float> & baseline,
+                                         int64_t elems_per_token) {
+        if (actual.size() != baseline.size() ||
+            actual.size() != size_t(elems_per_token * ntokens)) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_READY_TOKEN] field=%s status=FAIL "
+                "reason=SHAPE_MISMATCH\n", field);
+            return;
+        }
+        double max_abs = 0.0;
+        int64_t worst_token = -1;
+        int64_t worst_element = -1;
+        for (int32_t token = 0; token < ntokens; ++token) {
+            for (int64_t j = 0; j < elems_per_token; ++j) {
+                const size_t idx = size_t(token * elems_per_token + j);
+                const double err = std::fabs(
+                    double(actual[idx]) - double(baseline[idx]));
+                if (err > max_abs || worst_token < 0) {
+                    max_abs = err;
+                    worst_token = token;
+                    worst_element = j;
+                }
+            }
+        }
+        std::printf("[CYCLE_PHONE_READY_TOKEN] field=%s tokens=%d "
+                    "worst_pos=%lld worst_element=%lld max_abs=%.8g "
+                    "status=MEASURED\n",
+                    field, int(ntokens),
+                    (long long)worst_token, (long long)worst_element,
+                    max_abs);
+    };
+    report_token_errors(
+        "RESIDUAL", phone_ready.residual, ref_residual, hidden);
+    report_token_errors(
+        "FFN_NORM", phone_ready.norm, ref_norm, hidden);
+    report_token_errors(
+        "ROUTING_WEIGHTS", phone_ready.routing, ref_routing, topk);
+
     // Do NOT reuse the relaxed full-layer tolerance here. The residual
     // contains large activations; requiring its comparison to pass only
     // via 0.005*max_ref would hide significant Attention errors.
@@ -1076,7 +1119,7 @@ int main(int argc, char ** argv) {
                               double floor, double relative) {
         return d.valid && d.max_abs <= floor + relative * d.max_ref;
     };
-    const bool residual_ok = strict_ok(residual_diff, 0.02, 0.0001);
+    const bool residual_ok = strict_ok(residual_diff, 0.02, 0.00001);
     const bool norm_ok = strict_ok(norm_diff, 0.01, 0.001);
     const bool routing_ok = strict_ok(routing_diff, 0.003, 0.001);
 
@@ -1085,7 +1128,7 @@ int main(int argc, char ** argv) {
                 "strict_tolerance=%.8g status=%s\n",
                 residual_diff.max_abs, residual_diff.rms,
                 residual_diff.cosine,
-                0.02 + 0.0001 * residual_diff.max_ref,
+                0.02 + 0.00001 * residual_diff.max_ref,
                 residual_ok ? "PASS" : "FAIL");
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=FFN_NORM "
                 "max_abs=%.8g rms=%.8g cosine=%.8g "
