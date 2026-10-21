@@ -1454,16 +1454,20 @@ int main(int argc, char ** argv) {
                 const std::vector<float> & input_norm,
                 const std::vector<int32_t> & input_ids,
                 const std::vector<float> & input_routing,
-                std::vector<float> & sum_output) -> bool {
+                std::vector<float> & sum_output,
+                bool capture_down) -> bool {
             // The async Phone shard and foreground CPU shard consume one
             // immutable set of READY inputs. Both futures finish before
             // either backend is reused for another case.
+            std::vector<float> ph_raw_down;
+            std::vector<float> pc_raw_down;
             auto phone_probe = std::async(std::launch::async, [&] {
                 std::vector<float> result;
                 if (!cycle_real_execute_ffn(
                         phone, phone_weights,
                         input_norm, input_ids, input_routing,
-                        hidden, ntokens, topk, experts, result)) {
+                        hidden, ntokens, topk, experts, result,
+                        capture_down ? &ph_raw_down : nullptr)) {
                     result.clear();
                 }
                 return result;
@@ -1472,7 +1476,8 @@ int main(int argc, char ** argv) {
             const bool pc_probe_ok = cycle_real_execute_ffn(
                 cpu, pc_weights,
                 input_norm, input_ids, input_routing,
-                hidden, ntokens, topk, experts, pc_probe);
+                hidden, ntokens, topk, experts, pc_probe,
+                capture_down ? &pc_raw_down : nullptr);
             const std::vector<float> ph_probe = phone_probe.get();
             if (!pc_probe_ok ||
                 pc_probe.size() != size_t(hidden * ntokens) ||
@@ -1485,6 +1490,111 @@ int main(int argc, char ** argv) {
             sum_output.resize(size_t(hidden * ntokens));
             for (size_t j = 0; j < sum_output.size(); ++j) {
                 sum_output[j] = pc_probe[j] + ph_probe[j];
+            }
+            if (capture_down) {
+                const size_t n_down = size_t(hidden * topk * ntokens);
+                if (baseline_down.size() != n_down ||
+                    pc_raw_down.size() != n_down ||
+                    ph_raw_down.size() != n_down) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_INTERMEDIATE] case=%s status=FAIL "
+                        "reason=RAW_DOWN_SHAPE n=%zu cpu=%zu pc=%zu ph=%zu\n",
+                        label, n_down, baseline_down.size(),
+                        pc_raw_down.size(), ph_raw_down.size());
+                    return false;
+                }
+                std::vector<float> physical_down(n_down);
+                for (size_t j = 0; j < n_down; ++j) {
+                    physical_down[j] = pc_raw_down[j] + ph_raw_down[j];
+                }
+                const cycle_real_diff down_diff =
+                    cycle_real_compare(physical_down, baseline_down);
+                std::printf("[CYCLE_FFN_INTERMEDIATE] "
+                            "target=UNWEIGHTED_DOWN_FROM_SHARDS "
+                            "max_abs=%.8g rms=%.8g cosine=%.8g "
+                            "status=%s\n",
+                            down_diff.max_abs, down_diff.rms,
+                            down_diff.cosine,
+                            down_diff.valid ? "MEASURED" : "FAIL_NONFINITE");
+
+                // Per-token and per-Expert-slot maxima identify whether
+                // the discrepancy predates Router weighting. The same
+                // selected Expert IDs are used by CPU and both shards.
+                for (int32_t token = 0; token < ntokens; ++token) {
+                    double token_max = -1.0;
+                    int64_t worst_slot = -1;
+                    int64_t worst_hidden = -1;
+                    float reference_value = 0.0f;
+                    float physical_value = 0.0f;
+                    for (int64_t slot = 0; slot < topk; ++slot) {
+                        for (int64_t channel = 0; channel < hidden; ++channel) {
+                            const size_t idx = size_t(
+                                (token * topk + slot) * hidden + channel);
+                            const double abs_error = std::fabs(
+                                double(physical_down[idx]) -
+                                double(baseline_down[idx]));
+                            if (abs_error > token_max) {
+                                token_max = abs_error;
+                                worst_slot = slot;
+                                worst_hidden = channel;
+                                reference_value = baseline_down[idx];
+                                physical_value = physical_down[idx];
+                            }
+                        }
+                    }
+                    std::printf("[CYCLE_FFN_DOWN_TOKEN] pos=%d "
+                                "max_abs=%.8g expert_slot=%lld expert_id=%d "
+                                "hidden=%lld cpu_raw=%.8g shards_raw=%.8g "
+                                "status=MEASURED\n",
+                                int(token), token_max,
+                                (long long)worst_slot,
+                                input_ids[size_t(token * topk + worst_slot)],
+                                (long long)worst_hidden,
+                                reference_value, physical_value);
+                }
+
+                // Reconstruct both weighted FFNs in CPU F32 from the raw
+                // expert Down tensors. If CPU raw reproduces baseline_ffn,
+                // the oracle capture is internally coherent. If shard raw
+                // reproduces sum_output, any drift is already present
+                // before the final weighted expert reduction.
+                std::vector<float> oracle_weighted(size_t(hidden * ntokens), 0.0f);
+                std::vector<float> physical_weighted(size_t(hidden * ntokens), 0.0f);
+                for (int32_t token = 0; token < ntokens; ++token) {
+                    for (int64_t slot = 0; slot < topk; ++slot) {
+                        const float weight = input_routing[
+                            size_t(token * topk + slot)];
+                        for (int64_t j = 0; j < hidden; ++j) {
+                            const size_t base = size_t(token * hidden + j);
+                            const size_t idx = size_t(
+                                (token * topk + slot) * hidden + j);
+                            oracle_weighted[base] +=
+                                baseline_down[idx] * weight;
+                            physical_weighted[base] +=
+                                physical_down[idx] * weight;
+                        }
+                    }
+                }
+                const cycle_real_diff oracle_reduce_diff =
+                    cycle_real_compare(oracle_weighted, baseline_ffn);
+                const cycle_real_diff physical_reduce_diff =
+                    cycle_real_compare(physical_weighted, sum_output);
+                std::printf("[CYCLE_FFN_INTERMEDIATE] "
+                            "target=CPU_RAW_WEIGHTED_VS_CPU_FFN "
+                            "max_abs=%.8g rms=%.8g status=%s\n",
+                            oracle_reduce_diff.max_abs, oracle_reduce_diff.rms,
+                            oracle_reduce_diff.valid ? "MEASURED" : "FAIL_NONFINITE");
+                std::printf("[CYCLE_FFN_INTERMEDIATE] "
+                            "target=SHARD_RAW_WEIGHTED_VS_SHARD_FFN "
+                            "max_abs=%.8g rms=%.8g status=%s\n",
+                            physical_reduce_diff.max_abs,
+                            physical_reduce_diff.rms,
+                            physical_reduce_diff.valid ?
+                                "MEASURED" : "FAIL_NONFINITE");
+                if (!down_diff.valid || !oracle_reduce_diff.valid ||
+                    !physical_reduce_diff.valid) {
+                    return false;
+                }
             }
             const cycle_real_diff vs_cpu_full =
                 cycle_real_compare(sum_output, baseline_ffn);
@@ -1509,7 +1619,7 @@ int main(int argc, char ** argv) {
         // with NO Phone Attention/Router input discrepancy.
         if (!run_case("CPU_READY_CONTROL",
                       ref_norm, ref_ids, ref_routing,
-                      cpu_ready_control_ffn)) {
+                      cpu_ready_control_ffn, true)) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
@@ -1518,7 +1628,7 @@ int main(int argc, char ** argv) {
         std::vector<float> phone_norm_cpu_router;
         if (!run_case("PHONE_NORM_CPU_ROUTER",
                       norm, ref_ids, ref_routing,
-                      phone_norm_cpu_router)) {
+                      phone_norm_cpu_router, false)) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
@@ -1527,7 +1637,7 @@ int main(int argc, char ** argv) {
         std::vector<float> cpu_norm_phone_router;
         if (!run_case("CPU_NORM_PHONE_ROUTER",
                       ref_norm, ids, routing,
-                      cpu_norm_phone_router)) {
+                      cpu_norm_phone_router, false)) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
@@ -1565,7 +1675,7 @@ int main(int argc, char ** argv) {
         std::vector<float> phone_order_cpu_weights;
         if (!run_case("PHONE_ORDER_CPU_WEIGHTS",
                       ref_norm, ids, cpu_weights_in_phone_order,
-                      phone_order_cpu_weights)) {
+                      phone_order_cpu_weights, false)) {
             ggml_backend_free(phone);
             ggml_backend_free(cpu);
             return 1;
