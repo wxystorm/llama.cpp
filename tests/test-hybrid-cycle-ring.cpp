@@ -228,9 +228,77 @@ static void test_p2c_fifo_worker_runtime() {
     assert(done(llama_hybrid_cycle_stage::FFN_DESTINATION) == 1);
 }
 
+// Four chunks, two GPU allocations/Attention entries max in flight.
+// The Phone compute FIFO may start chunk N+2 only after a preceding
+// Reduce has returned its entry credit. Each READY and PARTIAL must join
+// with the PC FFN of the same chunk before the PC owns final output.
+static void test_bounded_multi_chunk_p2c_fifo() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    constexpr int chunks = 4;
+    std::array<std::atomic<uint32_t>, chunks> stage_bits {};
+    for (auto & flags : stage_bits) {
+        flags.store(0);
+    }
+    std::atomic<int> attention_count {0};
+    std::atomic<int> reduce_count {0};
+    const auto bit = [](llama_hybrid_cycle_stage stage) -> uint32_t {
+        return uint32_t(1) << static_cast<int>(stage);
+    };
+
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        layout, chunks, [&](const llama_hybrid_cycle_task & task) {
+            assert(task.layer == 0 &&
+                   task.chunk >= 0 && task.chunk < chunks);
+            const uint32_t before = stage_bits[size_t(task.chunk)].load();
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    assert(attention_count.fetch_add(1) == task.chunk);
+                    assert(task.chunk < reduce_count.load() + 2);
+                    break;
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_TO_PC);
+                    assert(before & bit(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    assert(before & bit(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::FFN_DESTINATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(before & bit(llama_hybrid_cycle_stage::SEND_ACTIVATION));
+                    break;
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_TO_PC);
+                    assert(before & bit(llama_hybrid_cycle_stage::FFN_SOURCE));
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(before & bit(llama_hybrid_cycle_stage::FFN_DESTINATION));
+                    assert(before & bit(llama_hybrid_cycle_stage::SEND_PARTIAL));
+                    ++reduce_count;
+                    break;
+                case llama_hybrid_cycle_stage::FULL_LAYER:
+                    assert(false);
+                    return false;
+            }
+            const uint32_t previous =
+                stage_bits[size_t(task.chunk)].fetch_or(bit(task.stage));
+            assert(!(previous & bit(task.stage)));
+            return true;
+        }, 2);
+    assert(ok);
+    assert(attention_count == chunks && reduce_count == chunks);
+    for (const auto & flags : stage_bits) {
+        assert((flags.load() & bit(llama_hybrid_cycle_stage::REDUCE)) != 0);
+    }
+}
+
 int main() {
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
+    test_bounded_multi_chunk_p2c_fifo();
     test_causal_entry_order();
     test_two_cycles_and_cuda_tail();
     test_reject_invalid_completions();
