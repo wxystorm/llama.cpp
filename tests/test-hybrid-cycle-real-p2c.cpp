@@ -1910,6 +1910,14 @@ int main(int argc, char ** argv) {
     mp.devices = devices;
     mp.split_mode = LLAMA_SPLIT_MODE_TENSOR;
     mp.hybrid_auto = false;
+    // Like the CPU-only oracle, the Cycle model is a correctness probe.
+    // Default use_extra_bufts=true enables CPU_REPACK (q4_K_8x8), which
+    // copies/rearranges many CPU-owned layer weights and wastes RAM here.
+    // Keep canonical CPU tensor storage while preserving physical
+    // PC_CPU + PHONE_GPU ownership and the actual RPC computation.
+    mp.use_extra_bufts = false;
+    std::printf("[CYCLE_REAL_MODEL_LOAD] split_mode=TENSOR "
+                "cpu_repack=DISABLED extra_bufts=0 status=CONFIGURED\n");
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
         llama_model_load_from_file(argv[1], mp), &llama_model_free);
     const int32_t model_layers =
