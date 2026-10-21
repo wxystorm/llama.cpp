@@ -49,18 +49,29 @@ public:
             return false;
         }
 
-        const auto backend_buft = ggml_backend_get_default_buffer_type(backend);
-        if (!backend_buft ||
-            ggml_backend_buffer_get_type(weights.up->buffer) != backend_buft ||
-            ggml_backend_buffer_get_type(weights.gate->buffer) != backend_buft ||
-            ggml_backend_buffer_get_type(weights.down->buffer) != backend_buft) {
+        // Never attach a Meta backend to the local FFN graph. The PC CPU
+        // accepts mmap/host/extra weight buffers as well as its default buft;
+        // GPU/RPC remains restricted to its exact physical buffer type.
+        const auto device = ggml_backend_get_device(backend);
+        if (!device ||
+            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META) {
             return false;
         }
-
-        // Never attach a Meta backend to the local FFN graph. In particular,
-        // a Meta graph would recombine the PC/Phone partials too early.
-        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) ==
-            GGML_BACKEND_DEVICE_TYPE_META) {
+        const auto backend_buft = ggml_backend_get_default_buffer_type(backend);
+        const auto weight_is_compatible = [&](const ggml_tensor * weight) {
+            if (!weight || !weight->buffer ||
+                ggml_backend_buffer_is_meta(weight->buffer)) {
+                return false;
+            }
+            const auto weight_buft = ggml_backend_buffer_get_type(weight->buffer);
+            return weight_buft == backend_buft ||
+                (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                 ggml_backend_dev_supports_buft(device, weight_buft));
+        };
+        if (!backend_buft ||
+            !weight_is_compatible(weights.up) ||
+            !weight_is_compatible(weights.gate) ||
+            !weight_is_compatible(weights.down)) {
             return false;
         }
 
