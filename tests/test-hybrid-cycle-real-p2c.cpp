@@ -60,6 +60,8 @@ struct cycle_real_capture {
 // CPU model has already been released when the physical period begins.
 struct cycle_real_period_reference {
     std::vector<std::vector<float>> layer_outputs;
+    std::vector<std::vector<float>> pc_attn_residuals;
+    std::vector<std::vector<float>> pc_ffn_outputs;
     std::vector<float> c2p_residual;
     std::vector<float> p2c_residual;
     std::vector<float> p2c_norm;
@@ -3597,6 +3599,12 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 0);
                         if (ok) {
+                            if (size_t(l) < checkpoints.pc_attn_residuals.size()) {
+                                cycle_real_period_checkpoint(
+                                    "PC_FULL_ATTN_RESIDUAL", l, c, st.start,
+                                    hidden, st.ready.residual,
+                                    checkpoints.pc_attn_residuals[size_t(l)]);
+                            }
                             const auto weights = full_shard(l, 0);
                             ok = cycle_real_execute_ffn(
                                 cpu, weights, st.ready.norm, st.ready.ids,
@@ -3604,6 +3612,12 @@ static bool cycle_real_execute_period_fifo(
                                 experts, st.partial);
                         }
                         if (ok) {
+                            if (size_t(l) < checkpoints.pc_ffn_outputs.size()) {
+                                cycle_real_period_checkpoint(
+                                    "PC_FULL_FFN", l, c, st.start,
+                                    hidden, st.partial,
+                                    checkpoints.pc_ffn_outputs[size_t(l)]);
+                            }
                             st.host_output = std::move(st.partial);
                             if (st.host_output.size() != st.ready.residual.size()) {
                                 ok = false;
@@ -4053,6 +4067,17 @@ int main(int argc, char ** argv) {
             capture.values.emplace(
                 "l_out-" + std::to_string(i), cycle_real_capture_value {});
         }
+        // Keep optional per-PC-layer Attention/FFN references only while
+        // investigating drift; mandatory end-to-end parity is unchanged.
+        if (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE")) {
+            for (int i = 0; i < capture_layout.x; ++i) {
+                capture.values.emplace(
+                    "ffn_inp-" + std::to_string(i), cycle_real_capture_value {});
+                capture.values.emplace(
+                    "ffn_moe_out-" + std::to_string(i),
+                    cycle_real_capture_value {});
+            }
+        }
     }
 
     const std::string prompt = argc >= 5 ? argv[4] :
@@ -4119,6 +4144,21 @@ int main(int argc, char ** argv) {
             reference_model->layers[size_t(layer)].ffn_up_exps->ne[1];
 
         llama_context_params cp = llama_context_default_params();
+        // CPU reference defaults to Flash Attention AUTO. The Cycle's
+        // explicit Attention graph uses no Flash Attention. Allow an A/B
+        // run that aligns their algorithms without altering the normal
+        // independent CPU baseline or relaxing CPU parity tolerances.
+        const bool reference_no_flash = cycle_period_mode &&
+            cycle_real_env_flag("LLAMA_HYBRID_CYCLE_REFERENCE_NO_FLASH");
+        if (reference_no_flash) {
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+        if (cycle_period_mode) {
+            std::printf(
+                "[CYCLE_REFERENCE_ATTENTION] mode=%s "
+                "cycle=NO_FLASH ref_kv=F16 status=CONFIGURED\n",
+                reference_no_flash ? "NO_FLASH" : "AUTO");
+        }
         cp.n_ctx = 512;
         cp.n_batch = 128;
         cp.n_ubatch = 128;
@@ -4627,6 +4667,16 @@ int main(int argc, char ** argv) {
                 for (int l = 0; l < expected_layout.cycle_size; ++l) {
                     checkpoints.layer_outputs.push_back(
                         optional_capture("l_out-" + std::to_string(l)));
+                }
+                checkpoints.pc_attn_residuals.reserve(
+                    size_t(expected_layout.x));
+                checkpoints.pc_ffn_outputs.reserve(
+                    size_t(expected_layout.x));
+                for (int l = 0; l < expected_layout.x; ++l) {
+                    checkpoints.pc_attn_residuals.push_back(
+                        optional_capture("ffn_inp-" + std::to_string(l)));
+                    checkpoints.pc_ffn_outputs.push_back(
+                        optional_capture("ffn_moe_out-" + std::to_string(l)));
                 }
                 checkpoints.c2p_residual = optional_capture(
                     "ffn_inp-" + std::to_string(expected_layout.x));
