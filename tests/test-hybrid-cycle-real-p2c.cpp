@@ -1647,11 +1647,9 @@ static bool cycle_real_dequantize_physical_expert_for_f64(
     return true;
 }
 
-// One-expert matmul, run only as a controlled diagnostic. A CPU quantized
-// MUL_MAT consumes F32 x but internally may quantize it to Q8_K; the Phone
-// quantized kernels consume the same original F32 x. For moe=true the
-// single selected expert is remapped to local expert ID 0.
-// Controlled single-expert MUL_MAT diagnostic. Do not substitute a
+// Single-expert MUL_MAT diagnostic. The CPU quantized kernel may convert
+// the common F32 input to Q8_K while OpenCL consumes F32.
+// This is deliberately an ordinary MUL_MAT probe only. Do not substitute a
 // one-expert MUL_MAT_ID graph for the real full-expert Phone MoE graph:
 // the OpenCL RPC supports-op check can accept this synthetic shape even
 // though ggml_cl_mul_mat_id subsequently aborts the Phone RPC server.
@@ -1710,7 +1708,8 @@ static bool cycle_real_probe_single_matmul_f64_input(
 }
 
 // Isolate Down from preceding Gate/Up/SwiGLU drift by feeding the SAME
-// captured CPU-reference SwiGLU slice to all four kernels. The selected
+// captured CPU-reference SwiGLU slice to CPU/GPU quantized and dense
+// F32 kernels. Synthetic one-expert MoE is unsupported and omitted. The selected
 // expert comes from the worst RAW_DOWN discrepancy in CPU_READY_CONTROL.
 // CPU / GPU / F64 use the identical physical Phone Down shard, including
 // any Q6_K format used by Q4_K_M models. No production graph is replaced.
@@ -1791,9 +1790,8 @@ static bool cycle_real_probe_down_f64_oracle(
             "reason=NONFINITE\n");
         return false;
     }
-    // Some OpenCL installations cannot run one-expert MUL_MAT_ID or a
-    // particular Q6_K generic kernel. Preserve every available result
-    // rather than hiding the F64 and Dense F32 measurements in that case.
+    // Preserve per-kernel availability. OpenCL may not support the
+    // generic Q6_K path, and synthetic MoE is explicitly not executed.
     const double na = std::numeric_limits<double>::quiet_NaN();
     // All three supported probe kernels must complete, while the
     // synthetic single-expert MoE comparison remains intentionally N/A.
