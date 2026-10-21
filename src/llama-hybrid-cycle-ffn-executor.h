@@ -81,12 +81,19 @@ public:
             const int32_t * ids, size_t ids_count,
             const float * routing, size_t routing_count,
             float * output, size_t output_count) {
+        // The Phone source may transfer its output directly from the
+        // remote GPU through the independent Cycle data-plane. In that case
+        // no ordinary RPC tensor_get is allowed: the caller will use the
+        // received PARTIAL frame on the PC, not a duplicate host readback.
+        const bool read_output = output != nullptr;
         if (!backend_ || !graph_ || !compute_buffer_ ||
-            !norm || !ids || !routing || !output ||
+            !norm || !ids || !routing ||
             norm_count != size_t(ggml_nelements(ffn_.norm)) ||
             ids_count != size_t(ggml_nelements(ffn_.topk_ids)) ||
             routing_count != size_t(ggml_nelements(ffn_.topk_weights)) ||
-            output_count != size_t(ggml_nelements(ffn_.ffn_output))) {
+            (read_output
+                ? output_count != size_t(ggml_nelements(ffn_.ffn_output))
+                : output_count != 0)) {
             return false;
         }
 
@@ -103,7 +110,10 @@ public:
 
         // The caller owns the output buffer. On the real P2C Phone backend,
         // this is the source FFN partial for Send #2, not a layer output.
-        ggml_backend_tensor_get(ffn_.ffn_output, output, 0, ggml_nbytes(ffn_.ffn_output));
+        if (read_output) {
+            ggml_backend_tensor_get(
+                ffn_.ffn_output, output, 0, ggml_nbytes(ffn_.ffn_output));
+        }
         return true;
     }
 
