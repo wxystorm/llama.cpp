@@ -2605,8 +2605,17 @@ struct cycle_real_c2p_phone_chunk {
     }
 
     bool execute_reduce(ggml_backend_t phone) {
-        if (!phone || !reduce_graph || !output || !pc_partial ||
+        // A full Phone GPU layer has no PC FFN shard and deliberately does
+        // not allocate pc_partial. C2P needs the PC shard for its two-input
+        // FFN sum; FULL_PHONE reduces only its local FFN and residual.
+        if (!phone || !reduce_graph || !output ||
+            (!is_full_layer && !pc_partial) ||
             !inputs.ffn_output || !residual) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_REDUCE] mode=%s status=FAIL "
+                "reason=MISSING_GRAPH_INPUT pc_partial=%d output=%d\n",
+                is_full_layer ? "PHONE_FULL" : "TENSOR_C2P",
+                pc_partial != nullptr ? 1 : 0, output != nullptr ? 1 : 0);
             return false;
         }
         const auto begin = std::chrono::steady_clock::now();
@@ -2617,9 +2626,10 @@ struct cycle_real_c2p_phone_chunk {
         }
         reduce_graph_submit_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();
-        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE "
+        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE mode=%s "
                     "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
                     "status=%s\n",
+                    is_full_layer ? "PHONE_FULL" : "TENSOR_C2P",
                     reduce_graph_submit_ms, ok ? "OK" : "FAIL");
         return ok;
     }
