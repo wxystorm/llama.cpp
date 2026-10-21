@@ -2,8 +2,10 @@
 
 #include "llama-hybrid-cycle-ring.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
@@ -12,6 +14,26 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+// Opt-in per-worker measurements. Each queue has exactly one owning
+// thread, so its slot is written by that worker only and read after join().
+// queue_wait_ms: task ready/enqueued -> actual pop, including older FIFO tasks.
+// idle_wait_ms: time the worker slept with no ready task. This is not
+// automatically a critical-path stall (another queue may be computing).
+// execute_ms: callback + dependency completion, not isolated GPU kernel time.
+struct llama_hybrid_cycle_queue_profile {
+    uint64_t tasks = 0;
+    uint64_t idle_wakes = 0;
+    double queue_wait_ms = 0.0;
+    double max_queue_wait_ms = 0.0;
+    double idle_wait_ms = 0.0;
+    double execute_ms = 0.0;
+    double max_execute_ms = 0.0;
+};
+struct llama_hybrid_cycle_fifo_profile {
+    std::array<llama_hybrid_cycle_queue_profile,
+        static_cast<size_t>(llama_hybrid_cycle_queue::COUNT)> queues {};
+};
 
 // Bridge the dependency-only Cycle ring to REAL per-device and per-direction
 // workers. The callback owns compute buffers, RPC transfers, ACKs, and Reduce.
@@ -28,7 +50,8 @@ inline bool llama_hybrid_cycle_run_fifo(
         int n_chunks,
         const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
         int max_inflight = 0,
-        bool credit_until_handoff = false) {
+        bool credit_until_handoff = false,
+        llama_hybrid_cycle_fifo_profile * profile = nullptr) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
@@ -56,6 +79,10 @@ inline bool llama_hybrid_cycle_run_fifo(
         wake.notify_all();
     };
     const auto work = [&](llama_hybrid_cycle_queue queue) {
+        // Slots are disjoint: there is one worker per queue, even when the
+        // stages in two different queues run concurrently.
+        auto * stats = profile ?
+            &profile->queues[static_cast<size_t>(queue)] : nullptr;
         while (!failed.load() && !ring.finished()) {
             uint64_t seen_epoch = 0;
             {
@@ -64,12 +91,28 @@ inline bool llama_hybrid_cycle_run_fifo(
             }
             llama_hybrid_cycle_task task;
             if (!ring.try_pop(queue, task)) {
+                const auto wait_begin = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(wake_mutex);
                 wake.wait(lock, [&] {
                     return wake_epoch != seen_epoch || failed.load() ||
                            ring.finished();
                 });
+                if (stats) {
+                    stats->idle_wait_ms +=
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - wait_begin).count();
+                    ++stats->idle_wakes;
+                }
                 continue;
+            }
+            const auto execute_begin = std::chrono::steady_clock::now();
+            if (stats && task.queued_at.time_since_epoch().count() != 0) {
+                const double queue_wait_ms =
+                    std::chrono::duration<double, std::milli>(
+                        execute_begin - task.queued_at).count();
+                stats->queue_wait_ms += queue_wait_ms;
+                stats->max_queue_wait_ms =
+                    std::max(stats->max_queue_wait_ms, queue_wait_ms);
             }
             bool ok = false;
             try {
@@ -100,6 +143,15 @@ inline bool llama_hybrid_cycle_run_fifo(
                     llama_hybrid_cycle_stage_name(task.stage),
                     task.layer, task.chunk);
                 failed.store(true);
+            }
+            if (stats) {
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - execute_begin).count();
+                ++stats->tasks;
+                stats->execute_ms += elapsed_ms;
+                stats->max_execute_ms =
+                    std::max(stats->max_execute_ms, elapsed_ms);
             }
             signal();
         }
