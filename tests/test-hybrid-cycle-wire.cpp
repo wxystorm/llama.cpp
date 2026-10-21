@@ -189,9 +189,89 @@ static void test_large_chunk_and_c2p() {
     assert(parsed.ready.topk_weights == weights);
 }
 
+// C2P uses the SAME two-send wire encoding, but the Phone GPU is now the
+// destination and the sole Reduce owner. Check per-chunk frame identity
+// and that the reverse ACKs preserve the ORIGINAL PC->Phone direction.
+static void test_c2p_two_sends_per_chunk_and_reverse_ack() {
+    constexpr uint32_t tokens = 16;
+    constexpr uint32_t hidden = 2048;
+    constexpr uint32_t topk = 8;
+    const size_t n = size_t(tokens) * hidden;
+    const size_t k = size_t(tokens) * topk;
+    std::vector<float> residual(n, 0.25f);
+    std::vector<float> norm(n, 0.5f);
+    std::vector<int32_t> ids(k, 7);
+    std::vector<float> weights(k, 0.125f);
+    std::vector<float> pc_partial(n, 0.375f);
+    const inference_cycle_ready_view ready {
+        tokens, hidden, topk, residual.data(),
+        norm.data(), ids.data(), weights.data()
+    };
+    const inference_cycle_partial_view partial {
+        tokens, hidden, pc_partial.data()
+    };
+    size_t ready_size = 0, partial_size = 0;
+    assert(inference_cycle_payload_size(
+        INFERENCE_CYCLE_READY, tokens, hidden, topk, ready_size));
+    assert(inference_cycle_payload_size(
+        INFERENCE_CYCLE_PARTIAL, tokens, hidden, 0, partial_size));
+
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uint64_t seq = uint64_t(chunk + 1);
+        std::vector<uint8_t> ready_wire(ready_size);
+        std::vector<uint8_t> partial_wire(partial_size);
+        size_t written = 0;
+        assert(inference_cycle_write_ready(
+            ready_wire.data(), ready_wire.size(), ready, written));
+        assert(written == ready_size);
+        assert(inference_cycle_write_partial(
+            partial_wire.data(), partial_wire.size(), partial, written));
+        assert(written == partial_size);
+
+        const auto rframe = make_cycle_frame(
+            INFERENCE_STAGE_CYCLE_READY,
+            INFERENCE_CYCLE_PC_TO_PHONE, ready_size, 5, chunk, seq, 123);
+        const auto pframe = make_cycle_frame(
+            INFERENCE_STAGE_CYCLE_PARTIAL,
+            INFERENCE_CYCLE_PC_TO_PHONE, partial_size, 5, chunk, seq, 123);
+        inference_cycle_message rmsg, pmsg;
+        assert(inference_cycle_decode_frame(
+            rframe, ready_wire.data(), ready_wire.size(), rmsg));
+        assert(inference_cycle_decode_frame(
+            pframe, partial_wire.data(), partial_wire.size(), pmsg));
+        assert(rmsg.direction == INFERENCE_CYCLE_PC_TO_PHONE);
+        assert(pmsg.direction == INFERENCE_CYCLE_PC_TO_PHONE);
+        assert(rmsg.kind == INFERENCE_CYCLE_READY);
+        assert(pmsg.kind == INFERENCE_CYCLE_PARTIAL);
+        assert(rmsg.chunk == chunk && pmsg.chunk == chunk);
+        assert(rmsg.seq == seq && pmsg.seq == seq);
+        assert(rmsg.ready.ffn_norm == norm);
+        assert(pmsg.partial.partial == pc_partial);
+
+        for (const auto stage : {INFERENCE_STAGE_CYCLE_READY,
+                                 INFERENCE_STAGE_CYCLE_PARTIAL}) {
+            auto ack = inference_make_header(INFERENCE_FRAME_ACK);
+            ack.stage = stage;
+            ack.tensor_role = INFERENCE_CYCLE_PC_TO_PHONE;
+            ack.flags = INFERENCE_CYCLE_ACK_DEVICE_READY;
+            ack.layer = 5;
+            ack.chunk = chunk;
+            ack.seq = seq;
+            ack.graph_id = 123;
+            inference_cycle_ack received;
+            assert(inference_cycle_decode_ack(ack, 0, received));
+            assert(received.direction == INFERENCE_CYCLE_PC_TO_PHONE);
+            assert(received.kind == (stage == INFERENCE_STAGE_CYCLE_READY ?
+                INFERENCE_CYCLE_READY : INFERENCE_CYCLE_PARTIAL));
+            assert(received.device_ready);
+        }
+    }
+}
+
 int main() {
     test_p2c_payload_and_cpu_reduce();
     test_ack_after_device_ready();
     test_large_chunk_and_c2p();
+    test_c2p_two_sends_per_chunk_and_reverse_ack();
     return 0;
 }
