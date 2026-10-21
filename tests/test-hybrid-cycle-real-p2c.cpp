@@ -993,8 +993,10 @@ static bool cycle_real_execute_phone_attention_pre(
 
     auto * attn_output = ggml_mul_mat(ctx, wo, attn);
     auto * residual = ggml_add(ctx, attn_output, x);
+    ggml_set_name(residual, "cycle_num_attn_residual");
     auto * norm = ggml_mul(
         ctx, ggml_rms_norm(ctx, residual, hp.f_norm_rms_eps), w_ffn_norm);
+    ggml_set_name(norm, "cycle_num_attn_ffn_norm");
     auto * router_logits = ggml_mul_mat(ctx, w_router, norm);
     auto * router_probs = ggml_soft_max(ctx, router_logits);
     auto * ids = ggml_cont(ctx, ggml_argsort_top_k(
@@ -1270,6 +1272,7 @@ static bool cycle_real_execute_ffn(
         sum = sum ? ggml_add(ctx, sum, view) : view;
     }
     in.ffn_output = ggml_cont(ctx, sum);
+    ggml_set_name(in.ffn_output, "cycle_num_phone_ffn_output");
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
     ggml_build_forward_expand(graph, in.ffn_output);
     const auto graph_build_done = std::chrono::steady_clock::now();
@@ -2571,6 +2574,7 @@ struct cycle_real_c2p_phone_chunk {
             sum = sum ? ggml_add(ctx, sum, expert) : expert;
         }
         inputs.ffn_output = ggml_cont(ctx, sum);
+        ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         auto * ffn_graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
 
@@ -2581,6 +2585,8 @@ struct cycle_real_c2p_phone_chunk {
             inputs.ffn_output :
             ggml_add(ctx, inputs.ffn_output, pc_partial);
         output = ggml_add(ctx, residual, ffnsum);
+        ggml_set_name(output, full_layer ?
+            "cycle_num_phone_full_lout" : "cycle_num_c2p_lout");
         reduce_graph = ggml_new_graph_custom(ctx, 16, false);
         if (!full_layer) {
             ggml_graph_add_node(reduce_graph, ffnsum);
