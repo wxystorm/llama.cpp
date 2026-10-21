@@ -1278,6 +1278,16 @@ struct cycle_real_ffn_stages {
     std::vector<float> swiglu;
 };
 
+// CPU-observed FFN graph build / buffer prepare / execute call times.
+// For Phone RPC the execute call is a submission, NOT the server kernel
+// duration. C2P/Phone-full GPU setup is profiled separately.
+struct cycle_real_ffn_phase_profile {
+    uint64_t count = 0;
+    double graph_build_ms = 0.0;
+    double backend_prepare_ms = 0.0;
+    double backend_execute_call_ms = 0.0;
+};
+
 static bool cycle_real_execute_ffn(
         ggml_backend_t backend,
         const llama_hybrid_cycle_ffn_shard_weights & shard,
@@ -1290,7 +1300,8 @@ static bool cycle_real_execute_ffn(
         std::vector<float> * raw_down_out = nullptr,
         cycle_real_ffn_stages * stages_out = nullptr,
         const cycle_real_live_wire * wire = nullptr,
-        const llama_hybrid_cycle_ready_graph * local_phone_ready = nullptr) {
+        const llama_hybrid_cycle_ready_graph * local_phone_ready = nullptr,
+        cycle_real_ffn_phase_profile * phase_profile = nullptr) {
     const auto graph_build_begin = std::chrono::steady_clock::now();
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
@@ -1336,8 +1347,20 @@ static bool cycle_real_execute_ffn(
                     "stage=PREPARE_BEGIN\n",
                     backend_name, (long long)shard.up->ne[1], ggml_graph_n_nodes(graph));
         llama_hybrid_cycle_ffn_executor executor;
-        if (!executor.prepare(backend, ctx, graph, in, shard,
-                              hidden, tokens, topk, experts)) {
+        const auto prepare_begin = std::chrono::steady_clock::now();
+        const bool prepared = executor.prepare(
+            backend, ctx, graph, in, shard, hidden, tokens, topk, experts);
+        const auto prepare_done = std::chrono::steady_clock::now();
+        if (phase_profile) {
+            ++phase_profile->count;
+            phase_profile->graph_build_ms +=
+                std::chrono::duration<double, std::milli>(
+                    graph_build_done - graph_build_begin).count();
+            phase_profile->backend_prepare_ms +=
+                std::chrono::duration<double, std::milli>(
+                    prepare_done - prepare_begin).count();
+        }
+        if (!prepared) {
             std::fprintf(stderr,
                 "[CYCLE_REAL_FFN_SHARD] backend=%s stage=PREPARE_FAIL "
                 "weight_buft=%s compute_buft=%s\n",
@@ -1350,6 +1373,7 @@ static bool cycle_real_execute_ffn(
             if (wire == nullptr) {
                 partial.resize(size_t(hidden * tokens));
             }
+            const auto execute_begin = std::chrono::steady_clock::now();
             ok = executor.execute(
                 norm.data(), norm.size(),
                 ids.data(), ids.size(),
@@ -1357,6 +1381,11 @@ static bool cycle_real_execute_ffn(
                 wire != nullptr ? nullptr : partial.data(),
                 wire != nullptr ? 0 : partial.size(),
                 local_phone_ready);
+            if (phase_profile) {
+                phase_profile->backend_execute_call_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - execute_begin).count();
+            }
             if (ok && stages_out != nullptr) {
                 const int64_t elems = shard.up->ne[1] * topk * tokens;
                 const auto read_stage = [&](const char * stage,
