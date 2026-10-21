@@ -3082,6 +3082,13 @@ int main(int argc, char ** argv) {
                 "bytes=%zu mode=%s status=PASS\n", ready_bytes,
                 live_wire_enabled ? "PHONE_GPU_REAL_DATA_PLANE" :
                                     "IN_PROCESS_CODEC");
+    if (live_wire_enabled && !ggml_backend_rpc_cycle_send_ack(
+            phone, layer, wire.chunk, wire.seq, wire.graph_id,
+            INFERENCE_CYCLE_READY, true)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_NETWORK] status=FAIL reason=READY_HOST_ACK\n");
+        return 1;
+    }
 
     ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
     if (!cpu) {
@@ -3693,7 +3700,19 @@ int main(int argc, char ** argv) {
             "[CYCLE_REAL_P2C] status=FAIL reason=PC_REDUCE\n");
         return 1;
     }
-    // No further RPC input/output or transport reception is required.
+    // PARTIAL is acknowledged only after PC has consumed it for the
+    // exclusive Reduce. Reverse ACK contains zero activation bytes.
+    if (live_wire_enabled) {
+        if (!ggml_backend_rpc_cycle_send_ack(
+                phone, layer, wire.chunk, wire.seq, wire.graph_id,
+                INFERENCE_CYCLE_PARTIAL, true) ||
+            !ggml_backend_rpc_cycle_wait_tx_idle(phone, 10000)) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_NETWORK] status=FAIL reason=PARTIAL_HOST_ACK\n");
+            return 1;
+        }
+    }
+    // Both payload frames were received and Reduce is complete.
     ggml_backend_free(phone);
     ggml_backend_free(cpu);
     const cycle_real_diff ffn_diff = cycle_real_compare(combined_ffn, baseline_ffn);
