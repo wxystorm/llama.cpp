@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    25
+#define RPC_PROTO_PATCH_VERSION    26
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -332,6 +332,24 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_ack(
 
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_tx_idle(
         ggml_backend_t backend, int timeout_ms);
+
+// Protocol 26: REAL C2P data-plane frames travel PC -> Phone exactly once.
+// APPLY consumes the Phone server's already-received READY/PARTIAL and writes
+// directly to the borrowed Phone GPU tensor buffers (no PC RPC re-upload).
+// READY returns after the GPU inputs are usable; PARTIAL is held until the
+// exclusive Phone GPU Reduce has finished, then FINISH sends its reverse ACK.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_apply_ready(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * residual, const ggml_tensor * norm,
+        const ggml_tensor * ids, const ggml_tensor * routing);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_apply_partial(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * partial);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_finish_reduce(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
 
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
