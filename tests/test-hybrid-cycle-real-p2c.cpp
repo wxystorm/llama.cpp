@@ -1300,8 +1300,9 @@ int main(int argc, char ** argv) {
             int(ntokens), mismatch_count, max_printed);
     }
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTER_PROBS "
-                "max_abs=%.8g rms=%.8g status=MEASURED\n",
-                probs_diff.max_abs, probs_diff.rms);
+                "max_abs=%.8g rms=%.8g status=%s\n",
+                probs_diff.max_abs, probs_diff.rms,
+                probs_diff.valid ? "MEASURED" : "FAIL_NONFINITE");
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS_SLOT_ORDER "
                 "max_abs=%.8g rms=%.8g status=DIAGNOSTIC_ONLY\n",
                 routing_slot_diff.max_abs, routing_slot_diff.rms);
@@ -1533,8 +1534,12 @@ int main(int argc, char ** argv) {
                 "real_ffn_weights=1 "
                 "ffn_shards=PC_CPU+PHONE_GPU reduce_owner=PC_CPU "
                 "reference=CPU_FULL_QWEN3_LAYER data_plane=RPC_BACKEND_ONLY "
-                "cycle_wire=IN_PROCESS_CODEC_ONLY status=%s\n",
+                "cycle_wire=IN_PROCESS_CODEC_ONLY "
+                "topk_order_exact=%d topk_set_equal=%d "
+                "reordered_tokens=%d status=%s\n",
                 layer, int(ntokens), forward_ms, parts_ms,
-                phone_attn_ms, pass ? "PASS" : "FAIL");
+                phone_attn_ms,
+                topk_equal ? 1 : 0, topk_set_equal ? 1 : 0,
+                int(permuted_tokens), pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
