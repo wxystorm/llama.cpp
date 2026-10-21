@@ -19,6 +19,9 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <map>
+#include <set>
+#include <tuple>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -276,6 +279,8 @@ enum rpc_cmd {
     RPC_CMD_INFERENCE_RETURN_BIND,
     RPC_CMD_INFERENCE_ROUTE_ARM,
     RPC_CMD_INFERENCE_CYCLE_SEND,
+    RPC_CMD_INFERENCE_CYCLE_APPLY,
+    RPC_CMD_INFERENCE_CYCLE_FINISH,
     RPC_CMD_COUNT,
 };
 
@@ -301,7 +306,9 @@ static_assert(RPC_CMD_RETURN_BULK_ACQUIRE == 34, "RPC_CMD_RETURN_BULK_ACQUIRE mu
 static_assert(RPC_CMD_INFERENCE_DATA_PLANE_OPEN == 35, "RPC_CMD_INFERENCE_DATA_PLANE_OPEN must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_RETURN_BIND == 36, "RPC_CMD_INFERENCE_RETURN_BIND must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_ROUTE_ARM == 37, "RPC_CMD_INFERENCE_ROUTE_ARM must be before RPC_CMD_COUNT");
-static_assert(RPC_CMD_INFERENCE_CYCLE_SEND == 38, "RPC_CMD_INFERENCE_CYCLE_SEND must be last before RPC_CMD_COUNT");
+static_assert(RPC_CMD_INFERENCE_CYCLE_SEND == 38, "RPC_CMD_INFERENCE_CYCLE_SEND must remain 38");
+static_assert(RPC_CMD_INFERENCE_CYCLE_APPLY == 39, "RPC_CMD_INFERENCE_CYCLE_APPLY must be 39");
+static_assert(RPC_CMD_INFERENCE_CYCLE_FINISH == 40, "RPC_CMD_INFERENCE_CYCLE_FINISH must be last");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -2035,6 +2042,128 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
 // Attach the independent persistent data-plane socket before issuing the
 // phone-local send command. All four tensors must still own live RPC buffers.
+// Protocol 26 C2P: ask the Phone RPC server to consume an already-received
+// data-plane frame into its own GPU tensors, never upload host activation
+// bytes through the control RPC connection.
+static bool rpc_cycle_apply_inbound_tensors(
+        ggml_backend_t backend, inference_cycle_payload_kind kind,
+        int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * const * targets,
+        uint32_t tokens, uint32_t hidden, uint32_t topk) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0 || tokens == 0 || hidden == 0 ||
+        (kind == INFERENCE_CYCLE_READY ? topk == 0 : topk != 0)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 26 ||
+        !get_inference_transport(ctx->endpoint)) {
+        GGML_LOG_ERROR("[CYCLE_C2P] status=FAIL reason=PHONE_SERVER_PATCH26_REQUIRED\n");
+        return false;
+    }
+    rpc_msg_inference_cycle_send_req request {};
+    request.device = ctx->device;
+    request.kind = kind;
+    request.layer = layer;
+    request.chunk = chunk;
+    request.seq = seq;
+    request.graph_id = graph_id;
+    request.tokens = tokens;
+    request.hidden = hidden;
+    request.topk = topk;
+    const size_t count = kind == INFERENCE_CYCLE_READY ? 4 : 1;
+    for (size_t i = 0; i < count; ++i) {
+        const ggml_tensor * t = targets[i];
+        if (!t || !t->buffer || !ggml_backend_buffer_is_rpc(t->buffer) ||
+            !ggml_is_contiguous(t)) {
+            return false;
+        }
+        auto * bctx = static_cast<ggml_backend_rpc_buffer_context *>(t->buffer->context);
+        if (!bctx || bctx->endpoint != ctx->endpoint || bctx->device != ctx->device) {
+            return false;
+        }
+        const uint32_t type = i == 2 && kind == INFERENCE_CYCLE_READY ?
+            GGML_TYPE_I32 : GGML_TYPE_F32;
+        const size_t elements = kind == INFERENCE_CYCLE_READY && i >= 2 ?
+            size_t(tokens) * topk : size_t(tokens) * hidden;
+        if (t->type != type || ggml_nelements(t) != int64_t(elements) ||
+            ggml_nbytes(t) != elements * sizeof(float)) {
+            return false;
+        }
+        request.tensors[i] = serialize_tensor(t);
+    }
+    auto sock = get_socket(ctx->endpoint);
+    if (!sock) {
+        return false;
+    }
+    rpc_msg_inference_cycle_send_rsp response {};
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_APPLY,
+        &request, sizeof(request), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO("[CYCLE_C2P] side=pc action=PHONE_GPU_APPLY kind=%s "
+                  "layer=%d chunk=%d seq=%" PRIu64 " status=%s\n",
+                  kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+                  layer, chunk, seq, ok ? "DEVICE_READY" : "FAIL");
+    return ok;
+}
+
+bool ggml_backend_rpc_cycle_apply_ready(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * residual, const ggml_tensor * norm,
+        const ggml_tensor * ids, const ggml_tensor * routing) {
+    if (!residual || !norm || !ids || !routing ||
+        residual->ne[0] <= 0 || residual->ne[1] <= 0 ||
+        ids->ne[0] <= 0 || residual->ne[0] > UINT32_MAX ||
+        residual->ne[1] > UINT32_MAX || ids->ne[0] > UINT32_MAX) {
+        return false;
+    }
+    const ggml_tensor * targets[4] = {residual, norm, ids, routing};
+    return rpc_cycle_apply_inbound_tensors(
+        backend, INFERENCE_CYCLE_READY, layer, chunk, seq, graph_id,
+        targets, uint32_t(residual->ne[1]), uint32_t(residual->ne[0]),
+        uint32_t(ids->ne[0]));
+}
+
+bool ggml_backend_rpc_cycle_apply_partial(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id, const ggml_tensor * partial) {
+    if (!partial || partial->ne[0] <= 0 || partial->ne[1] <= 0 ||
+        partial->ne[0] > UINT32_MAX || partial->ne[1] > UINT32_MAX) {
+        return false;
+    }
+    const ggml_tensor * targets[4] = {partial};
+    return rpc_cycle_apply_inbound_tensors(
+        backend, INFERENCE_CYCLE_PARTIAL, layer, chunk, seq, graph_id,
+        targets, uint32_t(partial->ne[1]), uint32_t(partial->ne[0]), 0);
+}
+
+bool ggml_backend_rpc_cycle_finish_reduce(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 || seq == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 26) {
+        return false;
+    }
+    rpc_msg_inference_cycle_send_req request {};
+    request.device = ctx->device;
+    request.kind = INFERENCE_CYCLE_PARTIAL;
+    request.layer = layer;
+    request.chunk = chunk;
+    request.seq = seq;
+    request.graph_id = graph_id;
+    auto sock = get_socket(ctx->endpoint);
+    rpc_msg_inference_cycle_send_rsp response {};
+    return sock && send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_FINISH,
+        &request, sizeof(request), &response, sizeof(response)) &&
+        response.result == 1;
+}
+
 static bool rpc_cycle_send_remote_tensors(
         ggml_backend_t backend, inference_cycle_payload_kind kind,
         int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
