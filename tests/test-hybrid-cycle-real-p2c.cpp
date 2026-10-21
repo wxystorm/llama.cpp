@@ -2633,13 +2633,84 @@ int main(int argc, char ** argv) {
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=PHONE_RPC_BACKEND\n");
         return 1;
     }
+    // The new phase is explicitly selectable so existing offline CPU-parity
+    // experiments can still run against an older Phone RPC server.
+    // In the real path, both payloads originate in the Phone server process.
+    const bool live_wire_enabled = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_REAL_P2C_NETWORK");
+    const cycle_real_live_wire wire {layer, 0, 1, 1};
+    if (live_wire_enabled) {
+        size_t required_bytes = 0;
+        if (!inference_cycle_payload_size(
+                INFERENCE_CYCLE_READY, uint32_t(ntokens),
+                uint32_t(hidden), uint32_t(topk), required_bytes)) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_NETWORK] status=FAIL reason=READY_SIZE\n");
+            ggml_backend_free(phone);
+            return 1;
+        }
+        // A 2-token case needs only two 1 MiB TX/RX slots per side.
+        // Do not preallocate the global RPC inference defaults
+        // (4 slots x 16 MiB in each direction) on an LMKD-sensitive phone.
+        if (!std::getenv("GGML_INFERENCE_TRANSPORT_SLOTS") &&
+            !cycle_real_set_env("GGML_INFERENCE_TRANSPORT_SLOTS", "2")) {
+            ggml_backend_free(phone);
+            return 1;
+        }
+        if (!std::getenv("GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB")) {
+            const size_t mib = 1024 * 1024;
+            const auto value = std::to_string(
+                std::max(size_t(1), (required_bytes + mib - 1) / mib));
+            if (!cycle_real_set_env(
+                    "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB",
+                    value.c_str())) {
+                ggml_backend_free(phone);
+                return 1;
+            }
+        }
+        const auto reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(phone));
+        const auto open = reg ?
+            reinterpret_cast<ggml_backend_rpc_inference_transport_open_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC)) :
+            nullptr;
+        if (!open || !open(phone)) {
+            std::fprintf(stderr,
+                "[CYCLE_REAL_NETWORK] status=FAIL "
+                "reason=DATA_PLANE_OPEN rebuild_phone_server_patch25=1\n");
+            ggml_backend_free(phone);
+            return 1;
+        }
+        std::printf("[CYCLE_REAL_NETWORK] direction=P2C "
+                    "mode=REAL_RPC_DATA_PLANE endpoint=%s "
+                    "source=PHONE_GPU_REMOTE_BUFFERS status=OPEN\n", argv[2]);
+    }
     cycle_real_phone_ready phone_ready;
+    inference_cycle_message ready_msg;
     double phone_attn_ms = 0.0;
     if (!cycle_real_execute_phone_attention_pre(
             phone, lw, model->hparams, ref_input,
-            hidden, ntokens, topk, experts, phone_ready, phone_attn_ms)) {
+            hidden, ntokens, topk, experts, phone_ready, phone_attn_ms,
+            live_wire_enabled ? &wire : nullptr)) {
         ggml_backend_free(phone);
         return 1;
+    }
+    if (live_wire_enabled) {
+        if (!cycle_real_receive_live_wire(
+                phone, wire, INFERENCE_CYCLE_READY,
+                uint32_t(ntokens), uint32_t(hidden), uint32_t(topk),
+                ready_msg)) {
+            ggml_backend_free(phone);
+            return 1;
+        }
+        phone_ready.residual = ready_msg.ready.residual;
+        phone_ready.norm = ready_msg.ready.ffn_norm;
+        phone_ready.ids = ready_msg.ready.topk_ids;
+        phone_ready.routing = ready_msg.ready.topk_weights;
+        // Router probabilities are not part of the two-send protocol.
+        // Do not perform a duplicate normal RPC readback just for a
+        // reference comparison in this transport-focused phase.
     }
 
     const cycle_real_diff residual_diff =
@@ -2648,7 +2719,8 @@ int main(int argc, char ** argv) {
         cycle_real_compare(phone_ready.norm, ref_norm);
     const cycle_real_diff routing_slot_diff =
         cycle_real_compare(phone_ready.routing, ref_routing);
-    const cycle_real_diff probs_diff =
+    const cycle_real_diff probs_diff = live_wire_enabled ?
+        cycle_real_diff {} :
         cycle_real_compare(phone_ready.router_probs, ref_router_probs);
     const bool topk_equal = phone_ready.ids == ref_ids;
 
@@ -2866,7 +2938,8 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTER_PROBS "
                 "max_abs=%.8g rms=%.8g status=%s\n",
                 probs_diff.max_abs, probs_diff.rms,
-                probs_diff.valid ? "MEASURED" : "FAIL_NONFINITE");
+                live_wire_enabled ? "SKIP_NETWORK_MODE" :
+                    (probs_diff.valid ? "MEASURED" : "FAIL_NONFINITE"));
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=ROUTING_WEIGHTS_SLOT_ORDER "
                 "max_abs=%.8g rms=%.8g status=DIAGNOSTIC_ONLY\n",
                 routing_slot_diff.max_abs, routing_slot_diff.rms);
@@ -2877,7 +2950,8 @@ int main(int argc, char ** argv) {
                 routing_aligned_diff.cosine,
                 0.003 + 0.001 * routing_aligned_diff.max_ref,
                 routing_ok ? "PASS" : "FAIL");
-    if (!residual_ok || !norm_ok || !probs_diff.valid ||
+    if (!residual_ok || !norm_ok ||
+        (!live_wire_enabled && !probs_diff.valid) ||
         !topk_set_equal || !topk_ids_valid || !routing_ok) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
@@ -2988,18 +3062,19 @@ int main(int argc, char ** argv) {
     // exactly as before, regardless of this diagnostic selection.
     const bool extended_diagnostics = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_REAL_EXTENDED_DIAG");
-    const bool run_ffn_ablation =
-        ntokens <= 2 || (extended_diagnostics && ntokens <= 16);
+    const bool run_ffn_ablation = !live_wire_enabled &&
+        (ntokens <= 2 || (extended_diagnostics && ntokens <= 16));
     std::vector<float> cpu_ready_control_ffn;
     std::printf("[CYCLE_DIAG_MODE] mode=%s tokens=%d "
                 "cpu_ready_control=%d full_cpu_f64_oracle=%d "
                 "phone_extra_gpu_probes=%d extra_phone_ffn_ablations=%d "
                 "env=LLAMA_HYBRID_CYCLE_REAL_EXTENDED_DIAG\n",
-                extended_diagnostics ? "EXTENDED" : "LOW_MEMORY_CPU_F64",
+                live_wire_enabled ? "NETWORK_P2C_NO_F64" :
+                    (extended_diagnostics ? "EXTENDED" : "LOW_MEMORY_CPU_F64"),
                 int(ntokens), run_ffn_ablation ? 1 : 0,
-                ntokens <= 2 ? 1 : 0,
-                extended_diagnostics && ntokens <= 2 ? 1 : 0,
-                extended_diagnostics && ntokens <= 16 ? 1 : 0);
+                run_ffn_ablation && ntokens <= 2 ? 1 : 0,
+                run_ffn_ablation && extended_diagnostics && ntokens <= 2 ? 1 : 0,
+                run_ffn_ablation && extended_diagnostics && ntokens <= 16 ? 1 : 0);
     std::printf("[CYCLE_FFN_ABLATION] enabled=%d tokens=%d "
                 "scope=DIAGNOSTIC_ONLY gate_unchanged=1\n",
                 run_ffn_ablation ? 1 : 0, int(ntokens));
