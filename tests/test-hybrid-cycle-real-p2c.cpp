@@ -1410,6 +1410,143 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Differential FFN experiment. The normal production-like path below
+    // ALWAYS uses Phone READY and keeps its original PASS/FAIL thresholds.
+    // Before it, replay the SAME physical PC+Phone FFN shards with controlled
+    // reference inputs. This separates shard/kernel error from Attention
+    // Norm drift, Router weight drift, and mere TopK slot permutations.
+    //
+    // Keep the extra runs to small diagnostic ubatches (1..16 tokens):
+    // larger benchmarks must not silently include 4 more FFN forwards.
+    const bool run_ffn_ablation = ntokens <= 16;
+    std::vector<float> cpu_ready_control_ffn;
+    std::printf("[CYCLE_FFN_ABLATION] enabled=%d tokens=%d "
+                "scope=DIAGNOSTIC_ONLY gate_unchanged=1\n",
+                run_ffn_ablation ? 1 : 0, int(ntokens));
+    if (run_ffn_ablation) {
+        const auto run_case = [&](
+                const char * label,
+                const std::vector<float> & input_norm,
+                const std::vector<int32_t> & input_ids,
+                const std::vector<float> & input_routing,
+                std::vector<float> & sum_output) -> bool {
+            // The async Phone shard and foreground CPU shard consume one
+            // immutable set of READY inputs. Both futures finish before
+            // either backend is reused for another case.
+            auto phone_probe = std::async(std::launch::async, [&] {
+                std::vector<float> result;
+                if (!cycle_real_execute_ffn(
+                        phone, phone_weights,
+                        input_norm, input_ids, input_routing,
+                        hidden, ntokens, topk, experts, result)) {
+                    result.clear();
+                }
+                return result;
+            });
+            std::vector<float> pc_probe;
+            const bool pc_probe_ok = cycle_real_execute_ffn(
+                cpu, pc_weights,
+                input_norm, input_ids, input_routing,
+                hidden, ntokens, topk, experts, pc_probe);
+            const std::vector<float> ph_probe = phone_probe.get();
+            if (!pc_probe_ok ||
+                pc_probe.size() != size_t(hidden * ntokens) ||
+                ph_probe.size() != size_t(hidden * ntokens)) {
+                std::fprintf(stderr,
+                    "[CYCLE_FFN_ABLATION] case=%s status=FAIL "
+                    "reason=SHARD_COMPUTE\n", label);
+                return false;
+            }
+            sum_output.resize(size_t(hidden * ntokens));
+            for (size_t j = 0; j < sum_output.size(); ++j) {
+                sum_output[j] = pc_probe[j] + ph_probe[j];
+            }
+            const cycle_real_diff vs_cpu_full =
+                cycle_real_compare(sum_output, baseline_ffn);
+            const cycle_real_diff vs_cpu_ready =
+                cycle_real_compare(sum_output, cpu_ready_control_ffn.empty()
+                    ? sum_output : cpu_ready_control_ffn);
+            std::printf(
+                "[CYCLE_FFN_ABLATION] case=%s "
+                "vs_cpu_full_max_abs=%.8g vs_cpu_full_rms=%.8g "
+                "vs_cpu_ready_max_abs=%.8g vs_cpu_ready_rms=%.8g "
+                "cpu_full_tolerance=%.8g status=%s\n",
+                label,
+                vs_cpu_full.max_abs, vs_cpu_full.rms,
+                vs_cpu_ready.max_abs, vs_cpu_ready.rms,
+                vs_cpu_full.tolerance,
+                vs_cpu_full.valid && vs_cpu_ready.valid ?
+                    "MEASURED" : "FAIL_NONFINITE");
+            report_token_errors(label, sum_output, baseline_ffn, hidden);
+            return vs_cpu_full.valid && vs_cpu_ready.valid;
+        };
+        // A: numerical floor of physical Q4_K shards and device kernels,
+        // with NO Phone Attention/Router input discrepancy.
+        if (!run_case("CPU_READY_CONTROL",
+                      ref_norm, ref_ids, ref_routing,
+                      cpu_ready_control_ffn)) {
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+        // B: change only the pre-FFN hidden vector.
+        std::vector<float> phone_norm_cpu_router;
+        if (!run_case("PHONE_NORM_CPU_ROUTER",
+                      norm, ref_ids, ref_routing,
+                      phone_norm_cpu_router)) {
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+        // C: change only Phone expert ID/weight pairs, preserving CPU Norm.
+        std::vector<float> cpu_norm_phone_router;
+        if (!run_case("CPU_NORM_PHONE_ROUTER",
+                      ref_norm, ids, routing,
+                      cpu_norm_phone_router)) {
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+        // D: compare TopK ordering alone. Use Phone's expert ordering with
+        // the CPU's exact weight matched to each expert ID; never assign a
+        // weight to the wrong expert. If this differs from A, the summation
+        // order/device arithmetic affects the result even with equal IDs.
+        std::vector<float> cpu_weights_in_phone_order;
+        cpu_weights_in_phone_order.reserve(size_t(ntokens * topk));
+        for (int32_t t = 0; t < ntokens; ++t) {
+            for (int64_t slot = 0; slot < topk; ++slot) {
+                const size_t pos = size_t(t * topk + slot);
+                const int32_t expert = ids[pos];
+                bool found = false;
+                for (int64_t ref_slot = 0; ref_slot < topk; ++ref_slot) {
+                    const size_t ref_pos = size_t(t * topk + ref_slot);
+                    if (ref_ids[ref_pos] == expert) {
+                        cpu_weights_in_phone_order.push_back(
+                            ref_routing[ref_pos]);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_ABLATION] case=PHONE_ORDER_CPU_WEIGHTS "
+                        "status=FAIL reason=EXPERT_PAIR_NOT_FOUND\n");
+                    ggml_backend_free(phone);
+                    ggml_backend_free(cpu);
+                    return 1;
+                }
+            }
+        }
+        std::vector<float> phone_order_cpu_weights;
+        if (!run_case("PHONE_ORDER_CPU_WEIGHTS",
+                      ref_norm, ids, cpu_weights_in_phone_order,
+                      phone_order_cpu_weights)) {
+            ggml_backend_free(phone);
+            ggml_backend_free(cpu);
+            return 1;
+        }
+    }
+
     const auto parts_begin = std::chrono::steady_clock::now();
     auto phone_task = std::async(std::launch::async, [&] {
         std::vector<float> part;
@@ -1504,6 +1641,17 @@ int main(int argc, char ** argv) {
     }
     const cycle_real_diff ffn_diff = cycle_real_compare(combined_ffn, baseline_ffn);
     const cycle_real_diff out_diff = cycle_real_compare(combined_output, baseline_output);
+    if (run_ffn_ablation) {
+        const cycle_real_diff delta =
+            cycle_real_compare(combined_ffn, cpu_ready_control_ffn);
+        std::printf("[CYCLE_FFN_ABLATION] case=PHONE_READY_ACTUAL "
+                    "vs_cpu_full_max_abs=%.8g vs_cpu_full_rms=%.8g "
+                    "vs_cpu_ready_max_abs=%.8g vs_cpu_ready_rms=%.8g "
+                    "cpu_full_tolerance=%.8g status=%s\n",
+                    ffn_diff.max_abs, ffn_diff.rms,
+                    delta.max_abs, delta.rms, ffn_diff.tolerance,
+                    ffn_diff.valid && delta.valid ? "MEASURED" : "FAIL_NONFINITE");
+    }
     report_token_errors("FFN_PARTIAL_SUM", combined_ffn, baseline_ffn, hidden);
     report_token_errors("LAYER_OUTPUT", combined_output, baseline_output, hidden);
     std::printf("[CYCLE_REAL_COMPARE] target=FFN_PARTIAL_SUM layer=%d "
