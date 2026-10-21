@@ -3,16 +3,14 @@
 // Attention/Norm/Router/FFN/l_out reference, and is freed before the Cycle
 // model is loaded. PC CPU + Phone GPU then run *real physical FFN shards*
 // independently. Only PC sums both partials and adds the captured residual.
-// Phone GPU executes a real causal AttentionPre over the prompt's KV tokens
-// and we compare its four READY outputs against that CPU reference before
-// using them for either FFN shard. The Phone graph now supports contiguous
-// multi-token causal KV within one prompt ubatch, but not persistent KV
-// across calls/chunks.
+// Phone GPU executes actual causal AttentionPre. Live P2C FIFO runs use
+// multiple token chunks, one persistent F16 K/V cache ON Phone GPU and
+// absolute RoPE positions. READY/PARTIAL are two Phone->PC data-plane
+// payloads per chunk; CPU owns the unique final Reduce.
 //
-// READY/PARTIAL are serialized/deserialized IN PROCESS as wire-format
-// checks only. The Phone FFN input/output still travel through ordinary
-// RPC backend tensor set/get; the dedicated P2C network queues, actual two
-// sender messages and FIFO stage executor are NOT active.
+// The legacy offline path remains available for numerical diagnostics.
+// Multi-chunk mode still covers ONE physical P2C layer, not the entire
+// 48-layer Cycle, and the cache is released after this request.
 //
 // Usage (choose a TENSOR_P2C layer in the fixed cycle):
 //   test-hybrid-cycle-real-p2c <Qwen3-MoE.gguf> <phone:rpc-port> <layer> [prompt] [n_tokens]
@@ -2846,12 +2844,11 @@ int main(int argc, char ** argv) {
     std::printf("[CYCLE_REAL_REFERENCE] model=CPU_ONLY "
                 "status=RELEASED_BEFORE_CYCLE_LOAD\n");
 
-    // All N tokens are computed together at positions [0,N); the Phone
-    // stage builds a causal F16 mask and may read earlier tokens' K/V.
-    // This is NOT yet a persistent KV cache across multiple separate
-    // llama_decode calls or distributed Cycle chunks.
+    // CPU reference captures a contiguous prompt; the Phone may execute
+    // it as causal chunks using a distinct persistent ON-GPU K/V cache.
     std::printf("[CYCLE_REAL_KV_SCOPE] tokens=%d position_end=%d "
-                "kind=CONTIGUOUS_PROMPT_CACHE persistent=0 status=OK\n",
+                "kind=CONTIGUOUS_PROMPT_CACHE source=CPU_REFERENCE "
+                "phone_chunk_kv=SEPARATE_PERSISTENT_BUFFER status=OK\n",
                 int(ntokens), int(ntokens - 1));
     // The RAII guard restored the physical Cycle placement policy. Verify
     // the requested P2C layer before loading the distributed model.
