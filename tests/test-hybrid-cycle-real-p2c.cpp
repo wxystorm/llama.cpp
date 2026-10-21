@@ -3499,6 +3499,111 @@ static bool cycle_real_phone_boundary_probe(
     return d.valid;
 }
 
+// Host mathematical RMSNorm oracle fed with the SAME residual that was
+// actually computed by Phone OpenCL. This separates CPU-reference input
+// propagation from a true Phone RMSNorm/scale kernel discrepancy.
+//
+// Debug-only: reads back one static FFN-norm weight vector from the Phone,
+// in addition to the already opt-in Attention/Norm activation readbacks.
+// No new graph execution, weight migration or persistent host mirror.
+static bool cycle_real_phone_same_input_norm_probe(
+        const ggml_tensor * phone_ffn_norm_weight,
+        const std::vector<float> & phone_residual,
+        const std::vector<float> & phone_norm,
+        const std::vector<float> & reference_norm,
+        int layer, int chunk, int64_t start, int64_t hidden,
+        float eps) {
+    if (!cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
+        return true;
+    }
+    const size_t width = hidden > 0 ? size_t(hidden) : 0;
+    if (!phone_ffn_norm_weight || !phone_ffn_norm_weight->buffer ||
+        width == 0 || phone_residual.empty() ||
+        phone_residual.size() != phone_norm.size() ||
+        phone_residual.size() % width != 0 ||
+        size_t(ggml_nelements(phone_ffn_norm_weight)) != width ||
+        !(eps >= 0.0f) ||
+        (phone_ffn_norm_weight->type != GGML_TYPE_F32 &&
+         phone_ffn_norm_weight->type != GGML_TYPE_F16)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_NORM_ISOLATE] layer=%d chunk=%d "
+            "status=UNAVAILABLE reason=INVALID_TENSOR_OR_WEIGHT\n",
+            layer, chunk);
+        // Lack of an optional oracle should not fail the real Cycle.
+        return true;
+    }
+
+    std::vector<float> gamma(width);
+    if (phone_ffn_norm_weight->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(phone_ffn_norm_weight,
+            gamma.data(), 0, width * sizeof(float));
+    } else {
+        std::vector<ggml_fp16_t> gamma_f16(width);
+        ggml_backend_tensor_get(phone_ffn_norm_weight,
+            gamma_f16.data(), 0, width * sizeof(ggml_fp16_t));
+        for (size_t i = 0; i < width; ++i) {
+            gamma[i] = ggml_fp16_to_fp32(gamma_f16[i]);
+        }
+    }
+
+    // Follow the definition RMSNorm(x)=x/sqrt(mean(x^2)+eps) * gamma,
+    // performing token-wise F32 output rounding. Double accumulation is
+    // an independent mathematical cross-check, not a claimed bitwise
+    // replica of any SIMD or OpenCL reduction order.
+    std::vector<float> same_input_norm(phone_residual.size());
+    double min_rms = INFINITY;
+    double max_rms = 0.0;
+    for (size_t t = 0; t < phone_residual.size() / width; ++t) {
+        const size_t base = t * width;
+        double sumsq = 0.0;
+        for (size_t i = 0; i < width; ++i) {
+            const double v = double(phone_residual[base+i]);
+            sumsq += v * v;
+        }
+        const double rms = std::sqrt(sumsq / double(width) + double(eps));
+        min_rms = std::min(min_rms, rms);
+        max_rms = std::max(max_rms, rms);
+        for (size_t i = 0; i < width; ++i) {
+            same_input_norm[base+i] = float(
+                (double(phone_residual[base+i]) / rms) *
+                double(gamma[i]));
+        }
+    }
+
+    const cycle_real_diff kernel = cycle_real_compare(phone_norm, same_input_norm);
+    std::printf(
+        "[CYCLE_PHONE_NORM_ISOLATE] layer=%d chunk=%d "
+        "positions=[%lld,%lld] gamma_type=%s eps=%.9g "
+        "input_rms_min=%.9g input_rms_max=%.9g "
+        "same_input_max_abs=%.9g same_input_rms=%.9g "
+        "same_input_cosine=%.9g math_oracle=%s",
+        layer, chunk, (long long)start,
+        (long long)(start + int64_t(phone_residual.size() / width) - 1),
+        ggml_type_name(phone_ffn_norm_weight->type),
+        double(eps), min_rms, max_rms,
+        kernel.max_abs, kernel.rms, kernel.cosine,
+        !kernel.valid ? "NONFINITE" :
+        kernel.max_abs <= 0.001 ? "CLOSE" : "DIFF");
+    const size_t begin = size_t(start) * width;
+    if (begin <= reference_norm.size() &&
+        phone_norm.size() <= reference_norm.size() - begin) {
+        const std::vector<float> cpu_slice(
+            reference_norm.begin() + begin,
+            reference_norm.begin() + begin + phone_norm.size());
+        const cycle_real_diff propagated =
+            cycle_real_compare(same_input_norm, cpu_slice);
+        std::printf(
+            " same_input_vs_reference_max_abs=%.9g "
+            "same_input_vs_reference_rms=%.9g",
+            propagated.max_abs, propagated.rms);
+    } else {
+        std::printf(" same_input_vs_reference=UNAVAILABLE");
+    }
+    std::printf(" status=MEASURED\n");
+    std::fflush(stdout);
+    return true;
+}
+
 // One physical Cycle period: X complete PC CPU layers, one C2P Tensor
 // boundary, Y complete Phone GPU layers, one P2C Tensor boundary.
 // The model's initial "embd" is captured from the independent CPU
@@ -3733,6 +3838,7 @@ static bool cycle_real_execute_period_fifo(
                             size_t(l) < checkpoints.phone_ffn_outputs.size() ?
                             checkpoints.phone_ffn_outputs[size_t(l)] : empty;
                         std::vector<float> attn_values;
+                        std::vector<float> norm_values;
                         std::vector<float> ffn_values;
                         ok = local_input != nullptr &&
                             cycle_real_execute_phone_attention_pre(
@@ -3758,7 +3864,20 @@ static bool cycle_real_execute_period_fifo(
                                 ok = cycle_real_phone_boundary_probe(
                                     phone, "PHONE_FULL_FFN_NORM",
                                     l, c, st.start, hidden,
-                                    st.ready.phone_graph.ffn_norm, norm_ref);
+                                    st.ready.phone_graph.ffn_norm, norm_ref,
+                                    &norm_values);
+                            }
+                            if (ok) {
+                                // Compare GPU RMSNorm+gamma with an
+                                // independent host formula using the exact
+                                // SAME GPU residual and physical gamma.
+                                const auto * gamma =
+                                    cycle_real_resolve_physical_weight(
+                                        layer.ffn_norm, phone, 1);
+                                ok = cycle_real_phone_same_input_norm_probe(
+                                    gamma, attn_values, norm_values, norm_ref,
+                                    l, c, st.start, hidden,
+                                    model.hparams.f_norm_rms_eps);
                             }
                         }
                         if (ok) {
