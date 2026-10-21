@@ -974,7 +974,7 @@ int main(int argc, char ** argv) {
                               double floor, double relative) {
         return d.valid && d.max_abs <= floor + relative * d.max_ref;
     };
-    const bool residual_ok = strict_ok(residual_diff, 0.02, 0.001);
+    const bool residual_ok = strict_ok(residual_diff, 0.02, 0.0001);
     const bool norm_ok = strict_ok(norm_diff, 0.01, 0.001);
     const bool routing_ok = strict_ok(routing_diff, 0.003, 0.001);
 
@@ -983,7 +983,7 @@ int main(int argc, char ** argv) {
                 "strict_tolerance=%.8g status=%s\n",
                 residual_diff.max_abs, residual_diff.rms,
                 residual_diff.cosine,
-                0.02 + 0.001 * residual_diff.max_ref,
+                0.02 + 0.0001 * residual_diff.max_ref,
                 residual_ok ? "PASS" : "FAIL");
     std::printf("[CYCLE_PHONE_READY_COMPARE] target=FFN_NORM "
                 "max_abs=%.8g rms=%.8g cosine=%.8g "
