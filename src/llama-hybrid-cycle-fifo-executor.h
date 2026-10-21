@@ -26,11 +26,13 @@
 inline bool llama_hybrid_cycle_run_fifo(
         const llama_hybrid_cycle_layout & layout,
         int n_chunks,
-        const std::function<bool(const llama_hybrid_cycle_task &)> & execute) {
-    if (!execute || !layout.enabled() || n_chunks <= 0) {
+        const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
+        int max_inflight = 0) {
+    if (!execute || !layout.enabled() || n_chunks <= 0 ||
+        max_inflight < 0 || max_inflight > n_chunks) {
         return false;
     }
-    llama_hybrid_cycle_task_ring ring(layout, n_chunks);
+    llama_hybrid_cycle_task_ring ring(layout, n_chunks, max_inflight);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
