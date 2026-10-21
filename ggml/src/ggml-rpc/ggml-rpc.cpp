@@ -2139,6 +2139,42 @@ bool ggml_backend_rpc_cycle_apply_partial(
         targets, uint32_t(partial->ne[1]), uint32_t(partial->ne[0]), 0);
 }
 
+bool ggml_backend_rpc_cycle_wait_ack(
+        ggml_backend_t backend, uint32_t kind,
+        int32_t layer, int32_t chunk, uint64_t seq, uint64_t graph_id,
+        int timeout_ms) {
+    if (!ggml_backend_is_rpc(backend) ||
+        layer < 0 || chunk < 0 || seq == 0 ||
+        (kind != INFERENCE_CYCLE_READY &&
+         kind != INFERENCE_CYCLE_PARTIAL)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) {
+        return false;
+    }
+    inference_frame_header header {};
+    std::vector<uint8_t> payload;
+    const bool received = rpc_inference_receive_matching(
+        ctx->endpoint, INFERENCE_FRAME_ACK,
+        kind == INFERENCE_CYCLE_READY ?
+            INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL,
+        0, seq, 0, payload, &header, timeout_ms);
+    inference_cycle_ack ack {};
+    const bool ok = received && inference_cycle_decode_ack(
+        header, payload.size(), ack) &&
+        ack.direction == INFERENCE_CYCLE_PC_TO_PHONE &&
+        ack.kind == kind && ack.layer == layer &&
+        ack.chunk == chunk && ack.seq == seq &&
+        ack.graph_id == graph_id && ack.device_ready;
+    GGML_LOG_INFO(
+        "[CYCLE_C2P_ACK] side=pc kind=%s layer=%d chunk=%d "
+        "seq=%" PRIu64 " device_ready=%d status=%s\n",
+        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+        layer, chunk, seq, ok ? 1 : 0, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool ggml_backend_rpc_cycle_finish_reduce(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id) {
