@@ -2234,10 +2234,13 @@ int main(int argc, char ** argv) {
                         (long long)full_channels);
                     return false;
                 }
+                std::pair<int32_t, int32_t> gate_phone_peak {0, 0};
+                std::pair<int32_t, int32_t> up_phone_peak {0, 0};
                 const auto compare_stages = [&](const char * stage_name,
                         const std::vector<float> & oracle,
                         const std::vector<float> & pc_values,
-                        const std::vector<float> & ph_values) -> bool {
+                        const std::vector<float> & ph_values,
+                        std::pair<int32_t, int32_t> * phone_peak) -> bool {
                     const size_t rows = size_t(topk * ntokens);
                     if (oracle.size() != size_t(full_channels) * rows ||
                         pc_values.size() != size_t(pc_channels) * rows ||
@@ -2290,6 +2293,11 @@ int main(int argc, char ** argv) {
                         }
                         const int64_t token = worst_row / topk;
                         const int64_t slot = worst_row % topk;
+                        if (!is_pc && phone_peak != nullptr) {
+                            *phone_peak = {
+                                int32_t(token), int32_t(slot)
+                            };
+                        }
                         const int32_t expert_id = input_ids[
                             size_t(token * topk + slot)];
                         const double rms = std::sqrt(
@@ -2308,13 +2316,13 @@ int main(int argc, char ** argv) {
                 };
                 if (!compare_stages(
                         "GATE", baseline_gate,
-                        pc_stages.gate, ph_stages.gate) ||
+                        pc_stages.gate, ph_stages.gate, &gate_phone_peak) ||
                     !compare_stages(
                         "UP", baseline_up,
-                        pc_stages.up, ph_stages.up) ||
+                        pc_stages.up, ph_stages.up, &up_phone_peak) ||
                     !compare_stages(
                         "SWIGLU", baseline_swiglu,
-                        pc_stages.swiglu, ph_stages.swiglu)) {
+                        pc_stages.swiglu, ph_stages.swiglu, nullptr)) {
                     return false;
                 }
 
@@ -2342,6 +2350,30 @@ int main(int argc, char ** argv) {
                             "reason=PROBE_EXECUTION\n");
                         return false;
                     }
+                    // GPU comparison is opt-in to this small diagnostic case:
+                    // one selected expert's Q4_K weight matrix + F32 input,
+                    // versus the existing Phone MoE MUL_MAT_ID output.
+                    // Use the largest observed GPU error separately for
+                    // Gate and Up. A probe failure is diagnostic only.
+                    const bool gate_gpu_op_ok =
+                        cycle_real_probe_phone_single_expert_mul_mat(
+                            "GATE", phone, phone_weights.gate,
+                            input_norm, input_ids,
+                            baseline_gate, ph_stages.gate,
+                            hidden, ntokens, topk, full_channels, pc_channels,
+                            gate_phone_peak.first, gate_phone_peak.second);
+                    const bool up_gpu_op_ok =
+                        cycle_real_probe_phone_single_expert_mul_mat(
+                            "UP", phone, phone_weights.up,
+                            input_norm, input_ids,
+                            baseline_up, ph_stages.up,
+                            hidden, ntokens, topk, full_channels, pc_channels,
+                            up_phone_peak.first, up_phone_peak.second);
+                    std::printf(
+                        "[CYCLE_FFN_GPU_OP_COMPARE_SUM] "
+                        "gate=%s up=%s mode=DIAGNOSTIC_ONLY\n",
+                        gate_gpu_op_ok ? "MEASURED" : "NOT_AVAILABLE",
+                        up_gpu_op_ok ? "MEASURED" : "NOT_AVAILABLE");
                 } else {
                     std::printf("[CYCLE_FFN_KERNEL_REPLAY] enabled=0 "
                                 "reason=EXTRA_RPC_WEIGHT_TRANSFER "
