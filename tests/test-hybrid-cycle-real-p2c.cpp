@@ -2588,9 +2588,20 @@ struct cycle_real_c2p_phone_chunk {
         ggml_set_name(output, full_layer ?
             "cycle_num_phone_full_lout" : "cycle_num_c2p_lout");
         reduce_graph = ggml_new_graph_custom(ctx, 16, false);
+        // ggml_graph_add_node() merely appends a pointer. Unlike the
+        // canonical ggml_build_forward_expand(), it does NOT set the
+        // GGML_TENSOR_FLAG_COMPUTE flag. GPU backends can therefore report
+        // GRAPH_COMPUTE success while skipping these ADD nodes and leaving
+        // their output allocations untouched (all zeros on OpenCL).
+        //
+        // Keep this graph limited to its one/two Reduce ADD nodes: using
+        // ggml_build_forward_expand() here would traverse the already-run
+        // FFN graph and execute it a second time.
         if (!full_layer) {
+            ffnsum->flags |= GGML_TENSOR_FLAG_COMPUTE;
             ggml_graph_add_node(reduce_graph, ffnsum);
         }
+        output->flags |= GGML_TENSOR_FLAG_COMPUTE;
         ggml_graph_add_node(reduce_graph, output);
         const auto build_end = std::chrono::steady_clock::now();
         if (!executor.prepare(
