@@ -373,6 +373,12 @@ static bool cycle_real_execute_phone_attention_pre(
     // Same no-Flash Qwen3 grouped-query layout as build_attn_mha():
     // [head_dim, 1 token, heads, 1 stream]. With no historical KV,
     // softmax has exactly one unmasked entry per Q head.
+    // The independent llama_context reference writes K/V to its default
+    // GGML_TYPE_F16 cache. Preserve that rounding even for position zero;
+    // otherwise the first-token V contribution is computed at F32 precision
+    // here and is not numerically the same attention path.
+    k = ggml_cast(ctx, k, GGML_TYPE_F16);
+    v = ggml_cast(ctx, v, GGML_TYPE_F16);
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
