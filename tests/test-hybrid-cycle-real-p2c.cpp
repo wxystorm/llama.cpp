@@ -3105,6 +3105,26 @@ static bool cycle_real_execute_c2p_fifo(
     return success;
 }
 
+// Explicit RPC fence: ggml_backend_synchronize(RPC) intentionally does
+// nothing. A physical GPU tensor must stay owned until the Phone SERVER
+// confirms that all earlier graphs have finished consuming it.
+static bool cycle_real_explicit_phone_fence(ggml_backend_t phone) {
+    auto * dev = phone ? ggml_backend_get_device(phone) : nullptr;
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const auto fence = reg ?
+        reinterpret_cast<ggml_backend_rpc_fence_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_RPC_FENCE_PROC)) :
+        nullptr;
+    if (!fence) {
+        std::fprintf(stderr,
+            "[CYCLE_PERIOD_FENCE] status=FAIL reason=RPC_FENCE_MISSING\n");
+        return false;
+    }
+    fence(phone);
+    return true;
+}
+
 // One physical Cycle period: X complete PC CPU layers, one C2P Tensor
 // boundary, Y complete Phone GPU layers, one P2C Tensor boundary.
 // The model's initial "embd" is captured from the independent CPU
@@ -3300,7 +3320,9 @@ static bool cycle_real_execute_period_fifo(
                         if (ok) {
                             // This is a real RPC fence; the RPC backend's
                             // ordinary synchronize() is a NO-OP.
-                            ggml_backend_rpc_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(phone);
+                        }
+                        if (ok) {
                             auto & previous = *states[size_t(l - 1)][size_t(c)];
                             previous.phone_output.reset();
                             st.phone_output =
@@ -3314,12 +3336,14 @@ static bool cycle_real_execute_period_fifo(
                             ok = st.phone_output->execute_full_local(st.ready);
                         }
                         if (ok) {
-                            ggml_backend_rpc_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(phone);
+                        }
+                        if (ok) {
                             st.ready.release_phone_graph();
                             ok = st.phone_output->execute_reduce(phone);
                         }
                         if (ok) {
-                            ggml_backend_rpc_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(phone);
                         }
                     }
                     break;
@@ -3354,7 +3378,9 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true);
                         if (ok) {
-                            ggml_backend_rpc_fence(phone);
+                            ok = cycle_real_explicit_phone_fence(phone);
+                        }
+                        if (ok) {
                             states[size_t(l - 1)][size_t(c)]->phone_output.reset();
                         }
                     }
