@@ -63,6 +63,7 @@ struct cycle_real_period_reference {
     std::vector<std::vector<float>> pc_attn_residuals;
     std::vector<std::vector<float>> pc_ffn_outputs;
     std::vector<float> c2p_residual;
+    std::vector<float> c2p_full_ffn;
     std::vector<float> p2c_residual;
     std::vector<float> p2c_norm;
 };
@@ -3424,6 +3425,77 @@ static bool cycle_real_explicit_phone_fence(ggml_backend_t phone) {
     return true;
 }
 
+// Opt-in correctness probe. The ordinary Cycle NEVER reads back its
+// interlayer Phone outputs. This method deliberately does so only when
+// LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK=1, AFTER an explicit server-side
+// GPU fence, and is therefore unsuitable for performance measurements.
+static bool cycle_real_phone_boundary_probe(
+        ggml_backend_t phone, const char * stage,
+        int layer, int chunk, int64_t start, int64_t hidden,
+        const ggml_tensor * device_tensor,
+        const std::vector<float> & cpu_reference,
+        std::vector<float> * readback = nullptr) {
+    if (!cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
+        return true;
+    }
+    const size_t count = device_tensor ?
+        size_t(ggml_nelements(device_tensor)) : 0;
+    if (!phone || !device_tensor || !device_tensor->buffer ||
+        device_tensor->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(device_tensor) || hidden <= 0 ||
+        start < 0 || count == 0 || count % size_t(hidden) != 0 ||
+        ggml_nbytes(device_tensor) != count * sizeof(float)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_BOUNDARY] stage=%s layer=%d chunk=%d "
+            "status=FAIL reason=INVALID_GPU_TENSOR\n",
+            stage, layer, chunk);
+        return false;
+    }
+    if (!cycle_real_explicit_phone_fence(phone)) {
+        return false;
+    }
+    std::vector<float> values(count);
+    ggml_backend_tensor_get(
+        device_tensor, values.data(), 0, count * sizeof(float));
+    if (readback != nullptr) {
+        *readback = values;
+    }
+    const size_t offset = size_t(start) * size_t(hidden);
+    if (cpu_reference.empty()) {
+        std::printf(
+            "[CYCLE_PHONE_BOUNDARY] stage=%s layer=%d chunk=%d "
+            "elements=%zu reference=NONE status=READBACK_OK\n",
+            stage, layer, chunk, count);
+        return true;
+    }
+    if (offset > cpu_reference.size() ||
+        count > cpu_reference.size() - offset) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_BOUNDARY] stage=%s layer=%d chunk=%d "
+            "reference=%zu required=%zu status=FAIL "
+            "reason=REFERENCE_SHAPE\n",
+            stage, layer, chunk, cpu_reference.size(), offset + count);
+        return false;
+    }
+    const std::vector<float> ref(
+        cpu_reference.begin() + offset,
+        cpu_reference.begin() + offset + count);
+    const cycle_real_diff d = cycle_real_compare(values, ref);
+    const double tolerance = 0.02 + 0.00002 * d.max_ref;
+    std::printf(
+        "[CYCLE_PHONE_BOUNDARY] stage=%s layer=%d chunk=%d "
+        "positions=[%lld,%lld] elements=%zu "
+        "max_abs=%.9g rms=%.9g cosine=%.9g tolerance=%.9g "
+        "state=%s diagnostic_readback=1\n",
+        stage, layer, chunk, (long long)start,
+        (long long)(start + int64_t(count / size_t(hidden)) - 1),
+        count, d.max_abs, d.rms, d.cosine, tolerance,
+        !d.valid ? "NONFINITE" :
+            d.max_abs <= tolerance ? "WITHIN_TOLERANCE" : "DRIFT");
+    std::fflush(stdout);
+    return d.valid;
+}
+
 // One physical Cycle period: X complete PC CPU layers, one C2P Tensor
 // boundary, Y complete Phone GPU layers, one P2C Tensor boundary.
 // The model's initial "embd" is captured from the independent CPU
@@ -3681,6 +3753,14 @@ static bool cycle_real_execute_period_fifo(
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(phone);
                         }
+                        if (ok && st.phone_output &&
+                            size_t(l) < checkpoints.layer_outputs.size()) {
+                            ok = cycle_real_phone_boundary_probe(
+                                phone, "PHONE_FULL_OUTPUT",
+                                l, c, st.start, hidden,
+                                st.phone_output->output,
+                                checkpoints.layer_outputs[size_t(l)]);
+                        }
                     }
                     break;
                 }
@@ -3864,6 +3944,57 @@ static bool cycle_real_execute_period_fifo(
                         }
                         // The GPU output MUST survive for the next Phone
                         // FULL_LAYER; do not free it at this boundary.
+                        if (ok && cycle_real_env_flag(
+                                "LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
+                            std::vector<float> phone_ffn;
+                            ok = cycle_real_phone_boundary_probe(
+                                phone, "C2P_PHONE_FFN",
+                                l, c, st.start, hidden,
+                                st.phone_output->inputs.ffn_output,
+                                {}, &phone_ffn);
+                            if (ok && phone_ffn.size() == st.partial.size() &&
+                                phone_ffn.size() == st.ready.residual.size()) {
+                                std::vector<float> joined = phone_ffn;
+                                for (size_t i = 0; i < joined.size(); ++i) {
+                                    joined[i] += st.partial[i];
+                                }
+                                cycle_real_period_checkpoint(
+                                    "C2P_FFN_SUM", l, c, st.start, hidden,
+                                    joined, checkpoints.c2p_full_ffn);
+                                std::vector<float> expected = joined;
+                                for (size_t i = 0; i < expected.size(); ++i) {
+                                    expected[i] += st.ready.residual[i];
+                                }
+                                std::vector<float> gpu_output;
+                                ok = cycle_real_phone_boundary_probe(
+                                    phone, "C2P_FINAL_OUTPUT",
+                                    l, c, st.start, hidden,
+                                    st.phone_output->output,
+                                    checkpoints.layer_outputs[size_t(l)],
+                                    &gpu_output);
+                                if (ok) {
+                                    const cycle_real_diff reduce_diff =
+                                        cycle_real_compare(gpu_output, expected);
+                                    std::printf(
+                                        "[CYCLE_PHONE_REDUCE_PARITY] "
+                                        "layer=%d chunk=%d max_abs=%.9g "
+                                        "rms=%.9g cosine=%.9g "
+                                        "source=GPU_OUTPUT_VS_SAME_INPUTS "
+                                        "state=%s\n",
+                                        l, c, reduce_diff.max_abs,
+                                        reduce_diff.rms, reduce_diff.cosine,
+                                        !reduce_diff.valid ? "INVALID" :
+                                        reduce_diff.max_abs < 0.0001 ?
+                                            "NUMERICALLY_CLOSE" : "DRIFT");
+                                }
+                            } else if (ok) {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PHONE_BOUNDARY] stage=C2P_FFN_SUM "
+                                    "layer=%d chunk=%d status=FAIL "
+                                    "reason=INPUT_SHAPE\n", l, c);
+                                ok = false;
+                            }
+                        }
                     } else {
                         const size_t n = size_t(hidden * st.tokens);
                         st.host_output.resize(n);
@@ -4060,6 +4191,11 @@ int main(int argc, char ** argv) {
         capture.values.emplace(
             "ffn_norm-" + std::to_string(capture_layout.cycle_size - 1),
             cycle_real_capture_value {});
+        if (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
+            capture.values.emplace(
+                "ffn_moe_out-" + std::to_string(capture_layout.x),
+                cycle_real_capture_value {});
+        }
         capture.values.emplace("embd", cycle_real_capture_value {});
         // Capture all first-period layer outputs for optional numeric probes,
         // including the exact last layer used by the mandatory parity gate.
@@ -4680,6 +4816,11 @@ int main(int argc, char ** argv) {
                 }
                 checkpoints.c2p_residual = optional_capture(
                     "ffn_inp-" + std::to_string(expected_layout.x));
+                if (cycle_real_env_flag(
+                        "LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK")) {
+                    checkpoints.c2p_full_ffn = optional_capture(
+                        "ffn_moe_out-" + std::to_string(expected_layout.x));
+                }
                 checkpoints.p2c_residual = optional_capture(
                     "ffn_inp-" + std::to_string(
                         expected_layout.cycle_size - 1));
