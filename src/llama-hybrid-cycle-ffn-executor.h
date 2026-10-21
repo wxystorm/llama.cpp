@@ -4,6 +4,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-impl.h" // ggml_backend_buffer_copy_tensor: no host fallback
 
 #include <cstddef>
 #include <cstdint>
