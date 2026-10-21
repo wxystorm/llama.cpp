@@ -3360,9 +3360,10 @@ int main(int argc, char ** argv) {
         ready_msg.ready.topk_weights,
         hidden, ntokens, topk, experts, pc_part);
     const auto phone_part = phone_task.get();
-    cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_REAL_FFN");
     const double parts_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - parts_begin).count();
+    // Keep the memory RPC query OUTSIDE ffn_parallel_ms timing.
+    cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_REAL_FFN");
 
     ggml_backend_free(phone);
     ggml_backend_free(cpu);
