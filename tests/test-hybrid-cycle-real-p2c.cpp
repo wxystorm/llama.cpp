@@ -3428,10 +3428,20 @@ static bool cycle_real_execute_c2p_fifo(
     return success;
 }
 
+// Aggregate only explicit server-confirmed Phone fences. For RPC backends
+// the ordinary ggml_backend_synchronize() is a NO-OP and is not counted.
+struct cycle_real_phone_fence_profile {
+    uint64_t calls = 0;
+    double wait_ms = 0.0;
+    double max_wait_ms = 0.0;
+};
+
 // Explicit RPC fence: ggml_backend_synchronize(RPC) intentionally does
 // nothing. A physical GPU tensor must stay owned until the Phone SERVER
 // confirms that all earlier graphs have finished consuming it.
-static bool cycle_real_explicit_phone_fence(ggml_backend_t phone) {
+static bool cycle_real_explicit_phone_fence(
+        ggml_backend_t phone,
+        cycle_real_phone_fence_profile * sample = nullptr) {
     auto * dev = phone ? ggml_backend_get_device(phone) : nullptr;
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     const auto fence = reg ?
@@ -3446,12 +3456,18 @@ static bool cycle_real_explicit_phone_fence(ggml_backend_t phone) {
     }
     const auto start = std::chrono::steady_clock::now();
     fence(phone);
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    if (sample) {
+        ++sample->calls;
+        sample->wait_ms += elapsed_ms;
+        sample->max_wait_ms = std::max(
+            sample->max_wait_ms, elapsed_ms);
+    }
     if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
         std::printf(
             "[CYCLE_PHONE_FENCE_PROFILE] gpu_wait_ms=%.3f "
-            "source=EXPLICIT_RPC_SYNCHRONIZE_ACK\n",
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - start).count());
+            "source=EXPLICIT_RPC_SYNCHRONIZE_ACK\n", elapsed_ms);
     }
     return true;
 }
