@@ -686,9 +686,13 @@ static bool cycle_real_execute_phone_attention_pre(
         int64_t topk, int64_t experts,
         cycle_real_phone_ready & result,
         double & elapsed_ms,
-        const cycle_real_live_wire * wire = nullptr) {
+        const cycle_real_live_wire * wire = nullptr,
+        cycle_real_phone_kv_cache * kv_cache = nullptr,
+        int64_t kv_token_start = 0) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
+        kv_token_start < 0 || kv_token_start + tokens > 128 ||
+        (kv_cache == nullptr && kv_token_start != 0) ||
         layer_input.size() != size_t(hidden * tokens) ||
         hp.f_norm_rms_eps <= 0.0f ||
         topk <= 0 || experts < topk ||
@@ -754,6 +758,20 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
 
+    const int64_t kv_tokens = kv_token_start + tokens;
+    if (kv_cache != nullptr &&
+        (!kv_cache->keys || !kv_cache->values ||
+         kv_cache->head_dim != head_dim ||
+         kv_cache->kv_heads != n_kv_heads ||
+         kv_tokens > kv_cache->max_tokens ||
+         kv_cache->committed_tokens != kv_token_start)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_KV_PERSISTENT] status=FAIL "
+            "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld expected=%lld\n",
+            (long long)kv_token_start,
+            (long long)(kv_cache ? kv_cache->committed_tokens : -1));
+        return false;
+    }
     ggml_init_params p {};
     p.mem_size = 16 * 1024 * 1024;
     p.no_alloc = true;
@@ -764,10 +782,9 @@ static bool cycle_real_execute_phone_attention_pre(
 
     auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
     auto * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
-    // Match the canonical KV-cache mask: [kv_tokens, query_tokens], F16.
-    // A single sequence at positions [0,N) needs N usable KV slots.
+    // Keys include all PAST tokens and the current causal chunk.
     auto * causal_mask = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F16, tokens, tokens);
+        ctx, GGML_TYPE_F16, kv_tokens, tokens);
     ggml_set_input(x);
     ggml_set_input(positions);
     ggml_set_input(causal_mask);
@@ -809,6 +826,29 @@ static bool cycle_real_execute_phone_attention_pre(
     // as llama_kv_cache::set_input_kq_mask (key_pos > query_pos -> -inf).
     k = ggml_cast(ctx, k, GGML_TYPE_F16);
     v = ggml_cast(ctx, v, GGML_TYPE_F16);
+    ggml_tensor * kv_k_write = nullptr;
+    ggml_tensor * kv_v_write = nullptr;
+    if (kv_cache != nullptr) {
+        // NEW K/V are contiguous [head_dim,kv_heads,chunk_tokens].
+        // Persist them in the same Phone GPU buffer before reading all
+        // historical keys; no historical K/V is ever sent to the PC.
+        auto * dst_k = ggml_view_3d(
+            ctx, kv_cache->keys, head_dim, n_kv_heads, tokens,
+            kv_cache->keys->nb[1], kv_cache->keys->nb[2],
+            size_t(kv_token_start) * kv_cache->keys->nb[2]);
+        auto * dst_v = ggml_view_3d(
+            ctx, kv_cache->values, head_dim, n_kv_heads, tokens,
+            kv_cache->values->nb[1], kv_cache->values->nb[2],
+            size_t(kv_token_start) * kv_cache->values->nb[2]);
+        kv_k_write = ggml_cpy(ctx, k, dst_k);
+        kv_v_write = ggml_cpy(ctx, v, dst_v);
+        k = ggml_view_3d(
+            ctx, kv_cache->keys, head_dim, n_kv_heads, kv_tokens,
+            kv_cache->keys->nb[1], kv_cache->keys->nb[2], 0);
+        v = ggml_view_3d(
+            ctx, kv_cache->values, head_dim, n_kv_heads, kv_tokens,
+            kv_cache->values->nb[1], kv_cache->values->nb[2], 0);
+    }
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
@@ -877,6 +917,11 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+    // Enforce GPU cache writes before subsequent prefix attention reads.
+    if (kv_cache != nullptr) {
+        ggml_build_forward_expand(graph, kv_k_write);
+        ggml_build_forward_expand(graph, kv_v_write);
+    }
     ggml_build_forward_expand(graph, ready.residual);
     ggml_build_forward_expand(graph, ready.ffn_norm);
     ggml_build_forward_expand(graph, ready.topk_ids);
@@ -915,15 +960,16 @@ static bool cycle_real_execute_phone_attention_pre(
     // Input layout: token-major hidden vectors; positions increment 0..N-1.
     // The F16 mask's dimension 0 is the KV index and dimension 1 is query.
     std::vector<int32_t> position_data(size_t(tokens), 0);
-    std::vector<ggml_fp16_t> mask_data(size_t(tokens * tokens));
+    std::vector<ggml_fp16_t> mask_data(size_t(tokens * kv_tokens));
     const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
     int64_t masked_future = 0;
     for (int64_t query = 0; query < tokens; ++query) {
-        position_data[size_t(query)] = int32_t(query);
-        for (int64_t key = 0; key < tokens; ++key) {
-            const bool future = key > query;
-            mask_data[size_t(query * tokens + key)] = future ? drop : keep;
+        const int64_t global_pos = kv_token_start + query;
+        position_data[size_t(query)] = int32_t(global_pos);
+        for (int64_t key = 0; key < kv_tokens; ++key) {
+            const bool future = key > global_pos;
+            mask_data[size_t(query * kv_tokens + key)] = future ? drop : keep;
             masked_future += future ? 1 : 0;
         }
     }
@@ -951,6 +997,15 @@ static bool cycle_real_execute_phone_attention_pre(
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_synchronize(backend);
+        if (kv_cache != nullptr) {
+            kv_cache->committed_tokens = kv_tokens;
+            std::printf(
+                "[CYCLE_PHONE_KV_PERSISTENT] chunk=%d committed=%lld "
+                "total=%lld status=OK\n",
+                wire != nullptr ? wire->chunk : -1,
+                (long long)kv_cache->committed_tokens,
+                (long long)kv_cache->max_tokens);
+        }
         if (wire != nullptr) {
             // GPU tensors remain valid until compute_buffer is destroyed.
             // The Phone RPC server copies directly into its transport TX
