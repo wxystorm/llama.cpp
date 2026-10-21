@@ -295,10 +295,72 @@ static void test_bounded_multi_chunk_p2c_fifo() {
     }
 }
 
+// C2P reverses the roles without changing the queue contract. Four real
+// chunks must keep Attention causal on PC, send READY before PARTIAL on one
+// PC->Phone FIFO, and Reduce ONLY on Phone after both shards are ready.
+static void test_bounded_multi_chunk_c2p_fifo() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_C2P};
+    constexpr int chunks = 4;
+    std::array<std::atomic<uint32_t>, chunks> flags {};
+    for (auto & f : flags) {
+        f.store(0);
+    }
+    std::atomic<int> attn {0};
+    std::atomic<int> reductions {0};
+    const auto bit = [](llama_hybrid_cycle_stage stage) -> uint32_t {
+        return uint32_t(1) << static_cast<int>(stage);
+    };
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        layout, chunks, [&](const llama_hybrid_cycle_task & task) {
+            assert(task.layer == 0 && task.chunk >= 0 && task.chunk < chunks);
+            const auto seen = flags[size_t(task.chunk)].load();
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(attn.fetch_add(1) == task.chunk);
+                    assert(task.chunk < reductions.load() + 2);
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(seen & bit(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_TO_PHONE);
+                    assert(seen & bit(llama_hybrid_cycle_stage::ATTN_PRE));
+                    break;
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_TO_PHONE);
+                    assert(seen & bit(llama_hybrid_cycle_stage::FFN_SOURCE));
+                    assert(seen & bit(llama_hybrid_cycle_stage::SEND_ACTIVATION));
+                    break;
+                case llama_hybrid_cycle_stage::FFN_DESTINATION:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    assert(seen & bit(llama_hybrid_cycle_stage::SEND_ACTIVATION));
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_GPU);
+                    assert(seen & bit(llama_hybrid_cycle_stage::SEND_PARTIAL));
+                    assert(seen & bit(llama_hybrid_cycle_stage::FFN_DESTINATION));
+                    ++reductions;
+                    break;
+                default:
+                    assert(false && "C2P task unexpectedly on FULL_LAYER");
+                    return false;
+            }
+            assert(!(flags[size_t(task.chunk)].fetch_or(bit(task.stage)) &
+                     bit(task.stage)));
+            return true;
+        }, 2);
+    assert(ok);
+    assert(attn == chunks && reductions == chunks);
+}
+
 int main() {
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
     test_bounded_multi_chunk_p2c_fifo();
+    test_bounded_multi_chunk_c2p_fifo();
     test_causal_entry_order();
     test_two_cycles_and_cuda_tail();
     test_reject_invalid_completions();
