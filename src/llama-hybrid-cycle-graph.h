@@ -150,21 +150,22 @@ inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
     if (!w.up->buffer || !w.gate->buffer || !w.down->buffer) {
         return false;
     }
-    // All three weights must be from one physical backend. The legacy
-    // default CPU buffer type has device=nullptr by design, so recognize it
-    // by its exact singleton type identity rather than rejecting the CPU.
-    // GPU/RPC still require a real non-Meta backend device.
+    // All three weights must share one physical buffer type. Non-default
+    // CPU host/mmap/extra buffers may be deviceless but are still valid if
+    // the CPU device supports them. GPU/RPC buffers must have a real device.
     const auto up_buft = ggml_backend_buffer_get_type(w.up->buffer);
     const auto gate_buft = ggml_backend_buffer_get_type(w.gate->buffer);
     const auto down_buft = ggml_backend_buffer_get_type(w.down->buffer);
-    if (up_buft == nullptr || up_buft != gate_buft || up_buft != down_buft) {
+    if (up_buft == nullptr || up_buft != gate_buft || up_buft != down_buft ||
+        ggml_backend_buffer_is_meta(w.up->buffer)) {
         return false;
     }
-    if (up_buft == ggml_backend_cpu_buffer_type()) {
-        return true;
-    }
     const auto dev = ggml_backend_buft_get_device(up_buft);
-    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META;
+    if (dev != nullptr) {
+        return ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META;
+    }
+    const auto cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return cpu_dev != nullptr && ggml_backend_dev_supports_buft(cpu_dev, up_buft);
 }
 
 
