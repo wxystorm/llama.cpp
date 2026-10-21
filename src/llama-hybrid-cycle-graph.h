@@ -156,8 +156,7 @@ inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
     const auto up_buft = ggml_backend_buffer_get_type(w.up->buffer);
     const auto gate_buft = ggml_backend_buffer_get_type(w.gate->buffer);
     const auto down_buft = ggml_backend_buffer_get_type(w.down->buffer);
-    if (up_buft == nullptr || up_buft != gate_buft || up_buft != down_buft ||
-        ggml_backend_buffer_is_meta(w.up->buffer)) {
+    if (up_buft == nullptr || up_buft != gate_buft || up_buft != down_buft) {
         return false;
     }
     const auto dev = ggml_backend_buft_get_device(up_buft);
