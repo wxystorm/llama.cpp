@@ -3585,16 +3585,32 @@ static bool cycle_real_execute_period_fifo(
     const double wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     ggml_backend_free(cpu);
-    const bool ok = succeeded && kv_ok && net_idle;
+    size_t nonfinite = 0;
+    size_t zero = 0;
+    double max_abs = 0.0;
+    if (succeeded) {
+        for (float value : final_output) {
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+            } else {
+                max_abs = std::max(max_abs, std::fabs(double(value)));
+                zero += value == 0.0f ? 1 : 0;
+            }
+        }
+    }
+    const bool output_ok = succeeded && nonfinite == 0 && max_abs > 0.0;
+    const bool ok = succeeded && kv_ok && net_idle && output_ok;
     std::printf(
         "[CYCLE_PERIOD_SUM] layers=%d x=%d y=%d chunks=%d tokens=%d "
         "c2p_payloads=%d p2c_payloads=%d total_payloads=%d "
         "phone_handoffs=DEVICE_LOCAL phone_to_pc_only_at=P2C "
         "gpu_output_owner_at_c2p=PHONE_GPU "
         "final_output_owner=PC_CPU "
+        "final_max_abs=%.6g final_zero=%zu final_nonfinite=%zu "
         "wall_ms=%.3f cpu_parity=NOT_CHECKED status=%s\n",
         n_layers, layout.x, layout.y, n_chunks, int(tokens),
-        2 * n_chunks, 2 * n_chunks, 4 * n_chunks, wall_ms,
+        2 * n_chunks, 2 * n_chunks, 4 * n_chunks,
+        max_abs, zero, nonfinite, wall_ms,
         ok ? "OK" : "FAIL");
     return ok;
 }
