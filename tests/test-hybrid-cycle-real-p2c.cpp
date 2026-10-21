@@ -2408,6 +2408,7 @@ struct cycle_real_c2p_phone_chunk {
     double gpu_alloc_ms = 0.0;
     double ffn_graph_submit_ms = 0.0;
     double reduce_graph_submit_ms = 0.0;
+    bool is_full_layer = false;
 
     cycle_real_c2p_phone_chunk() = default;
     cycle_real_c2p_phone_chunk(const cycle_real_c2p_phone_chunk &) = delete;
@@ -2425,12 +2426,14 @@ struct cycle_real_c2p_phone_chunk {
         output = nullptr;
         reduce_graph = nullptr;
         inputs = {};
+        is_full_layer = false;
     }
 
     bool prepare(
             ggml_backend_t phone,
             const llama_hybrid_cycle_ffn_shard_weights & shard,
-            int64_t hidden, int64_t tokens, int64_t topk, int64_t experts) {
+            int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
+            bool full_layer = false) {
         const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
@@ -2440,9 +2443,12 @@ struct cycle_real_c2p_phone_chunk {
         if (!ctx) {
             return false;
         }
+        is_full_layer = full_layer;
         inputs = llama_hybrid_cycle_make_ffn_graph_inputs(ctx, hidden, tokens, topk);
         residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
-        pc_partial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+        if (!full_layer) {
+            pc_partial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+        }
         auto * x = ggml_reshape_3d(ctx, inputs.norm, hidden, 1, tokens);
         auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, inputs.topk_ids);
         auto * up = ggml_mul_mat_id(ctx, shard.up, x, inputs.topk_ids);
@@ -2460,12 +2466,17 @@ struct cycle_real_c2p_phone_chunk {
         auto * ffn_graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
 
-        // Do not include FFN nodes in this second graph. Two GPU ADD nodes
-        // consume the persistent FFN output and the received PC shard.
-        auto * ffnsum = ggml_add(ctx, inputs.ffn_output, pc_partial);
+        // C2P Reduce consumes two FFN shards, while a FULL phone layer
+        // consumes only its own physical full-width FFN. Both operate
+        // directly on GPU tensors and never return hidden activations.
+        auto * ffnsum = full_layer ?
+            inputs.ffn_output :
+            ggml_add(ctx, inputs.ffn_output, pc_partial);
         output = ggml_add(ctx, residual, ffnsum);
         reduce_graph = ggml_new_graph_custom(ctx, 16, false);
-        ggml_graph_add_node(reduce_graph, ffnsum);
+        if (!full_layer) {
+            ggml_graph_add_node(reduce_graph, ffnsum);
+        }
         ggml_graph_add_node(reduce_graph, output);
         const auto build_end = std::chrono::steady_clock::now();
         if (!executor.prepare(
@@ -2486,6 +2497,26 @@ struct cycle_real_c2p_phone_chunk {
             "gpu_alloc_ms=%.3f source=PC_CLIENT status=OK\n",
             graph_build_ms, gpu_alloc_ms);
         return true;
+    }
+
+    bool execute_full_local(const cycle_real_phone_ready & ready) {
+        if (!is_full_layer || !ready.phone_graph.residual ||
+            !ready.phone_graph.ffn_norm ||
+            !ready.phone_graph.topk_ids ||
+            !ready.phone_graph.topk_weights ||
+            !residual || !residual->buffer ||
+            !ggml_backend_buffer_copy_tensor(
+                ready.phone_graph.residual, residual)) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_FULL] stage=INPUT status=FAIL "
+                "reason=LOCAL_GPU_HANDOFF\n");
+            return false;
+        }
+        const std::vector<float> empty_f32;
+        const std::vector<int32_t> empty_i32;
+        return executor.execute(
+            empty_f32.data(), 0, empty_i32.data(), 0,
+            empty_f32.data(), 0, nullptr, 0, &ready.phone_graph);
     }
 
     bool execute_ffn() {
