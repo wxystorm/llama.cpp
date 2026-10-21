@@ -543,10 +543,10 @@ struct cycle_real_phone_ready {
 // interval contiguous across KV heads: no host readback, no materialization
 // of previous chunks and no second cache instance per in-flight chunk.
 // Attention tasks run in causal chunk order on the single PHONE_GPU FIFO.
-// Complete PC layers keep native CPU weight tensors, while Tensor and Phone
-// layers borrow their physical static weight shards from Meta. Only accept
-// native weights whose buffer type matches the actual compute backend.
-// Never return the parent Meta tensor or perform an implicit device transfer.
+// PC full layers are loaded into native CPU buffers, including mmap-backed
+// and CPU extra-buffer types that need not equal the backend's default buft.
+// Tensor/Phone layers still borrow their real physical static Meta shards.
+// Never return the parent Meta tensor or copy weights across devices.
 static ggml_tensor * cycle_real_resolve_physical_weight(
         const ggml_tensor * weight, ggml_backend_t backend,
         size_t source_device) {
@@ -554,9 +554,26 @@ static ggml_tensor * cycle_real_resolve_physical_weight(
         weight->op != GGML_OP_NONE || weight->view_src != nullptr) {
         return nullptr;
     }
+    const auto weight_buft = ggml_backend_buffer_get_type(weight->buffer);
     const auto native_buft = ggml_backend_get_default_buffer_type(backend);
-    if (native_buft &&
-        ggml_backend_buffer_get_type(weight->buffer) == native_buft) {
+    const auto device = ggml_backend_get_device(backend);
+    const bool pc_native_compatible =
+        source_device == 0 && device &&
+        ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+        !ggml_backend_buffer_is_meta(weight->buffer) &&
+        ggml_backend_dev_supports_buft(device, weight_buft);
+    if ((native_buft && weight_buft == native_buft) ||
+        pc_native_compatible) {
+        if (pc_native_compatible && weight_buft != native_buft &&
+            std::getenv("GGML_CYCLE_SHARD_DIAG") != nullptr) {
+            std::fprintf(stderr,
+                "[CYCLE_WEIGHT_RESOLVE] weight=%s index=%zu "
+                "backend=%s weight_buft=%s default_buft=%s "
+                "mode=CPU_COMPATIBLE status=OK\n",
+                weight->name, source_device, ggml_backend_name(backend),
+                ggml_backend_buft_name(weight_buft),
+                native_buft ? ggml_backend_buft_name(native_buft) : "(null)");
+        }
         // Borrowed model tensor: it remains owned by the model until unload.
         return const_cast<ggml_tensor *>(weight);
     }
