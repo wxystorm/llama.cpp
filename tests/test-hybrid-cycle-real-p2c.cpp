@@ -1201,7 +1201,6 @@ int main(int argc, char ** argv) {
     const cycle_real_diff routing_aligned_diff =
         cycle_real_compare(aligned_phone_weights, aligned_ref_weights);
 
-
     // Print which *position* diverges, not just one pooled statistic.
     // In a causal multi-KV test, a future-mask or RoPE error can be local
     // to later tokens even when the first token matches perfectly.
@@ -1313,7 +1312,7 @@ int main(int argc, char ** argv) {
                 routing_aligned_diff.cosine,
                 0.003 + 0.001 * routing_aligned_diff.max_ref,
                 routing_ok ? "PASS" : "FAIL");
-    if (!residual_ok || !norm_ok ||
+    if (!residual_ok || !norm_ok || !probs_diff.valid ||
         !topk_set_equal || !topk_ids_valid || !routing_ok) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
@@ -1504,6 +1503,8 @@ int main(int argc, char ** argv) {
     }
     const cycle_real_diff ffn_diff = cycle_real_compare(combined_ffn, baseline_ffn);
     const cycle_real_diff out_diff = cycle_real_compare(combined_output, baseline_output);
+    report_token_errors("FFN_PARTIAL_SUM", combined_ffn, baseline_ffn, hidden);
+    report_token_errors("LAYER_OUTPUT", combined_output, baseline_output, hidden);
     std::printf("[CYCLE_REAL_COMPARE] target=FFN_PARTIAL_SUM layer=%d "
                 "max_abs=%.8g rms=%.8g cosine=%.8g tolerance=%.8g status=%s\n",
                 layer, ffn_diff.max_abs, ffn_diff.rms, ffn_diff.cosine,
