@@ -323,6 +323,16 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_partial(
         uint64_t seq, uint64_t graph_id,
         const ggml_tensor * partial);
 
+// Reverse direction contains control ACKs only. This does not send a
+// PC->Phone activation tensor. Flush is used before a short-lived
+// diagnostic process exits; the long-lived scheduler can batch ACKs.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_ack(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id, uint32_t kind, bool device_ready);
+
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_tx_idle(
+        ggml_backend_t backend, int timeout_ms);
+
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
