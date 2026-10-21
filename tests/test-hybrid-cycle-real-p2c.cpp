@@ -1147,6 +1147,7 @@ static bool cycle_real_execute_ffn(
         cycle_real_ffn_stages * stages_out = nullptr,
         const cycle_real_live_wire * wire = nullptr,
         const llama_hybrid_cycle_ready_graph * local_phone_ready = nullptr) {
+    const auto graph_build_begin = std::chrono::steady_clock::now();
     ggml_init_params params {};
     params.mem_size = 2 * 1024 * 1024;
     params.no_alloc = true;
@@ -1173,6 +1174,15 @@ static bool cycle_real_execute_ffn(
     in.ffn_output = ggml_cont(ctx, sum);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
     ggml_build_forward_expand(graph, in.ffn_output);
+    const auto graph_build_done = std::chrono::steady_clock::now();
+    if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
+        std::printf("[CYCLE_FFN_GRAPH_BUILD] backend=%s "
+                    "graph_build_ms=%.3f nodes=%d\n",
+                    ggml_backend_name(backend),
+                    std::chrono::duration<double, std::milli>(
+                        graph_build_done - graph_build_begin).count(),
+                    ggml_graph_n_nodes(graph));
+    }
 
     bool ok = false;
     {
