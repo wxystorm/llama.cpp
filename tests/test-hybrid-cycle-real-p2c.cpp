@@ -941,6 +941,185 @@ static cycle_real_diff cycle_real_compare(
     return result;
 }
 
+// Discriminate the normal Q4_K MUL_MAT kernel from the fused MoE
+// MUL_MAT_ID kernel on the SAME Phone OpenCL device. A fresh one-expert
+// quantized weight buffer is populated from the already-byte-verified
+// physical Phone shard; no GGUF re-quantization or kernel modification.
+//
+// Target the token/expert slot with the largest observed Phone stage error.
+// MUL_MAT [hidden,channels] x [hidden,1] uses one query vector, whereas
+// MUL_MAT_ID runs the full TopK/2-token MoE kernel. Comparing their outputs
+// isolates a possible MoE-specific half-dot or expert dispatch discrepancy.
+//
+// This is a correctness probe, NOT the production Phone FFN path.
+static bool cycle_real_probe_phone_single_expert_mul_mat(
+        const char * stage,
+        ggml_backend_t phone_backend,
+        const ggml_tensor * source_weight,
+        const std::vector<float> & input_norm,
+        const std::vector<int32_t> & selected_ids,
+        const std::vector<float> & full_cpu_stage,
+        const std::vector<float> & phone_id_stage,
+        int64_t hidden, int64_t tokens, int64_t topk,
+        int64_t full_channels, int64_t phone_channel_begin,
+        int32_t target_token, int32_t target_slot) {
+    if (!phone_backend || !source_weight || !source_weight->buffer ||
+        !ggml_is_contiguous(source_weight) ||
+        source_weight->type != GGML_TYPE_Q4_K ||
+        hidden != source_weight->ne[0] ||
+        source_weight->ne[1] <= 0 ||
+        source_weight->ne[2] <= 0 || source_weight->ne[3] != 1 ||
+        target_token < 0 || target_token >= tokens ||
+        target_slot < 0 || target_slot >= topk ||
+        phone_channel_begin < 0 ||
+        phone_channel_begin + source_weight->ne[1] > full_channels ||
+        input_norm.size() != size_t(hidden * tokens) ||
+        selected_ids.size() != size_t(topk * tokens) ||
+        full_cpu_stage.size() != size_t(full_channels * topk * tokens) ||
+        phone_id_stage.size() !=
+            size_t(source_weight->ne[1] * topk * tokens)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+            "reason=INVALID_SHAPE\n", stage);
+        return false;
+    }
+    const int64_t channels = source_weight->ne[1];
+    const int32_t expert = selected_ids[
+        size_t(target_token * topk + target_slot)];
+    if (expert < 0 || expert >= source_weight->ne[2]) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+            "reason=BAD_EXPERT_ID\n", stage);
+        return false;
+    }
+    const size_t bytes_per_expert =
+        ggml_row_size(source_weight->type, hidden) * size_t(channels);
+    if (bytes_per_expert == 0 ||
+        ggml_nbytes(source_weight) !=
+        bytes_per_expert * size_t(source_weight->ne[2])) {
+        return false;
+    }
+
+    ggml_init_params p {};
+    p.mem_size = 2 * 1024 * 1024;
+    p.no_alloc = true;
+    ggml_context * ctx = ggml_init(p);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(
+        ctx, source_weight->type, hidden, channels);
+    ggml_tensor * x = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, hidden, 1);
+    ggml_set_input(x);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(graph, y);
+
+    if (!ggml_backend_supports_op(phone_backend, y)) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+            "reason=GPU_MUL_MAT_UNSUPPORTED\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_buffer_t alloc = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, ggml_backend_get_default_buffer_type(phone_backend));
+    if (!alloc) {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+            "reason=GPU_ALLOC\n", stage);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<uint8_t> packed(bytes_per_expert);
+    ggml_backend_tensor_get(
+        source_weight, packed.data(),
+        size_t(expert) * bytes_per_expert, packed.size());
+    ggml_backend_tensor_set(
+        w, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(
+        x, input_norm.data() + size_t(target_token * hidden),
+        0, ggml_nbytes(x));
+    std::printf(
+        "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s target_pos=%d "
+        "target_slot=%d target_expert=%d weight_bytes=%zu "
+        "matmul_prec=F32 graph_nodes=%d status=PREPARED\n",
+        stage, int(target_token), int(target_slot), int(expert),
+        packed.size(), ggml_graph_n_nodes(graph));
+
+    const ggml_status compute_status =
+        ggml_backend_graph_compute(phone_backend, graph);
+    const bool ok = compute_status == GGML_STATUS_SUCCESS;
+    if (ok) {
+        ggml_backend_synchronize(phone_backend);
+        std::vector<float> single_output(size_t(channels));
+        ggml_backend_tensor_get(
+            y, single_output.data(), 0, ggml_nbytes(y));
+        double max_single_cpu = 0;
+        double max_id_cpu = 0;
+        double max_single_id = 0;
+        double sum_single_cpu = 0;
+        double sum_id_cpu = 0;
+        double sum_single_id = 0;
+        int64_t worst_channel = -1;
+        for (int64_t ch = 0; ch < channels; ++ch) {
+            const size_t cpu_idx = size_t(
+                (target_token * topk + target_slot) * full_channels +
+                phone_channel_begin + ch);
+            const size_t phone_idx = size_t(
+                (target_token * topk + target_slot) * channels + ch);
+            const double cpu_value = full_cpu_stage[cpu_idx];
+            const double id_value = phone_id_stage[phone_idx];
+            const double single_value = single_output[size_t(ch)];
+            if (!std::isfinite(cpu_value) ||
+                !std::isfinite(id_value) ||
+                !std::isfinite(single_value)) {
+                std::fprintf(stderr,
+                    "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+                    "reason=NONFINITE\n", stage);
+                ggml_backend_buffer_free(alloc);
+                ggml_free(ctx);
+                return false;
+            }
+            const double e_single_cpu =
+                std::fabs(single_value - cpu_value);
+            const double e_id_cpu = std::fabs(id_value - cpu_value);
+            const double e_single_id =
+                std::fabs(single_value - id_value);
+            sum_single_cpu += e_single_cpu * e_single_cpu;
+            sum_id_cpu += e_id_cpu * e_id_cpu;
+            sum_single_id += e_single_id * e_single_id;
+            max_single_cpu = std::max(max_single_cpu, e_single_cpu);
+            max_id_cpu = std::max(max_id_cpu, e_id_cpu);
+            if (e_single_id > max_single_id) {
+                max_single_id = e_single_id;
+                worst_channel = phone_channel_begin + ch;
+            }
+        }
+        std::printf(
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s pos=%d slot=%d expert=%d "
+            "single_vs_cpu_max_abs=%.8g single_vs_cpu_rms=%.8g "
+            "id_vs_cpu_max_abs=%.8g id_vs_cpu_rms=%.8g "
+            "single_vs_id_max_abs=%.8g single_vs_id_rms=%.8g "
+            "worst_channel=%lld status=MEASURED\n",
+            stage, int(target_token), int(target_slot), int(expert),
+            max_single_cpu, std::sqrt(sum_single_cpu / double(channels)),
+            max_id_cpu, std::sqrt(sum_id_cpu / double(channels)),
+            max_single_id, std::sqrt(sum_single_id / double(channels)),
+            (long long)worst_channel);
+    } else {
+        std::fprintf(stderr,
+            "[CYCLE_FFN_GPU_OP_COMPARE] stage=%s status=FAIL "
+            "reason=GPU_GRAPH_COMPUTE\n", stage);
+    }
+    ggml_backend_buffer_free(alloc);
+    ggml_free(ctx);
+    return ok;
+}
+
 // Replay the EXACT packed quantized Phone shard weights with GGML's CPU
 // MUL_MAT_ID, selecting only experts used by this ubatch. The Phone tensor
 // is read via RPC without re-quantization; selected experts are compacted
