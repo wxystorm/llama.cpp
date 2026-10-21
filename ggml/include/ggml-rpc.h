@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    24
+#define RPC_PROTO_PATCH_VERSION    25
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -307,6 +307,22 @@ using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
         ggml_backend_t backend,
         struct ggml_backend_rpc_snapshot_stats * stats);
 // backend API
+// Physically sourced Phone->PC Cycle wire transfers. Call only while the
+// borrowed RPC tensors' graph allocations are live, after device completion.
+// The Phone RPC server reads its LOCAL tensor data and queues the encoded
+// READY/PARTIAL on the existing independent inference data-plane socket.
+// The control RPC never uploads the payload from the PC.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_ready(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * residual, const ggml_tensor * norm,
+        const ggml_tensor * ids, const ggml_tensor * routing);
+
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_partial(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        const ggml_tensor * partial);
+
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
