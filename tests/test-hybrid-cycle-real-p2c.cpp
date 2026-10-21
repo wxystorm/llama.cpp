@@ -1520,13 +1520,16 @@ int main(int argc, char ** argv) {
             // either backend is reused for another case.
             std::vector<float> ph_raw_down;
             std::vector<float> pc_raw_down;
+            cycle_real_ffn_stages ph_stages;
+            cycle_real_ffn_stages pc_stages;
             auto phone_probe = std::async(std::launch::async, [&] {
                 std::vector<float> result;
                 if (!cycle_real_execute_ffn(
                         phone, phone_weights,
                         input_norm, input_ids, input_routing,
                         hidden, ntokens, topk, experts, result,
-                        capture_down ? &ph_raw_down : nullptr)) {
+                        capture_down ? &ph_raw_down : nullptr,
+                        capture_down ? &ph_stages : nullptr)) {
                     result.clear();
                 }
                 return result;
@@ -1536,7 +1539,8 @@ int main(int argc, char ** argv) {
                 cpu, pc_weights,
                 input_norm, input_ids, input_routing,
                 hidden, ntokens, topk, experts, pc_probe,
-                capture_down ? &pc_raw_down : nullptr);
+                capture_down ? &pc_raw_down : nullptr,
+                capture_down ? &pc_stages : nullptr);
             const std::vector<float> ph_probe = phone_probe.get();
             if (!pc_probe_ok ||
                 pc_probe.size() != size_t(hidden * ntokens) ||
@@ -1551,6 +1555,108 @@ int main(int argc, char ** argv) {
                 sum_output[j] = pc_probe[j] + ph_probe[j];
             }
             if (capture_down) {
+                // Compare the *first* divergent FFN stage, retaining the
+                // original per-expert channel order. Split intervals for
+                // Q4_K_M are contiguous along n_ff:
+                // PC [0,pc_channels), Phone [pc_channels,total_channels).
+                // Q4_K block-alignment has already been validated by the
+                // physical weight partition checks above.
+                const int64_t pc_channels = pc_weights.up->ne[1];
+                const int64_t ph_channels = phone_weights.up->ne[1];
+                const int64_t full_channels = reference_model_ffn_channels;
+                if (pc_channels <= 0 || ph_channels <= 0 ||
+                    pc_channels + ph_channels != full_channels) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FFN_STAGE_DIFF] status=FAIL "
+                        "reason=CHANNEL_PARTITION pc=%lld phone=%lld full=%lld\n",
+                        (long long)pc_channels, (long long)ph_channels,
+                        (long long)full_channels);
+                    return false;
+                }
+                const auto compare_stages = [&](const char * stage_name,
+                        const std::vector<float> & oracle,
+                        const std::vector<float> & pc_values,
+                        const std::vector<float> & ph_values) -> bool {
+                    const size_t rows = size_t(topk * ntokens);
+                    if (oracle.size() != size_t(full_channels) * rows ||
+                        pc_values.size() != size_t(pc_channels) * rows ||
+                        ph_values.size() != size_t(ph_channels) * rows) {
+                        std::fprintf(stderr,
+                            "[CYCLE_FFN_STAGE_DIFF] stage=%s status=FAIL "
+                            "reason=TENSOR_SHAPE full=%zu pc=%zu phone=%zu\n",
+                            stage_name, oracle.size(), pc_values.size(),
+                            ph_values.size());
+                        return false;
+                    }
+                    for (int dev = 0; dev < 2; ++dev) {
+                        const bool is_pc = dev == 0;
+                        const int64_t width = is_pc ? pc_channels : ph_channels;
+                        const int64_t channel_base = is_pc ? 0 : pc_channels;
+                        const auto & actual = is_pc ? pc_values : ph_values;
+                        const char * owner = is_pc ? "PC_CPU" : "PHONE_GPU";
+                        double err_sq = 0.0;
+                        double worst_err = -1.0;
+                        int64_t worst_row = -1;
+                        int64_t worst_channel = -1;
+                        float worst_ref = 0.0f;
+                        float worst_actual = 0.0f;
+                        for (int64_t row = 0; row < int64_t(rows); ++row) {
+                            for (int64_t ch = 0; ch < width; ++ch) {
+                                const size_t target = size_t(row * width + ch);
+                                const size_t source = size_t(
+                                    row * full_channels + channel_base + ch);
+                                const double x = actual[target];
+                                const double y = oracle[source];
+                                if (!std::isfinite(x) || !std::isfinite(y)) {
+                                    std::fprintf(stderr,
+                                        "[CYCLE_FFN_STAGE_DIFF] stage=%s "
+                                        "backend=%s status=FAIL "
+                                        "reason=NONFINITE_VALUE row=%lld channel=%lld\n",
+                                        stage_name, owner, (long long)row,
+                                        (long long)ch);
+                                    return false;
+                                }
+                                const double e = std::fabs(x - y);
+                                err_sq += e * e;
+                                if (e > worst_err) {
+                                    worst_err = e;
+                                    worst_row = row;
+                                    worst_channel = channel_base + ch;
+                                    worst_ref = float(y);
+                                    worst_actual = float(x);
+                                }
+                            }
+                        }
+                        const int64_t token = worst_row / topk;
+                        const int64_t slot = worst_row % topk;
+                        const int32_t expert_id = input_ids[
+                            size_t(token * topk + slot)];
+                        const double rms = std::sqrt(
+                            err_sq / double(actual.size()));
+                        std::printf(
+                            "[CYCLE_FFN_STAGE_DIFF] stage=%s backend=%s "
+                            "max_abs=%.8g rms=%.8g pos=%lld "
+                            "expert_slot=%lld expert_id=%d channel=%lld "
+                            "cpu_value=%.8g shard_value=%.8g status=MEASURED\n",
+                            stage_name, owner, worst_err, rms,
+                            (long long)token, (long long)slot, expert_id,
+                            (long long)worst_channel,
+                            worst_ref, worst_actual);
+                    }
+                    return true;
+                };
+                if (!compare_stages(
+                        "GATE", baseline_gate,
+                        pc_stages.gate, ph_stages.gate) ||
+                    !compare_stages(
+                        "UP", baseline_up,
+                        pc_stages.up, ph_stages.up) ||
+                    !compare_stages(
+                        "SWIGLU", baseline_swiglu,
+                        pc_stages.swiglu, ph_stages.swiglu)) {
+                    return false;
+                }
+
                 const size_t n_down = size_t(hidden * topk * ntokens);
                 if (baseline_down.size() != n_down ||
                     pc_raw_down.size() != n_down ||
