@@ -85,13 +85,18 @@ inline const char * llama_hybrid_cycle_queue_name(llama_hybrid_cycle_queue queue
 class llama_hybrid_cycle_task_ring {
 public:
     explicit llama_hybrid_cycle_task_ring(
-            const llama_hybrid_cycle_layout & layout, int n_chunks)
-        : layout_(layout), n_chunks_(n_chunks) {
-        if (!layout_.enabled() || n_chunks_ <= 0) {
-            throw std::invalid_argument("cycle task ring requires a nonempty layout and positive chunk count");
+            const llama_hybrid_cycle_layout & layout, int n_chunks,
+            int max_inflight = 0)
+        : layout_(layout), n_chunks_(n_chunks),
+          max_inflight_(max_inflight == 0 ? n_chunks : max_inflight) {
+        if (!layout_.enabled() || n_chunks_ <= 0 ||
+            max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
+            throw std::invalid_argument(
+                "cycle task ring requires positive chunks and valid in-flight window");
         }
         entry_ready_.assign(layout_.kinds.size(), std::vector<uint8_t>(n_chunks_, 0));
         next_chunk_.assign(layout_.kinds.size(), 0);
+        layer_inflight_.assign(layout_.kinds.size(), 0);
         tensor_ready_.assign(layout_.kinds.size(), std::vector<tensor_join_state>(n_chunks_));
     }
 
@@ -265,8 +270,19 @@ private:
             throw std::logic_error("duplicate cycle layer entry");
         }
         entry_ready_[layer][chunk] = 1;
-        while (next_chunk_[layer] < n_chunks_ && entry_ready_[layer][next_chunk_[layer]]) {
+        drain_entry_window(layer);
+    }
+
+    // Apply bounded credits separately at every layer. A late chunk cannot
+    // jump ahead of an earlier KV position and may not allocate a new Phone
+    // Attention graph until one earlier chunk's final Reduce has freed its
+    // entry credit. Default (max_inflight == n_chunks) is legacy behavior.
+    void drain_entry_window(int layer) {
+        while (next_chunk_[layer] < n_chunks_ &&
+               entry_ready_[layer][next_chunk_[layer]] != 0 &&
+               layer_inflight_[layer] < max_inflight_) {
             const int ready_chunk = next_chunk_[layer]++;
+            ++layer_inflight_[layer];
             enqueue(layer, ready_chunk,
                     is_tensor(layout_.kinds[layer]) ?
                         llama_hybrid_cycle_stage::ATTN_PRE :
@@ -275,12 +291,20 @@ private:
     }
 
     void finish_layer(int layer, int chunk) {
+        if (layer_inflight_[layer] <= 0) {
+            throw std::logic_error("cycle layer credit underflow");
+        }
+        --layer_inflight_[layer];
         ++layer_outputs_done_;
+        // Unlock the oldest ready chunk at this layer only after the
+        // previous in-flight output is complete and its buffers are safe.
+        drain_entry_window(layer);
         mark_entry_ready(layer + 1, chunk);
     }
 
     llama_hybrid_cycle_layout layout_;
     int n_chunks_ = 0;
+    int max_inflight_ = 0;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
@@ -290,5 +314,6 @@ private:
     std::set<task_id> seen_;
     std::vector<std::vector<uint8_t>> entry_ready_;
     std::vector<int> next_chunk_;
+    std::vector<int> layer_inflight_;
     std::vector<std::vector<tensor_join_state>> tensor_ready_;
 };
