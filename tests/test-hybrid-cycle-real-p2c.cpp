@@ -792,6 +792,17 @@ static bool cycle_real_receive_live_wire(
     return true;
 }
 
+// CPU-observed Attention phases. For RPC the graph_call_ms is ONLY the
+// submission round trip; Phone kernel execution is asynchronous and must
+// be measured by the server. One FIFO worker owns each queue-local sample.
+struct cycle_real_attention_phase_profile {
+    uint64_t count = 0;
+    double graph_build_ms = 0.0;
+    double alloc_ms = 0.0;
+    double input_copy_ms = 0.0;
+    double graph_call_ms = 0.0;
+};
+
 static bool cycle_real_execute_phone_attention_pre(
         ggml_backend_t backend, const llama_layer & layer,
         const llama_hparams & hp,
@@ -805,7 +816,8 @@ static bool cycle_real_execute_phone_attention_pre(
         int64_t kv_token_start = 0,
         size_t source_device = 1,
         const ggml_tensor * device_input = nullptr,
-        bool retain_device_ready = false) {
+        bool retain_device_ready = false,
+        cycle_real_attention_phase_profile * phase_profile = nullptr) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -1151,6 +1163,21 @@ static bool cycle_real_execute_phone_attention_pre(
     const auto input_done = std::chrono::steady_clock::now();
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     const auto submit_done = std::chrono::steady_clock::now();
+    if (phase_profile) {
+        ++phase_profile->count;
+        phase_profile->graph_build_ms +=
+            std::chrono::duration<double, std::milli>(
+                graph_build_done - graph_build_begin).count();
+        phase_profile->alloc_ms +=
+            std::chrono::duration<double, std::milli>(
+                alloc_done - alloc_begin).count();
+        phase_profile->input_copy_ms +=
+            std::chrono::duration<double, std::milli>(
+                input_done - begin).count();
+        phase_profile->graph_call_ms +=
+            std::chrono::duration<double, std::milli>(
+                submit_done - input_done).count();
+    }
     if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
         std::printf(
             "[CYCLE_ATTN_PROFILE] backend=%s "
