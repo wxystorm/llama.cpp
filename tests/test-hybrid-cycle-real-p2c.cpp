@@ -23,6 +23,7 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "llama-hybrid-cycle.h"
+#include "llama-hybrid-cycle-fifo-executor.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -2180,6 +2181,197 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
     return true;
 }
 
+// Execute one REAL P2C Tensor layer through the same FIFO contract used by
+// the multi-layer Cycle scheduler. Layer-local index 0 maps to the requested
+// physical Qwen3-MoE layer; no synthetic CPU model or hidden FFN recompute is
+// used as a task completion. Future multi-chunk execution can share the
+// worker runtime while extending per-chunk compute and KV ownership.
+static bool cycle_real_execute_p2c_fifo(
+        ggml_backend_t phone, ggml_backend_dev_t cpu_dev,
+        const llama_layer & layer_weights, const llama_hparams & hp,
+        const llama_hybrid_cycle_ffn_shard_weights & pc_weights,
+        const llama_hybrid_cycle_ffn_shard_weights & phone_weights,
+        const std::vector<float> & layer_input,
+        const cycle_real_live_wire & wire,
+        int64_t hidden, int32_t tokens, int64_t topk, int64_t experts) {
+    ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
+    if (!cpu) {
+        std::fprintf(stderr, "[CYCLE_FIFO_REAL] status=FAIL reason=CPU_INIT\n");
+        return false;
+    }
+
+    cycle_real_phone_ready phone_ready;
+    inference_cycle_message ready_msg;
+    inference_cycle_message partial_msg;
+    std::vector<float> pc_partial;
+    std::vector<float> combined_ffn;
+    std::vector<float> combined_output;
+    double phone_attention_ms = 0.0;
+    double pc_ffn_ms = 0.0;
+    double phone_ffn_ms = 0.0;
+    double ready_receive_ms = 0.0;
+    double partial_receive_ms = 0.0;
+    double reduce_ms = 0.0;
+    const auto whole_begin = std::chrono::steady_clock::now();
+
+    // The first integration uses one REAL P2C layer and one chunk, not the
+    // full model's other layer kinds. Every task below drives an actual
+    // device execution or a real Phone->PC data-plane receive.
+    llama_hybrid_cycle_layout fragment;
+    fragment.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    const bool success = llama_hybrid_cycle_run_fifo(
+        fragment, 1, [&](const llama_hybrid_cycle_task & task) -> bool {
+            if (task.layer != 0 || task.chunk != 0) {
+                return false;
+            }
+            const auto started = std::chrono::steady_clock::now();
+            bool ok = false;
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                    // Phone sends READY directly from its Attention tensors.
+                    ok = cycle_real_execute_phone_attention_pre(
+                        phone, layer_weights, hp, layer_input,
+                        hidden, tokens, topk, experts,
+                        phone_ready, phone_attention_ms, &wire);
+                    break;
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                    // This dedicated RX worker must not be run by the
+                    // Phone compute worker. Completion means CPU host READY
+                    // is available; only then can PC FFN be scheduled.
+                    ok = cycle_real_receive_live_wire(
+                        phone, wire, INFERENCE_CYCLE_READY,
+                        uint32_t(tokens), uint32_t(hidden), uint32_t(topk),
+                        ready_msg);
+                    if (ok) {
+                        ok = ready_msg.ready.tokens == uint32_t(tokens) &&
+                             ready_msg.ready.hidden == uint32_t(hidden) &&
+                             ready_msg.ready.topk == uint32_t(topk) &&
+                             ggml_backend_rpc_cycle_send_ack(
+                                 phone, wire.layer, wire.chunk,
+                                 wire.seq, wire.graph_id,
+                                 INFERENCE_CYCLE_READY, true);
+                    }
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE: {
+                    // There is deliberately NO dependence on the PC receive
+                    // of READY. All three FFN inputs are copied locally
+                    // from the borrowed Phone Attention graph buffers.
+                    const std::vector<float> empty_f32;
+                    const std::vector<int32_t> empty_i32;
+                    std::vector<float> unused_partial;
+                    ok = cycle_real_execute_ffn(
+                        phone, phone_weights,
+                        empty_f32, empty_i32, empty_f32,
+                        hidden, tokens, topk, experts,
+                        unused_partial, nullptr, nullptr,
+                        &wire, &phone_ready.phone_graph);
+                    phone_ready.release_phone_graph();
+                    break;
+                }
+                case llama_hybrid_cycle_stage::FFN_DESTINATION:
+                    // The destination FFN runs using only the received
+                    // Phone-owned READY payload, never a local CPU proxy.
+                    ok = cycle_real_execute_ffn(
+                        cpu, pc_weights,
+                        ready_msg.ready.ffn_norm,
+                        ready_msg.ready.topk_ids,
+                        ready_msg.ready.topk_weights,
+                        hidden, tokens, topk, experts, pc_partial);
+                    break;
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    // Real Phone->PC data-plane receive. No duplicate RPC
+                    // tensor_get and no new full-duplex tensor exchange.
+                    ok = cycle_real_receive_live_wire(
+                        phone, wire, INFERENCE_CYCLE_PARTIAL,
+                        uint32_t(tokens), uint32_t(hidden), 0,
+                        partial_msg);
+                    if (ok) {
+                        ok = partial_msg.partial.tokens == uint32_t(tokens) &&
+                             partial_msg.partial.hidden == uint32_t(hidden) &&
+                             partial_msg.partial.partial.size() ==
+                                 size_t(tokens) * size_t(hidden);
+                    }
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    // Ring only enqueues REDUCE when BOTH remote partial
+                    // and local PC FFN have completed. PC is sole owner of
+                    // final ADD and the Phone PARTIAL ACK follows Reduce.
+                    combined_ffn.resize(size_t(tokens) * size_t(hidden));
+                    combined_output.resize(combined_ffn.size());
+                    ok = pc_partial.size() == combined_ffn.size() &&
+                         partial_msg.partial.partial.size() ==
+                             combined_ffn.size();
+                    if (ok) {
+                        for (size_t i = 0; i < combined_ffn.size(); ++i) {
+                            combined_ffn[i] =
+                                pc_partial[i] + partial_msg.partial.partial[i];
+                        }
+                        ok = inference_cycle_reduce_p2c_pc_cpu(
+                            ready_msg.ready,
+                            pc_partial.data(), pc_partial.size(),
+                            partial_msg.partial,
+                            combined_output.data(), combined_output.size());
+                    }
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_send_ack(
+                                 phone, wire.layer, wire.chunk,
+                                 wire.seq, wire.graph_id,
+                                 INFERENCE_CYCLE_PARTIAL, true) &&
+                             ggml_backend_rpc_cycle_wait_tx_idle(phone, 10000);
+                    }
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+            if (task.stage == llama_hybrid_cycle_stage::FFN_SOURCE) {
+                phone_ffn_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::FFN_DESTINATION) {
+                pc_ffn_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION) {
+                ready_receive_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
+                partial_receive_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::REDUCE) {
+                reduce_ms = ms;
+            }
+            std::printf(
+                "[CYCLE_FIFO_REAL_STAGE] layer=%d chunk=%d stage=%s "
+                "queue=%s wall_ms=%.3f status=%s\n",
+                wire.layer, wire.chunk,
+                llama_hybrid_cycle_stage_name(task.stage),
+                llama_hybrid_cycle_queue_name(task.queue),
+                ms, ok ? "OK" : "FAIL");
+            std::fflush(stdout);
+            return ok;
+        });
+
+    // The worker threads are joined before graph buffers/backends are
+    // released. A failed FFN task must not leave borrowed READY GPU
+    // buffers alive beyond the Phone backend's lifetime.
+    phone_ready.release_phone_graph();
+    ggml_backend_free(cpu);
+    const double whole_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - whole_begin).count();
+    std::printf(
+        "[CYCLE_FIFO_REAL_P2C_SUM] layer=%d chunk=%d seq=%llu "
+        "direction=PHONE_TO_PC payload_sends=2 "
+        "attention_owner=PHONE_GPU ffn_source=PHONE_GPU "
+        "ffn_destination=PC_CPU reduce_owner=PC_CPU "
+        "phone_local_handoff=1 phone_duplicate_rpc_readback=0 "
+        "ready_rx_ms=%.3f partial_rx_ms=%.3f "
+        "phone_attn_ms=%.3f phone_ffn_ms=%.3f pc_ffn_ms=%.3f "
+        "reduce_ms=%.3f wall_ms=%.3f "
+        "cpu_parity=NOT_CHECKED status=%s\n",
+        wire.layer, wire.chunk, (unsigned long long) wire.seq,
+        ready_receive_ms, partial_receive_ms,
+        phone_attention_ms, phone_ffn_ms, pc_ffn_ms,
+        reduce_ms, whole_ms, success ? "OK" : "FAIL");
+    return success;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
@@ -2718,6 +2910,21 @@ int main(int argc, char ** argv) {
                     "mode=REAL_RPC_DATA_PLANE endpoint=%s "
                     "source=PHONE_GPU_REMOTE_BUFFERS status=OPEN\n", argv[2]);
     }
+    // Real data-plane runs now default to the FIFO stage executor. Set
+    // LLAMA_HYBRID_CYCLE_REAL_P2C_FIFO=0 to retain the earlier sequential
+    // network diagnostic path while investigating transport behavior.
+    const char * fifo_env = std::getenv("LLAMA_HYBRID_CYCLE_REAL_P2C_FIFO");
+    const bool fifo_enabled = live_wire_enabled &&
+        (fifo_env == nullptr || std::strcmp(fifo_env, "0") != 0);
+    if (fifo_enabled) {
+        const bool ok = cycle_real_execute_p2c_fifo(
+            phone, cpu_dev, lw, model->hparams,
+            pc_weights, phone_weights, ref_input, wire,
+            hidden, ntokens, topk, experts);
+        ggml_backend_free(phone);
+        return ok ? 0 : 1;
+    }
+
     cycle_real_phone_ready phone_ready;
     inference_cycle_message ready_msg;
     double phone_attn_ms = 0.0;
