@@ -112,10 +112,22 @@ public:
         // PC FFN continues to consume the received host READY arrays.
         if (local_phone_ready != nullptr) {
             const auto copy_local = [](const ggml_tensor * src, ggml_tensor * dst) {
-                return src != nullptr && src->buffer != nullptr &&
-                       dst != nullptr && dst->buffer != nullptr &&
-                       ggml_are_same_layout(src, dst) &&
-                       ggml_backend_buffer_copy_tensor(src, dst);
+                if (src == nullptr || dst == nullptr ||
+                    src->buffer == nullptr || dst->buffer == nullptr ||
+                    src->type != dst->type) {
+                    return false;
+                }
+                // ggml_are_same_layout is private to ggml-impl.h and is
+                // not declared for this header. Preserve its exact tensor
+                // type/dimension/stride contract without importing it.
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    if (src->ne[i] != dst->ne[i] ||
+                        src->nb[i] != dst->nb[i]) {
+                        return false;
+                    }
+                }
+                // Direct same-device copy ONLY; never use a host fallback.
+                return ggml_backend_buffer_copy_tensor(src, dst);
             };
             if (!copy_local(local_phone_ready->ffn_norm, ffn_.norm) ||
                 !copy_local(local_phone_ready->topk_ids, ffn_.topk_ids) ||
