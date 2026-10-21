@@ -124,6 +124,26 @@ static bool cycle_real_env_flag(const char * name) {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+static void cycle_real_phone_mem_checkpoint(
+        ggml_backend_dev_t phone_dev, const char * stage) {
+    if (!phone_dev) {
+        return;
+    }
+    // Device-reported OpenCL memory is indicative, not Android MemAvailable
+    // or LMKD attribution. In particular it need not reflect every driver
+    // cache, system allocation or the separate Termux UI process.
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_dev_memory(phone_dev, &free_bytes, &total_bytes);
+    const double mib = 1024.0 * 1024.0;
+    std::printf(
+        "[CYCLE_DIAG_MEMORY] stage=%s phone_free_mib=%.2f "
+        "phone_total_mib=%.2f source=GGML_BACKEND_DEV_MEMORY "
+        "scope=DEVICE_REPORTED_NOT_ANDROID_LMK\n",
+        stage, double(free_bytes) / mib, double(total_bytes) / mib);
+    std::fflush(stdout);
+}
+
 static bool cycle_real_set_env(const char * name, const char * value) {
 #ifdef _WIN32
     return _putenv_s(name, value ? value : "") == 0;
@@ -2342,6 +2362,7 @@ int main(int argc, char ** argv) {
             "[CYCLE_REAL_P2C] status=FAIL reason=NOT_PHONE_GPU\n");
         return 1;
     }
+    cycle_real_phone_mem_checkpoint(phone_dev, "BEFORE_CYCLE_MODEL_LOAD");
     ggml_backend_dev_t devices[3] = {cpu_dev, phone_dev, nullptr};
     llama_model_params mp = llama_model_default_params();
     mp.devices = devices;
@@ -2371,6 +2392,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_CYCLE_MODEL_LOAD");
     const auto & lw = model->layers[size_t(layer)];
     if (!cycle_real_check_phone_weight("ATTN_NORM", lw.attn_norm, phone_dev) ||
         !cycle_real_check_phone_weight("ATTN_Q", lw.wq, phone_dev) ||
@@ -3225,6 +3247,7 @@ int main(int argc, char ** argv) {
         };
         // A: numerical floor of physical Q4_K shards and device kernels,
         // with NO Phone Attention/Router input discrepancy.
+        cycle_real_phone_mem_checkpoint(phone_dev, "BEFORE_CPU_READY_CONTROL");
         if (!run_case("CPU_READY_CONTROL",
                       ref_norm, ref_ids, ref_routing,
                       cpu_ready_control_ffn, extended_diagnostics)) {
@@ -3232,19 +3255,24 @@ int main(int argc, char ** argv) {
             ggml_backend_free(cpu);
             return 1;
         }
-        // The complete math oracle uses the same CPU READY inputs as the
-        // physical-control FFN and captures every selected expert. A probe
-        // failure cannot change the existing official CPU-parity gate.
-        if (ntokens <= 2 &&
-            !cycle_real_probe_full_ffn_f64_oracle(
+        // The complete mathematical oracle consumes the same CPU READY
+        // inputs as the physical-control FFN. All arithmetic and temporary
+        // compute allocations are on the PC CPU. Only packed weight bytes
+        // are read from the existing Phone weight allocation.
+        if (ntokens <= 2) {
+            cycle_real_phone_mem_checkpoint(phone_dev, "BEFORE_CPU_F64_ORACLE");
+            const bool f64_ok = cycle_real_probe_full_ffn_f64_oracle(
                 cpu, pc_weights, phone_weights,
                 ref_norm, ref_ids, ref_routing,
                 baseline_ffn, cpu_ready_control_ffn,
                 ref_residual, baseline_output,
-                hidden, ntokens, topk, experts)) {
-            std::fprintf(stderr,
-                "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
-                "scope=DIAGNOSTIC_ONLY\n");
+                hidden, ntokens, topk, experts);
+            if (!f64_ok) {
+                std::fprintf(stderr,
+                    "[CYCLE_FFN_FULL_F64_ORACLE] status=NOT_AVAILABLE "
+                    "scope=DIAGNOSTIC_ONLY\n");
+            }
+            cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_CPU_F64_ORACLE");
         }
         if (extended_diagnostics) {
         // B: change only the pre-FFN hidden vector.
@@ -3311,6 +3339,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    cycle_real_phone_mem_checkpoint(phone_dev, "BEFORE_REAL_FFN");
     const auto parts_begin = std::chrono::steady_clock::now();
     auto phone_task = std::async(std::launch::async, [&] {
         std::vector<float> part;
@@ -3331,6 +3360,7 @@ int main(int argc, char ** argv) {
         ready_msg.ready.topk_weights,
         hidden, ntokens, topk, experts, pc_part);
     const auto phone_part = phone_task.get();
+    cycle_real_phone_mem_checkpoint(phone_dev, "AFTER_REAL_FFN");
     const double parts_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - parts_begin).count();
 
