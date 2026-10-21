@@ -248,6 +248,245 @@ static std::vector<T> cycle_real_read(
     return out;
 }
 
+// Correctness-first Phone AttentionPre for the first token (position zero).
+// The Qwen3-MoE attention equation is exactly the non-Flash, no-prior-KV
+// branch for this ONE-TOKEN case. Q/K/V, Q/K head RMSNorm, RoPE, grouped
+// attention softmax, output projection, residual, FFN Norm and Router are
+// actual GGML operations executed on Phone GPU with physical model weights.
+//
+// For later positions/chunks we MUST use the canonical KV-aware staged
+// Qwen3-MoE graph, not extrapolate this single-token implementation.
+struct cycle_real_phone_ready {
+    std::vector<float> residual;
+    std::vector<float> norm;
+    std::vector<int32_t> ids;
+    std::vector<float> routing;
+};
+
+static bool cycle_real_execute_phone_attention_pre(
+        ggml_backend_t backend, const llama_layer & layer,
+        const llama_hparams & hp,
+        const std::vector<float> & layer_input,
+        int64_t hidden, int64_t topk, int64_t experts,
+        cycle_real_phone_ready & result,
+        double & elapsed_ms) {
+    if (!backend || ggml_backend_is_meta(backend) ||
+        layer_input.size() != size_t(hidden) ||
+        hp.f_norm_rms_eps <= 0.0f ||
+        topk <= 0 || experts < topk ||
+        layer.wqkv || layer.wq_b || layer.wk_b || layer.wv_b ||
+        layer.wo_b || layer.wq_s || layer.wk_s || layer.wv_s ||
+        layer.wo_s || hp.f_clamp_kqv != 0.0f ||
+        hp.attn_soft_cap || hp.f_max_alibi_bias != 0.0f) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
+            "reason=UNSUPPORTED_FIRST_TOKEN_CONFIGURATION\n");
+        return false;
+    }
+
+    // Meta gives a borrowed tensor on the REAL Phone buffer, not a
+    // retransmitted or re-quantized copy. Empty PC shards are expected.
+    auto get_weight = [](const ggml_tensor * t) -> ggml_tensor * {
+        return ggml_backend_meta_get_static_weight_shard(t, 1);
+    };
+    ggml_tensor * w_attn_norm = get_weight(layer.attn_norm);
+    ggml_tensor * wq = get_weight(layer.wq);
+    ggml_tensor * wk = get_weight(layer.wk);
+    ggml_tensor * wv = get_weight(layer.wv);
+    ggml_tensor * wo = get_weight(layer.wo);
+    ggml_tensor * wq_norm = get_weight(layer.attn_q_norm);
+    ggml_tensor * wk_norm = get_weight(layer.attn_k_norm);
+    ggml_tensor * w_ffn_norm = get_weight(layer.ffn_norm);
+    ggml_tensor * w_router = get_weight(layer.ffn_gate_inp);
+
+    if (!w_attn_norm || !wq || !wk || !wv || !wo ||
+        !wq_norm || !wk_norm || !w_ffn_norm || !w_router) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=PHONE_WEIGHT_MISSING\n");
+        return false;
+    }
+    const int64_t head_dim = wq_norm->ne[0];
+    if (head_dim <= 0 || wk_norm->ne[0] != head_dim ||
+        wq->ne[0] != hidden || wk->ne[0] != hidden ||
+        wv->ne[0] != hidden || wq->ne[1] % head_dim != 0 ||
+        wk->ne[1] % head_dim != 0 ||
+        wv->ne[1] != wk->ne[1] ||
+        wo->ne[0] != wq->ne[1] || wo->ne[1] != hidden ||
+        w_router->ne[0] != hidden || w_router->ne[1] != experts ||
+        w_attn_norm->ne[0] != hidden || w_ffn_norm->ne[0] != hidden ||
+        hp.n_rot_full != uint32_t(head_dim)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=QKV_SHAPE\n");
+        return false;
+    }
+    const int64_t n_heads = wq->ne[1] / head_dim;
+    const int64_t n_kv_heads = wk->ne[1] / head_dim;
+    if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=GQA_HEADS\n");
+        return false;
+    }
+
+    ggml_init_params p {};
+    p.mem_size = 16 * 1024 * 1024;
+    p.no_alloc = true;
+    ggml_context * ctx = ggml_init(p);
+    if (!ctx) {
+        return false;
+    }
+
+    auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
+    auto * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(x);
+    ggml_set_input(positions);
+    ggml_set_name(x, "cycle_phone_attn_input");
+    ggml_set_name(positions, "cycle_phone_position");
+
+    auto * attn_norm = ggml_mul(
+        ctx, ggml_rms_norm(ctx, x, hp.f_norm_rms_eps), w_attn_norm);
+    auto * q = ggml_reshape_3d(ctx,
+        ggml_mul_mat(ctx, wq, attn_norm), head_dim, n_heads, 1);
+    auto * k = ggml_reshape_3d(ctx,
+        ggml_mul_mat(ctx, wk, attn_norm), head_dim, n_kv_heads, 1);
+    auto * v = ggml_reshape_3d(ctx,
+        ggml_mul_mat(ctx, wv, attn_norm), head_dim, n_kv_heads, 1);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, hp.f_norm_rms_eps), wq_norm);
+    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, hp.f_norm_rms_eps), wk_norm);
+
+    // Position 0: RoPE is an identity transform (the comparison below
+    // tests the actual output but NOT nonzero-position/KV correctness).
+    // Run the real op so Q and K stay on the same graph as Attention.
+    const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
+        int(hp.n_ctx_orig_yarn) : 512;
+    const float rope_base = hp.rope_freq_base_train > 0 ?
+        hp.rope_freq_base_train : 10000.0f;
+    const float rope_scale = hp.rope_freq_scale_train > 0 ?
+        hp.rope_freq_scale_train : 1.0f;
+    q = ggml_rope_ext(ctx, q, positions, nullptr,
+        int(head_dim), GGML_ROPE_TYPE_NEOX, ctx_orig,
+        rope_base, rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+    k = ggml_rope_ext(ctx, k, positions, nullptr,
+        int(head_dim), GGML_ROPE_TYPE_NEOX, ctx_orig,
+        rope_base, rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    // Same no-Flash Qwen3 grouped-query layout as build_attn_mha():
+    // [head_dim, 1 token, heads, 1 stream]. With no historical KV,
+    // softmax has exactly one unmasked entry per Q head.
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+    auto * kq = ggml_mul_mat(ctx, k, q);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    auto * probs = ggml_soft_max_ext(
+        ctx, kq, nullptr, 1.0f / std::sqrt(float(head_dim)), 0.0f);
+    auto * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
+    auto * kqv = ggml_mul_mat(ctx, vt, probs);
+    auto * attn = ggml_cont_2d(ctx,
+        ggml_permute(ctx, kqv, 0, 2, 1, 3), hidden, 1);
+
+    auto * attn_output = ggml_mul_mat(ctx, wo, attn);
+    auto * residual = ggml_add(ctx, attn_output, x);
+    auto * norm = ggml_mul(
+        ctx, ggml_rms_norm(ctx, residual, hp.f_norm_rms_eps), w_ffn_norm);
+    auto * router_logits = ggml_mul_mat(ctx, w_router, norm);
+    auto * router_probs = ggml_soft_max(ctx, router_logits);
+    auto * ids = ggml_cont(ctx, ggml_argsort_top_k(
+        ctx, router_probs, int(topk)));
+    auto * router_p3 = ggml_reshape_3d(ctx, router_probs, 1, experts, 1);
+    auto * weights = ggml_get_rows(ctx, router_p3, ids);
+    weights = ggml_reshape_2d(ctx, weights, topk, 1);
+    auto * sum = ggml_sum_rows(ctx, weights);
+    sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
+    weights = ggml_div(ctx, weights, sum);
+    weights = ggml_reshape_3d(ctx, weights, 1, topk, 1);
+    if (hp.expert_weights_scale != 0.0f &&
+        hp.expert_weights_scale != 1.0f) {
+        weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
+    }
+    weights = ggml_cont(ctx, weights);
+
+    const llama_hybrid_cycle_ready_graph ready {
+        residual, norm, ids, weights
+    };
+    if (!llama_hybrid_cycle_ready_graph_valid(ready, hidden, 1, topk)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=READY_SHAPES\n");
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+    ggml_build_forward_expand(graph, ready.residual);
+    ggml_build_forward_expand(graph, ready.ffn_norm);
+    ggml_build_forward_expand(graph, ready.topk_ids);
+    ggml_build_forward_expand(graph, ready.topk_weights);
+
+    int unsupported = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op != GGML_OP_NONE &&
+            !ggml_backend_supports_op(backend, node)) {
+            ++unsupported;
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_ATTN_PRE_OP] node=%d op=%s "
+                "name=%s supported=0\n",
+                i, ggml_op_name(node->op), node->name);
+        }
+    }
+    if (unsupported != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
+            "reason=UNSUPPORTED_PHONE_OP count=%d\n", unsupported);
+        ggml_free(ctx);
+        return false;
+    }
+
+    const auto buft = ggml_backend_get_default_buffer_type(backend);
+    ggml_backend_buffer_t compute_buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!compute_buffer) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ALLOC_PHONE_GRAPH\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    const auto begin = std::chrono::steady_clock::now();
+    const int32_t pos0 = 0;
+    ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(positions, &pos0, 0, sizeof(pos0));
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    bool ok = status == GGML_STATUS_SUCCESS;
+    if (ok) {
+        ggml_backend_synchronize(backend);
+        result.residual.resize(size_t(hidden));
+        result.norm.resize(size_t(hidden));
+        result.ids.resize(size_t(topk));
+        result.routing.resize(size_t(topk));
+        ggml_backend_tensor_get(ready.residual,
+            result.residual.data(), 0, ggml_nbytes(ready.residual));
+        ggml_backend_tensor_get(ready.ffn_norm,
+            result.norm.data(), 0, ggml_nbytes(ready.ffn_norm));
+        ggml_backend_tensor_get(ready.topk_ids,
+            result.ids.data(), 0, ggml_nbytes(ready.topk_ids));
+        ggml_backend_tensor_get(ready.topk_weights,
+            result.routing.data(), 0, ggml_nbytes(ready.topk_weights));
+    }
+    elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    std::printf(
+        "[CYCLE_PHONE_ATTN_PRE] backend=%s "
+        "position=0 tokens=1 heads=%lld kv_heads=%lld "
+        "graph_nodes=%d wall_ms=%.3f status=%s\n",
+        ggml_backend_name(backend),
+        (long long)n_heads, (long long)n_kv_heads,
+        ggml_graph_n_nodes(graph), elapsed_ms,
+        ok ? "OK" : "FAIL");
+
+    ggml_backend_buffer_free(compute_buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 static bool cycle_real_execute_ffn(
         ggml_backend_t backend,
         const llama_hybrid_cycle_ffn_shard_weights & shard,
