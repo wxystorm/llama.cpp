@@ -86,9 +86,10 @@ class llama_hybrid_cycle_task_ring {
 public:
     explicit llama_hybrid_cycle_task_ring(
             const llama_hybrid_cycle_layout & layout, int n_chunks,
-            int max_inflight = 0)
+            int max_inflight = 0, bool credit_until_handoff = false)
         : layout_(layout), n_chunks_(n_chunks),
-          max_inflight_(max_inflight == 0 ? n_chunks : max_inflight) {
+          max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
+          credit_until_handoff_(credit_until_handoff) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -144,6 +145,12 @@ public:
             if (task.stage != llama_hybrid_cycle_stage::FULL_LAYER) {
                 throw std::logic_error("unexpected non-Tensor stage");
             }
+            // This full layer has now consumed the previous layer's
+            // output. Only NOW can the previous owner's GPU/CPU buffer
+            // credit be reused to start another Chunk.
+            if (credit_until_handoff_ && task.layer > 0) {
+                release_layer_credit(task.layer - 1);
+            }
             finish_layer(task.layer, task.chunk);
             return;
         }
@@ -151,6 +158,12 @@ public:
         tensor_join_state & state = tensor_ready_[task.layer][task.chunk];
         switch (task.stage) {
             case llama_hybrid_cycle_stage::ATTN_PRE:
+                // The next Tensor layer has consumed its predecessor's
+                // output in AttentionPre. Preserve the predecessor's
+                // GPU buffer until THIS point, not just its old Reduce.
+                if (credit_until_handoff_ && task.layer > 0) {
+                    release_layer_credit(task.layer - 1);
+                }
                 // Let the sender start its shard without waiting for Send #1.
                 enqueue(task.layer, task.chunk, llama_hybrid_cycle_stage::SEND_ACTIVATION);
                 enqueue(task.layer, task.chunk, llama_hybrid_cycle_stage::FFN_SOURCE);
@@ -290,21 +303,33 @@ private:
         }
     }
 
-    void finish_layer(int layer, int chunk) {
+    void release_layer_credit(int layer) {
         if (layer_inflight_[layer] <= 0) {
             throw std::logic_error("cycle layer credit underflow");
         }
         --layer_inflight_[layer];
-        ++layer_outputs_done_;
-        // Unlock the oldest ready chunk at this layer only after the
-        // previous in-flight output is complete and its buffers are safe.
         drain_entry_window(layer);
+    }
+
+    void finish_layer(int layer, int chunk) {
+        ++layer_outputs_done_;
+        // For the full multi-layer period, output buffers remain owned
+        // by this layer until the successor's FULL_LAYER or ATTN_PRE
+        // actually consumes the tensor. Otherwise Reduce could allow
+        // unbounded pending Phone GPU outputs despite max_inflight=2.
+        // On a single-layer diagnostic or the final layer, the normal
+        // immediate credit release is still correct.
+        if (!credit_until_handoff_ ||
+            layer + 1 == int(layout_.kinds.size())) {
+            release_layer_credit(layer);
+        }
         mark_entry_ready(layer + 1, chunk);
     }
 
     llama_hybrid_cycle_layout layout_;
     int n_chunks_ = 0;
     int max_inflight_ = 0;
+    bool credit_until_handoff_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
