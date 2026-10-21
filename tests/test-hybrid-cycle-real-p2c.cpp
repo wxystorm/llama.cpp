@@ -2758,6 +2758,234 @@ static bool cycle_real_execute_p2c_fifo(
     return success && kv_ok;
 }
 
+// Reverse of P2C: one REAL Tensor C2P layer, sliced into causal chunks.
+// ATTENTION and source FFN: PC CPU. READY and PARTIAL: two PC->Phone data
+// frames/chunk on the SAME FIFO TX queue. Destination FFN + final Reduce:
+// Phone GPU. The Phone server applies both received payloads locally, so
+// neither FFN input nor the final layer output makes a PC return trip.
+struct cycle_real_c2p_chunk {
+    int64_t start = 0;
+    int64_t tokens = 0;
+    cycle_real_live_wire wire;
+    cycle_real_phone_ready pc_ready;
+    std::vector<float> pc_partial;
+    std::unique_ptr<cycle_real_c2p_phone_chunk> phone_gpu;
+    double attention_ms = 0.0;
+    double pc_ffn_ms = 0.0;
+    double phone_ffn_ms = 0.0;
+    double ready_ms = 0.0;
+    double partial_ms = 0.0;
+    double reduce_ms = 0.0;
+};
+
+static bool cycle_real_execute_c2p_fifo(
+        ggml_backend_t phone, ggml_backend_dev_t cpu_dev,
+        const llama_layer & layer, const llama_hparams & hp,
+        const llama_hybrid_cycle_ffn_shard_weights & pc_weights,
+        const llama_hybrid_cycle_ffn_shard_weights & phone_weights,
+        const std::vector<float> & input, const cycle_real_live_wire & base,
+        int64_t hidden, int32_t tokens, int64_t topk, int64_t experts,
+        int32_t chunk_tokens, int max_inflight) {
+    if (!phone || !cpu_dev || hidden <= 0 || tokens <= 0 ||
+        chunk_tokens <= 0 || max_inflight <= 0 ||
+        input.size() != size_t(hidden * tokens)) {
+        return false;
+    }
+    ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, nullptr);
+    if (!cpu) {
+        return false;
+    }
+    const int count = (tokens + chunk_tokens - 1) / chunk_tokens;
+    const int window = std::min(max_inflight, count);
+    std::vector<std::unique_ptr<cycle_real_c2p_chunk>> chunks;
+    chunks.reserve(size_t(count));
+    for (int i = 0; i < count; ++i) {
+        auto st = std::make_unique<cycle_real_c2p_chunk>();
+        st->start = int64_t(i) * chunk_tokens;
+        st->tokens = std::min(
+            int64_t(chunk_tokens), int64_t(tokens) - st->start);
+        st->wire = {base.layer, i, base.seq + uint64_t(i), base.graph_id};
+        chunks.push_back(std::move(st));
+    }
+
+    // The SAME per-layer causal algorithm as P2C, but cached on PC CPU.
+    // This full-prefix K/V is local, not part of either C2P data message.
+    cycle_real_phone_kv_cache pc_kv;
+    if (count > 1 && !pc_kv.init(cpu, layer, tokens, 0)) {
+        std::fprintf(stderr, "[CYCLE_FIFO_C2P] status=FAIL reason=PC_KV_ALLOC\n");
+        ggml_backend_free(cpu);
+        return false;
+    }
+    std::printf(
+        "[CYCLE_FIFO_C2P_PLAN] layer=%d tokens=%d chunk_tokens=%d "
+        "chunks=%d max_inflight=%d kv_owner=PC_CPU "
+        "ffn=PC_CPU+PHONE_GPU reduce_owner=PHONE_GPU "
+        "payloads_per_chunk=2 status=READY\n",
+        base.layer, int(tokens), int(chunk_tokens), count, window);
+    const auto begin = std::chrono::steady_clock::now();
+
+    llama_hybrid_cycle_layout fragment;
+    fragment.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_C2P};
+    const bool ran = llama_hybrid_cycle_run_fifo(
+        fragment, count, [&](const llama_hybrid_cycle_task & task) -> bool {
+            if (task.layer != 0 || task.chunk < 0 || task.chunk >= count) {
+                return false;
+            }
+            auto & st = *chunks[size_t(task.chunk)];
+            const auto started = std::chrono::steady_clock::now();
+            bool ok = false;
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE: {
+                    std::vector<float> x(size_t(st.tokens * hidden));
+                    std::copy_n(
+                        input.data() + size_t(st.start * hidden),
+                        x.size(), x.data());
+                    // source_device=0 is PC CPU, not the P2C Phone shard.
+                    ok = cycle_real_execute_phone_attention_pre(
+                        cpu, layer, hp, x, hidden, st.tokens, topk, experts,
+                        st.pc_ready, st.attention_ms, nullptr,
+                        count > 1 ? &pc_kv : nullptr, st.start, 0);
+                    if (ok) {
+                        st.phone_gpu = std::make_unique<cycle_real_c2p_phone_chunk>();
+                        ok = st.phone_gpu->prepare(
+                            phone, phone_weights, hidden,
+                            st.tokens, topk, experts);
+                    }
+                    break;
+                }
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                    ok = cycle_real_send_c2p_frame(
+                        phone, st.wire, INFERENCE_CYCLE_READY,
+                        st.pc_ready, st.pc_partial,
+                        uint32_t(st.tokens), uint32_t(hidden), uint32_t(topk));
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_apply_ready(
+                            phone, st.wire.layer, st.wire.chunk,
+                            st.wire.seq, st.wire.graph_id,
+                            st.phone_gpu->residual,
+                            st.phone_gpu->inputs.norm,
+                            st.phone_gpu->inputs.topk_ids,
+                            st.phone_gpu->inputs.topk_weights);
+                    }
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_wait_ack(
+                            phone, INFERENCE_CYCLE_READY,
+                            st.wire.layer, st.wire.chunk, st.wire.seq,
+                            st.wire.graph_id, 30000);
+                    }
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE:
+                    // PC can calculate its shard while READY is in flight.
+                    ok = cycle_real_execute_ffn(
+                        cpu, pc_weights, st.pc_ready.norm,
+                        st.pc_ready.ids, st.pc_ready.routing,
+                        hidden, st.tokens, topk, experts, st.pc_partial);
+                    break;
+                case llama_hybrid_cycle_stage::FFN_DESTINATION:
+                    // READY has already been placed on the Phone GPU, and
+                    // this compute needs ZERO PC->Phone control data copies.
+                    ok = st.phone_gpu && st.phone_gpu->execute_ffn();
+                    break;
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    ok = cycle_real_send_c2p_frame(
+                        phone, st.wire, INFERENCE_CYCLE_PARTIAL,
+                        st.pc_ready, st.pc_partial,
+                        uint32_t(st.tokens), uint32_t(hidden), uint32_t(topk));
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_apply_partial(
+                            phone, st.wire.layer, st.wire.chunk,
+                            st.wire.seq, st.wire.graph_id,
+                            st.phone_gpu->pc_partial);
+                    }
+                    // The incoming PC shard is DEVICE-ready now; the ACK
+                    // remains deferred until the Phone Reduce completes.
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    ok = st.phone_gpu && st.phone_gpu->execute_reduce(phone);
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_finish_reduce(
+                            phone, st.wire.layer, st.wire.chunk,
+                            st.wire.seq, st.wire.graph_id);
+                    }
+                    if (ok) {
+                        ok = ggml_backend_rpc_cycle_wait_ack(
+                            phone, INFERENCE_CYCLE_PARTIAL,
+                            st.wire.layer, st.wire.chunk, st.wire.seq,
+                            st.wire.graph_id, 30000);
+                    }
+                    // Return the in-flight credit only after the ONLY
+                    // Phone GPU Reduce and its ACK are both complete.
+                    if (ok) {
+                        st.phone_gpu->release();
+                        st.phone_gpu.reset();
+                    }
+                    break;
+                default:
+                    break;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+            if (task.stage == llama_hybrid_cycle_stage::FFN_SOURCE) {
+                st.pc_ffn_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::FFN_DESTINATION) {
+                st.phone_ffn_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION) {
+                st.ready_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
+                st.partial_ms = ms;
+            } else if (task.stage == llama_hybrid_cycle_stage::REDUCE) {
+                st.reduce_ms = ms;
+            }
+            std::printf(
+                "[CYCLE_FIFO_C2P_STAGE] layer=%d chunk=%d seq=%llu "
+                "pos=[%lld,%lld] stage=%s queue=%s wall_ms=%.3f status=%s\n",
+                st.wire.layer, st.wire.chunk,
+                (unsigned long long)st.wire.seq,
+                (long long)st.start,
+                (long long)(st.start + st.tokens - 1),
+                llama_hybrid_cycle_stage_name(task.stage),
+                llama_hybrid_cycle_queue_name(task.queue),
+                ms, ok ? "OK" : "FAIL");
+            std::fflush(stdout);
+            return ok;
+        }, window);
+    const bool kv_complete = count == 1 || pc_kv.committed_tokens == tokens;
+    pc_kv.release();
+    const bool tx_idle = ggml_backend_rpc_cycle_wait_tx_idle(phone, 10000);
+    ggml_backend_free(cpu);
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    double attn_ms = 0.0, pc_ffn_ms = 0.0, phone_ffn_ms = 0.0;
+    double send_ready_ms = 0.0, send_partial_ms = 0.0, reduce_ms = 0.0;
+    for (const auto & st : chunks) {
+        attn_ms += st->attention_ms;
+        pc_ffn_ms += st->pc_ffn_ms;
+        phone_ffn_ms += st->phone_ffn_ms;
+        send_ready_ms += st->ready_ms;
+        send_partial_ms += st->partial_ms;
+        reduce_ms += st->reduce_ms;
+    }
+    const bool success = ran && kv_complete && tx_idle;
+    std::printf(
+        "[CYCLE_FIFO_REAL_C2P_SUM] layer=%d tokens=%d "
+        "chunks=%d chunk_tokens=%d max_inflight=%d "
+        "direction=PC_TO_PHONE payload_sends=%d "
+        "attention_owner=PC_CPU ffn_source=PC_CPU "
+        "ffn_destination=PHONE_GPU reduce_owner=PHONE_GPU "
+        "phone_ffn_inputs=DEVICE_LOCAL_COPY "
+        "phone_reduce=REAL_GPU_GRAPH phone_output=DEVICE_RESIDENT "
+        "pc_kv=CPU_PERSISTENT phone_duplicate_rpc_readback=0 "
+        "attn_ms=%.3f pc_ffn_ms=%.3f phone_ffn_ms=%.3f "
+        "ready_total_ms=%.3f partial_total_ms=%.3f "
+        "reduce_total_ms=%.3f wall_ms=%.3f "
+        "cpu_parity=NOT_CHECKED status=%s\n",
+        base.layer, int(tokens), count, int(chunk_tokens), window,
+        2 * count, attn_ms, pc_ffn_ms, phone_ffn_ms,
+        send_ready_ms, send_partial_ms, reduce_ms, wall_ms,
+        success ? "OK" : "FAIL");
+    return success;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4 || argc > 6 || !llama_hybrid_cycle_requested()) {
         std::fprintf(stderr,
