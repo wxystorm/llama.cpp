@@ -77,10 +77,9 @@ struct llama_hybrid_cycle_layout {
     int cycle_size = 0;
     int cycles = 0;
     int tail_begin = 0;
-    // Opt-in execution policy for PC full layers in the real Cycle period:
-    // PC CUDA Attention/Router -> PC CPU FFN -> PC CPU residual Reduce.
-    // Placement kinds remain unchanged; the default path stays CPU-only.
-    bool pc_cuda_attn = false;
+    // Opt-in real Cycle policy: execute an entire PC full layer on PC CUDA.
+    // Physical Meta placement and both tensor boundaries are unchanged.
+    bool pc_cuda_full = false;
     std::vector<llama_hybrid_cycle_layer_kind> kinds;
 
     bool enabled() const { return !kinds.empty(); }

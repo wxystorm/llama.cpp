@@ -145,31 +145,6 @@ public:
         const auto kind = layout_.kinds[task.layer];
         const bool tensor = is_tensor(kind);
 
-        if (!tensor && layout_.pc_cuda_attn &&
-            kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
-            // A PC full layer is a local two-device FIFO pipeline in this
-            // opt-in mode, not one blocking CPU FULL_LAYER callback.
-            switch (task.stage) {
-                case llama_hybrid_cycle_stage::ATTN_PRE:
-                    // CUDA has consumed its predecessor's host output and
-                    // synchronized its causal K/V before handing READY to CPU.
-                    if (credit_until_handoff_ && task.layer > 0) {
-                        release_layer_credit(task.layer - 1);
-                    }
-                    enqueue(task.layer, task.chunk,
-                            llama_hybrid_cycle_stage::FFN_SOURCE);
-                    return;
-                case llama_hybrid_cycle_stage::FFN_SOURCE:
-                    enqueue(task.layer, task.chunk,
-                            llama_hybrid_cycle_stage::REDUCE);
-                    return;
-                case llama_hybrid_cycle_stage::REDUCE:
-                    finish_layer(task.layer, task.chunk);
-                    return;
-                default:
-                    throw std::logic_error("unexpected PC CUDA full stage");
-            }
-        }
         if (!tensor) {
             if (task.stage != llama_hybrid_cycle_stage::FULL_LAYER) {
                 throw std::logic_error("unexpected non-Tensor stage");
@@ -269,9 +244,7 @@ private:
         const auto destination = llama_hybrid_cycle_output_owner(kind);
         llama_hybrid_cycle_task task {layer, chunk, stage, source, compute_queue(source)};
 
-        if (layout_.pc_cuda_attn &&
-            kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
-            switch (stage) {
+        switch (stage) {
                 case llama_hybrid_cycle_stage::ATTN_PRE:
                     task.owner = llama_hybrid_cycle_owner::PC_CUDA;
                     task.queue = llama_hybrid_cycle_queue::PC_CUDA;
@@ -288,6 +261,12 @@ private:
 
         switch (stage) {
             case llama_hybrid_cycle_stage::FULL_LAYER:
+                if (layout_.pc_cuda_full &&
+                    kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
+                    task.owner = llama_hybrid_cycle_owner::PC_CUDA;
+                    task.queue = llama_hybrid_cycle_queue::PC_CUDA;
+                }
+                break;
             case llama_hybrid_cycle_stage::ATTN_PRE:
             case llama_hybrid_cycle_stage::FFN_SOURCE:
                 break;
@@ -344,9 +323,7 @@ private:
             const int ready_chunk = next_chunk_[layer]++;
             ++layer_inflight_[layer];
             enqueue(layer, ready_chunk,
-                    (is_tensor(layout_.kinds[layer]) ||
-                     (layout_.pc_cuda_attn &&
-                      layout_.kinds[layer] == llama_hybrid_cycle_layer_kind::PC_CPU)) ?
+                    is_tensor(layout_.kinds[layer]) ?
                         llama_hybrid_cycle_stage::ATTN_PRE :
                         llama_hybrid_cycle_stage::FULL_LAYER);
         }

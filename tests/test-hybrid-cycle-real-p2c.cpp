@@ -634,23 +634,25 @@ static ggml_tensor * cycle_real_resolve_physical_weight(
 }
 
 
- // Copy ONLY the nine PC full-layer Attention/Router weights into CUDA once.
- // Keep the model's existing CPU/Phone physical placement unchanged, so its
- // Meta shard indices and PC FFN ownership are not disturbed.
-struct cycle_real_pc_cuda_attention_weights {
+// Mirror the entire PC full layer (Attention, Router, FFN experts) on CUDA
+// once before the measured period. The CPU+Phone physical Meta layout is
+// unchanged, so Tensor C2P/P2C still use the same model-device indices.
+// No full layer is split between CPU and CUDA in this mode.
+struct cycle_real_pc_cuda_full_weights {
     enum slot : size_t {
-        ATTN_NORM, WQ, WK, WV, WO, Q_NORM, K_NORM, FFN_NORM, ROUTER, COUNT
+        ATTN_NORM, WQ, WK, WV, WO, Q_NORM, K_NORM, FFN_NORM, ROUTER,
+        FFN_UP, FFN_GATE, FFN_DOWN, COUNT
     };
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     std::array<ggml_tensor *, COUNT> tensors {};
 
-    cycle_real_pc_cuda_attention_weights() = default;
-    cycle_real_pc_cuda_attention_weights(
-        const cycle_real_pc_cuda_attention_weights &) = delete;
-    cycle_real_pc_cuda_attention_weights & operator=(
-        const cycle_real_pc_cuda_attention_weights &) = delete;
-    ~cycle_real_pc_cuda_attention_weights() { release(); }
+    cycle_real_pc_cuda_full_weights() = default;
+    cycle_real_pc_cuda_full_weights(
+        const cycle_real_pc_cuda_full_weights &) = delete;
+    cycle_real_pc_cuda_full_weights & operator=(
+        const cycle_real_pc_cuda_full_weights &) = delete;
+    ~cycle_real_pc_cuda_full_weights() { release(); }
 
     void release() {
         if (buffer) {
@@ -673,7 +675,8 @@ struct cycle_real_pc_cuda_attention_weights {
         const ggml_tensor * logical[COUNT] = {
             layer.attn_norm, layer.wq, layer.wk, layer.wv, layer.wo,
             layer.attn_q_norm, layer.attn_k_norm, layer.ffn_norm,
-            layer.ffn_gate_inp
+            layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps,
+            layer.ffn_down_exps
         };
         std::array<const ggml_tensor *, COUNT> physical {};
         for (size_t i = 0; i < COUNT; ++i) {
@@ -711,7 +714,7 @@ struct cycle_real_pc_cuda_attention_weights {
         size_t upload_bytes = 0;
         for (size_t i = 0; i < COUNT; ++i) {
             // One-time CPU -> CUDA copy; never re-upload model weights per
-            // Chunk. Dynamic READY tensors are separately read back to CPU.
+            // Chunk. Only final full-layer output is read back to the host.
             ggml_backend_tensor_copy(physical[i], tensors[i]);
             upload_bytes += ggml_nbytes(physical[i]);
         }
@@ -723,11 +726,15 @@ struct cycle_real_pc_cuda_attention_weights {
             double(upload_bytes) / (1024.0 * 1024.0));
         return true;
     }
+
+    llama_hybrid_cycle_ffn_shard_weights full_ffn_shard() const {
+        return {tensors[FFN_UP], tensors[FFN_GATE], tensors[FFN_DOWN]};
+    }
 };
 
 struct cycle_real_pc_cuda_runtime {
     ggml_backend_t backend = nullptr;
-    std::vector<std::unique_ptr<cycle_real_pc_cuda_attention_weights>> weights;
+    std::vector<std::unique_ptr<cycle_real_pc_cuda_full_weights>> weights;
     ~cycle_real_pc_cuda_runtime() {
         weights.clear();  // Free GPU weights before destroying CUDA backend.
         if (backend) {
@@ -771,14 +778,14 @@ struct cycle_real_phone_kv_cache {
     bool init(ggml_backend_t backend,
               const llama_layer & layer, int64_t total_tokens,
               size_t source_device = 1,
-              const cycle_real_pc_cuda_attention_weights * cuda_weights = nullptr) {
+              const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr) {
         release();
         const auto * norm = cuda_weights ?
-            cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::K_NORM] :
+            cuda_weights->tensors[cycle_real_pc_cuda_full_weights::K_NORM] :
             cycle_real_resolve_physical_weight(
                 layer.attn_k_norm, backend, source_device);
         const auto * wk = cuda_weights ?
-            cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::WK] :
+            cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WK] :
             cycle_real_resolve_physical_weight(
                 layer.wk, backend, source_device);
         if (!backend || !norm || !wk ||
@@ -928,7 +935,7 @@ static bool cycle_real_execute_phone_attention_pre(
         const ggml_tensor * device_input = nullptr,
         bool retain_device_ready = false,
         cycle_real_attention_phase_profile * phase_profile = nullptr,
-        const cycle_real_pc_cuda_attention_weights * cuda_weights = nullptr) {
+        const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -965,31 +972,31 @@ static bool cycle_real_execute_phone_attention_pre(
         return cycle_real_resolve_physical_weight(t, backend, source_device);
     };
     ggml_tensor * w_attn_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::ATTN_NORM] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::ATTN_NORM] :
         get_weight(layer.attn_norm);
     ggml_tensor * wq = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::WQ] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WQ] :
         get_weight(layer.wq);
     ggml_tensor * wk = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::WK] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WK] :
         get_weight(layer.wk);
     ggml_tensor * wv = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::WV] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WV] :
         get_weight(layer.wv);
     ggml_tensor * wo = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::WO] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WO] :
         get_weight(layer.wo);
     ggml_tensor * wq_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::Q_NORM] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::Q_NORM] :
         get_weight(layer.attn_q_norm);
     ggml_tensor * wk_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::K_NORM] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::K_NORM] :
         get_weight(layer.attn_k_norm);
     ggml_tensor * w_ffn_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::FFN_NORM] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::FFN_NORM] :
         get_weight(layer.ffn_norm);
     ggml_tensor * w_router = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_attention_weights::ROUTER] :
+        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::ROUTER] :
         get_weight(layer.ffn_gate_inp);
 
     if (!w_attn_norm || !wq || !wk || !wv || !wo ||
@@ -3913,8 +3920,12 @@ static bool cycle_real_execute_period_fifo(
     const int64_t experts = model.hparams.n_expert;
     const bool perf_mode = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PERF_MODE");
-    const bool pc_cuda_attn = cycle_real_env_flag(
-        "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN");
+    const bool pc_cuda_full = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PC_CUDA_FULL");
+    if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
+        std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
+                    "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
+    }
     // Opt-in: retain only full-Phone FFN/Reduce graphs after the NEXT
     // layer has consumed their output. This never reuses an in-flight
     // activation, never crosses model layers, and does not alter fences.
@@ -4002,7 +4013,7 @@ static bool cycle_real_execute_period_fifo(
         "[CYCLE_CPU_THREADS] threads=%d source=%s status=OK\n",
         cpu_threads, threads_override ? "ENV" : "GGML_DEFAULT");
     cycle_real_pc_cuda_runtime pc_cuda;
-    if (pc_cuda_attn) {
+    if (pc_cuda_full) {
         // CUDA is a third COMPUTE backend, but it is NOT added to the
         // physical Meta model-device array (CPU=0, Phone=1).
         const auto cuda_dev = ggml_backend_dev_by_name("CUDA0");
@@ -4018,7 +4029,7 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda.weights.resize(size_t(n_layers));
         for (int l = 0; l < layout.x; ++l) {
             auto weights =
-                std::make_unique<cycle_real_pc_cuda_attention_weights>();
+                std::make_unique<cycle_real_pc_cuda_full_weights>();
             if (!weights->prepare(
                     pc_cuda.backend, cpu, model.layers[size_t(l)], l)) {
                 std::fprintf(stderr,
@@ -4031,8 +4042,9 @@ static bool cycle_real_execute_period_fifo(
         }
         std::printf(
             "[CYCLE_PC_CUDA_PLAN] enabled=1 device=%s "
-            "layers=%d attn_queue=PC_CUDA ffn_queue=PC_CPU "
-            "reduce_queue=PC_CPU weight_upload=ONCE_PER_LAYER "
+            "layers=%d full_stage_queue=PC_CUDA "
+            "attention=PC_CUDA ffn=PC_CUDA reduce=PC_CUDA "
+            "tensor_pc_backend=PC_CPU weight_upload=ONCE_PER_LAYER "
             "status=READY\n",
             ggml_backend_dev_name(cuda_dev), layout.x);
     }
@@ -4041,7 +4053,7 @@ static bool cycle_real_execute_period_fifo(
     for (int l = 0; l < n_layers; ++l) {
         auto cache = std::make_unique<cycle_real_phone_kv_cache>();
         const bool pc_source = l <= layout.x;
-        const bool cuda_layer = pc_cuda_attn && l < layout.x;
+        const bool cuda_layer = pc_cuda_full && l < layout.x;
         if (n_chunks > 1 &&
             !cache->init(cuda_layer ? pc_cuda.backend :
                          (pc_source ? cpu : phone),
@@ -4114,7 +4126,7 @@ static bool cycle_real_execute_period_fifo(
     std::fflush(stdout);
 
     llama_hybrid_cycle_layout period = layout;
-    period.pc_cuda_attn = pc_cuda_attn;
+    period.pc_cuda_full = pc_cuda_full;
     period.kinds.resize(size_t(n_layers));
     period.tail_begin = n_layers;
     const auto host_input = [&](int l, int c) -> std::vector<float> {
@@ -4178,7 +4190,99 @@ static bool cycle_real_execute_period_fifo(
             switch (task.stage) {
                 case llama_hybrid_cycle_stage::FULL_LAYER: {
                     if (kind == llama_hybrid_cycle_layer_kind::PC_CPU &&
-                        !pc_cuda_attn) {
+                        pc_cuda_full) {
+                        const auto input = host_input(l, c);
+                        const auto * weights = pc_cuda.weights[size_t(l)].get();
+                        double attn_ms = 0.0;
+                        const auto cuda_begin = std::chrono::steady_clock::now();
+                        ok = weights &&
+                            input.size() == size_t(st.tokens * hidden) &&
+                            cycle_real_execute_phone_attention_pre(
+                                pc_cuda.backend, layer, model.hparams, input,
+                                hidden, st.tokens, topk, experts,
+                                st.ready, attn_ms, nullptr,
+                                n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
+                                st.start, 0, nullptr, true,
+                                perf_mode ? &attn_profile[queue_index] : nullptr,
+                                weights);
+                        if (ok && cycle_real_env_flag(
+                                "LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") &&
+                            size_t(l) < checkpoints.pc_attn_residuals.size()) {
+                            std::vector<float> cuda_residual(
+                                size_t(st.tokens * hidden));
+                            ggml_backend_tensor_get(
+                                st.ready.phone_graph.residual,
+                                cuda_residual.data(), 0,
+                                cuda_residual.size() * sizeof(float));
+                            cycle_real_period_checkpoint(
+                                "PC_CUDA_FULL_ATTN_RESIDUAL", l, c, st.start,
+                                hidden, cuda_residual,
+                                checkpoints.pc_attn_residuals[size_t(l)]);
+                        }
+                        if (ok) {
+                            // Reuse the already-validated GPU FFN+ADD graph
+                            // builder. It is backend-generic; here every
+                            // weight and activation resides on local CUDA.
+                            cycle_real_c2p_phone_chunk full_gpu;
+                            ok = full_gpu.prepare(
+                                pc_cuda.backend, weights->full_ffn_shard(),
+                                hidden, st.tokens, topk, experts,
+                                true, true, false);
+                            if (ok) {
+                                ok = full_gpu.execute_full_local(st.ready);
+                            }
+                            if (ok) {
+                                // CUDA synchronize is real (unlike the RPC
+                                // backend NO-OP), completing the fused FFN
+                                // and residual ADD before tensor readback.
+                                ggml_backend_synchronize(pc_cuda.backend);
+                            }
+                            if (ok && cycle_real_env_flag(
+                                    "LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") &&
+                                size_t(l) < checkpoints.pc_ffn_outputs.size()) {
+                                std::vector<float> cuda_ffn(
+                                    size_t(st.tokens * hidden));
+                                ggml_backend_tensor_get(
+                                    full_gpu.inputs.ffn_output,
+                                    cuda_ffn.data(), 0,
+                                    cuda_ffn.size() * sizeof(float));
+                                cycle_real_period_checkpoint(
+                                    "PC_CUDA_FULL_FFN", l, c, st.start,
+                                    hidden, cuda_ffn,
+                                    checkpoints.pc_ffn_outputs[size_t(l)]);
+                            }
+                            if (ok) {
+                                st.host_output.resize(
+                                    size_t(st.tokens * hidden));
+                                ggml_backend_tensor_get(
+                                    full_gpu.output, st.host_output.data(),
+                                    0, st.host_output.size() * sizeof(float));
+                                cycle_real_numeric_probe(
+                                    "PC_FULL_OUTPUT", l, c, st.host_output);
+                                if (size_t(l) < checkpoints.layer_outputs.size()) {
+                                    cycle_real_period_checkpoint(
+                                        "PC_FULL_OUTPUT", l, c, st.start,
+                                        hidden, st.host_output,
+                                        checkpoints.layer_outputs[size_t(l)]);
+                                }
+                            }
+                        }
+                        // Both CUDA graphs have completed or failed. Do not
+                        // retain borrowed activations beyond this FIFO task.
+                        st.ready.release_phone_graph();
+                        if (stage_detail || !ok) {
+                            std::printf(
+                                "[CYCLE_PC_CUDA_FULL] layer=%d chunk=%d "
+                                "attn_ms=%.3f callback_ms=%.3f "
+                                "output_owner=PC_CUDA readback=FINAL_LOUT "
+                                "status=%s\n",
+                                l, c, attn_ms,
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    cuda_begin).count(),
+                                ok ? "OK" : "FAIL");
+                        }
+                    } else if (kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
                         const auto input = host_input(l, c);
                         double attn_ms = 0.0;
                         ok = input.size() == size_t(st.tokens * hidden) &&
@@ -4470,28 +4574,7 @@ static bool cycle_real_execute_period_fifo(
                 }
                 case llama_hybrid_cycle_stage::ATTN_PRE: {
                     double attn_ms = 0.0;
-                    if (kind == llama_hybrid_cycle_layer_kind::PC_CPU &&
-                        pc_cuda_attn) {
-                        const auto input = host_input(l, c);
-                        const auto * weights = pc_cuda.weights[size_t(l)].get();
-                        ok = weights &&
-                            input.size() == size_t(st.tokens * hidden) &&
-                            cycle_real_execute_phone_attention_pre(
-                                pc_cuda.backend, layer, model.hparams, input,
-                                hidden, st.tokens, topk, experts,
-                                st.ready, attn_ms, nullptr,
-                                n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
-                                st.start, 0, nullptr, false,
-                                perf_mode ? &attn_profile[queue_index] : nullptr,
-                                weights);
-                        if (ok &&
-                            size_t(l) < checkpoints.pc_attn_residuals.size()) {
-                            cycle_real_period_checkpoint(
-                                "PC_FULL_ATTN_RESIDUAL", l, c, st.start, hidden,
-                                st.ready.residual,
-                                checkpoints.pc_attn_residuals[size_t(l)]);
-                        }
-                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         const auto input = host_input(l, c);
                         ok = input.size() == size_t(st.tokens * hidden) &&
                             cycle_real_execute_phone_attention_pre(
@@ -4598,22 +4681,7 @@ static bool cycle_real_execute_period_fifo(
                     break;
                 }
                 case llama_hybrid_cycle_stage::FFN_SOURCE: {
-                    if (kind == llama_hybrid_cycle_layer_kind::PC_CPU &&
-                        pc_cuda_attn) {
-                        const auto weights = full_shard(l, 0);
-                        ok = cycle_real_execute_ffn(
-                            cpu, weights, st.ready.norm,
-                            st.ready.ids, st.ready.routing,
-                            hidden, st.tokens, topk, experts,
-                            st.partial, nullptr, nullptr, nullptr, nullptr,
-                            perf_mode ? &ffn_profile[queue_index] : nullptr);
-                        if (ok &&
-                            size_t(l) < checkpoints.pc_ffn_outputs.size()) {
-                            cycle_real_period_checkpoint(
-                                "PC_FULL_FFN", l, c, st.start, hidden,
-                                st.partial, checkpoints.pc_ffn_outputs[size_t(l)]);
-                        }
-                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
                             cpu, weights, st.ready.norm,
@@ -4682,29 +4750,7 @@ static bool cycle_real_execute_period_fifo(
                     break;
                 }
                 case llama_hybrid_cycle_stage::REDUCE: {
-                    if (kind == llama_hybrid_cycle_layer_kind::PC_CPU &&
-                        pc_cuda_attn) {
-                        st.host_output = std::move(st.partial);
-                        ok = st.host_output.size() == st.ready.residual.size();
-                        if (ok) {
-                            for (size_t i = 0; i < st.host_output.size(); ++i) {
-                                st.host_output[i] += st.ready.residual[i];
-                            }
-                            cycle_real_numeric_probe(
-                                "PC_FULL_OUTPUT", l, c, st.host_output);
-                            if (size_t(l) < checkpoints.layer_outputs.size()) {
-                                cycle_real_period_checkpoint(
-                                    "PC_FULL_OUTPUT", l, c, st.start, hidden,
-                                    st.host_output,
-                                    checkpoints.layer_outputs[size_t(l)]);
-                            }
-                        }
-                        st.ready.residual.clear();
-                        st.ready.norm.clear();
-                        st.ready.ids.clear();
-                        st.ready.routing.clear();
-                        st.ready.router_probs.clear();
-                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         ok = st.phone_output &&
                             st.phone_output->execute_reduce(phone);
                         if (ok) {
@@ -4887,10 +4933,15 @@ static bool cycle_real_execute_period_fifo(
     const bool ok = execution_ok && (perf_mode || parity_ok);
     std::printf(
         "[CYCLE_PC_CUDA_SUM] enabled=%d pc_full_layers=%d "
-        "attention=PC_CUDA ffn=PC_CPU reduce=PC_CPU "
-        "kv_owner=%s status=%s\n",
-        pc_cuda_attn ? 1 : 0, layout.x,
-        pc_cuda_attn ? "PC_CUDA" : "PC_CPU",
+        "stage=FULL_LAYER queue=%s "
+        "attention=%s ffn=%s reduce=%s "
+        "tensor_pc_backend=PC_CPU kv_owner=%s status=%s\n",
+        pc_cuda_full ? 1 : 0, layout.x,
+        pc_cuda_full ? "PC_CUDA" : "PC_CPU",
+        pc_cuda_full ? "PC_CUDA" : "PC_CPU",
+        pc_cuda_full ? "PC_CUDA" : "PC_CPU",
+        pc_cuda_full ? "PC_CUDA" : "PC_CPU",
+        pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
     std::printf(
         "[CYCLE_PHONE_FULL_FUSE_SUM] enabled=%d scope=PHONE_FULL "
