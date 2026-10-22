@@ -2737,6 +2737,7 @@ struct cycle_real_c2p_phone_chunk {
     double ffn_graph_submit_ms = 0.0;
     double reduce_graph_submit_ms = 0.0;
     bool is_full_layer = false;
+    bool fused_full_graph = false;
     // Persisted FFN/Reduce graph is safe to replay ONLY for the same
     // physical layer (owned by its per-layer pool) and token shape.
     int64_t prepared_tokens = 0;
@@ -2758,6 +2759,7 @@ struct cycle_real_c2p_phone_chunk {
         reduce_graph = nullptr;
         inputs = {};
         is_full_layer = false;
+        fused_full_graph = false;
         prepared_tokens = 0;
     }
 
@@ -2765,7 +2767,7 @@ struct cycle_real_c2p_phone_chunk {
             ggml_backend_t phone,
             const llama_hybrid_cycle_ffn_shard_weights & shard,
             int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
-            bool full_layer = false) {
+            bool full_layer = false, bool fuse_full = false) {
         const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
@@ -2776,6 +2778,7 @@ struct cycle_real_c2p_phone_chunk {
             return false;
         }
         is_full_layer = full_layer;
+        fused_full_graph = full_layer && fuse_full;
         inputs = llama_hybrid_cycle_make_ffn_graph_inputs(ctx, hidden, tokens, topk);
         residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         if (!full_layer) {
@@ -2797,33 +2800,33 @@ struct cycle_real_c2p_phone_chunk {
         inputs.ffn_output = ggml_cont(ctx, sum);
         ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         auto * ffn_graph = ggml_new_graph_custom(ctx, 512, false);
-        ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
 
-        // C2P Reduce consumes two FFN shards, while a FULL phone layer
-        // consumes only its own physical full-width FFN. Both operate
-        // directly on GPU tensors and never return hidden activations.
+        // C2P Reduce needs the remote PC shard, so it MUST remain split.
+        // For a complete Phone layer, one opt-in FFN + residual ADD graph
+        // replaces a separate one-node ADD graph and its RPC fence.
+        // The original FFN-only/Reduce graphs remain the default.
         auto * ffnsum = full_layer ?
             inputs.ffn_output :
             ggml_add(ctx, inputs.ffn_output, pc_partial);
         output = ggml_add(ctx, residual, ffnsum);
         ggml_set_name(output, full_layer ?
             "cycle_num_phone_full_lout" : "cycle_num_c2p_lout");
-        reduce_graph = ggml_new_graph_custom(ctx, 16, false);
-        // ggml_graph_add_node() merely appends a pointer. Unlike the
-        // canonical ggml_build_forward_expand(), it does NOT set the
-        // GGML_TENSOR_FLAG_COMPUTE flag. GPU backends can therefore report
-        // GRAPH_COMPUTE success while skipping these ADD nodes and leaving
-        // their output allocations untouched (all zeros on OpenCL).
-        //
-        // Keep this graph limited to its one/two Reduce ADD nodes: using
-        // ggml_build_forward_expand() here would traverse the already-run
-        // FFN graph and execute it a second time.
-        if (!full_layer) {
-            ffnsum->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            ggml_graph_add_node(reduce_graph, ffnsum);
+        if (fused_full_graph) {
+            // Canonical build also sets GGML_TENSOR_FLAG_COMPUTE. Unlike
+            // the split Reduce graph, recursion here is intentional.
+            ggml_build_forward_expand(ffn_graph, output);
+        } else {
+            ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
+            reduce_graph = ggml_new_graph_custom(ctx, 16, false);
+            // Appending a node directly does not set COMPUTE flags.
+            // The independent split Reduce must not recompute the FFN.
+            if (!full_layer) {
+                ffnsum->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_graph_add_node(reduce_graph, ffnsum);
+            }
+            output->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_graph_add_node(reduce_graph, output);
         }
-        output->flags |= GGML_TENSOR_FLAG_COMPUTE;
-        ggml_graph_add_node(reduce_graph, output);
         const auto build_end = std::chrono::steady_clock::now();
         if (!executor.prepare(
                 phone, ctx, ffn_graph, inputs, shard,
@@ -3759,6 +3762,10 @@ static bool cycle_real_execute_period_fifo(
     // activation, never crosses model layers, and does not alter fences.
     const bool phone_full_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_REUSE");
+    // Optional graph fusion for complete Phone layers only. A C2P
+    // Tensor needs the PC partial later and deliberately remains split.
+    const bool phone_full_fuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE");
     if (perf_mode &&
         (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
          cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
@@ -4121,7 +4128,8 @@ static bool cycle_real_execute_period_fifo(
                                 auto & pool = phone_full_pool[size_t(l)];
                                 for (auto it = pool.begin(); it != pool.end(); ++it) {
                                     if ((*it)->is_full_layer &&
-                                        (*it)->prepared_tokens == st.tokens) {
+                                        (*it)->prepared_tokens == st.tokens &&
+                                        (*it)->fused_full_graph == phone_full_fuse) {
                                         st.phone_output = std::move(*it);
                                         pool.erase(it);
                                         ++phone_reuse_stats[size_t(l)].hits;
@@ -4135,7 +4143,7 @@ static bool cycle_real_execute_period_fifo(
                                 const auto weights = full_shard(l, 1);
                                 ok = st.phone_output->prepare(
                                     phone, weights, hidden, st.tokens,
-                                    topk, experts, true);
+                                    topk, experts, true, phone_full_fuse);
                                 if (ok && phone_full_reuse) {
                                     ++phone_reuse_stats[size_t(l)].misses;
                                 }
@@ -4191,8 +4199,14 @@ static bool cycle_real_execute_period_fifo(
                         const auto full_reduce_begin =
                             std::chrono::steady_clock::now();
                         if (ok) {
+                            // FFN fence above has completed the entire
+                            // fused FFN+ADD graph, including l_out.
+                            // Only AFTER that fence may its Attention
+                            // input graph be released.
                             st.ready.release_phone_graph();
-                            ok = st.phone_output->execute_reduce(phone);
+                            if (!st.phone_output->fused_full_graph) {
+                                ok = st.phone_output->execute_reduce(phone);
+                            }
                         }
                         if (perf_mode) {
                             full_detail.reduce_submit_and_cleanup_ms +=
@@ -4200,7 +4214,7 @@ static bool cycle_real_execute_period_fifo(
                                     std::chrono::steady_clock::now() -
                                     full_reduce_begin).count();
                         }
-                        if (ok) {
+                        if (ok && !st.phone_output->fused_full_graph) {
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
@@ -4611,6 +4625,11 @@ static bool cycle_real_execute_period_fifo(
     // cross-backend numerical tolerance difference. STRICT (default)
     // continues to fail when ANY CPU parity chunk exceeds the bound.
     const bool ok = execution_ok && (perf_mode || parity_ok);
+    std::printf(
+        "[CYCLE_PHONE_FULL_FUSE_SUM] enabled=%d scope=PHONE_FULL "
+        "graph_mode=%s async_safety=POST_FFN_FENCE\n",
+        phone_full_fuse ? 1 : 0,
+        phone_full_fuse ? "FFN_AND_ADD_ONE_GRAPH" : "FFN_PLUS_REDUCE");
     if (phone_full_reuse) {
         for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
             const auto & sample = phone_reuse_stats[size_t(l)];
