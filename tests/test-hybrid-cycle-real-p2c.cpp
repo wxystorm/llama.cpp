@@ -5716,14 +5716,34 @@ static bool cycle_real_execute_period_fifo(
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
                                 nullptr, attn_scratch[size_t(l)],
                                 graph_cache_by_layer[size_t(l)]);
-                        if (ok) {
+                        if (ok && !phone_ordered_handoff) {
+                            // Legacy: explicit client-to-Phone completion.
                             ok = cycle_real_explicit_phone_fence(
                                 phone,
                                 perf_mode ? &fence_profile[queue_index] : nullptr,
                                 l, c, "P2C_ATTN");
                         }
                         if (ok) {
+                            // Ordered mode is safe here because the same
+                            // COMPUTE-socket SEND_READY RPC has already read
+                            // the GPU Attention/Router tensors on Phone into
+                            // independent TX staging and ACKed that step.
+                            // The preceding Graph Compute is synchronous on
+                            // the server; this is a completion event, NOT
+                            // merely an asynchronous send() return.
                             retire_device_output(l - 1, c);
+                            if (phone_ordered_handoff) {
+                                ++ordered_p2c_handoffs;
+                                if (stage_detail) {
+                                    std::printf(
+                                        "[CYCLE_PHONE_ORDERED_HANDOFF] "
+                                        "phase=%s layer=%d chunk=%d "
+                                        "kind=P2C_ATTN "
+                                        "completion=READY_STAGED_RPC_ACK "
+                                        "old_fence=ELIDED status=OK\n",
+                                        run_phase, l, c);
+                                }
+                            }
                         }
                     }
                     break;
@@ -6131,6 +6151,16 @@ static bool cycle_real_execute_period_fifo(
         }, window, true, perf_mode ? &fifo_profile : nullptr,
         pc_reduce_priority);
     const auto fifo_done = std::chrono::steady_clock::now();
+    std::printf(
+        "[CYCLE_PHONE_ORDERED_HANDOFF_SUM] phase=%s enabled=%d "
+        "phone_full_attn_fences_elided=%llu "
+        "p2c_attn_fences_elided=%llu "
+        "ffn_and_reduce_fences=UNCHANGED "
+        "graph_reuse=UNCHANGED scratch_reuse=UNCHANGED "
+        "transport=UNCHANGED\n",
+        run_phase, phone_ordered_handoff ? 1 : 0,
+        (unsigned long long) ordered_full_handoffs,
+        (unsigned long long) ordered_p2c_handoffs);
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
     std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
