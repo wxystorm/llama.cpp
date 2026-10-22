@@ -6782,6 +6782,7 @@ public:
             cycle_rx_frames.clear();
             cycle_rx_applied_partial.clear();
         }
+        cycle_server_timing_reset();
         return true;
     }
 
@@ -7250,6 +7251,142 @@ private:
     // A bounded HOST-ready mailbox owned by the Phone server's one RX
     // dispatcher. READY/PARTIAL move to GPU only through control APPLY.
     // An applied PARTIAL is acknowledged only after GPU Reduce completion.
+    // Phone-local Cycle timing. PC proxy callbacks NEVER contribute to these
+    // counters. A data-plane OPEN creates a new session; P2C PARTIAL sends
+    // take cumulative snapshots, so no new RPC command or Fence is needed.
+    struct cycle_server_metric {
+        uint64_t count = 0;
+        double sum_ms = 0.0;
+        double max_ms = 0.0;
+        void add(double value_ms) {
+            ++count;
+            sum_ms += value_ms;
+            max_ms = std::max(max_ms, value_ms);
+        }
+    };
+    struct cycle_server_timing {
+        uint64_t session = 0;
+        std::array<cycle_server_metric, 5> graph_prepare {};
+        std::array<cycle_server_metric, 5> graph_compute_sync {};
+        std::array<cycle_server_metric, 2> c2p_rx_wait {};
+        std::array<cycle_server_metric, 2> c2p_input_ready {};
+        std::array<cycle_server_metric, 2> p2c_gpu_readback {};
+        std::array<cycle_server_metric, 2> p2c_tx_enqueue {};
+        cycle_server_metric c2p_reduce_sync {};
+        std::array<uint64_t, 2> c2p_bytes {};
+        std::array<uint64_t, 2> p2c_bytes {};
+    };
+    std::mutex cycle_server_timing_mutex;
+    cycle_server_timing cycle_server_times {};
+    uint64_t cycle_server_next_session = 0;
+
+    bool cycle_server_timing_enabled() const {
+        return std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr;
+    }
+    void cycle_server_timing_reset() {
+        if (!cycle_server_timing_enabled()) return;
+        std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+        cycle_server_times = {};
+        cycle_server_times.session = ++cycle_server_next_session;
+        GGML_LOG_INFO("[CYCLE_PHONE_SERVER_SESSION] side=PHONE_SERVER "
+            "session=%" PRIu64 " scope=DATA_PLANE_OPEN "
+            "timer=PHONE_MONOTONIC schema=SERVER_ONLY status=READY\n",
+            cycle_server_times.session);
+    }
+    void cycle_server_record_graph(
+            size_t phase, double prepare_ms, double compute_sync_ms) {
+        if (!cycle_server_timing_enabled() || phase >= 5) return;
+        std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+        cycle_server_times.graph_prepare[phase].add(prepare_ms);
+        cycle_server_times.graph_compute_sync[phase].add(compute_sync_ms);
+    }
+    void cycle_server_record_c2p(
+            bool ready, double rx_wait_ms, double input_ready_ms,
+            uint64_t bytes) {
+        if (!cycle_server_timing_enabled()) return;
+        const size_t k = ready ? 0 : 1;
+        std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+        cycle_server_times.c2p_rx_wait[k].add(rx_wait_ms);
+        cycle_server_times.c2p_input_ready[k].add(input_ready_ms);
+        cycle_server_times.c2p_bytes[k] += bytes;
+    }
+    void cycle_server_record_c2p_reduce_sync(double ms) {
+        if (!cycle_server_timing_enabled()) return;
+        std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+        cycle_server_times.c2p_reduce_sync.add(ms);
+    }
+    void cycle_server_record_p2c(
+            bool ready, double readback_ms, double tx_enqueue_ms,
+            uint64_t bytes) {
+        if (!cycle_server_timing_enabled()) return;
+        const size_t k = ready ? 0 : 1;
+        std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+        cycle_server_times.p2c_gpu_readback[k].add(readback_ms);
+        cycle_server_times.p2c_tx_enqueue[k].add(tx_enqueue_ms);
+        cycle_server_times.p2c_bytes[k] += bytes;
+    }
+    void cycle_server_timing_snapshot(int layer, int chunk, uint64_t seq) {
+        if (!cycle_server_timing_enabled()) return;
+        cycle_server_timing p;
+        {
+            std::lock_guard<std::mutex> lock(cycle_server_timing_mutex);
+            p = cycle_server_times;
+        }
+        static const char * phases[5] = {
+            "ATTN", "FFN", "REDUCE", "OTHER", "RECOMPUTE"
+        };
+        uint64_t graph_calls = 0;
+        double graph_compute_ms = 0.0, graph_prepare_ms = 0.0;
+        for (size_t i = 0; i < 5; ++i) {
+            const auto & compute = p.graph_compute_sync[i];
+            const auto & prepare = p.graph_prepare[i];
+            graph_calls += compute.count;
+            graph_compute_ms += compute.sum_ms;
+            graph_prepare_ms += prepare.sum_ms;
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_SERVER_GRAPH_SUM] side=PHONE_SERVER "
+                "scope=DATA_PLANE_SESSION session=%" PRIu64 " phase=%s "
+                "calls=%" PRIu64 " request_prepare_sum_ms=%.3f "
+                "compute_sync_sum_ms=%.3f compute_sync_max_ms=%.3f "
+                "semantics=SERVER_REQUEST_PREP_AND_SYNC_GRAPH\n",
+                p.session, phases[i], compute.count, prepare.sum_ms,
+                compute.sum_ms, compute.max_ms);
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            const char * kind = i == 0 ? "READY" : "PARTIAL";
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_SERVER_C2P_SUM] side=PHONE_SERVER "
+                "scope=DATA_PLANE_SESSION session=%" PRIu64 " kind=%s "
+                "calls=%" PRIu64 " bytes=%" PRIu64 " "
+                "rx_wait_sum_ms=%.3f input_ready_sum_ms=%.3f "
+                "semantics=RX_MAILBOX_WAIT_AND_GPU_UPLOAD_SYNC\n",
+                p.session, kind, p.c2p_rx_wait[i].count, p.c2p_bytes[i],
+                p.c2p_rx_wait[i].sum_ms, p.c2p_input_ready[i].sum_ms);
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_SERVER_P2C_SUM] side=PHONE_SERVER "
+                "scope=DATA_PLANE_SESSION session=%" PRIu64 " kind=%s "
+                "calls=%" PRIu64 " bytes=%" PRIu64 " "
+                "gpu_readback_sum_ms=%.3f tx_enqueue_sum_ms=%.3f "
+                "semantics=GET_TENSOR_AND_TRANSPORT_QUEUE_NOT_WIRE\n",
+                p.session, kind, p.p2c_gpu_readback[i].count,
+                p.p2c_bytes[i], p.p2c_gpu_readback[i].sum_ms,
+                p.p2c_tx_enqueue[i].sum_ms);
+        }
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_SERVER_SUM] side=PHONE_SERVER "
+            "scope=DATA_PLANE_SESSION session=%" PRIu64 " "
+            "snapshot=AFTER_P2C_PARTIAL_ENQUEUE layer=%d chunk=%d "
+            "seq=%" PRIu64 " graph_calls=%" PRIu64 " "
+            "graph_request_prepare_sum_ms=%.3f "
+            "graph_compute_sync_sum_ms=%.3f "
+            "c2p_finish_sync_sum_ms=%.3f "
+            "wall_total=NOT_MEASURED queue_overlap=POSSIBLE "
+            "cross_device_addition=FORBIDDEN\n",
+            p.session, layer, chunk, seq, graph_calls,
+            graph_prepare_ms, graph_compute_ms,
+            p.c2p_reduce_sync.sum_ms);
+    }
+
     std::mutex cycle_rx_mutex;
     std::condition_variable cycle_rx_cv;
     std::map<cycle_rx_key, inference_cycle_message> cycle_rx_frames;
@@ -8994,6 +9131,10 @@ bool rpc_server::apply_inference_cycle(
         request.layer, request.chunk, request.seq,
         (ready ? 2 * n + 2 * routes : n) * sizeof(float));
     if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        cycle_server_record_c2p(
+            ready, (rx_ready_us - apply_begin_us) / 1000.0,
+            (gpu_input_ready_us - rx_ready_us) / 1000.0,
+            (ready ? 2 * n + 2 * routes : n) * sizeof(float));
         GGML_LOG_INFO(
             "[CYCLE_C2P_RX_PROFILE] kind=%s layer=%d chunk=%d "
             "seq=%" PRIu64 " rx_wait_ms=%.3f "
@@ -9045,6 +9186,8 @@ bool rpc_server::finish_inference_cycle(
         " reduce=PHONE_GPU ack=PARTIAL_DEVICE_READY status=OK\n",
         request.layer, request.chunk, request.seq);
     if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        cycle_server_record_c2p_reduce_sync(
+            (wait_end_us - wait_begin_us) / 1000.0);
         GGML_LOG_INFO(
             "[CYCLE_C2P_GPU_WAIT] layer=%d chunk=%d seq=%" PRIu64
             " gpu_wait_ms=%.3f source=PHONE_SERVER_BACKEND_SYNC\n",
@@ -9113,6 +9256,9 @@ bool rpc_server::send_inference_cycle(
     };
 
     bool ok = false;
+    const int64_t readback_begin_us = ggml_time_us();
+    int64_t readback_done_us = readback_begin_us;
+    double tx_enqueue_ms = 0.0;
     if (ready) {
         std::vector<float> residual(n), norm(n), weights(r);
         std::vector<int32_t> ids(r);
@@ -9120,6 +9266,7 @@ bool rpc_server::send_inference_cycle(
              read(1, GGML_TYPE_F32, n, norm.data()) &&
              read(2, GGML_TYPE_I32, r, ids.data()) &&
              read(3, GGML_TYPE_F32, r, weights.data());
+        readback_done_us = ggml_time_us();
         if (ok) {
             cycle_phone_numeric_host("P2C_SEND_GPU_READ", "residual",
                 residual.data(), n, request.layer, request.chunk);
@@ -9129,24 +9276,47 @@ bool rpc_server::send_inference_cycle(
                 request.tokens, request.hidden, request.topk,
                 residual.data(), norm.data(), ids.data(), weights.data()
             };
+            const int64_t tx_begin_us = ggml_time_us();
             ok = inference_cycle_send_ready(
                 *transport, INFERENCE_CYCLE_PHONE_TO_PC,
                 request.layer, request.chunk, request.seq, request.graph_id,
                 view);
+            tx_enqueue_ms = (ggml_time_us() - tx_begin_us) / 1000.0;
         }
     } else {
         std::vector<float> partial(n);
         ok = read(0, GGML_TYPE_F32, n, partial.data());
+        readback_done_us = ggml_time_us();
         if (ok) {
             cycle_phone_numeric_host("P2C_SEND_GPU_READ", "phone_partial",
                 partial.data(), n, request.layer, request.chunk);
             const inference_cycle_partial_view view {
                 request.tokens, request.hidden, partial.data()
             };
+            const int64_t tx_begin_us = ggml_time_us();
             ok = inference_cycle_send_partial(
                 *transport, INFERENCE_CYCLE_PHONE_TO_PC,
                 request.layer, request.chunk, request.seq, request.graph_id,
                 view);
+            tx_enqueue_ms = (ggml_time_us() - tx_begin_us) / 1000.0;
+        }
+    }
+    if (ok && cycle_server_timing_enabled()) {
+        const double readback_ms =
+            (readback_done_us - readback_begin_us) / 1000.0;
+        cycle_server_record_p2c(ready, readback_ms,
+                                tx_enqueue_ms, wire_bytes);
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_SERVER_TX] side=PHONE_SERVER kind=%s "
+            "layer=%d chunk=%d seq=%" PRIu64
+            " bytes=%zu gpu_readback_ms=%.3f "
+            "tx_enqueue_ms=%.3f wire_complete=NOT_MEASURED\n",
+            ready ? "READY" : "PARTIAL",
+            request.layer, request.chunk, request.seq,
+            wire_bytes, readback_ms, tx_enqueue_ms);
+        if (!ready) {
+            cycle_server_timing_snapshot(
+                request.layer, request.chunk, request.seq);
         }
     }
 
@@ -11401,6 +11571,10 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    // Starts after the RPC command bytes have arrived. It deliberately
+    // excludes socket receive and any PC-side graph-submit wait.
+    const int64_t request_begin_us = cycle_server_timing_enabled() ?
+        ggml_time_us() : 0;
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -11509,6 +11683,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             device,
             graph_uid,
             graph);
+    // Stop immediately after synchronous compute. Numeric probes and
+    // debug GPU readbacks MUST NOT inflate backend execution time.
+    const int64_t t1 = ggml_time_us();
     if (status == GGML_STATUS_SUCCESS) {
         cycle_phone_numeric_reduce_edges(graph, graph_uid, true);
     }
@@ -11529,8 +11706,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             cycle_phone_numeric_tensor("GRAPH_OUTPUT", graph->nodes[i], graph_uid);
         }
     }
-    const int64_t t1 = ggml_time_us();
-
     // This timer runs on the actual Phone RPC server and includes the
     // synchronous backend graph execution. Unlike the client-side
     // FFN_DESTINATION timer, it is NOT merely RPC graph submission.
@@ -11545,6 +11720,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         } else if (n_nodes >= 40 && n_nodes <= 70) {
             phase = "ATTN";
         }
+        const size_t phase_index = n_nodes == 2 ? 2 :
+            n_nodes >= 20 && n_nodes <= 26 ? 1 :
+            n_nodes >= 40 && n_nodes <= 70 ? 0 : 3;
+        cycle_server_record_graph(
+            phase_index, (t0 - request_begin_us) / 1000.0,
+            (t1 - t0) / 1000.0);
         GGML_LOG_INFO(
             "[CYCLE_GPU_SERVER] phase_hint=%s graph_uid=%" PRIu64
             " nodes=%u gpu_compute_ms=%.3f "
@@ -11603,6 +11784,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     const int64_t t1 = ggml_time_us();
 
     if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+        cycle_server_record_graph(4, 0.0, (t1 - t0) / 1000.0);
         GGML_LOG_INFO(
             "[CYCLE_GPU_SERVER] phase_hint=RECOMPUTE "
             "graph_uid=%" PRIu64 " nodes=%d gpu_compute_ms=%.3f "
