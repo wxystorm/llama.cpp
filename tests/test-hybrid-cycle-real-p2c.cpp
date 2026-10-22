@@ -3338,6 +3338,83 @@ struct cycle_real_phone_full_session_pool {
     }
 };
 
+// C2P FFN slot graphs and GPU buffers may outlive individual Cycle periods,
+// but must be retired before the Phone RPC backend or model is destroyed.
+// READY/PARTIAL payloads and wire transaction state are never cached.
+struct cycle_real_c2p_ffn_session_pool {
+    using slot_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
+    ggml_backend_t phone = nullptr;
+    const llama_model * model = nullptr;
+    int layer = -1;
+    int layers = 0;
+    int32_t total_tokens = 0;
+    int chunk_tokens = 0;
+    int window = 0;
+    std::mutex mutex;
+    std::vector<slot_ptr> idle;
+    // Number of prepared/reserved slots including those borrowed by workers.
+    size_t live_slots = 0;
+
+    ~cycle_real_c2p_ffn_session_pool() { clear(); }
+
+    void configure(ggml_backend_t p, const llama_model & m,
+                   const llama_hybrid_cycle_layout & layout,
+                   int32_t tokens, int chunk, int inflight) {
+        clear();
+        phone = p;
+        model = &m;
+        layer = layout.x;
+        layers = layout.cycle_size;
+        total_tokens = tokens;
+        chunk_tokens = chunk;
+        window = inflight;
+    }
+
+    bool matches(ggml_backend_t p, const llama_model & m,
+                 const llama_hybrid_cycle_layout & layout,
+                 int32_t tokens, int chunk, int inflight) const {
+        // Only called between cycles, after every FIFO worker has joined.
+        if (phone != p || model != &m || layer != layout.x ||
+            layers != layout.cycle_size || total_tokens != tokens ||
+            chunk_tokens != chunk || window != inflight ||
+            live_slots > size_t(window) || idle.size() != live_slots) {
+            return false;
+        }
+        for (const auto & slot : idle) {
+            if (!slot || slot->is_full_layer ||
+                slot->prepared_tokens <= 0 ||
+                slot->prepared_tokens > chunk_tokens) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void clear() {
+        // All workers must have joined; perform remote RPC FREE off-lock.
+        std::vector<slot_ptr> to_release;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (idle.size() != live_slots) {
+                std::fprintf(stderr,
+                    "[CYCLE_C2P_FFN_SESSION] status=FAIL "
+                    "reason=TEARDOWN_WITH_BORROWED_SLOT "
+                    "idle=%zu live=%zu\n",
+                    idle.size(), live_slots);
+            }
+            to_release = std::move(idle);
+            live_slots = 0;
+        }
+        to_release.clear();
+        phone = nullptr;
+        model = nullptr;
+        layer = -1;
+        layers = 0;
+        total_tokens = 0;
+        chunk_tokens = window = 0;
+    }
+};
+
 // P2C FFN keeps one complete graph and its Phone GPU compute buffer
 // between chunks. The dedicated PHONE_GPU FIFO worker is its only user:
 // no separate lock or speculative graph execution is needed. Its output
@@ -4284,7 +4361,8 @@ static bool cycle_real_execute_period_fifo(
         int32_t tokens, int chunk_tokens, int max_inflight,
         bool warmup_run = false, uint64_t wire_epoch = 0,
         cycle_real_phone_full_session_pool * phone_full_session = nullptr,
-        cycle_real_pc_cuda_session_pool * pc_cuda_session = nullptr) {
+        cycle_real_pc_cuda_session_pool * pc_cuda_session = nullptr,
+        cycle_real_c2p_ffn_session_pool * c2p_ffn_session = nullptr) {
     const char * run_phase = warmup_run ? "WARMUP" : "MEASURE";
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
@@ -4308,6 +4386,18 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_P2C_FFN_REUSE");
     const bool c2p_ffn_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE");
+    const bool c2p_ffn_session_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_C2P_FFN_SESSION_REUSE");
+    if (c2p_ffn_session_reuse != (c2p_ffn_session != nullptr) ||
+        (c2p_ffn_session_reuse &&
+         (!c2p_ffn_reuse ||
+          !c2p_ffn_session->matches(
+              phone, model, layout, tokens, chunk_tokens, window)))) {
+        std::fprintf(stderr,
+            "[CYCLE_C2P_FFN_SESSION] phase=%s status=FAIL "
+            "reason=REQUIRES_C2P_REUSE_AND_MATCHING_SESSION\n", run_phase);
+        return false;
+    }
     const bool attn_scratch_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
     const bool attn_graph_reuse = cycle_real_env_flag(
@@ -4634,13 +4724,20 @@ static bool cycle_real_execute_period_fifo(
                 phone_full_pool[size_t(l)].size();
         }
     }
-    // C2P setup runs on PC_CPU but finished outputs are retired by
-    // PHONE_GPU, once the successor's Attention fence has completed.
-    // The pool lock protects ONLY pointer transfer / metadata: allocating
-    // or freeing GPU RPC buffers while holding it would block both workers.
-    std::mutex c2p_pool_mutex;
-    std::vector<phone_chunk_ptr> c2p_pool;
-    size_t c2p_live_slots = 0;
+    // C2P setup runs on PC_CPU. PHONE_GPU returns slots only after the
+    // successor's Attention fence; neither worker changes its FIFO order.
+    // This same pointer-transfer lock serves either a period or a session.
+    std::mutex period_c2p_pool_mutex;
+    std::vector<phone_chunk_ptr> period_c2p_pool;
+    size_t period_c2p_live_slots = 0;
+    auto & c2p_pool_mutex = c2p_ffn_session ?
+        c2p_ffn_session->mutex : period_c2p_pool_mutex;
+    auto & c2p_pool = c2p_ffn_session ?
+        c2p_ffn_session->idle : period_c2p_pool;
+    size_t & c2p_live_slots = c2p_ffn_session ?
+        c2p_ffn_session->live_slots : period_c2p_live_slots;
+    const size_t c2p_cached_at_period_start =
+        c2p_ffn_session ? c2p_pool.size() : 0;
     uint64_t c2p_prepares = 0;
     uint64_t c2p_hits = 0;
     uint64_t c2p_retired = 0;
@@ -5617,16 +5714,25 @@ static bool cycle_real_execute_period_fifo(
     // No borrowed input or output outlives the FIFO workers.
     p2c_ffn_slot.reset();
     const auto p2c_pool_release_done = std::chrono::steady_clock::now();
-    // Pool ownership moves out under the mutex. All synchronous RPC frees
-    // run after unlock, since the producer/consumer workers have joined.
+    // Retain fully-drained C2P FFN slots on successful session periods;
+    // otherwise release them while the Phone backend is still available.
     size_t c2p_cached_at_fifo_end = 0;
+    bool c2p_session_drained = true;
     std::vector<phone_chunk_ptr> c2p_to_release;
     if (c2p_ffn_reuse) {
         {
             std::lock_guard<std::mutex> lock(c2p_pool_mutex);
             c2p_cached_at_fifo_end = c2p_pool.size();
-            c2p_to_release = std::move(c2p_pool);
+            if (c2p_ffn_session) {
+                c2p_session_drained =
+                    c2p_cached_at_fifo_end == c2p_live_slots;
+            }
+            if (!c2p_ffn_session || !succeeded || !c2p_session_drained) {
+                c2p_to_release = std::move(c2p_pool);
+                c2p_live_slots = 0;
+            }
         }
+        // RPC buffer frees must never run while holding the pool mutex.
         c2p_to_release.clear();
     }
     const auto c2p_pool_release_done = std::chrono::steady_clock::now();
@@ -5724,7 +5830,8 @@ static bool cycle_real_execute_period_fifo(
         }
     }
     const bool output_ok = succeeded && nonfinite == 0 && max_abs > 0.0;
-    const bool execution_ok = succeeded && kv_ok && net_idle && output_ok;
+    const bool execution_ok =
+        succeeded && kv_ok && net_idle && output_ok && c2p_session_drained;
     // Compare only a COMPLETED period. Never claim CPU parity from a
     // partially filled final_output after a failed stage or transport.
     const bool parity_ok = execution_ok &&
@@ -5859,11 +5966,30 @@ static bool cycle_real_execute_period_fifo(
             "shape_replacements=%llu slots_total=%zu "
             "cached_at_fifo_end=%zu graph_owner=PC_CPU_AND_PHONE_GPU "
             "output_release=SUCCESSOR_ATTN_FENCED "
-            "cache_lifetime=ONE_PERIOD\n",
+            "cache_lifetime=%s\n",
             layout.x, (unsigned long long)c2p_prepares,
             (unsigned long long)c2p_hits, (unsigned long long)c2p_retired,
             (unsigned long long)c2p_shape_replacements,
-            c2p_live_slots, c2p_cached_at_fifo_end);
+            c2p_live_slots, c2p_cached_at_fifo_end,
+            c2p_ffn_session ? "MODEL_SESSION" : "ONE_PERIOD");
+    }
+    if (c2p_ffn_session) {
+        const size_t end_slots = c2p_pool.size();
+        const size_t active_slots = c2p_live_slots >= end_slots ?
+            c2p_live_slots - end_slots : 0;
+        std::printf(
+            "[CYCLE_C2P_FFN_SESSION_SUM] phase=%s layer=%d "
+            "start_slots=%zu prepares=%llu hits=%llu retired=%llu "
+            "shape_replacements=%llu end_slots=%zu active=%zu "
+            "max_slots=%d drained=%d status=%s\n",
+            run_phase, layout.x, c2p_cached_at_period_start,
+            (unsigned long long)c2p_prepares,
+            (unsigned long long)c2p_hits,
+            (unsigned long long)c2p_retired,
+            (unsigned long long)c2p_shape_replacements,
+            end_slots, active_slots, window,
+            c2p_session_drained ? 1 : 0,
+            execution_ok ? "OK" : "FAIL");
     }
     if (perf_mode && (c2p_ffn_reuse || p2c_ffn_reuse)) {
         std::printf(
@@ -6980,6 +7106,8 @@ int main(int argc, char ** argv) {
             }
             const bool phone_full_session_reuse = cycle_real_env_flag(
                 "LLAMA_HYBRID_CYCLE_PHONE_FULL_SESSION_REUSE");
+            const bool c2p_ffn_session_reuse = cycle_real_env_flag(
+                "LLAMA_HYBRID_CYCLE_C2P_FFN_SESSION_REUSE");
             const bool pc_cuda_attn_graph_cache_enabled =
                 cycle_real_env_flag(
                     "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN_GRAPH_CACHE");
@@ -7002,8 +7130,30 @@ int main(int argc, char ** argv) {
                 ggml_backend_free(phone);
                 return 1;
             }
+            if (c2p_ffn_session_reuse &&
+                !cycle_real_env_flag("LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE")) {
+                std::fprintf(stderr,
+                    "[CYCLE_C2P_FFN_SESSION] status=FAIL "
+                    "reason=REQUIRES_C2P_FFN_REUSE\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
             cycle_real_phone_full_session_pool full_session;
             cycle_real_pc_cuda_session_pool pc_cuda_session;
+            cycle_real_c2p_ffn_session_pool c2p_session;
+            if (c2p_ffn_session_reuse) {
+                const int effective_window = std::min(
+                    max_inflight, (int(ntokens) + chunk_tokens - 1) / chunk_tokens);
+                c2p_session.configure(
+                    phone, *model, expected_layout, ntokens,
+                    chunk_tokens, effective_window);
+                std::printf(
+                    "[CYCLE_C2P_FFN_SESSION_PLAN] enabled=1 layer=%d "
+                    "max_slots=%d ownership=MODEL_AND_PHONE_RPC_BACKEND "
+                    "retire=SUCCESSOR_ATTN_FENCED "
+                    "release=BEFORE_PHONE_BACKEND_FREE\n",
+                    expected_layout.x, effective_window);
+            }
             if (pc_cuda_attn_graph_cache_enabled) {
                 if (!cycle_real_env_flag(
                         "LLAMA_HYBRID_CYCLE_PC_CUDA_FULL") ||
@@ -7093,7 +7243,8 @@ int main(int argc, char ** argv) {
                     is_warmup, epoch,
                     phone_full_session_reuse ? &full_session : nullptr,
                     pc_cuda_attn_graph_cache_enabled ?
-                        &pc_cuda_session : nullptr);
+                        &pc_cuda_session : nullptr,
+                    c2p_ffn_session_reuse ? &c2p_session : nullptr);
                 const double run_full_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - run_start).count();
@@ -7107,6 +7258,32 @@ int main(int argc, char ** argv) {
                     phase, epoch, run_full_ms, ok ? "OK" : "FAIL");
                 std::fflush(stdout);
                 if (!ok) break;
+            }
+            if (c2p_ffn_session_reuse) {
+                const size_t slots_before_release = c2p_session.idle.size();
+                const auto release_begin = std::chrono::steady_clock::now();
+                c2p_session.clear();
+                const double release_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        release_begin).count();
+                std::printf(
+                    "[CYCLE_C2P_FFN_SESSION_TEARDOWN] "
+                    "slots_released=%zu release_ms=%.3f "
+                    "included_in=SESSION_LIFETIME_NOT_PERIOD_WALL "
+                    "before_phone_backend_free=1 status=OK\n",
+                    slots_before_release, release_ms);
+                const double session_wall_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        session_run_begin).count();
+                std::printf(
+                    "[CYCLE_C2P_FFN_SESSION_LIFETIME_SUM] "
+                    "run_calls=%d run_call_sum_ms=%.3f "
+                    "teardown_ms=%.3f session_wall_ms=%.3f "
+                    "measurement=INCLUDES_FINAL_REMOTE_BUFFER_FREE\n",
+                    session_run_calls, session_run_call_sum_ms,
+                    release_ms, session_wall_ms);
             }
             if (pc_cuda_attn_graph_cache_enabled) {
                 const size_t graphs_before_release =
