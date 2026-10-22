@@ -3228,12 +3228,9 @@ struct cycle_real_c2p_phone_chunk {
     }
 };
 
-// The Phone FULL graph/compute-buffer cache is optionally owned by the
-// model+Phone-backend session rather than a single Cycle period. ONLY idle
-// FFN/Reduce graphs live here. Attention graphs, activations and KV are
-// always recreated for every period and may not be retained as session data.
-// A reused graph borrows the same physical model weights and RPC backend,
-// so this owner MUST be drained before either weights or backend are freed.
+// The model/Phone RPC session owns idle full-layer FFN slots and optional
+// Attention graph/KV/scratch pools. READY tensors are transient Chunk leases;
+// Graph metadata and scratch physical allocations remain independent.
 struct cycle_real_phone_full_session_pool {
     using slot_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
     ggml_backend_t phone = nullptr;
@@ -3247,16 +3244,21 @@ struct cycle_real_phone_full_session_pool {
     bool fuse = false;
     bool rpc_replay = false;
     bool attn_graph_enabled = false;
+    bool attn_scratch_session_enabled = false;
+    double last_attn_scratch_release_ms = 0.0;
     std::vector<std::vector<slot_ptr>> idle_by_layer;
-    // Only Phone physical layers are session-persistent; PC/CUDA KV stays
-    // strictly per-period. Graphs borrow these exact KV Tensor objects.
+    // Host Graph metadata borrows stable physical KV tensor objects.
     std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> phone_kv;
     std::vector<std::unique_ptr<cycle_real_attention_graph_cache>> attn_graphs;
+    // These pools own only the GPU scratch allocations; they never own
+    // Graphs, KV or cross-period READY activations.
+    std::vector<std::unique_ptr<cycle_real_attention_scratch_pool>> attn_scratch;
 
     void configure(ggml_backend_t p, const llama_model & m,
                    const llama_hybrid_cycle_layout & layout,
                    int32_t tokens, int chunk, int inflight,
-                   bool fusion, bool replay, bool cache_attention) {
+                   bool fusion, bool replay, bool cache_attention,
+                   bool cache_scratch) {
         clear();
         phone = p;
         model = &m;
@@ -3269,6 +3271,7 @@ struct cycle_real_phone_full_session_pool {
         fuse = fusion;
         rpc_replay = replay;
         attn_graph_enabled = cache_attention;
+        attn_scratch_session_enabled = cache_scratch;
         idle_by_layer.resize(size_t(layers));
         if (attn_graph_enabled) {
             phone_kv.resize(size_t(layers));
@@ -3278,23 +3281,49 @@ struct cycle_real_phone_full_session_pool {
                     std::make_unique<cycle_real_attention_graph_cache>();
             }
         }
+        if (attn_scratch_session_enabled) {
+            attn_scratch.resize(size_t(layers));
+            for (int l = x + 1; l < layers; ++l) {
+                auto & pool = attn_scratch[size_t(l)];
+                pool = std::make_unique<cycle_real_attention_scratch_pool>();
+                pool->configure(p, inflight);
+            }
+        }
     }
 
     bool matches(ggml_backend_t p, const llama_model & m,
                  const llama_hybrid_cycle_layout & layout,
                  int32_t tokens, int chunk, int inflight,
-                 bool fusion, bool replay, bool cache_attention) const {
-        return phone == p && model == &m &&
-            layers == layout.cycle_size &&
-            x == layout.x && y == layout.y &&
-            total_tokens == tokens && chunk_tokens == chunk &&
-            window == inflight &&
-            fuse == fusion && rpc_replay == replay &&
-            attn_graph_enabled == cache_attention &&
-            idle_by_layer.size() == size_t(layers) &&
-            (!attn_graph_enabled ||
-             (attn_graphs.size() == size_t(layers) &&
-              phone_kv.size() == size_t(layers)));
+                 bool fusion, bool replay, bool cache_attention,
+                 bool cache_scratch) const {
+        if (!(phone == p && model == &m &&
+              layers == layout.cycle_size &&
+              x == layout.x && y == layout.y &&
+              total_tokens == tokens && chunk_tokens == chunk &&
+              window == inflight &&
+              fuse == fusion && rpc_replay == replay &&
+              attn_graph_enabled == cache_attention &&
+              attn_scratch_session_enabled == cache_scratch &&
+              idle_by_layer.size() == size_t(layers) &&
+              (!attn_graph_enabled ||
+               (attn_graphs.size() == size_t(layers) &&
+                phone_kv.size() == size_t(layers))))) {
+            return false;
+        }
+        if (!attn_scratch_session_enabled) {
+            return attn_scratch.empty();
+        }
+        if (attn_scratch.size() != size_t(layers)) return false;
+        const auto required_buft = ggml_backend_get_default_buffer_type(p);
+        for (int l = x + 1; l < layers; ++l) {
+            const auto & pool = attn_scratch[size_t(l)];
+            if (!pool || pool->buft != required_buft ||
+                pool->max_slots != size_t(window) ||
+                !pool->active.empty()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     size_t cached_slots() const {
@@ -3311,10 +3340,18 @@ struct cycle_real_phone_full_session_pool {
         return result;
     }
 
+    size_t cached_attention_scratch_slots() const {
+        size_t result = 0;
+        for (const auto & pool : attn_scratch) {
+            if (pool) result += pool->idle.size();
+        }
+        return result;
+    }
+
     void clear() {
-        // Destroy host-side Graphs first: they borrow physical KV tensors.
-        // Free KV on Phone RPC only after the graph metadata is gone and
-        // while the backend/model weights still exist.
+        last_attn_scratch_release_ms = 0.0;
+        // Graphs borrow KV and can temporarily bind to Scratch. Always
+        // invalidate graph metadata before freeing any physical buffers.
         for (auto & cache : attn_graphs) {
             if (cache && !cache->is_idle()) {
                 std::fprintf(stderr,
@@ -3323,6 +3360,22 @@ struct cycle_real_phone_full_session_pool {
             }
         }
         attn_graphs.clear();
+        const auto scratch_release_begin = std::chrono::steady_clock::now();
+        for (auto & pool : attn_scratch) {
+            if (!pool) continue;
+            if (!pool->active.empty()) {
+                std::fprintf(stderr,
+                    "[CYCLE_ATTN_SCRATCH_SESSION] status=FAIL "
+                    "reason=TEARDOWN_WITH_ACTIVE_LEASE count=%zu\n",
+                    pool->active.size());
+            }
+            pool->clear();  // RPC FREE before the Phone backend is destroyed.
+        }
+        attn_scratch.clear();
+        last_attn_scratch_release_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() -
+                scratch_release_begin).count();
         for (auto & cache : phone_kv) {
             if (cache) cache->release();
         }
@@ -3335,6 +3388,37 @@ struct cycle_real_phone_full_session_pool {
         total_tokens = 0;
         chunk_tokens = window = 0;
         fuse = rpc_replay = attn_graph_enabled = false;
+        attn_scratch_session_enabled = false;
+    }
+};
+
+// Snapshot cumulative counters at a period boundary. Session reuse should
+// report Measure-only allocations, hits and times, not Warmup totals.
+struct cycle_real_attn_scratch_period_stats {
+    size_t start_slots = 0;
+    uint64_t allocations = 0;
+    uint64_t hits = 0;
+    uint64_t evictions = 0;
+    uint64_t fallbacks = 0;
+    uint64_t recycled = 0;
+    uint64_t bind_failures = 0;
+    double size_query_ms = 0.0;
+    double buffer_alloc_ms = 0.0;
+    double graph_bind_ms = 0.0;
+    double buffer_free_ms = 0.0;
+
+    void capture(const cycle_real_attention_scratch_pool & pool) {
+        start_slots = pool.idle.size();
+        allocations = pool.allocations;
+        hits = pool.hits;
+        evictions = pool.evictions;
+        fallbacks = pool.fallbacks;
+        recycled = pool.recycled;
+        bind_failures = pool.bind_failures;
+        size_query_ms = pool.size_query_ms;
+        buffer_alloc_ms = pool.buffer_alloc_ms;
+        graph_bind_ms = pool.graph_bind_ms;
+        buffer_free_ms = pool.buffer_free_ms;
     }
 };
 
