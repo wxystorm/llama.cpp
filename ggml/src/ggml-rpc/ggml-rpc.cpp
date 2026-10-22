@@ -7462,7 +7462,14 @@ public:
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
-        ggml_cgraph          * graph;
+        ggml_cgraph          * graph = nullptr;
+
+        // Only Graphs explicitly registered for Phone-local Cycle replay
+        // retain their GPU-buffer dependencies here. A freed FFN slot must
+        // not leave a runnable graph pointing to stale OpenCL allocations.
+        // Ordinary RPC graph caching keeps its existing lifetime behavior.
+        bool cycle_registered = false;
+        std::vector<uint64_t> cycle_buffer_dependencies;
     };
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -8240,6 +8247,31 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
+    }
+    // Registered Phone-local FFN/Full graphs borrow this buffer. Expire
+    // ONLY graphs explicitly registered for Cycle replay, before releasing
+    // the allocation; an unregistered stale UID must never be recomputed.
+    // The main COMPUTE socket orders this FREE after the last completion
+    // acknowledgement and after the caller has retired the slot.
+    for (uint32_t device = 0; device < stored_graphs.size(); ++device) {
+        auto & graphs = stored_graphs[device];
+        for (auto it = graphs.begin(); it != graphs.end();) {
+            const auto & entry = it->second;
+            if (entry.cycle_registered &&
+                std::find(entry.cycle_buffer_dependencies.begin(),
+                          entry.cycle_buffer_dependencies.end(),
+                          request.remote_ptr) !=
+                    entry.cycle_buffer_dependencies.end()) {
+                GGML_LOG_INFO(
+                    "[CYCLE_RPC_GRAPH_EVICT] side=PHONE device=%u "
+                    "graph_uid=%" PRIu64 " reason=REGISTERED_BUFFER_FREE "
+                    "buffer=%" PRIu64 "\n",
+                    device, it->first, request.remote_ptr);
+                it = graphs.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     erase_opencl_tensor_extras_for_buffer(buffer);
     ggml_backend_buffer_free(buffer);
@@ -12040,6 +12072,23 @@ bool rpc_server::graph_compute(
         // The host-side graph has all weight/input/output RPC descriptors
         // already bound. Keep only the restored graph; do not execute FFN
         // with inputs that have not been produced by Attention yet.
+        // Cache registration lives exactly as long as ALL borrowed RPC
+        // buffers. The server will invalidate this UID on any such FREE.
+        graph_entry.cycle_buffer_dependencies.clear();
+        graph_entry.cycle_buffer_dependencies.reserve(n_tensors);
+        for (uint32_t i = 0; i < n_tensors; ++i) {
+            if (tensors[i].buffer != 0) {
+                graph_entry.cycle_buffer_dependencies.push_back(
+                    tensors[i].buffer);
+            }
+        }
+        std::sort(graph_entry.cycle_buffer_dependencies.begin(),
+                  graph_entry.cycle_buffer_dependencies.end());
+        graph_entry.cycle_buffer_dependencies.erase(
+            std::unique(graph_entry.cycle_buffer_dependencies.begin(),
+                        graph_entry.cycle_buffer_dependencies.end()),
+            graph_entry.cycle_buffer_dependencies.end());
+        graph_entry.cycle_registered = true;
         graph_entry.graph = graph;
         GGML_LOG_INFO(
             "[CYCLE_P2C_LOCAL] side=PHONE action=GRAPH_REGISTER "
