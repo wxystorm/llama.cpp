@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1026,7 +1027,9 @@ static bool cycle_real_execute_phone_attention_pre(
         cycle_real_attention_phase_profile * phase_profile = nullptr,
         const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr,
         cycle_real_attention_scratch_pool * scratch_pool = nullptr,
-        cycle_real_attention_graph_cache * graph_cache = nullptr) {
+        cycle_real_attention_graph_cache * graph_cache = nullptr,
+        const std::function<bool(const llama_hybrid_cycle_ready_graph &)> &
+            before_phone_graph_compute = {}) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -1400,6 +1403,18 @@ static bool cycle_real_execute_phone_attention_pre(
                 kv_cache == nullptr ? "SINGLE_UBATCH" :
             source_device == 0 ? "PC_PERSISTENT" : "PHONE_PERSISTENT");
 
+    // Arm the Phone continuation before the ordered Attention Graph and
+    // READY stage. Failure must return both Graph and Scratch leases.
+    if (before_phone_graph_compute &&
+        !before_phone_graph_compute(ready)) {
+        if (graph_slot) {
+            graph_cache->recycle(graph_slot, false);
+        } else {
+            ggml_free(ctx);
+        }
+        release_compute_buffer();
+        return false;
+    }
     const auto begin = std::chrono::steady_clock::now();
     if (device_input != nullptr) {
         // A FULL Phone layer hands off its computed l_out to the next
@@ -3523,6 +3538,7 @@ struct cycle_real_p2c_ffn_slot {
     llama_hybrid_cycle_ffn_executor executor;
     llama_hybrid_cycle_ffn_graph inputs {};
     int64_t prepared_tokens = 0;
+    uint64_t registered_graph_uid = 0;
     double graph_build_ms = 0.0;
     double backend_prepare_ms = 0.0;
     double last_execute_call_ms = 0.0;
@@ -3541,6 +3557,7 @@ struct cycle_real_p2c_ffn_slot {
         }
         inputs = {};
         prepared_tokens = 0;
+        registered_graph_uid = 0;
         graph_build_ms = 0.0;
         backend_prepare_ms = 0.0;
         last_execute_call_ms = 0.0;
@@ -3550,7 +3567,7 @@ struct cycle_real_p2c_ffn_slot {
     bool prepare(ggml_backend_t phone,
                  const llama_hybrid_cycle_ffn_shard_weights & shard,
                  int64_t hidden, int64_t tokens, int64_t topk,
-                 int64_t experts) {
+                 int64_t experts, bool phone_local_chain = false) {
         release();
         const auto build_begin = std::chrono::steady_clock::now();
         ggml_init_params params {};
@@ -3580,6 +3597,10 @@ struct cycle_real_p2c_ffn_slot {
         ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(graph, inputs.ffn_output);
+        if (phone_local_chain) {
+            // A fresh UID owns precisely this retained Graph/Buffer Slot.
+            ggml_graph_set_uid(graph, cycle_real_phone_graph_replay_uid());
+        }
         const auto build_end = std::chrono::steady_clock::now();
         const bool ok = executor.prepare(
             phone, ctx, graph, inputs, shard, hidden, tokens, topk, experts);
@@ -3591,6 +3612,13 @@ struct cycle_real_p2c_ffn_slot {
         if (!ok) {
             release();
             return false;
+        }
+        if (phone_local_chain) {
+            if (!ggml_backend_rpc_cycle_register_graph(phone, graph)) {
+                release();
+                return false;
+            }
+            registered_graph_uid = graph->uid;
         }
         prepared_tokens = tokens;
         return true;
