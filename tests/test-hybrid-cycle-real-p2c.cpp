@@ -4712,6 +4712,19 @@ static bool cycle_real_execute_period_fifo(
     // never preempting a running FFN and never bypassing the two-shard join.
     const bool pc_reduce_priority = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PC_REDUCE_PRIORITY");
+    // Opt-in Phone RPC patch 27: after staging P2C READY, the server
+    // continues the cached FFN and PARTIAL send without PC issuing three
+    // local COPY commands, a Graph compute, and a second Send command.
+    const bool phone_p2c_local_ffn = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_P2C_LOCAL_FFN");
+    if (phone_p2c_local_ffn &&
+        (!phone_ordered_handoff || !p2c_ffn_reuse)) {
+        std::fprintf(stderr,
+            "[CYCLE_P2C_LOCAL] phase=%s status=FAIL "
+            "reason=REQUIRES_PHONE_ORDERED_HANDOFF_AND_P2C_FFN_REUSE\n",
+            run_phase);
+        return false;
+    }
     if (attn_graph_reuse &&
         (!attn_scratch_reuse || !phone_full_session ||
          !phone_full_session->attn_graph_enabled)) {
@@ -5089,6 +5102,7 @@ static bool cycle_real_execute_period_fifo(
     uint64_t p2c_ffn_prepares = 0;
     uint64_t p2c_ffn_hits = 0;
     uint64_t p2c_ffn_replacements = 0;
+    uint64_t p2c_phone_local_completed = 0;
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] phase=%s epoch=%" PRIu64
@@ -5103,12 +5117,14 @@ static bool cycle_real_execute_period_fifo(
     std::printf(
         "[CYCLE_ORDERED_HANDOFF_PLAN] phase=%s "
         "phone_ordered_handoff=%d pc_reduce_priority=%d "
+        "phone_p2c_local_ffn=%d "
         "phone_full_attn_completion=FFN_LOCAL_RPC_COPY_ACK "
         "p2c_attn_completion=READY_STAGED_RPC_ACK "
         "phone_full_ffn_fence=RETAINED "
         "cpu_priority=READY_P2C_REDUCE_FIRST\n",
         run_phase, phone_ordered_handoff ? 1 : 0,
-        pc_reduce_priority ? 1 : 0);
+        pc_reduce_priority ? 1 : 0,
+        phone_p2c_local_ffn ? 1 : 0);
 
     llama_hybrid_cycle_layout period = layout;
     period.pc_cuda_full = pc_cuda_full;
@@ -6183,12 +6199,15 @@ static bool cycle_real_execute_period_fifo(
         "[CYCLE_PHONE_ORDERED_HANDOFF_SUM] phase=%s enabled=%d "
         "phone_full_attn_fences_elided=%llu "
         "p2c_attn_fences_elided=%llu "
+        "p2c_local_ffn_enabled=%d p2c_local_ffn_completed=%llu "
         "ffn_and_reduce_fences=UNCHANGED "
         "graph_reuse=UNCHANGED scratch_reuse=UNCHANGED "
         "transport=UNCHANGED\n",
         run_phase, phone_ordered_handoff ? 1 : 0,
         (unsigned long long) ordered_full_handoffs,
-        (unsigned long long) ordered_p2c_handoffs);
+        (unsigned long long) ordered_p2c_handoffs,
+        phone_p2c_local_ffn ? 1 : 0,
+        (unsigned long long) p2c_phone_local_completed);
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
     std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
