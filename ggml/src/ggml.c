@@ -7324,6 +7324,11 @@ void ggml_graph_clear(struct ggml_cgraph * cgraph) {
     ggml_hash_set_reset(&cgraph->visited_hash_set);
 }
 
+void ggml_graph_set_uid(struct ggml_cgraph * cgraph, uint64_t uid) {
+    GGML_ASSERT(cgraph != NULL);
+    cgraph->uid = uid;
+}
+
 int ggml_graph_size(struct ggml_cgraph * cgraph) {
     return cgraph->size;
 }
