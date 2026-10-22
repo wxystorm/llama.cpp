@@ -410,6 +410,57 @@ static void test_p2c_ready_reduce_priority() {
     }
 }
 
+// The P2C CPU Reduce is the sole producer of the next PC CUDA layer's
+// input. A READY packet and a completed PC FFN alone must NOT enqueue CUDA.
+// Completion of BOTH FFN shards and Reduce enqueues the CUDA task, without
+// making the CPU wait for that CUDA work to finish.
+static void test_p2c_reduce_handoff_to_cuda_queue() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {
+        llama_hybrid_cycle_layer_kind::TENSOR_P2C,
+        llama_hybrid_cycle_layer_kind::PC_CPU
+    };
+    layout.pc_cuda_full = true;
+    llama_hybrid_cycle_task_ring ring(layout, 2, 2, true, true);
+    ring.start();
+
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 1));
+
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 0));
+    assert(ring.pending(llama_hybrid_cycle_queue::PC_CUDA) == 0);
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 0));
+    assert(ring.pending(llama_hybrid_cycle_queue::PC_CUDA) == 0);
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 0));
+    assert(ring.pending(llama_hybrid_cycle_queue::PC_CUDA) == 1);
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                       llama_hybrid_cycle_stage::FULL_LAYER, 1, 0));
+
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                       llama_hybrid_cycle_stage::FULL_LAYER, 1, 1));
+    assert(ring.finished());
+    assert(ring.output_count() == 4);
+}
+
 // The full X=5,Y=1 period must NOT run its C2P/P2C boundaries as
 // independent one-layer tests. The output of EACH preceding physical
 // layer's chunk is a dependency on the next layer's matching chunk.
@@ -517,6 +568,7 @@ int main() {
     test_p2c_fifo_worker_runtime();
     test_bounded_multi_chunk_p2c_fifo();
     test_p2c_ready_reduce_priority();
+    test_p2c_reduce_handoff_to_cuda_queue();
     test_bounded_multi_chunk_c2p_fifo();
     test_complete_period_fifo_handoffs();
     test_causal_entry_order();
