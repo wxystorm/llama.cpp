@@ -4406,7 +4406,7 @@ static bool cycle_real_execute_period_fifo(
         uint64_t busy_misses = 0, capacity_misses = 0;
         uint64_t returned = 0, aborted = 0;
     };
-    std::vector<graph_cache_snapshot> graph_cache_start(size_t(n_layers));
+    std::vector<graph_cache_snapshot> graph_cache_start(static_cast<size_t>(n_layers));
     for (int l = 0; l < n_layers; ++l) {
         const bool is_phone_graph_layer = attn_graph_reuse && l > layout.x;
         std::unique_ptr<cycle_real_phone_kv_cache> cache;
