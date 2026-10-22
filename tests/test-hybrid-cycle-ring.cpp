@@ -419,7 +419,74 @@ static void test_complete_period_fifo_handoffs() {
     }
 }
 
+
+ // Opt-in PC full-layer split: one CUDA Attention FIFO, one CPU FFN/Reduce
+ // FIFO. Layer output cannot advance until CPU Reduce completes; each
+ // layer's CUDA Attention sees chunks in causal order.
+static void test_pc_cuda_full_fifo() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {
+        llama_hybrid_cycle_layer_kind::PC_CPU,
+        llama_hybrid_cycle_layer_kind::PC_CPU
+    };
+    layout.pc_cuda_attn = true;
+    constexpr int chunks = 3;
+    llama_hybrid_cycle_task_ring ring(layout, chunks, 2, true);
+    std::array<std::array<int, chunks>, 2> stage_done {};
+    std::array<int, 2> next_attn {};
+    constexpr std::array<llama_hybrid_cycle_queue, 2> queues {
+        llama_hybrid_cycle_queue::PC_CUDA,
+        llama_hybrid_cycle_queue::PC_CPU
+    };
+    ring.start();
+    for (int steps = 0; steps < 100 && !ring.finished(); ++steps) {
+        bool progress = false;
+        for (auto queue : queues) {
+            llama_hybrid_cycle_task task;
+            if (!ring.try_pop(queue, task)) {
+                continue;
+            }
+            progress = true;
+            const int l = task.layer;
+            const int c = task.chunk;
+            int & done = stage_done[size_t(l)][size_t(c)];
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                    assert(queue == llama_hybrid_cycle_queue::PC_CUDA);
+                    assert(done == 0 && next_attn[size_t(l)]++ == c);
+                    assert(l == 0 || stage_done[size_t(l-1)][size_t(c)] == 3);
+                    done = 1;
+                    break;
+                case llama_hybrid_cycle_stage::FFN_SOURCE:
+                    assert(queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(done == 1);
+                    done = 2;
+                    break;
+                case llama_hybrid_cycle_stage::REDUCE:
+                    assert(queue == llama_hybrid_cycle_queue::PC_CPU);
+                    assert(done == 2);
+                    done = 3;
+                    break;
+                default:
+                    assert(false && "PC CUDA mode must never schedule FULL_LAYER");
+            }
+            ring.complete(task);
+        }
+        assert(progress || ring.finished());
+    }
+    assert(ring.finished());
+    assert(ring.output_count() == size_t(2 * chunks));
+    for (const auto & row : stage_done) {
+        for (int done : row) {
+            assert(done == 3);
+        }
+    }
+    expect_empty(ring, llama_hybrid_cycle_queue::PC_CUDA);
+    expect_empty(ring, llama_hybrid_cycle_queue::PC_CPU);
+}
+
 int main() {
+    test_pc_cuda_full_fifo();
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
     test_bounded_multi_chunk_p2c_fifo();
