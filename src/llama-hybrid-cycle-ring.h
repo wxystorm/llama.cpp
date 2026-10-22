@@ -90,10 +90,12 @@ class llama_hybrid_cycle_task_ring {
 public:
     explicit llama_hybrid_cycle_task_ring(
             const llama_hybrid_cycle_layout & layout, int n_chunks,
-            int max_inflight = 0, bool credit_until_handoff = false)
+            int max_inflight = 0, bool credit_until_handoff = false,
+            bool pc_cpu_reduce_priority = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
-          credit_until_handoff_(credit_until_handoff) {
+          credit_until_handoff_(credit_until_handoff),
+          pc_cpu_reduce_priority_(pc_cpu_reduce_priority) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -116,16 +118,32 @@ public:
         }
     }
 
-    // Every queue is strict FIFO, including the two independent TX directions.
-    // Executors should pop without keeping mu_ locked while doing any work.
+    // Every queue is FIFO, including both independent TX directions. With
+    // explicit opt-in, only PC_CPU may pick the oldest READY P2C REDUCE ahead
+    // of pending FFN tasks. No running FFN is preempted, and REDUCE is still
+    // enqueued only after BOTH remote and local FFN shards have completed.
+    // This keeps each stage FIFO, causality and buffer ownership unchanged.
     bool try_pop(llama_hybrid_cycle_queue queue, llama_hybrid_cycle_task & out) {
         std::lock_guard<std::mutex> lock(mu_);
         const size_t index = static_cast<size_t>(queue);
         if (index >= queues_.size() || queues_[index].empty()) {
             return false;
         }
-        out = queues_[index].front();
-        queues_[index].pop_front();
+        auto & ready = queues_[index];
+        auto selected = ready.begin();
+        if (pc_cpu_reduce_priority_ &&
+            queue == llama_hybrid_cycle_queue::PC_CPU) {
+            for (auto it = ready.begin(); it != ready.end(); ++it) {
+                if (it->stage == llama_hybrid_cycle_stage::REDUCE &&
+                    layout_.kinds[size_t(it->layer)] ==
+                        llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+                    selected = it;
+                    break;
+                }
+            }
+        }
+        out = *selected;
+        ready.erase(selected);
         const auto key = task_key(out);
         if (!running_.emplace(key, out).second) {
             throw std::logic_error("cycle task already running");
@@ -341,6 +359,7 @@ private:
     int n_chunks_ = 0;
     int max_inflight_ = 0;
     bool credit_until_handoff_ = false;
+    bool pc_cpu_reduce_priority_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
