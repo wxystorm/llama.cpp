@@ -3076,6 +3076,110 @@ struct cycle_real_c2p_phone_chunk {
     }
 };
 
+// P2C FFN keeps one complete graph and its Phone GPU compute buffer
+// between chunks. The dedicated PHONE_GPU FIFO worker is its only user:
+// no separate lock or speculative graph execution is needed. Its output
+// becomes independent of this GPU buffer once the Phone server has
+// read it into the transport TX slot (SEND_PARTIAL returns success).
+struct cycle_real_p2c_ffn_slot {
+    ggml_context * ctx = nullptr;
+    llama_hybrid_cycle_ffn_executor executor;
+    llama_hybrid_cycle_ffn_graph inputs {};
+    int64_t prepared_tokens = 0;
+    double graph_build_ms = 0.0;
+    double backend_prepare_ms = 0.0;
+
+    cycle_real_p2c_ffn_slot() = default;
+    cycle_real_p2c_ffn_slot(const cycle_real_p2c_ffn_slot &) = delete;
+    cycle_real_p2c_ffn_slot & operator=(const cycle_real_p2c_ffn_slot &) = delete;
+    ~cycle_real_p2c_ffn_slot() { release(); }
+
+    void release() {
+        executor.reset(); // Free the remote buffer before its graph context.
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        inputs = {};
+        prepared_tokens = 0;
+        graph_build_ms = 0.0;
+        backend_prepare_ms = 0.0;
+    }
+
+    bool prepare(ggml_backend_t phone,
+                 const llama_hybrid_cycle_ffn_shard_weights & shard,
+                 int64_t hidden, int64_t tokens, int64_t topk,
+                 int64_t experts) {
+        release();
+        const auto build_begin = std::chrono::steady_clock::now();
+        ggml_init_params params {};
+        params.mem_size = 2 * 1024 * 1024;
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        // Exactly the same physical FFN shard graph as the uncached
+        // cycle_real_execute_ffn() path (no residual ADD / Meta allreduce).
+        inputs = llama_hybrid_cycle_make_ffn_graph_inputs(
+            ctx, hidden, tokens, topk);
+        auto * x = ggml_reshape_3d(ctx, inputs.norm, hidden, 1, tokens);
+        auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, inputs.topk_ids);
+        auto * up = ggml_mul_mat_id(ctx, shard.up, x, inputs.topk_ids);
+        auto * activation = ggml_swiglu_split(ctx, gate, up);
+        auto * down = ggml_mul_mat_id(ctx, shard.down, activation, inputs.topk_ids);
+        auto * weighted = ggml_mul(ctx, down, inputs.topk_weights);
+        ggml_tensor * sum = nullptr;
+        for (int64_t k = 0; k < topk; ++k) {
+            auto * view = ggml_view_2d(
+                ctx, weighted, hidden, tokens, weighted->nb[2],
+                size_t(k) * weighted->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, view) : view;
+        }
+        inputs.ffn_output = ggml_cont(ctx, sum);
+        ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+        ggml_build_forward_expand(graph, inputs.ffn_output);
+        const auto build_end = std::chrono::steady_clock::now();
+        const bool ok = executor.prepare(
+            phone, ctx, graph, inputs, shard, hidden, tokens, topk, experts);
+        const auto prepare_end = std::chrono::steady_clock::now();
+        graph_build_ms = std::chrono::duration<double, std::milli>(
+            build_end - build_begin).count();
+        backend_prepare_ms = std::chrono::duration<double, std::milli>(
+            prepare_end - build_end).count();
+        if (!ok) {
+            release();
+            return false;
+        }
+        prepared_tokens = tokens;
+        return true;
+    }
+
+    bool execute_and_send(ggml_backend_t phone,
+                          const llama_hybrid_cycle_ready_graph & ready,
+                          const cycle_real_live_wire & wire,
+                          cycle_real_ffn_phase_profile * profile) {
+        if (!ctx || prepared_tokens <= 0 || !inputs.ffn_output) return false;
+        // Each chunk has fresh Norm, TopK ids and TopK weights. The executor
+        // copies these from the corresponding Phone Attention buffers.
+        const auto execute_begin = std::chrono::steady_clock::now();
+        const bool computed = executor.execute(
+            nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, &ready);
+        if (profile) {
+            profile->backend_execute_call_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - execute_begin).count();
+        }
+        if (!computed) return false;
+        // This RPC command synchronously reads GPU output and copies it
+        // into the independent Phone TX slot before acknowledging success.
+        // The slot can then be overwritten for another chunk while TX runs.
+        return ggml_backend_rpc_cycle_send_partial(
+            phone, wire.layer, wire.chunk, wire.seq, wire.graph_id,
+            inputs.ffn_output);
+    }
+};
+
 static bool cycle_real_send_c2p_frame(
         ggml_backend_t phone, const cycle_real_live_wire & wire,
         inference_cycle_payload_kind kind,
@@ -3936,6 +4040,8 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_PERF_MODE");
     const bool pc_cuda_full = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PC_CUDA_FULL");
+    const bool p2c_ffn_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_P2C_FFN_REUSE");
     if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
         std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
                     "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
@@ -4143,6 +4249,12 @@ static bool cycle_real_execute_period_fifo(
         static_cast<size_t>(n_layers));
     std::vector<cycle_real_pc_cuda_full_detail> pc_cuda_detail(
         static_cast<size_t>(n_layers));
+    // Owned exclusively by the PHONE_GPU FIFO worker. One shape-specific
+    // slot is enough: this worker executes FFN_SOURCE tasks serially.
+    std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_ffn_slot;
+    uint64_t p2c_ffn_prepares = 0;
+    uint64_t p2c_ffn_hits = 0;
+    uint64_t p2c_ffn_replacements = 0;
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] phase=%s epoch=%" PRIu64
@@ -4758,12 +4870,56 @@ static bool cycle_real_execute_period_fifo(
                         const std::vector<float> none_f;
                         const std::vector<int32_t> none_i;
                         std::vector<float> ignored;
-                        ok = cycle_real_execute_ffn(
-                            phone, weights, none_f, none_i, none_f,
-                            hidden, st.tokens, topk, experts,
-                            ignored, nullptr, nullptr,
-                            &st.wire, &st.ready.phone_graph,
-                            perf_mode ? &ffn_profile[queue_index] : nullptr);
+                        if (!p2c_ffn_reuse) {
+                            ok = cycle_real_execute_ffn(
+                                phone, weights, none_f, none_i, none_f,
+                                hidden, st.tokens, topk, experts,
+                                ignored, nullptr, nullptr,
+                                &st.wire, &st.ready.phone_graph,
+                                perf_mode ? &ffn_profile[queue_index] : nullptr);
+                        } else {
+                            const bool same_shape = p2c_ffn_slot &&
+                                p2c_ffn_slot->prepared_tokens == st.tokens;
+                            if (!same_shape) {
+                                if (p2c_ffn_slot) {
+                                    // Tail chunks may have fewer tokens.
+                                    // Free a mismatched slot before preparing
+                                    // its replacement; never replay an
+                                    // incompatible tensor shape.
+                                    p2c_ffn_slot.reset();
+                                    ++p2c_ffn_replacements;
+                                }
+                                p2c_ffn_slot =
+                                    std::make_unique<cycle_real_p2c_ffn_slot>();
+                                ok = p2c_ffn_slot->prepare(
+                                    phone, weights, hidden, st.tokens,
+                                    topk, experts);
+                                if (ok) ++p2c_ffn_prepares;
+                            } else {
+                                ++p2c_ffn_hits;
+                                ok = true;
+                            }
+                            if (ok) {
+                                auto * profile = perf_mode ?
+                                    &ffn_profile[queue_index] : nullptr;
+                                if (profile) {
+                                    ++profile->count;
+                                    if (!same_shape) {
+                                        profile->graph_build_ms +=
+                                            p2c_ffn_slot->graph_build_ms;
+                                        profile->backend_prepare_ms +=
+                                            p2c_ffn_slot->backend_prepare_ms;
+                                    }
+                                }
+                                ok = p2c_ffn_slot->execute_and_send(
+                                    phone, st.ready.phone_graph, st.wire,
+                                    profile);
+                            }
+                            if (!ok) {
+                                // A failed graph/send must not become a hit.
+                                p2c_ffn_slot.reset();
+                            }
+                        }
                         st.ready.release_phone_graph();
                     }
                     break;
@@ -4933,6 +5089,10 @@ static bool cycle_real_execute_period_fifo(
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr);
     const auto fifo_done = std::chrono::steady_clock::now();
+    const bool p2c_ffn_cached_at_end = p2c_ffn_slot != nullptr;
+    // Release the cached RPC allocation BEFORE the period timer stops.
+    // No borrowed input or output outlives the FIFO workers.
+    p2c_ffn_slot.reset();
     // Include the eventual GPU cache release in the measured period.
     // Otherwise a cache hit could look faster merely because the final
     // GPU buffer_free calls moved outside wall_ms.
@@ -5009,6 +5169,18 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
+    if (p2c_ffn_reuse) {
+        std::printf(
+            "[CYCLE_P2C_FFN_REUSE_SUM] side=PC layer=%d enabled=1 "
+            "prepares=%llu hits=%llu shape_replacements=%llu "
+            "cached_at_fifo_end=%d graph_owner=PHONE_GPU "
+            "output_release=PHONE_TX_SLOT_COPIED "
+            "cache_lifetime=ONE_PERIOD\n",
+            n_layers - 1, (unsigned long long)p2c_ffn_prepares,
+            (unsigned long long)p2c_ffn_hits,
+            (unsigned long long)p2c_ffn_replacements,
+            p2c_ffn_cached_at_end ? 1 : 0);
+    }
     std::printf(
         "[CYCLE_PHONE_FULL_FUSE_SUM] enabled=%d scope=PHONE_FULL "
         "graph_mode=%s async_safety=POST_FFN_FENCE\n",
