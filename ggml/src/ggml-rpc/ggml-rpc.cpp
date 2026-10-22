@@ -13006,6 +13006,18 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
     size_t return_bulk_credit_inflight = 0;
     size_t return_bulk_credit_limit = 0;
 
+    // Opt-in Phone-local P2C continuation state, tied to this COMPUTE
+    // connection. Every armed job is removed after its READY command; DONE
+    // survives until the PC Phone worker safely returns its scratch lease.
+    using p2c_task_key =
+        std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
+    const auto p2c_key = [](int32_t layer, int32_t chunk,
+                            uint64_t seq, uint64_t graph_id) {
+        return p2c_task_key {layer, chunk, seq, graph_id};
+    };
+    std::map<p2c_task_key, rpc_msg_inference_cycle_p2c_arm_req> p2c_armed;
+    std::map<p2c_task_key, bool> p2c_completed;
+
     // Diagnostic-only per-COMPUTE-connection order. The command sequence is
     // assigned when the server receives each command byte, including commands
     // not selected for logging. Client/server clocks must not be subtracted.
@@ -13887,6 +13899,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_GRAPH_REGISTER: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) return;
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = server.graph_compute(input, true) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
