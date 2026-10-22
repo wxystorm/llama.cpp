@@ -282,6 +282,11 @@ enum rpc_cmd {
     RPC_CMD_INFERENCE_CYCLE_SEND,
     RPC_CMD_INFERENCE_CYCLE_APPLY,
     RPC_CMD_INFERENCE_CYCLE_FINISH,
+    // Protocol patch 27: Graph registered but not executed, then a local
+    // Phone P2C FFN continuation after Attention READY staging.
+    RPC_CMD_GRAPH_REGISTER,
+    RPC_CMD_INFERENCE_CYCLE_P2C_ARM,
+    RPC_CMD_INFERENCE_CYCLE_P2C_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -309,7 +314,10 @@ static_assert(RPC_CMD_INFERENCE_RETURN_BIND == 36, "RPC_CMD_INFERENCE_RETURN_BIN
 static_assert(RPC_CMD_INFERENCE_ROUTE_ARM == 37, "RPC_CMD_INFERENCE_ROUTE_ARM must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_INFERENCE_CYCLE_SEND == 38, "RPC_CMD_INFERENCE_CYCLE_SEND must remain 38");
 static_assert(RPC_CMD_INFERENCE_CYCLE_APPLY == 39, "RPC_CMD_INFERENCE_CYCLE_APPLY must be 39");
-static_assert(RPC_CMD_INFERENCE_CYCLE_FINISH == 40, "RPC_CMD_INFERENCE_CYCLE_FINISH must be last");
+static_assert(RPC_CMD_INFERENCE_CYCLE_FINISH == 40, "RPC_CMD_INFERENCE_CYCLE_FINISH must remain 40");
+static_assert(RPC_CMD_GRAPH_REGISTER == 41, "RPC_CMD_GRAPH_REGISTER must be 41");
+static_assert(RPC_CMD_INFERENCE_CYCLE_P2C_ARM == 42, "RPC_CMD_INFERENCE_CYCLE_P2C_ARM must be 42");
+static_assert(RPC_CMD_INFERENCE_CYCLE_P2C_WAIT == 43, "RPC_CMD_INFERENCE_CYCLE_P2C_WAIT must be 43");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -362,6 +370,23 @@ struct rpc_msg_inference_cycle_send_req {
 };
 struct rpc_msg_inference_cycle_send_rsp {
     uint32_t result;
+};
+
+// Arm one P2C FFN continuation for a specific Chunk. The Phone server
+// consumes READY from its existing device allocations; all three FFN inputs
+// and its partial output have persistent GPU buffers already prepared by
+// the client-side graph/FFN-session reuse path. No activation byte is sent.
+struct rpc_msg_inference_cycle_p2c_arm_req {
+    rpc_msg_inference_cycle_send_req partial {};
+    uint64_t ffn_graph_uid = 0;
+    rpc_tensor ready_inputs[3] {};
+    rpc_tensor ffn_inputs[3] {};
+};
+struct rpc_msg_inference_cycle_p2c_wait_req {
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint64_t seq = 0;
+    uint64_t graph_id = 0;
 };
 
 struct rpc_msg_device_count_rsp {
