@@ -5825,7 +5825,14 @@ static bool cycle_real_execute_period_fifo(
                             // The preceding Graph Compute is synchronous on
                             // the server; this is a completion event, NOT
                             // merely an asynchronous send() return.
-                            retire_device_output(l - 1, c);
+                            // Phone-local P2C FFN may still be running
+                            // after SEND_READY replies. Do not hold up READY
+                            // publication with a remote FREE_BUFFER RPC.
+                            // Its prior layer output remains pinned until
+                            // the Phone-local FFN is confirmed complete.
+                            if (!phone_p2c_local_ffn) {
+                                retire_device_output(l - 1, c);
+                            }
                             if (phone_ordered_handoff) {
                                 ++ordered_p2c_handoffs;
                                 if (stage_detail) {
@@ -5970,7 +5977,15 @@ static bool cycle_real_execute_period_fifo(
                                     done_ms;
                                 st.p2c_timing.phone_send_partial_rpc_ms = 0.0;
                             }
-                            if (ok) ++p2c_phone_local_completed;
+                            if (ok) {
+                                // The deferred producer l_out and Attention
+                                // scratch are no longer used by the Phone
+                                // backend. Only this PHONE_GPU worker owns
+                                // their pools; never recycle from the RX
+                                // worker or at asynchronous submit time.
+                                retire_device_output(l - 1, c);
+                                ++p2c_phone_local_completed;
+                            }
                         } else if (!p2c_ffn_reuse) {
                             const auto fallback_begin =
                                 std::chrono::steady_clock::now();
