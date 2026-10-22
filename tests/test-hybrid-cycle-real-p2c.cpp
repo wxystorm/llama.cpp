@@ -6342,6 +6342,59 @@ static bool cycle_real_execute_period_fifo(
                         st.host_output.resize(n);
                         const auto reduce_begin =
                             std::chrono::steady_clock::now();
+                        if (phone_p2c_local_ffn) {
+                            // REDUCE is released only after both FFN branches
+                            // complete: their PC-local event timestamps are
+                            // published to this worker by ring.complete().
+                            const auto & e = st.p2c_overlap;
+                            const auto stamped = [](
+                                    std::chrono::steady_clock::time_point t) {
+                                return t.time_since_epoch().count() != 0;
+                            };
+                            if (stamped(e.ready_received) &&
+                                stamped(e.cpu_ffn_started) &&
+                                stamped(e.cpu_ffn_finished) &&
+                                stamped(e.partial_received)) {
+                                const auto ms = [](
+                                        std::chrono::steady_clock::time_point a,
+                                        std::chrono::steady_clock::time_point b) {
+                                    return std::chrono::duration<double, std::milli>(
+                                        b - a).count();
+                                };
+                                const bool started_before_partial =
+                                    e.cpu_ffn_started < e.partial_received;
+                                const auto overlap_begin = std::max(
+                                    e.cpu_ffn_started, e.ready_received);
+                                const auto overlap_end = std::min(
+                                    e.cpu_ffn_finished, e.partial_received);
+                                const double overlap_ms = std::max(
+                                    0.0, ms(overlap_begin, overlap_end));
+                                p2c_cpu_started_while_partial_pending +=
+                                    started_before_partial ? 1 : 0;
+                                p2c_cpu_partial_pending_overlap_ms += overlap_ms;
+                                std::printf(
+                                    "[CYCLE_P2C_LOCAL_OVERLAP] phase=%s "
+                                    "layer=%d chunk=%d "
+                                    "ready_to_cpu_ffn_ms=%.3f "
+                                    "cpu_ffn_ms=%.3f "
+                                    "cpu_started_before_partial_rx=%d "
+                                    "cpu_while_partial_pending_ms=%.3f "
+                                    "partial_rx_to_reduce_ms=%.3f "
+                                    "scope=PC_EVENTS_NOT_REMOTE_KERNEL\n",
+                                    run_phase, l, c,
+                                    ms(e.ready_received, e.cpu_ffn_started),
+                                    ms(e.cpu_ffn_started, e.cpu_ffn_finished),
+                                    started_before_partial ? 1 : 0,
+                                    overlap_ms,
+                                    ms(e.partial_received, reduce_begin));
+                            } else {
+                                std::printf(
+                                    "[CYCLE_P2C_LOCAL_OVERLAP] phase=%s "
+                                    "layer=%d chunk=%d status=INCOMPLETE "
+                                    "reason=MISSING_STAGE_EVENT\n",
+                                    run_phase, l, c);
+                            }
+                        }
                         ok = inference_cycle_reduce_p2c_pc_cpu(
                             st.recv_ready.ready, st.partial.data(),
                             st.partial.size(), st.recv_partial.partial,
@@ -6402,6 +6455,16 @@ static bool cycle_real_execute_period_fifo(
         }, window, true, perf_mode ? &fifo_profile : nullptr,
         pc_reduce_priority);
     const auto fifo_done = std::chrono::steady_clock::now();
+    if (phone_p2c_local_ffn) {
+        std::printf(
+            "[CYCLE_P2C_LOCAL_OVERLAP_SUM] phase=%s chunks=%d "
+            "pc_cpu_started_before_partial_rx=%llu "
+            "cpu_work_while_phone_partial_pending_ms=%.3f "
+            "scope=PC_EVENTS_NOT_REMOTE_KERNEL\n",
+            run_phase, n_chunks,
+            (unsigned long long) p2c_cpu_started_while_partial_pending,
+            p2c_cpu_partial_pending_overlap_ms);
+    }
     std::printf(
         "[CYCLE_PHONE_ORDERED_HANDOFF_SUM] phase=%s enabled=%d "
         "phone_full_attn_fences_elided=%llu "
