@@ -43,20 +43,25 @@ struct llama_hybrid_cycle_fifo_profile {
 //   REDUCE          -> exclusive output owner has completed l_out
 //
 // One FIFO worker owns each queue; an unrelated queue can continue while a
-// Phone RPC send or PC computation is in flight. This contains scheduling
-// complexity here, outside the GGML backend mapping/buffer ownership rules.
+// Phone RPC send or PC computation is in flight. With explicit opt-in, the
+// PC_CPU worker prefers already-ready P2C Reduce tasks when selecting the
+// next task, without preempting its current FFN or changing TX ordering.
+// Buffer ownership is independent of this local dequeue policy.
 inline bool llama_hybrid_cycle_run_fifo(
         const llama_hybrid_cycle_layout & layout,
         int n_chunks,
         const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
         int max_inflight = 0,
         bool credit_until_handoff = false,
-        llama_hybrid_cycle_fifo_profile * profile = nullptr) {
+        llama_hybrid_cycle_fifo_profile * profile = nullptr,
+        bool pc_cpu_reduce_priority = false) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
     }
-    llama_hybrid_cycle_task_ring ring(layout, n_chunks, max_inflight, credit_until_handoff);
+    llama_hybrid_cycle_task_ring ring(
+        layout, n_chunks, max_inflight, credit_until_handoff,
+        pc_cpu_reduce_priority);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
