@@ -122,6 +122,10 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC \
     "ggml_backend_rpc_inference_transport_receive"
 
+// A Cycle DATA reader selects by task identity, leaving unrelated frames queued.
+#define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_MATCHING_PROC \
+    "ggml_backend_rpc_inference_transport_receive_matching"
+
 #define GGML_BACKEND_RPC_INFERENCE_TRANSPORT_STATS_PROC \
     "ggml_backend_rpc_inference_transport_stats"
 
@@ -215,6 +219,15 @@ using ggml_backend_rpc_inference_transport_submit_t = bool (*)(
 using ggml_backend_rpc_inference_transport_receive_t = bool (*)(
         ggml_backend_t backend,
         struct ggml_backend_rpc_inference_task * task,
+        void * data,
+        size_t capacity,
+        size_t * size,
+        int timeout_ms);
+
+// Does not consume READY/PARTIAL frames belonging to another task.
+using ggml_backend_rpc_inference_transport_receive_matching_t = bool (*)(
+        ggml_backend_t backend,
+        const struct ggml_backend_rpc_inference_task * expected,
         void * data,
         size_t capacity,
         size_t * size,

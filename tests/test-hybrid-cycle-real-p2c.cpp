@@ -928,9 +928,9 @@ struct cycle_real_live_wire {
     uint64_t graph_id = 1;
 };
 
-// The existing RPC data-plane receiver already has a single application RX
-// dispatcher. Do not call transport.receive() a second time on its socket.
-// Fetch exactly one queued frame through the existing exported dispatch proc.
+// Reuse the single RPC data-plane RX dispatcher; do not create another
+// socket receiver. Local Phone FFN can queue a prior PARTIAL before the next
+// Chunk READY, so select the specific task rather than pop a FIFO frame.
 static bool cycle_real_receive_live_wire(
         ggml_backend_t phone, const cycle_real_live_wire & wire,
         inference_cycle_payload_kind kind,
@@ -941,9 +941,10 @@ static bool cycle_real_receive_live_wire(
     if (!reg) {
         return false;
     }
-    auto receive = reinterpret_cast<ggml_backend_rpc_inference_transport_receive_t>(
-        ggml_backend_reg_get_proc_address(
-            reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC));
+    auto receive = reinterpret_cast<
+        ggml_backend_rpc_inference_transport_receive_matching_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_MATCHING_PROC));
     if (!receive) {
         return false;
     }
@@ -954,19 +955,28 @@ static bool cycle_real_receive_live_wire(
         return false;
     }
     std::vector<uint8_t> frame_data(bytes);
+    const uint16_t stage = kind == INFERENCE_CYCLE_READY ?
+        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
     ggml_backend_rpc_inference_task task {};
+    task.stage = stage;
+    task.stream_id = 0; // Cycle frames use the default inference stream.
+    task.tensor_role = INFERENCE_CYCLE_PHONE_TO_PC;
+    task.layer = wire.layer;
+    task.chunk = wire.chunk;
+    task.seq = wire.seq;
+    task.graph_id = wire.graph_id;
     size_t received = 0;
     if (!receive(phone, &task, frame_data.data(), frame_data.size(),
                  &received, 30000) || received != bytes) {
         std::fprintf(stderr,
             "[CYCLE_REAL_WIRE] side=pc stage=%s status=FAIL "
-            "reason=RECEIVE_OR_SIZE expected=%zu got=%zu\n",
+            "reason=RECEIVE_MATCH_OR_SIZE expected=%zu got=%zu "
+            "layer=%d chunk=%d seq=%llu\n",
             kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
-            bytes, received);
+            bytes, received, wire.layer, wire.chunk,
+            (unsigned long long) wire.seq);
         return false;
     }
-    const uint16_t stage = kind == INFERENCE_CYCLE_READY ?
-        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
     inference_frame_header header =
         inference_make_header(INFERENCE_FRAME_DATA);
     header.stage = task.stage;

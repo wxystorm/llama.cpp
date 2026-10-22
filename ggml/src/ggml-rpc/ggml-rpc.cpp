@@ -1779,7 +1779,8 @@ static bool rpc_inference_receive_matching(
         size_t expected_size,
         std::vector<uint8_t> & output,
         inference_frame_header * header_out = nullptr,
-        int timeout_ms = -1) {
+        int timeout_ms = -1,
+        const ggml_backend_rpc_inference_task * expected = nullptr) {
     auto transport = get_inference_transport(endpoint);
     if (!transport) {
         return false;
@@ -1796,12 +1797,14 @@ static bool rpc_inference_receive_matching(
             state->pending.begin(),
             state->pending.end(),
             [&](const rpc_inference_owned_frame & owned) {
+                const auto & header = owned.header;
                 return rpc_inference_frame_matches(
-                    owned.header,
-                    type,
-                    stage,
-                    stream_id,
-                    seq);
+                           header, type, stage, stream_id, seq) &&
+                    (expected == nullptr ||
+                     (header.layer == expected->layer &&
+                      header.chunk == expected->chunk &&
+                      header.graph_id == expected->graph_id &&
+                      header.tensor_role == expected->tensor_role));
             });
     };
 
@@ -2003,6 +2006,36 @@ static bool ggml_backend_rpc_inference_transport_receive(
     *size = frame.data.size();
 
     return fits;
+}
+
+// The local Phone FFN may enqueue an earlier PARTIAL before the PC requests
+// the next READY. Search the existing dispatcher instead of popping its head.
+static bool ggml_backend_rpc_inference_transport_receive_matching(
+        ggml_backend_t backend,
+        const ggml_backend_rpc_inference_task * expected,
+        void * data,
+        size_t capacity,
+        size_t * size,
+        int timeout_ms) {
+    auto * ctx = rpc_inference_device_context(backend);
+    if (!ctx || !expected || !size ||
+        (capacity > 0 && !data) ||
+        expected->layer < 0 || expected->chunk < 0 || expected->seq == 0) {
+        return false;
+    }
+    *size = 0;
+    std::vector<uint8_t> payload;
+    if (!rpc_inference_receive_matching(
+            ctx->endpoint, INFERENCE_FRAME_DATA,
+            expected->stage, expected->stream_id, expected->seq,
+            capacity, payload, nullptr, timeout_ms, expected)) {
+        return false;
+    }
+    if (!payload.empty()) {
+        std::memcpy(data, payload.data(), payload.size());
+    }
+    *size = payload.size();
+    return true;
 }
 
 static bool ggml_backend_rpc_inference_transport_get_stats(
@@ -15157,6 +15190,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_inference_transport_receive);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_MATCHING_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_inference_transport_receive_matching);
     }
     if (std::strcmp(
             name,
