@@ -4,6 +4,9 @@
 #include <array>
 #include <cassert>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 
 static llama_hybrid_cycle_task take(
@@ -226,6 +229,63 @@ static void test_p2c_fifo_worker_runtime() {
     assert(done(llama_hybrid_cycle_stage::SEND_PARTIAL) == 1);
     assert(done(llama_hybrid_cycle_stage::FFN_SOURCE) == 1);
     assert(done(llama_hybrid_cycle_stage::FFN_DESTINATION) == 1);
+}
+
+// P2C must not wait for Phone FFN completion before PC starts its own
+// FFN. The Phone GPU worker deliberately blocks its FFN_SOURCE until the
+// PC CPU worker has entered FFN_DESTINATION. A single global stage/Fence
+// barrier would deadlock this test; independent worker queues must progress.
+static void test_p2c_cpu_ffn_runs_while_phone_ffn_pending() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    std::mutex state_mu;
+    std::condition_variable state_cv;
+    bool phone_ffn_entered = false;
+    bool pc_ffn_entered = false;
+    bool reduce_ran = false;
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        layout, 1, [&](const llama_hybrid_cycle_task & task) {
+            switch (task.stage) {
+                case llama_hybrid_cycle_stage::ATTN_PRE:
+                case llama_hybrid_cycle_stage::SEND_ACTIVATION:
+                case llama_hybrid_cycle_stage::SEND_PARTIAL:
+                    return true;
+                case llama_hybrid_cycle_stage::FFN_SOURCE: {
+                    std::unique_lock<std::mutex> lock(state_mu);
+                    phone_ffn_entered = true;
+                    state_cv.notify_all();
+                    // The PC CPU must be allowed to execute while the Phone
+                    // GPU is still busy with its FFN.
+                    return state_cv.wait_for(
+                        lock, std::chrono::seconds(2),
+                        [&] { return pc_ffn_entered; });
+                }
+                case llama_hybrid_cycle_stage::FFN_DESTINATION: {
+                    std::unique_lock<std::mutex> lock(state_mu);
+                    // Wait until the Phone task is actually in flight:
+                    // prove overlap rather than a coincidental task order.
+                    if (!state_cv.wait_for(
+                            lock, std::chrono::seconds(2),
+                            [&] { return phone_ffn_entered; })) {
+                        return false;
+                    }
+                    pc_ffn_entered = true;
+                    state_cv.notify_all();
+                    return true;
+                }
+                case llama_hybrid_cycle_stage::REDUCE: {
+                    std::lock_guard<std::mutex> lock(state_mu);
+                    assert(phone_ffn_entered && pc_ffn_entered);
+                    reduce_ran = true;
+                    return true;
+                }
+                case llama_hybrid_cycle_stage::FULL_LAYER:
+                    return false;
+            }
+            return false;
+        });
+    assert(ok);
+    assert(reduce_ran);
 }
 
 // Four chunks, two GPU allocations/Attention entries max in flight.
@@ -566,6 +626,7 @@ int main() {
     test_pc_cuda_full_fifo();
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
+    test_p2c_cpu_ffn_runs_while_phone_ffn_pending();
     test_bounded_multi_chunk_p2c_fifo();
     test_p2c_ready_reduce_priority();
     test_p2c_reduce_handoff_to_cuda_queue();
