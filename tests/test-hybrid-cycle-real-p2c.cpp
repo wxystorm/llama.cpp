@@ -4486,6 +4486,18 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
     const bool attn_graph_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
+    const bool attn_scratch_session_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_SESSION_REUSE");
+    if (attn_scratch_session_reuse &&
+        (!attn_scratch_reuse || !attn_graph_reuse ||
+         !phone_full_session ||
+         !phone_full_session->attn_scratch_session_enabled)) {
+        std::fprintf(stderr,
+            "[CYCLE_ATTN_SCRATCH_SESSION] phase=%s status=FAIL "
+            "reason=REQUIRES_PHONE_SESSION_GRAPH_AND_SCRATCH_POOL\n",
+            run_phase);
+        return false;
+    }
     const bool pc_cuda_attn_graph_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN_GRAPH_CACHE");
     if (pc_cuda_attn_graph_reuse &&
@@ -4537,7 +4549,8 @@ static bool cycle_real_execute_period_fifo(
         (!phone_full_reuse ||
          !phone_full_session->matches(
             phone, model, layout, tokens, chunk_tokens, window,
-            phone_full_fuse, phone_full_rpc_replay, attn_graph_reuse))) {
+            phone_full_fuse, phone_full_rpc_replay, attn_graph_reuse,
+            attn_scratch_session_reuse))) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_FULL_SESSION] phase=%s status=FAIL "
             "reason=MODEL_BACKEND_LAYOUT_OR_SHAPE_MISMATCH\n",
@@ -4772,10 +4785,15 @@ static bool cycle_real_execute_period_fifo(
         kv.push_back(std::move(cache));
     }
 
-    // Declared BEFORE states so any failure-path READY destructors can
-    // safely return their leases while the pool still exists.
+    // READY borrows a stable pool pointer through FFN consumption/fence.
+    // Only period-owned pools are constructed each run; session pools are
+    // configured once outside the Warmup/Measure loop.
     std::vector<std::unique_ptr<cycle_real_attention_scratch_pool>>
-        attn_scratch(static_cast<size_t>(n_layers));
+        period_attn_scratch(static_cast<size_t>(n_layers));
+    std::vector<cycle_real_attention_scratch_pool *>
+        attn_scratch(static_cast<size_t>(n_layers), nullptr);
+    std::vector<cycle_real_attn_scratch_period_stats>
+        attn_scratch_start(static_cast<size_t>(n_layers));
     if (attn_scratch_reuse || pc_cuda_attn_graph_reuse) {
         for (int l = 0; l < n_layers; ++l) {
             const bool cuda_layer =
@@ -4783,10 +4801,20 @@ static bool cycle_real_execute_period_fifo(
             const bool phone_layer =
                 attn_scratch_reuse && l > layout.x;
             if (!cuda_layer && !phone_layer) continue;
-            attn_scratch[size_t(l)] =
-                std::make_unique<cycle_real_attention_scratch_pool>();
-            attn_scratch[size_t(l)]->configure(
-                cuda_layer ? pc_cuda.backend : phone, window);
+            if (phone_layer && attn_scratch_session_reuse) {
+                attn_scratch[size_t(l)] =
+                    phone_full_session->attn_scratch[size_t(l)].get();
+            } else {
+                auto & owned = period_attn_scratch[size_t(l)];
+                owned = std::make_unique<cycle_real_attention_scratch_pool>();
+                owned->configure(
+                    cuda_layer ? pc_cuda.backend : phone, window);
+                attn_scratch[size_t(l)] = owned.get();
+            }
+            if (phone_layer) {
+                attn_scratch_start[size_t(l)].capture(
+                    *attn_scratch[size_t(l)]);
+            }
         }
     }
 
@@ -4979,7 +5007,7 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 0, nullptr, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                weights, attn_scratch[size_t(l)].get(),
+                                weights, attn_scratch[size_t(l)],
                                 graph_cache_by_layer[size_t(l)]);
                         const auto cuda_attn_done = std::chrono::steady_clock::now();
                         if (ok && cycle_real_env_flag(
@@ -5178,7 +5206,7 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                nullptr, attn_scratch[size_t(l)].get(),
+                                nullptr, attn_scratch[size_t(l)],
                                 graph_cache_by_layer[size_t(l)]);
                         if (perf_mode) {
                             ++full_detail.chunks;
@@ -5481,7 +5509,7 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                nullptr, attn_scratch[size_t(l)].get(),
+                                nullptr, attn_scratch[size_t(l)],
                                 graph_cache_by_layer[size_t(l)]);
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(
