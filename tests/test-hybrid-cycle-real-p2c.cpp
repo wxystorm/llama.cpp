@@ -5188,7 +5188,7 @@ static bool cycle_real_execute_period_fifo(
         "[CYCLE_ORDERED_HANDOFF_PLAN] phase=%s "
         "phone_ordered_handoff=%d pc_reduce_priority=%d "
         "phone_p2c_local_ffn=%d phone_full_local_ffn=%d "
-        "phone_full_attn_completion=FFN_LOCAL_RPC_COPY_ACK "
+        "phone_full_attn_completion=%s "
         "p2c_attn_completion=READY_STAGED_RPC_ACK "
         "phone_full_ffn_completion=%s "
         "cpu_priority=READY_P2C_REDUCE_FIRST\n",
@@ -5196,6 +5196,7 @@ static bool cycle_real_execute_period_fifo(
         pc_reduce_priority ? 1 : 0,
         phone_p2c_local_ffn ? 1 : 0,
         phone_full_local_ffn ? 1 : 0,
+        phone_full_local_ffn ? "PHONE_FULL_RUN_ACK" : "FFN_LOCAL_COPY_ACK",
         phone_full_local_ffn ? "PHONE_RUN_RPC_ACK" : "EXPLICIT_FENCE");
 
     llama_hybrid_cycle_layout period = layout;
@@ -5603,10 +5604,12 @@ static bool cycle_real_execute_period_fifo(
                                     phone, st.ready, l, c, st.wire.seq) :
                                 st.phone_output->execute_full_local(st.ready);
                             if (ok && phone_ordered_handoff) {
-                                // Same RPC COMPUTE connection orders Graph
-                                // execution before the FFN-local input copies;
-                                // COPY_TENSOR has returned an RPC response.
-                                // No GPU producer input can still be in use.
+                                // The ordered socket guarantees that Attention
+                                // finished before FFN input copies. In local
+                                // mode, PHONE_FULL_RUN_ACK confirms both copy
+                                // and fused FFN+ADD completion. In legacy mode,
+                                // COPY_TENSOR has ACKed the last input copy.
+                                // Either path may now retire producer l_out.
                                 retire_device_output(l - 1, c);
                                 ++ordered_full_handoffs;
                                 if (stage_detail) {
@@ -5614,9 +5617,12 @@ static bool cycle_real_execute_period_fifo(
                                         "[CYCLE_PHONE_ORDERED_HANDOFF] "
                                         "phase=%s layer=%d chunk=%d "
                                         "kind=PHONE_FULL_ATTN "
-                                        "completion=FFN_LOCAL_COPY_ACK "
+                                        "completion=%s "
                                         "old_fence=ELIDED status=OK\n",
-                                        run_phase, l, c);
+                                        run_phase, l, c,
+                                        phone_full_local_ffn ?
+                                            "PHONE_FULL_RUN_ACK" :
+                                            "FFN_LOCAL_COPY_ACK");
                                 }
                             }
                         }
