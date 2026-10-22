@@ -5729,7 +5729,9 @@ static bool cycle_real_execute_period_fifo(
             }
             if (!c2p_ffn_session || !succeeded || !c2p_session_drained) {
                 c2p_to_release = std::move(c2p_pool);
-                c2p_live_slots = 0;
+                // Preserve the legacy period accounting in REUSE_SUM;
+                // only a session needs its persistent reservation reset.
+                if (c2p_ffn_session) c2p_live_slots = 0;
             }
         }
         // RPC buffer frees must never run while holding the pool mutex.
