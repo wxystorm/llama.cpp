@@ -1090,7 +1090,7 @@ static bool cycle_real_execute_phone_attention_pre(
         }
     }
     if (!graph_slot) {
-
+    ggml_init_params p {};
     p.mem_size = 16 * 1024 * 1024;
     p.no_alloc = true;
     ctx = ggml_init(p);
