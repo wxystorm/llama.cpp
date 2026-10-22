@@ -245,21 +245,6 @@ private:
         llama_hybrid_cycle_task task {layer, chunk, stage, source, compute_queue(source)};
 
         switch (stage) {
-                case llama_hybrid_cycle_stage::ATTN_PRE:
-                    task.owner = llama_hybrid_cycle_owner::PC_CUDA;
-                    task.queue = llama_hybrid_cycle_queue::PC_CUDA;
-                    return task;
-                case llama_hybrid_cycle_stage::FFN_SOURCE:
-                case llama_hybrid_cycle_stage::REDUCE:
-                    task.owner = llama_hybrid_cycle_owner::PC_CPU;
-                    task.queue = llama_hybrid_cycle_queue::PC_CPU;
-                    return task;
-                default:
-                    throw std::logic_error("unexpected PC CUDA task stage");
-            }
-        }
-
-        switch (stage) {
             case llama_hybrid_cycle_stage::FULL_LAYER:
                 if (layout_.pc_cuda_full &&
                     kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
