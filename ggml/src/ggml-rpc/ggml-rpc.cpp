@@ -2123,10 +2123,36 @@ static bool rpc_cycle_apply_inbound_tensors(
     if (!sock) {
         return false;
     }
+    const bool control_timing =
+        std::getenv("LLAMA_HYBRID_CYCLE_RPC_CONTROL_TIMING") != nullptr;
+    rpc_cmd_roundtrip_profile rpc_timing {};
+    rpc_cmd_roundtrip_profile * const previous_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (control_timing) rpc_cmd_roundtrip_profile_active = &rpc_timing;
+    const int64_t rpc_begin_us = control_timing ? ggml_time_us() : 0;
     rpc_msg_inference_cycle_send_rsp response {};
     const bool rpc_ok = send_rpc_cmd(
         sock, RPC_CMD_INFERENCE_CYCLE_APPLY,
         &request, sizeof(request), &response, sizeof(response));
+    const int64_t rpc_done_us = control_timing ? ggml_time_us() : 0;
+    if (control_timing) {
+        rpc_cmd_roundtrip_profile_active = previous_profile;
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_APPLY_DETAIL] side=PC kind=%s "
+            "layer=%d chunk=%d seq=%" PRIu64 " "
+            "socket_lock_wait_ms=%.3f request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f total_rpc_ms=%.3f "
+            "status=%s scope=CLIENT_CONTROL_SOCKET\n",
+            kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+            layer, chunk, seq,
+            rpc_timing.socket_lock_wait_us / 1000.0,
+            rpc_timing.request_send_us / 1000.0,
+            rpc_timing.response_header_wait_us / 1000.0,
+            rpc_timing.response_body_wait_us / 1000.0,
+            (rpc_done_us - rpc_begin_us) / 1000.0,
+            rpc_ok ? "OK" : "FAIL");
+    }
     const bool ok = rpc_ok && response.result == 1;
     GGML_LOG_INFO("[CYCLE_C2P] side=pc action=PHONE_GPU_APPLY kind=%s "
                   "layer=%d chunk=%d seq=%" PRIu64
@@ -2222,11 +2248,37 @@ bool ggml_backend_rpc_cycle_finish_reduce(
     request.seq = seq;
     request.graph_id = graph_id;
     auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    const bool control_timing =
+        std::getenv("LLAMA_HYBRID_CYCLE_RPC_CONTROL_TIMING") != nullptr;
+    rpc_cmd_roundtrip_profile rpc_timing {};
+    rpc_cmd_roundtrip_profile * const previous_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (control_timing) rpc_cmd_roundtrip_profile_active = &rpc_timing;
+    const int64_t rpc_begin_us = control_timing ? ggml_time_us() : 0;
     rpc_msg_inference_cycle_send_rsp response {};
-    return sock && send_rpc_cmd(
+    const bool rpc_ok = send_rpc_cmd(
         sock, RPC_CMD_INFERENCE_CYCLE_FINISH,
-        &request, sizeof(request), &response, sizeof(response)) &&
-        response.result == 1;
+        &request, sizeof(request), &response, sizeof(response));
+    const int64_t rpc_done_us = control_timing ? ggml_time_us() : 0;
+    if (control_timing) {
+        rpc_cmd_roundtrip_profile_active = previous_profile;
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_FINISH_DETAIL] side=PC "
+            "layer=%d chunk=%d seq=%" PRIu64 " "
+            "socket_lock_wait_ms=%.3f request_send_ms=%.3f "
+            "response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f total_rpc_ms=%.3f "
+            "status=%s scope=CLIENT_CONTROL_SOCKET\n",
+            layer, chunk, seq,
+            rpc_timing.socket_lock_wait_us / 1000.0,
+            rpc_timing.request_send_us / 1000.0,
+            rpc_timing.response_header_wait_us / 1000.0,
+            rpc_timing.response_body_wait_us / 1000.0,
+            (rpc_done_us - rpc_begin_us) / 1000.0,
+            rpc_ok ? "OK" : "FAIL");
+    }
+    return rpc_ok && response.result == 1;
 }
 
 static bool rpc_cycle_send_remote_tensors(
