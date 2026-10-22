@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <exception>
 #include <optional>
 #include <string>
 #include <vector>
