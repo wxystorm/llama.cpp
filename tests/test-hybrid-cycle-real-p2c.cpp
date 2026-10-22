@@ -4765,6 +4765,19 @@ static bool cycle_real_execute_period_fifo(
     // FFN/output fences remain until the last consumer is safe to recycle.
     const bool phone_ordered_handoff = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_ORDERED_HANDOFF");
+    // Protocol 28: execute Phone Full FFN+ADD inside one Phone RPC
+    // completion transaction, reusing the existing FFN graph and buffers.
+    const bool phone_full_local_ffn = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_LOCAL_FFN");
+    if (phone_full_local_ffn &&
+        (!phone_ordered_handoff || !phone_full_fuse ||
+         !phone_full_rpc_replay || !phone_full_reuse)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_FULL_LOCAL] phase=%s status=FAIL "
+            "reason=REQUIRES_ORDERED_HANDOFF_FUSED_GRAPH_REPLAY_AND_POOL\n",
+            run_phase);
+        return false;
+    }
     // P2C only: prefer an already-ready PC CPU Reduce over queued FFN work,
     // never preempting a running FFN and never bypassing the two-shard join.
     const bool pc_reduce_priority = cycle_real_env_flag(
@@ -5174,14 +5187,16 @@ static bool cycle_real_execute_period_fifo(
     std::printf(
         "[CYCLE_ORDERED_HANDOFF_PLAN] phase=%s "
         "phone_ordered_handoff=%d pc_reduce_priority=%d "
-        "phone_p2c_local_ffn=%d "
+        "phone_p2c_local_ffn=%d phone_full_local_ffn=%d "
         "phone_full_attn_completion=FFN_LOCAL_RPC_COPY_ACK "
         "p2c_attn_completion=READY_STAGED_RPC_ACK "
-        "phone_full_ffn_fence=RETAINED "
+        "phone_full_ffn_completion=%s "
         "cpu_priority=READY_P2C_REDUCE_FIRST\n",
         run_phase, phone_ordered_handoff ? 1 : 0,
         pc_reduce_priority ? 1 : 0,
-        phone_p2c_local_ffn ? 1 : 0);
+        phone_p2c_local_ffn ? 1 : 0,
+        phone_full_local_ffn ? 1 : 0,
+        phone_full_local_ffn ? "PHONE_RUN_RPC_ACK" : "EXPLICIT_FENCE");
 
     llama_hybrid_cycle_layout period = layout;
     period.pc_cuda_full = pc_cuda_full;
@@ -5543,7 +5558,9 @@ static bool cycle_real_execute_period_fifo(
                                     if ((*it)->is_full_layer &&
                                         (*it)->prepared_tokens == st.tokens &&
                                         (*it)->fused_full_graph == phone_full_fuse &&
-                                        (*it)->rpc_full_replay == phone_full_rpc_replay) {
+                                        (*it)->rpc_full_replay == phone_full_rpc_replay &&
+                                        ((*it)->registered_full_graph_uid != 0) ==
+                                            phone_full_local_ffn) {
                                         st.phone_output = std::move(*it);
                                         pool.erase(it);
                                         ++phone_reuse_stats[size_t(l)].hits;
@@ -5558,7 +5575,7 @@ static bool cycle_real_execute_period_fifo(
                                 ok = st.phone_output->prepare(
                                     phone, weights, hidden, st.tokens,
                                     topk, experts, true, phone_full_fuse,
-                                    phone_full_rpc_replay);
+                                    phone_full_rpc_replay, phone_full_local_ffn);
                                 if (ok && phone_full_reuse) {
                                     ++phone_reuse_stats[size_t(l)].misses;
                                 }
@@ -5581,7 +5598,10 @@ static bool cycle_real_execute_period_fifo(
                         const auto full_ffn_call_begin =
                             std::chrono::steady_clock::now();
                         if (ok) {
-                            ok = st.phone_output->execute_full_local(st.ready);
+                            ok = phone_full_local_ffn ?
+                                st.phone_output->execute_full_server(
+                                    phone, st.ready, l, c, st.wire.seq) :
+                                st.phone_output->execute_full_local(st.ready);
                             if (ok && phone_ordered_handoff) {
                                 // Same RPC COMPUTE connection orders Graph
                                 // execution before the FFN-local input copies;
@@ -5606,7 +5626,7 @@ static bool cycle_real_execute_period_fifo(
                                     std::chrono::steady_clock::now() -
                                     full_ffn_call_begin).count();
                         }
-                        if (ok) {
+                        if (ok && !phone_full_local_ffn) {
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
@@ -5620,6 +5640,9 @@ static bool cycle_real_execute_period_fifo(
                                         fence_begin).count();
                             }
                         }
+                        // Phone Full RUN_ACK guarantees the fused FFN + ADD
+                        // output is complete, so the explicit Fence is
+                        // redundant only when this mode is enabled.
                         if (ok && boundary_trace) {
                             // The full-Phone MoE FFN has completed, but the
                             // Reduce graph has not yet run. This isolates
@@ -6347,14 +6370,19 @@ static bool cycle_real_execute_period_fifo(
         "phone_full_attn_fences_elided=%llu "
         "p2c_attn_fences_elided=%llu "
         "p2c_local_ffn_enabled=%d p2c_local_ffn_completed=%llu "
-        "ffn_and_reduce_fences=UNCHANGED "
+        "phone_full_local_ffn_enabled=%d "
+        "phone_full_local_completions=%llu "
+        "phone_full_ffn_fence=%s "
         "graph_reuse=UNCHANGED scratch_reuse=UNCHANGED "
         "transport=UNCHANGED\n",
         run_phase, phone_ordered_handoff ? 1 : 0,
         (unsigned long long) ordered_full_handoffs,
         (unsigned long long) ordered_p2c_handoffs,
         phone_p2c_local_ffn ? 1 : 0,
-        (unsigned long long) p2c_phone_local_completed);
+        (unsigned long long) p2c_phone_local_completed,
+        phone_full_local_ffn ? 1 : 0,
+        (unsigned long long) (phone_full_local_ffn ? ordered_full_handoffs : 0),
+        phone_full_local_ffn ? "ELIDED_BY_PHONE_RUN_ACK" : "UNCHANGED");
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
     std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
