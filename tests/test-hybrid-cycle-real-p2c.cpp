@@ -5501,6 +5501,8 @@ static bool cycle_real_execute_period_fifo(
                 case llama_hybrid_cycle_stage::ATTN_PRE: {
                     double attn_ms = 0.0;
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                        const auto attn_call_begin =
+                            std::chrono::steady_clock::now();
                         const auto input = host_input(l, c);
                         ok = input.size() == size_t(st.tokens * hidden) &&
                             cycle_real_execute_phone_attention_pre(
@@ -5510,6 +5512,10 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 0, nullptr, false,
                                 perf_mode ? &attn_profile[queue_index] : nullptr);
+                        if (path_timing) {
+                            st.c2p_timing.pc_attn_call_ms =
+                                cycle_real_path_elapsed_ms(attn_call_begin);
+                        }
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "C2P_READY_RESIDUAL", l, c, st.ready.residual);
@@ -5518,6 +5524,8 @@ static bool cycle_real_execute_period_fifo(
                             cycle_real_period_checkpoint(
                                 "C2P_ATTN_RESIDUAL", l, c, st.start, hidden,
                                 st.ready.residual, checkpoints.c2p_residual);
+                            const auto phone_prepare_begin =
+                                std::chrono::steady_clock::now();
                             bool needs_prepare = true;
                             bool slot_reserved = false;
                             phone_chunk_ptr incompatible_slot;
@@ -5586,6 +5594,11 @@ static bool cycle_real_execute_period_fifo(
                                         st.phone_output->gpu_alloc_ms;
                                 }
                             }
+                            if (path_timing) {
+                                st.c2p_timing.phone_slot_prepare_ms =
+                                    cycle_real_path_elapsed_ms(
+                                        phone_prepare_begin);
+                            }
                         }
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                         const auto * local_input = take_device_input(l, c);
@@ -5615,8 +5628,11 @@ static bool cycle_real_execute_period_fifo(
                         ok = st.phone_output && cycle_real_send_c2p_frame(
                             phone, st.wire, INFERENCE_CYCLE_READY,
                             st.ready, st.partial,
-                            uint32_t(st.tokens), uint32_t(hidden), uint32_t(topk));
+                            uint32_t(st.tokens), uint32_t(hidden), uint32_t(topk),
+                            path_timing ? &st.c2p_timing.ready_tx : nullptr);
                         if (ok) {
+                            const auto call_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_apply_ready(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
@@ -5624,12 +5640,22 @@ static bool cycle_real_execute_period_fifo(
                                 st.phone_output->inputs.norm,
                                 st.phone_output->inputs.topk_ids,
                                 st.phone_output->inputs.topk_weights);
+                            if (path_timing) {
+                                st.c2p_timing.ready_apply_rpc_ms =
+                                    cycle_real_path_elapsed_ms(call_begin);
+                            }
                         }
                         if (ok) {
+                            const auto ack_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_wait_ack(
                                 phone, INFERENCE_CYCLE_READY,
                                 st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id, 30000);
+                            if (path_timing) {
+                                st.c2p_timing.ready_ack_wait_ms =
+                                    cycle_real_path_elapsed_ms(ack_begin);
+                            }
                         }
                     } else {
                         ok = cycle_real_receive_live_wire(
@@ -5664,6 +5690,8 @@ static bool cycle_real_execute_period_fifo(
                 }
                 case llama_hybrid_cycle_stage::FFN_SOURCE: {
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                        const auto pc_ffn_begin =
+                            std::chrono::steady_clock::now();
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
                             cpu, weights, st.ready.norm,
@@ -5671,6 +5699,10 @@ static bool cycle_real_execute_period_fifo(
                             hidden, st.tokens, topk, experts,
                             st.partial, nullptr, nullptr, nullptr, nullptr,
                             perf_mode ? &ffn_profile[queue_index] : nullptr);
+                        if (path_timing) {
+                            st.c2p_timing.pc_ffn_call_ms =
+                                cycle_real_path_elapsed_ms(pc_ffn_begin);
+                        }
                     } else {
                         const auto weights = full_shard(l, 1);
                         const std::vector<float> none_f;
@@ -5733,6 +5765,10 @@ static bool cycle_real_execute_period_fifo(
                 case llama_hybrid_cycle_stage::FFN_DESTINATION: {
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         ok = st.phone_output && st.phone_output->execute_ffn();
+                        if (path_timing && st.phone_output) {
+                            st.c2p_timing.phone_ffn_submit_rpc_ms =
+                                st.phone_output->ffn_graph_submit_ms;
+                        }
                     } else {
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
@@ -5755,12 +5791,19 @@ static bool cycle_real_execute_period_fifo(
                         ok = st.phone_output && cycle_real_send_c2p_frame(
                             phone, st.wire, INFERENCE_CYCLE_PARTIAL,
                             st.ready, st.partial, uint32_t(st.tokens),
-                            uint32_t(hidden), uint32_t(topk));
+                            uint32_t(hidden), uint32_t(topk),
+                            path_timing ? &st.c2p_timing.partial_tx : nullptr);
                         if (ok) {
+                            const auto apply_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_apply_partial(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
                                 st.phone_output->pc_partial);
+                            if (path_timing) {
+                                st.c2p_timing.partial_apply_rpc_ms =
+                                    cycle_real_path_elapsed_ms(apply_begin);
+                            }
                         }
                     } else {
                         ok = cycle_real_receive_live_wire(
@@ -5779,16 +5822,34 @@ static bool cycle_real_execute_period_fifo(
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         ok = st.phone_output &&
                             st.phone_output->execute_reduce(phone);
+                        if (path_timing && st.phone_output) {
+                            st.c2p_timing.reduce_graph_rpc_ms =
+                                st.phone_output->reduce_graph_call_ms;
+                            st.c2p_timing.reduce_backend_sync_ms =
+                                st.phone_output->reduce_backend_sync_ms;
+                        }
                         if (ok) {
+                            const auto finish_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_finish_reduce(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id);
+                            if (path_timing) {
+                                st.c2p_timing.reduce_finish_rpc_ms =
+                                    cycle_real_path_elapsed_ms(finish_begin);
+                            }
                         }
                         if (ok) {
+                            const auto ack_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_wait_ack(
                                 phone, INFERENCE_CYCLE_PARTIAL,
                                 st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id, 30000);
+                            if (path_timing) {
+                                st.c2p_timing.reduce_ack_wait_ms =
+                                    cycle_real_path_elapsed_ms(ack_begin);
+                            }
                         }
                         // The GPU output MUST survive for the next Phone
                         // FULL_LAYER; do not free it at this boundary.
