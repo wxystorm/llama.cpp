@@ -3039,6 +3039,10 @@ struct cycle_real_c2p_phone_chunk {
     double gpu_alloc_ms = 0.0;
     double ffn_graph_submit_ms = 0.0;
     double reduce_graph_submit_ms = 0.0;
+    // Client-side RPC graph submission, distinct from actual Phone GPU time.
+    double reduce_graph_call_ms = 0.0;
+    // RPC synchronize may be a no-op; do not label it a device fence.
+    double reduce_backend_sync_ms = 0.0;
     bool is_full_layer = false;
     bool fused_full_graph = false;
     bool rpc_full_replay = false;
@@ -3066,6 +3070,8 @@ struct cycle_real_c2p_phone_chunk {
         fused_full_graph = false;
         rpc_full_replay = false;
         prepared_tokens = 0;
+        reduce_graph_call_ms = 0.0;
+        reduce_backend_sync_ms = 0.0;
     }
 
     bool prepare(
@@ -3214,11 +3220,19 @@ struct cycle_real_c2p_phone_chunk {
         const auto begin = std::chrono::steady_clock::now();
         const bool ok = ggml_backend_graph_compute(phone, reduce_graph) ==
                         GGML_STATUS_SUCCESS;
+        const auto graph_done = std::chrono::steady_clock::now();
         if (ok) {
             ggml_backend_synchronize(phone);
         }
-        reduce_graph_submit_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - begin).count();
+        const auto done = std::chrono::steady_clock::now();
+        reduce_graph_call_ms =
+            std::chrono::duration<double, std::milli>(
+                graph_done - begin).count();
+        reduce_backend_sync_ms =
+            std::chrono::duration<double, std::milli>(
+                done - graph_done).count();
+        reduce_graph_submit_ms = reduce_graph_call_ms +
+            reduce_backend_sync_ms;
         std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE mode=%s "
                     "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
                     "status=%s\n",
@@ -3511,6 +3525,8 @@ struct cycle_real_p2c_ffn_slot {
     int64_t prepared_tokens = 0;
     double graph_build_ms = 0.0;
     double backend_prepare_ms = 0.0;
+    double last_execute_call_ms = 0.0;
+    double last_send_partial_rpc_ms = 0.0;
 
     cycle_real_p2c_ffn_slot() = default;
     cycle_real_p2c_ffn_slot(const cycle_real_p2c_ffn_slot &) = delete;
@@ -3527,6 +3543,8 @@ struct cycle_real_p2c_ffn_slot {
         prepared_tokens = 0;
         graph_build_ms = 0.0;
         backend_prepare_ms = 0.0;
+        last_execute_call_ms = 0.0;
+        last_send_partial_rpc_ms = 0.0;
     }
 
     bool prepare(ggml_backend_t phone,
@@ -3588,27 +3606,44 @@ struct cycle_real_p2c_ffn_slot {
         const auto execute_begin = std::chrono::steady_clock::now();
         const bool computed = executor.execute(
             nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, &ready);
+        const auto execute_done = std::chrono::steady_clock::now();
+        last_execute_call_ms =
+            std::chrono::duration<double, std::milli>(
+                execute_done - execute_begin).count();
         if (profile) {
-            profile->backend_execute_call_ms +=
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - execute_begin).count();
+            profile->backend_execute_call_ms += last_execute_call_ms;
         }
+        last_send_partial_rpc_ms = 0.0;
         if (!computed) return false;
         // This RPC command synchronously reads GPU output and copies it
         // into the independent Phone TX slot before acknowledging success.
         // The slot can then be overwritten for another chunk while TX runs.
-        return ggml_backend_rpc_cycle_send_partial(
+        const bool sent = ggml_backend_rpc_cycle_send_partial(
             phone, wire.layer, wire.chunk, wire.seq, wire.graph_id,
             inputs.ffn_output);
+        last_send_partial_rpc_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - execute_done).count();
+        return sent;
     }
 };
 
+struct cycle_real_wire_submit_timing {
+    size_t payload_bytes = 0;
+    double encode_ms = 0.0;
+    double enqueue_call_ms = 0.0;
+};
+
+// PC-side breakdown only: encoding and queuing are not the network wire
+// duration. Remote delivery/processing is later reflected in ACK waits.
 static bool cycle_real_send_c2p_frame(
         ggml_backend_t phone, const cycle_real_live_wire & wire,
         inference_cycle_payload_kind kind,
         const cycle_real_phone_ready & ready,
         const std::vector<float> & partial,
-        uint32_t tokens, uint32_t hidden, uint32_t topk) {
+        uint32_t tokens, uint32_t hidden, uint32_t topk,
+        cycle_real_wire_submit_timing * timing = nullptr) {
+    const auto encode_begin = std::chrono::steady_clock::now();
     size_t bytes = 0;
     if (!inference_cycle_payload_size(
             kind, tokens, hidden,
@@ -3656,8 +3691,17 @@ static bool cycle_real_send_c2p_frame(
     task.stage = kind == INFERENCE_CYCLE_READY ?
         INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
     task.tensor_role = INFERENCE_CYCLE_PC_TO_PHONE;
+    const auto enqueue_begin = std::chrono::steady_clock::now();
     const bool submitted = submit != nullptr &&
         submit(phone, &task, frame.data(), frame.size());
+    if (timing) {
+        timing->payload_bytes = bytes;
+        timing->encode_ms = std::chrono::duration<double, std::milli>(
+            enqueue_begin - encode_begin).count();
+        timing->enqueue_call_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - enqueue_begin).count();
+    }
     std::printf(
         "[CYCLE_C2P_WIRE] side=pc action=SEND kind=%s layer=%d chunk=%d "
         "seq=%llu bytes=%zu direction=PC_TO_PHONE status=%s\n",
