@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    28
+#define RPC_PROTO_PATCH_VERSION    29
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -401,6 +401,23 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full(
         uint64_t seq, uint64_t ffn_graph_uid,
         const struct ggml_tensor * const sources[4],
         const struct ggml_tensor * const destinations[4]);
+
+// Protocol 29, opt-in V2: after completing this Full FFN+ADD, the Phone
+// server enqueues the NEXT layer's pre-registered Attention graph on its
+// local FIFO. No PC-side second Attention submit and no device readback.
+// This initial safe mode requires a single in-flight Chunk per layer.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full_chain(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t ffn_graph_uid,
+        const struct ggml_tensor * const sources[4],
+        const struct ggml_tensor * const destinations[4],
+        int32_t next_layer, uint64_t next_seq, uint64_t next_graph_id,
+        uint64_t next_attention_graph_uid,
+        const struct ggml_tensor * full_output,
+        const struct ggml_tensor * next_attention_input);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_next_attention(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
 
 // Protocol 26: REAL C2P data-plane frames travel PC -> Phone exactly once.
 // APPLY consumes the Phone server's already-received READY/PARTIAL and writes
