@@ -2849,9 +2849,9 @@ struct cycle_real_c2p_phone_chunk {
             // Replayed graph references exactly these persistent FFN,
             // residual and output buffers. A freed graph must NEVER reuse
             // its UID; only this object's subsequent Chunk may replay it.
-            ffn_graph->uid = cycle_real_phone_graph_replay_uid();
+            ggml_graph_set_uid(ffn_graph, cycle_real_phone_graph_replay_uid());
             if (reduce_graph) {
-                reduce_graph->uid = cycle_real_phone_graph_replay_uid();
+                ggml_graph_set_uid(reduce_graph, cycle_real_phone_graph_replay_uid());
             }
         }
         const auto build_end = std::chrono::steady_clock::now();
