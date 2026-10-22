@@ -14411,6 +14411,64 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
+            case RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_RUN: {
+                rpc_msg_inference_cycle_phone_full_run_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const int64_t begin_us = ggml_time_us();
+                bool ok = request.device < device_count &&
+                    request.layer >= 0 && request.chunk >= 0 &&
+                    request.seq != 0 && request.ffn_graph_uid != 0;
+                // This command follows Attention compute on the ordered
+                // COMPUTE socket. Reuse precisely the registered FFN slot
+                // and its output ADD graph, without constructing new graphs
+                // or copying activations over the network. The remote copy
+                // helper validates each concrete buffer and tensor layout.
+                for (int i = 0; i < 4 && ok; ++i) {
+                    const rpc_tensor & src = request.ready_inputs[i];
+                    const rpc_tensor & dst = request.ffn_inputs[i];
+                    const uint32_t expected_type = i == 2 ?
+                        GGML_TYPE_I32 : GGML_TYPE_F32;
+                    if (src.buffer == 0 || dst.buffer == 0 ||
+                        src.type != expected_type ||
+                        dst.type != expected_type) {
+                        ok = false;
+                        break;
+                    }
+                    rpc_msg_copy_tensor_req copy {};
+                    copy.src = src;
+                    copy.dst = dst;
+                    rpc_msg_copy_tensor_rsp copied {};
+                    ok = server.copy_tensor(copy, copied) &&
+                         copied.result != 0;
+                }
+                const int64_t copy_done_us = ggml_time_us();
+                if (ok) {
+                    rpc_msg_graph_recompute_req run {};
+                    run.device = request.device;
+                    run.graph_uid = request.ffn_graph_uid;
+                    ok = server.graph_recompute(run);
+                }
+                const int64_t compute_done_us = ggml_time_us();
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                const int64_t reply_done_us = ggml_time_us();
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_FULL_LOCAL] side=PHONE action=RUN "
+                    "layer=%d chunk=%d seq=%" PRIu64
+                    " graph_uid=%" PRIu64 " copy_ms=%.3f "
+                    "ffn_and_add_ms=%.3f response_ms=%.3f "
+                    "total_ms=%.3f status=%s "
+                    "graph=REGISTERED_REPLAY result=DEVICE_COMPLETE\n",
+                    request.layer, request.chunk, request.seq,
+                    request.ffn_graph_uid,
+                    (copy_done_us - begin_us) / 1000.0,
+                    (compute_done_us - copy_done_us) / 1000.0,
+                    (reply_done_us - compute_done_us) / 1000.0,
+                    (reply_done_us - begin_us) / 1000.0,
+                    ok ? "OK" : "FAIL");
+                break;
+            }
             case RPC_CMD_INFERENCE_CYCLE_APPLY: {
                 rpc_msg_inference_cycle_send_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
