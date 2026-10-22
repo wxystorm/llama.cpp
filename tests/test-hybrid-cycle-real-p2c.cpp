@@ -4233,6 +4233,8 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE");
     const bool attn_scratch_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
+    const bool attn_graph_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
     if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
         std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
                     "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
@@ -4248,11 +4250,20 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE");
     const bool phone_full_rpc_replay = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY");
+    if (attn_graph_reuse &&
+        (!attn_scratch_reuse || !phone_full_session ||
+         !phone_full_session->attn_graph_enabled)) {
+        std::fprintf(stderr,
+            "[CYCLE_ATTN_GRAPH_CACHE] phase=%s status=FAIL "
+            "reason=REQUIRES_SESSION_AND_SCRATCH_POOL\n",
+            run_phase);
+        return false;
+    }
     if (phone_full_session &&
         (!phone_full_reuse ||
          !phone_full_session->matches(
             phone, model, layout, tokens, chunk_tokens, window,
-            phone_full_fuse, phone_full_rpc_replay))) {
+            phone_full_fuse, phone_full_rpc_replay, attn_graph_reuse))) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_FULL_SESSION] phase=%s status=FAIL "
             "reason=MODEL_BACKEND_LAYOUT_OR_SHAPE_MISMATCH\n",
@@ -6645,8 +6656,10 @@ int main(int argc, char ** argv) {
             // Opt-in two-pass benchmark: warm a COMPLETE Cycle with the
             // same token shapes, KV prefixes and FIFO window, then run the
             // independently measured Cycle without reloading the model.
-            // Each pass allocates fresh per-period KV and graph state and
-            // fully drains the transport before the next begins.
+            // All non-Phone KV remains per period. Opt-in Phone Attention
+            // Graph Cache keeps Phone KV physical addresses for this model
+            // session, but resets committed_tokens between periods.
+            // Transport always fully drains before the next period.
             int warmup_runs = 0;
             const char * warm_env =
                 std::getenv("LLAMA_HYBRID_CYCLE_WARMUP_RUNS");
@@ -6665,6 +6678,17 @@ int main(int argc, char ** argv) {
             }
             const bool phone_full_session_reuse = cycle_real_env_flag(
                 "LLAMA_HYBRID_CYCLE_PHONE_FULL_SESSION_REUSE");
+            const bool attn_graph_cache_enabled = cycle_real_env_flag(
+                "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
+            if (attn_graph_cache_enabled &&
+                (!phone_full_session_reuse || !cycle_real_env_flag(
+                    "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL"))) {
+                std::fprintf(stderr,
+                    "[CYCLE_ATTN_GRAPH_CACHE] status=FAIL "
+                    "reason=REQUIRES_PHONE_FULL_SESSION_AND_ATTN_SCRATCH\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
             if (phone_full_session_reuse &&
                 !cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_REUSE")) {
                 std::fprintf(stderr,
@@ -6681,7 +6705,20 @@ int main(int argc, char ** argv) {
                     phone, *model, expected_layout, ntokens,
                     chunk_tokens, effective_window,
                     cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE"),
-                    cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY"));
+                    cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY"),
+                    attn_graph_cache_enabled);
+                if (attn_graph_cache_enabled) {
+                    std::printf(
+                        "[CYCLE_ATTN_GRAPH_CACHE_PLAN] enabled=1 "
+                        "layers=[%d,%d] graph_owner=PHONE_SESSION "
+                        "kv_buffer=SESSION_PERSISTENT "
+                        "kv_tokens=RESET_EACH_PERIOD "
+                        "scratch_owner=PERIOD_POOL "
+                        "graph_key=QUERY_TOKENS_KV_TOKENS "
+                        "rpc_server_replay=UNCHANGED\n",
+                        expected_layout.x + 1,
+                        expected_layout.cycle_size - 1);
+                }
                 std::printf(
                     "[CYCLE_PHONE_FULL_SESSION_PLAN] enabled=1 "
                     "layers=[%d,%d] max_slots_per_layer=%d "
