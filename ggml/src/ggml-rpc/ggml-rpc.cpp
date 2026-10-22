@@ -13260,12 +13260,14 @@ struct rpc_cycle_p2c_fifo_v1 {
                 jobs.pop_front();
             }
             const int64_t t0 = ggml_time_us();
+            int64_t lock_acquired_us = t0;
             int64_t t1 = t0, t2 = t0, t3 = t0;
             bool ok = true;
             try {
                 // The WAIT handler never owns this mutex. Other GPU RPCs
                 // serialize here to protect graph_map and borrowed buffers.
                 std::lock_guard<std::mutex> gpu(server.cycle_p2c_gpu_gate());
+                lock_acquired_us = ggml_time_us();
                 for (int i = 0; i < 3 && ok; ++i) {
                     rpc_msg_copy_tensor_req req {};
                     req.src = item.plan.ready_inputs[i];
@@ -13304,12 +13306,15 @@ struct rpc_cycle_p2c_fifo_v1 {
             GGML_LOG_INFO(
                 "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=DONE "
                 "layer=%d chunk=%d seq=%" PRIu64 " uid=%" PRIu64
-                " queue_wait_ms=%.3f copy_ms=%.3f ffn_ms=%.3f "
+                " queue_wait_ms=%.3f gpu_gate_wait_ms=%.3f "
+                "copy_ms=%.3f ffn_ms=%.3f "
                 "partial_stage_ms=%.3f status=%s\n",
                 std::get<0>(item.id), std::get<1>(item.id),
                 std::get<2>(item.id), item.plan.ffn_graph_uid,
                 (t0 - item.enqueue_us) / 1000.0,
-                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                (lock_acquired_us - t0) / 1000.0,
+                (t1 - lock_acquired_us) / 1000.0,
+                (t2 - t1) / 1000.0,
                 (t3 - t2) / 1000.0, ok ? "OK" : "FAIL");
         }
     }
