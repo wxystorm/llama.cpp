@@ -4672,6 +4672,18 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE");
     const bool phone_full_rpc_replay = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY");
+    // First reversible step toward local Phone execution: a synchronous
+    // Phone-to-PC READY staging RPC and a same-server FFN input-copy RPC
+    // already follow their Attention graphs on the ordered COMPUTE socket.
+    // These server commands guarantee Graph execution completion before
+    // their reply, so an extra PC-issued Attention fence is redundant.
+    // FFN/output fences remain until the last consumer is safe to recycle.
+    const bool phone_ordered_handoff = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_ORDERED_HANDOFF");
+    // P2C only: prefer an already-ready PC CPU Reduce over queued FFN work,
+    // never preempting a running FFN and never bypassing the two-shard join.
+    const bool pc_reduce_priority = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PC_REDUCE_PRIORITY");
     if (attn_graph_reuse &&
         (!attn_scratch_reuse || !phone_full_session ||
          !phone_full_session->attn_graph_enabled)) {
@@ -5040,6 +5052,9 @@ static bool cycle_real_execute_period_fifo(
         static_cast<size_t>(n_layers));
     std::vector<cycle_real_pc_cuda_full_detail> pc_cuda_detail(
         static_cast<size_t>(n_layers));
+    // Each counter has only one writer: the PHONE_GPU FIFO worker.
+    uint64_t ordered_full_handoffs = 0;
+    uint64_t ordered_p2c_handoffs = 0;
     // Owned exclusively by the PHONE_GPU FIFO worker. One shape-specific
     // slot is enough: this worker executes FFN_SOURCE tasks serially.
     std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_ffn_slot;
@@ -5057,6 +5072,15 @@ static bool cycle_real_execute_period_fifo(
         run_phase, wire_epoch, layout.x, layout.y, n_layers - 1,
         int(tokens), n_chunks, chunk_tokens, window);
     std::fflush(stdout);
+    std::printf(
+        "[CYCLE_ORDERED_HANDOFF_PLAN] phase=%s "
+        "phone_ordered_handoff=%d pc_reduce_priority=%d "
+        "phone_full_attn_completion=FFN_LOCAL_RPC_COPY_ACK "
+        "p2c_attn_completion=READY_STAGED_RPC_ACK "
+        "phone_full_ffn_fence=RETAINED "
+        "cpu_priority=READY_P2C_REDUCE_FIRST\n",
+        run_phase, phone_ordered_handoff ? 1 : 0,
+        pc_reduce_priority ? 1 : 0);
 
     llama_hybrid_cycle_layout period = layout;
     period.pc_cuda_full = pc_cuda_full;
@@ -5090,10 +5114,11 @@ static bool cycle_real_execute_period_fifo(
         const auto & previous = *states[size_t(l - 1)][size_t(c)];
         return previous.phone_output ? previous.phone_output->output : nullptr;
     };
-    // Called by the sole PHONE_GPU worker only AFTER the consumer
-    // Attention has explicitly fenced. At that point the producer's
-    // l_out will not be read again. Retain the FFN/Reduce GPU buffers for
-    // a later Chunk of the SAME physical full-Phone layer.
+    // Called by the sole PHONE_GPU worker after the consumer has safely
+    // finished reading the producer's l_out: in legacy mode after Attention
+    // Fence; in ordered-handoff mode after the ordered FFN-local input-copy
+    // RPC completes, or after the P2C READY RPC has staged its payload.
+    // Keep per-layer FFN/Reduce GPU buffers for the next compatible Chunk.
     const auto retire_device_output = [&](int producer_layer, int chunk) {
         auto & owned = states[size_t(producer_layer)][size_t(chunk)]->phone_output;
         if (c2p_ffn_reuse && owned && !owned->is_full_layer &&
@@ -6082,7 +6107,8 @@ static bool cycle_real_execute_period_fifo(
                 std::fflush(stdout);
             }
             return ok;
-        }, window, true, perf_mode ? &fifo_profile : nullptr);
+        }, window, true, perf_mode ? &fifo_profile : nullptr,
+        pc_reduce_priority);
     const auto fifo_done = std::chrono::steady_clock::now();
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
