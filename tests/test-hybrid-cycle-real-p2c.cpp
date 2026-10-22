@@ -6520,11 +6520,15 @@ int main(int argc, char ** argv) {
             std::printf(
                 "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d "
                 "measured_runs=1 model_load=ONCE "
-                "same_shapes=1 distinct_kv_and_graphs=1 "
+                "same_shapes=1 distinct_kv=1 phone_full_graph_scope=%s "
                 "wire_seq=UNIQUE_PER_ROUND "
                 "pc_wall_includes=FIFO_AND_RELEASE "
                 "phone_server_sums=SESSION_CUMULATIVE_USE_DELTA\n",
-                warmup_runs != 0 ? 1 : 0, warmup_runs);
+                warmup_runs != 0 ? 1 : 0, warmup_runs,
+                phone_full_session_reuse ? "SESSION" : "PERIOD");
+            const auto session_run_begin = std::chrono::steady_clock::now();
+            double session_run_call_sum_ms = 0.0;
+            int session_run_calls = 0;
             for (int run = 0; run <= warmup_runs; ++run) {
                 const bool is_warmup = run < warmup_runs;
                 const char * phase = is_warmup ? "WARMUP" : "MEASURE";
@@ -6543,6 +6547,8 @@ int main(int argc, char ** argv) {
                 const double run_full_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - run_start).count();
+                session_run_call_sum_ms += run_full_ms;
+                ++session_run_calls;
                 std::printf(
                     "[CYCLE_WARMUP_RUN] phase=%s epoch=%" PRIu64
                     " full_call_wall_ms=%.3f "
@@ -6566,6 +6572,17 @@ int main(int argc, char ** argv) {
                     "included_in=SESSION_LIFETIME_NOT_PERIOD_WALL "
                     "before_phone_backend_free=1 status=OK\n",
                     cached_before_release, release_ms);
+                const double session_lifetime_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        session_run_begin).count();
+                std::printf(
+                    "[CYCLE_PHONE_FULL_SESSION_LIFETIME_SUM] "
+                    "run_calls=%d run_call_sum_ms=%.3f "
+                    "teardown_ms=%.3f session_wall_ms=%.3f "
+                    "measurement=INCLUDES_FINAL_REMOTE_BUFFER_FREE\n",
+                    session_run_calls, session_run_call_sum_ms,
+                    release_ms, session_lifetime_ms);
                 std::fflush(stdout);
             }
         } else {
