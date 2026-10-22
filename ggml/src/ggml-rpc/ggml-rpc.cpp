@@ -7001,7 +7001,8 @@ public:
     }
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
-    bool graph_compute(const std::vector<uint8_t> & input);
+    bool graph_compute(const std::vector<uint8_t> & input,
+                       bool register_only = false);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
@@ -11871,7 +11872,8 @@ ggml_status rpc_server::graph_compute_phone_npu_ffn(
     return GGML_STATUS_SUCCESS;
 }
 
-bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+bool rpc_server::graph_compute(
+        const std::vector<uint8_t> & input, bool register_only) {
     // Starts after the RPC command bytes have arrived. It deliberately
     // excludes socket receive and any PC-side graph-submit wait.
     const int64_t request_begin_us = cycle_server_timing_enabled() ?
@@ -11943,6 +11945,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+
+    if (register_only) {
+        // The host-side graph has all weight/input/output RPC descriptors
+        // already bound. Keep only the restored graph; do not execute FFN
+        // with inputs that have not been produced by Attention yet.
+        graph_entry.graph = graph;
+        GGML_LOG_INFO(
+            "[CYCLE_P2C_LOCAL] side=PHONE action=GRAPH_REGISTER "
+            "device=%u graph_uid=%" PRIu64 " nodes=%u "
+            "status=OK execute=DEFERRED\n",
+            device, graph_uid, n_nodes);
+        return true;
+    }
 
     // Only for the Cycle live-FFN test. The PC RPC device stub advertises
     // all GGML ops as supported. Validate on the REAL OpenCL device.
