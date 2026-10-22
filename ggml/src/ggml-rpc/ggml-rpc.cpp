@@ -5754,6 +5754,33 @@ static bool rpc_flush_pending_fused_input(
     return send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
 }
 
+// One-time graph registration for a Phone-local P2C continuation. Unlike
+// GRAPH_COMPUTE this RPC does not execute FFN with uninitialized inputs.
+bool ggml_backend_rpc_cycle_register_graph(
+        ggml_backend_t backend, const ggml_cgraph * graph) {
+    if (!ggml_backend_is_rpc(backend) || !graph || graph->uid == 0 ||
+        graph->n_nodes <= 0) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto sock = ctx ? get_socket(ctx->endpoint) : nullptr;
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 27) {
+        GGML_LOG_ERROR("[CYCLE_P2C_LOCAL] action=REGISTER status=FAIL "
+                       "reason=PHONE_RPC_PATCH27_REQUIRED\n");
+        return false;
+    }
+    std::vector<uint8_t> payload;
+    serialize_graph(ctx->device, graph->uid, graph, payload);
+    rpc_msg_inference_cycle_send_rsp response {};
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_GRAPH_REGISTER,
+        payload.data(), payload.size(), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO(
+        "[CYCLE_P2C_LOCAL] side=PC action=REGISTER graph_uid=%" PRIu64
+        " nodes=%d bytes=%zu status=%s\n",
+        graph->uid, graph->n_nodes, payload.size(), ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Client-side one-way Graph submission timing. The synchronous GPU work
 // happens later, when the Phone server processes the command. Graph UID
 // allows correlation with CYCLE_RPC_GRAPH_ORDER on the same compute socket.
