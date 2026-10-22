@@ -28,6 +28,7 @@
 #include "ggml-rpc.h"
 #include "ggml-backend.h"
 #include "cycle-attention-scratch-pool.h"
+#include "cycle-attention-graph-cache.h"
 
 #include <algorithm>
 #include <array>
@@ -575,6 +576,8 @@ struct cycle_real_phone_ready {
     ggml_context * phone_ctx = nullptr;
     ggml_backend_buffer_t phone_compute_buffer = nullptr;
     cycle_real_attention_scratch_pool * phone_scratch_pool = nullptr;
+    cycle_real_attention_graph_cache * phone_graph_cache = nullptr;
+    cycle_real_attention_graph_cache::slot * phone_cached_graph = nullptr;
     llama_hybrid_cycle_ready_graph phone_graph {};
 
     cycle_real_phone_ready() = default;
@@ -585,10 +588,17 @@ struct cycle_real_phone_ready {
     void release_phone_graph() {
         // FFN already consumed/fenced READY before handing its buffer back.
         // Graph metadata must not outlive the memory it describes.
-        if (phone_ctx != nullptr) {
+        if (phone_graph_cache && phone_cached_graph) {
+            // This graph is session-owned. Drop tensor bindings so another
+            // Chunk can attach a fresh scratch lease without stale RPC
+            // pointers. Do not destroy its ggml_context.
+            phone_graph_cache->recycle(phone_cached_graph, true);
+        } else if (phone_ctx != nullptr) {
             ggml_free(phone_ctx);
-            phone_ctx = nullptr;
         }
+        phone_ctx = nullptr;
+        phone_graph_cache = nullptr;
+        phone_cached_graph = nullptr;
         if (phone_compute_buffer != nullptr) {
             if (phone_scratch_pool) {
                 phone_scratch_pool->recycle(phone_compute_buffer);
@@ -3118,12 +3128,17 @@ struct cycle_real_phone_full_session_pool {
     int window = 0;
     bool fuse = false;
     bool rpc_replay = false;
+    bool attn_graph_enabled = false;
     std::vector<std::vector<slot_ptr>> idle_by_layer;
+    // Only Phone physical layers are session-persistent; PC/CUDA KV stays
+    // strictly per-period. Graphs borrow these exact KV Tensor objects.
+    std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> phone_kv;
+    std::vector<std::unique_ptr<cycle_real_attention_graph_cache>> attn_graphs;
 
     void configure(ggml_backend_t p, const llama_model & m,
                    const llama_hybrid_cycle_layout & layout,
                    int32_t tokens, int chunk, int inflight,
-                   bool fusion, bool replay) {
+                   bool fusion, bool replay, bool cache_attention) {
         clear();
         phone = p;
         model = &m;
@@ -3135,20 +3150,33 @@ struct cycle_real_phone_full_session_pool {
         window = inflight;
         fuse = fusion;
         rpc_replay = replay;
+        attn_graph_enabled = cache_attention;
         idle_by_layer.resize(size_t(layers));
+        if (attn_graph_enabled) {
+            phone_kv.resize(size_t(layers));
+            attn_graphs.resize(size_t(layers));
+            for (int l = x + 1; l < layers; ++l) {
+                attn_graphs[size_t(l)] =
+                    std::make_unique<cycle_real_attention_graph_cache>();
+            }
+        }
     }
 
     bool matches(ggml_backend_t p, const llama_model & m,
                  const llama_hybrid_cycle_layout & layout,
                  int32_t tokens, int chunk, int inflight,
-                 bool fusion, bool replay) const {
+                 bool fusion, bool replay, bool cache_attention) const {
         return phone == p && model == &m &&
             layers == layout.cycle_size &&
             x == layout.x && y == layout.y &&
             total_tokens == tokens && chunk_tokens == chunk &&
             window == inflight &&
             fuse == fusion && rpc_replay == replay &&
-            idle_by_layer.size() == size_t(layers);
+            attn_graph_enabled == cache_attention &&
+            idle_by_layer.size() == size_t(layers) &&
+            (!attn_graph_enabled ||
+             (attn_graphs.size() == size_t(layers) &&
+              phone_kv.size() == size_t(layers)));
     }
 
     size_t cached_slots() const {
@@ -3158,8 +3186,21 @@ struct cycle_real_phone_full_session_pool {
     }
 
     void clear() {
-        // Every remote GPU free below must run while the same RPC backend
-        // and the borrowed physical model weights are still alive.
+        // Destroy host-side Graphs first: they borrow physical KV tensors.
+        // Free KV on Phone RPC only after the graph metadata is gone and
+        // while the backend/model weights still exist.
+        for (auto & cache : attn_graphs) {
+            if (cache && !cache->is_idle()) {
+                std::fprintf(stderr,
+                    "[CYCLE_ATTN_GRAPH_CACHE] status=FAIL "
+                    "reason=SESSION_TEARDOWN_WITH_ACTIVE_GRAPH\n");
+            }
+        }
+        attn_graphs.clear();
+        for (auto & cache : phone_kv) {
+            if (cache) cache->release();
+        }
+        phone_kv.clear();
         for (auto & layer : idle_by_layer) layer.clear();
         idle_by_layer.clear();
         phone = nullptr;
@@ -3167,7 +3208,7 @@ struct cycle_real_phone_full_session_pool {
         layers = x = y = 0;
         total_tokens = 0;
         chunk_tokens = window = 0;
-        fuse = rpc_replay = false;
+        fuse = rpc_replay = attn_graph_enabled = false;
     }
 };
 
