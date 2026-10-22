@@ -3325,6 +3325,7 @@ struct cycle_real_phone_full_session_pool {
     int window = 0;
     bool fuse = false;
     bool rpc_replay = false;
+    bool local_full_enabled = false;
     bool attn_graph_enabled = false;
     bool attn_scratch_session_enabled = false;
     double last_attn_scratch_release_ms = 0.0;
@@ -3340,7 +3341,7 @@ struct cycle_real_phone_full_session_pool {
                    const llama_hybrid_cycle_layout & layout,
                    int32_t tokens, int chunk, int inflight,
                    bool fusion, bool replay, bool cache_attention,
-                   bool cache_scratch) {
+                   bool cache_scratch, bool local_full) {
         clear();
         phone = p;
         model = &m;
@@ -3352,6 +3353,7 @@ struct cycle_real_phone_full_session_pool {
         window = inflight;
         fuse = fusion;
         rpc_replay = replay;
+        local_full_enabled = local_full;
         attn_graph_enabled = cache_attention;
         attn_scratch_session_enabled = cache_scratch;
         idle_by_layer.resize(size_t(layers));
@@ -3377,13 +3379,14 @@ struct cycle_real_phone_full_session_pool {
                  const llama_hybrid_cycle_layout & layout,
                  int32_t tokens, int chunk, int inflight,
                  bool fusion, bool replay, bool cache_attention,
-                 bool cache_scratch) const {
+                 bool cache_scratch, bool local_full) const {
         if (!(phone == p && model == &m &&
               layers == layout.cycle_size &&
               x == layout.x && y == layout.y &&
               total_tokens == tokens && chunk_tokens == chunk &&
               window == inflight &&
               fuse == fusion && rpc_replay == replay &&
+              local_full_enabled == local_full &&
               attn_graph_enabled == cache_attention &&
               attn_scratch_session_enabled == cache_scratch &&
               idle_by_layer.size() == size_t(layers) &&
@@ -3471,6 +3474,7 @@ struct cycle_real_phone_full_session_pool {
         chunk_tokens = window = 0;
         fuse = rpc_replay = attn_graph_enabled = false;
         attn_scratch_session_enabled = false;
+        local_full_enabled = false;
     }
 };
 
@@ -4792,7 +4796,7 @@ static bool cycle_real_execute_period_fifo(
          !phone_full_session->matches(
             phone, model, layout, tokens, chunk_tokens, window,
             phone_full_fuse, phone_full_rpc_replay, attn_graph_reuse,
-            attn_scratch_session_reuse))) {
+            attn_scratch_session_reuse, phone_full_local_ffn))) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_FULL_SESSION] phase=%s status=FAIL "
             "reason=MODEL_BACKEND_LAYOUT_OR_SHAPE_MISMATCH\n",
@@ -8067,7 +8071,8 @@ int main(int argc, char ** argv) {
                     chunk_tokens, effective_window,
                     cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE"),
                     cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY"),
-                    attn_graph_cache_enabled, attn_scratch_session_reuse);
+                    attn_graph_cache_enabled, attn_scratch_session_reuse,
+                    cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_LOCAL_FFN"));
                 if (attn_graph_cache_enabled) {
                     std::printf(
                         "[CYCLE_ATTN_GRAPH_CACHE_PLAN] enabled=1 "
