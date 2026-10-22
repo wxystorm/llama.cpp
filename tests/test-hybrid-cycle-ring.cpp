@@ -356,6 +356,60 @@ static void test_bounded_multi_chunk_c2p_fifo() {
     assert(attn == chunks && reductions == chunks);
 }
 
+// Reduce priority is an opt-in LOCAL dequeue policy, not a bypass of the
+// two-FFN join, Phone causal entry order or transfer FIFO ordering. Arrange
+// for P2C C0 Reduce to become ready behind C1 FFN on PC CPU.
+static void test_p2c_ready_reduce_priority() {
+    for (const bool reduce_first : {false, true}) {
+        llama_hybrid_cycle_layout layout;
+        layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+        llama_hybrid_cycle_task_ring ring(
+            layout, 2, 2, false, reduce_first);
+        ring.start();
+
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                           llama_hybrid_cycle_stage::ATTN_PRE, 0, 0));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                           llama_hybrid_cycle_stage::ATTN_PRE, 0, 1));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                           llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 0));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                           llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 1));
+
+        // Both destination FFNs are ready, but neither phone partial has
+        // been received. Reduce must NOT be dispatched early.
+        auto pc_ffn0 = take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                            llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 0);
+        ring.complete(pc_ffn0);
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                           llama_hybrid_cycle_stage::FFN_SOURCE, 0, 0));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                           llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 0));
+
+        const auto first = take(
+            ring, llama_hybrid_cycle_queue::PC_CPU,
+            reduce_first ? llama_hybrid_cycle_stage::REDUCE :
+                           llama_hybrid_cycle_stage::FFN_DESTINATION,
+            0, reduce_first ? 0 : 1);
+        ring.complete(first);
+        const auto second = take(
+            ring, llama_hybrid_cycle_queue::PC_CPU,
+            reduce_first ? llama_hybrid_cycle_stage::FFN_DESTINATION :
+                           llama_hybrid_cycle_stage::REDUCE,
+            0, reduce_first ? 1 : 0);
+        ring.complete(second);
+
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                           llama_hybrid_cycle_stage::FFN_SOURCE, 0, 1));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                           llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 1));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                           llama_hybrid_cycle_stage::REDUCE, 0, 1));
+        assert(ring.finished());
+        assert(ring.output_count() == 2);
+    }
+}
+
 // The full X=5,Y=1 period must NOT run its C2P/P2C boundaries as
 // independent one-layer tests. The output of EACH preceding physical
 // layer's chunk is a dependency on the next layer's matching chunk.
@@ -462,6 +516,7 @@ int main() {
     test_one_cycle();
     test_p2c_fifo_worker_runtime();
     test_bounded_multi_chunk_p2c_fifo();
+    test_p2c_ready_reduce_priority();
     test_bounded_multi_chunk_c2p_fifo();
     test_complete_period_fifo_handoffs();
     test_causal_entry_order();
