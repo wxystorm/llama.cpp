@@ -3077,6 +3077,77 @@ struct cycle_real_c2p_phone_chunk {
     }
 };
 
+// The Phone FULL graph/compute-buffer cache is optionally owned by the
+// model+Phone-backend session rather than a single Cycle period. ONLY idle
+// FFN/Reduce graphs live here. Attention graphs, activations and KV are
+// always recreated for every period and may not be retained as session data.
+// A reused graph borrows the same physical model weights and RPC backend,
+// so this owner MUST be drained before either weights or backend are freed.
+struct cycle_real_phone_full_session_pool {
+    using slot_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
+    ggml_backend_t phone = nullptr;
+    const llama_model * model = nullptr;
+    int layers = 0;
+    int x = 0;
+    int y = 0;
+    int32_t total_tokens = 0;
+    int chunk_tokens = 0;
+    int window = 0;
+    bool fuse = false;
+    bool rpc_replay = false;
+    std::vector<std::vector<slot_ptr>> idle_by_layer;
+
+    void configure(ggml_backend_t p, const llama_model & m,
+                   const llama_hybrid_cycle_layout & layout,
+                   int32_t tokens, int chunk, int inflight,
+                   bool fusion, bool replay) {
+        clear();
+        phone = p;
+        model = &m;
+        layers = layout.cycle_size;
+        x = layout.x;
+        y = layout.y;
+        total_tokens = tokens;
+        chunk_tokens = chunk;
+        window = inflight;
+        fuse = fusion;
+        rpc_replay = replay;
+        idle_by_layer.resize(size_t(layers));
+    }
+
+    bool matches(ggml_backend_t p, const llama_model & m,
+                 const llama_hybrid_cycle_layout & layout,
+                 int32_t tokens, int chunk, int inflight,
+                 bool fusion, bool replay) const {
+        return phone == p && model == &m &&
+            layers == layout.cycle_size &&
+            x == layout.x && y == layout.y &&
+            total_tokens == tokens && chunk_tokens == chunk &&
+            window == inflight &&
+            fuse == fusion && rpc_replay == replay &&
+            idle_by_layer.size() == size_t(layers);
+    }
+
+    size_t cached_slots() const {
+        size_t result = 0;
+        for (const auto & layer : idle_by_layer) result += layer.size();
+        return result;
+    }
+
+    void clear() {
+        // Every remote GPU free below must run while the same RPC backend
+        // and the borrowed physical model weights are still alive.
+        for (auto & layer : idle_by_layer) layer.clear();
+        idle_by_layer.clear();
+        phone = nullptr;
+        model = nullptr;
+        layers = x = y = 0;
+        total_tokens = 0;
+        chunk_tokens = window = 0;
+        fuse = rpc_replay = false;
+    }
+};
+
 // P2C FFN keeps one complete graph and its Phone GPU compute buffer
 // between chunks. The dedicated PHONE_GPU FIFO worker is its only user:
 // no separate lock or speculative graph execution is needed. Its output
@@ -4021,7 +4092,8 @@ static bool cycle_real_execute_period_fifo(
         const std::vector<float> & cpu_reference_output,
         const cycle_real_period_reference & checkpoints,
         int32_t tokens, int chunk_tokens, int max_inflight,
-        bool warmup_run = false, uint64_t wire_epoch = 0) {
+        bool warmup_run = false, uint64_t wire_epoch = 0,
+        cycle_real_phone_full_session_pool * phone_full_session = nullptr) {
     const char * run_phase = warmup_run ? "WARMUP" : "MEASURE";
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
@@ -4060,6 +4132,17 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE");
     const bool phone_full_rpc_replay = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY");
+    if (phone_full_session &&
+        (!phone_full_reuse ||
+         !phone_full_session->matches(
+            phone, model, layout, tokens, chunk_tokens, window,
+            phone_full_fuse, phone_full_rpc_replay))) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_FULL_SESSION] phase=%s status=FAIL "
+            "reason=MODEL_BACKEND_LAYOUT_OR_SHAPE_MISMATCH\n",
+            run_phase);
+        return false;
+    }
     if (perf_mode &&
         (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
          cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
@@ -4205,7 +4288,18 @@ static bool cycle_real_execute_period_fifo(
     // FFN graph owns the very same GPU allocation and borrowed model weights
     // it used on the last Chunk. No CPU/GPU hidden activation is cached.
     using phone_chunk_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
-    std::vector<std::vector<phone_chunk_ptr>> phone_full_pool(static_cast<size_t>(n_layers));
+    std::vector<std::vector<phone_chunk_ptr>> period_phone_full_pool(
+        static_cast<size_t>(n_layers));
+    auto & phone_full_pool = phone_full_session ?
+        phone_full_session->idle_by_layer : period_phone_full_pool;
+    std::vector<size_t> phone_full_cached_at_period_start(
+        static_cast<size_t>(n_layers), 0);
+    if (phone_full_session) {
+        for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
+            phone_full_cached_at_period_start[size_t(l)] =
+                phone_full_pool[size_t(l)].size();
+        }
+    }
     // C2P setup runs on PC_CPU but finished outputs are retired by
     // PHONE_GPU, once the successor's Attention fence has completed.
     // The pool lock protects ONLY pointer transfer / metadata: allocating
@@ -5191,8 +5285,11 @@ static bool cycle_real_execute_period_fifo(
             phone_cached_at_end[size_t(l)] =
                 phone_full_pool[size_t(l)].size();
         }
-        for (auto & pool : phone_full_pool) {
-            pool.clear();
+        // Successful cycles leave cached graph+buffer resources in the
+        // model/session owner. Failed FIFO runs must not keep partially
+        // used or uncertain remote buffers for the next period.
+        if (!phone_full_session || !succeeded) {
+            for (auto & pool : phone_full_pool) pool.clear();
         }
     }
     const auto phone_pool_release_done = std::chrono::steady_clock::now();
@@ -5319,11 +5416,28 @@ static bool cycle_real_execute_period_fifo(
                 "[CYCLE_PHONE_FULL_REUSE_SUM] layer=%d enabled=1 "
                 "hits=%llu prepares=%llu retired=%llu "
                 "cached_at_fifo_end=%zu graph_owner=PHONE_GPU "
-                "output_release=SUCCESSOR_ATTN_FENCED\n",
+                "output_release=SUCCESSOR_ATTN_FENCED "
+                "phase=%s cache_scope=%s cached_at_period_start=%zu\n",
                 l, (unsigned long long)sample.hits,
                 (unsigned long long)sample.misses,
                 (unsigned long long)sample.recycled,
-                phone_cached_at_end[size_t(l)]);
+                phone_cached_at_end[size_t(l)],
+                run_phase, phone_full_session ? "SESSION" : "PERIOD",
+                phone_full_cached_at_period_start[size_t(l)]);
+            if (phone_full_session) {
+                std::printf(
+                    "[CYCLE_PHONE_FULL_SESSION_REUSE_SUM] phase=%s "
+                    "layer=%d start_slots=%zu prepares=%llu "
+                    "hits=%llu retired=%llu end_slots=%zu "
+                    "status=%s\n",
+                    run_phase, l,
+                    phone_full_cached_at_period_start[size_t(l)],
+                    (unsigned long long)sample.misses,
+                    (unsigned long long)sample.hits,
+                    (unsigned long long)sample.recycled,
+                    phone_cached_at_end[size_t(l)],
+                    succeeded ? "OK" : "FAIL");
+            }
         }
     }
     if (perf_mode) {
@@ -6374,8 +6488,37 @@ int main(int argc, char ** argv) {
                     return 1;
                 }
             }
+            const bool phone_full_session_reuse = cycle_real_env_flag(
+                "LLAMA_HYBRID_CYCLE_PHONE_FULL_SESSION_REUSE");
+            if (phone_full_session_reuse &&
+                !cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_REUSE")) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_FULL_SESSION] status=FAIL "
+                    "reason=REQUIRES_PHONE_FULL_REUSE\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
+            cycle_real_phone_full_session_pool full_session;
+            if (phone_full_session_reuse) {
+                const int effective_window = std::min(
+                    max_inflight, (int(ntokens) + chunk_tokens - 1) / chunk_tokens);
+                full_session.configure(
+                    phone, *model, expected_layout, ntokens,
+                    chunk_tokens, effective_window,
+                    cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE"),
+                    cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY"));
+                std::printf(
+                    "[CYCLE_PHONE_FULL_SESSION_PLAN] enabled=1 "
+                    "layers=[%d,%d] max_slots_per_layer=%d "
+                    "ownership=MODEL_AND_PHONE_RPC_BACKEND "
+                    "retire=SUCCESSOR_ATTN_FENCED "
+                    "release=BEFORE_PHONE_BACKEND_FREE\n",
+                    expected_layout.x + 1,
+                    expected_layout.x + expected_layout.y,
+                    effective_window);
+            }
             std::printf(
-                "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d "
+                "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d 
                 "measured_runs=1 model_load=ONCE "
                 "same_shapes=1 distinct_kv_and_graphs=1 "
                 "wire_seq=UNIQUE_PER_ROUND "
@@ -6395,7 +6538,8 @@ int main(int argc, char ** argv) {
                     phone, cpu_dev, *model, expected_layout,
                     embeddings, cpu_reference_output, checkpoints,
                     ntokens, chunk_tokens, max_inflight,
-                    is_warmup, epoch);
+                    is_warmup, epoch,
+                    phone_full_session_reuse ? &full_session : nullptr);
                 const double run_full_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - run_start).count();
@@ -6407,6 +6551,22 @@ int main(int argc, char ** argv) {
                     phase, epoch, run_full_ms, ok ? "OK" : "FAIL");
                 std::fflush(stdout);
                 if (!ok) break;
+            }
+            if (phone_full_session_reuse) {
+                const size_t cached_before_release = full_session.cached_slots();
+                const auto release_begin = std::chrono::steady_clock::now();
+                full_session.clear();
+                const double release_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        release_begin).count();
+                std::printf(
+                    "[CYCLE_PHONE_FULL_SESSION_TEARDOWN] "
+                    "slots_released=%zu release_ms=%.3f "
+                    "included_in=SESSION_LIFETIME_NOT_PERIOD_WALL "
+                    "before_phone_backend_free=1 status=OK\n",
+                    cached_before_release, release_ms);
+                std::fflush(stdout);
             }
         } else {
             const cycle_real_live_wire wire {layer, 0, 1, 1};
