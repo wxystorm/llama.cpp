@@ -3235,6 +3235,14 @@ struct cycle_real_phone_full_session_pool {
         return result;
     }
 
+    size_t cached_attention_graphs() const {
+        size_t result = 0;
+        for (const auto & gc : attn_graphs) {
+            if (gc) result += gc->entries.size();
+        }
+        return result;
+    }
+
     void clear() {
         // Destroy host-side Graphs first: they borrow physical KV tensors.
         // Free KV on Phone RPC only after the graph metadata is gone and
@@ -5574,6 +5582,31 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
+    if (attn_graph_reuse) {
+        for (int l = layout.x + 1; l < n_layers; ++l) {
+            const auto & gc = *graph_cache_by_layer[size_t(l)];
+            const auto & before = graph_cache_start[size_t(l)];
+            const auto & cache = *phone_full_session->phone_kv[size_t(l)];
+            std::printf(
+                "[CYCLE_ATTN_GRAPH_CACHE_SUM] phase=%s layer=%d "
+                "hits=%llu misses=%llu prepares=%llu "
+                "busy_misses=%llu capacity_misses=%llu "
+                "returned=%llu aborted=%llu cached_graphs=%zu "
+                "kv_tokens_reset=%lld kv_buffer_persistent=%d "
+                "graph_owner=SESSION scratch_owner=PERIOD "
+                "rpc_replay=UNCHANGED\n",
+                run_phase, l,
+                (unsigned long long)(gc.hits - before.hits),
+                (unsigned long long)(gc.misses - before.misses),
+                (unsigned long long)(gc.prepares - before.prepares),
+                (unsigned long long)(gc.busy_misses - before.busy_misses),
+                (unsigned long long)(gc.capacity_misses - before.capacity_misses),
+                (unsigned long long)(gc.returned - before.returned),
+                (unsigned long long)(gc.aborted - before.aborted),
+                gc.entries.size(), (long long)cache.committed_tokens,
+                cache.buffer != nullptr ? 1 : 0);
+        }
+    }
     if (attn_scratch_reuse) {
         for (int l = layout.x + 1; l < n_layers; ++l) {
             const auto & pool = *attn_scratch[size_t(l)];
@@ -5585,7 +5618,7 @@ static bool cycle_real_execute_period_fifo(
                 "cached_at_fifo_end=%zu "
                 "size_query_ms=%.3f rpc_alloc_ms=%.3f "
                 "graph_bind_ms=%.3f rpc_free_ms=%.3f "
-                "graph_mode=REBUILT_EACH_CHUNK kv_mode=PER_CYCLE\n",
+                "graph_mode=%s kv_mode=%s\n",
                 run_phase, l, pool.max_slots, pool.peak_slots,
                 (unsigned long long)pool.allocations,
                 (unsigned long long)pool.hits,
@@ -5595,7 +5628,11 @@ static bool cycle_real_execute_period_fifo(
                 (unsigned long long)pool.bind_failures,
                 pool.active.size(), attn_cached_at_fifo_end[size_t(l)],
                 pool.size_query_ms, pool.buffer_alloc_ms,
-                pool.graph_bind_ms, pool.buffer_free_ms);
+                pool.graph_bind_ms, pool.buffer_free_ms,
+                attn_graph_reuse ? "SESSION_CACHE_BY_KV_SHAPE" :
+                    "REBUILT_EACH_CHUNK",
+                attn_graph_reuse ? "SESSION_PHYSICAL_RESET_PER_PERIOD" :
+                    "PER_CYCLE");
         }
         std::printf(
             "[CYCLE_ATTN_SCRATCH_RELEASE_SUM] phase=%s "
@@ -6784,11 +6821,13 @@ int main(int argc, char ** argv) {
             std::printf(
                 "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d "
                 "measured_runs=1 model_load=ONCE "
-                "same_shapes=1 distinct_kv=1 phone_full_graph_scope=%s "
+                "same_shapes=1 kv_scope=%s phone_full_graph_scope=%s "
                 "wire_seq=UNIQUE_PER_ROUND "
                 "pc_wall_includes=FIFO_AND_RELEASE "
                 "phone_server_sums=SESSION_CUMULATIVE_USE_DELTA\n",
                 warmup_runs != 0 ? 1 : 0, warmup_runs,
+                attn_graph_cache_enabled ? "PHONE_PERSISTENT_PC_PERIOD" :
+                    "PERIOD",
                 phone_full_session_reuse ? "SESSION" : "PERIOD");
             const auto session_run_begin = std::chrono::steady_clock::now();
             double session_run_call_sum_ms = 0.0;
@@ -6824,6 +6863,8 @@ int main(int argc, char ** argv) {
             }
             if (phone_full_session_reuse) {
                 const size_t cached_before_release = full_session.cached_slots();
+                const size_t attn_graphs_before_release =
+                    full_session.cached_attention_graphs();
                 const auto release_begin = std::chrono::steady_clock::now();
                 full_session.clear();
                 const double release_ms =
@@ -6832,10 +6873,12 @@ int main(int argc, char ** argv) {
                         release_begin).count();
                 std::printf(
                     "[CYCLE_PHONE_FULL_SESSION_TEARDOWN] "
-                    "slots_released=%zu release_ms=%.3f "
+                    "slots_released=%zu attn_graphs_released=%zu "
+                    "release_ms=%.3f "
                     "included_in=SESSION_LIFETIME_NOT_PERIOD_WALL "
                     "before_phone_backend_free=1 status=OK\n",
-                    cached_before_release, release_ms);
+                    cached_before_release,
+                    attn_graphs_before_release, release_ms);
                 const double session_lifetime_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
