@@ -6645,6 +6645,157 @@ static bool cycle_real_execute_period_fifo(
             !execution_ok ? "NOT_CHECKED" :
                 parity_ok ? "PASS" : "FAIL");
     }
+    if (path_timing) {
+        // These metrics are written by distinct FIFO stages and inspected
+        // only after all workers have joined. They describe HOST-side
+        // calls/waits; remote GPU kernel duration and raw wire dwell are
+        // NOT available from these client-side timestamps.
+        cycle_real_c2p_path_timing ct {};
+        cycle_real_p2c_path_timing pt {};
+        for (int c = 0; c < n_chunks; ++c) {
+            const auto & c2p =
+                states[size_t(layout.x)][size_t(c)]->c2p_timing;
+            const auto & p2c =
+                states[size_t(n_layers - 1)][size_t(c)]->p2c_timing;
+            ct.pc_attn_call_ms += c2p.pc_attn_call_ms;
+            ct.phone_slot_prepare_ms += c2p.phone_slot_prepare_ms;
+            ct.pc_ffn_call_ms += c2p.pc_ffn_call_ms;
+            ct.phone_ffn_submit_rpc_ms += c2p.phone_ffn_submit_rpc_ms;
+            ct.ready_tx.payload_bytes += c2p.ready_tx.payload_bytes;
+            ct.ready_tx.encode_ms += c2p.ready_tx.encode_ms;
+            ct.ready_tx.enqueue_call_ms += c2p.ready_tx.enqueue_call_ms;
+            ct.ready_apply_rpc_ms += c2p.ready_apply_rpc_ms;
+            ct.ready_ack_wait_ms += c2p.ready_ack_wait_ms;
+            ct.partial_tx.payload_bytes += c2p.partial_tx.payload_bytes;
+            ct.partial_tx.encode_ms += c2p.partial_tx.encode_ms;
+            ct.partial_tx.enqueue_call_ms += c2p.partial_tx.enqueue_call_ms;
+            ct.partial_apply_rpc_ms += c2p.partial_apply_rpc_ms;
+            ct.reduce_graph_rpc_ms += c2p.reduce_graph_rpc_ms;
+            ct.reduce_backend_sync_ms += c2p.reduce_backend_sync_ms;
+            ct.reduce_finish_rpc_ms += c2p.reduce_finish_rpc_ms;
+            ct.reduce_ack_wait_ms += c2p.reduce_ack_wait_ms;
+
+            pt.ready_rx_bytes += p2c.ready_rx_bytes;
+            pt.partial_rx_bytes += p2c.partial_rx_bytes;
+            pt.ready_receive_decode_ms += p2c.ready_receive_decode_ms;
+            pt.ready_ack_rpc_ms += p2c.ready_ack_rpc_ms;
+            pt.phone_ffn_prepare_ms += p2c.phone_ffn_prepare_ms;
+            pt.phone_ffn_submit_rpc_ms += p2c.phone_ffn_submit_rpc_ms;
+            pt.phone_send_partial_rpc_ms += p2c.phone_send_partial_rpc_ms;
+            pt.phone_ffn_fallback_call_ms += p2c.phone_ffn_fallback_call_ms;
+            pt.pc_ffn_call_ms += p2c.pc_ffn_call_ms;
+            pt.partial_receive_decode_ms += p2c.partial_receive_decode_ms;
+            pt.pc_reduce_call_ms += p2c.pc_reduce_call_ms;
+            pt.partial_ack_rpc_ms += p2c.partial_ack_rpc_ms;
+
+            std::printf(
+                "[CYCLE_PATH_C2P_CHUNK] phase=%s layer=%d chunk=%d "
+                "tokens=%lld ready_bytes=%zu partial_bytes=%zu "
+                "ready_pack_ms=%.3f ready_enqueue_call_ms=%.3f "
+                "ready_apply_rpc_ms=%.3f ready_ack_wait_ms=%.3f "
+                "partial_pack_ms=%.3f partial_enqueue_call_ms=%.3f "
+                "partial_apply_rpc_ms=%.3f "
+                "pc_attn_call_ms=%.3f phone_slot_prepare_ms=%.3f "
+                "pc_ffn_call_ms=%.3f phone_ffn_submit_rpc_ms=%.3f "
+                "reduce_graph_rpc_ms=%.3f reduce_backend_sync_ms=%.3f "
+                "reduce_finish_rpc_ms=%.3f reduce_ack_wait_ms=%.3f\n",
+                run_phase, layout.x, c,
+                (long long)states[size_t(layout.x)][size_t(c)]->tokens,
+                c2p.ready_tx.payload_bytes, c2p.partial_tx.payload_bytes,
+                c2p.ready_tx.encode_ms, c2p.ready_tx.enqueue_call_ms,
+                c2p.ready_apply_rpc_ms, c2p.ready_ack_wait_ms,
+                c2p.partial_tx.encode_ms, c2p.partial_tx.enqueue_call_ms,
+                c2p.partial_apply_rpc_ms,
+                c2p.pc_attn_call_ms, c2p.phone_slot_prepare_ms,
+                c2p.pc_ffn_call_ms, c2p.phone_ffn_submit_rpc_ms,
+                c2p.reduce_graph_rpc_ms, c2p.reduce_backend_sync_ms,
+                c2p.reduce_finish_rpc_ms, c2p.reduce_ack_wait_ms);
+            std::printf(
+                "[CYCLE_PATH_P2C_CHUNK] phase=%s layer=%d chunk=%d "
+                "tokens=%lld ready_bytes=%zu partial_bytes=%zu "
+                "ready_recv_decode_ms=%.3f ready_ack_rpc_ms=%.3f "
+                "partial_recv_decode_ms=%.3f partial_ack_rpc_ms=%.3f "
+                "phone_ffn_prepare_ms=%.3f phone_ffn_submit_rpc_ms=%.3f "
+                "phone_send_partial_rpc_ms=%.3f "
+                "phone_ffn_fallback_call_ms=%.3f "
+                "pc_ffn_call_ms=%.3f pc_reduce_call_ms=%.3f\n",
+                run_phase, n_layers - 1, c,
+                (long long)states[size_t(n_layers - 1)][size_t(c)]->tokens,
+                p2c.ready_rx_bytes, p2c.partial_rx_bytes,
+                p2c.ready_receive_decode_ms, p2c.ready_ack_rpc_ms,
+                p2c.partial_receive_decode_ms, p2c.partial_ack_rpc_ms,
+                p2c.phone_ffn_prepare_ms, p2c.phone_ffn_submit_rpc_ms,
+                p2c.phone_send_partial_rpc_ms,
+                p2c.phone_ffn_fallback_call_ms,
+                p2c.pc_ffn_call_ms, p2c.pc_reduce_call_ms);
+        }
+
+        std::printf(
+            "[CYCLE_PATH_C2P_TRANSFER_SUM] phase=%s layer=%d chunks=%d "
+            "ready_payload_bytes=%zu partial_payload_bytes=%zu "
+            "ready_pack_ms=%.3f ready_enqueue_call_ms=%.3f "
+            "ready_apply_rpc_ms=%.3f ready_ack_wait_ms=%.3f "
+            "partial_pack_ms=%.3f partial_enqueue_call_ms=%.3f "
+            "partial_apply_rpc_ms=%.3f "
+            "send_semantics=ENCODE_AND_ASYNC_QUEUE_NOT_WIRE "
+            "ack_semantics=REMOTE_DELIVERY_AND_PROCESSING_WAIT\n",
+            run_phase, layout.x, n_chunks,
+            ct.ready_tx.payload_bytes, ct.partial_tx.payload_bytes,
+            ct.ready_tx.encode_ms, ct.ready_tx.enqueue_call_ms,
+            ct.ready_apply_rpc_ms, ct.ready_ack_wait_ms,
+            ct.partial_tx.encode_ms, ct.partial_tx.enqueue_call_ms,
+            ct.partial_apply_rpc_ms);
+        std::printf(
+            "[CYCLE_PATH_C2P_COMPUTE_SUM] phase=%s layer=%d chunks=%d "
+            "pc_attn_call_ms=%.3f phone_slot_prepare_ms=%.3f "
+            "pc_ffn_call_ms=%.3f phone_ffn_submit_rpc_ms=%.3f "
+            "compute_semantics=PC_CALLS_PHONE_REMOTE_SUBMISSION "
+            "phone_gpu_kernel_ms=SERVER_ONLY\n",
+            run_phase, layout.x, n_chunks,
+            ct.pc_attn_call_ms, ct.phone_slot_prepare_ms,
+            ct.pc_ffn_call_ms, ct.phone_ffn_submit_rpc_ms);
+        std::printf(
+            "[CYCLE_PATH_C2P_REDUCE_SUM] phase=%s layer=%d chunks=%d "
+            "graph_submit_rpc_ms=%.3f backend_sync_call_ms=%.3f "
+            "finish_reduce_rpc_ms=%.3f partial_ack_wait_ms=%.3f "
+            "backend_sync_semantics=RPC_NOOP_POSSIBLE "
+            "kernel_completion_ms=NOT_SEPARATELY_MEASURED\n",
+            run_phase, layout.x, n_chunks,
+            ct.reduce_graph_rpc_ms, ct.reduce_backend_sync_ms,
+            ct.reduce_finish_rpc_ms, ct.reduce_ack_wait_ms);
+        std::printf(
+            "[CYCLE_PATH_P2C_TRANSFER_SUM] phase=%s layer=%d chunks=%d "
+            "ready_payload_bytes=%zu partial_payload_bytes=%zu "
+            "ready_recv_decode_ms=%.3f ready_ack_rpc_ms=%.3f "
+            "partial_recv_decode_ms=%.3f partial_ack_rpc_ms=%.3f "
+            "phone_send_partial_rpc_ms=%.3f "
+            "receive_semantics=WAIT_PLUS_COPY_AND_DECODE_NOT_WIRE_ONLY "
+            "phone_send_semantics=SERVER_TX_STAGING_RPC\n",
+            run_phase, n_layers - 1, n_chunks,
+            pt.ready_rx_bytes, pt.partial_rx_bytes,
+            pt.ready_receive_decode_ms, pt.ready_ack_rpc_ms,
+            pt.partial_receive_decode_ms, pt.partial_ack_rpc_ms,
+            pt.phone_send_partial_rpc_ms);
+        std::printf(
+            "[CYCLE_PATH_P2C_COMPUTE_SUM] phase=%s layer=%d chunks=%d "
+            "phone_ffn_prepare_ms=%.3f phone_ffn_submit_rpc_ms=%.3f "
+            "phone_ffn_fallback_call_ms=%.3f "
+            "pc_ffn_call_ms=%.3f pc_reduce_call_ms=%.3f "
+            "phone_gpu_kernel_ms=SERVER_ONLY "
+            "different_fifo_queues=OVERLAPPING_NOT_ADDITIVE\n",
+            run_phase, n_layers - 1, n_chunks,
+            pt.phone_ffn_prepare_ms, pt.phone_ffn_submit_rpc_ms,
+            pt.phone_ffn_fallback_call_ms,
+            pt.pc_ffn_call_ms, pt.pc_reduce_call_ms);
+        std::printf(
+            "[CYCLE_PATH_PROFILE_NOTE] phase=%s "
+            "fifo_wall_ms=%.3f c2p_layer=%d p2c_layer=%d "
+            "per_queue_subphases=HOST_OBSERVED "
+            "raw_network_transfer_ms=NOT_MEASURED "
+            "device_kernel_only_ms=NOT_MEASURED "
+            "cross_queue_time_addition=INVALID\n",
+            run_phase, fifo_ms, layout.x, n_layers - 1);
+    }
     std::printf(
         "[CYCLE_PERIOD_SUM] phase=%s epoch=%" PRIu64
         " layers=%d x=%d y=%d chunks=%d tokens=%d "
