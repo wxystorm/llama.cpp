@@ -4492,6 +4492,8 @@ struct cycle_real_p2c_path_timing {
     double phone_ffn_prepare_ms = 0.0;
     double phone_ffn_submit_rpc_ms = 0.0;
     double phone_send_partial_rpc_ms = 0.0;
+    // Fallback without FFN pool includes the output-send RPC.
+    double phone_ffn_fallback_call_ms = 0.0;
     double pc_ffn_call_ms = 0.0;
     double partial_receive_decode_ms = 0.0;
     double pc_reduce_call_ms = 0.0;
@@ -5658,10 +5660,23 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                     } else {
+                        const auto receive_begin =
+                            std::chrono::steady_clock::now();
                         ok = cycle_real_receive_live_wire(
                             phone, st.wire, INFERENCE_CYCLE_READY,
                             uint32_t(st.tokens), uint32_t(hidden),
                             uint32_t(topk), st.recv_ready);
+                        if (path_timing) {
+                            st.p2c_timing.ready_receive_decode_ms =
+                                cycle_real_path_elapsed_ms(receive_begin);
+                            size_t payload_bytes = 0;
+                            if (ok && inference_cycle_payload_size(
+                                    INFERENCE_CYCLE_READY, uint32_t(st.tokens),
+                                    uint32_t(hidden), uint32_t(topk),
+                                    payload_bytes)) {
+                                st.p2c_timing.ready_rx_bytes = payload_bytes;
+                            }
+                        }
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "P2C_READY_RESIDUAL", l, c,
@@ -5680,10 +5695,16 @@ static bool cycle_real_execute_period_fifo(
                                 "P2C_FFN_NORM", l, c, st.start, hidden,
                                 st.recv_ready.ready.ffn_norm,
                                 checkpoints.p2c_norm);
+                            const auto ack_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_send_ack(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
                                 INFERENCE_CYCLE_READY, true);
+                            if (path_timing) {
+                                st.p2c_timing.ready_ack_rpc_ms =
+                                    cycle_real_path_elapsed_ms(ack_begin);
+                            }
                         }
                     }
                     break;
@@ -5709,16 +5730,24 @@ static bool cycle_real_execute_period_fifo(
                         const std::vector<int32_t> none_i;
                         std::vector<float> ignored;
                         if (!p2c_ffn_reuse) {
+                            const auto fallback_begin =
+                                std::chrono::steady_clock::now();
                             ok = cycle_real_execute_ffn(
                                 phone, weights, none_f, none_i, none_f,
                                 hidden, st.tokens, topk, experts,
                                 ignored, nullptr, nullptr,
                                 &st.wire, &st.ready.phone_graph,
                                 perf_mode ? &ffn_profile[queue_index] : nullptr);
+                            if (path_timing) {
+                                st.p2c_timing.phone_ffn_fallback_call_ms =
+                                    cycle_real_path_elapsed_ms(fallback_begin);
+                            }
                         } else {
                             const bool same_shape = p2c_ffn_slot &&
                                 p2c_ffn_slot->prepared_tokens == st.tokens;
                             if (!same_shape) {
+                                const auto phone_prepare_begin =
+                                    std::chrono::steady_clock::now();
                                 if (p2c_ffn_slot) {
                                     // Tail chunks may have fewer tokens.
                                     // Free a mismatched slot before preparing
@@ -5732,6 +5761,11 @@ static bool cycle_real_execute_period_fifo(
                                 ok = p2c_ffn_slot->prepare(
                                     phone, weights, hidden, st.tokens,
                                     topk, experts);
+                                if (path_timing) {
+                                    st.p2c_timing.phone_ffn_prepare_ms =
+                                        cycle_real_path_elapsed_ms(
+                                            phone_prepare_begin);
+                                }
                                 if (ok) ++p2c_ffn_prepares;
                             } else {
                                 ++p2c_ffn_hits;
@@ -5752,6 +5786,12 @@ static bool cycle_real_execute_period_fifo(
                                 ok = p2c_ffn_slot->execute_and_send(
                                     phone, st.ready.phone_graph, st.wire,
                                     profile);
+                                if (path_timing) {
+                                    st.p2c_timing.phone_ffn_submit_rpc_ms =
+                                        p2c_ffn_slot->last_execute_call_ms;
+                                    st.p2c_timing.phone_send_partial_rpc_ms =
+                                        p2c_ffn_slot->last_send_partial_rpc_ms;
+                                }
                             }
                             if (!ok) {
                                 // A failed graph/send must not become a hit.
