@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -2724,6 +2725,19 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
 // the local physical FFN shard and the FINAL GPU Reduce. The split FFN graph
 // and two-op Reduce graph are independent, so no FFN kernel is recomputed
 // when the PC PARTIAL becomes GPU-ready.
+// Nonzero graph UIDs opt in to the RPC server's GRAPH_RECOMPUTE cache.
+// A fresh process-time namespace and monotonic counter prevent accidental
+// reuse of a stale server-side graph when its device buffers were freed.
+// Never enable replay for a graph whose buffer lifetime is not owned here.
+static uint64_t cycle_real_phone_graph_replay_uid() {
+    static std::atomic<uint64_t> next_uid {
+        uint64_t(std::chrono::steady_clock::now()
+            .time_since_epoch().count()) | UINT64_C(1)
+    };
+    const uint64_t uid = next_uid.fetch_add(1, std::memory_order_relaxed);
+    return uid != 0 ? uid : 1;
+}
+
 struct cycle_real_c2p_phone_chunk {
     ggml_context * ctx = nullptr;
     ggml_tensor * residual = nullptr;
@@ -2738,6 +2752,7 @@ struct cycle_real_c2p_phone_chunk {
     double reduce_graph_submit_ms = 0.0;
     bool is_full_layer = false;
     bool fused_full_graph = false;
+    bool rpc_full_replay = false;
     // Persisted FFN/Reduce graph is safe to replay ONLY for the same
     // physical layer (owned by its per-layer pool) and token shape.
     int64_t prepared_tokens = 0;
@@ -2760,6 +2775,7 @@ struct cycle_real_c2p_phone_chunk {
         inputs = {};
         is_full_layer = false;
         fused_full_graph = false;
+        rpc_full_replay = false;
         prepared_tokens = 0;
     }
 
@@ -2767,7 +2783,8 @@ struct cycle_real_c2p_phone_chunk {
             ggml_backend_t phone,
             const llama_hybrid_cycle_ffn_shard_weights & shard,
             int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
-            bool full_layer = false, bool fuse_full = false) {
+            bool full_layer = false, bool fuse_full = false,
+            bool enable_rpc_replay = false) {
         const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
@@ -2779,6 +2796,7 @@ struct cycle_real_c2p_phone_chunk {
         }
         is_full_layer = full_layer;
         fused_full_graph = full_layer && fuse_full;
+        rpc_full_replay = full_layer && enable_rpc_replay;
         inputs = llama_hybrid_cycle_make_ffn_graph_inputs(ctx, hidden, tokens, topk);
         residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         if (!full_layer) {
@@ -2826,6 +2844,15 @@ struct cycle_real_c2p_phone_chunk {
             }
             output->flags |= GGML_TENSOR_FLAG_COMPUTE;
             ggml_graph_add_node(reduce_graph, output);
+        }
+        if (rpc_full_replay) {
+            // Replayed graph references exactly these persistent FFN,
+            // residual and output buffers. A freed graph must NEVER reuse
+            // its UID; only this object's subsequent Chunk may replay it.
+            ffn_graph->uid = cycle_real_phone_graph_replay_uid();
+            if (reduce_graph) {
+                reduce_graph->uid = cycle_real_phone_graph_replay_uid();
+            }
         }
         const auto build_end = std::chrono::steady_clock::now();
         if (!executor.prepare(
@@ -3766,6 +3793,8 @@ static bool cycle_real_execute_period_fifo(
     // Tensor needs the PC partial later and deliberately remains split.
     const bool phone_full_fuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE");
+    const bool phone_full_rpc_replay = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY");
     if (perf_mode &&
         (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
          cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
@@ -4129,7 +4158,8 @@ static bool cycle_real_execute_period_fifo(
                                 for (auto it = pool.begin(); it != pool.end(); ++it) {
                                     if ((*it)->is_full_layer &&
                                         (*it)->prepared_tokens == st.tokens &&
-                                        (*it)->fused_full_graph == phone_full_fuse) {
+                                        (*it)->fused_full_graph == phone_full_fuse &&
+                                        (*it)->rpc_full_replay == phone_full_rpc_replay) {
                                         st.phone_output = std::move(*it);
                                         pool.erase(it);
                                         ++phone_reuse_stats[size_t(l)].hits;
@@ -4143,7 +4173,8 @@ static bool cycle_real_execute_period_fifo(
                                 const auto weights = full_shard(l, 1);
                                 ok = st.phone_output->prepare(
                                     phone, weights, hidden, st.tokens,
-                                    topk, experts, true, phone_full_fuse);
+                                    topk, experts, true, phone_full_fuse,
+                                    phone_full_rpc_replay);
                                 if (ok && phone_full_reuse) {
                                     ++phone_reuse_stats[size_t(l)].misses;
                                 }
@@ -4630,6 +4661,12 @@ static bool cycle_real_execute_period_fifo(
         "graph_mode=%s async_safety=POST_FFN_FENCE\n",
         phone_full_fuse ? 1 : 0,
         phone_full_fuse ? "FFN_AND_ADD_ONE_GRAPH" : "FFN_PLUS_REDUCE");
+    std::printf(
+        "[CYCLE_PHONE_FULL_RPC_REPLAY_SUM] enabled=%d "
+        "scope=PHONE_FULL uid=NONZERO_PER_PREPARED_GRAPH "
+        "cache_owner=RPC_SERVER "
+        "graph_lifetime=FFN_GPU_BUFFER_LIFETIME\n",
+        phone_full_rpc_replay ? 1 : 0);
     if (phone_full_reuse) {
         for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
             const auto & sample = phone_reuse_stats[size_t(l)];
