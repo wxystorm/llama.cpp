@@ -4465,7 +4465,48 @@ struct cycle_real_pc_cuda_full_detail {
     double task_wall_max_ms = 0.0;
 };
 
+// Per-Chunk timers are written by their owning FIFO stage/worker and read
+// only after the full FIFO joins. No new locks, device fences or RPCs.
+// All RPC durations are PC-client-observed; they are not kernel event times.
+struct cycle_real_c2p_path_timing {
+    double pc_attn_call_ms = 0.0;
+    double phone_slot_prepare_ms = 0.0;
+    double pc_ffn_call_ms = 0.0;
+    double phone_ffn_submit_rpc_ms = 0.0;
+    cycle_real_wire_submit_timing ready_tx {};
+    double ready_apply_rpc_ms = 0.0;
+    double ready_ack_wait_ms = 0.0;
+    cycle_real_wire_submit_timing partial_tx {};
+    double partial_apply_rpc_ms = 0.0;
+    double reduce_graph_rpc_ms = 0.0;
+    double reduce_backend_sync_ms = 0.0;
+    double reduce_finish_rpc_ms = 0.0;
+    double reduce_ack_wait_ms = 0.0;
+};
+
+struct cycle_real_p2c_path_timing {
+    size_t ready_rx_bytes = 0;
+    size_t partial_rx_bytes = 0;
+    double ready_receive_decode_ms = 0.0;
+    double ready_ack_rpc_ms = 0.0;
+    double phone_ffn_prepare_ms = 0.0;
+    double phone_ffn_submit_rpc_ms = 0.0;
+    double phone_send_partial_rpc_ms = 0.0;
+    double pc_ffn_call_ms = 0.0;
+    double partial_receive_decode_ms = 0.0;
+    double pc_reduce_call_ms = 0.0;
+    double partial_ack_rpc_ms = 0.0;
+};
+
+static double cycle_real_path_elapsed_ms(
+        std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
 struct cycle_real_period_chunk {
+    cycle_real_c2p_path_timing c2p_timing {};
+    cycle_real_p2c_path_timing p2c_timing {};
     int layer = 0;
     int chunk = 0;
     int64_t start = 0;
@@ -4927,6 +4968,10 @@ static bool cycle_real_execute_period_fifo(
     // Keep strict CPU parity for correctness runs. Performance runs still
     // REPORT parity, but it is independently non-gating: only real compute,
     // causal KV, TX drain and finite nonzero output can succeed the run.
+    // Opt-in fine-grained host-side C2P/P2C transfer, compute and ACK
+    // breakdown. No additional synchronization or remote profiling calls.
+    const bool path_timing =
+        cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PATH_TIMING");
     const bool stage_detail = std::getenv(
         "LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr;
     constexpr size_t n_queues =
