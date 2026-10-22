@@ -3740,6 +3740,11 @@ static bool cycle_real_execute_period_fifo(
     const int64_t experts = model.hparams.n_expert;
     const bool perf_mode = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PERF_MODE");
+    // Opt-in: retain only full-Phone FFN/Reduce graphs after the NEXT
+    // layer has consumed their output. This never reuses an in-flight
+    // activation, never crosses model layers, and does not alter fences.
+    const bool phone_full_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_REUSE");
     if (perf_mode &&
         (cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
          cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
@@ -3834,6 +3839,17 @@ static bool cycle_real_execute_period_fifo(
 
     using state_ptr = std::unique_ptr<cycle_real_period_chunk>;
     std::vector<std::vector<state_ptr>> states(static_cast<size_t>(n_layers));
+    // Only the PHONE_GPU worker accesses this per-layer pool. Every cached
+    // FFN graph owns the very same GPU allocation and borrowed model weights
+    // it used on the last Chunk. No CPU/GPU hidden activation is cached.
+    using phone_chunk_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
+    std::vector<std::vector<phone_chunk_ptr>> phone_full_pool(size_t(n_layers));
+    struct phone_reuse_layer_stats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t recycled = 0;
+    };
+    std::vector<phone_reuse_layer_stats> phone_reuse_stats(size_t(n_layers));
     for (int l = 0; l < n_layers; ++l) {
         auto & row = states[size_t(l)];
         row.reserve(size_t(n_chunks));
@@ -3906,6 +3922,21 @@ static bool cycle_real_execute_period_fifo(
         }
         const auto & previous = *states[size_t(l - 1)][size_t(c)];
         return previous.phone_output ? previous.phone_output->output : nullptr;
+    };
+    // Called by the sole PHONE_GPU worker only AFTER the consumer
+    // Attention has explicitly fenced. At that point the producer's
+    // l_out will not be read again. Retain the FFN/Reduce GPU buffers for
+    // a later Chunk of the SAME physical full-Phone layer.
+    const auto retire_device_output = [&](int producer_layer, int chunk) {
+        auto & owned = states[size_t(producer_layer)][size_t(chunk)]->phone_output;
+        if (phone_full_reuse && owned && owned->is_full_layer &&
+            producer_layer > layout.x &&
+            producer_layer < layout.x + layout.y + 1) {
+            phone_full_pool[size_t(producer_layer)].push_back(std::move(owned));
+            ++phone_reuse_stats[size_t(producer_layer)].recycled;
+        } else {
+            owned.reset();
+        }
     };
 
     const bool succeeded = llama_hybrid_cycle_run_fifo(
@@ -4042,21 +4073,41 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                         if (ok) {
-                            auto & previous = *states[size_t(l - 1)][size_t(c)];
-                            previous.phone_output.reset();
-                            st.phone_output =
-                                std::make_unique<cycle_real_c2p_phone_chunk>();
-                            const auto weights = full_shard(l, 1);
-                            ok = st.phone_output->prepare(
-                                phone, weights, hidden, st.tokens,
-                                topk, experts, true);
-                            if (ok && perf_mode) {
-                                auto & sample = gpu_prepare_profile[queue_index];
-                                ++sample.count;
-                                sample.graph_build_ms +=
-                                    st.phone_output->graph_build_ms;
-                                sample.gpu_buffer_alloc_ms +=
-                                    st.phone_output->gpu_alloc_ms;
+                            retire_device_output(l - 1, c);
+                            // The previous consumer's fence is the ownership
+                            // release point. Reused graph input buffers are
+                            // overwritten by execute_full_local() for THIS
+                            // Chunk before either FFN or Reduce is submitted.
+                            if (phone_full_reuse) {
+                                auto & pool = phone_full_pool[size_t(l)];
+                                for (auto it = pool.begin(); it != pool.end(); ++it) {
+                                    if ((*it)->is_full_layer &&
+                                        (*it)->prepared_tokens == st.tokens) {
+                                        st.phone_output = std::move(*it);
+                                        pool.erase(it);
+                                        ++phone_reuse_stats[size_t(l)].hits;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!st.phone_output) {
+                                st.phone_output =
+                                    std::make_unique<cycle_real_c2p_phone_chunk>();
+                                const auto weights = full_shard(l, 1);
+                                ok = st.phone_output->prepare(
+                                    phone, weights, hidden, st.tokens,
+                                    topk, experts, true);
+                                if (ok && phone_full_reuse) {
+                                    ++phone_reuse_stats[size_t(l)].misses;
+                                }
+                                if (ok && perf_mode) {
+                                    auto & sample = gpu_prepare_profile[queue_index];
+                                    ++sample.count;
+                                    sample.graph_build_ms +=
+                                        st.phone_output->graph_build_ms;
+                                    sample.gpu_buffer_alloc_ms +=
+                                        st.phone_output->gpu_alloc_ms;
+                                }
                             }
                         }
                         if (ok) {
@@ -4175,7 +4226,7 @@ static bool cycle_real_execute_period_fifo(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
                         }
                         if (ok) {
-                            states[size_t(l - 1)][size_t(c)]->phone_output.reset();
+                            retire_device_output(l - 1, c);
                         }
                     }
                     break;
@@ -4466,6 +4517,20 @@ static bool cycle_real_execute_period_fifo(
     // cross-backend numerical tolerance difference. STRICT (default)
     // continues to fail when ANY CPU parity chunk exceeds the bound.
     const bool ok = execution_ok && (perf_mode || parity_ok);
+    if (phone_full_reuse) {
+        for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
+            const auto & sample = phone_reuse_stats[size_t(l)];
+            std::printf(
+                "[CYCLE_PHONE_FULL_REUSE_SUM] layer=%d enabled=1 "
+                "hits=%llu prepares=%llu retired=%llu "
+                "idle_pool=%zu graph_owner=PHONE_GPU "
+                "output_release=SUCCESSOR_ATTN_FENCED\n",
+                l, (unsigned long long)sample.hits,
+                (unsigned long long)sample.misses,
+                (unsigned long long)sample.recycled,
+                phone_full_pool[size_t(l)].size());
+        }
+    }
     if (perf_mode) {
         double busy_sum_ms = 0.0;
         for (size_t q = 0; q < n_queues; ++q) {
