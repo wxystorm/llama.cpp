@@ -287,6 +287,8 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_REGISTER,
     RPC_CMD_INFERENCE_CYCLE_P2C_ARM,
     RPC_CMD_INFERENCE_CYCLE_P2C_WAIT,
+    // Protocol patch 28: one Phone-local Full FFN+Reduce transaction.
+    RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_RUN,
     RPC_CMD_COUNT,
 };
 
@@ -318,6 +320,8 @@ static_assert(RPC_CMD_INFERENCE_CYCLE_FINISH == 40, "RPC_CMD_INFERENCE_CYCLE_FIN
 static_assert(RPC_CMD_GRAPH_REGISTER == 41, "RPC_CMD_GRAPH_REGISTER must be 41");
 static_assert(RPC_CMD_INFERENCE_CYCLE_P2C_ARM == 42, "RPC_CMD_INFERENCE_CYCLE_P2C_ARM must be 42");
 static_assert(RPC_CMD_INFERENCE_CYCLE_P2C_WAIT == 43, "RPC_CMD_INFERENCE_CYCLE_P2C_WAIT must be 43");
+static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_RUN == 44,
+              "RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_RUN must be 44");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -387,6 +391,19 @@ struct rpc_msg_inference_cycle_p2c_wait_req {
     int32_t chunk = -1;
     uint64_t seq = 0;
     uint64_t graph_id = 0;
+};
+
+// RPC patch 28: Attention is complete on the same COMPUTE connection
+// before the Phone handler sees this request. Its four locally-resident
+// outputs feed one persistent Full-FFN+ADD graph; no activations cross PC.
+struct rpc_msg_inference_cycle_phone_full_run_req {
+    uint32_t device = 0;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint64_t seq = 0;
+    uint64_t ffn_graph_uid = 0;
+    rpc_tensor ready_inputs[4] {};
+    rpc_tensor ffn_inputs[4] {};
 };
 
 struct rpc_msg_device_count_rsp {
@@ -2534,6 +2551,79 @@ bool ggml_backend_rpc_cycle_wait_p2c_ffn(
         "status=%s\n",
         layer, chunk, seq, (ggml_time_us() - t0) / 1000.0,
         ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// One RPC completion transaction for an entire Phone Full FFN+residual
+// stage. The Phone server dispatches this after all prior Attention compute
+// commands on its ordered COMPUTE socket. Client-side RPC synchronize() is
+// a no-op, so this explicit ACK is also the final l_out ownership boundary.
+bool ggml_backend_rpc_cycle_run_phone_full(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t ffn_graph_uid,
+        const ggml_tensor * const sources[4],
+        const ggml_tensor * const destinations[4]) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0 || ffn_graph_uid == 0 || !sources || !destinations) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 28) {
+        GGML_LOG_ERROR(
+            "[CYCLE_PHONE_FULL_LOCAL] side=PC status=FAIL "
+            "reason=PHONE_RPC_PATCH28_REQUIRED\n");
+        return false;
+    }
+
+    rpc_msg_inference_cycle_phone_full_run_req request {};
+    request.device = ctx->device;
+    request.layer = layer;
+    request.chunk = chunk;
+    request.seq = seq;
+    request.ffn_graph_uid = ffn_graph_uid;
+    for (int i = 0; i < 4; ++i) {
+        const ggml_tensor * src = sources[i];
+        const ggml_tensor * dst = destinations[i];
+        const ggml_type expected_type = i == 2 ?
+            GGML_TYPE_I32 : GGML_TYPE_F32;
+        if (!src || !dst || !src->buffer || !dst->buffer ||
+            src->type != expected_type || dst->type != expected_type ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(src, dst) ||
+            ggml_nbytes(src) != ggml_nbytes(dst) ||
+            !ggml_backend_buffer_is_rpc(src->buffer) ||
+            !ggml_backend_buffer_is_rpc(dst->buffer)) {
+            return false;
+        }
+        auto * src_buf = static_cast<ggml_backend_rpc_buffer_context *>(
+            src->buffer->context);
+        auto * dst_buf = static_cast<ggml_backend_rpc_buffer_context *>(
+            dst->buffer->context);
+        if (!src_buf || !dst_buf ||
+            src_buf->endpoint != ctx->endpoint ||
+            dst_buf->endpoint != ctx->endpoint ||
+            src_buf->device != ctx->device ||
+            dst_buf->device != ctx->device) {
+            return false;
+        }
+        request.ready_inputs[i] = serialize_tensor(src);
+        request.ffn_inputs[i] = serialize_tensor(dst);
+    }
+    const auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const int64_t t0 = ggml_time_us();
+    const bool rpc_ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_RUN,
+        &request, sizeof(request), &response, sizeof(response));
+    const bool ok = rpc_ok && response.result == 1;
+    GGML_LOG_INFO(
+        "[CYCLE_PHONE_FULL_LOCAL] side=PC action=RUN "
+        "layer=%d chunk=%d seq=%" PRIu64 " graph_uid=%" PRIu64
+        " run_ack_wait_ms=%.3f status=%s "
+        "completion=PHONE_FULL_L_OUT_READY\n",
+        layer, chunk, seq, ffn_graph_uid,
+        (ggml_time_us() - t0) / 1000.0, ok ? "OK" : "FAIL");
     return ok;
 }
 
