@@ -11916,14 +11916,26 @@ bool rpc_server::synchronize(uint32_t device) {
     }
 
     ggml_backend_t backend = backends[device];
-    ggml_backend_dev_t dev =
-        ggml_backend_get_device(backend);
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
 
+    // Instrument only when requested on the PHONE server. No additional
+    // synchronize or RPC calls are issued. This measures the actual backend
+    // synchronization, not a GPU kernel in isolation.
+    const bool trace =
+        std::getenv("GGML_CYCLE_RPC_CONTROL_TIMING") != nullptr;
+    const int64_t start_us = trace ? ggml_time_us() : 0;
+    int64_t payload_lock_wait_us = 0;
+    int64_t backend_sync_us = 0;
+    int64_t payload_release_us = 0;
     size_t released_payloads = 0;
     {
-        std::lock_guard<std::mutex> lock(
-            async_return_payload_mutex);
+        const int64_t mutex_begin_us = trace ? ggml_time_us() : 0;
+        std::lock_guard<std::mutex> lock(async_return_payload_mutex);
+        const int64_t sync_begin_us = trace ? ggml_time_us() : 0;
+        if (trace) payload_lock_wait_us = sync_begin_us - mutex_begin_us;
         ggml_backend_synchronize(backend);
+        const int64_t sync_done_us = trace ? ggml_time_us() : 0;
+        if (trace) backend_sync_us = sync_done_us - sync_begin_us;
 
         if (dev != nullptr) {
             auto it = async_return_payloads.find(dev);
@@ -11932,16 +11944,27 @@ bool rpc_server::synchronize(uint32_t device) {
                 async_return_payloads.erase(it);
             }
         }
+        if (trace) payload_release_us = ggml_time_us() - sync_done_us;
+    }
+    if (trace) {
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_FENCE_SERVER] side=PHONE device=%u "
+            "async_payload_lock_wait_ms=%.3f backend_sync_ms=%.3f "
+            "async_payload_release_ms=%.3f total_handler_ms=%.3f "
+            "released_payloads=%zu "
+            "scope=PHONE_SERVER_SYNC_NOT_KERNEL_ONLY\n",
+            device, payload_lock_wait_us / 1000.0,
+            backend_sync_us / 1000.0, payload_release_us / 1000.0,
+            (ggml_time_us() - start_us) / 1000.0, released_payloads);
     }
 
     if (released_payloads != 0 &&
-            rpc_tensor_phone_stage_profile_enabled()) {
+        rpc_tensor_phone_stage_profile_enabled()) {
         GGML_LOG_INFO(
             "[TENSOR_PHONE_RPC_STAGE] side=phone "
             "stage=async_return_payload_release "
             "device=%u count=%zu\n",
-            device,
-            released_payloads);
+            device, released_payloads);
     }
     return true;
 }
@@ -13567,15 +13590,32 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_SYNCHRONIZE: {
+                const bool trace =
+                    std::getenv("GGML_CYCLE_RPC_CONTROL_TIMING") != nullptr;
+                const int64_t receive_begin_us = trace ? ggml_time_us() : 0;
                 rpc_msg_synchronize_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t receive_done_us = trace ? ggml_time_us() : 0;
                 if (!server.synchronize(request.device)) {
                     return;
                 }
+                const int64_t sync_done_us = trace ? ggml_time_us() : 0;
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
+                }
+                if (trace) {
+                    GGML_LOG_INFO(
+                        "[CYCLE_RPC_FENCE_SERVER_IO] side=PHONE device=%u "
+                        "request_read_ms=%.3f sync_handler_ms=%.3f "
+                        "response_send_ms=%.3f total_dispatch_ms=%.3f "
+                        "scope=PHONE_CONTROL_SOCKET_HANDLER\n",
+                        request.device,
+                        (receive_done_us - receive_begin_us) / 1000.0,
+                        (sync_done_us - receive_done_us) / 1000.0,
+                        (ggml_time_us() - sync_done_us) / 1000.0,
+                        (ggml_time_us() - receive_begin_us) / 1000.0);
                 }
                 break;
             }
