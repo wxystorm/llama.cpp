@@ -6518,7 +6518,7 @@ int main(int argc, char ** argv) {
                     effective_window);
             }
             std::printf(
-                "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d 
+                "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d "
                 "measured_runs=1 model_load=ONCE "
                 "same_shapes=1 distinct_kv_and_graphs=1 "
                 "wire_seq=UNIQUE_PER_ROUND "
