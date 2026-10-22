@@ -3914,7 +3914,9 @@ static bool cycle_real_execute_period_fifo(
         const std::vector<float> & embedding,
         const std::vector<float> & cpu_reference_output,
         const cycle_real_period_reference & checkpoints,
-        int32_t tokens, int chunk_tokens, int max_inflight) {
+        int32_t tokens, int chunk_tokens, int max_inflight,
+        bool warmup_run = false, uint64_t wire_epoch = 0) {
+    const char * run_phase = warmup_run ? "WARMUP" : "MEASURE";
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
         layout.cycle_size != layout.x + layout.y + 2 ||
@@ -4110,7 +4112,12 @@ static bool cycle_real_execute_period_fifo(
             st->start = int64_t(c) * chunk_tokens;
             st->tokens = std::min(
                 int64_t(chunk_tokens), int64_t(tokens) - st->start);
-            st->wire = {l, c, uint64_t(l + 1) * 1000 + uint64_t(c + 1), 1};
+            // Each run has disjoint wire seq IDs. The first (warmup) run
+            // keeps legacy IDs, while the measured run uses the next epoch.
+            // Both runs share the model and one transport connection.
+            st->wire = {l, c,
+                wire_epoch * 100000 + uint64_t(l + 1) * 1000 +
+                    uint64_t(c + 1), 1};
             row.push_back(std::move(st));
         }
     }
@@ -4137,13 +4144,14 @@ static bool cycle_real_execute_period_fifo(
         static_cast<size_t>(n_layers));
     const auto started = std::chrono::steady_clock::now();
     std::printf(
-        "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
+        "[CYCLE_PERIOD_PLAN] phase=%s epoch=%" PRIu64
+        " x=%d y=%d layers=[0,%d] "
         "tokens=%d chunks=%d chunk_tokens=%d max_inflight=%d "
         "topology=PC_FULL_C2P_PHONE_FULL_P2C "
         "output_credit_release=DOWNSTREAM_CONSUMED "
         "phone_interlayer_readback=FORBIDDEN status=READY\n",
-        layout.x, layout.y, n_layers - 1, int(tokens), n_chunks,
-        chunk_tokens, window);
+        run_phase, wire_epoch, layout.x, layout.y, n_layers - 1,
+        int(tokens), n_chunks, chunk_tokens, window);
     std::fflush(stdout);
 
     llama_hybrid_cycle_layout period = layout;
@@ -4985,7 +4993,9 @@ static bool cycle_real_execute_period_fifo(
     // PERF mode separates successful execution from an already known
     // cross-backend numerical tolerance difference. STRICT (default)
     // continues to fail when ANY CPU parity chunk exceeds the bound.
-    const bool ok = execution_ok && (perf_mode || parity_ok);
+    // Warmup must check execution safety, but a pre-existing cross-backend
+    // strict-parity failure must not prevent the measured follow-up run.
+    const bool ok = execution_ok && (warmup_run || perf_mode || parity_ok);
     std::printf(
         "[CYCLE_PC_CUDA_SUM] enabled=%d pc_full_layers=%d "
         "stage=FULL_LAYER queue=%s "
@@ -5205,20 +5215,23 @@ static bool cycle_real_execute_period_fifo(
         // Queue times from different workers may overlap. Their sum is
         // never claimed to be an exposed end-to-end critical-path delay.
         std::printf(
-            "[CYCLE_PERIOD_PERF_SUM] side=PC fifo_wall_ms=%.3f "
+            "[CYCLE_PERIOD_PERF_SUM] side=PC phase=%s epoch=%" PRIu64
+            " fifo_wall_ms=%.3f "
             "phone_pool_release_ms=%.3f "
             "kv_release_ms=%.3f tx_idle_ms=%.3f wall_ms=%.3f "
             "queue_execute_sum_ms=%.3f "
             "queue_overlap=INDEPENDENT_WORKERS "
             "parity_timing=EXCLUDED "
             "execution_status=%s strict_parity=%s\n",
+            run_phase, wire_epoch,
             fifo_ms, phone_pool_release_ms, kv_release_ms, tx_idle_ms,
             wall_ms, busy_sum_ms, execution_ok ? "OK" : "FAIL",
             !execution_ok ? "NOT_CHECKED" :
                 parity_ok ? "PASS" : "FAIL");
     }
     std::printf(
-        "[CYCLE_PERIOD_SUM] layers=%d x=%d y=%d chunks=%d tokens=%d "
+        "[CYCLE_PERIOD_SUM] phase=%s epoch=%" PRIu64
+        " layers=%d x=%d y=%d chunks=%d tokens=%d "
         "c2p_payloads=%d p2c_payloads=%d total_payloads=%d "
         "phone_handoffs=DEVICE_LOCAL phone_to_pc_only_at=P2C "
         "gpu_output_owner_at_c2p=PHONE_GPU "
@@ -5227,10 +5240,11 @@ static bool cycle_real_execute_period_fifo(
         "final_max_abs=%.6g final_zero=%zu final_nonfinite=%zu "
         "wall_ms=%.3f mode=%s execution_status=%s "
         "cpu_parity=%s status=%s\n",
-        n_layers, layout.x, layout.y, n_chunks, int(tokens),
-        2 * n_chunks, 2 * n_chunks, 4 * n_chunks,
+        run_phase, wire_epoch, n_layers, layout.x, layout.y,
+        n_chunks, int(tokens), 2 * n_chunks, 2 * n_chunks, 4 * n_chunks,
         max_abs, zero, nonfinite, wall_ms,
-        perf_mode ? "PERF_PARITY_NON_GATING" : "STRICT",
+        warmup_run ? "WARMUP_PARITY_NON_GATING" :
+            perf_mode ? "PERF_PARITY_NON_GATING" : "STRICT",
         execution_ok ? "OK" : "FAIL",
         !execution_ok ? "NOT_CHECKED" : parity_ok ? "PASS" : "FAIL",
         ok ? "OK" : "FAIL");
@@ -6046,10 +6060,61 @@ int main(int argc, char ** argv) {
                     "ffn_norm-" + std::to_string(
                         expected_layout.cycle_size - 1));
             }
-            ok = cycle_real_execute_period_fifo(
-                phone, cpu_dev, *model, expected_layout,
-                embeddings, cpu_reference_output, checkpoints,
-                ntokens, chunk_tokens, max_inflight);
+            // Opt-in two-pass benchmark: warm a COMPLETE Cycle with the
+            // same token shapes, KV prefixes and FIFO window, then run the
+            // independently measured Cycle without reloading the model.
+            // Each pass allocates fresh per-period KV and graph state and
+            // fully drains the transport before the next begins.
+            int warmup_runs = 0;
+            const char * warm_env =
+                std::getenv("LLAMA_HYBRID_CYCLE_WARMUP_RUNS");
+            if (warm_env) {
+                if (std::strcmp(warm_env, "0") == 0) {
+                    warmup_runs = 0;
+                } else if (std::strcmp(warm_env, "1") == 0) {
+                    warmup_runs = 1;
+                } else {
+                    std::fprintf(stderr,
+                        "[CYCLE_WARMUP] status=FAIL "
+                        "reason=EXPECTED_0_OR_1 value=%s\n", warm_env);
+                    ggml_backend_free(phone);
+                    return 1;
+                }
+            }
+            std::printf(
+                "[CYCLE_WARMUP_PLAN] enabled=%d warmup_runs=%d "
+                "measured_runs=1 model_load=ONCE "
+                "same_shapes=1 distinct_kv_and_graphs=1 "
+                "wire_seq=UNIQUE_PER_ROUND "
+                "pc_wall_includes=FIFO_AND_RELEASE "
+                "phone_server_sums=SESSION_CUMULATIVE_USE_DELTA\n",
+                warmup_runs != 0 ? 1 : 0, warmup_runs);
+            for (int run = 0; run <= warmup_runs; ++run) {
+                const bool is_warmup = run < warmup_runs;
+                const char * phase = is_warmup ? "WARMUP" : "MEASURE";
+                const uint64_t epoch = uint64_t(run);
+                std::printf(
+                    "[CYCLE_WARMUP_RUN] phase=%s epoch=%" PRIu64
+                    " status=BEGIN\n", phase, epoch);
+                std::fflush(stdout);
+                const auto run_start = std::chrono::steady_clock::now();
+                ok = cycle_real_execute_period_fifo(
+                    phone, cpu_dev, *model, expected_layout,
+                    embeddings, cpu_reference_output, checkpoints,
+                    ntokens, chunk_tokens, max_inflight,
+                    is_warmup, epoch);
+                const double run_full_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - run_start).count();
+                std::printf(
+                    "[CYCLE_WARMUP_RUN] phase=%s epoch=%" PRIu64
+                    " full_call_wall_ms=%.3f "
+                    "includes=BACKEND_INIT_WEIGHT_MIRROR_AND_PARITY "
+                    "status=%s\n",
+                    phase, epoch, run_full_ms, ok ? "OK" : "FAIL");
+                std::fflush(stdout);
+                if (!ok) break;
+            }
         } else {
             const cycle_real_live_wire wire {layer, 0, 1, 1};
             ok = cycle_real_execute_c2p_fifo(
