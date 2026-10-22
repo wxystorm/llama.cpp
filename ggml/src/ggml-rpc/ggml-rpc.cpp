@@ -14213,6 +14213,112 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
+
+                // READY is now in the independent Phone TX staging buffer,
+                // and the PC can receive it/compute its FFN immediately.
+                // Continue the Phone FFN WITHOUT any PC stage RPC: copy
+                // Attention Norm/TopK into the registered FFN slot, run
+                // its cached graph on the Phone GPU, then stage PARTIAL.
+                if (response.result == 1 &&
+                    request.kind == INFERENCE_CYCLE_READY) {
+                    const auto key = p2c_key(
+                        request.layer, request.chunk,
+                        request.seq, request.graph_id);
+                    const auto armed = p2c_armed.find(key);
+                    if (armed != p2c_armed.end()) {
+                        const auto plan = armed->second;
+                        p2c_armed.erase(armed);
+                        const int64_t begin_us = ggml_time_us();
+                        bool ok = true;
+                        for (int i = 0; i < 3 && ok; ++i) {
+                            rpc_msg_copy_tensor_req copy {};
+                            copy.src = plan.ready_inputs[i];
+                            copy.dst = plan.ffn_inputs[i];
+                            rpc_msg_copy_tensor_rsp copied {};
+                            ok = server.copy_tensor(copy, copied) &&
+                                 copied.result;
+                        }
+                        const int64_t copy_done_us = ggml_time_us();
+                        if (ok) {
+                            rpc_msg_graph_recompute_req compute {};
+                            compute.device = plan.partial.device;
+                            compute.graph_uid = plan.ffn_graph_uid;
+                            ok = server.graph_recompute(compute);
+                        }
+                        const int64_t compute_done_us = ggml_time_us();
+                        if (ok) {
+                            ok = server.send_inference_cycle(plan.partial);
+                        }
+                        const int64_t done_us = ggml_time_us();
+                        p2c_completed.emplace(key, ok);
+                        GGML_LOG_INFO(
+                            "[CYCLE_P2C_LOCAL] side=PHONE action=CHAIN "
+                            "layer=%d chunk=%d seq=%" PRIu64
+                            " graph_uid=%" PRIu64
+                            " copy_ms=%.3f ffn_compute_ms=%.3f "
+                            "partial_stage_ms=%.3f total_ms=%.3f "
+                            "ready_tx=ALREADY_STAGED status=%s\n",
+                            request.layer, request.chunk, request.seq,
+                            plan.ffn_graph_uid,
+                            (copy_done_us - begin_us) / 1000.0,
+                            (compute_done_us - copy_done_us) / 1000.0,
+                            (done_us - compute_done_us) / 1000.0,
+                            (done_us - begin_us) / 1000.0,
+                            ok ? "OK" : "FAIL");
+                    }
+                }
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_P2C_ARM: {
+                rpc_msg_inference_cycle_p2c_arm_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto & msg = request.partial;
+                const auto key = p2c_key(
+                    msg.layer, msg.chunk, msg.seq, msg.graph_id);
+                const bool valid =
+                    request.ffn_graph_uid != 0 &&
+                    msg.device < device_count &&
+                    msg.kind == INFERENCE_CYCLE_PARTIAL &&
+                    msg.layer >= 0 && msg.chunk >= 0 &&
+                    msg.seq != 0 && msg.tokens >= 1 &&
+                    msg.tokens <= 128 && msg.hidden >= 1 &&
+                    msg.hidden <= 65536 && msg.topk == 0 &&
+                    msg.tensors[0].buffer != 0 &&
+                    p2c_armed.size() < 64 && p2c_completed.size() < 64 &&
+                    p2c_armed.find(key) == p2c_armed.end() &&
+                    p2c_completed.find(key) == p2c_completed.end();
+                rpc_msg_inference_cycle_send_rsp response {};
+                if (valid) {
+                    p2c_armed.emplace(key, request);
+                    response.result = 1;
+                }
+                GGML_LOG_INFO(
+                    "[CYCLE_P2C_LOCAL] side=PHONE action=ARM "
+                    "layer=%d chunk=%d seq=%" PRIu64
+                    " graph_uid=%" PRIu64 " status=%s\n",
+                    msg.layer, msg.chunk, msg.seq, request.ffn_graph_uid,
+                    response.result == 1 ? "OK" : "REJECT");
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT: {
+                rpc_msg_inference_cycle_p2c_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto key = p2c_key(
+                    request.layer, request.chunk,
+                    request.seq, request.graph_id);
+                rpc_msg_inference_cycle_send_rsp response {};
+                const auto done = p2c_completed.find(key);
+                if (done != p2c_completed.end()) {
+                    response.result = done->second ? 1 : 0;
+                    p2c_completed.erase(done);
+                }
+                GGML_LOG_INFO(
+                    "[CYCLE_P2C_LOCAL] side=PHONE action=COMPLETE "
+                    "layer=%d chunk=%d seq=%" PRIu64 " status=%s\n",
+                    request.layer, request.chunk, request.seq,
+                    response.result == 1 ? "OK" : "FAIL");
+                if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_INFERENCE_CYCLE_APPLY: {
