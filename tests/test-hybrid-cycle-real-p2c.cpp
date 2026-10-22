@@ -42,6 +42,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -4042,6 +4043,8 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_PC_CUDA_FULL");
     const bool p2c_ffn_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_P2C_FFN_REUSE");
+    const bool c2p_ffn_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE");
     if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
         std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
                     "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
@@ -4203,6 +4206,17 @@ static bool cycle_real_execute_period_fifo(
     // it used on the last Chunk. No CPU/GPU hidden activation is cached.
     using phone_chunk_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
     std::vector<std::vector<phone_chunk_ptr>> phone_full_pool(static_cast<size_t>(n_layers));
+    // C2P setup runs on PC_CPU but finished outputs are retired by
+    // PHONE_GPU, once the successor's Attention fence has completed.
+    // The pool lock protects ONLY pointer transfer / metadata: allocating
+    // or freeing GPU RPC buffers while holding it would block both workers.
+    std::mutex c2p_pool_mutex;
+    std::vector<phone_chunk_ptr> c2p_pool;
+    size_t c2p_live_slots = 0;
+    uint64_t c2p_prepares = 0;
+    uint64_t c2p_hits = 0;
+    uint64_t c2p_retired = 0;
+    uint64_t c2p_shape_replacements = 0;
     struct phone_reuse_layer_stats {
         uint64_t hits = 0;
         uint64_t misses = 0;
@@ -4305,9 +4319,16 @@ static bool cycle_real_execute_period_fifo(
     // a later Chunk of the SAME physical full-Phone layer.
     const auto retire_device_output = [&](int producer_layer, int chunk) {
         auto & owned = states[size_t(producer_layer)][size_t(chunk)]->phone_output;
-        if (phone_full_reuse && owned && owned->is_full_layer &&
-            producer_layer > layout.x &&
-            producer_layer < layout.x + layout.y + 1) {
+        if (c2p_ffn_reuse && owned && !owned->is_full_layer &&
+            producer_layer == layout.x) {
+            // This callback runs only AFTER the next layer's Attention
+            // fence, guaranteeing it no longer reads the C2P output.
+            std::lock_guard<std::mutex> lock(c2p_pool_mutex);
+            c2p_pool.push_back(std::move(owned));
+            ++c2p_retired;
+        } else if (phone_full_reuse && owned && owned->is_full_layer &&
+                   producer_layer > layout.x &&
+                   producer_layer < layout.x + layout.y + 1) {
             phone_full_pool[size_t(producer_layer)].push_back(std::move(owned));
             ++phone_reuse_stats[size_t(producer_layer)].recycled;
         } else {
@@ -4768,19 +4789,73 @@ static bool cycle_real_execute_period_fifo(
                             cycle_real_period_checkpoint(
                                 "C2P_ATTN_RESIDUAL", l, c, st.start, hidden,
                                 st.ready.residual, checkpoints.c2p_residual);
-                            st.phone_output =
-                                std::make_unique<cycle_real_c2p_phone_chunk>();
-                            const auto weights = full_shard(l, 1);
-                            ok = st.phone_output->prepare(
-                                phone, weights, hidden, st.tokens,
-                                topk, experts);
-                            if (ok && perf_mode) {
-                                auto & sample = gpu_prepare_profile[queue_index];
-                                ++sample.count;
-                                sample.graph_build_ms +=
-                                    st.phone_output->graph_build_ms;
-                                sample.gpu_buffer_alloc_ms +=
-                                    st.phone_output->gpu_alloc_ms;
+                            bool needs_prepare = true;
+                            bool slot_reserved = false;
+                            phone_chunk_ptr incompatible_slot;
+                            if (c2p_ffn_reuse) {
+                                {
+                                    std::lock_guard<std::mutex> lock(c2p_pool_mutex);
+                                    for (auto it = c2p_pool.begin();
+                                         it != c2p_pool.end(); ++it) {
+                                        if ((*it)->prepared_tokens == st.tokens &&
+                                            !(*it)->is_full_layer) {
+                                            st.phone_output = std::move(*it);
+                                            c2p_pool.erase(it);
+                                            ++c2p_hits;
+                                            needs_prepare = false;
+                                            break;
+                                        }
+                                    }
+                                    if (needs_prepare) {
+                                        if (c2p_live_slots < size_t(window)) {
+                                            ++c2p_live_slots;
+                                            slot_reserved = true;
+                                        } else if (!c2p_pool.empty()) {
+                                            // The last chunk may have a
+                                            // shorter token shape. Evict one
+                                            // idle incompatible buffer, not
+                                            // a producer still in use.
+                                            incompatible_slot =
+                                                std::move(c2p_pool.back());
+                                            c2p_pool.pop_back();
+                                            ++c2p_shape_replacements;
+                                            slot_reserved = true;
+                                        }
+                                        if (slot_reserved) ++c2p_prepares;
+                                    }
+                                }
+                                // Never perform the synchronous RPC FREE
+                                // inside the mutex protecting both workers.
+                                incompatible_slot.reset();
+                                if (needs_prepare && !slot_reserved) {
+                                    std::fprintf(stderr,
+                                        "[CYCLE_C2P_FFN_REUSE] layer=%d "
+                                        "chunk=%d status=FAIL "
+                                        "reason=POOL_EXHAUSTED window=%d\n",
+                                        l, c, window);
+                                    ok = false;
+                                }
+                            }
+                            if (ok && needs_prepare) {
+                                st.phone_output =
+                                    std::make_unique<cycle_real_c2p_phone_chunk>();
+                                const auto weights = full_shard(l, 1);
+                                ok = st.phone_output->prepare(
+                                    phone, weights, hidden, st.tokens,
+                                    topk, experts);
+                                if (!ok && c2p_ffn_reuse) {
+                                    st.phone_output.reset();
+                                    std::lock_guard<std::mutex> lock(c2p_pool_mutex);
+                                    --c2p_live_slots;
+                                }
+                                if (ok && perf_mode) {
+                                    auto & sample = gpu_prepare_profile[queue_index];
+                                    ++sample.count;
+                                    sample.graph_build_ms +=
+                                        st.phone_output->graph_build_ms;
+                                    sample.gpu_buffer_alloc_ms +=
+                                        st.phone_output->gpu_alloc_ms;
+                                }
                             }
                         }
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
@@ -5093,6 +5168,20 @@ static bool cycle_real_execute_period_fifo(
     // Release the cached RPC allocation BEFORE the period timer stops.
     // No borrowed input or output outlives the FIFO workers.
     p2c_ffn_slot.reset();
+    const auto p2c_pool_release_done = std::chrono::steady_clock::now();
+    // Pool ownership moves out under the mutex. All synchronous RPC frees
+    // run after unlock, since the producer/consumer workers have joined.
+    size_t c2p_cached_at_fifo_end = 0;
+    std::vector<phone_chunk_ptr> c2p_to_release;
+    if (c2p_ffn_reuse) {
+        {
+            std::lock_guard<std::mutex> lock(c2p_pool_mutex);
+            c2p_cached_at_fifo_end = c2p_pool.size();
+            c2p_to_release = std::move(c2p_pool);
+        }
+        c2p_to_release.clear();
+    }
+    const auto c2p_pool_release_done = std::chrono::steady_clock::now();
     // Include the eventual GPU cache release in the measured period.
     // Otherwise a cache hit could look faster merely because the final
     // GPU buffer_free calls moved outside wall_ms.
@@ -5124,6 +5213,15 @@ static bool cycle_real_execute_period_fifo(
     const double phone_pool_release_ms =
         std::chrono::duration<double, std::milli>(
             phone_pool_release_done - fifo_done).count();
+    const double p2c_pool_release_ms =
+        std::chrono::duration<double, std::milli>(
+            p2c_pool_release_done - fifo_done).count();
+    const double c2p_pool_release_ms =
+        std::chrono::duration<double, std::milli>(
+            c2p_pool_release_done - p2c_pool_release_done).count();
+    const double full_pool_release_ms =
+        std::chrono::duration<double, std::milli>(
+            phone_pool_release_done - c2p_pool_release_done).count();
     const double kv_release_ms = std::chrono::duration<double, std::milli>(
         kv_release_done - phone_pool_release_done).count();
     const double tx_idle_ms = std::chrono::duration<double, std::milli>(
@@ -5169,6 +5267,28 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
+    if (c2p_ffn_reuse) {
+        std::printf(
+            "[CYCLE_C2P_FFN_REUSE_SUM] side=PC layer=%d enabled=1 "
+            "prepares=%llu hits=%llu retired=%llu "
+            "shape_replacements=%llu slots_total=%zu "
+            "cached_at_fifo_end=%zu graph_owner=PC_CPU_AND_PHONE_GPU "
+            "output_release=SUCCESSOR_ATTN_FENCED "
+            "cache_lifetime=ONE_PERIOD\n",
+            layout.x, (unsigned long long)c2p_prepares,
+            (unsigned long long)c2p_hits, (unsigned long long)c2p_retired,
+            (unsigned long long)c2p_shape_replacements,
+            c2p_live_slots, c2p_cached_at_fifo_end);
+    }
+    if (perf_mode && (c2p_ffn_reuse || p2c_ffn_reuse)) {
+        std::printf(
+            "[CYCLE_FFN_POOL_RELEASE_SUM] side=PC "
+            "p2c_release_ms=%.3f c2p_release_ms=%.3f "
+            "phone_full_release_ms=%.3f "
+            "included_in=PERIOD_WALL_AND_PHONE_POOL_RELEASE\n",
+            p2c_pool_release_ms, c2p_pool_release_ms,
+            full_pool_release_ms);
+    }
     if (p2c_ffn_reuse) {
         std::printf(
             "[CYCLE_P2C_FFN_REUSE_SUM] side=PC layer=%d enabled=1 "
