@@ -4213,7 +4213,10 @@ struct cycle_real_phone_fence_profile {
 // confirms that all earlier graphs have finished consuming it.
 static bool cycle_real_explicit_phone_fence(
         ggml_backend_t phone,
-        cycle_real_phone_fence_profile * sample = nullptr) {
+        cycle_real_phone_fence_profile * sample = nullptr,
+        int layer = -1,
+        int chunk = -1,
+        const char * stage = "UNKNOWN") {
     auto * dev = phone ? ggml_backend_get_device(phone) : nullptr;
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     const auto fence = reg ?
@@ -4226,8 +4229,35 @@ static bool cycle_real_explicit_phone_fence(
             "[CYCLE_PERIOD_FENCE] status=FAIL reason=RPC_FENCE_MISSING\n");
         return false;
     }
+
+    // Opt-in profiling calls the SAME RPC_CMD_SYNCHRONIZE fence and does not
+    // change scheduling or device ownership. The extension only exposes
+    // client-side COMPUTE socket lock, request and response timings.
+    const bool control_timing =
+        cycle_real_env_flag("LLAMA_HYBRID_CYCLE_RPC_CONTROL_TIMING");
+    ggml_backend_rpc_fence_timing breakdown {};
+    ggml_backend_rpc_fence_profiled_t profiled = nullptr;
+    if (control_timing) {
+        profiled = reg ?
+            reinterpret_cast<ggml_backend_rpc_fence_profiled_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_FENCE_PROFILED_PROC)) :
+            nullptr;
+        if (!profiled) {
+            std::fprintf(stderr,
+                "[CYCLE_RPC_FENCE_DETAIL] stage=%s layer=%d chunk=%d "
+                "status=FAIL reason=PROFILED_RPC_FENCE_PROC_MISSING\n",
+                stage, layer, chunk);
+            return false;
+        }
+    }
+
     const auto start = std::chrono::steady_clock::now();
-    fence(phone);
+    if (control_timing) {
+        profiled(phone, &breakdown);
+    } else {
+        fence(phone);
+    }
     const double elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     if (sample) {
@@ -4235,6 +4265,24 @@ static bool cycle_real_explicit_phone_fence(
         sample->wait_ms += elapsed_ms;
         sample->max_wait_ms = std::max(
             sample->max_wait_ms, elapsed_ms);
+    }
+    if (control_timing) {
+        const double accounted_ms =
+            breakdown.socket_lock_wait_ms + breakdown.request_send_ms +
+            breakdown.response_header_wait_ms +
+            breakdown.response_body_wait_ms;
+        std::printf(
+            "[CYCLE_RPC_FENCE_DETAIL] side=PC layer=%d chunk=%d "
+            "stage=%s total_wall_ms=%.3f socket_lock_wait_ms=%.3f "
+            "request_send_ms=%.3f response_header_wait_ms=%.3f "
+            "response_body_wait_ms=%.3f rpc_total_ms=%.3f "
+            "rpc_unattributed_ms=%.3f "
+            "source=CLIENT_CONTROL_SOCKET_NOT_GPU_KERNEL\n",
+            layer, chunk, stage, elapsed_ms,
+            breakdown.socket_lock_wait_ms, breakdown.request_send_ms,
+            breakdown.response_header_wait_ms,
+            breakdown.response_body_wait_ms, breakdown.total_ms,
+            breakdown.total_ms - accounted_ms);
     }
     if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
         std::printf(
@@ -4270,7 +4318,8 @@ static bool cycle_real_phone_boundary_probe(
             stage, layer, chunk);
         return false;
     }
-    if (!cycle_real_explicit_phone_fence(phone)) {
+    if (!cycle_real_explicit_phone_fence(
+            phone, nullptr, layer, chunk, stage)) {
         return false;
     }
     std::vector<float> values(count);
@@ -5312,7 +5361,9 @@ static bool cycle_real_execute_period_fifo(
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
-                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                                phone,
+                                perf_mode ? &fence_profile[queue_index] : nullptr,
+                                l, c, "PHONE_FULL_ATTN");
                             if (perf_mode) {
                                 full_detail.attn_fence_ms +=
                                     std::chrono::duration<double, std::milli>(
@@ -5412,7 +5463,9 @@ static bool cycle_real_execute_period_fifo(
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
-                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                                phone,
+                                perf_mode ? &fence_profile[queue_index] : nullptr,
+                                l, c, "PHONE_FULL_FFN");
                             if (perf_mode) {
                                 full_detail.ffn_fence_ms +=
                                     std::chrono::duration<double, std::milli>(
@@ -5452,7 +5505,9 @@ static bool cycle_real_execute_period_fifo(
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
-                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                                phone,
+                                perf_mode ? &fence_profile[queue_index] : nullptr,
+                                l, c, "PHONE_FULL_REDUCE");
                             if (perf_mode) {
                                 full_detail.reduce_fence_ms +=
                                     std::chrono::duration<double, std::milli>(
@@ -5617,7 +5672,9 @@ static bool cycle_real_execute_period_fifo(
                                 graph_cache_by_layer[size_t(l)]);
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(
-                                phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                                phone,
+                                perf_mode ? &fence_profile[queue_index] : nullptr,
+                                l, c, "P2C_ATTN");
                         }
                         if (ok) {
                             retire_device_output(l - 1, c);
