@@ -7287,6 +7287,17 @@ int main(int argc, char ** argv) {
                     "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN_GRAPH_CACHE");
             const bool attn_graph_cache_enabled = cycle_real_env_flag(
                 "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
+            const bool attn_scratch_session_reuse = cycle_real_env_flag(
+                "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_SESSION_REUSE");
+            if (attn_scratch_session_reuse &&
+                (!attn_graph_cache_enabled || !phone_full_session_reuse ||
+                 !cycle_real_env_flag("LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL"))) {
+                std::fprintf(stderr,
+                    "[CYCLE_ATTN_SCRATCH_SESSION] status=FAIL "
+                    "reason=REQUIRES_PHONE_SESSION_GRAPH_AND_SCRATCH_POOL\n");
+                ggml_backend_free(phone);
+                return 1;
+            }
             if (attn_graph_cache_enabled &&
                 (!phone_full_session_reuse || !cycle_real_env_flag(
                     "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL"))) {
@@ -7360,18 +7371,30 @@ int main(int argc, char ** argv) {
                     chunk_tokens, effective_window,
                     cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_FUSE"),
                     cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PHONE_FULL_RPC_REPLAY"),
-                    attn_graph_cache_enabled);
+                    attn_graph_cache_enabled, attn_scratch_session_reuse);
                 if (attn_graph_cache_enabled) {
                     std::printf(
                         "[CYCLE_ATTN_GRAPH_CACHE_PLAN] enabled=1 "
                         "layers=[%d,%d] graph_owner=PHONE_SESSION "
                         "kv_buffer=SESSION_PERSISTENT "
                         "kv_tokens=RESET_EACH_PERIOD "
-                        "scratch_owner=PERIOD_POOL "
+                        "scratch_owner=%s "
                         "graph_key=QUERY_TOKENS_KV_TOKENS "
                         "rpc_server_replay=UNCHANGED\n",
                         expected_layout.x + 1,
-                        expected_layout.cycle_size - 1);
+                        expected_layout.cycle_size - 1,
+                        attn_scratch_session_reuse ?
+                            "PHONE_SESSION" : "PERIOD_POOL");
+                }
+                if (attn_scratch_session_reuse) {
+                    std::printf(
+                        "[CYCLE_ATTN_SCRATCH_SESSION_PLAN] "
+                        "enabled=1 layers=[%d,%d] max_slots_per_layer=%d "
+                        "graph_binding=PER_CHUNK "
+                        "ownership=MODEL_AND_PHONE_RPC_BACKEND "
+                        "release=AFTER_GRAPH_BEFORE_PHONE_BACKEND_FREE\n",
+                        expected_layout.x + 1,
+                        expected_layout.cycle_size - 1, effective_window);
                 }
                 std::printf(
                     "[CYCLE_PHONE_FULL_SESSION_PLAN] enabled=1 "
@@ -7479,12 +7502,23 @@ int main(int argc, char ** argv) {
                 const size_t cached_before_release = full_session.cached_slots();
                 const size_t attn_graphs_before_release =
                     full_session.cached_attention_graphs();
+                const size_t attn_scratch_before_release =
+                    full_session.cached_attention_scratch_slots();
                 const auto release_begin = std::chrono::steady_clock::now();
                 full_session.clear();
                 const double release_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         release_begin).count();
+                if (attn_scratch_session_reuse) {
+                    std::printf(
+                        "[CYCLE_ATTN_SCRATCH_SESSION_TEARDOWN] "
+                        "slots_released=%zu release_ms=%.3f "
+                        "included_in=PHONE_FULL_SESSION_TEARDOWN "
+                        "before_phone_backend_free=1 status=OK\n",
+                        attn_scratch_before_release,
+                        full_session.last_attn_scratch_release_ms);
+                }
                 std::printf(
                     "[CYCLE_PHONE_FULL_SESSION_TEARDOWN] "
                     "slots_released=%zu attn_graphs_released=%zu "
