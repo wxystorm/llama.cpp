@@ -5810,6 +5810,8 @@ static bool cycle_real_execute_period_fifo(
                                 st.phone_output->ffn_graph_submit_ms;
                         }
                     } else {
+                        const auto pc_ffn_begin =
+                            std::chrono::steady_clock::now();
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
                             cpu, weights,
@@ -5819,6 +5821,10 @@ static bool cycle_real_execute_period_fifo(
                             hidden, st.tokens, topk, experts,
                             st.partial, nullptr, nullptr, nullptr, nullptr,
                             perf_mode ? &ffn_profile[queue_index] : nullptr);
+                        if (path_timing) {
+                            st.p2c_timing.pc_ffn_call_ms =
+                                cycle_real_path_elapsed_ms(pc_ffn_begin);
+                        }
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "P2C_PC_FFN", l, c, st.partial);
@@ -5846,10 +5852,23 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                     } else {
+                        const auto receive_begin =
+                            std::chrono::steady_clock::now();
                         ok = cycle_real_receive_live_wire(
                             phone, st.wire, INFERENCE_CYCLE_PARTIAL,
                             uint32_t(st.tokens), uint32_t(hidden), 0,
                             st.recv_partial);
+                        if (path_timing) {
+                            st.p2c_timing.partial_receive_decode_ms =
+                                cycle_real_path_elapsed_ms(receive_begin);
+                            size_t payload_bytes = 0;
+                            if (ok && inference_cycle_payload_size(
+                                    INFERENCE_CYCLE_PARTIAL,
+                                    uint32_t(st.tokens),
+                                    uint32_t(hidden), 0, payload_bytes)) {
+                                st.p2c_timing.partial_rx_bytes = payload_bytes;
+                            }
+                        }
                         if (ok) {
                             cycle_real_numeric_probe(
                                 "P2C_PHONE_FFN_RX", l, c,
@@ -5947,15 +5966,27 @@ static bool cycle_real_execute_period_fifo(
                     } else {
                         const size_t n = size_t(hidden * st.tokens);
                         st.host_output.resize(n);
+                        const auto reduce_begin =
+                            std::chrono::steady_clock::now();
                         ok = inference_cycle_reduce_p2c_pc_cpu(
                             st.recv_ready.ready, st.partial.data(),
                             st.partial.size(), st.recv_partial.partial,
                             st.host_output.data(), st.host_output.size());
+                        if (path_timing) {
+                            st.p2c_timing.pc_reduce_call_ms =
+                                cycle_real_path_elapsed_ms(reduce_begin);
+                        }
                         if (ok) {
+                            const auto ack_begin =
+                                std::chrono::steady_clock::now();
                             ok = ggml_backend_rpc_cycle_send_ack(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id,
                                 INFERENCE_CYCLE_PARTIAL, true);
+                            if (path_timing) {
+                                st.p2c_timing.partial_ack_rpc_ms =
+                                    cycle_real_path_elapsed_ms(ack_begin);
+                            }
                         }
                         if (ok) {
                             cycle_real_numeric_probe(
