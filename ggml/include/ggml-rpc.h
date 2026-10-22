@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    27
+#define RPC_PROTO_PATCH_VERSION    28
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -375,6 +375,19 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_arm_p2c_ffn(
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_p2c_ffn(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id);
+
+// Protocol 28: Phone Full local FFN+residual graph replay. The Attention
+// Graph was submitted on the SAME ordered COMPUTE connection. The Phone
+// server copies four Attention/Router outputs into an already-registered
+// FFN/Reduce graph slot, executes it synchronously, and ACKs only after
+// the resulting l_out is device-complete. No extra PC-initiated Fence,
+// per-tensor Copy RPCs, Graph-submit RPC or intermediate host transfers.
+// All eight tensor descriptors and the graph slot stay caller-owned.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t ffn_graph_uid,
+        const struct ggml_tensor * const sources[4],
+        const struct ggml_tensor * const destinations[4]);
 
 // Protocol 26: REAL C2P data-plane frames travel PC -> Phone exactly once.
 // APPLY consumes the Phone server's already-received READY/PARTIAL and writes
