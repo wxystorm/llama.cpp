@@ -4640,9 +4640,20 @@ static double cycle_real_path_elapsed_ms(
         std::chrono::steady_clock::now() - start).count();
 }
 
+// PC-only event timestamps. These are published before each FIFO stage
+// completes (under the ring mutex); REDUCE reads them only after BOTH PC FFN
+// and Phone PARTIAL have joined. No cross-device clock arithmetic is used.
+struct cycle_real_p2c_overlap_events {
+    std::chrono::steady_clock::time_point ready_received {};
+    std::chrono::steady_clock::time_point cpu_ffn_started {};
+    std::chrono::steady_clock::time_point cpu_ffn_finished {};
+    std::chrono::steady_clock::time_point partial_received {};
+};
+
 struct cycle_real_period_chunk {
     cycle_real_c2p_path_timing c2p_timing {};
     cycle_real_p2c_path_timing p2c_timing {};
+    cycle_real_p2c_overlap_events p2c_overlap {};
     int layer = 0;
     int chunk = 0;
     int64_t start = 0;
@@ -5173,6 +5184,11 @@ static bool cycle_real_execute_period_fifo(
     uint64_t p2c_ffn_hits = 0;
     uint64_t p2c_ffn_replacements = 0;
     uint64_t p2c_phone_local_completed = 0;
+    // These metrics have a single writer (PC_CPU REDUCE). They describe
+    // useful cross-queue overlap before PC receives Phone's PARTIAL, not
+    // device kernel overlap or phone-server execution time.
+    uint64_t p2c_cpu_started_while_partial_pending = 0;
+    double p2c_cpu_partial_pending_overlap_ms = 0.0;
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] phase=%s epoch=%" PRIu64
@@ -5988,6 +6004,10 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                         if (ok) {
+                            if (phone_p2c_local_ffn) {
+                                st.p2c_overlap.ready_received =
+                                    std::chrono::steady_clock::now();
+                            }
                             cycle_real_numeric_probe(
                                 "P2C_READY_RESIDUAL", l, c,
                                 st.recv_ready.ready.residual);
@@ -6155,6 +6175,9 @@ static bool cycle_real_execute_period_fifo(
                     } else {
                         const auto pc_ffn_begin =
                             std::chrono::steady_clock::now();
+                        if (phone_p2c_local_ffn) {
+                            st.p2c_overlap.cpu_ffn_started = pc_ffn_begin;
+                        }
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
                             cpu, weights,
@@ -6164,6 +6187,10 @@ static bool cycle_real_execute_period_fifo(
                             hidden, st.tokens, topk, experts,
                             st.partial, nullptr, nullptr, nullptr, nullptr,
                             perf_mode ? &ffn_profile[queue_index] : nullptr);
+                        if (phone_p2c_local_ffn) {
+                            st.p2c_overlap.cpu_ffn_finished =
+                                std::chrono::steady_clock::now();
+                        }
                         if (path_timing) {
                             st.p2c_timing.pc_ffn_call_ms =
                                 cycle_real_path_elapsed_ms(pc_ffn_begin);
@@ -6213,6 +6240,10 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                         if (ok) {
+                            if (phone_p2c_local_ffn) {
+                                st.p2c_overlap.partial_received =
+                                    std::chrono::steady_clock::now();
+                            }
                             cycle_real_numeric_probe(
                                 "P2C_PHONE_FFN_RX", l, c,
                                 st.recv_partial.partial.partial);
