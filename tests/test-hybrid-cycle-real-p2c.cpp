@@ -852,6 +852,74 @@ struct cycle_real_phone_kv_cache {
     }
 };
 
+// Session-owned PC CUDA graphs borrow mirrored weights and physical KV.
+// Scratch is still leased per period, not pinned by the cached metadata.
+// Destroy Graph -> KV -> mirrored weights/backend before releasing the model.
+struct cycle_real_pc_cuda_session_pool {
+    const llama_model * model = nullptr;
+    int layers = 0;
+    int32_t total_tokens = 0;
+    int chunk_tokens = 0;
+    int window = 0;
+    std::unique_ptr<cycle_real_pc_cuda_runtime> runtime;
+    std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> kv;
+    std::vector<std::unique_ptr<cycle_real_attention_graph_cache>> attn_graphs;
+
+    ~cycle_real_pc_cuda_session_pool() { clear(); }
+
+    void configure(const llama_model & m,
+                   const llama_hybrid_cycle_layout & layout,
+                   int32_t tokens, int chunk, int inflight) {
+        clear();
+        model = &m;
+        layers = layout.x;
+        total_tokens = tokens;
+        chunk_tokens = chunk;
+        window = inflight;
+        kv.resize(size_t(layers));
+        attn_graphs.resize(size_t(layers));
+        for (int l = 0; l < layers; ++l) {
+            attn_graphs[size_t(l)] =
+                std::make_unique<cycle_real_attention_graph_cache>();
+        }
+    }
+
+    bool matches(const llama_model & m,
+                 const llama_hybrid_cycle_layout & layout,
+                 int32_t tokens, int chunk, int inflight) const {
+        return model == &m && layers == layout.x &&
+               total_tokens == tokens && chunk_tokens == chunk &&
+               window == inflight &&
+               kv.size() == size_t(layers) &&
+               attn_graphs.size() == size_t(layers);
+    }
+
+    size_t cached_attention_graphs() const {
+        size_t result = 0;
+        for (const auto & cache : attn_graphs) {
+            if (cache) result += cache->entries.size();
+        }
+        return result;
+    }
+
+    void clear() {
+        for (const auto & cache : attn_graphs) {
+            if (cache && !cache->is_idle()) {
+                std::fprintf(stderr,
+                    "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE] status=FAIL "
+                    "reason=SESSION_TEARDOWN_WITH_ACTIVE_GRAPH\n");
+            }
+        }
+        attn_graphs.clear();
+        kv.clear();
+        runtime.reset();  // Frees CUDA weight mirrors before CUDA backend.
+        model = nullptr;
+        layers = 0;
+        total_tokens = 0;
+        chunk_tokens = window = 0;
+    }
+};
+
 struct cycle_real_live_wire {
     int32_t layer = -1;
     int32_t chunk = 0;
@@ -4215,7 +4283,8 @@ static bool cycle_real_execute_period_fifo(
         const cycle_real_period_reference & checkpoints,
         int32_t tokens, int chunk_tokens, int max_inflight,
         bool warmup_run = false, uint64_t wire_epoch = 0,
-        cycle_real_phone_full_session_pool * phone_full_session = nullptr) {
+        cycle_real_phone_full_session_pool * phone_full_session = nullptr,
+        cycle_real_pc_cuda_session_pool * pc_cuda_session = nullptr) {
     const char * run_phase = warmup_run ? "WARMUP" : "MEASURE";
     if (!phone || !cpu_dev || tokens <= 0 || tokens > 128 ||
         chunk_tokens <= 0 || max_inflight <= 0 ||
@@ -4243,6 +4312,23 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
     const bool attn_graph_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
+    const bool pc_cuda_attn_graph_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN_GRAPH_CACHE");
+    if (pc_cuda_attn_graph_reuse &&
+        (!pc_cuda_full || !pc_cuda_session || n_chunks < 2)) {
+        std::fprintf(stderr,
+            "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE] phase=%s status=FAIL "
+            "reason=REQUIRES_CUDA_FULL_SESSION_MULTICHUNK\n", run_phase);
+        return false;
+    }
+    if (pc_cuda_attn_graph_reuse &&
+        !pc_cuda_session->matches(
+            model, layout, tokens, chunk_tokens, window)) {
+        std::fprintf(stderr,
+            "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE] phase=%s status=FAIL "
+            "reason=MODEL_LAYOUT_OR_SHAPE_MISMATCH\n", run_phase);
+        return false;
+    }
     if (attn_graph_reuse && n_chunks < 2) {
         std::fprintf(stderr,
             "[CYCLE_ATTN_GRAPH_CACHE] status=FAIL "
@@ -4359,8 +4445,14 @@ static bool cycle_real_execute_period_fifo(
     std::printf(
         "[CYCLE_CPU_THREADS] threads=%d source=%s status=OK\n",
         cpu_threads, threads_override ? "ENV" : "GGML_DEFAULT");
-    cycle_real_pc_cuda_runtime pc_cuda;
-    if (pc_cuda_full) {
+    cycle_real_pc_cuda_runtime period_pc_cuda;
+    if (pc_cuda_session && !pc_cuda_session->runtime) {
+        pc_cuda_session->runtime =
+            std::make_unique<cycle_real_pc_cuda_runtime>();
+    }
+    cycle_real_pc_cuda_runtime & pc_cuda = pc_cuda_session ?
+        *pc_cuda_session->runtime : period_pc_cuda;
+    if (pc_cuda_full && !pc_cuda.backend) {
         // CUDA is a third COMPUTE backend, but it is NOT added to the
         // physical Meta model-device array (CPU=0, Phone=1).
         const auto cuda_dev = ggml_backend_dev_by_name("CUDA0");
@@ -4402,6 +4494,24 @@ static bool cycle_real_execute_period_fifo(
             "tensor_pc_backend=PC_CPU weight_upload=ONCE_PER_LAYER "
             "status=READY\n",
             ggml_backend_dev_name(cuda_dev), layout.x);
+    } else if (pc_cuda_full && pc_cuda_session) {
+        bool mirrored_weights_valid =
+            pc_cuda.weights.size() >= size_t(layout.x);
+        for (int l = 0; l < layout.x && mirrored_weights_valid; ++l) {
+            mirrored_weights_valid =
+                pc_cuda.weights[size_t(l)] != nullptr;
+        }
+        if (!mirrored_weights_valid) {
+            std::fprintf(stderr,
+                "[CYCLE_PC_CUDA_SESSION] phase=%s status=FAIL "
+                "reason=WEIGHT_MIRROR_NOT_READY\n", run_phase);
+            ggml_backend_free(cpu);
+            return false;
+        }
+        std::printf(
+            "[CYCLE_PC_CUDA_SESSION] phase=%s backend=REUSED "
+            "weight_mirror=REUSED layers=%d status=OK\n",
+            run_phase, layout.x);
     }
     std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> kv;
     kv.reserve(size_t(n_layers));
@@ -4415,7 +4525,34 @@ static bool cycle_real_execute_period_fifo(
     std::vector<graph_cache_snapshot> graph_cache_start(static_cast<size_t>(n_layers));
     for (int l = 0; l < n_layers; ++l) {
         const bool is_phone_graph_layer = attn_graph_reuse && l > layout.x;
+        const bool is_cuda_graph_layer =
+            pc_cuda_attn_graph_reuse && l < layout.x;
         std::unique_ptr<cycle_real_phone_kv_cache> cache;
+        if (is_cuda_graph_layer) {
+            auto & session_kv = pc_cuda_session->kv[size_t(l)];
+            cache = std::move(session_kv);
+            if (cache && (cache->committed_tokens != 0 ||
+                          cache->max_tokens != tokens ||
+                          !cache->keys || !cache->values)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE] phase=%s layer=%d "
+                    "status=FAIL reason=INVALID_SESSION_KV_STATE\n",
+                    run_phase, l);
+                session_kv = std::move(cache);
+                ggml_backend_free(cpu);
+                return false;
+            }
+            auto * gc = pc_cuda_session->attn_graphs[size_t(l)].get();
+            graph_cache_by_layer[size_t(l)] = gc;
+            auto & before = graph_cache_start[size_t(l)];
+            before.hits = gc->hits;
+            before.misses = gc->misses;
+            before.prepares = gc->prepares;
+            before.busy_misses = gc->busy_misses;
+            before.capacity_misses = gc->capacity_misses;
+            before.returned = gc->returned;
+            before.aborted = gc->aborted;
+        }
         if (is_phone_graph_layer) {
             auto & session_kv = phone_full_session->phone_kv[size_t(l)];
             cache = std::move(session_kv);
@@ -4465,11 +4602,17 @@ static bool cycle_real_execute_period_fifo(
     // safely return their leases while the pool still exists.
     std::vector<std::unique_ptr<cycle_real_attention_scratch_pool>>
         attn_scratch(static_cast<size_t>(n_layers));
-    if (attn_scratch_reuse) {
-        for (int l = layout.x + 1; l < n_layers; ++l) {
+    if (attn_scratch_reuse || pc_cuda_attn_graph_reuse) {
+        for (int l = 0; l < n_layers; ++l) {
+            const bool cuda_layer =
+                pc_cuda_attn_graph_reuse && l < layout.x;
+            const bool phone_layer =
+                attn_scratch_reuse && l > layout.x;
+            if (!cuda_layer && !phone_layer) continue;
             attn_scratch[size_t(l)] =
                 std::make_unique<cycle_real_attention_scratch_pool>();
-            attn_scratch[size_t(l)]->configure(phone, window);
+            attn_scratch[size_t(l)]->configure(
+                cuda_layer ? pc_cuda.backend : phone, window);
         }
     }
 
@@ -4655,7 +4798,8 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 0, nullptr, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                weights);
+                                weights, attn_scratch[size_t(l)].get(),
+                                graph_cache_by_layer[size_t(l)]);
                         const auto cuda_attn_done = std::chrono::steady_clock::now();
                         if (ok && cycle_real_env_flag(
                                 "LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") &&
@@ -5456,11 +5600,12 @@ static bool cycle_real_execute_period_fifo(
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
     std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
-    if (attn_scratch_reuse) {
+    if (attn_scratch_reuse || pc_cuda_attn_graph_reuse) {
         for (auto & layer_states : states) {
             for (auto & st : layer_states) st->ready.release_phone_graph();
         }
-        for (int l = layout.x + 1; l < n_layers; ++l) {
+        for (int l = 0; l < n_layers; ++l) {
+            if (!attn_scratch[size_t(l)]) continue;
             auto & pool = *attn_scratch[size_t(l)];
             attn_cached_at_fifo_end[size_t(l)] = pool.idle.size();
             pool.clear();
@@ -5506,7 +5651,23 @@ static bool cycle_real_execute_period_fifo(
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
             kv[size_t(l)]->committed_tokens == tokens);
-        if (attn_graph_reuse && l > layout.x) {
+        if (pc_cuda_attn_graph_reuse && l < layout.x) {
+            auto * gc = graph_cache_by_layer[size_t(l)];
+            const bool ready = succeeded && gc && gc->is_idle() &&
+                kv[size_t(l)]->committed_tokens == tokens;
+            kv_ok = kv_ok && ready;
+            if (ready) {
+                // Cached Graphs borrow these exact physical CUDA KV tensors.
+                // Reset their logical prefix, not their underlying buffers.
+                kv[size_t(l)]->committed_tokens = 0;
+                pc_cuda_session->kv[size_t(l)] =
+                    std::move(kv[size_t(l)]);
+            } else {
+                // Never retain a Graph borrowing failed-period KV.
+                if (gc) gc->clear();
+                kv[size_t(l)]->release();
+            }
+        } else if (attn_graph_reuse && l > layout.x) {
             auto * gc = graph_cache_by_layer[size_t(l)];
             kv_ok = kv_ok && gc && gc->is_idle();
             // Every chunk's K/V has been written and consumed, and all
@@ -5588,6 +5749,31 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
+    if (pc_cuda_attn_graph_reuse) {
+        for (int l = 0; l < layout.x; ++l) {
+            const auto & gc = *graph_cache_by_layer[size_t(l)];
+            const auto & before = graph_cache_start[size_t(l)];
+            const auto & cache = pc_cuda_session->kv[size_t(l)];
+            std::printf(
+                "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE_SUM] phase=%s layer=%d "
+                "hits=%llu misses=%llu prepares=%llu "
+                "busy_misses=%llu capacity_misses=%llu "
+                "returned=%llu aborted=%llu cached_graphs=%zu "
+                "kv_tokens_reset=%lld kv_buffer_persistent=%d "
+                "graph_owner=CUDA_SESSION scratch_owner=PERIOD\n",
+                run_phase, l,
+                (unsigned long long)(gc.hits - before.hits),
+                (unsigned long long)(gc.misses - before.misses),
+                (unsigned long long)(gc.prepares - before.prepares),
+                (unsigned long long)(gc.busy_misses - before.busy_misses),
+                (unsigned long long)(gc.capacity_misses - before.capacity_misses),
+                (unsigned long long)(gc.returned - before.returned),
+                (unsigned long long)(gc.aborted - before.aborted),
+                gc.entries.size(),
+                (long long)(cache ? cache->committed_tokens : -1),
+                cache && cache->buffer ? 1 : 0);
+        }
+    }
     if (attn_graph_reuse) {
         for (int l = layout.x + 1; l < n_layers; ++l) {
             const auto & gc = *graph_cache_by_layer[size_t(l)];
@@ -5611,6 +5797,27 @@ static bool cycle_real_execute_period_fifo(
                 (unsigned long long)(gc.aborted - before.aborted),
                 gc.entries.size(), (long long)cache.committed_tokens,
                 cache.buffer != nullptr ? 1 : 0);
+        }
+    }
+    if (pc_cuda_attn_graph_reuse) {
+        for (int l = 0; l < layout.x; ++l) {
+            const auto & pool = *attn_scratch[size_t(l)];
+            std::printf(
+                "[CYCLE_PC_CUDA_ATTN_SCRATCH_POOL_SUM] phase=%s layer=%d "
+                "max_slots=%zu peak_slots=%zu allocs=%llu hits=%llu "
+                "fallbacks=%llu returned=%llu bind_failures=%llu "
+                "active=%zu cached_at_fifo_end=%zu "
+                "buffer_alloc_ms=%.3f graph_bind_ms=%.3f "
+                "buffer_free_ms=%.3f\n",
+                run_phase, l, pool.max_slots, pool.peak_slots,
+                (unsigned long long)pool.allocations,
+                (unsigned long long)pool.hits,
+                (unsigned long long)pool.fallbacks,
+                (unsigned long long)pool.recycled,
+                (unsigned long long)pool.bind_failures,
+                pool.active.size(), attn_cached_at_fifo_end[size_t(l)],
+                pool.buffer_alloc_ms, pool.graph_bind_ms,
+                pool.buffer_free_ms);
         }
     }
     if (attn_scratch_reuse) {
@@ -6773,6 +6980,9 @@ int main(int argc, char ** argv) {
             }
             const bool phone_full_session_reuse = cycle_real_env_flag(
                 "LLAMA_HYBRID_CYCLE_PHONE_FULL_SESSION_REUSE");
+            const bool pc_cuda_attn_graph_cache_enabled =
+                cycle_real_env_flag(
+                    "LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN_GRAPH_CACHE");
             const bool attn_graph_cache_enabled = cycle_real_env_flag(
                 "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
             if (attn_graph_cache_enabled &&
@@ -6793,6 +7003,31 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             cycle_real_phone_full_session_pool full_session;
+            cycle_real_pc_cuda_session_pool pc_cuda_session;
+            if (pc_cuda_attn_graph_cache_enabled) {
+                if (!cycle_real_env_flag(
+                        "LLAMA_HYBRID_CYCLE_PC_CUDA_FULL") ||
+                    (int(ntokens) + chunk_tokens - 1) / chunk_tokens < 2) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE] status=FAIL "
+                        "reason=REQUIRES_PC_CUDA_FULL_AND_MULTICHUNK\n");
+                    ggml_backend_free(phone);
+                    return 1;
+                }
+                const int effective_window = std::min(
+                    max_inflight, (int(ntokens) + chunk_tokens - 1) / chunk_tokens);
+                pc_cuda_session.configure(
+                    *model, expected_layout, ntokens,
+                    chunk_tokens, effective_window);
+                std::printf(
+                    "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE_PLAN] enabled=1 "
+                    "layers=[0,%d] graph_owner=CUDA_SESSION "
+                    "backend_weight_kv=SESSION_PERSISTENT "
+                    "kv_tokens=RESET_EACH_PERIOD "
+                    "scratch_owner=PERIOD_POOL "
+                    "graph_key=QUERY_TOKENS_KV_TOKENS\n",
+                    expected_layout.x - 1);
+            }
             if (phone_full_session_reuse) {
                 const int effective_window = std::min(
                     max_inflight, (int(ntokens) + chunk_tokens - 1) / chunk_tokens);
@@ -6832,8 +7067,12 @@ int main(int argc, char ** argv) {
                 "pc_wall_includes=FIFO_AND_RELEASE "
                 "phone_server_sums=SESSION_CUMULATIVE_USE_DELTA\n",
                 warmup_runs != 0 ? 1 : 0, warmup_runs,
-                attn_graph_cache_enabled ? "PHONE_PERSISTENT_PC_PERIOD" :
-                    "PERIOD",
+                pc_cuda_attn_graph_cache_enabled ?
+                    (attn_graph_cache_enabled ?
+                        "PHONE_AND_PC_CUDA_PERSISTENT" :
+                        "PC_CUDA_PERSISTENT_PHONE_PERIOD") :
+                    (attn_graph_cache_enabled ?
+                        "PHONE_PERSISTENT_PC_PERIOD" : "PERIOD"),
                 phone_full_session_reuse ? "SESSION" : "PERIOD");
             const auto session_run_begin = std::chrono::steady_clock::now();
             double session_run_call_sum_ms = 0.0;
@@ -6852,7 +7091,9 @@ int main(int argc, char ** argv) {
                     embeddings, cpu_reference_output, checkpoints,
                     ntokens, chunk_tokens, max_inflight,
                     is_warmup, epoch,
-                    phone_full_session_reuse ? &full_session : nullptr);
+                    phone_full_session_reuse ? &full_session : nullptr,
+                    pc_cuda_attn_graph_cache_enabled ?
+                        &pc_cuda_session : nullptr);
                 const double run_full_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - run_start).count();
@@ -6866,6 +7107,22 @@ int main(int argc, char ** argv) {
                     phase, epoch, run_full_ms, ok ? "OK" : "FAIL");
                 std::fflush(stdout);
                 if (!ok) break;
+            }
+            if (pc_cuda_attn_graph_cache_enabled) {
+                const size_t graphs_before_release =
+                    pc_cuda_session.cached_attention_graphs();
+                const auto release_begin = std::chrono::steady_clock::now();
+                pc_cuda_session.clear();
+                const double release_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        release_begin).count();
+                std::printf(
+                    "[CYCLE_PC_CUDA_ATTN_GRAPH_CACHE_TEARDOWN] "
+                    "graphs_released=%zu release_ms=%.3f "
+                    "includes=GRAPH_KV_WEIGHT_AND_BACKEND_FREE "
+                    "status=OK\n",
+                    graphs_before_release, release_ms);
             }
             if (phone_full_session_reuse) {
                 const size_t cached_before_release = full_session.cached_slots();
