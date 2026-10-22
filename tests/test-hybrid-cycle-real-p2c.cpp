@@ -683,7 +683,7 @@ struct cycle_real_pc_cuda_attention_weights {
                 !ggml_is_contiguous(physical[i])) {
                 std::fprintf(stderr,
                     "[CYCLE_PC_CUDA_WEIGHT] layer=%d slot=%zu "
-                    "status=FAIL reason=PC_PHYSICAL_WEIGHT_UNAVAILABLE\\n",
+                    "status=FAIL reason=PC_PHYSICAL_WEIGHT_UNAVAILABLE\n",
                     layer_index, i);
                 return false;
             }
@@ -718,7 +718,7 @@ struct cycle_real_pc_cuda_attention_weights {
         ggml_backend_synchronize(cuda);
         std::printf(
             "[CYCLE_PC_CUDA_WEIGHT] layer=%d weights=%zu upload_mib=%.3f "
-            "owner=PC_CUDA lifetime=PERIOD status=READY\\n",
+            "owner=PC_CUDA lifetime=PERIOD status=READY\n",
             layer_index, size_t(COUNT),
             double(upload_bytes) / (1024.0 * 1024.0));
         return true;
@@ -4011,7 +4011,7 @@ static bool cycle_real_execute_period_fifo(
             !(pc_cuda.backend = ggml_backend_dev_init(cuda_dev, nullptr))) {
             std::fprintf(stderr,
                 "[CYCLE_PC_CUDA_PLAN] status=FAIL reason=CUDA0_UNAVAILABLE "
-                "hint=BUILD_WITH_GGML_CUDA\\n");
+                "hint=BUILD_WITH_GGML_CUDA\n");
             ggml_backend_free(cpu);
             return false;
         }
@@ -4023,7 +4023,7 @@ static bool cycle_real_execute_period_fifo(
                     pc_cuda.backend, cpu, model.layers[size_t(l)], l)) {
                 std::fprintf(stderr,
                     "[CYCLE_PC_CUDA_PLAN] layer=%d status=FAIL "
-                    "reason=ATTN_WEIGHT_UPLOAD\\n", l);
+                    "reason=ATTN_WEIGHT_UPLOAD\n", l);
                 ggml_backend_free(cpu);
                 return false;
             }
@@ -4033,7 +4033,7 @@ static bool cycle_real_execute_period_fifo(
             "[CYCLE_PC_CUDA_PLAN] enabled=1 device=%s "
             "layers=%d attn_queue=PC_CUDA ffn_queue=PC_CPU "
             "reduce_queue=PC_CPU weight_upload=ONCE_PER_LAYER "
-            "status=READY\\n",
+            "status=READY\n",
             ggml_backend_dev_name(cuda_dev), layout.x);
     }
     std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> kv;
@@ -4888,7 +4888,7 @@ static bool cycle_real_execute_period_fifo(
     std::printf(
         "[CYCLE_PC_CUDA_SUM] enabled=%d pc_full_layers=%d "
         "attention=PC_CUDA ffn=PC_CPU reduce=PC_CPU "
-        "kv_owner=%s status=%s\\n",
+        "kv_owner=%s status=%s\n",
         pc_cuda_attn ? 1 : 0, layout.x,
         pc_cuda_attn ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
