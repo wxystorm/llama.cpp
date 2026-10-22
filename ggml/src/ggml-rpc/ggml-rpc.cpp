@@ -9524,6 +9524,16 @@ bool rpc_server::apply_inference_cycle(
         source[0] = msg.partial.partial.data();
     }
 
+    // C2P APPLY first waits for its HOST frame. Do not hold the Phone GPU
+    // worker gate during that wait: the P2C worker can have ready work.
+    // Lock only while uploading GPU inputs and synchronizing their use.
+    std::unique_lock<std::mutex> cycle_p2c_apply_gpu_guard;
+    if (const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1")) {
+        if (std::strcmp(v1, "1") == 0) {
+            cycle_p2c_apply_gpu_guard =
+                std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
+        }
+    }
     const size_t count = ready ? 4 : 1;
     for (size_t i = 0; i < count; ++i) {
         const rpc_tensor & dst = request.tensors[i];
@@ -9573,6 +9583,9 @@ bool rpc_server::apply_inference_cycle(
         }
     }
     const int64_t gpu_input_ready_us = ggml_time_us();
+    if (cycle_p2c_apply_gpu_guard.owns_lock()) {
+        cycle_p2c_apply_gpu_guard.unlock();
+    }
     // READY ACK means Phone GPU inputs can be consumed. PARTIAL needs the
     // subsequent GPU Reduce before ACK may be sent to the PC sender.
     if (ready) {
@@ -13308,6 +13321,7 @@ static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
         case RPC_CMD_INFERENCE_DATA_PLANE_OPEN:
         case RPC_CMD_INFERENCE_CYCLE_P2C_ARM:
         case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT:
+        case RPC_CMD_INFERENCE_CYCLE_APPLY: // waits HOST RX; locks GPU internally
         case RPC_CMD_HELLO:
         case RPC_CMD_DEVICE_COUNT:
         case RPC_CMD_GET_ALIGNMENT:
