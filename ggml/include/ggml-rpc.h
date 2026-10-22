@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    26
+#define RPC_PROTO_PATCH_VERSION    27
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -353,6 +353,28 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_send_ack(
 
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_tx_idle(
         ggml_backend_t backend, int timeout_ms);
+
+// Protocol 27 (opt-in P2C local FFN chain):
+// Register a graph WITHOUT executing it, then arm one P2C chunk while the
+// Attention READY tensors are device-resident. Once SEND_READY has staged
+// its own independent TX payload, the Phone RPC server copies Norm/TopK
+// locally, executes the registered FFN graph, and stages SEND_PARTIAL.
+// The client waits for completion only when returning the Attention scratch
+// lease; the PC CPU may compute its FFN in parallel after READY arrives.
+// No phone->PC->phone activation loop, no new tensor copies over control RPC.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_register_graph(
+        ggml_backend_t backend, const struct ggml_cgraph * graph);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_arm_p2c_ffn(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id, uint64_t ffn_graph_uid,
+        const ggml_tensor * source_norm, const ggml_tensor * source_ids,
+        const ggml_tensor * source_weights,
+        const ggml_tensor * ffn_norm, const ggml_tensor * ffn_ids,
+        const ggml_tensor * ffn_weights,
+        const ggml_tensor * ffn_partial);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_p2c_ffn(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
 
 // Protocol 26: REAL C2P data-plane frames travel PC -> Phone exactly once.
 // APPLY consumes the Phone server's already-received READY/PARTIAL and writes
