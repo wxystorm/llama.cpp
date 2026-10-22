@@ -13615,7 +13615,35 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor_graph_compute(input)) {
+                uint64_t graph_uid = 0;
+                uint32_t graph_device = 0;
+                if (cycle_order_trace &&
+                    input.size() >= sizeof(rpc_msg_set_tensor_graph_req_v6)) {
+                    // Match the server's v6/v7 header validation; interpreting
+                    // the first payload bytes as v7 metadata is not safe.
+                    rpc_msg_set_tensor_graph_req_v6 head {};
+                    memcpy(&head, input.data(), sizeof(head));
+                    const size_t n = static_cast<size_t>(head.size);
+                    const size_t graph_n = static_cast<size_t>(head.graph_size);
+                    const bool is_v6 = n <= SIZE_MAX - sizeof(head) &&
+                        graph_n <= SIZE_MAX - sizeof(head) - n &&
+                        input.size() == sizeof(head) + n + graph_n;
+                    if (!is_v6 &&
+                        input.size() >= sizeof(rpc_msg_set_tensor_graph_req)) {
+                        rpc_msg_set_tensor_graph_req full {};
+                        memcpy(&full, input.data(), sizeof(full));
+                        graph_uid = full.graph_uid;
+                        graph_device = full.device;
+                    }
+                }
+                const int64_t begin_us = cycle_graph_begin(
+                    "SET_TENSOR_GRAPH_COMPUTE", graph_uid, graph_device,
+                    cycle_command_arrival_us);
+                const bool ok = server.set_tensor_graph_compute(input);
+                cycle_graph_end(
+                    "SET_TENSOR_GRAPH_COMPUTE", graph_uid, graph_device,
+                    begin_us, ok);
+                if (!ok) {
                     return;
                 }
                 break;
@@ -13945,10 +13973,32 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t handler_begin_us =
+                    cycle_order_trace ? ggml_time_us() : 0;
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.apply_inference_cycle(request) ? 1 : 0;
+                const int64_t handler_done_us =
+                    cycle_order_trace ? ggml_time_us() : 0;
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
+                }
+                if (cycle_order_trace) {
+                    GGML_LOG_INFO(
+                        "[CYCLE_RPC_CONTROL_ORDER] side=PHONE "
+                        "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+                        "cmd=APPLY kind=%s layer=%d chunk=%d "
+                        "seq=%" PRIu64 " last_graph_uid=%" PRIu64 " "
+                        "request_read_ms=%.3f handler_ms=%.3f "
+                        "response_write_ms=%.3f result=%u\n",
+                        cycle_connection_id, cycle_command_seq,
+                        request.kind == INFERENCE_CYCLE_READY ?
+                            "READY" : "PARTIAL",
+                        request.layer, request.chunk, request.seq,
+                        cycle_last_graph_uid,
+                        (handler_begin_us - cycle_command_arrival_us) / 1000.0,
+                        (handler_done_us - handler_begin_us) / 1000.0,
+                        (ggml_time_us() - handler_done_us) / 1000.0,
+                        response.result);
                 }
                 break;
             }
@@ -13957,10 +14007,30 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const int64_t handler_begin_us =
+                    cycle_order_trace ? ggml_time_us() : 0;
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.finish_inference_cycle(request) ? 1 : 0;
+                const int64_t handler_done_us =
+                    cycle_order_trace ? ggml_time_us() : 0;
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
+                }
+                if (cycle_order_trace) {
+                    GGML_LOG_INFO(
+                        "[CYCLE_RPC_CONTROL_ORDER] side=PHONE "
+                        "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+                        "cmd=FINISH kind=PARTIAL layer=%d chunk=%d "
+                        "seq=%" PRIu64 " last_graph_uid=%" PRIu64 " "
+                        "request_read_ms=%.3f handler_ms=%.3f "
+                        "response_write_ms=%.3f result=%u\n",
+                        cycle_connection_id, cycle_command_seq,
+                        request.layer, request.chunk, request.seq,
+                        cycle_last_graph_uid,
+                        (handler_begin_us - cycle_command_arrival_us) / 1000.0,
+                        (handler_done_us - handler_begin_us) / 1000.0,
+                        (ggml_time_us() - handler_done_us) / 1000.0,
+                        response.result);
                 }
                 break;
             }
