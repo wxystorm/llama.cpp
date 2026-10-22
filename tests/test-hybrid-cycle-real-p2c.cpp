@@ -3168,11 +3168,13 @@ struct cycle_real_c2p_phone_chunk {
             output->flags |= GGML_TENSOR_FLAG_COMPUTE;
             ggml_graph_add_node(reduce_graph, output);
         }
+        const uint64_t phone_full_graph_uid = rpc_full_replay ?
+            cycle_real_phone_graph_replay_uid() : 0;
         if (rpc_full_replay) {
             // Replayed graph references exactly these persistent FFN,
             // residual and output buffers. A freed graph must NEVER reuse
             // its UID; only this object's subsequent Chunk may replay it.
-            ggml_graph_set_uid(ffn_graph, cycle_real_phone_graph_replay_uid());
+            ggml_graph_set_uid(ffn_graph, phone_full_graph_uid);
             if (reduce_graph) {
                 ggml_graph_set_uid(reduce_graph, cycle_real_phone_graph_replay_uid());
             }
@@ -3198,7 +3200,7 @@ struct cycle_real_c2p_phone_chunk {
                 release();
                 return false;
             }
-            registered_full_graph_uid = ffn_graph->uid;
+            registered_full_graph_uid = phone_full_graph_uid;
         }
         const auto alloc_end = std::chrono::steady_clock::now();
         graph_build_ms = std::chrono::duration<double, std::milli>(
@@ -3654,9 +3656,11 @@ struct cycle_real_p2c_ffn_slot {
         ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(graph, inputs.ffn_output);
+        const uint64_t phone_local_graph_uid = phone_local_chain ?
+            cycle_real_phone_graph_replay_uid() : 0;
         if (phone_local_chain) {
             // A fresh UID owns precisely this retained Graph/Buffer Slot.
-            ggml_graph_set_uid(graph, cycle_real_phone_graph_replay_uid());
+            ggml_graph_set_uid(graph, phone_local_graph_uid);
         }
         const auto build_end = std::chrono::steady_clock::now();
         const bool ok = executor.prepare(
@@ -3675,7 +3679,7 @@ struct cycle_real_p2c_ffn_slot {
                 release();
                 return false;
             }
-            registered_graph_uid = graph->uid;
+            registered_graph_uid = phone_local_graph_uid;
         }
         prepared_tokens = tokens;
         return true;
