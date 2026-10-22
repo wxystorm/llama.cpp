@@ -5729,6 +5729,22 @@ static bool rpc_flush_pending_fused_input(
     return send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
 }
 
+// Client-side one-way Graph submission timing. The synchronous GPU work
+// happens later, when the Phone server processes the command. Graph UID
+// allows correlation with CYCLE_RPC_GRAPH_ORDER on the same compute socket.
+static void rpc_cycle_client_trace_graph_submit(
+        const char * command, uint64_t graph_uid,
+        int nodes, int64_t send_begin_us, bool status) {
+    if (send_begin_us == 0) return;
+    GGML_LOG_INFO(
+        "[CYCLE_RPC_GRAPH_SEND] side=PC cmd=%s graph_uid=%" PRIu64
+        " nodes=%d send_call_ms=%.3f status=%s "
+        "semantics=ONE_WAY_SOCKET_SUBMIT_NOT_SERVER_EXECUTE\n",
+        command, graph_uid, nodes,
+        (ggml_time_us() - send_begin_us) / 1000.0,
+        status ? "OK" : "FAIL");
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
@@ -5736,6 +5752,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
+    const bool graph_order_trace =
+        std::getenv("LLAMA_HYBRID_CYCLE_RPC_ORDER_TIMING") != nullptr;
     const bool cacheable = cgraph->uid != 0;
     bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     //新的
@@ -5801,9 +5819,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             memcpy(fused_input.packet.data() + FUSED_REQ_OFFSET, &request, sizeof(request));
 
             auto sock = get_socket(rpc_ctx->endpoint);
+            const int64_t send_begin_us =
+                graph_order_trace ? ggml_time_us() : 0;
             const bool status = sock->send_data(
                 fused_input.packet.data(),
                 fused_input.packet.size());
+            rpc_cycle_client_trace_graph_submit(
+                "SET_TENSOR_RECOMPUTE_SNAPSHOT", graph_uid,
+                cgraph->n_nodes, send_begin_us, status);
             RPC_STATUS_ASSERT(status);
             rpc_fence_diag_record_graph(
                 rpc_ctx, graph_uid, cgraph,
@@ -5830,10 +5853,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             request.size = graph_snapshot.size;
 
             auto sock = get_socket(rpc_ctx->endpoint);
+            const int64_t send_begin_us =
+                graph_order_trace ? ggml_time_us() : 0;
             const bool status = send_rpc_cmd_compact_small(
                 sock,
                 RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
                 request);
+            rpc_cycle_client_trace_graph_submit(
+                "GRAPH_RECOMPUTE_SNAPSHOT", graph_uid,
+                cgraph->n_nodes, send_begin_us, status);
             RPC_STATUS_ASSERT(status);
             rpc_fence_diag_record_graph(
                 rpc_ctx, graph_uid, cgraph,
@@ -5851,10 +5879,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
+        const int64_t send_begin_us =
+            graph_order_trace ? ggml_time_us() : 0;
         bool status = send_rpc_cmd_compact_small(
             sock,
             RPC_CMD_GRAPH_RECOMPUTE,
             request);
+        rpc_cycle_client_trace_graph_submit(
+            "GRAPH_RECOMPUTE", graph_uid,
+            cgraph->n_nodes, send_begin_us, status);
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
@@ -5884,7 +5917,12 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
+        const int64_t send_begin_us =
+            graph_order_trace ? ggml_time_us() : 0;
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        rpc_cycle_client_trace_graph_submit(
+            "GRAPH_COMPUTE", graph_uid,
+            cgraph->n_nodes, send_begin_us, status);
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
