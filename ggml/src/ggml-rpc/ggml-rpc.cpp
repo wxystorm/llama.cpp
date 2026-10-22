@@ -13735,18 +13735,67 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             case RPC_CMD_SYNCHRONIZE: {
                 const bool trace =
                     std::getenv("GGML_CYCLE_RPC_CONTROL_TIMING") != nullptr;
-                const int64_t receive_begin_us = trace ? ggml_time_us() : 0;
+                const int64_t receive_begin_us =
+                    (trace || cycle_order_trace) ? ggml_time_us() : 0;
                 rpc_msg_synchronize_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                const int64_t receive_done_us = trace ? ggml_time_us() : 0;
+                const int64_t receive_done_us =
+                    (trace || cycle_order_trace) ? ggml_time_us() : 0;
+                if (cycle_order_trace) {
+                    const uint64_t intervening =
+                        cycle_last_graph_cmd_seq != 0 &&
+                        cycle_command_seq > cycle_last_graph_cmd_seq ?
+                            cycle_command_seq - cycle_last_graph_cmd_seq - 1 : 0;
+                    const double since_last_graph_ms =
+                        cycle_last_graph_end_us != 0 ?
+                            (receive_done_us - cycle_last_graph_end_us) /
+                                1000.0 : -1.0;
+                    GGML_LOG_INFO(
+                        "[CYCLE_RPC_FENCE_ORDER] event=BEGIN side=PHONE "
+                        "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+                        "device=%u last_graph_uid=%" PRIu64 " "
+                        "last_graph_device=%u last_graph_cmd=%s "
+                        "last_graph_command_seq=%" PRIu64 " "
+                        "intervening_commands=%" PRIu64 " "
+                        "graphs_since_fence=%u "
+                        "graph_handler_since_fence_ms=%.3f "
+                        "since_last_graph_done_ms=%.3f "
+                        "request_read_ms=%.3f "
+                        "scope=SEQUENTIAL_CONTROL_SOCKET\n",
+                        cycle_connection_id, cycle_command_seq,
+                        request.device, cycle_last_graph_uid,
+                        cycle_last_graph_device, cycle_last_graph_kind,
+                        cycle_last_graph_cmd_seq, intervening,
+                        cycle_graphs_since_fence,
+                        cycle_graph_exec_since_fence_ms, since_last_graph_ms,
+                        (receive_done_us - cycle_command_arrival_us) / 1000.0);
+                }
                 if (!server.synchronize(request.device)) {
                     return;
                 }
-                const int64_t sync_done_us = trace ? ggml_time_us() : 0;
+                const int64_t sync_done_us =
+                    (trace || cycle_order_trace) ? ggml_time_us() : 0;
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
+                }
+                const int64_t reply_done_us =
+                    (trace || cycle_order_trace) ? ggml_time_us() : 0;
+                if (cycle_order_trace) {
+                    GGML_LOG_INFO(
+                        "[CYCLE_RPC_FENCE_ORDER] event=END side=PHONE "
+                        "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+                        "device=%u sync_handler_ms=%.3f "
+                        "response_write_ms=%.3f total_dispatch_ms=%.3f "
+                        "scope=FENCE_SERVER_HANDLER_NOT_PREVIOUS_GRAPH\n",
+                        cycle_connection_id, cycle_command_seq,
+                        request.device,
+                        (sync_done_us - receive_done_us) / 1000.0,
+                        (reply_done_us - sync_done_us) / 1000.0,
+                        (reply_done_us - cycle_command_arrival_us) / 1000.0);
+                    cycle_graphs_since_fence = 0;
+                    cycle_graph_exec_since_fence_ms = 0.0;
                 }
                 if (trace) {
                     GGML_LOG_INFO(
@@ -13757,8 +13806,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                         request.device,
                         (receive_done_us - receive_begin_us) / 1000.0,
                         (sync_done_us - receive_done_us) / 1000.0,
-                        (ggml_time_us() - sync_done_us) / 1000.0,
-                        (ggml_time_us() - receive_begin_us) / 1000.0);
+                        (reply_done_us - sync_done_us) / 1000.0,
+                        (reply_done_us - receive_begin_us) / 1000.0);
                 }
                 break;
             }
@@ -13787,7 +13836,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                if (!server.graph_recompute_snapshot(request)) {
+                const int64_t begin_us = cycle_graph_begin(
+                    "GRAPH_RECOMPUTE_SNAPSHOT", request.graph_uid,
+                    request.device, cycle_command_arrival_us);
+                const bool ok = server.graph_recompute_snapshot(request);
+                cycle_graph_end(
+                    "GRAPH_RECOMPUTE_SNAPSHOT", request.graph_uid,
+                    request.device, begin_us, ok);
+                if (!ok) {
                     return;
                 }
                 break;
@@ -13797,7 +13853,22 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor_recompute_snapshot(input)) {
+                rpc_msg_set_tensor_recompute_snapshot_req trace_request {};
+                if (cycle_order_trace &&
+                    input.size() >= sizeof(trace_request)) {
+                    memcpy(&trace_request, input.data(), sizeof(trace_request));
+                }
+                const int64_t begin_us = cycle_graph_begin(
+                    "SET_TENSOR_RECOMPUTE_SNAPSHOT",
+                    trace_request.graph.graph_uid,
+                    trace_request.graph.device,
+                    cycle_command_arrival_us);
+                const bool ok = server.set_tensor_recompute_snapshot(input);
+                cycle_graph_end(
+                    "SET_TENSOR_RECOMPUTE_SNAPSHOT",
+                    trace_request.graph.graph_uid,
+                    trace_request.graph.device, begin_us, ok);
+                if (!ok) {
                     return;
                 }
                 break;
