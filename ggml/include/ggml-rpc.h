@@ -66,6 +66,11 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_FENCE_PROC \
     "ggml_backend_rpc_fence"
 
+// Optional diagnostic entry point: same RPC fence and device-wide safety
+// semantics, but reports PC-client wait/IO subphases. No wire protocol change.
+#define GGML_BACKEND_RPC_FENCE_PROFILED_PROC \
+    "ggml_backend_rpc_fence_profiled"
+
 #define GGML_BACKEND_RPC_SNAPSHOT_ARM_PROC \
     "ggml_backend_rpc_snapshot_arm"
 
@@ -268,6 +273,22 @@ using ggml_backend_rpc_get_route_snapshot_t = bool (*)(
         ggml_tensor * dst2);
 
 using ggml_backend_rpc_fence_t = void (*)(ggml_backend_t backend);
+
+// All measurements are client-side monotonic elapsed milliseconds.
+// socket_lock_wait_ms may include blocking behind another RPC on the
+// shared COMPUTE socket. response_header_wait_ms may include server queue,
+// backend synchronize and network RTT; it is NOT GPU-kernel time.
+struct ggml_backend_rpc_fence_timing {
+    double socket_lock_wait_ms = 0.0;
+    double request_send_ms = 0.0;
+    double response_header_wait_ms = 0.0;
+    double response_body_wait_ms = 0.0;
+    double total_ms = 0.0;
+};
+
+using ggml_backend_rpc_fence_profiled_t = void (*)(
+        ggml_backend_t backend,
+        ggml_backend_rpc_fence_timing * timing);
 
 using ggml_backend_rpc_snapshot_arm_t = bool (*)(
         ggml_backend_t backend,
