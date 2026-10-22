@@ -7020,6 +7020,9 @@ rpc_phone_npu_find_ffn_stages(
 
 class rpc_server {
 public:
+    // Shared GPU/Graph/Buffer gate for the opt-in Phone P2C FIFO worker.
+    std::mutex & cycle_p2c_gpu_gate() { return cycle_p2c_gpu_gate_; }
+
     rpc_server(
             std::vector<ggml_backend_t> all_backends,
             const char * cache_dir,
@@ -7617,6 +7620,7 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+    std::mutex cycle_p2c_gpu_gate_;
 
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
@@ -13133,6 +13137,194 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 */
 
+/*
+ * Opt-in independent Phone GPU FFN FIFO. The COMPUTE RPC handler owns ARM
+ * descriptors and enqueues ONLY after READY has been staged to the TX lane.
+ * The worker owns COPY -> graph REPLAY -> PARTIAL TX staging. The registered
+ * graph and buffers remain in the shared rpc_server; completion is returned
+ * to the existing P2C_WAIT before their PC-side owner may recycle them.
+ */
+struct rpc_cycle_p2c_fifo_v1 {
+    using key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
+    struct job {
+        key id {};
+        rpc_msg_inference_cycle_p2c_arm_req plan {};
+        int64_t enqueue_us = 0;
+    };
+    rpc_server & server;
+    bool enabled;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<job> jobs;
+    std::set<key> pending;
+    std::map<key, bool> completed;
+    bool stopping = false;
+    std::thread worker;
+    uint64_t jobs_started = 0, jobs_finished = 0;
+
+    rpc_cycle_p2c_fifo_v1(rpc_server & s, bool on) : server(s), enabled(on) {}
+    ~rpc_cycle_p2c_fifo_v1() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join(); // no borrowed graph outlives us
+        if (jobs_started) {
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=STOP "
+                "enqueued=%" PRIu64 " completed=%" PRIu64 "\n",
+                jobs_started, jobs_finished);
+        }
+    }
+
+    bool can_arm(const key & k) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return !stopping && pending.size() + completed.size() < 64 &&
+            !pending.count(k) && !completed.count(k);
+    }
+    bool enqueue(const key & k,
+                 const rpc_msg_inference_cycle_p2c_arm_req & plan) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!enabled || stopping || jobs.size() >= 32 ||
+            pending.size() + completed.size() >= 64 ||
+            pending.count(k) || completed.count(k)) return false;
+        if (!worker.joinable()) {
+            try {
+                worker = std::thread([this] { run(); });
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=START "
+                    "mode=GPU_FIFO worker=DEDICATED graph_reuse=UNCHANGED\n");
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR(
+                    "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=START "
+                    "status=FAIL what=%s\n", e.what());
+                return false;
+            }
+        }
+        jobs.push_back(job {k, plan, ggml_time_us()});
+        pending.insert(k);
+        ++jobs_started;
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=ENQUEUE "
+            "layer=%d chunk=%d seq=%" PRIu64 " depth=%zu\n",
+            std::get<0>(k), std::get<1>(k), std::get<2>(k), jobs.size());
+        cv.notify_one();
+        return true;
+    }
+    bool wait(const key & k) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool ready = cv.wait_for(
+            lock, std::chrono::seconds(30), [&] {
+                return completed.count(k) ||
+                    (stopping && !pending.count(k));
+            });
+        auto done = completed.find(k);
+        if (!ready || done == completed.end()) {
+            GGML_LOG_ERROR(
+                "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=WAIT "
+                "layer=%d chunk=%d seq=%" PRIu64
+                " status=FAIL reason=NO_COMPLETION\n",
+                std::get<0>(k), std::get<1>(k), std::get<2>(k));
+            return false;
+        }
+        bool ok = done->second;
+        completed.erase(done);
+        return ok;
+    }
+    void run() {
+        while (true) {
+            job item {};
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return stopping || !jobs.empty(); });
+                if (jobs.empty()) {
+                    if (stopping) return;
+                    continue;
+                }
+                item = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            const int64_t t0 = ggml_time_us();
+            int64_t t1 = t0, t2 = t0, t3 = t0;
+            bool ok = true;
+            try {
+                // The WAIT handler never owns this mutex. Other GPU RPCs
+                // serialize here to protect graph_map and borrowed buffers.
+                std::lock_guard<std::mutex> gpu(server.cycle_p2c_gpu_gate());
+                for (int i = 0; i < 3 && ok; ++i) {
+                    rpc_msg_copy_tensor_req req {};
+                    req.src = item.plan.ready_inputs[i];
+                    req.dst = item.plan.ffn_inputs[i];
+                    rpc_msg_copy_tensor_rsp rsp {};
+                    ok = server.copy_tensor(req, rsp) && rsp.result != 0;
+                }
+                t1 = ggml_time_us();
+                if (ok) {
+                    rpc_msg_graph_recompute_req req {};
+                    req.device = item.plan.partial.device;
+                    req.graph_uid = item.plan.ffn_graph_uid;
+                    ok = server.graph_recompute(req);
+                }
+                t2 = ggml_time_us();
+                if (ok) ok = server.send_inference_cycle(item.plan.partial);
+                t3 = ggml_time_us();
+            } catch (const std::exception & e) {
+                ok = false; t3 = ggml_time_us();
+                GGML_LOG_ERROR(
+                    "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=EXCEPTION "
+                    "seq=%" PRIu64 " what=%s\n", std::get<2>(item.id), e.what());
+            } catch (...) {
+                ok = false; t3 = ggml_time_us();
+                GGML_LOG_ERROR(
+                    "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=EXCEPTION "
+                    "seq=%" PRIu64 " what=UNKNOWN\n", std::get<2>(item.id));
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pending.erase(item.id);
+                completed.emplace(item.id, ok);
+                ++jobs_finished;
+            }
+            cv.notify_all();
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=DONE "
+                "layer=%d chunk=%d seq=%" PRIu64 " uid=%" PRIu64
+                " queue_wait_ms=%.3f copy_ms=%.3f ffn_ms=%.3f "
+                "partial_stage_ms=%.3f status=%s\n",
+                std::get<0>(item.id), std::get<1>(item.id),
+                std::get<2>(item.id), item.plan.ffn_graph_uid,
+                (t0 - item.enqueue_us) / 1000.0,
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                (t3 - t2) / 1000.0, ok ? "OK" : "FAIL");
+        }
+    }
+};
+
+// Data-plane receive and the completion wait must never hold the GPU gate.
+static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_INFERENCE_DATA_PLANE_OPEN:
+        case RPC_CMD_INFERENCE_CYCLE_P2C_ARM:
+        case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT:
+        case RPC_CMD_HELLO:
+        case RPC_CMD_DEVICE_COUNT:
+        case RPC_CMD_GET_ALIGNMENT:
+        case RPC_CMD_GET_MAX_SIZE:
+        case RPC_CMD_GET_DEVICE_MEMORY:
+        case RPC_CMD_GET_ALLOC_SIZE:
+        case RPC_CMD_BUFFER_GET_BASE:
+        case RPC_CMD_RETURN_BULK_ACQUIRE:
+        case RPC_CMD_INFERENCE_RETURN_BIND:
+        case RPC_CMD_INFERENCE_ROUTE_ARM:
+        case RPC_CMD_ROUTE_MARK_READY:
+        case RPC_CMD_PHONE_FFN_MARK_READY:
+            return false;
+        default:
+            return true;
+    }
+}
+
 static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr sock, size_t device_count) {
     rpc_server & server = *server_ptr;
     uint8_t cmd;
@@ -13188,7 +13380,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
         return p2c_task_key {layer, chunk, seq, graph_id};
     };
     std::map<p2c_task_key, rpc_msg_inference_cycle_p2c_arm_req> p2c_armed;
-    std::map<p2c_task_key, bool> p2c_completed;
+    std::map<p2c_task_key, bool> p2c_completed; // Original inline path.
+    const char * cycle_p2c_v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1");
+    rpc_cycle_p2c_fifo_v1 executor(
+        server, cycle_p2c_v1 && std::strcmp(cycle_p2c_v1, "1") == 0);
 
     // Diagnostic-only per-COMPUTE-connection order. The command sequence is
     // assigned when the server receives each command byte, including commands
@@ -13275,6 +13470,13 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
         if (cycle_order_trace) ++cycle_command_seq;
         const int64_t cycle_command_arrival_us =
             cycle_order_trace ? ggml_time_us() : 0;
+        // Non-wait control commands share the backend lane with Phone V1.
+        std::unique_lock<std::mutex> cycle_gpu_guard;
+        if (executor.enabled &&
+            rpc_cycle_p2c_v1_gpu_command(static_cast<rpc_cmd>(cmd))) {
+            cycle_gpu_guard = std::unique_lock<std::mutex>(
+                server.cycle_p2c_gpu_gate());
+        }
         if (return_bulk_credit_held &&
                 cmd != RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT) {
             GGML_LOG_ERROR(
@@ -14382,6 +14584,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.send_inference_cycle(request) ? 1 : 0;
+                if (executor.enabled && response.result == 1 &&
+                    request.kind == INFERENCE_CYCLE_READY) {
+                    const auto k = p2c_key(
+                        request.layer, request.chunk,
+                        request.seq, request.graph_id);
+                    auto it = p2c_armed.find(k);
+                    if (it != p2c_armed.end()) {
+                        // Only ACK success when the worker accepted the job.
+                        if (!executor.enqueue(k, it->second)) {
+                            response.result = 0;
+                        }
+                        p2c_armed.erase(it);
+                    }
+                }
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
@@ -14391,7 +14607,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 // Continue the Phone FFN WITHOUT any PC stage RPC: copy
                 // Attention Norm/TopK into the registered FFN slot, run
                 // its cached graph on the Phone GPU, then stage PARTIAL.
-                if (response.result == 1 &&
+                // Preserve this exact old path when V1 is not enabled.
+                if (!executor.enabled && response.result == 1 &&
                     request.kind == INFERENCE_CYCLE_READY) {
                     const auto key = p2c_key(
                         request.layer, request.chunk,
@@ -14456,9 +14673,11 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     msg.tokens <= 128 && msg.hidden >= 1 &&
                     msg.hidden <= 65536 && msg.topk == 0 &&
                     msg.tensors[0].buffer != 0 &&
-                    p2c_armed.size() < 64 && p2c_completed.size() < 64 &&
+                    p2c_armed.size() < 64 &&
                     p2c_armed.find(key) == p2c_armed.end() &&
-                    p2c_completed.find(key) == p2c_completed.end();
+                    (executor.enabled ? executor.can_arm(key) :
+                     (p2c_completed.size() < 64 &&
+                      p2c_completed.find(key) == p2c_completed.end()));
                 rpc_msg_inference_cycle_send_rsp response {};
                 if (valid) {
                     p2c_armed.emplace(key, request);
@@ -14480,10 +14699,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     request.layer, request.chunk,
                     request.seq, request.graph_id);
                 rpc_msg_inference_cycle_send_rsp response {};
-                const auto done = p2c_completed.find(key);
-                if (done != p2c_completed.end()) {
-                    response.result = done->second ? 1 : 0;
-                    p2c_completed.erase(done);
+                if (executor.enabled) {
+                    response.result = executor.wait(key) ? 1 : 0;
+                } else {
+                    const auto done = p2c_completed.find(key);
+                    if (done != p2c_completed.end()) {
+                        response.result = done->second ? 1 : 0;
+                        p2c_completed.erase(done);
+                    }
                 }
                 GGML_LOG_INFO(
                     "[CYCLE_P2C_LOCAL] side=PHONE action=COMPLETE "
