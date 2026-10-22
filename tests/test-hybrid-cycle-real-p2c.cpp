@@ -957,7 +957,8 @@ static bool cycle_real_execute_phone_attention_pre(
         bool retain_device_ready = false,
         cycle_real_attention_phase_profile * phase_profile = nullptr,
         const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr,
-        cycle_real_attention_scratch_pool * scratch_pool = nullptr) {
+        cycle_real_attention_scratch_pool * scratch_pool = nullptr,
+        cycle_real_attention_graph_cache * graph_cache = nullptr) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -1064,18 +1065,43 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
     const auto graph_build_begin = std::chrono::steady_clock::now();
-    ggml_init_params p {};
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * x = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * causal_mask = nullptr;
+    ggml_tensor * router_probs = nullptr;
+    llama_hybrid_cycle_ready_graph ready {};
+    cycle_real_attention_graph_cache::slot * graph_slot = nullptr;
+    const bool cache_candidate = graph_cache != nullptr && kv_cache != nullptr;
+    if (cache_candidate) {
+        graph_slot = graph_cache->checkout(tokens, kv_tokens, kv_cache);
+        if (graph_slot) {
+            // The compiled graph, physical KV views and weight pointers are
+            // identical to the Warmup graph. Its GPU scratch was detached
+            // after the previous FFN consumer fence.
+            ctx = graph_slot->ctx;
+            graph = graph_slot->graph;
+            x = graph_slot->input;
+            positions = graph_slot->positions;
+            causal_mask = graph_slot->causal_mask;
+            router_probs = graph_slot->router_probs;
+            ready = graph_slot->ready;
+        }
+    }
+    if (!graph_slot) {
+
     p.mem_size = 16 * 1024 * 1024;
     p.no_alloc = true;
-    ggml_context * ctx = ggml_init(p);
+    ctx = ggml_init(p);
     if (!ctx) {
         return false;
     }
 
-    auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
-    auto * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+    x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+    positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
     // Keys include all PAST tokens and the current causal chunk.
-    auto * causal_mask = ggml_new_tensor_2d(
+    causal_mask = ggml_new_tensor_2d(
         ctx, GGML_TYPE_F16, kv_tokens, tokens);
     ggml_set_input(x);
     ggml_set_input(positions);
@@ -1185,7 +1211,7 @@ static bool cycle_real_execute_phone_attention_pre(
         ctx, ggml_rms_norm(ctx, residual, hp.f_norm_rms_eps), w_ffn_norm);
     ggml_set_name(norm, "cycle_num_attn_ffn_norm");
     auto * router_logits = ggml_mul_mat(ctx, w_router, norm);
-    auto * router_probs = ggml_soft_max(ctx, router_logits);
+    router_probs = ggml_soft_max(ctx, router_logits);
     auto * ids = ggml_cont(ctx, ggml_argsort_top_k(
         ctx, router_probs, int(topk)));
     auto * router_p3 = ggml_reshape_3d(ctx, router_probs, 1, experts, tokens);
@@ -1201,16 +1227,14 @@ static bool cycle_real_execute_phone_attention_pre(
     }
     weights = ggml_cont(ctx, weights);
 
-    const llama_hybrid_cycle_ready_graph ready {
-        residual, norm, ids, weights
-    };
+    ready = {residual, norm, ids, weights};
     if (!llama_hybrid_cycle_ready_graph_valid(ready, hidden, tokens, topk)) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=READY_SHAPES\n");
         ggml_free(ctx);
         return false;
     }
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+    graph = ggml_new_graph_custom(ctx, 512, false);
     // Enforce GPU cache writes before subsequent prefix attention reads.
     if (kv_cache != nullptr) {
         ggml_build_forward_expand(graph, kv_k_write);
@@ -1220,8 +1244,6 @@ static bool cycle_real_execute_phone_attention_pre(
     ggml_build_forward_expand(graph, ready.ffn_norm);
     ggml_build_forward_expand(graph, ready.topk_ids);
     ggml_build_forward_expand(graph, ready.topk_weights);
-    const auto graph_build_done = std::chrono::steady_clock::now();
-
     int unsupported = 0;
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
         const ggml_tensor * node = ggml_graph_node(graph, i);
@@ -1242,6 +1264,9 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
 
+    }
+    const auto graph_build_done = std::chrono::steady_clock::now();
+
     const auto buft = ggml_backend_get_default_buffer_type(backend);
     const auto alloc_begin = std::chrono::steady_clock::now();
     ggml_backend_buffer_t compute_buffer = nullptr;
@@ -1254,7 +1279,11 @@ static bool cycle_real_execute_phone_attention_pre(
     if (!allocated || !compute_buffer) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ALLOC_PHONE_GRAPH\n");
-        ggml_free(ctx);
+        if (graph_slot) {
+            graph_cache->recycle(graph_slot, false);
+        } else {
+            ggml_free(ctx);
+        }
         return false;
     }
 
@@ -1285,7 +1314,11 @@ static bool cycle_real_execute_phone_attention_pre(
     if (masked_future != tokens * (tokens - 1) / 2) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_KV] status=FAIL reason=MASK_VALIDATION\n");
-        ggml_free(ctx);
+        if (graph_slot) {
+            graph_cache->recycle(graph_slot, false);
+        } else {
+            ggml_free(ctx);
+        }
         release_compute_buffer();
         return false;
     }
@@ -1314,7 +1347,11 @@ static bool cycle_real_execute_phone_attention_pre(
             std::fprintf(stderr,
                 "[CYCLE_PHONE_LOCAL_HANDOFF] status=FAIL "
                 "reason=DEVICE_COPY_UNSUPPORTED\n");
-            ggml_free(ctx);
+            if (graph_slot) {
+                graph_cache->recycle(graph_slot, false);
+            } else {
+                ggml_free(ctx);
+            }
             release_compute_buffer();
             return false;
         }
@@ -1430,13 +1467,26 @@ static bool cycle_real_execute_phone_attention_pre(
     if (ok && (wire != nullptr || retain_device_ready)) {
         // Borrow original Attention tensors until the local Phone FFN
         // consumes them, preventing a hidden PC->Phone activation upload.
-        result.phone_ctx = ctx;
+        if (cache_candidate && !graph_slot) {
+            // Store metadata only. READY still owns the temporary GPU
+            // scratch buffer; the graph remains busy until FFN consumes it.
+            graph_slot = graph_cache->retain(
+                tokens, kv_tokens, kv_cache, ctx, graph,
+                x, positions, causal_mask, router_probs, ready);
+        }
+        result.phone_ctx = graph_slot ? nullptr : ctx;
         result.phone_compute_buffer = compute_buffer;
         result.phone_scratch_pool = scratch_pooled ? scratch_pool : nullptr;
+        result.phone_graph_cache = graph_slot ? graph_cache : nullptr;
+        result.phone_cached_graph = graph_slot;
         result.phone_graph = ready;
         return true;
     }
-    ggml_free(ctx);
+    if (graph_slot) {
+        graph_cache->recycle(graph_slot, false);
+    } else {
+        ggml_free(ctx);
+    }
     release_compute_buffer();
     return ok;
 }
