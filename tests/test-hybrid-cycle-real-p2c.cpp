@@ -3701,6 +3701,20 @@ struct cycle_real_phone_prepare_profile {
     double graph_build_ms = 0.0;
     double gpu_buffer_alloc_ms = 0.0;
 };
+// Detailed wall-clock split for complete Phone GPU layers only. One
+// PHONE_GPU worker owns all updates; no atomics or extra RPC calls.
+// Fence segments are a subset of Phone FULL stage wall time, not added
+// again to the per-queue totals.
+struct cycle_real_phone_full_detail {
+    uint64_t chunks = 0;
+    double attn_call_ms = 0.0;
+    double attn_fence_ms = 0.0;
+    double pool_checkout_and_prepare_ms = 0.0;
+    double local_ffn_copy_and_call_ms = 0.0;
+    double ffn_fence_ms = 0.0;
+    double reduce_submit_and_cleanup_ms = 0.0;
+    double reduce_fence_ms = 0.0;
+};
 
 struct cycle_real_period_chunk {
     int layer = 0;
@@ -3881,6 +3895,8 @@ static bool cycle_real_execute_period_fifo(
     std::array<cycle_real_ffn_phase_profile, n_queues> ffn_profile {};
     std::array<cycle_real_phone_prepare_profile, n_queues> gpu_prepare_profile {};
     std::array<cycle_real_phone_fence_profile, n_queues> fence_profile {};
+    std::vector<cycle_real_phone_full_detail> phone_full_detail(
+        static_cast<size_t>(n_layers));
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
@@ -4030,6 +4046,12 @@ static bool cycle_real_execute_period_fifo(
                         std::vector<float> attn_values;
                         std::vector<float> norm_values;
                         std::vector<float> ffn_values;
+                        // These phases are timed at the PC caller. The
+                        // Attention call includes graph setup, copies and
+                        // submit; Server GPU execution is reported separately.
+                        auto & full_detail = phone_full_detail[size_t(l)];
+                        const auto attn_call_begin =
+                            std::chrono::steady_clock::now();
                         ok = local_input != nullptr &&
                             cycle_real_execute_phone_attention_pre(
                                 phone, layer, model.hparams, empty,
@@ -4038,11 +4060,26 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr);
+                        if (perf_mode) {
+                            ++full_detail.chunks;
+                            full_detail.attn_call_ms +=
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    attn_call_begin).count();
+                        }
                         if (ok) {
                             // This is a real RPC fence; the RPC backend's
                             // ordinary synchronize() is a NO-OP.
+                            const auto fence_begin =
+                                std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                            if (perf_mode) {
+                                full_detail.attn_fence_ms +=
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        fence_begin).count();
+                            }
                         }
                         if (ok && boundary_trace) {
                             // The Attention tensors are still GPU-owned
@@ -4072,6 +4109,8 @@ static bool cycle_real_execute_period_fifo(
                                     model.hparams.f_norm_rms_eps);
                             }
                         }
+                        const auto full_prepare_begin =
+                            std::chrono::steady_clock::now();
                         if (ok) {
                             retire_device_output(l - 1, c);
                             // The previous consumer's fence is the ownership
@@ -4110,12 +4149,34 @@ static bool cycle_real_execute_period_fifo(
                                 }
                             }
                         }
+                        if (perf_mode) {
+                            full_detail.pool_checkout_and_prepare_ms +=
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    full_prepare_begin).count();
+                        }
+                        const auto full_ffn_call_begin =
+                            std::chrono::steady_clock::now();
                         if (ok) {
                             ok = st.phone_output->execute_full_local(st.ready);
                         }
+                        if (perf_mode) {
+                            full_detail.local_ffn_copy_and_call_ms +=
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    full_ffn_call_begin).count();
+                        }
                         if (ok) {
+                            const auto fence_begin =
+                                std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                            if (perf_mode) {
+                                full_detail.ffn_fence_ms +=
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        fence_begin).count();
+                            }
                         }
                         if (ok && boundary_trace) {
                             // The full-Phone MoE FFN has completed, but the
@@ -4127,13 +4188,29 @@ static bool cycle_real_execute_period_fifo(
                                 st.phone_output->inputs.ffn_output,
                                 ffn_ref, &ffn_values);
                         }
+                        const auto full_reduce_begin =
+                            std::chrono::steady_clock::now();
                         if (ok) {
                             st.ready.release_phone_graph();
                             ok = st.phone_output->execute_reduce(phone);
                         }
+                        if (perf_mode) {
+                            full_detail.reduce_submit_and_cleanup_ms +=
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    full_reduce_begin).count();
+                        }
                         if (ok) {
+                            const auto fence_begin =
+                                std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
+                            if (perf_mode) {
+                                full_detail.reduce_fence_ms +=
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        fence_begin).count();
+                            }
                         }
                         if (ok && st.phone_output &&
                             size_t(l) < checkpoints.layer_outputs.size()) {
@@ -4549,6 +4626,24 @@ static bool cycle_real_execute_period_fifo(
         }
     }
     if (perf_mode) {
+        // Compare this breakdown against PHONE_GPU/FULL_LAYER stage_sum_ms.
+        // The numbers describe client-side wall time and are subsets of it.
+        for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
+            const auto & sample = phone_full_detail[size_t(l)];
+            std::printf(
+                "[CYCLE_PHONE_FULL_DETAIL] layer=%d chunks=%llu "
+                "attn_call_ms=%.3f attn_fence_ms=%.3f "
+                "pool_checkout_prepare_ms=%.3f "
+                "local_ffn_copy_call_ms=%.3f ffn_fence_ms=%.3f "
+                "reduce_submit_cleanup_ms=%.3f reduce_fence_ms=%.3f "
+                "semantics=CLIENT_WALL_SUBPHASES\n",
+                l, (unsigned long long)sample.chunks,
+                sample.attn_call_ms, sample.attn_fence_ms,
+                sample.pool_checkout_and_prepare_ms,
+                sample.local_ffn_copy_and_call_ms,
+                sample.ffn_fence_ms, sample.reduce_submit_and_cleanup_ms,
+                sample.reduce_fence_ms);
+        }
         double busy_sum_ms = 0.0;
         for (size_t q = 0; q < n_queues; ++q) {
             const auto & worker = fifo_profile.queues[q];
