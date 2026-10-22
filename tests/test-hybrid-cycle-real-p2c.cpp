@@ -4243,6 +4243,12 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
     const bool attn_graph_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_ATTN_GRAPH_CACHE");
+    if (attn_graph_reuse && n_chunks < 2) {
+        std::fprintf(stderr,
+            "[CYCLE_ATTN_GRAPH_CACHE] status=FAIL "
+            "reason=REQUIRES_MULTICHUNK_PERSISTENT_KV\n");
+        return false;
+    }
     if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
         std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
                     "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
