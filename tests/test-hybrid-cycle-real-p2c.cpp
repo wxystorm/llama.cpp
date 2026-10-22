@@ -5750,8 +5750,56 @@ static bool cycle_real_execute_period_fifo(
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                         const auto * local_input = take_device_input(l, c);
                         const std::vector<float> empty;
-                        ok = local_input != nullptr &&
-                            cycle_real_execute_phone_attention_pre(
+                        ok = local_input != nullptr;
+                        std::function<bool(const llama_hybrid_cycle_ready_graph &)>
+                            arm_local_ffn;
+                        if (ok && phone_p2c_local_ffn) {
+                            // Prepare ONCE per physical FFN slot/shape, then
+                            // reuse its GPU buffers and registered graph UID
+                            // across all matching P2C chunks. Registration
+                            // does NOT run with uninitialized Attention data.
+                            const bool same_shape = p2c_ffn_slot &&
+                                p2c_ffn_slot->prepared_tokens == st.tokens &&
+                                p2c_ffn_slot->registered_graph_uid != 0;
+                            if (!same_shape) {
+                                const auto prepare_begin =
+                                    std::chrono::steady_clock::now();
+                                p2c_ffn_slot.reset();
+                                auto replacement =
+                                    std::make_unique<cycle_real_p2c_ffn_slot>();
+                                ok = replacement->prepare(
+                                    phone, full_shard(l, 1), hidden,
+                                    st.tokens, topk, experts, true);
+                                if (ok) {
+                                    p2c_ffn_slot = std::move(replacement);
+                                    ++p2c_ffn_prepares;
+                                }
+                                if (path_timing) {
+                                    st.p2c_timing.phone_ffn_prepare_ms =
+                                        cycle_real_path_elapsed_ms(
+                                            prepare_begin);
+                                }
+                            } else {
+                                ++p2c_ffn_hits;
+                            }
+                            if (ok) {
+                                arm_local_ffn = [&](const
+                                        llama_hybrid_cycle_ready_graph & ready) {
+                                    return ggml_backend_rpc_cycle_arm_p2c_ffn(
+                                        phone, st.wire.layer, st.wire.chunk,
+                                        st.wire.seq, st.wire.graph_id,
+                                        p2c_ffn_slot->registered_graph_uid,
+                                        ready.ffn_norm, ready.topk_ids,
+                                        ready.topk_weights,
+                                        p2c_ffn_slot->inputs.norm,
+                                        p2c_ffn_slot->inputs.topk_ids,
+                                        p2c_ffn_slot->inputs.topk_weights,
+                                        p2c_ffn_slot->inputs.ffn_output);
+                                };
+                            }
+                        }
+                        if (ok) {
+                            ok = cycle_real_execute_phone_attention_pre(
                                 phone, layer, model.hparams, empty,
                                 hidden, st.tokens, topk, experts,
                                 st.ready, attn_ms, &st.wire,
@@ -5759,7 +5807,9 @@ static bool cycle_real_execute_period_fifo(
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
                                 nullptr, attn_scratch[size_t(l)],
-                                graph_cache_by_layer[size_t(l)]);
+                                graph_cache_by_layer[size_t(l)],
+                                arm_local_ffn);
+                        }
                         if (ok && !phone_ordered_handoff) {
                             // Legacy: explicit client-to-Phone completion.
                             ok = cycle_real_explicit_phone_fence(
