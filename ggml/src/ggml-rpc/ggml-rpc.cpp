@@ -12779,6 +12779,72 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
     size_t return_bulk_credit_inflight = 0;
     size_t return_bulk_credit_limit = 0;
 
+    // Diagnostic-only per-COMPUTE-connection order. The command sequence is
+    // assigned when the server receives each command byte, including commands
+    // not selected for logging. Client/server clocks must not be subtracted.
+    const bool cycle_order_trace =
+        std::getenv("GGML_CYCLE_RPC_ORDER_TIMING") != nullptr;
+    static std::atomic<uint64_t> next_cycle_connection_id {0};
+    const uint64_t cycle_connection_id = cycle_order_trace ?
+        next_cycle_connection_id.fetch_add(
+            1, std::memory_order_relaxed) + 1 : 0;
+    uint64_t cycle_command_seq = 0;
+    uint64_t cycle_last_graph_cmd_seq = 0;
+    uint64_t cycle_last_graph_uid = 0;
+    uint32_t cycle_last_graph_device = 0;
+    const char * cycle_last_graph_kind = "NONE";
+    int64_t cycle_last_graph_end_us = 0;
+    uint32_t cycle_graphs_since_fence = 0;
+    double cycle_graph_exec_since_fence_ms = 0.0;
+
+    auto cycle_graph_begin = [&](
+            const char * kind, uint64_t graph_uid, uint32_t device,
+            int64_t command_arrival_us) -> int64_t {
+        if (!cycle_order_trace) return 0;
+        const int64_t t = ggml_time_us();
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_GRAPH_ORDER] event=BEGIN side=PHONE "
+            "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+            "cmd=%s graph_uid=%" PRIu64 " device=%u "
+            "request_read_ms=%.3f "
+            "scope=ONE_COMPUTE_CONNECTION\n",
+            cycle_connection_id, cycle_command_seq,
+            kind, graph_uid, device,
+            (t - command_arrival_us) / 1000.0);
+        return t;
+    };
+    auto cycle_graph_end = [&](
+            const char * kind, uint64_t graph_uid, uint32_t device,
+            int64_t begin_us, bool ok) {
+        if (!cycle_order_trace) return;
+        const int64_t done_us = ggml_time_us();
+        const double execution_ms = (done_us - begin_us) / 1000.0;
+        ++cycle_graphs_since_fence;
+        cycle_graph_exec_since_fence_ms += execution_ms;
+        cycle_last_graph_cmd_seq = cycle_command_seq;
+        cycle_last_graph_uid = graph_uid;
+        cycle_last_graph_device = device;
+        cycle_last_graph_kind = kind;
+        cycle_last_graph_end_us = done_us;
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_GRAPH_ORDER] event=END side=PHONE "
+            "connection=%" PRIu64 " command_seq=%" PRIu64 " "
+            "cmd=%s graph_uid=%" PRIu64 " device=%u "
+            "handler_exec_ms=%.3f graphs_since_fence=%u "
+            "graph_exec_since_fence_ms=%.3f status=%s "
+            "scope=SERVER_HANDLER_INCLUDES_GRAPH_NOT_KERNEL_ONLY\n",
+            cycle_connection_id, cycle_command_seq,
+            kind, graph_uid, device, execution_ms,
+            cycle_graphs_since_fence,
+            cycle_graph_exec_since_fence_ms, ok ? "OK" : "FAIL");
+    };
+    if (cycle_order_trace) {
+        GGML_LOG_INFO(
+            "[CYCLE_RPC_ORDER_SESSION] side=PHONE connection=%" PRIu64
+            " scope=SINGLE_RPC_CONNECTION status=START\n",
+            cycle_connection_id);
+    }
+
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             if (return_bulk_credit_held) {
@@ -12795,6 +12861,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        if (cycle_order_trace) ++cycle_command_seq;
+        const int64_t cycle_command_arrival_us =
+            cycle_order_trace ? ggml_time_us() : 0;
         if (return_bulk_credit_held &&
                 cmd != RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT) {
             GGML_LOG_ERROR(
