@@ -13639,7 +13639,22 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.graph_compute(input)) {
+                uint32_t graph_device = 0;
+                uint64_t graph_uid = 0;
+                if (cycle_order_trace &&
+                    input.size() >= sizeof(uint32_t) + sizeof(uint64_t)) {
+                    memcpy(&graph_device, input.data(), sizeof(graph_device));
+                    memcpy(&graph_uid,
+                           input.data() + sizeof(graph_device),
+                           sizeof(graph_uid));
+                }
+                const int64_t begin_us = cycle_graph_begin(
+                    "GRAPH_COMPUTE", graph_uid, graph_device,
+                    cycle_command_arrival_us);
+                const bool ok = server.graph_compute(input);
+                cycle_graph_end(
+                    "GRAPH_COMPUTE", graph_uid, graph_device, begin_us, ok);
+                if (!ok) {
                     return;
                 }
                 break;
@@ -13649,7 +13664,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                if (!server.graph_recompute(request)) {
+                const int64_t begin_us = cycle_graph_begin(
+                    "GRAPH_RECOMPUTE", request.graph_uid, request.device,
+                    cycle_command_arrival_us);
+                const bool ok = server.graph_recompute(request);
+                cycle_graph_end(
+                    "GRAPH_RECOMPUTE", request.graph_uid, request.device,
+                    begin_us, ok);
+                if (!ok) {
                     return;
                 }
                 break;
