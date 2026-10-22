@@ -1062,6 +1062,7 @@ static bool send_rpc_cmd(
 }
 
 struct rpc_cmd_roundtrip_profile {
+    int64_t socket_lock_wait_us     = 0;
     int64_t request_send_us         = 0;
     int64_t response_header_wait_us = 0;
     int64_t response_body_wait_us   = 0;
@@ -1078,9 +1079,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     }
     // The lock must cover BOTH request and response. A per-send lock cannot
     // prevent one worker from consuming another worker's reply.
-    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
     rpc_cmd_roundtrip_profile * const profile =
         rpc_cmd_roundtrip_profile_active;
+    const int64_t lock_wait_begin_us =
+        profile != nullptr ? ggml_time_us() : 0;
+    std::lock_guard<std::recursive_mutex> transaction_lock(sock->rpc_cmd_mutex);
+    if (profile != nullptr) {
+        profile->socket_lock_wait_us = ggml_time_us() - lock_wait_begin_us;
+    }
 
     const int64_t request_send_begin_us =
         profile != nullptr ? ggml_time_us() : 0;
@@ -3253,7 +3259,10 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
-static void ggml_backend_rpc_fence(ggml_backend_t backend) {
+static void ggml_backend_rpc_fence_impl(
+        ggml_backend_t backend,
+        ggml_backend_rpc_fence_timing * breakdown) {
+    if (breakdown) *breakdown = {};
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     rpc_msg_synchronize_req request {};
     request.device = rpc_ctx->device;
@@ -3295,7 +3304,12 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
     auto sock = get_socket(rpc_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
 
-    const int64_t fence_begin_us = fence_diag ? ggml_time_us() : 0;
+    rpc_cmd_roundtrip_profile rpc_timing {};
+    rpc_cmd_roundtrip_profile * const previous_profile =
+        rpc_cmd_roundtrip_profile_active;
+    if (breakdown) rpc_cmd_roundtrip_profile_active = &rpc_timing;
+    const int64_t begin_us =
+        (breakdown || fence_diag) ? ggml_time_us() : 0;
     const bool status = send_rpc_cmd(
         sock,
         RPC_CMD_SYNCHRONIZE,
@@ -3303,9 +3317,22 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
         sizeof(request),
         nullptr,
         0);
+    const int64_t done_us =
+        (breakdown || fence_diag) ? ggml_time_us() : 0;
+    if (breakdown) {
+        rpc_cmd_roundtrip_profile_active = previous_profile;
+        breakdown->socket_lock_wait_ms =
+            rpc_timing.socket_lock_wait_us / 1000.0;
+        breakdown->request_send_ms =
+            rpc_timing.request_send_us / 1000.0;
+        breakdown->response_header_wait_ms =
+            rpc_timing.response_header_wait_us / 1000.0;
+        breakdown->response_body_wait_ms =
+            rpc_timing.response_body_wait_us / 1000.0;
+        breakdown->total_ms = (done_us - begin_us) / 1000.0;
+    }
     const int64_t fence_us =
-        fence_diag ? ggml_time_us() - fence_begin_us : 0;
-
+        fence_diag ? done_us - begin_us : 0;
     RPC_STATUS_ASSERT(status);
 
     if (fence_diag) {
@@ -3319,6 +3346,16 @@ static void ggml_backend_rpc_fence(ggml_backend_t backend) {
             diag_graph_uid,
             fence_us / 1000.0);
     }
+}
+
+static void ggml_backend_rpc_fence(ggml_backend_t backend) {
+    ggml_backend_rpc_fence_impl(backend, nullptr);
+}
+
+static void ggml_backend_rpc_fence_profiled(
+        ggml_backend_t backend,
+        ggml_backend_rpc_fence_timing * timing) {
+    ggml_backend_rpc_fence_impl(backend, timing);
 }
 
 static bool ggml_backend_rpc_route_mark_ready(
@@ -14148,6 +14185,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_FENCE_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_fence);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_FENCE_PROFILED_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_fence_profiled);
     }
     if (std::strcmp(
             name,
