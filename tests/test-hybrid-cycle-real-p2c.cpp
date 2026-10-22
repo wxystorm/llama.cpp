@@ -5380,9 +5380,8 @@ static bool cycle_real_execute_period_fifo(
                                     std::chrono::steady_clock::now() -
                                     attn_call_begin).count();
                         }
-                        if (ok) {
-                            // This is a real RPC fence; the RPC backend's
-                            // ordinary synchronize() is a NO-OP.
+                        if (ok && !phone_ordered_handoff) {
+                            // Legacy: wait for the one-way Graph submission.
                             const auto fence_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_explicit_phone_fence(
@@ -5396,6 +5395,10 @@ static bool cycle_real_execute_period_fifo(
                                         fence_begin).count();
                             }
                         }
+                        // In ordered mode, do NOT recycle producer buffers at
+                        // Graph submission. The server executes Attention
+                        // synchronously before any subsequent COPY_TENSOR
+                        // RPC on this shared COMPUTE socket.
                         if (ok && boundary_trace) {
                             // The Attention tensors are still GPU-owned
                             // here. Read them BEFORE release_phone_graph().
@@ -5427,11 +5430,12 @@ static bool cycle_real_execute_period_fifo(
                         const auto full_prepare_begin =
                             std::chrono::steady_clock::now();
                         if (ok) {
-                            retire_device_output(l - 1, c);
-                            // The previous consumer's fence is the ownership
-                            // release point. Reused graph input buffers are
-                            // overwritten by execute_full_local() for THIS
-                            // Chunk before either FFN or Reduce is submitted.
+                            // Legacy completion fence permits retirement now.
+                            // Ordered completion defers it until FFN's input
+                            // COPY_TENSOR RPC has acknowledged on the server.
+                            if (!phone_ordered_handoff) {
+                                retire_device_output(l - 1, c);
+                            }
                             if (phone_full_reuse) {
                                 auto & pool = phone_full_pool[size_t(l)];
                                 for (auto it = pool.begin(); it != pool.end(); ++it) {
@@ -5477,6 +5481,23 @@ static bool cycle_real_execute_period_fifo(
                             std::chrono::steady_clock::now();
                         if (ok) {
                             ok = st.phone_output->execute_full_local(st.ready);
+                            if (ok && phone_ordered_handoff) {
+                                // Same RPC COMPUTE connection orders Graph
+                                // execution before the FFN-local input copies;
+                                // COPY_TENSOR has returned an RPC response.
+                                // No GPU producer input can still be in use.
+                                retire_device_output(l - 1, c);
+                                ++ordered_full_handoffs;
+                                if (stage_detail) {
+                                    std::printf(
+                                        "[CYCLE_PHONE_ORDERED_HANDOFF] "
+                                        "phase=%s layer=%d chunk=%d "
+                                        "kind=PHONE_FULL_ATTN "
+                                        "completion=FFN_LOCAL_COPY_ACK "
+                                        "old_fence=ELIDED status=OK\n",
+                                        run_phase, l, c);
+                                }
+                            }
                         }
                         if (perf_mode) {
                             full_detail.local_ffn_copy_and_call_ms +=
