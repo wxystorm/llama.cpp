@@ -4472,6 +4472,20 @@ static bool cycle_real_execute_period_fifo(
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr);
     const auto fifo_done = std::chrono::steady_clock::now();
+    // Include the eventual GPU cache release in the measured period.
+    // Otherwise a cache hit could look faster merely because the final
+    // GPU buffer_free calls moved outside wall_ms.
+    std::vector<size_t> phone_cached_at_end(static_cast<size_t>(n_layers), 0);
+    if (phone_full_reuse) {
+        for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
+            phone_cached_at_end[size_t(l)] =
+                phone_full_pool[size_t(l)].size();
+        }
+        for (auto & pool : phone_full_pool) {
+            pool.clear();
+        }
+    }
+    const auto phone_pool_release_done = std::chrono::steady_clock::now();
     bool kv_ok = true;
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
@@ -4486,8 +4500,11 @@ static bool cycle_real_execute_period_fifo(
         tx_idle_done - started).count();
     const double fifo_ms = std::chrono::duration<double, std::milli>(
         fifo_done - started).count();
+    const double phone_pool_release_ms =
+        std::chrono::duration<double, std::milli>(
+            phone_pool_release_done - fifo_done).count();
     const double kv_release_ms = std::chrono::duration<double, std::milli>(
-        kv_release_done - fifo_done).count();
+        kv_release_done - phone_pool_release_done).count();
     const double tx_idle_ms = std::chrono::duration<double, std::milli>(
         tx_idle_done - kv_release_done).count();
     ggml_backend_free(cpu);
@@ -4523,12 +4540,12 @@ static bool cycle_real_execute_period_fifo(
             std::printf(
                 "[CYCLE_PHONE_FULL_REUSE_SUM] layer=%d enabled=1 "
                 "hits=%llu prepares=%llu retired=%llu "
-                "idle_pool=%zu graph_owner=PHONE_GPU "
+                "cached_at_fifo_end=%zu graph_owner=PHONE_GPU "
                 "output_release=SUCCESSOR_ATTN_FENCED\n",
                 l, (unsigned long long)sample.hits,
                 (unsigned long long)sample.misses,
                 (unsigned long long)sample.recycled,
-                phone_full_pool[size_t(l)].size());
+                phone_cached_at_end[size_t(l)]);
         }
     }
     if (perf_mode) {
@@ -4638,13 +4655,14 @@ static bool cycle_real_execute_period_fifo(
         // never claimed to be an exposed end-to-end critical-path delay.
         std::printf(
             "[CYCLE_PERIOD_PERF_SUM] fifo_wall_ms=%.3f "
+            "phone_pool_release_ms=%.3f "
             "kv_release_ms=%.3f tx_idle_ms=%.3f wall_ms=%.3f "
             "queue_execute_sum_ms=%.3f "
             "queue_overlap=INDEPENDENT_WORKERS "
             "parity_timing=EXCLUDED "
             "execution_status=%s strict_parity=%s\n",
-            fifo_ms, kv_release_ms, tx_idle_ms, wall_ms,
-            busy_sum_ms, execution_ok ? "OK" : "FAIL",
+            fifo_ms, phone_pool_release_ms, kv_release_ms, tx_idle_ms,
+            wall_ms, busy_sum_ms, execution_ok ? "OK" : "FAIL",
             !execution_ok ? "NOT_CHECKED" :
                 parity_ok ? "PASS" : "FAIL");
     }
