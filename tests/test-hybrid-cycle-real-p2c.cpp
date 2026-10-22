@@ -5946,7 +5946,32 @@ static bool cycle_real_execute_period_fifo(
                         const std::vector<float> none_f;
                         const std::vector<int32_t> none_i;
                         std::vector<float> ignored;
-                        if (!p2c_ffn_reuse) {
+                        if (phone_p2c_local_ffn) {
+                            // Phone already received the READY arm, then
+                            // executed local COPY/FFN/SEND_PARTIAL directly
+                            // in its RPC handler after staging READY.
+                            // This wait is ONLY the final Buffer Ownership
+                            // handoff: its completion allows Scratch Pool
+                            // recycle by the sole PHONE_GPU queue worker.
+                            const auto done_begin =
+                                std::chrono::steady_clock::now();
+                            ok = ggml_backend_rpc_cycle_wait_p2c_ffn(
+                                phone, st.wire.layer, st.wire.chunk,
+                                st.wire.seq, st.wire.graph_id);
+                            const double done_ms =
+                                cycle_real_path_elapsed_ms(done_begin);
+                            if (perf_mode) {
+                                auto & profile = ffn_profile[queue_index];
+                                ++profile.count;
+                                profile.backend_execute_call_ms += done_ms;
+                            }
+                            if (path_timing) {
+                                st.p2c_timing.phone_ffn_submit_rpc_ms =
+                                    done_ms;
+                                st.p2c_timing.phone_send_partial_rpc_ms = 0.0;
+                            }
+                            if (ok) ++p2c_phone_local_completed;
+                        } else if (!p2c_ffn_reuse) {
                             const auto fallback_begin =
                                 std::chrono::steady_clock::now();
                             ok = cycle_real_execute_ffn(
