@@ -2737,6 +2737,9 @@ struct cycle_real_c2p_phone_chunk {
     double ffn_graph_submit_ms = 0.0;
     double reduce_graph_submit_ms = 0.0;
     bool is_full_layer = false;
+    // Persisted FFN/Reduce graph is safe to replay ONLY for the same
+    // physical layer (owned by its per-layer pool) and token shape.
+    int64_t prepared_tokens = 0;
 
     cycle_real_c2p_phone_chunk() = default;
     cycle_real_c2p_phone_chunk(const cycle_real_c2p_phone_chunk &) = delete;
@@ -2755,6 +2758,7 @@ struct cycle_real_c2p_phone_chunk {
         reduce_graph = nullptr;
         inputs = {};
         is_full_layer = false;
+        prepared_tokens = 0;
     }
 
     bool prepare(
@@ -2834,6 +2838,7 @@ struct cycle_real_c2p_phone_chunk {
             build_end - build_begin).count();
         gpu_alloc_ms = std::chrono::duration<double, std::milli>(
             alloc_end - build_end).count();
+        prepared_tokens = tokens;
         std::printf(
             "[CYCLE_GPU_PREPARE] phase=PHONE_FFN graph_build_ms=%.3f "
             "gpu_alloc_ms=%.3f source=PC_CLIENT status=OK\n",
