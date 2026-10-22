@@ -27,6 +27,7 @@
 #include "inference-cycle-reduce.h"
 #include "ggml-rpc.h"
 #include "ggml-backend.h"
+#include "cycle-attention-scratch-pool.h"
 
 #include <algorithm>
 #include <array>
@@ -573,6 +574,7 @@ struct cycle_real_phone_ready {
     // Keep READY's Phone GPU tensors alive through FFN local input copies.
     ggml_context * phone_ctx = nullptr;
     ggml_backend_buffer_t phone_compute_buffer = nullptr;
+    cycle_real_attention_scratch_pool * phone_scratch_pool = nullptr;
     llama_hybrid_cycle_ready_graph phone_graph {};
 
     cycle_real_phone_ready() = default;
@@ -581,14 +583,21 @@ struct cycle_real_phone_ready {
     ~cycle_real_phone_ready() { release_phone_graph(); }
 
     void release_phone_graph() {
-        if (phone_compute_buffer != nullptr) {
-            ggml_backend_buffer_free(phone_compute_buffer);
-            phone_compute_buffer = nullptr;
-        }
+        // FFN already consumed/fenced READY before handing its buffer back.
+        // Graph metadata must not outlive the memory it describes.
         if (phone_ctx != nullptr) {
             ggml_free(phone_ctx);
             phone_ctx = nullptr;
         }
+        if (phone_compute_buffer != nullptr) {
+            if (phone_scratch_pool) {
+                phone_scratch_pool->recycle(phone_compute_buffer);
+            } else {
+                ggml_backend_buffer_free(phone_compute_buffer);
+            }
+            phone_compute_buffer = nullptr;
+        }
+        phone_scratch_pool = nullptr;
         phone_graph = {};
     }
 };
@@ -937,7 +946,8 @@ static bool cycle_real_execute_phone_attention_pre(
         const ggml_tensor * device_input = nullptr,
         bool retain_device_ready = false,
         cycle_real_attention_phase_profile * phase_profile = nullptr,
-        const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr) {
+        const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr,
+        cycle_real_attention_scratch_pool * scratch_pool = nullptr) {
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
         kv_token_start < 0 || kv_token_start + tokens > 128 ||
@@ -1224,15 +1234,27 @@ static bool cycle_real_execute_phone_attention_pre(
 
     const auto buft = ggml_backend_get_default_buffer_type(backend);
     const auto alloc_begin = std::chrono::steady_clock::now();
-    ggml_backend_buffer_t compute_buffer =
-        ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    ggml_backend_buffer_t compute_buffer = nullptr;
+    bool scratch_pooled = false;
+    const bool allocated = scratch_pool ?
+        scratch_pool->acquire(ctx, compute_buffer, scratch_pooled) :
+        (compute_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft)) != nullptr;
     const auto alloc_done = std::chrono::steady_clock::now();
-    if (!compute_buffer) {
+    if (!allocated || !compute_buffer) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ALLOC_PHONE_GRAPH\n");
         ggml_free(ctx);
         return false;
     }
+
+    const auto release_compute_buffer = [&] {
+        if (scratch_pooled && scratch_pool) {
+            scratch_pool->recycle(compute_buffer);
+        } else {
+            ggml_backend_buffer_free(compute_buffer);
+        }
+    };
 
     // Input layout: token-major hidden vectors; positions increment 0..N-1.
     // The F16 mask's dimension 0 is the KV index and dimension 1 is query.
@@ -1253,8 +1275,8 @@ static bool cycle_real_execute_phone_attention_pre(
     if (masked_future != tokens * (tokens - 1) / 2) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_KV] status=FAIL reason=MASK_VALIDATION\n");
-        ggml_backend_buffer_free(compute_buffer);
         ggml_free(ctx);
+        release_compute_buffer();
         return false;
     }
     std::printf("[CYCLE_PHONE_KV] query_tokens=%lld kv_tokens=%lld "
@@ -1282,8 +1304,8 @@ static bool cycle_real_execute_phone_attention_pre(
             std::fprintf(stderr,
                 "[CYCLE_PHONE_LOCAL_HANDOFF] status=FAIL "
                 "reason=DEVICE_COPY_UNSUPPORTED\n");
-            ggml_backend_buffer_free(compute_buffer);
             ggml_free(ctx);
+            release_compute_buffer();
             return false;
         }
         std::printf(
@@ -1400,11 +1422,12 @@ static bool cycle_real_execute_phone_attention_pre(
         // consumes them, preventing a hidden PC->Phone activation upload.
         result.phone_ctx = ctx;
         result.phone_compute_buffer = compute_buffer;
+        result.phone_scratch_pool = scratch_pooled ? scratch_pool : nullptr;
         result.phone_graph = ready;
         return true;
     }
-    ggml_backend_buffer_free(compute_buffer);
     ggml_free(ctx);
+    release_compute_buffer();
     return ok;
 }
 
@@ -4117,6 +4140,8 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_P2C_FFN_REUSE");
     const bool c2p_ffn_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE");
+    const bool attn_scratch_reuse = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_ATTN_SCRATCH_POOL");
     if (std::getenv("LLAMA_HYBRID_CYCLE_PC_CUDA_ATTN") != nullptr) {
         std::printf("[CYCLE_PC_CUDA_PLAN] old_option=PC_CUDA_ATTN "
                     "status=IGNORED reason=FULL_LAYER_MODE_SUPERSEDES_SPLIT\n");
@@ -4280,6 +4305,18 @@ static bool cycle_real_execute_period_fifo(
             return false;
         }
         kv.push_back(std::move(cache));
+    }
+
+    // Declared BEFORE states so any failure-path READY destructors can
+    // safely return their leases while the pool still exists.
+    std::vector<std::unique_ptr<cycle_real_attention_scratch_pool>>
+        attn_scratch(static_cast<size_t>(n_layers));
+    if (attn_scratch_reuse) {
+        for (int l = layout.x + 1; l < n_layers; ++l) {
+            attn_scratch[size_t(l)] =
+                std::make_unique<cycle_real_attention_scratch_pool>();
+            attn_scratch[size_t(l)]->configure(phone, window);
+        }
     }
 
     using state_ptr = std::unique_ptr<cycle_real_period_chunk>;
@@ -4661,7 +4698,8 @@ static bool cycle_real_execute_period_fifo(
                                 st.ready, attn_ms, nullptr,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
-                                perf_mode ? &attn_profile[queue_index] : nullptr);
+                                perf_mode ? &attn_profile[queue_index] : nullptr,
+                                nullptr, attn_scratch[size_t(l)].get());
                         if (perf_mode) {
                             ++full_detail.chunks;
                             full_detail.attn_call_ms +=
@@ -4962,7 +5000,8 @@ static bool cycle_real_execute_period_fifo(
                                 st.ready, attn_ms, &st.wire,
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
-                                perf_mode ? &attn_profile[queue_index] : nullptr);
+                                perf_mode ? &attn_profile[queue_index] : nullptr,
+                                nullptr, attn_scratch[size_t(l)].get());
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
@@ -5258,6 +5297,20 @@ static bool cycle_real_execute_period_fifo(
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr);
     const auto fifo_done = std::chrono::steady_clock::now();
+    // All FIFO workers have joined; FFN no longer borrows any READY tensors.
+    // Explicit cleanup also handles exceptional/failure-path READY objects.
+    std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
+    if (attn_scratch_reuse) {
+        for (auto & layer_states : states) {
+            for (auto & st : layer_states) st->ready.release_phone_graph();
+        }
+        for (int l = layout.x + 1; l < n_layers; ++l) {
+            auto & pool = *attn_scratch[size_t(l)];
+            attn_cached_at_fifo_end[size_t(l)] = pool.idle.size();
+            pool.clear();
+        }
+    }
+    const auto attn_scratch_release_done = std::chrono::steady_clock::now();
     const bool p2c_ffn_cached_at_end = p2c_ffn_slot != nullptr;
     // Release the cached RPC allocation BEFORE the period timer stops.
     // No borrowed input or output outlives the FIFO workers.
@@ -5310,9 +5363,12 @@ static bool cycle_real_execute_period_fifo(
     const double phone_pool_release_ms =
         std::chrono::duration<double, std::milli>(
             phone_pool_release_done - fifo_done).count();
+    const double attn_scratch_release_ms =
+        std::chrono::duration<double, std::milli>(
+            attn_scratch_release_done - fifo_done).count();
     const double p2c_pool_release_ms =
         std::chrono::duration<double, std::milli>(
-            p2c_pool_release_done - fifo_done).count();
+            p2c_pool_release_done - attn_scratch_release_done).count();
     const double c2p_pool_release_ms =
         std::chrono::duration<double, std::milli>(
             c2p_pool_release_done - p2c_pool_release_done).count();
@@ -5364,6 +5420,34 @@ static bool cycle_real_execute_period_fifo(
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         pc_cuda_full ? "PC_CUDA" : "PC_CPU",
         execution_ok ? "OK" : "FAIL");
+    if (attn_scratch_reuse) {
+        for (int l = layout.x + 1; l < n_layers; ++l) {
+            const auto & pool = *attn_scratch[size_t(l)];
+            std::printf(
+                "[CYCLE_ATTN_SCRATCH_POOL_SUM] phase=%s layer=%d "
+                "enabled=1 max_slots=%zu peak_slots=%zu "
+                "allocs=%llu hits=%llu evictions=%llu fallbacks=%llu "
+                "returned=%llu bind_failures=%llu active=%zu "
+                "cached_at_fifo_end=%zu "
+                "size_query_ms=%.3f rpc_alloc_ms=%.3f "
+                "graph_bind_ms=%.3f rpc_free_ms=%.3f "
+                "graph_mode=REBUILT_EACH_CHUNK kv_mode=PER_CYCLE\n",
+                run_phase, l, pool.max_slots, pool.peak_slots,
+                (unsigned long long)pool.allocations,
+                (unsigned long long)pool.hits,
+                (unsigned long long)pool.evictions,
+                (unsigned long long)pool.fallbacks,
+                (unsigned long long)pool.recycled,
+                (unsigned long long)pool.bind_failures,
+                pool.active.size(), attn_cached_at_fifo_end[size_t(l)],
+                pool.size_query_ms, pool.buffer_alloc_ms,
+                pool.graph_bind_ms, pool.buffer_free_ms);
+        }
+        std::printf(
+            "[CYCLE_ATTN_SCRATCH_RELEASE_SUM] phase=%s "
+            "release_ms=%.3f included_in=PERIOD_WALL\n",
+            run_phase, attn_scratch_release_ms);
+    }
     if (c2p_ffn_reuse) {
         std::printf(
             "[CYCLE_C2P_FFN_REUSE_SUM] side=PC layer=%d enabled=1 "
