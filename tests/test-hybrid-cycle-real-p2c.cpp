@@ -3843,13 +3843,13 @@ static bool cycle_real_execute_period_fifo(
     // FFN graph owns the very same GPU allocation and borrowed model weights
     // it used on the last Chunk. No CPU/GPU hidden activation is cached.
     using phone_chunk_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
-    std::vector<std::vector<phone_chunk_ptr>> phone_full_pool(size_t(n_layers));
+    std::vector<std::vector<phone_chunk_ptr>> phone_full_pool(static_cast<size_t>(n_layers));
     struct phone_reuse_layer_stats {
         uint64_t hits = 0;
         uint64_t misses = 0;
         uint64_t recycled = 0;
     };
-    std::vector<phone_reuse_layer_stats> phone_reuse_stats(size_t(n_layers));
+    std::vector<phone_reuse_layer_stats> phone_reuse_stats(static_cast<size_t>(n_layers));
     for (int l = 0; l < n_layers; ++l) {
         auto & row = states[size_t(l)];
         row.reserve(size_t(n_chunks));
