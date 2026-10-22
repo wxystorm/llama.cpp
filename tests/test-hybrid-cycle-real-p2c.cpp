@@ -4018,11 +4018,19 @@ static bool cycle_real_execute_period_fifo(
         // physical Meta model-device array (CPU=0, Phone=1).
         const auto cuda_dev = ggml_backend_dev_by_name("CUDA0");
         if (!cuda_dev ||
-            ggml_backend_dev_type(cuda_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
-            !(pc_cuda.backend = ggml_backend_dev_init(cuda_dev, nullptr))) {
+            ggml_backend_dev_type(cuda_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
             std::fprintf(stderr,
-                "[CYCLE_PC_CUDA_PLAN] status=FAIL reason=CUDA0_UNAVAILABLE "
-                "hint=BUILD_WITH_GGML_CUDA\n");
+                "[CYCLE_PC_CUDA_PLAN] status=FAIL "
+                "reason=CUDA0_NOT_REGISTERED\n");
+            ggml_backend_free(cpu);
+            return false;
+        }
+        pc_cuda.backend = ggml_backend_dev_init(cuda_dev, nullptr);
+        if (!pc_cuda.backend) {
+            std::fprintf(stderr,
+                "[CYCLE_PC_CUDA_PLAN] status=FAIL "
+                "reason=CUDA0_DEVICE_INIT_FAILED device=%s\n",
+                ggml_backend_dev_name(cuda_dev));
             ggml_backend_free(cpu);
             return false;
         }
@@ -5170,6 +5178,42 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_init();
+    // The physical PC+Phone model is expensive to load. Fail fast if the
+    // opt-in local CUDA full-layer executor is unavailable. A statically
+    // registered CPU/RPC backend can prevent llama_backend_init() from
+    // scanning dynamically built CUDA DLLs; explicitly load available
+    // backends once more only when CUDA0 was not already registered.
+    if (cycle_period_mode &&
+        cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PC_CUDA_FULL")) {
+        auto * cuda_dev = ggml_backend_dev_by_name("CUDA0");
+        const bool attempted_load = cuda_dev == nullptr;
+        if (attempted_load) {
+            ggml_backend_load_all();
+            cuda_dev = ggml_backend_dev_by_name("CUDA0");
+        }
+        std::printf(
+            "[CYCLE_PC_CUDA_DISCOVERY] requested=CUDA0 "
+            "retry_dynamic_load=%d cuda_registry=%d devices=%zu status=%s\n",
+            attempted_load ? 1 : 0,
+            ggml_backend_reg_by_name("CUDA") ? 1 : 0,
+            ggml_backend_dev_count(),
+            cuda_dev ? "FOUND" : "NOT_FOUND");
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            std::printf(
+                "[CYCLE_PC_CUDA_DEVICE] index=%zu name=%s type=%d\n",
+                i, ggml_backend_dev_name(dev),
+                int(ggml_backend_dev_type(dev)));
+        }
+        if (!cuda_dev ||
+            ggml_backend_dev_type(cuda_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            std::fprintf(stderr,
+                "[CYCLE_PC_CUDA_DISCOVERY] status=FAIL "
+                "reason=CUDA0_NOT_REGISTERED "
+                "hint=CHECK_GGML_CUDA_CMAKE_CACHE_AND_CUDA_DLL\n");
+            return 1;
+        }
+    }
     const auto cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         std::fprintf(stderr,
