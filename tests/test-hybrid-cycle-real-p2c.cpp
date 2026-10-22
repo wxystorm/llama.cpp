@@ -4574,7 +4574,7 @@ static bool cycle_real_execute_period_fifo(
                 }
                 case llama_hybrid_cycle_stage::ATTN_PRE: {
                     double attn_ms = 0.0;
-                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         const auto input = host_input(l, c);
                         ok = input.size() == size_t(st.tokens * hidden) &&
                             cycle_real_execute_phone_attention_pre(
@@ -4681,7 +4681,7 @@ static bool cycle_real_execute_period_fifo(
                     break;
                 }
                 case llama_hybrid_cycle_stage::FFN_SOURCE: {
-                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         const auto weights = full_shard(l, 0);
                         ok = cycle_real_execute_ffn(
                             cpu, weights, st.ready.norm,
@@ -4750,7 +4750,7 @@ static bool cycle_real_execute_period_fifo(
                     break;
                 }
                 case llama_hybrid_cycle_stage::REDUCE: {
-                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {                    } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                         ok = st.phone_output &&
                             st.phone_output->execute_reduce(phone);
                         if (ok) {
