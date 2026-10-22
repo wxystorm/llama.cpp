@@ -3882,6 +3882,17 @@ struct cycle_real_phone_full_detail {
     double reduce_fence_ms = 0.0;
 };
 
+// PC host-observed durations, not kernel event timings. The PC_CUDA FIFO
+// has one worker, so no additional locking is required for these counters.
+struct cycle_real_pc_cuda_full_detail {
+    uint64_t chunks = 0;
+    double attn_call_ms = 0.0;
+    double ffn_prepare_call_ms = 0.0;
+    double ffn_execute_sync_ms = 0.0;
+    double lout_readback_ms = 0.0;
+    double task_wall_max_ms = 0.0;
+};
+
 struct cycle_real_period_chunk {
     int layer = 0;
     int chunk = 0;
@@ -4122,6 +4133,8 @@ static bool cycle_real_execute_period_fifo(
     std::array<cycle_real_phone_fence_profile, n_queues> fence_profile {};
     std::vector<cycle_real_phone_full_detail> phone_full_detail(
         static_cast<size_t>(n_layers));
+    std::vector<cycle_real_pc_cuda_full_detail> pc_cuda_detail(
+        static_cast<size_t>(n_layers));
     const auto started = std::chrono::steady_clock::now();
     std::printf(
         "[CYCLE_PERIOD_PLAN] x=%d y=%d layers=[0,%d] "
@@ -4202,6 +4215,9 @@ static bool cycle_real_execute_period_fifo(
                         const auto input = host_input(l, c);
                         const auto * weights = pc_cuda.weights[size_t(l)].get();
                         double attn_ms = 0.0;
+                        double ffn_prepare_call_ms = 0.0;
+                        double ffn_execute_sync_ms = 0.0;
+                        double lout_readback_ms = 0.0;
                         const auto cuda_begin = std::chrono::steady_clock::now();
                         ok = weights &&
                             input.size() == size_t(st.tokens * hidden) &&
@@ -4213,6 +4229,7 @@ static bool cycle_real_execute_period_fifo(
                                 st.start, 0, nullptr, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
                                 weights);
+                        const auto cuda_attn_done = std::chrono::steady_clock::now();
                         if (ok && cycle_real_env_flag(
                                 "LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") &&
                             size_t(l) < checkpoints.pc_attn_residuals.size()) {
@@ -4232,18 +4249,27 @@ static bool cycle_real_execute_period_fifo(
                             // builder. It is backend-generic; here every
                             // weight and activation resides on local CUDA.
                             cycle_real_c2p_phone_chunk full_gpu;
+                            const auto ffn_prepare_begin =
+                                std::chrono::steady_clock::now();
                             ok = full_gpu.prepare(
                                 pc_cuda.backend, weights->full_ffn_shard(),
                                 hidden, st.tokens, topk, experts,
                                 true, true, false);
+                            ffn_prepare_call_ms =
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    ffn_prepare_begin).count();
                             if (ok) {
+                                const auto ffn_execute_begin =
+                                    std::chrono::steady_clock::now();
                                 ok = full_gpu.execute_full_local(st.ready);
-                            }
-                            if (ok) {
-                                // CUDA synchronize is real (unlike the RPC
-                                // backend NO-OP), completing the fused FFN
-                                // and residual ADD before tensor readback.
-                                ggml_backend_synchronize(pc_cuda.backend);
+                                if (ok) {
+                                    ggml_backend_synchronize(pc_cuda.backend);
+                                }
+                                ffn_execute_sync_ms =
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        ffn_execute_begin).count();
                             }
                             if (ok && cycle_real_env_flag(
                                     "LLAMA_HYBRID_CYCLE_NUMERIC_TRACE") &&
@@ -4260,11 +4286,17 @@ static bool cycle_real_execute_period_fifo(
                                     checkpoints.pc_ffn_outputs[size_t(l)]);
                             }
                             if (ok) {
+                                const auto readback_begin =
+                                    std::chrono::steady_clock::now();
                                 st.host_output.resize(
                                     size_t(st.tokens * hidden));
                                 ggml_backend_tensor_get(
                                     full_gpu.output, st.host_output.data(),
                                     0, st.host_output.size() * sizeof(float));
+                                lout_readback_ms =
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        readback_begin).count();
                                 cycle_real_numeric_probe(
                                     "PC_FULL_OUTPUT", l, c, st.host_output);
                                 if (size_t(l) < checkpoints.layer_outputs.size()) {
@@ -4278,6 +4310,21 @@ static bool cycle_real_execute_period_fifo(
                         // Both CUDA graphs have completed or failed. Do not
                         // retain borrowed activations beyond this FIFO task.
                         st.ready.release_phone_graph();
+                        if (perf_mode) {
+                            auto & sample = pc_cuda_detail[size_t(l)];
+                            ++sample.chunks;
+                            sample.attn_call_ms +=
+                                std::chrono::duration<double, std::milli>(
+                                    cuda_attn_done - cuda_begin).count();
+                            sample.ffn_prepare_call_ms += ffn_prepare_call_ms;
+                            sample.ffn_execute_sync_ms += ffn_execute_sync_ms;
+                            sample.lout_readback_ms += lout_readback_ms;
+                            sample.task_wall_max_ms = std::max(
+                                sample.task_wall_max_ms,
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    cuda_begin).count());
+                        }
                         if (stage_detail || !ok) {
                             std::printf(
                                 "[CYCLE_PC_CUDA_FULL] layer=%d chunk=%d "
@@ -4982,7 +5029,7 @@ static bool cycle_real_execute_period_fifo(
         for (int l = layout.x + 1; l < layout.x + layout.y + 1; ++l) {
             const auto & sample = phone_full_detail[size_t(l)];
             std::printf(
-                "[CYCLE_PHONE_FULL_DETAIL] layer=%d chunks=%llu "
+                "[CYCLE_PHONE_FULL_DETAIL] side=PC layer=%d chunks=%llu "
                 "attn_call_ms=%.3f attn_fence_ms=%.3f "
                 "pool_checkout_prepare_ms=%.3f "
                 "local_ffn_copy_call_ms=%.3f ffn_fence_ms=%.3f "
@@ -5003,7 +5050,7 @@ static bool cycle_real_execute_period_fifo(
             }
             busy_sum_ms += worker.execute_ms;
             std::printf(
-                "[CYCLE_PERIOD_QUEUE_PROFILE] queue=%s tasks=%llu "
+                "[CYCLE_PERIOD_QUEUE_PROFILE] side=PC queue=%s tasks=%llu "
                 "execute_sum_ms=%.3f max_execute_ms=%.3f "
                 "ready_queue_wait_sum_ms=%.3f max_ready_queue_wait_ms=%.3f "
                 "worker_idle_sum_ms=%.3f idle_wakes=%llu\n",
@@ -5019,7 +5066,7 @@ static bool cycle_real_execute_period_fifo(
                     continue;
                 }
                 std::printf(
-                    "[CYCLE_PERIOD_STAGE_SUM] queue=%s stage=%s "
+                    "[CYCLE_PERIOD_STAGE_SUM] side=PC queue=%s stage=%s "
                     "count=%llu stage_sum_ms=%.3f max_stage_ms=%.3f\n",
                     llama_hybrid_cycle_queue_name(
                         static_cast<llama_hybrid_cycle_queue>(q)),
@@ -5059,20 +5106,22 @@ static bool cycle_real_execute_period_fifo(
             const auto & gpu = gpu_prepare_profile[q];
             if (gpu.count) {
                 std::printf(
-                    "[CYCLE_PERIOD_PHONE_FFN_PREP_SUM] queue=%s "
+                    "[CYCLE_PERIOD_PHONE_FFN_PREP_SUM] side=PC queue=%s "
                     "count=%llu graph_build_sum_ms=%.3f "
-                    "gpu_buffer_alloc_sum_ms=%.3f "
-                    "scope=PHONE_GPU_GRAPH_SETUP\n",
+                    "backend_prepare_call_sum_ms=%.3f "
+                    "scope=PC_PHONE_PROXY_PREPARE "
+                    "includes=BACKEND_ALLOC_AND_RPC_NOT_KERNEL_ONLY\n",
                     name, (unsigned long long)gpu.count,
                     gpu.graph_build_ms, gpu.gpu_buffer_alloc_ms);
             }
             const auto & fence = fence_profile[q];
             if (fence.calls) {
                 std::printf(
-                    "[CYCLE_PERIOD_PHONE_FENCE_SUM] queue=%s "
+                    "[CYCLE_PERIOD_PHONE_FENCE_SUM] side=PC queue=%s "
                     "count=%llu rpc_fence_wait_sum_ms=%.3f "
                     "max_fence_wait_ms=%.3f "
-                    "source=PHONE_SERVER_SYNCHRONIZE_ACK\n",
+                    "scope=PC_WAIT_FOR_PHONE_ACK "
+                    "includes=REMOTE_COMPLETION_AND_CONTROL_RPC\n",
                     name, (unsigned long long)fence.calls,
                     fence.wait_ms, fence.max_wait_ms);
             }
@@ -5086,7 +5135,7 @@ static bool cycle_real_execute_period_fifo(
                     llama_hybrid_cycle_stage::SEND_PARTIAL)];
                 if (ready.count || partial.count) {
                     std::printf(
-                        "[CYCLE_PERIOD_TRANSPORT_SUM] queue=%s "
+                        "[CYCLE_PERIOD_TRANSPORT_SUM] side=PC queue=%s "
                         "ready_count=%llu partial_count=%llu "
                         "ready_stage_sum_ms=%.3f partial_stage_sum_ms=%.3f "
                         "semantics=CALLBACK_AND_ACK_NOT_WIRE_ONLY\n",
@@ -5097,10 +5146,66 @@ static bool cycle_real_execute_period_fifo(
                 }
             }
         }
+        // Each queue's callback time is measured on PC. The PHONE_GPU
+        // queue is a host-side RPC proxy, NOT the phone GPU compute clock.
+        const auto & host_cpu = fifo_profile.queues[
+            static_cast<size_t>(llama_hybrid_cycle_queue::PC_CPU)];
+        const auto & host_cuda = fifo_profile.queues[
+            static_cast<size_t>(llama_hybrid_cycle_queue::PC_CUDA)];
+        const auto & remote_proxy = fifo_profile.queues[
+            static_cast<size_t>(llama_hybrid_cycle_queue::PHONE_GPU)];
+        const auto & c2p_worker = fifo_profile.queues[
+            static_cast<size_t>(llama_hybrid_cycle_queue::PC_TO_PHONE)];
+        const auto & p2c_worker = fifo_profile.queues[
+            static_cast<size_t>(llama_hybrid_cycle_queue::PHONE_TO_PC)];
+        std::printf(
+            "[CYCLE_PC_HOST_SUM] side=PC scope=FIFO_PERIOD "
+            "fifo_wall_ms=%.3f cpu_callback_sum_ms=%.3f "
+            "cuda_callback_sum_ms=%.3f "
+            "phone_rpc_proxy_callback_sum_ms=%.3f "
+            "c2p_transport_callback_sum_ms=%.3f "
+            "p2c_transport_callback_sum_ms=%.3f "
+            "semantics=PARALLEL_HOST_WORKER_CALLBACKS "
+            "cross_queue_addition=FORBIDDEN\n",
+            fifo_ms, host_cpu.execute_ms, host_cuda.execute_ms,
+            remote_proxy.execute_ms, c2p_worker.execute_ms,
+            p2c_worker.execute_ms);
+        const size_t phone_q =
+            static_cast<size_t>(llama_hybrid_cycle_queue::PHONE_GPU);
+        std::printf(
+            "[CYCLE_PC_REMOTE_PROXY_SUM] side=PC "
+            "scope=PHONE_GPU_QUEUE_CALLBACKS calls=%llu "
+            "callback_wall_sum_ms=%.3f "
+            "fence_ack_wait_sum_ms=%.3f "
+            "ffn_prepare_call_sum_ms=%.3f "
+            "subphases=SUBSETS_OF_CALLBACK_WALL "
+            "gpu_kernel_time=PHONE_SERVER_ONLY\n",
+            (unsigned long long)remote_proxy.tasks,
+            remote_proxy.execute_ms,
+            fence_profile[phone_q].wait_ms,
+            gpu_prepare_profile[phone_q].gpu_buffer_alloc_ms);
+        if (pc_cuda_full) {
+            for (int l = 0; l < layout.x; ++l) {
+                const auto & sample = pc_cuda_detail[size_t(l)];
+                std::printf(
+                    "[CYCLE_PC_CUDA_DETAIL] side=PC layer=%d chunks=%llu "
+                    "attn_call_sum_ms=%.3f "
+                    "ffn_prepare_call_sum_ms=%.3f "
+                    "ffn_execute_sync_sum_ms=%.3f "
+                    "lout_readback_sum_ms=%.3f "
+                    "max_full_task_wall_ms=%.3f "
+                    "semantics=HOST_WALL_CUDA_CALLS_AND_SYNC "
+                    "kernel_only=NOT_MEASURED\n",
+                    l, (unsigned long long)sample.chunks,
+                    sample.attn_call_ms, sample.ffn_prepare_call_ms,
+                    sample.ffn_execute_sync_ms, sample.lout_readback_ms,
+                    sample.task_wall_max_ms);
+            }
+        }
         // Queue times from different workers may overlap. Their sum is
         // never claimed to be an exposed end-to-end critical-path delay.
         std::printf(
-            "[CYCLE_PERIOD_PERF_SUM] fifo_wall_ms=%.3f "
+            "[CYCLE_PERIOD_PERF_SUM] side=PC fifo_wall_ms=%.3f "
             "phone_pool_release_ms=%.3f "
             "kv_release_ms=%.3f tx_idle_ms=%.3f wall_ms=%.3f "
             "queue_execute_sum_ms=%.3f "
