@@ -5809,7 +5809,10 @@ static bool cycle_real_execute_period_fifo(
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
     std::vector<size_t> attn_cached_at_fifo_end(size_t(n_layers), 0);
+    bool attn_scratch_session_drained = true;
     if (attn_scratch_reuse || pc_cuda_attn_graph_reuse) {
+        // FIFO workers have joined. FFN consumers must release READY before
+        // Graph bindings and Scratch leases may be reused or destroyed.
         for (auto & layer_states : states) {
             for (auto & st : layer_states) st->ready.release_phone_graph();
         }
@@ -5817,7 +5820,26 @@ static bool cycle_real_execute_period_fifo(
             if (!attn_scratch[size_t(l)]) continue;
             auto & pool = *attn_scratch[size_t(l)];
             attn_cached_at_fifo_end[size_t(l)] = pool.idle.size();
-            pool.clear();
+            const bool session_layer =
+                attn_scratch_session_reuse && l > layout.x;
+            if (session_layer) {
+                const bool drained = pool.active.empty();
+                attn_scratch_session_drained =
+                    attn_scratch_session_drained && drained;
+                if (!drained) {
+                    std::fprintf(stderr,
+                        "[CYCLE_ATTN_SCRATCH_SESSION] phase=%s layer=%d "
+                        "status=FAIL reason=ACTIVE_LEASE_AT_PERIOD_END "
+                        "active=%zu\n", run_phase, l, pool.active.size());
+                }
+                if (!succeeded || !drained) {
+                    // A failed period may not recycle potentially stale
+                    // physical buffers into a subsequent Cycle.
+                    pool.clear();
+                }
+            } else {
+                pool.clear();
+            }
         }
     }
     const auto attn_scratch_release_done = std::chrono::steady_clock::now();
@@ -5945,7 +5967,8 @@ static bool cycle_real_execute_period_fifo(
     }
     const bool output_ok = succeeded && nonfinite == 0 && max_abs > 0.0;
     const bool execution_ok =
-        succeeded && kv_ok && net_idle && output_ok && c2p_session_drained;
+        succeeded && kv_ok && net_idle && output_ok &&
+        c2p_session_drained && attn_scratch_session_drained;
     // Compare only a COMPLETED period. Never claim CPU parity from a
     // partially filled final_output after a failed stage or transport.
     const bool parity_ok = execution_ok &&
@@ -6044,6 +6067,22 @@ static bool cycle_real_execute_period_fifo(
     if (attn_scratch_reuse) {
         for (int l = layout.x + 1; l < n_layers; ++l) {
             const auto & pool = *attn_scratch[size_t(l)];
+            const auto & before = attn_scratch_start[size_t(l)];
+            const uint64_t allocs = pool.allocations - before.allocations;
+            const uint64_t hits = pool.hits - before.hits;
+            const uint64_t evictions = pool.evictions - before.evictions;
+            const uint64_t fallbacks = pool.fallbacks - before.fallbacks;
+            const uint64_t returned = pool.recycled - before.recycled;
+            const uint64_t bind_failures =
+                pool.bind_failures - before.bind_failures;
+            const double query_ms =
+                pool.size_query_ms - before.size_query_ms;
+            const double alloc_ms =
+                pool.buffer_alloc_ms - before.buffer_alloc_ms;
+            const double bind_ms =
+                pool.graph_bind_ms - before.graph_bind_ms;
+            const double free_ms =
+                pool.buffer_free_ms - before.buffer_free_ms;
             std::printf(
                 "[CYCLE_ATTN_SCRATCH_POOL_SUM] phase=%s layer=%d "
                 "enabled=1 max_slots=%zu peak_slots=%zu "
@@ -6052,26 +6091,47 @@ static bool cycle_real_execute_period_fifo(
                 "cached_at_fifo_end=%zu "
                 "size_query_ms=%.3f rpc_alloc_ms=%.3f "
                 "graph_bind_ms=%.3f rpc_free_ms=%.3f "
-                "graph_mode=%s kv_mode=%s\n",
+                "graph_mode=%s kv_mode=%s scratch_owner=%s\n",
                 run_phase, l, pool.max_slots, pool.peak_slots,
-                (unsigned long long)pool.allocations,
-                (unsigned long long)pool.hits,
-                (unsigned long long)pool.evictions,
-                (unsigned long long)pool.fallbacks,
-                (unsigned long long)pool.recycled,
-                (unsigned long long)pool.bind_failures,
+                (unsigned long long)allocs, (unsigned long long)hits,
+                (unsigned long long)evictions,
+                (unsigned long long)fallbacks,
+                (unsigned long long)returned,
+                (unsigned long long)bind_failures,
                 pool.active.size(), attn_cached_at_fifo_end[size_t(l)],
-                pool.size_query_ms, pool.buffer_alloc_ms,
-                pool.graph_bind_ms, pool.buffer_free_ms,
+                query_ms, alloc_ms, bind_ms, free_ms,
                 attn_graph_reuse ? "SESSION_CACHE_BY_KV_SHAPE" :
                     "REBUILT_EACH_CHUNK",
                 attn_graph_reuse ? "SESSION_PHYSICAL_RESET_PER_PERIOD" :
-                    "PER_CYCLE");
+                    "PER_CYCLE",
+                attn_scratch_session_reuse ? "PHONE_SESSION" : "PERIOD");
+            if (attn_scratch_session_reuse) {
+                std::printf(
+                    "[CYCLE_ATTN_SCRATCH_SESSION_SUM] "
+                    "phase=%s layer=%d start_slots=%zu "
+                    "allocs=%llu hits=%llu evictions=%llu "
+                    "fallbacks=%llu returned=%llu "
+                    "bind_failures=%llu end_slots=%zu active=%zu "
+                    "max_slots=%zu drained=%d status=%s\n",
+                    run_phase, l, before.start_slots,
+                    (unsigned long long)allocs,
+                    (unsigned long long)hits,
+                    (unsigned long long)evictions,
+                    (unsigned long long)fallbacks,
+                    (unsigned long long)returned,
+                    (unsigned long long)bind_failures,
+                    pool.idle.size(), pool.active.size(), pool.max_slots,
+                    pool.active.empty() ? 1 : 0,
+                    (succeeded && attn_scratch_session_drained) ?
+                        "OK" : "FAIL");
+            }
         }
         std::printf(
             "[CYCLE_ATTN_SCRATCH_RELEASE_SUM] phase=%s "
-            "release_ms=%.3f included_in=PERIOD_WALL\n",
-            run_phase, attn_scratch_release_ms);
+            "release_ms=%.3f included_in=PERIOD_WALL scope=%s\n",
+            run_phase, attn_scratch_release_ms,
+            attn_scratch_session_reuse ?
+                "LEASE_RETIRE_ONLY" : "POOL_FREE");
     }
     if (c2p_ffn_reuse) {
         std::printf(
