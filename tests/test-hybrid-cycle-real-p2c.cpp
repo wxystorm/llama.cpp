@@ -4391,20 +4391,58 @@ static bool cycle_real_execute_period_fifo(
     }
     std::vector<std::unique_ptr<cycle_real_phone_kv_cache>> kv;
     kv.reserve(size_t(n_layers));
+    std::vector<cycle_real_attention_graph_cache *> graph_cache_by_layer(
+        size_t(n_layers), nullptr);
+    struct graph_cache_snapshot {
+        uint64_t hits = 0, misses = 0, prepares = 0;
+        uint64_t busy_misses = 0, capacity_misses = 0;
+        uint64_t returned = 0, aborted = 0;
+    };
+    std::vector<graph_cache_snapshot> graph_cache_start(size_t(n_layers));
     for (int l = 0; l < n_layers; ++l) {
-        auto cache = std::make_unique<cycle_real_phone_kv_cache>();
-        const bool pc_source = l <= layout.x;
-        const bool cuda_layer = pc_cuda_full && l < layout.x;
-        if (n_chunks > 1 &&
-            !cache->init(cuda_layer ? pc_cuda.backend :
-                         (pc_source ? cpu : phone),
-                         model.layers[size_t(l)], tokens,
-                         pc_source ? 0 : 1,
-                         cuda_layer ? pc_cuda.weights[size_t(l)].get() : nullptr)) {
-            std::fprintf(stderr,
-                "[CYCLE_PERIOD] status=FAIL reason=KV_ALLOC layer=%d\n", l);
-            ggml_backend_free(cpu);
-            return false;
+        const bool is_phone_graph_layer = attn_graph_reuse && l > layout.x;
+        std::unique_ptr<cycle_real_phone_kv_cache> cache;
+        if (is_phone_graph_layer) {
+            auto & session_kv = phone_full_session->phone_kv[size_t(l)];
+            cache = std::move(session_kv);
+            if (cache && (cache->committed_tokens != 0 ||
+                          cache->max_tokens != tokens ||
+                          (n_chunks > 1 && (!cache->keys || !cache->values)))) {
+                std::fprintf(stderr,
+                    "[CYCLE_ATTN_GRAPH_CACHE] phase=%s layer=%d "
+                    "status=FAIL reason=INVALID_SESSION_KV_STATE\n",
+                    run_phase, l);
+                session_kv = std::move(cache);
+                ggml_backend_free(cpu);
+                return false;
+            }
+            auto * gc = phone_full_session->attn_graphs[size_t(l)].get();
+            graph_cache_by_layer[size_t(l)] = gc;
+            auto & before = graph_cache_start[size_t(l)];
+            before.hits = gc->hits;
+            before.misses = gc->misses;
+            before.prepares = gc->prepares;
+            before.busy_misses = gc->busy_misses;
+            before.capacity_misses = gc->capacity_misses;
+            before.returned = gc->returned;
+            before.aborted = gc->aborted;
+        }
+        if (!cache) {
+            cache = std::make_unique<cycle_real_phone_kv_cache>();
+            const bool pc_source = l <= layout.x;
+            const bool cuda_layer = pc_cuda_full && l < layout.x;
+            if (n_chunks > 1 &&
+                !cache->init(cuda_layer ? pc_cuda.backend :
+                             (pc_source ? cpu : phone),
+                             model.layers[size_t(l)], tokens,
+                             pc_source ? 0 : 1,
+                             cuda_layer ?
+                                 pc_cuda.weights[size_t(l)].get() : nullptr)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PERIOD] status=FAIL reason=KV_ALLOC layer=%d\n", l);
+                ggml_backend_free(cpu);
+                return false;
+            }
         }
         kv.push_back(std::move(cache));
     }
@@ -4801,7 +4839,8 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                nullptr, attn_scratch[size_t(l)].get());
+                                nullptr, attn_scratch[size_t(l)].get(),
+                                graph_cache_by_layer[size_t(l)]);
                         if (perf_mode) {
                             ++full_detail.chunks;
                             full_detail.attn_call_ms +=
@@ -5103,7 +5142,8 @@ static bool cycle_real_execute_period_fifo(
                                 n_chunks > 1 ? kv[size_t(l)].get() : nullptr,
                                 st.start, 1, local_input, true,
                                 perf_mode ? &attn_profile[queue_index] : nullptr,
-                                nullptr, attn_scratch[size_t(l)].get());
+                                nullptr, attn_scratch[size_t(l)].get(),
+                                graph_cache_by_layer[size_t(l)]);
                         if (ok) {
                             ok = cycle_real_explicit_phone_fence(
                                 phone, perf_mode ? &fence_profile[queue_index] : nullptr);
@@ -5452,7 +5492,19 @@ static bool cycle_real_execute_period_fifo(
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
             kv[size_t(l)]->committed_tokens == tokens);
-        kv[size_t(l)]->release();
+        if (attn_graph_reuse && l > layout.x) {
+            auto * gc = graph_cache_by_layer[size_t(l)];
+            kv_ok = kv_ok && gc && gc->is_idle();
+            // Every chunk's K/V has been written and consumed, and all
+            // phone FIFO callbacks have finished. Reset the logical KV
+            // prefix, NOT its tensor or physical RPC buffer. Cached Graphs
+            // must continue referencing these exact tensors next period.
+            kv[size_t(l)]->committed_tokens = 0;
+            phone_full_session->phone_kv[size_t(l)] =
+                std::move(kv[size_t(l)]);
+        } else {
+            kv[size_t(l)]->release();
+        }
     }
     const auto kv_release_done = std::chrono::steady_clock::now();
     const bool net_idle =
