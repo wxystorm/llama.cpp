@@ -11,14 +11,15 @@
 #include <map>
 #include <vector>
 
-// First-stage Attention optimization: cache ONLY a physical GPU scratch
-// buffer, NOT ggml_context, ggml_cgraph, positions, causal mask or KV.
-// Each new Attention graph rebinds its tensors into an idle allocation.
+// Cache ONLY a physical backend scratch buffer, NOT ggml_context,
+// ggml_cgraph, positions, causal mask, READY activations or KV. Cached
+// Attention graph metadata is independently rebound to each idle lease.
 //
-// One instance per physical Phone layer, used by the single PHONE_GPU FIFO
-// worker. A lease is released only once FFN has consumed READY tensors.
-// All leases must be returned before clearing the pool or freeing the GPU
-// RPC backend. This pool intentionally does not cross Cycle boundaries.
+// One pool per physical layer, accessed by its single FIFO worker. A
+// lease is recycled only after the FFN consumer has completed and fenced.
+// By default the pool is per-Cycle; opt-in Phone Session ownership retains
+// idle allocations across Warmup/Measure without pinning them to Graphs.
+// Every lease must be returned before the pool or backend is destroyed.
 struct cycle_real_attention_scratch_pool {
     struct slot {
         ggml_backend_buffer_t buffer = nullptr;
