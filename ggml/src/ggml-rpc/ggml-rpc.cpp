@@ -2415,6 +2415,128 @@ bool ggml_backend_rpc_cycle_send_partial(
         uint32_t(partial->ne[0]), 0);
 }
 
+// Register the next Phone-local FFN continuation while READY's attention
+// tensor buffers and the reusable FFN slot still have stable remote IDs.
+bool ggml_backend_rpc_cycle_arm_p2c_ffn(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id, uint64_t ffn_graph_uid,
+        const ggml_tensor * source_norm, const ggml_tensor * source_ids,
+        const ggml_tensor * source_weights,
+        const ggml_tensor * ffn_norm, const ggml_tensor * ffn_ids,
+        const ggml_tensor * ffn_weights,
+        const ggml_tensor * ffn_partial) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0 || ffn_graph_uid == 0 || !source_norm ||
+        !source_ids || !source_weights || !ffn_norm ||
+        !ffn_ids || !ffn_weights || !ffn_partial) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 27) {
+        GGML_LOG_ERROR("[CYCLE_P2C_LOCAL] action=ARM status=FAIL "
+                       "reason=PHONE_RPC_PATCH27_REQUIRED\n");
+        return false;
+    }
+    const int64_t hidden = source_norm->ne[0];
+    const int64_t tokens = source_norm->ne[1];
+    if (hidden <= 0 || hidden > 65536 || tokens <= 0 || tokens > 128 ||
+        source_norm->type != GGML_TYPE_F32 ||
+        ffn_partial->type != GGML_TYPE_F32 ||
+        ffn_norm->type != GGML_TYPE_F32 ||
+        source_ids->type != GGML_TYPE_I32 ||
+        ffn_ids->type != GGML_TYPE_I32 ||
+        source_weights->type != GGML_TYPE_F32 ||
+        ffn_weights->type != GGML_TYPE_F32 ||
+        ggml_nelements(ffn_partial) != hidden * tokens ||
+        ggml_nelements(ffn_norm) != hidden * tokens ||
+        ggml_nelements(source_ids) != ggml_nelements(ffn_ids) ||
+        ggml_nelements(source_weights) != ggml_nelements(ffn_weights) ||
+        ggml_nelements(source_ids) != ggml_nelements(source_weights) ||
+        !ggml_are_same_shape(source_norm, ffn_norm)) {
+        return false;
+    }
+
+    rpc_msg_inference_cycle_p2c_arm_req request {};
+    request.partial.device = ctx->device;
+    request.partial.kind = INFERENCE_CYCLE_PARTIAL;
+    request.partial.layer = layer;
+    request.partial.chunk = chunk;
+    request.partial.seq = seq;
+    request.partial.graph_id = graph_id;
+    request.partial.tokens = uint32_t(tokens);
+    request.partial.hidden = uint32_t(hidden);
+    request.partial.topk = 0;
+    request.ffn_graph_uid = ffn_graph_uid;
+    const ggml_tensor * sources[3] = {
+        source_norm, source_ids, source_weights,
+    };
+    const ggml_tensor * destinations[3] = {
+        ffn_norm, ffn_ids, ffn_weights,
+    };
+    const ggml_tensor * tensors[7] = {
+        source_norm, source_ids, source_weights,
+        ffn_norm, ffn_ids, ffn_weights, ffn_partial,
+    };
+    for (const ggml_tensor * tensor : tensors) {
+        if (!tensor || !tensor->buffer ||
+            !ggml_backend_buffer_is_rpc(tensor->buffer) ||
+            !ggml_is_contiguous(tensor)) return false;
+        auto * buf = static_cast<ggml_backend_rpc_buffer_context *>(
+            tensor->buffer->context);
+        if (!buf || buf->endpoint != ctx->endpoint ||
+            buf->device != ctx->device) return false;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (sources[i]->type != destinations[i]->type ||
+            !ggml_are_same_shape(sources[i], destinations[i]) ||
+            ggml_nbytes(sources[i]) != ggml_nbytes(destinations[i])) {
+            return false;
+        }
+        request.ready_inputs[i] = serialize_tensor(sources[i]);
+        request.ffn_inputs[i] = serialize_tensor(destinations[i]);
+    }
+    request.partial.tensors[0] = serialize_tensor(ffn_partial);
+    auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_P2C_ARM,
+        &request, sizeof(request), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO(
+        "[CYCLE_P2C_LOCAL] side=PC action=ARM layer=%d chunk=%d "
+        "seq=%" PRIu64 " graph_uid=%" PRIu64 " status=%s\n",
+        layer, chunk, seq, ffn_graph_uid, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool ggml_backend_rpc_cycle_wait_p2c_ffn(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto sock = ctx ? get_socket(ctx->endpoint) : nullptr;
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 27)
+        return false;
+    rpc_msg_inference_cycle_p2c_wait_req request {};
+    request.layer = layer;
+    request.chunk = chunk;
+    request.seq = seq;
+    request.graph_id = graph_id;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const int64_t t0 = ggml_time_us();
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_P2C_WAIT,
+        &request, sizeof(request), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO(
+        "[CYCLE_P2C_LOCAL] side=PC action=WAIT_PARTIAL_STAGED "
+        "layer=%d chunk=%d seq=%" PRIu64 " wait_ms=%.3f "
+        "status=%s\n",
+        layer, chunk, seq, (ggml_time_us() - t0) / 1000.0,
+        ok ? "OK" : "FAIL");
+    return ok;
+}
+
 bool ggml_backend_rpc_cycle_send_ack(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id,
