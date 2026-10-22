@@ -3061,6 +3061,9 @@ struct cycle_real_c2p_phone_chunk {
     bool is_full_layer = false;
     bool fused_full_graph = false;
     bool rpc_full_replay = false;
+    // Nonzero only when the persistent, fused Full-layer FFN+ADD graph
+    // has been registered on this Phone RPC backend without executing.
+    uint64_t registered_full_graph_uid = 0;
     // Persisted FFN/Reduce graph is safe to replay ONLY for the same
     // physical layer (owned by its per-layer pool) and token shape.
     int64_t prepared_tokens = 0;
@@ -3084,6 +3087,7 @@ struct cycle_real_c2p_phone_chunk {
         is_full_layer = false;
         fused_full_graph = false;
         rpc_full_replay = false;
+        registered_full_graph_uid = 0;
         prepared_tokens = 0;
         reduce_graph_call_ms = 0.0;
         reduce_backend_sync_ms = 0.0;
@@ -3094,7 +3098,8 @@ struct cycle_real_c2p_phone_chunk {
             const llama_hybrid_cycle_ffn_shard_weights & shard,
             int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
             bool full_layer = false, bool fuse_full = false,
-            bool enable_rpc_replay = false) {
+            bool enable_rpc_replay = false,
+            bool enable_phone_full_local = false) {
         const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
@@ -3107,6 +3112,14 @@ struct cycle_real_c2p_phone_chunk {
         is_full_layer = full_layer;
         fused_full_graph = full_layer && fuse_full;
         rpc_full_replay = full_layer && enable_rpc_replay;
+        if (enable_phone_full_local &&
+            (!is_full_layer || !fused_full_graph || !rpc_full_replay)) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_FULL_LOCAL] phase=PREPARE "
+                "status=FAIL reason=REQUIRES_FUSED_FULL_GRAPH_AND_REPLAY\n");
+            release();
+            return false;
+        }
         inputs = llama_hybrid_cycle_make_ffn_graph_inputs(ctx, hidden, tokens, topk);
         residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         if (!full_layer) {
@@ -3173,6 +3186,20 @@ struct cycle_real_c2p_phone_chunk {
             release();
             return false;
         }
+        // Registration creates the server-side FFN/Reduce graph ONCE per
+        // physical slot/shape. It does not run with uninitialized inputs.
+        // The existing pool keeps both graph UID and GPU buffers alive
+        // until the final downstream Attention has consumed l_out.
+        if (enable_phone_full_local) {
+            if (!ggml_backend_rpc_cycle_register_graph(phone, ffn_graph)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_FULL_LOCAL] phase=REGISTER "
+                    "status=FAIL reason=REMOTE_GRAPH_REGISTER\n");
+                release();
+                return false;
+            }
+            registered_full_graph_uid = ffn_graph->uid;
+        }
         const auto alloc_end = std::chrono::steady_clock::now();
         graph_build_ms = std::chrono::duration<double, std::milli>(
             build_end - build_begin).count();
@@ -3204,6 +3231,32 @@ struct cycle_real_c2p_phone_chunk {
         return executor.execute(
             empty_f32.data(), 0, empty_i32.data(), 0,
             empty_f32.data(), 0, nullptr, 0, &ready.phone_graph);
+    }
+
+    // One ordered RPC completion instead of four COPY_TENSOR transactions,
+    // a client Graph submit and a separate explicit GPU Fence. Attention
+    // output is already resident on Phone; it never returns through PC.
+    bool execute_full_server(
+            ggml_backend_t phone,
+            const cycle_real_phone_ready & ready,
+            int layer, int chunk, uint64_t seq) {
+        if (!is_full_layer || !fused_full_graph ||
+            registered_full_graph_uid == 0 || !residual ||
+            !inputs.norm || !inputs.topk_ids || !inputs.topk_weights) {
+            return false;
+        }
+        const ggml_tensor * const sources[4] = {
+            ready.phone_graph.residual,
+            ready.phone_graph.ffn_norm,
+            ready.phone_graph.topk_ids,
+            ready.phone_graph.topk_weights,
+        };
+        const ggml_tensor * const destinations[4] = {
+            residual, inputs.norm, inputs.topk_ids, inputs.topk_weights,
+        };
+        return ggml_backend_rpc_cycle_run_phone_full(
+            phone, layer, chunk, seq, registered_full_graph_uid,
+            sources, destinations);
     }
 
     bool execute_ffn() {
