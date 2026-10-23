@@ -26,6 +26,7 @@
 #include "llama-hybrid-cycle-attention.h"
 #include "llama-hybrid-cycle-wire.h"
 #include "llama-hybrid-cycle-phone-executor.h"
+#include "llama-hybrid-cycle-p2c-ffn.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -726,12 +727,7 @@ struct cycle_real_ffn_stages {
 // CPU-observed FFN graph build / buffer prepare / execute call times.
 // For Phone RPC the execute call is a submission, NOT the server kernel
 // duration. C2P/Phone-full GPU setup is profiled separately.
-struct cycle_real_ffn_phase_profile {
-    uint64_t count = 0;
-    double graph_build_ms = 0.0;
-    double backend_prepare_ms = 0.0;
-    double backend_execute_call_ms = 0.0;
-};
+using cycle_real_ffn_phase_profile = llama_hybrid_cycle_ffn_phase_profile;
 
 static bool cycle_real_execute_ffn(
         ggml_backend_t backend,
@@ -2462,118 +2458,11 @@ struct cycle_real_c2p_ffn_session_pool {
 // no separate lock or speculative graph execution is needed. Its output
 // becomes independent of this GPU buffer once the Phone server has
 // read it into the transport TX slot (SEND_PARTIAL returns success).
-struct cycle_real_p2c_ffn_slot {
-    ggml_context * ctx = nullptr;
-    llama_hybrid_cycle_ffn_executor executor;
-    llama_hybrid_cycle_ffn_graph inputs {};
-    int64_t prepared_tokens = 0;
-    uint64_t registered_graph_uid = 0;
-    double graph_build_ms = 0.0;
-    double backend_prepare_ms = 0.0;
-    double last_execute_call_ms = 0.0;
-    double last_send_partial_rpc_ms = 0.0;
-
-    cycle_real_p2c_ffn_slot() = default;
-    cycle_real_p2c_ffn_slot(const cycle_real_p2c_ffn_slot &) = delete;
-    cycle_real_p2c_ffn_slot & operator=(const cycle_real_p2c_ffn_slot &) = delete;
-    ~cycle_real_p2c_ffn_slot() { release(); }
-
-    void release() {
-        executor.reset(); // Free the remote buffer before its graph context.
-        if (ctx) {
-            ggml_free(ctx);
-            ctx = nullptr;
-        }
-        inputs = {};
-        prepared_tokens = 0;
-        registered_graph_uid = 0;
-        graph_build_ms = 0.0;
-        backend_prepare_ms = 0.0;
-        last_execute_call_ms = 0.0;
-        last_send_partial_rpc_ms = 0.0;
-    }
-
-    bool prepare(ggml_backend_t phone,
-                 const llama_hybrid_cycle_ffn_shard_weights & shard,
-                 int64_t hidden, int64_t tokens, int64_t topk,
-                 int64_t experts, bool phone_local_chain = false) {
-        release();
-        const auto build_begin = std::chrono::steady_clock::now();
-        ggml_init_params params {};
-        params.mem_size = 2 * 1024 * 1024;
-        params.no_alloc = true;
-        ctx = ggml_init(params);
-        if (!ctx) return false;
-
-        // Exactly the same physical FFN shard graph as the uncached
-        // cycle_real_execute_ffn() path (no residual ADD / Meta allreduce).
-        inputs = llama_hybrid_cycle_make_ffn_graph_inputs(
-            ctx, hidden, tokens, topk);
-        if (!llama_hybrid_cycle_build_moe_ffn_graph(
-                ctx, inputs, shard, hidden, tokens, topk)) {
-            release();
-            return false;
-        }
-        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
-        ggml_build_forward_expand(graph, inputs.ffn_output);
-        const uint64_t phone_local_graph_uid = phone_local_chain ?
-            llama_hybrid_cycle_graph_replay_uid() : 0;
-        if (phone_local_chain) {
-            // A fresh UID owns precisely this retained Graph/Buffer Slot.
-            ggml_graph_set_uid(graph, phone_local_graph_uid);
-        }
-        const auto build_end = std::chrono::steady_clock::now();
-        const bool ok = executor.prepare(
-            phone, ctx, graph, inputs, shard, hidden, tokens, topk, experts);
-        const auto prepare_end = std::chrono::steady_clock::now();
-        graph_build_ms = std::chrono::duration<double, std::milli>(
-            build_end - build_begin).count();
-        backend_prepare_ms = std::chrono::duration<double, std::milli>(
-            prepare_end - build_end).count();
-        if (!ok) {
-            release();
-            return false;
-        }
-        if (phone_local_chain) {
-            if (!ggml_backend_rpc_cycle_register_graph(phone, graph)) {
-                release();
-                return false;
-            }
-            registered_graph_uid = phone_local_graph_uid;
-        }
-        prepared_tokens = tokens;
-        return true;
-    }
-
-    bool execute_and_send(ggml_backend_t phone,
-                          const llama_hybrid_cycle_ready_graph & ready,
-                          const cycle_real_live_wire & wire,
-                          cycle_real_ffn_phase_profile * profile) {
-        if (!ctx || prepared_tokens <= 0 || !inputs.ffn_output) return false;
-        // Each chunk has fresh Norm, TopK ids and TopK weights. The executor
-        // copies these from the corresponding Phone Attention buffers.
-        const auto execute_begin = std::chrono::steady_clock::now();
-        const bool computed = executor.execute(
-            nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, &ready);
-        const auto execute_done = std::chrono::steady_clock::now();
-        last_execute_call_ms =
-            std::chrono::duration<double, std::milli>(
-                execute_done - execute_begin).count();
-        if (profile) {
-            profile->backend_execute_call_ms += last_execute_call_ms;
-        }
-        last_send_partial_rpc_ms = 0.0;
-        if (!computed) return false;
-        // This RPC command synchronously reads GPU output and copies it
-        // into the independent Phone TX slot before acknowledging success.
-        // The slot can then be overwritten for another chunk while TX runs.
-        const bool sent = ggml_backend_rpc_cycle_send_partial(
-            phone, wire.layer, wire.chunk, wire.seq, wire.graph_id,
-            inputs.ffn_output);
-        last_send_partial_rpc_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - execute_done).count();
-        return sent;
+// Test binds ggml-rpc, while the physical FFN slot is owned by libllama.
+struct cycle_real_p2c_ffn_slot : llama_hybrid_cycle_p2c_ffn_slot {
+    cycle_real_p2c_ffn_slot() {
+        rpc_ops.register_graph = &ggml_backend_rpc_cycle_register_graph;
+        rpc_ops.send_partial = &ggml_backend_rpc_cycle_send_partial;
     }
 };
 

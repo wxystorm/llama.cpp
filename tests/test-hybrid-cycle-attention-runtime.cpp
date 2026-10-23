@@ -1,6 +1,7 @@
 #include "llama-hybrid-cycle-attention.h"
 #include "llama-hybrid-cycle-wire.h"
 #include "llama-hybrid-cycle-phone-executor.h"
+#include "llama-hybrid-cycle-p2c-ffn.h"
 #include "llama-model.h"
 
 #include <cassert>
@@ -45,6 +46,15 @@ int main() {
     phone_slot.release();
     assert(phone_slot.registered_full_graph_uid == 0);
     assert(phone_slot.output == nullptr);
+    llama_hybrid_cycle_p2c_ffn_slot p2c_slot;
+    llama_hybrid_cycle_ready_graph no_ready {};
+    llama_hybrid_cycle_live_wire p2c_wire {7, 0, 1, 1};
+    assert(!p2c_slot.execute_and_send(
+        nullptr, no_ready, p2c_wire, nullptr));
+    p2c_slot.registered_graph_uid = 321;
+    p2c_slot.release();
+    assert(p2c_slot.registered_graph_uid == 0);
+
 
     // Invalid READY shape must be rejected before any transport backend
     // proc is invoked (including when Phone is unavailable).

@@ -7,6 +7,8 @@
 // against the ggml-rpc plugin; the caller binds its loaded plugin functions.
 struct llama_hybrid_cycle_phone_rpc_ops {
     bool (*register_graph)(ggml_backend_t, const ggml_cgraph *) = nullptr;
+    bool (*send_partial)(ggml_backend_t, int32_t, int32_t, uint64_t, uint64_t,
+                         const ggml_tensor *) = nullptr;
     bool (*run_full)(ggml_backend_t, int32_t, int32_t, uint64_t, uint64_t,
                      const ggml_tensor * const[4],
                      const ggml_tensor * const[4]) = nullptr;
