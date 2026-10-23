@@ -14057,9 +14057,10 @@ struct rpc_cycle_p2c_fifo_v1 {
             });
         auto found = p2c_v6_ready_result.find(k);
         if (!signaled || found == p2c_v6_ready_result.end()) return false;
-        const bool result = found->second;
-        p2c_v6_ready_result.erase(found);
-        return result;
+        // Keep READY published until the final FFN completion WAIT.
+        // Otherwise the worker may reinsert a false result after READY
+        // has already been consumed while it is still running FFN.
+        return found->second;
     }
 
     bool wait_c2p_reduce(const key & k) {
@@ -14291,6 +14292,7 @@ struct rpc_cycle_p2c_fifo_v1 {
         }
         bool ok = done->second;
         completed.erase(done);
+        p2c_v6_ready_result.erase(k);
         return ok;
     }
     void run() {
