@@ -37,6 +37,13 @@
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
+// All Phone path durations use ONLY the Phone server's monotonic clock.
+// No PC/Phone clock offset estimation or extra synchronization RPCs.
+static bool rpc_cycle_critical_path_enabled() {
+    const char * v = std::getenv("GGML_CYCLE_CRITICAL_PATH");
+    return v && std::strcmp(v, "1") == 0;
+}
+
 static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 static constexpr size_t RPC_RETURN_TRANSFER_LANES = 2;
 
@@ -13828,6 +13835,7 @@ struct rpc_cycle_p2c_fifo_v1 {
         rpc_msg_inference_cycle_v5_c2p_arm_req c2p_v5 {};
         rpc_msg_inference_cycle_v6_p2c_req p2c_v6 {};
         bool region_has_p2c = false;
+        int64_t main_admit_us = 0; // Phone local event, propagated L4..L7.
     };
     struct c2p_v5_state {
         rpc_msg_inference_cycle_v5_c2p_arm_req arm {};
@@ -13843,6 +13851,10 @@ struct rpc_cycle_p2c_fifo_v1 {
         bool reduce_queued = false;
         bool reduce_done = false;
         bool reduce_failed = false;
+        int64_t ready_gpu_us = 0;
+        int64_t ffn_done_us = 0;
+        int64_t pc_partial_gpu_us = 0;
+        int64_t region_registered_us = 0;
     };
     rpc_server & server;
     bool enabled;
@@ -13977,6 +13989,8 @@ struct rpc_cycle_p2c_fifo_v1 {
         }
         it->second.region = req.region;
         it->second.region_registered = true;
+        if (rpc_cycle_critical_path_enabled())
+            it->second.region_registered_us = ggml_time_us();
         admit_c2p_reduces_locked();
         GGML_LOG_INFO(
             "[CYCLE_PHONE_V5] side=PHONE event=REGION_REGISTERED "
@@ -13993,10 +14007,14 @@ struct rpc_cycle_p2c_fifo_v1 {
         if (partial) {
             if (s.partial_applied) return false;
             s.partial_applied = true;
+            if (rpc_cycle_critical_path_enabled())
+                s.pc_partial_gpu_us = ggml_time_us();
             admit_c2p_reduces_locked();
         } else {
             if (s.ready_applied || s.ffn_queued) return false;
             s.ready_applied = true;
+            if (rpc_cycle_critical_path_enabled())
+                s.ready_gpu_us = ggml_time_us();
             s.ffn_queued = true;
             job ff {};
             ff.id = k;
@@ -14037,6 +14055,24 @@ struct rpc_cycle_p2c_fifo_v1 {
             task.type = kind::C2P_V5_REDUCE;
             task.c2p_v5 = s.arm;
             task.enqueue_us = ggml_time_us();
+            if (rpc_cycle_critical_path_enabled()) {
+                const auto elapsed = [&](int64_t then_us) -> double {
+                    return then_us > 0 ?
+                        (task.enqueue_us - then_us) / 1000.0 : -1.0;
+                };
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_PATH_JOIN] layer=%d chunk=%d "
+                    "seq=%" PRIu64 " "
+                    "ready_to_admit_ms=%.3f ffn_to_admit_ms=%.3f "
+                    "pc_partial_to_admit_ms=%.3f "
+                    "region_to_admit_ms=%.3f "
+                    "prerequisites=GPU_READY_FFN_DONE_PC_PARTIAL_REGION "
+                    "clock_scope=PHONE_MONOTONIC\n",
+                    s.arm.layer, s.arm.chunk, s.arm.seq,
+                    elapsed(s.ready_gpu_us), elapsed(s.ffn_done_us),
+                    elapsed(s.pc_partial_gpu_us),
+                    elapsed(s.region_registered_us));
+            }
             jobs.push_back(std::move(task));
             ++jobs_started;
             ++v5_next_reduce_chunk;
@@ -14192,7 +14228,8 @@ struct rpc_cycle_p2c_fifo_v1 {
     bool enqueue_phone_region(
             const rpc_msg_inference_cycle_phone_region_req & request,
             bool v5_main = false,
-            const rpc_msg_inference_cycle_v6_p2c_req * p2c = nullptr) {
+            const rpc_msg_inference_cycle_v6_p2c_req * p2c = nullptr,
+            int64_t main_admit_us = 0) {
         const auto & first = request.stages[0];
         const auto & second = request.stages[1];
         const key a {first.layer, first.chunk, first.seq, first.graph_id};
@@ -14253,6 +14290,7 @@ struct rpc_cycle_p2c_fifo_v1 {
         next.region_next = second;
         next.region_has_next = true;
         next.v5_main_continuation = v5_main;
+        next.main_admit_us = main_admit_us;
         next.region_has_p2c = p2c != nullptr;
         if (p2c) next.p2c_v6 = *p2c;
         next.enqueue_us = ggml_time_us();
@@ -14368,7 +14406,8 @@ struct rpc_cycle_p2c_fifo_v1 {
                             }
                         }
                         if (ok) ok = enqueue_phone_region(
-                            region, true, has_p2c ? &p2c : nullptr);
+                            region, true, has_p2c ? &p2c : nullptr,
+                            item.enqueue_us);
                     }
                     GGML_LOG_INFO(
                         "[CYCLE_PHONE_V5] side=PHONE event=MAIN_REDUCE_DONE "
@@ -14439,6 +14478,27 @@ struct rpc_cycle_p2c_fifo_v1 {
                         (ffn_done - ffn_input_ready) / 1000.0,
                         (t3 - ffn_done) / 1000.0,
                         ok ? "OK" : "FAIL");
+                    if (rpc_cycle_critical_path_enabled()) {
+                        const double main_to_ready = item.main_admit_us > 0 ?
+                            (ready_staged_us - item.main_admit_us) /
+                                1000.0 : -1.0;
+                        const double main_to_partial = item.main_admit_us > 0 ?
+                            (t3 - item.main_admit_us) / 1000.0 : -1.0;
+                        GGML_LOG_INFO(
+                            "[CYCLE_PHONE_PATH_MAIN] layer=%d chunk=%d "
+                            "seq=%" PRIu64 " "
+                            "main_admit_to_ready_ms=%.3f "
+                            "ready_to_partial_ms=%.3f "
+                            "main_admit_to_partial_ms=%.3f "
+                            "l7_main_queue_wait_ms=%.3f "
+                            "status=%s clock_scope=PHONE_MONOTONIC "
+                            "network_tx=STAGED_NOT_WIRE_DONE\n",
+                            p.layer, p.chunk, p.ready.seq,
+                            main_to_ready, (t3 - ready_staged_us) / 1000.0,
+                            main_to_partial,
+                            (t0 - item.enqueue_us) / 1000.0,
+                            ok ? "OK" : "FAIL");
+                    }
                 } else if (item.type == kind::PHONE_REGION_STAGE) {
                     // One Full layer is an atomic compute stage on the GPU.
                     // The next layer is NOT run inline: it is appended to
@@ -14571,7 +14631,11 @@ struct rpc_cycle_p2c_fifo_v1 {
                         if (item.type == kind::C2P_V5_FFN) {
                             c2p.ffn_done = ok;
                             c2p.ffn_failed = !ok;
-                            if (ok) admit_c2p_reduces_locked();
+                            if (ok) {
+                                if (rpc_cycle_critical_path_enabled())
+                                    c2p.ffn_done_us = ggml_time_us();
+                                admit_c2p_reduces_locked();
+                            }
                         } else {
                             c2p.reduce_done = ok;
                             c2p.reduce_failed = !ok;
@@ -14598,6 +14662,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                         follow.region = plan;
                         follow.region_has_next = false;
                         follow.v5_main_continuation = item.v5_main_continuation;
+                        follow.main_admit_us = item.main_admit_us;
                         follow.region_has_p2c = item.region_has_p2c;
                         if (item.region_has_p2c)
                             follow.p2c_v6 = item.p2c_v6;
@@ -14639,6 +14704,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                         follow.id = k;
                         follow.type = kind::P2C_V6_MAIN;
                         follow.p2c_v6 = p;
+                        follow.main_admit_us = item.main_admit_us;
                         follow.enqueue_us = ggml_time_us();
                         jobs.push_front(std::move(follow));
                         ++jobs_started;
