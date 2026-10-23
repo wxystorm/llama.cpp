@@ -7819,6 +7819,16 @@ public:
         cycle_upload_owner_cv_.notify_all();
     }
 
+    // Buffer Credit normally prevents FREE before APPLY ACK. Also enforce
+    // this at the RPC allocation lifetime boundary as a backstop.
+    void cycle_gpu_wait_before_free(uint64_t allocation) {
+        if (!cycle_gpu_transfer_enabled()) return;
+        std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
+        cycle_upload_owner_cv_.wait(lock, [&] {
+            return cycle_upload_inflight_.count(allocation) == 0;
+        });
+    }
+
     class cycle_gpu_upload_lease {
     public:
         cycle_gpu_upload_lease(
@@ -9182,6 +9192,7 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
+    cycle_gpu_wait_before_free(request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
@@ -9220,6 +9231,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
+    cycle_gpu_wait_before_free(request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
