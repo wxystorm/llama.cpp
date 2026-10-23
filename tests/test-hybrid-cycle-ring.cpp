@@ -740,7 +740,51 @@ static void test_v5_phone_rx_first() {
     assert(ring.finished());
 }
 
+// V5 PC proxy: a future C2P Reduce must NOT occupy the only PHONE_GPU
+// callback worker ahead of a now-ready MAIN continuation. This also avoids
+// blocking on C2P's yet-unregistered window-credit-dependent Region.
+static void test_v5_pc_phone_proxy_main_priority() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {
+        llama_hybrid_cycle_layer_kind::TENSOR_C2P,
+        llama_hybrid_cycle_layer_kind::PHONE_GPU,
+        llama_hybrid_cycle_layer_kind::PHONE_GPU,
+        llama_hybrid_cycle_layer_kind::TENSOR_P2C
+    };
+    llama_hybrid_cycle_task_ring ring(
+        layout, 2, 2, true, false, true, true);
+    ring.start();
+    for (int c = 0; c < 2; ++c) {
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                           llama_hybrid_cycle_stage::ATTN_PRE, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                           llama_hybrid_cycle_stage::FFN_SOURCE, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                           llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                           llama_hybrid_cycle_stage::FFN_DESTINATION, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                           llama_hybrid_cycle_stage::SEND_PARTIAL, 0, c));
+    }
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 0));
+    // C1's REDUCE was already queued. V5 instead completes C0's
+    // downstream Phone and P2C stages at the next scheduling boundary.
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FULL_LAYER, 1, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FULL_LAYER, 2, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 3, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 3, 0));
+    // Now the proxy may return to C1 while independent P2C TX progresses.
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 1));
+}
+
 int main() {
+    test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
     test_v5_phone_rx_first();
     test_v4_ordered_c2p_reduce();
