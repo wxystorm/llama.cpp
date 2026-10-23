@@ -1,4 +1,6 @@
 #include "llama-hybrid-cycle-runtime.h"
+#include "llama-hybrid-cycle-graph.h"
+#include "llama-model.h"
 
 #include <algorithm>
 #include <array>
@@ -164,6 +166,73 @@ bool llama_hybrid_cycle_run_fifo(
     return !failed.load() && ring.finished();
 }
 
+
+bool llama_hybrid_cycle_runtime_validate_model(
+        const llama_model & model,
+        const llama_hybrid_cycle_layout & layout,
+        std::string & reason) {
+    reason.clear();
+    if (model.arch != LLM_ARCH_QWEN3MOE) {
+        reason = "UNSUPPORTED_MODEL_ARCH";
+        return false;
+    }
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        reason = "REQUIRES_TENSOR_SPLIT_MODE";
+        return false;
+    }
+    if (!layout.enabled() || layout.cycle_size <= 0 ||
+        layout.x <= 0 || layout.y <= 0 ||
+        int64_t(layout.x) + layout.y + 2 != layout.cycle_size ||
+        layout.kinds.size() > size_t(model.hparams.n_layer()) ||
+        layout.kinds.size() > model.layers.size() ||
+        layout.kinds.size() > model.hybrid_layer_modes.size() ||
+        layout.kinds.size() > model.pc_layer_backends.size()) {
+        reason = "PHYSICAL_LAYER_COUNT_OR_LAYOUT_MISMATCH";
+        return false;
+    }
+    for (size_t i = 0; i < layout.kinds.size(); ++i) {
+        const auto kind = layout.kinds[i];
+        const auto mode = model.hybrid_layer_modes[i];
+        bool match = false;
+        switch (kind) {
+            case llama_hybrid_cycle_layer_kind::PC_CPU:
+                // PC CUDA-full weights may be mirrored from this PC_ONLY
+                // placement by the independent runtime/session pool.
+                match = mode == llama_hybrid_layer_mode::PC_ONLY;
+                break;
+            case llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL:
+                match = mode == llama_hybrid_layer_mode::PC_ONLY &&
+                    model.pc_layer_backends[i] ==
+                        llama_pc_layer_backend::CUDA;
+                break;
+            case llama_hybrid_cycle_layer_kind::PHONE_GPU:
+                match = mode == llama_hybrid_layer_mode::PHONE_ONLY;
+                break;
+            case llama_hybrid_cycle_layer_kind::TENSOR_C2P:
+                match = mode == llama_hybrid_layer_mode::TENSOR_C2P;
+                break;
+            case llama_hybrid_cycle_layer_kind::TENSOR_P2C:
+                match = mode == llama_hybrid_layer_mode::TENSOR_P2C;
+                break;
+        }
+        if (!match) {
+            reason = "DEVICE_ROLE_MISMATCH layer=" + std::to_string(i);
+            return false;
+        }
+        if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+            kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            const auto & lw = model.layers[i];
+            if (!llama_hybrid_cycle_ffn_partition_valid(
+                    lw.ffn_up_exps, lw.ffn_gate_exps, lw.ffn_down_exps,
+                    model.hparams.n_embd, model.hparams.n_expert)) {
+                reason = "PHYSICAL_FFN_SHARD_MISMATCH layer=" +
+                    std::to_string(i);
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 llama_hybrid_cycle_runtime::llama_hybrid_cycle_runtime(
         llama_hybrid_cycle_runtime_config config)

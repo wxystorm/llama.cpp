@@ -3,6 +3,9 @@
 #include "llama-hybrid-cycle-fifo-executor.h"
 
 #include <functional>
+#include <string>
+
+struct llama_model;
 
 // Runtime scheduling contract. Device work is deliberately supplied by the
 // caller, so the same five physical FIFO workers can serve a test Cycle today
@@ -32,6 +35,15 @@ struct llama_hybrid_cycle_runtime_region {
     int p2c_layer = -1;
     int end = -1;
 };
+
+// Validate the *loaded physical model* before dispatching any real stage.
+// The layout uses absolute layer indices; a test may validate just the first
+// period, while the future CLI path validates the full 48-layer sequence.
+// Planner layout, Meta allocation and physical MoE shards must all agree.
+LLAMA_API bool llama_hybrid_cycle_runtime_validate_model(
+    const llama_model & model,
+    const llama_hybrid_cycle_layout & layout,
+    std::string & reason);
 
 class llama_hybrid_cycle_runtime {
 public:

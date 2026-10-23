@@ -22,6 +22,7 @@
 #include "llama-model.h"
 #include "llama-hybrid-cycle.h"
 #include "llama-hybrid-cycle-runtime.h"
+#include "llama-hybrid-cycle-physical.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -628,137 +629,9 @@ struct cycle_real_phone_ready {
 // and CPU extra-buffer types that need not equal the backend's default buft.
 // Tensor/Phone layers still borrow their real physical static Meta shards.
 // Never return the parent Meta tensor or copy weights across devices.
-static ggml_tensor * cycle_real_resolve_physical_weight(
-        const ggml_tensor * weight, ggml_backend_t backend,
-        size_t source_device) {
-    if (!weight || !weight->buffer || !backend ||
-        weight->op != GGML_OP_NONE || weight->view_src != nullptr) {
-        return nullptr;
-    }
-    const auto weight_buft = ggml_backend_buffer_get_type(weight->buffer);
-    const auto native_buft = ggml_backend_get_default_buffer_type(backend);
-    const auto device = ggml_backend_get_device(backend);
-    const bool pc_native_compatible =
-        source_device == 0 && device &&
-        ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU &&
-        !ggml_backend_buffer_is_meta(weight->buffer) &&
-        ggml_backend_dev_supports_buft(device, weight_buft);
-    if ((native_buft && weight_buft == native_buft) ||
-        pc_native_compatible) {
-        if (pc_native_compatible && weight_buft != native_buft &&
-            std::getenv("GGML_CYCLE_SHARD_DIAG") != nullptr) {
-            std::fprintf(stderr,
-                "[CYCLE_WEIGHT_RESOLVE] weight=%s index=%zu "
-                "backend=%s weight_buft=%s default_buft=%s "
-                "mode=CPU_COMPATIBLE status=OK\n",
-                weight->name, source_device, ggml_backend_name(backend),
-                ggml_backend_buft_name(weight_buft),
-                native_buft ? ggml_backend_buft_name(native_buft) : "(null)");
-        }
-        // Borrowed model tensor: it remains owned by the model until unload.
-        return const_cast<ggml_tensor *>(weight);
-    }
-    return ggml_backend_meta_get_static_weight_shard(weight, source_device);
-}
-
-
-// Mirror the entire PC full layer (Attention, Router, FFN experts) on CUDA
-// once before the measured period. The CPU+Phone physical Meta layout is
-// unchanged, so Tensor C2P/P2C still use the same model-device indices.
-// No full layer is split between CPU and CUDA in this mode.
-struct cycle_real_pc_cuda_full_weights {
-    enum slot : size_t {
-        ATTN_NORM, WQ, WK, WV, WO, Q_NORM, K_NORM, FFN_NORM, ROUTER,
-        FFN_UP, FFN_GATE, FFN_DOWN, COUNT
-    };
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
-    std::array<ggml_tensor *, COUNT> tensors {};
-
-    cycle_real_pc_cuda_full_weights() = default;
-    cycle_real_pc_cuda_full_weights(
-        const cycle_real_pc_cuda_full_weights &) = delete;
-    cycle_real_pc_cuda_full_weights & operator=(
-        const cycle_real_pc_cuda_full_weights &) = delete;
-    ~cycle_real_pc_cuda_full_weights() { release(); }
-
-    void release() {
-        if (buffer) {
-            ggml_backend_buffer_free(buffer);
-            buffer = nullptr;
-        }
-        if (ctx) {
-            ggml_free(ctx);
-            ctx = nullptr;
-        }
-        tensors.fill(nullptr);
-    }
-
-    bool prepare(ggml_backend_t cuda, ggml_backend_t cpu,
-                 const llama_layer & layer, int layer_index) {
-        release();
-        if (!cuda || !cpu) {
-            return false;
-        }
-        const ggml_tensor * logical[COUNT] = {
-            layer.attn_norm, layer.wq, layer.wk, layer.wv, layer.wo,
-            layer.attn_q_norm, layer.attn_k_norm, layer.ffn_norm,
-            layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps,
-            layer.ffn_down_exps
-        };
-        std::array<const ggml_tensor *, COUNT> physical {};
-        for (size_t i = 0; i < COUNT; ++i) {
-            physical[i] = cycle_real_resolve_physical_weight(
-                logical[i], cpu, 0);
-            if (!physical[i] || !physical[i]->buffer ||
-                !ggml_is_contiguous(physical[i])) {
-                std::fprintf(stderr,
-                    "[CYCLE_PC_CUDA_WEIGHT] layer=%d slot=%zu "
-                    "status=FAIL reason=PC_PHYSICAL_WEIGHT_UNAVAILABLE\n",
-                    layer_index, i);
-                return false;
-            }
-        }
-        ggml_init_params params {};
-        params.mem_size = 2 * 1024 * 1024;
-        params.no_alloc = true;
-        ctx = ggml_init(params);
-        if (!ctx) {
-            return false;
-        }
-        for (size_t i = 0; i < COUNT; ++i) {
-            tensors[i] = ggml_dup_tensor(ctx, physical[i]);
-            if (!tensors[i]) {
-                release();
-                return false;
-            }
-        }
-        buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx, ggml_backend_get_default_buffer_type(cuda));
-        if (!buffer) {
-            release();
-            return false;
-        }
-        size_t upload_bytes = 0;
-        for (size_t i = 0; i < COUNT; ++i) {
-            // One-time CPU -> CUDA copy; never re-upload model weights per
-            // Chunk. Only final full-layer output is read back to the host.
-            ggml_backend_tensor_copy(physical[i], tensors[i]);
-            upload_bytes += ggml_nbytes(physical[i]);
-        }
-        ggml_backend_synchronize(cuda);
-        std::printf(
-            "[CYCLE_PC_CUDA_WEIGHT] layer=%d weights=%zu upload_mib=%.3f "
-            "owner=PC_CUDA lifetime=PERIOD status=READY\n",
-            layer_index, size_t(COUNT),
-            double(upload_bytes) / (1024.0 * 1024.0));
-        return true;
-    }
-
-    llama_hybrid_cycle_ffn_shard_weights full_ffn_shard() const {
-        return {tensors[FFN_UP], tensors[FFN_GATE], tensors[FFN_DOWN]};
-    }
-};
+// The real V5 test now borrows libllama's physical weight/KV primitives.
+using cycle_real_pc_cuda_full_weights = llama_hybrid_cycle_cuda_full_weights;
+using cycle_real_phone_kv_cache = llama_hybrid_cycle_physical_kv_cache;
 
 struct cycle_real_pc_cuda_runtime {
     ggml_backend_t backend = nullptr;
@@ -768,94 +641,6 @@ struct cycle_real_pc_cuda_runtime {
         if (backend) {
             ggml_backend_free(backend);
         }
-    }
-};
-
-struct cycle_real_phone_kv_cache {
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
-    ggml_tensor * keys = nullptr;
-    ggml_tensor * values = nullptr;
-    int64_t max_tokens = 0;
-    int64_t head_dim = 0;
-    int64_t kv_heads = 0;
-    int64_t committed_tokens = 0;
-
-    cycle_real_phone_kv_cache() = default;
-    cycle_real_phone_kv_cache(const cycle_real_phone_kv_cache &) = delete;
-    cycle_real_phone_kv_cache & operator=(const cycle_real_phone_kv_cache &) = delete;
-    ~cycle_real_phone_kv_cache() { release(); }
-
-    void release() {
-        if (buffer) {
-            ggml_backend_buffer_free(buffer);
-            buffer = nullptr;
-        }
-        if (ctx) {
-            ggml_free(ctx);
-            ctx = nullptr;
-        }
-        keys = nullptr;
-        values = nullptr;
-        max_tokens = 0;
-        head_dim = 0;
-        kv_heads = 0;
-        committed_tokens = 0;
-    }
-
-    bool init(ggml_backend_t backend,
-              const llama_layer & layer, int64_t total_tokens,
-              size_t source_device = 1,
-              const cycle_real_pc_cuda_full_weights * cuda_weights = nullptr) {
-        release();
-        const auto * norm = cuda_weights ?
-            cuda_weights->tensors[cycle_real_pc_cuda_full_weights::K_NORM] :
-            cycle_real_resolve_physical_weight(
-                layer.attn_k_norm, backend, source_device);
-        const auto * wk = cuda_weights ?
-            cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WK] :
-            cycle_real_resolve_physical_weight(
-                layer.wk, backend, source_device);
-        if (!backend || !norm || !wk ||
-            total_tokens <= 0 || total_tokens > 128 ||
-            norm->ne[0] <= 0 || wk->ne[1] % norm->ne[0] != 0) {
-            return false;
-        }
-        head_dim = norm->ne[0];
-        kv_heads = wk->ne[1] / head_dim;
-        max_tokens = total_tokens;
-        ggml_init_params params {};
-        params.mem_size = 1024 * 1024;
-        params.no_alloc = true;
-        ctx = ggml_init(params);
-        if (!ctx) {
-            return false;
-        }
-        keys = ggml_new_tensor_3d(
-            ctx, GGML_TYPE_F16, head_dim, kv_heads, max_tokens);
-        values = ggml_new_tensor_3d(
-            ctx, GGML_TYPE_F16, head_dim, kv_heads, max_tokens);
-        if (!keys || !values) {
-            release();
-            return false;
-        }
-        ggml_set_name(keys, "cycle_phone_k_cache_f16");
-        ggml_set_name(values, "cycle_phone_v_cache_f16");
-        buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx, ggml_backend_get_default_buffer_type(backend));
-        if (!buffer) {
-            release();
-            return false;
-        }
-        std::printf(
-            "[CYCLE_PHONE_KV_PERSISTENT] total_tokens=%lld head_dim=%lld "
-            "kv_heads=%lld cache_bytes=%zu residency=%s "
-            "status=READY\n",
-            (long long)max_tokens, (long long)head_dim,
-            (long long)kv_heads, ggml_nbytes(keys) + ggml_nbytes(values),
-            cuda_weights ? "PC_CUDA_F16" :
-                source_device == 0 ? "PC_CPU_F16" : "PHONE_GPU_F16");
-        return true;
     }
 };
 
@@ -1090,7 +875,7 @@ static bool cycle_real_execute_phone_attention_pre(
     // PC complete layers use their native CPU model weights. Tensor and
     // Phone layers still borrow physical Meta shards without host transfers.
     auto get_weight = [backend, source_device](const ggml_tensor * t) -> ggml_tensor * {
-        return cycle_real_resolve_physical_weight(t, backend, source_device);
+        return llama_hybrid_cycle_resolve_physical_weight(t, backend, source_device);
     };
     ggml_tensor * w_attn_norm = cuda_weights ?
         cuda_weights->tensors[cycle_real_pc_cuda_full_weights::ATTN_NORM] :
@@ -1680,21 +1465,16 @@ static bool cycle_real_execute_ffn(
 
     auto in = llama_hybrid_cycle_make_ffn_graph_inputs(
         ctx, hidden, tokens, topk);
-    auto * x = ggml_reshape_3d(ctx, in.norm, hidden, 1, tokens);
-    auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, in.topk_ids);
-    auto * up = ggml_mul_mat_id(ctx, shard.up, x, in.topk_ids);
-    auto * activation = ggml_swiglu_split(ctx, gate, up);
-    auto * down = ggml_mul_mat_id(ctx, shard.down, activation, in.topk_ids);
-    auto * weighted = ggml_mul(ctx, down, in.topk_weights);
-
-    ggml_tensor * sum = nullptr;
-    for (int64_t k = 0; k < topk; ++k) {
-        auto * view = ggml_view_2d(ctx, weighted, hidden, tokens,
-                                  weighted->nb[2], size_t(k) * weighted->nb[1]);
-        sum = sum ? ggml_add(ctx, sum, view) : view;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * activation = nullptr;
+    ggml_tensor * down = nullptr;
+    if (!llama_hybrid_cycle_build_moe_ffn_graph(
+            ctx, in, shard, hidden, tokens, topk,
+            &gate, &up, &activation, &down)) {
+        ggml_free(ctx);
+        return false;
     }
-    in.ffn_output = ggml_cont(ctx, sum);
-    ggml_set_name(in.ffn_output, "cycle_num_phone_ffn_output");
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
     ggml_build_forward_expand(graph, in.ffn_output);
     const auto graph_build_done = std::chrono::steady_clock::now();
@@ -3199,49 +2979,24 @@ struct cycle_real_c2p_phone_chunk {
         if (!full_layer) {
             pc_partial = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
         }
-        auto * x = ggml_reshape_3d(ctx, inputs.norm, hidden, 1, tokens);
-        auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, inputs.topk_ids);
-        auto * up = ggml_mul_mat_id(ctx, shard.up, x, inputs.topk_ids);
-        auto * act = ggml_swiglu_split(ctx, gate, up);
-        auto * down = ggml_mul_mat_id(ctx, shard.down, act, inputs.topk_ids);
-        auto * weighted = ggml_mul(ctx, down, inputs.topk_weights);
-        ggml_tensor * sum = nullptr;
-        for (int64_t k = 0; k < topk; ++k) {
-            auto * expert = ggml_view_2d(
-                ctx, weighted, hidden, tokens,
-                weighted->nb[2], size_t(k) * weighted->nb[1]);
-            sum = sum ? ggml_add(ctx, sum, expert) : expert;
+        if (!llama_hybrid_cycle_build_moe_ffn_graph(
+                ctx, inputs, shard, hidden, tokens, topk)) {
+            release();
+            return false;
         }
-        inputs.ffn_output = ggml_cont(ctx, sum);
-        ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         auto * ffn_graph = ggml_new_graph_custom(ctx, 512, false);
 
-        // C2P Reduce needs the remote PC shard, so it MUST remain split.
-        // For a complete Phone layer, one opt-in FFN + residual ADD graph
-        // replaces a separate one-node ADD graph and its RPC fence.
-        // The original FFN-only/Reduce graphs remain the default.
-        auto * ffnsum = full_layer ?
-            inputs.ffn_output :
-            ggml_add(ctx, inputs.ffn_output, pc_partial);
-        output = ggml_add(ctx, residual, ffnsum);
-        ggml_set_name(output, full_layer ?
-            "cycle_num_phone_full_lout" : "cycle_num_c2p_lout");
-        if (fused_full_graph) {
-            // Canonical build also sets GGML_TENSOR_FLAG_COMPUTE. Unlike
-            // the split Reduce graph, recursion here is intentional.
-            ggml_build_forward_expand(ffn_graph, output);
-        } else {
-            ggml_build_forward_expand(ffn_graph, inputs.ffn_output);
-            reduce_graph = ggml_new_graph_custom(ctx, 16, false);
-            // Appending a node directly does not set COMPUTE flags.
-            // The independent split Reduce must not recompute the FFN.
-            if (!full_layer) {
-                ffnsum->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                ggml_graph_add_node(reduce_graph, ffnsum);
-            }
-            output->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            ggml_graph_add_node(reduce_graph, output);
+        // One physical owner builds the SAME V5 Reduce graph through
+        // libllama; the split Reduce must never recompute FFN.
+        const auto reduced = llama_hybrid_cycle_build_reduce_graph(
+            ctx, ffn_graph, residual, inputs.ffn_output, pc_partial,
+            full_layer, fused_full_graph);
+        if (!reduced.output) {
+            release();
+            return false;
         }
+        output = reduced.output;
+        reduce_graph = reduced.reduce_graph;
         const uint64_t phone_full_graph_uid = rpc_full_replay ?
             cycle_real_phone_graph_replay_uid() : 0;
         const uint64_t c2p_reduce_graph_uid = rpc_full_replay && reduce_graph ?
@@ -3810,21 +3565,11 @@ struct cycle_real_p2c_ffn_slot {
         // cycle_real_execute_ffn() path (no residual ADD / Meta allreduce).
         inputs = llama_hybrid_cycle_make_ffn_graph_inputs(
             ctx, hidden, tokens, topk);
-        auto * x = ggml_reshape_3d(ctx, inputs.norm, hidden, 1, tokens);
-        auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, inputs.topk_ids);
-        auto * up = ggml_mul_mat_id(ctx, shard.up, x, inputs.topk_ids);
-        auto * activation = ggml_swiglu_split(ctx, gate, up);
-        auto * down = ggml_mul_mat_id(ctx, shard.down, activation, inputs.topk_ids);
-        auto * weighted = ggml_mul(ctx, down, inputs.topk_weights);
-        ggml_tensor * sum = nullptr;
-        for (int64_t k = 0; k < topk; ++k) {
-            auto * view = ggml_view_2d(
-                ctx, weighted, hidden, tokens, weighted->nb[2],
-                size_t(k) * weighted->nb[1]);
-            sum = sum ? ggml_add(ctx, sum, view) : view;
+        if (!llama_hybrid_cycle_build_moe_ffn_graph(
+                ctx, inputs, shard, hidden, tokens, topk)) {
+            release();
+            return false;
         }
-        inputs.ffn_output = ggml_cont(ctx, sum);
-        ggml_set_name(inputs.ffn_output, "cycle_num_phone_ffn_output");
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(graph, inputs.ffn_output);
         const uint64_t phone_local_graph_uid = phone_local_chain ?
@@ -4867,6 +4612,22 @@ static bool cycle_real_execute_period_fifo(
         int(layout.kinds.size()) < layout.cycle_size) {
         return false;
     }
+    // Validate loaded physical weight/Meta ownership before creating any
+    // Phone GPU sessions. The standalone probe still executes one period.
+    llama_hybrid_cycle_layout physical_period = layout;
+    physical_period.kinds.resize(size_t(layout.cycle_size));
+    std::string physical_error;
+    if (!llama_hybrid_cycle_runtime_validate_model(
+            model, physical_period, physical_error)) {
+        std::fprintf(stderr,
+            "[CYCLE_RUNTIME_MODEL] status=FAIL reason=%s\n",
+            physical_error.c_str());
+        return false;
+    }
+    std::printf(
+        "[CYCLE_RUNTIME_MODEL] layers=%d x=%d y=%d "
+        "placement=PHYSICAL_AND_FFN_SHARDS status=PASS\n",
+        layout.cycle_size, layout.x, layout.y);
     const int n_layers = layout.cycle_size;
     const int n_chunks = (tokens + chunk_tokens - 1) / chunk_tokens;
     const int window = std::min(max_inflight, n_chunks);
@@ -5557,9 +5318,9 @@ static bool cycle_real_execute_period_fifo(
         // PC_FULL uses the complete native CPU MoE weights. PHONE_FULL
         // borrows its complete Phone GPU physical Meta shard.
         return llama_hybrid_cycle_ffn_shard_weights {
-            cycle_real_resolve_physical_weight(weights.ffn_up_exps, backend, device),
-            cycle_real_resolve_physical_weight(weights.ffn_gate_exps, backend, device),
-            cycle_real_resolve_physical_weight(weights.ffn_down_exps, backend, device),
+            llama_hybrid_cycle_resolve_physical_weight(weights.ffn_up_exps, backend, device),
+            llama_hybrid_cycle_resolve_physical_weight(weights.ffn_gate_exps, backend, device),
+            llama_hybrid_cycle_resolve_physical_weight(weights.ffn_down_exps, backend, device),
         };
     };
     const auto take_device_input = [&](int l, int c) -> const ggml_tensor * {
@@ -6286,7 +6047,7 @@ static bool cycle_real_execute_period_fifo(
                                 // independent host formula using the exact
                                 // SAME GPU residual and physical gamma.
                                 const auto * gamma =
-                                    cycle_real_resolve_physical_weight(
+                                    llama_hybrid_cycle_resolve_physical_weight(
                                         layer.ffn_norm, phone, 1);
                                 ok = cycle_real_phone_same_input_norm_probe(
                                     gamma, attn_values, norm_values, norm_ref,

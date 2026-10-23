@@ -117,6 +117,84 @@ struct llama_hybrid_cycle_ffn_shard_weights {
     bool available() const { return up && gate && down; }
 };
 
+// Build exactly one physical MoE FFN intermediate-channel shard. Router
+// inputs (Norm, TopK ids/weights) are borrowed from Attention; neither
+// Router nor residual ADD is recomputed here. Gate/Up/SwiGLU/Down outputs
+// remain optional handles for existing numerical diagnostics.
+inline bool llama_hybrid_cycle_build_moe_ffn_graph(
+        ggml_context * ctx,
+        llama_hybrid_cycle_ffn_graph & in,
+        const llama_hybrid_cycle_ffn_shard_weights & shard,
+        int64_t hidden, int64_t tokens, int64_t topk,
+        ggml_tensor ** gate_out = nullptr,
+        ggml_tensor ** up_out = nullptr,
+        ggml_tensor ** swiglu_out = nullptr,
+        ggml_tensor ** down_out = nullptr) {
+    if (!ctx || !shard.available() ||
+        !in.norm || !in.topk_ids || !in.topk_weights ||
+        hidden <= 0 || tokens <= 0 || topk <= 0) {
+        return false;
+    }
+    auto * x = ggml_reshape_3d(ctx, in.norm, hidden, 1, tokens);
+    auto * gate = ggml_mul_mat_id(ctx, shard.gate, x, in.topk_ids);
+    auto * up = ggml_mul_mat_id(ctx, shard.up, x, in.topk_ids);
+    auto * swiglu = ggml_swiglu_split(ctx, gate, up);
+    auto * down = ggml_mul_mat_id(ctx, shard.down, swiglu, in.topk_ids);
+    auto * weighted = ggml_mul(ctx, down, in.topk_weights);
+    ggml_tensor * sum = nullptr;
+    for (int64_t k = 0; k < topk; ++k) {
+        auto * view = ggml_view_2d(
+            ctx, weighted, hidden, tokens, weighted->nb[2],
+            size_t(k) * weighted->nb[1]);
+        sum = sum ? ggml_add(ctx, sum, view) : view;
+    }
+    in.ffn_output = ggml_cont(ctx, sum);
+    ggml_set_name(in.ffn_output, "cycle_num_phone_ffn_output");
+    if (gate_out) *gate_out = gate;
+    if (up_out) *up_out = up;
+    if (swiglu_out) *swiglu_out = swiglu;
+    if (down_out) *down_out = down;
+    return true;
+}
+
+// Build the ONE output-owner Reduce contract without recomputing FFN.
+// A split Tensor layer computes ADD(local FFN, remote FFN) + residual;
+// a complete Phone layer computes local FFN + residual. The separate
+// Reduce graph intentionally includes only the final ADD nodes, with
+// GGML_TENSOR_FLAG_COMPUTE set exactly as in the V5 implementation.
+struct llama_hybrid_cycle_reduce_graph {
+    ggml_tensor * output = nullptr;
+    ggml_cgraph * reduce_graph = nullptr;
+};
+
+inline llama_hybrid_cycle_reduce_graph llama_hybrid_cycle_build_reduce_graph(
+        ggml_context * ctx, ggml_cgraph * ffn_graph,
+        ggml_tensor * residual, ggml_tensor * local_ffn,
+        ggml_tensor * remote_ffn, bool full_layer, bool fuse_full) {
+    if (!ctx || !ffn_graph || !residual || !local_ffn ||
+        (!full_layer && !remote_ffn)) {
+        return {};
+    }
+    auto * ffnsum = full_layer ?
+        local_ffn : ggml_add(ctx, local_ffn, remote_ffn);
+    auto * output = ggml_add(ctx, residual, ffnsum);
+    ggml_set_name(output, full_layer ?
+        "cycle_num_phone_full_lout" : "cycle_num_c2p_lout");
+    if (fuse_full) {
+        ggml_build_forward_expand(ffn_graph, output);
+        return {output, nullptr};
+    }
+    ggml_build_forward_expand(ffn_graph, local_ffn);
+    auto * reduce_graph = ggml_new_graph_custom(ctx, 16, false);
+    if (!full_layer) {
+        ffnsum->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_graph_add_node(reduce_graph, ffnsum);
+    }
+    output->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_graph_add_node(reduce_graph, output);
+    return {output, reduce_graph};
+}
+
 inline llama_hybrid_cycle_ffn_shard_weights llama_hybrid_cycle_get_physical_ffn_weights(
         const ggml_tensor * up, const ggml_tensor * gate,
         const ggml_tensor * down, size_t device_index) {
