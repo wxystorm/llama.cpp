@@ -14701,6 +14701,8 @@ static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
         case RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM:
         case RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER:
+        case RPC_CMD_INFERENCE_CYCLE_V6_REGION_REGISTER:
+        case RPC_CMD_INFERENCE_CYCLE_V6_P2C_READY_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_APPLY: // waits HOST RX; locks GPU internally
@@ -16297,6 +16299,103 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (ok) ok = executor.register_c2p_region(request);
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_V6_REGION_REGISTER: {
+                rpc_msg_inference_cycle_v6_region_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto & prefix = request.prefix;
+                const auto & first = prefix.region.stages[0];
+                const auto & second = prefix.region.stages[1];
+                const auto & p = request.p2c;
+                const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
+                bool ok = v5 && std::strcmp(v5, "1") == 0 &&
+                    executor.enabled &&
+                    first.device < device_count &&
+                    second.device == first.device &&
+                    second.layer == first.layer + 1 &&
+                    first.layer == prefix.c2p_layer + 1 &&
+                    first.chunk == second.chunk &&
+                    prefix.c2p_seq != 0 &&
+                    p.device == first.device &&
+                    p.layer == second.layer + 1 &&
+                    p.chunk == second.chunk &&
+                    p.input_source.buffer != 0 &&
+                    p.attention_input.buffer != 0 &&
+                    p.input_source.type == GGML_TYPE_F32 &&
+                    p.attention_input.type == GGML_TYPE_F32 &&
+                    p.attention_graph_uid != 0 &&
+                    p.ffn.ffn_graph_uid != 0 &&
+                    p.ready.kind == INFERENCE_CYCLE_READY &&
+                    p.ffn.partial.kind == INFERENCE_CYCLE_PARTIAL &&
+                    p.ready.device == p.device &&
+                    p.ffn.partial.device == p.device &&
+                    p.ready.layer == p.layer &&
+                    p.ffn.partial.layer == p.layer &&
+                    p.ready.chunk == p.chunk &&
+                    p.ffn.partial.chunk == p.chunk &&
+                    p.ready.seq != 0 &&
+                    p.ready.seq == p.ffn.partial.seq &&
+                    p.ready.graph_id == p.ffn.partial.graph_id &&
+                    p.ready.tokens > 0 && p.ready.tokens <= 128 &&
+                    p.ready.hidden > 0 && p.ready.hidden <= 65536 &&
+                    p.ready.topk > 0 && p.ready.topk <= 128 &&
+                    p.ffn.partial.tokens == p.ready.tokens &&
+                    p.ffn.partial.hidden == p.ready.hidden &&
+                    p.ffn.partial.topk == 0 &&
+                    p.ffn.partial.tensors[0].buffer != 0 &&
+                    p.ffn.partial.tensors[0].type == GGML_TYPE_F32;
+                for (int k = 0; k < 2 && ok; ++k) {
+                    const auto & s = prefix.region.stages[k];
+                    ok = s.seq != 0 && s.chunk >= 0 &&
+                         s.attention_graph_uid != 0 &&
+                         s.ffn_graph_uid != 0 &&
+                         s.input_source.buffer != 0 &&
+                         s.attention_input.buffer != 0 &&
+                         s.input_source.type == GGML_TYPE_F32 &&
+                         s.attention_input.type == GGML_TYPE_F32;
+                    for (int i = 0; i < 4 && ok; ++i) {
+                        const uint32_t type = i == 2 ?
+                            GGML_TYPE_I32 : GGML_TYPE_F32;
+                        ok = s.ready_outputs[i].buffer != 0 &&
+                             s.ffn_inputs[i].buffer != 0 &&
+                             s.ready_outputs[i].type == type &&
+                             s.ffn_inputs[i].type == type;
+                    }
+                }
+                for (int i = 0; i < 4 && ok; ++i) {
+                    const uint32_t type = i == 2 ?
+                        GGML_TYPE_I32 : GGML_TYPE_F32;
+                    ok = p.ready.tensors[i].buffer != 0 &&
+                         p.ready.tensors[i].type == type;
+                    if (i > 0 && ok) {
+                        const int j = i-1;
+                        ok = p.ffn.ready_inputs[j].buffer != 0 &&
+                             p.ffn.ffn_inputs[j].buffer != 0 &&
+                             p.ffn.ready_inputs[j].type == type &&
+                             p.ffn.ffn_inputs[j].type == type;
+                    }
+                }
+                if (ok) ok = executor.register_c2p_region(prefix, &p);
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_V5_P2C] side=PHONE event=REGISTER "
+                    "chunk=%d layer=%d status=%s\n",
+                    p.chunk, p.layer, ok ? "OK" : "FAIL");
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_V6_P2C_READY_WAIT: {
+                rpc_msg_inference_cycle_p2c_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto k = p2c_key(
+                    request.layer, request.chunk, request.seq,
+                    request.graph_id);
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = executor.enabled &&
+                    executor.wait_p2c_v6_ready(k) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
