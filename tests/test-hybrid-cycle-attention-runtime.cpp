@@ -1,5 +1,6 @@
 #include "llama-hybrid-cycle-attention.h"
 #include "llama-hybrid-cycle-wire.h"
+#include "llama-hybrid-cycle-phone-executor.h"
 #include "llama-model.h"
 
 #include <cassert>
@@ -27,6 +28,23 @@ int main() {
         ready, call_ms));
     assert(ready.phone_compute_buffer == nullptr);
     ready.release_phone_graph();
+
+    // Link and exercise the actual Phone MAIN/FFN/Reduce slot from
+    // libllama. Invalid/empty slots must fail closed without running RPC.
+    llama_hybrid_cycle_phone_ffn_slot phone_slot;
+    llama_hybrid_cycle_phone_ffn_slot next_slot;
+    assert(!phone_slot.execute_full_local(ready));
+    assert(!phone_slot.execute_full_server(
+        nullptr, ready, 5, 0, 1));
+    assert(!phone_slot.execute_full_server_chain(
+        nullptr, ready, 5, 0, 1, 6, 2, 3, ready));
+    assert(!phone_slot.execute_full_server_pair(
+        nullptr, ready, 5, 0, 1, 6, 2, 3, ready, next_slot));
+    assert(!phone_slot.execute_reduce(nullptr));
+    phone_slot.registered_full_graph_uid = 123;
+    phone_slot.release();
+    assert(phone_slot.registered_full_graph_uid == 0);
+    assert(phone_slot.output == nullptr);
 
     // Invalid READY shape must be rejected before any transport backend
     // proc is invoked (including when Phone is unavailable).
