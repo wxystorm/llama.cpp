@@ -14158,7 +14158,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                     GGML_LOG_INFO(
                         "[CYCLE_PHONE_V5] side=PHONE event=MAIN_REDUCE_DONE "
                         "chunk=%d seq=%" PRIu64 " "
-                        "region=ENQUEUE_FRONT status=%s\\n",
+                        "region=ENQUEUE_FRONT status=%s\n",
                         item.c2p_v5.chunk, item.c2p_v5.seq,
                         ok ? "OK" : "FAIL");
                 } else if (item.type == kind::PHONE_REGION_STAGE) {
