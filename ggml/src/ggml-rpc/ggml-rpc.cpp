@@ -14612,6 +14612,48 @@ struct rpc_cycle_p2c_fifo_v1 {
                     gpu.lock();
                 }
                 lock_acquired_us = ggml_time_us();
+                // Publish the actual allocations borrowed by this stage.
+                // Old FFN/MAIN FIFO ordering and GPU gate are unchanged.
+                std::vector<uint64_t> stage_buffers;
+                bool stage_known = true;
+                const auto add_tensor = [&](const rpc_tensor & t) {
+                    if (t.buffer) stage_buffers.push_back(t.buffer);
+                };
+                const auto add_graph = [&](uint32_t dev, uint64_t uid) {
+                    if (!server.cycle_gpu_graph_allocations(
+                            dev, uid, stage_buffers)) stage_known = false;
+                };
+                if (item.type == kind::C2P_V5_FFN) {
+                    add_graph(item.c2p_v5.device,
+                              item.c2p_v5.ffn_graph_uid);
+                } else if (item.type == kind::C2P_V5_REDUCE) {
+                    add_graph(item.c2p_v5.device,
+                              item.c2p_v5.reduce_graph_uid);
+                } else if (item.type == kind::PHONE_REGION_STAGE) {
+                    const auto & p = item.region;
+                    add_graph(p.device, p.attention_graph_uid);
+                    add_graph(p.device, p.ffn_graph_uid);
+                    add_tensor(p.input_source);
+                    add_tensor(p.attention_input);
+                    for (const auto & t : p.ready_outputs) add_tensor(t);
+                    for (const auto & t : p.ffn_inputs) add_tensor(t);
+                } else if (item.type == kind::P2C_V6_MAIN) {
+                    const auto & p = item.p2c_v6;
+                    add_graph(p.device, p.attention_graph_uid);
+                    add_graph(p.device, p.ffn.ffn_graph_uid);
+                    add_tensor(p.input_source);
+                    add_tensor(p.attention_input);
+                    for (const auto & t : p.ready.tensors) add_tensor(t);
+                    for (const auto & t : p.ffn.partial.tensors) add_tensor(t);
+                    for (const auto & t : p.ffn.ready_inputs) add_tensor(t);
+                    for (const auto & t : p.ffn.ffn_inputs) add_tensor(t);
+                } else {
+                    // No complete graph/Buffer ownership audit for legacy jobs.
+                    stage_known = false;
+                }
+                rpc_server::cycle_gpu_stage_guard stage_guard(
+                    server, std::move(stage_buffers), stage_known,
+                    rpc_server::cycle_gpu_transfer_enabled());
                 if (item.type == kind::C2P_V5_FFN) {
                     rpc_msg_graph_recompute_req run {};
                     run.device = item.c2p_v5.device;
