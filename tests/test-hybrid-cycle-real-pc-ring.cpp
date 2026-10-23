@@ -1,10 +1,11 @@
-// Opt-in mixed physical Cycle probe: REAL PC Full + explicitly MOCK Phone stages.
+// Opt-in mixed Cycle probe: REAL PC Full and C2P PC source, MOCK Phone GPU/wire.
 //
 // All 48 layers share ONE five-worker FIFO. The 24 PC Full layers execute
 // real Qwen3-MoE Attention/RoPE/Router/FFN on their physical CPU weights,
 // using physical persistent KV and actual Session host handoffs.
-// C2P/Phone Full/P2C tasks are deliberately synthetic: they keep the
-// dependency/transfer-stage topology but DO NOT submit Phone compute or wire.
+// C2P PC Attention and its FFN_SOURCE shard ALSO execute real CPU weights.
+// C2P Phone-side destination, Phone Full, P2C and both network directions
+// remain MOCK; no Phone FFN/Reduce is executed or claimed as real.
 // This is NOT a 48-layer Transformer forward or a numeric parity test.
 //
 // Usage:
@@ -15,6 +16,7 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "llama-hybrid-cycle-pc-full.h"
+#include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-regions.h"
 
 #include "ggml-backend.h"
@@ -190,6 +192,8 @@ int main(int argc, char ** argv) {
                         std::array<std::atomic<int>, 6> p2c_completed {};
                         for (auto & count : p2c_completed) count.store(0);
                         std::atomic<int> mock_stages {0};
+                        std::atomic<int> real_c2p_attn {0};
+                        std::atomic<int> real_c2p_ffn {0};
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -223,25 +227,54 @@ int main(int argc, char ** argv) {
                                         return false;
                                     }
                                     const auto kind = layout.kinds[size_t(l)];
-                                    const auto & state = session.at(l, c);
+                                    auto & state = session.at(l, c);
                                     const size_t expected =
                                         size_t(state.tokens) * size_t(hidden);
                                     auto & target = mock_at(l, c);
                                     bool valid = true;
-                                    // Phone stages are explicitly MOCKED.
-                                    // Do not submit or acknowledge real RPC.
+                                    // Real C2P PC source uses physical weights and persistent
+                                    // KV. The GPU and both Wire stages remain MOCK.
+                                    // No fake RPC graph or ACK is submitted.
                                     if (kind ==
                                         llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
                                         if (task.stage ==
                                             llama_hybrid_cycle_stage::ATTN_PRE) {
+                                            std::vector<float> host_input;
                                             valid = session.copy_predecessor_host_input(
-                                                l, c, hidden, target);
+                                                l, c, hidden, host_input);
+                                            const auto * r = resources.layer(l);
+                                            valid = valid && r &&
+                                                llama_hybrid_cycle_execute_c2p_pc_attention(
+                                                    *model, *r, cpu, l,
+                                                    state.start, state.tokens,
+                                                    host_input, state.ready);
+                                            if (valid) ++real_c2p_attn;
+                                        } else if (task.stage ==
+                                                   llama_hybrid_cycle_stage::FFN_SOURCE) {
+                                            const auto * r = resources.layer(l);
+                                            valid = r &&
+                                                llama_hybrid_cycle_execute_c2p_pc_ffn_source(
+                                                    *model, *r, cpu, l, state.tokens,
+                                                    state.ready, state.partial);
+                                            if (valid) ++real_c2p_ffn;
                                         } else if (task.stage ==
                                                    llama_hybrid_cycle_stage::REDUCE) {
+                                            // Missing Phone FFN remains EXPLICITLY
+                                            // mocked. This is NOT a correct
+                                            // Transformer layer output.
                                             valid = cycle_pc_ring_finite(
-                                                target, expected);
+                                                state.ready.residual, expected) &&
+                                                cycle_pc_ring_finite(
+                                                    state.partial, expected);
                                             if (valid) {
-                                                for (float & v : target) v += 0.001f;
+                                                target.resize(expected);
+                                                for (size_t i = 0; i < expected; ++i) {
+                                                    target[i] =
+                                                        state.ready.residual[i] +
+                                                        state.partial[i] + 0.001f;
+                                                }
+                                                valid = cycle_pc_ring_finite(
+                                                    target, expected);
                                             }
                                         }
                                     } else if (kind ==
@@ -320,7 +353,8 @@ int main(int argc, char ** argv) {
                             std::printf(
                                 "[CYCLE_REAL_PC_RING] phase=FORWARD "
                                 "layers=48 chunks=%d max_inflight=%d "
-                                "pc_full=REAL_CPU phone_stages=MOCK_ONLY "
+                                "pc_full=REAL_CPU c2p_pc=REAL_CPU "
+                                "phone_gpu=MOCK_ONLY wire=MOCK_ONLY "
                                 "source=SYNTHETIC_HIDDEN status=BEGIN\n",
                                 n_chunks, max_inflight);
                             ok = runtime.run(stages, nullptr, &timeline);
@@ -353,8 +387,33 @@ int main(int argc, char ** argv) {
                                     n_tokens, ok ? "PASS" : "FAIL");
                             }
                         }
+                        int c2p_pc_layers = 0;
+                        if (ok) {
+                            for (int l = 4; l < 48 && ok; l += 8) {
+                                const auto * r = resources.layer(l);
+                                ok = r && r->kv &&
+                                     r->kv->committed_tokens == n_tokens;
+                                for (int c = 0; c < n_chunks && ok; ++c) {
+                                    const auto & s = session.at(l, c);
+                                    ok = cycle_pc_ring_finite(
+                                        s.partial,
+                                        size_t(s.tokens) * size_t(hidden));
+                                }
+                                if (ok) ++c2p_pc_layers;
+                                std::printf(
+                                    "[CYCLE_REAL_C2P_PC_KV] layer=%d "
+                                    "committed=%lld expected=%d status=%s\n",
+                                    l,
+                                    (long long)(r && r->kv ?
+                                        r->kv->committed_tokens : -1),
+                                    n_tokens, ok ? "PASS" : "FAIL");
+                            }
+                        }
                         if (ok) {
                             ok = pc_layers == 24 &&
+                                 c2p_pc_layers == 6 &&
+                                 real_c2p_attn.load() == 6 * n_chunks &&
+                                 real_c2p_ffn.load() == 6 * n_chunks &&
                                  mock_stages.load() == 6 * n_chunks * 14;
                             for (int cycle = 0; cycle < 6 && ok; ++cycle) {
                                 ok = p2c_completed[size_t(cycle)].load() ==
@@ -420,13 +479,18 @@ int main(int argc, char ** argv) {
                         std::printf(
                             "[CYCLE_REAL_PC_RING] layers=48 "
                             "pc_full_layers=%d pc_full=REAL_CPU "
-                            "phone_stages=MOCK_ONLY phone_rpc_compute=NOT_RUN "
+                            "c2p_pc_layers=%d c2p_pc=REAL_CPU "
+                            "phone_gpu=MOCK_ONLY wire=MOCK_ONLY "
+                            "phone_rpc_compute=NOT_RUN "
                             "tokens=%d chunks=%d max_inflight=%d "
-                            "mock_stage_calls=%d expected_mock_stage_calls=%d "
+                            "real_c2p_attn_calls=%d real_c2p_ffn_calls=%d "
+                            "region_stage_calls=%d expected_region_stage_calls=%d "
                             "cross_period_early=%d "
                             "full_48_forward=NOT_RUN logits=NOT_RUN "
                             "sum=%.9g max_abs=%.9g status=%s\n",
-                            pc_layers, n_tokens, n_chunks, max_inflight,
+                            pc_layers, c2p_pc_layers,
+                            n_tokens, n_chunks, max_inflight,
+                            real_c2p_attn.load(), real_c2p_ffn.load(),
                             mock_stages.load(), 6 * n_chunks * 14,
                             earlier_than_previous_last,
                             sum, max_abs, ok ? "PASS" : "FAIL");
