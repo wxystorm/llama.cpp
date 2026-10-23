@@ -33,6 +33,7 @@
 #include "llama-hybrid-cycle-wire.h"
 #include "inference-cycle-reduce.h"
 #include "hybrid-cycle-full-reference.h"
+#include "hybrid-cycle-same-input.h"
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -194,6 +195,21 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[CYCLE_REAL_PC_RING] status=FAIL "
             "reason=TRACE_STAGES_REQUIRES_TRACE_PARITY\n");
+        return 2;
+    }
+    const char * ab_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_AB_SAME_INPUT");
+    if (ab_env && std::strcmp(ab_env, "0") != 0 &&
+        std::strcmp(ab_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=BAD_AB_SAME_INPUT_FLAG\n");
+        return 2;
+    }
+    const bool same_input_ab = ab_env && std::strcmp(ab_env, "1") == 0;
+    if (same_input_ab && (!trace_stages || n_tokens != 16)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=AB_SAME_INPUT_REQUIRES_STAGE_TRACE_AND_16_TOKENS\n");
         return 2;
     }
 
@@ -1513,6 +1529,20 @@ int main(int argc, char ** argv) {
                             if (samples != 48 * n_chunks) {
                                 ok = false;
                             }
+                        }
+
+                        // Diagnostic A/B replays independent physical Phone
+                        // Full layers (5,46) using the oracle's EXACT L4/L45
+                        // input. This excludes all upstream layer drift.
+                        // Run ONLY after all global FIFO workers/transport
+                        // have joined; no physical KV/FFN slot is borrowed.
+                        // Numerical mismatch is informational here. Normal
+                        // six-period strict parity remains the sole pass
+                        // criterion, but execution failure is fatal.
+                        if (ok && same_input_ab) {
+                            const auto ab = cycle_same_input::run(
+                                *model, phone, reference, n_tokens);
+                            if (!ab.execution_ok) ok = false;
                         }
 
                         // Six independent physical boundaries. The CPU
