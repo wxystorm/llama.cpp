@@ -7776,7 +7776,8 @@ public:
         const ggml_type dtype = static_cast<ggml_type>(desc.type);
         const int64_t block_size = ggml_blck_size(dtype);
         if (block_size <= 0 || !desc.ne[0] ||
-            desc.ne[0] % uint64_t(block_size) != 0)
+            desc.ne[0] % uint64_t(block_size) != 0 ||
+            desc.nb[0] != ggml_type_size(dtype))
             return imprecise();
         for (int d = 1; d < GGML_MAX_DIMS; ++d) {
             if (!desc.ne[d]) return imprecise();
@@ -7825,7 +7826,8 @@ public:
         const auto & graphs = stored_graphs[device];
         const auto it = graphs.find(uid);
         if (it == graphs.end() || !it->second.cycle_registered ||
-            !it->second.graph || !it->second.cycle_ranges_known)
+            !it->second.graph || !it->second.cycle_ranges_known ||
+            it->second.cycle_ranges.empty())
             return false;
         out.insert(out.end(),
             it->second.cycle_ranges.begin(),
@@ -10823,7 +10825,7 @@ bool rpc_server::apply_inference_cycle(
             "async_transfer=%d transfer_submit_ms=%.3f "
             "transfer_event_wait_ms=%.3f "
             "scope=PHONE_SERVER_GPU_UPLOAD "
-            "gpu_copy_semantics=BACKEND_UPLOAD_AND_SYNC_NOT_KERNEL_ONLY\n",
+            "gpu_copy_semantics=%s\n",
             ready ? "READY" : "PARTIAL", request.layer,
             request.chunk, request.seq,
             (rx_ready_us - apply_begin_us) / 1000.0,
@@ -10833,7 +10835,9 @@ bool rpc_server::apply_inference_cycle(
             upload_priority ? 1 : 0,
             uploaded_async ? 1 : 0,
             transfer_submit_us / 1000.0,
-            transfer_event_wait_us / 1000.0);
+            transfer_event_wait_us / 1000.0,
+            uploaded_async ? "OPENCL_TRANSFER_EVENT_COMPLETE" :
+                             "BACKEND_UPLOAD_AND_SYNC_NOT_KERNEL_ONLY");
     }
     return true;
 }
@@ -14973,6 +14977,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                     // No complete graph/Buffer ownership audit for legacy jobs.
                     stage_known = false;
                 }
+                if (stage_ranges.empty()) stage_known = false;
                 if (rpc_server::cycle_gpu_transfer_enabled()) {
                     GGML_LOG_INFO(
                         "[CYCLE_GPU_OWNERSHIP_STAGE] layer=%d chunk=%d "
