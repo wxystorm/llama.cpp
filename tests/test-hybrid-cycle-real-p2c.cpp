@@ -5407,6 +5407,8 @@ static bool cycle_real_execute_period_fifo(
     // breakdown. No additional synchronization or remote profiling calls.
     const bool path_timing =
         cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PATH_TIMING");
+    const bool chunk_path_trace =
+        cycle_real_env_flag("LLAMA_HYBRID_CYCLE_CHUNK_PATH_TRACE");
     const bool stage_detail = std::getenv(
         "LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr;
     constexpr size_t n_queues =
@@ -5416,6 +5418,7 @@ static bool cycle_real_execute_period_fifo(
     std::array<std::array<cycle_real_period_stage_profile, n_stages>,
         n_queues> stage_profile {};
     llama_hybrid_cycle_fifo_profile fifo_profile {};
+    llama_hybrid_cycle_chunk_timeline chunk_timeline {};
     std::array<cycle_real_attention_phase_profile, n_queues> attn_profile {};
     std::array<cycle_real_ffn_phase_profile, n_queues> ffn_profile {};
     std::array<cycle_real_phone_prepare_profile, n_queues> gpu_prepare_profile {};
@@ -5854,6 +5857,7 @@ static bool cycle_real_execute_period_fifo(
         return true;
     };
 
+    const auto fifo_trace_begin = std::chrono::steady_clock::now();
     const bool succeeded = llama_hybrid_cycle_run_fifo(
         period, n_chunks, [&](const llama_hybrid_cycle_task & task) -> bool {
             if (task.layer < 0 || task.layer >= n_layers ||
@@ -7335,8 +7339,14 @@ static bool cycle_real_execute_period_fifo(
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr,
         pc_reduce_priority, phone_full_region_auto,
-        phone_c2p_local);
+        phone_c2p_local, chunk_path_trace ? &chunk_timeline : nullptr);
     const auto fifo_done = std::chrono::steady_clock::now();
+    if (chunk_path_trace) {
+        std::printf("[CYCLE_CHUNK_TRACE_PHASE] phase=%s\n", run_phase);
+        llama_hybrid_cycle_print_chunk_timeline(
+            period, n_chunks, window, fifo_trace_begin, fifo_done,
+            chunk_timeline);
+    }
     if (phone_p2c_local_ffn) {
         std::printf(
             "[CYCLE_P2C_LOCAL_OVERLAP_SUM] phase=%s chunks=%d "
