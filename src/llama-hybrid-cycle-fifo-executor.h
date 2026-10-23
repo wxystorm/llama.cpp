@@ -33,6 +33,7 @@ struct llama_hybrid_cycle_queue_profile {
 struct llama_hybrid_cycle_fifo_profile {
     std::array<llama_hybrid_cycle_queue_profile,
         static_cast<size_t>(llama_hybrid_cycle_queue::COUNT)> queues {};
+    std::vector<llama_hybrid_cycle_credit_layer_profile> credit_layers;
 };
 
 // Bridge the dependency-only Cycle ring to REAL per-device and per-direction
@@ -56,7 +57,8 @@ inline bool llama_hybrid_cycle_run_fifo(
         llama_hybrid_cycle_fifo_profile * profile = nullptr,
         bool pc_cpu_reduce_priority = false,
         bool ordered_c2p_reduce = false,
-        bool phone_main_priority = false) {
+        bool phone_main_priority = false,
+        bool trace_entry_credit = false) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
@@ -64,7 +66,7 @@ inline bool llama_hybrid_cycle_run_fifo(
     llama_hybrid_cycle_task_ring ring(
         layout, n_chunks, max_inflight, credit_until_handoff,
         pc_cpu_reduce_priority, ordered_c2p_reduce,
-        phone_main_priority);
+        phone_main_priority, trace_entry_credit);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
@@ -182,6 +184,9 @@ inline bool llama_hybrid_cycle_run_fifo(
     }
     for (auto & worker : workers) {
         worker.join();
+    }
+    if (profile && trace_entry_credit) {
+        profile->credit_layers = ring.credit_profiles();
     }
     return !failed.load() && ring.finished();
 }
