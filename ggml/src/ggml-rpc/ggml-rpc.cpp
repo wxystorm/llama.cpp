@@ -7844,6 +7844,9 @@ public:
             std::vector<cycle_gpu_span> ranges, bool known) {
         cycle_gpu_merge_spans(ranges);
         std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
+        // Prevent a stream of unrelated uploads from starving an opaque
+        // command while it joins previously submitted transfer events.
+        if (!known) cycle_gpu_opaque_pending_ = true;
         cycle_upload_owner_cv_.wait(lock, [&] {
             if (!known) return cycle_upload_inflight_.empty();
             for (const auto & a : cycle_upload_inflight_) {
@@ -7857,6 +7860,7 @@ public:
         cycle_gpu_stage_active_ = true;
         cycle_gpu_stage_known_ = known;
         cycle_gpu_stage_ranges_ = std::move(ranges);
+        if (!known) cycle_gpu_opaque_pending_ = false;
     }
     void cycle_gpu_stage_end() {
         std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
@@ -7893,8 +7897,9 @@ public:
             *why = "NO_VALID_UPLOAD_RANGES";
             return false;
         }
-        if (cycle_gpu_stage_active_ && !cycle_gpu_stage_known_) {
-            *why = "UNKNOWN_STAGE";
+        if (cycle_gpu_opaque_pending_ ||
+            (cycle_gpu_stage_active_ && !cycle_gpu_stage_known_)) {
+            *why = "UNKNOWN_OR_PENDING_STAGE";
             return false;
         }
         if (cycle_gpu_stage_active_) {
@@ -8654,6 +8659,7 @@ private:
     std::vector<cycle_gpu_span> cycle_upload_inflight_;
     bool cycle_gpu_stage_active_ = false;
     bool cycle_gpu_stage_known_ = false;
+    bool cycle_gpu_opaque_pending_ = false;
     std::mutex cycle_gpu_upload_mutex_;
     std::condition_variable cycle_gpu_upload_cv_;
     unsigned cycle_gpu_upload_waiters_ = 0;
@@ -10703,13 +10709,18 @@ bool rpc_server::apply_inference_cycle(
     const int64_t gpu_gate_enter_us =
         gpu_stage_timing ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> cycle_p2c_apply_gpu_guard;
+    std::unique_ptr<cycle_gpu_stage_guard> fallback_opaque_guard;
     if (needs_gpu_gate && !uploaded_async) {
         cycle_p2c_apply_gpu_guard =
             std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
-        // A fallback may race a separate APPLY connection that has already
-        // submitted an event-backed upload. The old GPU mutex alone cannot
-        // serialize commands on the NEW transfer queue.
-        cycle_gpu_wait_all_uploads();
+        // Legacy APPLY writes and synchronizes the shared GPU Backend.
+        // Register an opaque stage until ALL writes are complete, so no
+        // independent upload can race this command after the initial wait.
+        if (cycle_gpu_transfer_enabled()) {
+            fallback_opaque_guard = std::make_unique<cycle_gpu_stage_guard>(
+                *this, std::vector<cycle_gpu_span>{},
+                /* known = */ false, /* active = */ true);
+        }
     }
     upload_ticket.acquired();
     const int64_t gpu_gate_acquired_us =
@@ -10764,6 +10775,8 @@ bool rpc_server::apply_inference_cycle(
     }
     }
     const int64_t gpu_input_ready_us = ggml_time_us();
+    // Release ownership while still holding the old GPU gate.
+    fallback_opaque_guard.reset();
     if (cycle_p2c_apply_gpu_guard.owns_lock()) {
         cycle_p2c_apply_gpu_guard.unlock();
     }
@@ -15580,14 +15593,20 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             cycle_order_trace ? ggml_time_us() : 0;
         // Non-wait control commands share the backend lane with Phone V1.
         std::unique_lock<std::mutex> cycle_gpu_guard;
+        std::unique_ptr<rpc_server::cycle_gpu_stage_guard> cycle_opaque_guard;
         if (executor.enabled &&
             rpc_cycle_p2c_v1_gpu_command(static_cast<rpc_cmd>(cmd))) {
             cycle_gpu_guard = std::unique_lock<std::mutex>(
                 server.cycle_p2c_gpu_gate());
-            // Opaque commands outside the Phone MAIN Worker have no
-            // per-Chunk buffer borrow set. Conservatively join transfer
-            // events before touching the shared Backend/graph metadata.
-            server.cycle_gpu_wait_all_uploads();
+            // A one-time wait without a claim would be racy: a new async
+            // upload could begin just after the check while this RPC uses
+            // GPU memory. Hold an UNKNOWN ownership stage for the command.
+            if (rpc_server::cycle_gpu_transfer_enabled()) {
+                cycle_opaque_guard =
+                    std::make_unique<rpc_server::cycle_gpu_stage_guard>(
+                        server, std::vector<rpc_server::cycle_gpu_span>{},
+                        /* known = */ false, /* active = */ true);
+            }
         }
         if (return_bulk_credit_held &&
                 cmd != RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT) {
