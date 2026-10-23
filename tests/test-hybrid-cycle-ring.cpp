@@ -828,7 +828,26 @@ static void test_path_entry_credit_profile() {
     assert(samples[0].credit_wait_sum_ms >= 0.0);
 }
 
+// The real 5-worker bridge copies credit metrics only after workers
+// join. Capturing the metric must not alter task order or introduce a
+// new GPU/network dependency.
+static void test_path_fifo_credit_profile() {
+    llama_hybrid_cycle_layout fragment;
+    fragment.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    llama_hybrid_cycle_fifo_profile profile {};
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        fragment, 3, [](const llama_hybrid_cycle_task &) {
+            return true;
+        }, 2, false, &profile, false, false, false, true);
+    assert(ok);
+    assert(profile.credit_layers.size() == 1);
+    assert(profile.credit_layers[0].admitted_chunks == 3);
+    assert(profile.credit_layers[0].credit_blocked_chunks >= 1);
+    assert(profile.credit_layers[0].credit_wait_sum_ms >= 0.0);
+}
+
 int main() {
+    test_path_fifo_credit_profile();
     test_path_entry_credit_profile();
     test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
