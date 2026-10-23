@@ -91,11 +91,13 @@ public:
     explicit llama_hybrid_cycle_task_ring(
             const llama_hybrid_cycle_layout & layout, int n_chunks,
             int max_inflight = 0, bool credit_until_handoff = false,
-            bool pc_cpu_reduce_priority = false)
+            bool pc_cpu_reduce_priority = false,
+            bool ordered_c2p_reduce = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
           credit_until_handoff_(credit_until_handoff),
-          pc_cpu_reduce_priority_(pc_cpu_reduce_priority) {
+          pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
+          ordered_c2p_reduce_(ordered_c2p_reduce) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -105,6 +107,7 @@ public:
         next_chunk_.assign(layout_.kinds.size(), 0);
         layer_inflight_.assign(layout_.kinds.size(), 0);
         tensor_ready_.assign(layout_.kinds.size(), std::vector<tensor_join_state>(n_chunks_));
+        next_c2p_reduce_chunk_.assign(layout_.kinds.size(), 0);
     }
 
     void start() {
@@ -206,6 +209,21 @@ public:
                 try_enqueue_reduce(task.layer, task.chunk, state);
                 break;
             case llama_hybrid_cycle_stage::REDUCE:
+                if (ordered_c2p_reduce_ &&
+                    kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    if (task.chunk != next_c2p_reduce_chunk_[task.layer]) {
+                        throw std::logic_error(
+                            "V4 C2P Reduce completed out of Chunk order");
+                    }
+                    const int next = ++next_c2p_reduce_chunk_[task.layer];
+                    // Enqueue the next READY Reduce BEFORE marking this
+                    // Chunk's L5 entry ready. Otherwise a future L5 WAIT
+                    // could block the sole Phone GPU queue behind C2P.
+                    if (next < n_chunks_) {
+                        try_enqueue_reduce(
+                            task.layer, next, tensor_ready_[task.layer][next]);
+                    }
+                }
                 finish_layer(task.layer, task.chunk);
                 break;
             case llama_hybrid_cycle_stage::FULL_LAYER:
@@ -298,6 +316,12 @@ private:
     }
 
     void try_enqueue_reduce(int layer, int chunk, tensor_join_state & state) {
+        // Only V4 requests this causal C2P Reduce admission rule.
+        // The FFN branches remain independent and can finish in any
+        // order; do not block a worker waiting for an earlier chunk.
+        if (ordered_c2p_reduce_ &&
+            layout_.kinds[layer] == llama_hybrid_cycle_layer_kind::TENSOR_C2P &&
+            chunk != next_c2p_reduce_chunk_[layer]) return;
         if (state.destination_ffn_ready && state.source_partial_ready && !state.reduce_queued) {
             state.reduce_queued = true;
             enqueue(layer, chunk, llama_hybrid_cycle_stage::REDUCE);
@@ -360,6 +384,7 @@ private:
     int max_inflight_ = 0;
     bool credit_until_handoff_ = false;
     bool pc_cpu_reduce_priority_ = false;
+    bool ordered_c2p_reduce_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
@@ -370,5 +395,6 @@ private:
     std::vector<std::vector<uint8_t>> entry_ready_;
     std::vector<int> next_chunk_;
     std::vector<int> layer_inflight_;
+    std::vector<int> next_c2p_reduce_chunk_;
     std::vector<std::vector<tensor_join_state>> tensor_ready_;
 };

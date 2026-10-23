@@ -295,6 +295,8 @@ enum rpc_cmd {
     RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT,
     // Patch 30: start a Phone Full pair, no separate next-layer FFN RPC.
     RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR,
+    // Patch 31: enqueue an entire Phone Full region from C2P completion.
+    RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
     RPC_CMD_COUNT,
 };
 
@@ -334,6 +336,8 @@ static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT == 46,
               "RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT must be 46");
 static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR == 47,
               "RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR must be 47");
+static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM == 48,
+              "RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM must be 48");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -440,6 +444,26 @@ struct rpc_msg_inference_cycle_phone_full_pair_req {
     uint64_t next_ffn_graph_uid = 0;
     rpc_tensor next_ffn_sources[4] {};
     rpc_tensor next_ffn_destinations[4] {};
+};
+
+// Patch 31: two independent Phone Full stages, each with a unique KV
+// prefix and a per-stage ownership ACK. The first stage starts from the
+// completed C2P Reduce l_out. The second starts from stage 0's FFN+ADD.
+struct rpc_msg_inference_cycle_phone_region_stage_req {
+    uint32_t device = 0;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint64_t seq = 0;
+    uint64_t graph_id = 0;
+    uint64_t attention_graph_uid = 0;
+    uint64_t ffn_graph_uid = 0;
+    rpc_tensor input_source {};
+    rpc_tensor attention_input {};
+    rpc_tensor ready_outputs[4] {};
+    rpc_tensor ffn_inputs[4] {};
+};
+struct rpc_msg_inference_cycle_phone_region_req {
+    rpc_msg_inference_cycle_phone_region_stage_req stages[2] {};
 };
 
 struct rpc_msg_device_count_rsp {
@@ -2899,6 +2923,97 @@ bool ggml_backend_rpc_cycle_wait_phone_next_full(
         " wait_ms=%.3f status=%s\n",
         layer, chunk, seq, (ggml_time_us() - t0) / 1000.0,
         ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// A single C2P-completion kickoff replaces all L5/L6 Graph submissions.
+// This API transmits descriptors only; no hidden-state device readback.
+bool ggml_backend_rpc_cycle_arm_phone_region(
+        ggml_backend_t backend,
+        const ggml_rpc_cycle_phone_region_stage stages[2]) {
+    if (!ggml_backend_is_rpc(backend) || !stages ||
+        stages[0].layer < 0 ||
+        stages[1].layer != stages[0].layer + 1 ||
+        stages[0].chunk < 0 || stages[0].chunk != stages[1].chunk ||
+        stages[0].seq == 0 || stages[1].seq == 0)
+        return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 31) {
+        GGML_LOG_ERROR(
+            "[CYCLE_PHONE_V4] side=PC status=FAIL "
+            "reason=PHONE_RPC_PATCH31_REQUIRED\n");
+        return false;
+    }
+    const auto valid_tensor = [&](const ggml_tensor * tensor,
+                                  ggml_type type) -> bool {
+        if (!tensor || !tensor->buffer ||
+            !ggml_backend_buffer_is_rpc(tensor->buffer) ||
+            tensor->type != type || !ggml_is_contiguous(tensor))
+            return false;
+        const auto * buf = static_cast<ggml_backend_rpc_buffer_context *>(
+            tensor->buffer->context);
+        return buf && buf->endpoint == ctx->endpoint &&
+            buf->device == ctx->device;
+    };
+    rpc_msg_inference_cycle_phone_region_req request {};
+    for (int k = 0; k < 2; ++k) {
+        const auto & src = stages[k];
+        auto & dst = request.stages[k];
+        if (src.attention_graph_uid == 0 || src.ffn_graph_uid == 0 ||
+            !valid_tensor(src.input_source, GGML_TYPE_F32) ||
+            !valid_tensor(src.attention_input, GGML_TYPE_F32) ||
+            !ggml_are_same_shape(src.input_source, src.attention_input) ||
+            ggml_nbytes(src.input_source) !=
+                ggml_nbytes(src.attention_input)) return false;
+        dst.device = ctx->device;
+        dst.layer = src.layer;
+        dst.chunk = src.chunk;
+        dst.seq = src.seq;
+        dst.graph_id = src.graph_id;
+        dst.attention_graph_uid = src.attention_graph_uid;
+        dst.ffn_graph_uid = src.ffn_graph_uid;
+        dst.input_source = serialize_tensor(src.input_source);
+        dst.attention_input = serialize_tensor(src.attention_input);
+        for (int i = 0; i < 4; ++i) {
+            const auto type = i == 2 ? GGML_TYPE_I32 : GGML_TYPE_F32;
+            if (!valid_tensor(src.attention_outputs[i], type) ||
+                !valid_tensor(src.ffn_inputs[i], type) ||
+                !ggml_are_same_shape(
+                    src.attention_outputs[i], src.ffn_inputs[i]) ||
+                ggml_nbytes(src.attention_outputs[i]) !=
+                    ggml_nbytes(src.ffn_inputs[i])) return false;
+            dst.ready_outputs[i] = serialize_tensor(
+                src.attention_outputs[i]);
+            dst.ffn_inputs[i] = serialize_tensor(src.ffn_inputs[i]);
+        }
+    }
+    const auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const int64_t started = ggml_time_us();
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
+        &request, sizeof(request), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO(
+        "[CYCLE_PHONE_V4] side=PC event=ARM_REGION "
+        "first_layer=%d next_layer=%d chunk=%d seq=%" PRIu64
+        " ack_ms=%.3f status=%s\n",
+        stages[0].layer, stages[1].layer, stages[0].chunk,
+        stages[0].seq, (ggml_time_us() - started) / 1000.0,
+        ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool ggml_backend_rpc_cycle_wait_phone_region_stage(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id) {
+    const bool ok = ggml_backend_rpc_cycle_wait_phone_next_full(
+        backend, layer, chunk, seq, graph_id);
+    GGML_LOG_INFO(
+        "[CYCLE_PHONE_V4] side=PC event=STAGE_DONE "
+        "layer=%d chunk=%d seq=%" PRIu64 " status=%s\n",
+        layer, chunk, seq, ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -13431,7 +13546,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
  */
 struct rpc_cycle_p2c_fifo_v1 {
     using key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
-    enum class kind { P2C_FFN, NEXT_ATTENTION, NEXT_ATTENTION_FULL };
+    enum class kind {
+        P2C_FFN, NEXT_ATTENTION, NEXT_ATTENTION_FULL, PHONE_REGION_STAGE
+    };
     struct job {
         key id {};
         rpc_msg_inference_cycle_p2c_arm_req plan {};
@@ -13439,6 +13556,9 @@ struct rpc_cycle_p2c_fifo_v1 {
         kind type = kind::P2C_FFN;
         rpc_msg_inference_cycle_phone_full_chain_req next {};
         rpc_msg_inference_cycle_phone_full_pair_req next_full {};
+        rpc_msg_inference_cycle_phone_region_stage_req region {};
+        rpc_msg_inference_cycle_phone_region_stage_req region_next {};
+        bool region_has_next = false;
     };
     rpc_server & server;
     bool enabled;
@@ -13455,6 +13575,11 @@ struct rpc_cycle_p2c_fifo_v1 {
     int32_t v2_last_layer = -1;
     int32_t v2_last_chunk = -1;
     uint64_t v2_last_seq = 0;
+    // V4 receives L5 stage requests in causal C2P Chunk order. L6 stages
+    // are appended to the SAME FIFO after their corresponding L5 ends.
+    int32_t v4_last_layer = -1;
+    int32_t v4_last_chunk = -1;
+    uint64_t v4_last_seq = 0;
 
     rpc_cycle_p2c_fifo_v1(rpc_server & s, bool on) : server(s), enabled(on) {}
     ~rpc_cycle_p2c_fifo_v1() {
@@ -13576,6 +13701,79 @@ struct rpc_cycle_p2c_fifo_v1 {
         cv.notify_one();
         return true;
     }
+    // V4: Reserve BOTH completion keys before enqueueing the first stage.
+    // The second stage is appended only after L5 is truly device-complete.
+    // This preserves the original FIFO rule: a previously queued L5 Chunk
+    // stays ahead of the newly-ready next-layer L6 Chunk.
+    bool enqueue_phone_region(
+            const rpc_msg_inference_cycle_phone_region_req & request) {
+        const auto & first = request.stages[0];
+        const auto & second = request.stages[1];
+        const key a {first.layer, first.chunk, first.seq, first.graph_id};
+        const key b {second.layer, second.chunk, second.seq, second.graph_id};
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!enabled || stopping || jobs.size() >= 31 ||
+            pending.size() + completed.size() >= 62 ||
+            a == b || pending.count(a) || pending.count(b) ||
+            completed.count(a) || completed.count(b)) return false;
+        const bool first_chunk = first.chunk == 0;
+        const bool ordered = first_chunk ?
+            (first.seq > v4_last_seq) :
+            (first.layer == v4_last_layer &&
+             first.chunk == v4_last_chunk + 1 &&
+             first.seq == v4_last_seq + 1);
+        if (!ordered || first.layer < 0 ||
+            second.layer != first.layer + 1 ||
+            first.chunk < 0 || first.chunk != second.chunk ||
+            first.seq == 0 || second.seq == 0 ||
+            first.device != second.device ||
+            !first.attention_graph_uid || !first.ffn_graph_uid ||
+            !second.attention_graph_uid || !second.ffn_graph_uid) {
+            GGML_LOG_ERROR(
+                "[CYCLE_PHONE_V4] side=PHONE event=ADMISSION "
+                "layer=%d chunk=%d seq=%" PRIu64
+                " last_layer=%d last_chunk=%d last_seq=%" PRIu64
+                " status=FAIL reason=OUT_OF_ORDER_OR_BAD_PLAN\n",
+                first.layer, first.chunk, first.seq,
+                v4_last_layer, v4_last_chunk, v4_last_seq);
+            return false;
+        }
+        if (!worker.joinable()) {
+            try {
+                worker = std::thread([this] { run(); });
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=START "
+                    "mode=GPU_FIFO worker=DEDICATED graph_reuse=UNCHANGED\n");
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR(
+                    "[CYCLE_PHONE_V4] side=PHONE event=START "
+                    "status=FAIL what=%s\n", e.what());
+                return false;
+            }
+        }
+        job next {};
+        next.id = a;
+        next.type = kind::PHONE_REGION_STAGE;
+        next.region = first;
+        next.region_next = second;
+        next.region_has_next = true;
+        next.enqueue_us = ggml_time_us();
+        jobs.push_back(std::move(next));
+        pending.insert(a);
+        pending.insert(b);
+        jobs_started += 2;
+        v4_last_layer = first.layer;
+        v4_last_chunk = first.chunk;
+        v4_last_seq = first.seq;
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_V4] side=PHONE event=ENQUEUE_REGION "
+            "first_layer=%d next_layer=%d chunk=%d seq=%" PRIu64
+            " depth=%zu status=OK\n",
+            first.layer, second.layer, first.chunk, first.seq, jobs.size());
+        cv.notify_one();
+        return true;
+    }
+
     bool wait(const key & k) {
         std::unique_lock<std::mutex> lock(mutex);
         const bool ready = cv.wait_for(
@@ -13618,7 +13816,54 @@ struct rpc_cycle_p2c_fifo_v1 {
                 // serialize here to protect graph_map and borrowed buffers.
                 std::lock_guard<std::mutex> gpu(server.cycle_p2c_gpu_gate());
                 lock_acquired_us = ggml_time_us();
-                if (item.type == kind::NEXT_ATTENTION ||
+                if (item.type == kind::PHONE_REGION_STAGE) {
+                    // One Full layer is an atomic compute stage on the GPU.
+                    // The next layer is NOT run inline: it is appended to
+                    // the FIFO only after this stage's completion, so older
+                    // chunks already queued retain their original order.
+                    const auto & region = item.region;
+                    rpc_msg_copy_tensor_req input {};
+                    input.src = region.input_source;
+                    input.dst = region.attention_input;
+                    rpc_msg_copy_tensor_rsp input_rsp {};
+                    ok = server.copy_tensor(input, input_rsp) &&
+                        input_rsp.result != 0;
+                    t1 = ggml_time_us();
+                    if (ok) {
+                        rpc_msg_graph_recompute_req req {};
+                        req.device = region.device;
+                        req.graph_uid = region.attention_graph_uid;
+                        ok = server.graph_recompute(req);
+                    }
+                    t2 = ggml_time_us();
+                    for (int i = 0; i < 4 && ok; ++i) {
+                        rpc_msg_copy_tensor_req req {};
+                        req.src = region.ready_outputs[i];
+                        req.dst = region.ffn_inputs[i];
+                        rpc_msg_copy_tensor_rsp rsp {};
+                        ok = server.copy_tensor(req, rsp) && rsp.result != 0;
+                    }
+                    const int64_t ffn_copy_end = ggml_time_us();
+                    if (ok) {
+                        rpc_msg_graph_recompute_req req {};
+                        req.device = region.device;
+                        req.graph_uid = region.ffn_graph_uid;
+                        ok = server.graph_recompute(req);
+                    }
+                    t3 = ggml_time_us();
+                    GGML_LOG_INFO(
+                        "[CYCLE_PHONE_V4] side=PHONE event=LOCAL_FULL_DONE "
+                        "layer=%d chunk=%d seq=%" PRIu64
+                        " input_copy_ms=%.3f attn_ms=%.3f "
+                        "ffn_copy_ms=%.3f ffn_add_ms=%.3f "
+                        "status=%s\n",
+                        region.layer, region.chunk, region.seq,
+                        (t1 - lock_acquired_us) / 1000.0,
+                        (t2 - t1) / 1000.0,
+                        (ffn_copy_end - t2) / 1000.0,
+                        (t3 - ffn_copy_end) / 1000.0,
+                        ok ? "OK" : "FAIL");
+                } else if (item.type == kind::NEXT_ATTENTION ||
                     item.type == kind::NEXT_ATTENTION_FULL) {
                     rpc_msg_copy_tensor_req copy {};
                     copy.src = item.next.full_output;
@@ -13698,6 +13943,35 @@ struct rpc_cycle_p2c_fifo_v1 {
                 pending.erase(item.id);
                 completed.emplace(item.id, ok);
                 ++jobs_finished;
+                if (item.type == kind::PHONE_REGION_STAGE &&
+                    item.region_has_next) {
+                    const auto & plan = item.region_next;
+                    const key next_key {
+                        plan.layer, plan.chunk, plan.seq, plan.graph_id
+                    };
+                    if (ok) {
+                        job follow {};
+                        follow.id = next_key;
+                        follow.type = kind::PHONE_REGION_STAGE;
+                        follow.region = plan;
+                        follow.region_has_next = false;
+                        follow.enqueue_us = ggml_time_us();
+                        // Enqueue AT THE BACK of the existing FIFO. This
+                        // is the essential cross-layer Chunk ordering rule.
+                        jobs.push_back(std::move(follow));
+                        GGML_LOG_INFO(
+                            "[CYCLE_PHONE_V4] side=PHONE event=APPEND_NEXT "
+                            "layer=%d chunk=%d seq=%" PRIu64
+                            " depth=%zu status=OK\n",
+                            plan.layer, plan.chunk, plan.seq, jobs.size());
+                    } else {
+                        // A failed L5 cannot leave L6 WAIT hanging. Both
+                        // pending keys were reserved at initial ARM.
+                        pending.erase(next_key);
+                        completed.emplace(next_key, false);
+                        ++jobs_finished;
+                    }
+                }
             }
             cv.notify_all();
             GGML_LOG_INFO(
@@ -13707,17 +13981,21 @@ struct rpc_cycle_p2c_fifo_v1 {
                 " queue_wait_ms=%.3f gpu_gate_wait_ms=%.3f "
                 "copy_ms=%.3f graph_ms=%.3f "
                 "partial_stage_ms=%.3f status=%s\n",
-                item.type == kind::NEXT_ATTENTION_FULL ?
-                    "NEXT_ATTENTION_FULL" :
-                    item.type == kind::NEXT_ATTENTION ?
-                        "NEXT_ATTENTION" : "P2C_FFN",
+                item.type == kind::PHONE_REGION_STAGE ?
+                    "PHONE_REGION_FULL" :
+                    item.type == kind::NEXT_ATTENTION_FULL ?
+                        "NEXT_ATTENTION_FULL" :
+                        item.type == kind::NEXT_ATTENTION ?
+                            "NEXT_ATTENTION" : "P2C_FFN",
                 std::get<0>(item.id), std::get<1>(item.id),
                 std::get<2>(item.id),
-                item.type == kind::NEXT_ATTENTION_FULL ?
-                    item.next_full.next_ffn_graph_uid :
-                    item.type == kind::NEXT_ATTENTION ?
-                        item.next.next_attention_graph_uid :
-                        item.plan.ffn_graph_uid,
+                item.type == kind::PHONE_REGION_STAGE ?
+                    item.region.ffn_graph_uid :
+                    item.type == kind::NEXT_ATTENTION_FULL ?
+                        item.next_full.next_ffn_graph_uid :
+                        item.type == kind::NEXT_ATTENTION ?
+                            item.next.next_attention_graph_uid :
+                            item.plan.ffn_graph_uid,
                 (t0 - item.enqueue_us) / 1000.0,
                 (lock_acquired_us - t0) / 1000.0,
                 (t1 - lock_acquired_us) / 1000.0,
@@ -13732,6 +14010,7 @@ static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
     switch (cmd) {
         case RPC_CMD_INFERENCE_DATA_PLANE_OPEN:
         case RPC_CMD_INFERENCE_CYCLE_P2C_ARM:
+        case RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM: // FIFO enqueue only
         case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_APPLY: // waits HOST RX; locks GPU internally
@@ -15281,6 +15560,56 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     (reply_done_us - compute_done_us) / 1000.0,
                     (reply_done_us - begin_us) / 1000.0,
                     ok ? "OK" : "FAIL");
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM: {
+                rpc_msg_inference_cycle_phone_region_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const char * v4 = std::getenv(
+                    "GGML_CYCLE_PHONE_EXECUTOR_V4");
+                const bool enabled_v4 = executor.enabled && v4 &&
+                    std::strcmp(v4, "1") == 0;
+                bool ok = enabled_v4 &&
+                    request.stages[0].device < device_count &&
+                    request.stages[1].device == request.stages[0].device &&
+                    request.stages[1].layer ==
+                        request.stages[0].layer + 1 &&
+                    request.stages[1].chunk ==
+                        request.stages[0].chunk;
+                // Validate before enqueuing. No Graph runs in this handler.
+                // The worker checks all physical buffers and graph UIDs
+                // while holding the ordinary Phone GPU graph-map gate.
+                for (int k = 0; k < 2 && ok; ++k) {
+                    const auto & stage = request.stages[k];
+                    ok = stage.layer >= 0 && stage.chunk >= 0 &&
+                        stage.seq != 0 && stage.attention_graph_uid != 0 &&
+                        stage.ffn_graph_uid != 0 &&
+                        stage.input_source.buffer != 0 &&
+                        stage.attention_input.buffer != 0 &&
+                        stage.input_source.type == GGML_TYPE_F32 &&
+                        stage.attention_input.type == GGML_TYPE_F32;
+                    for (int i = 0; i < 4 && ok; ++i) {
+                        const uint32_t type = i == 2 ?
+                            GGML_TYPE_I32 : GGML_TYPE_F32;
+                        ok = stage.ready_outputs[i].buffer != 0 &&
+                            stage.ffn_inputs[i].buffer != 0 &&
+                            stage.ready_outputs[i].type == type &&
+                            stage.ffn_inputs[i].type == type;
+                    }
+                }
+                if (ok) ok = executor.enqueue_phone_region(request);
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_V4] side=PHONE event=ARM_REGION "
+                    "layer=%d next_layer=%d chunk=%d seq=%" PRIu64
+                    " action=FIFO_ENQUEUE status=%s\n",
+                    request.stages[0].layer,
+                    request.stages[1].layer,
+                    request.stages[0].chunk,
+                    request.stages[0].seq,
+                    ok ? "OK" : "FAIL");
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
             case RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT: {

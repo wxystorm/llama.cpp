@@ -54,14 +54,15 @@ inline bool llama_hybrid_cycle_run_fifo(
         int max_inflight = 0,
         bool credit_until_handoff = false,
         llama_hybrid_cycle_fifo_profile * profile = nullptr,
-        bool pc_cpu_reduce_priority = false) {
+        bool pc_cpu_reduce_priority = false,
+        bool ordered_c2p_reduce = false) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
     }
     llama_hybrid_cycle_task_ring ring(
         layout, n_chunks, max_inflight, credit_until_handoff,
-        pc_cpu_reduce_priority);
+        pc_cpu_reduce_priority, ordered_c2p_reduce);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {

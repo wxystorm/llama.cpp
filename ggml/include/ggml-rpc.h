@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    30
+#define RPC_PROTO_PATCH_VERSION    31
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -440,6 +440,33 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full_pair(
 // Uses the same Phone FIFO completion channel as V2; in V3 that channel
 // signals BOTH next Attention and next FFN+ADD have completed.
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_next_full(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
+
+// Protocol 31: start the COMPLETE two-layer Phone region after the C2P
+// Reduce has finished. All graphs/FFN slots are registered on PC first.
+// Only descriptors cross the RPC socket; the activation stays on Phone.
+// The server enqueues L5 Attention+FFN, then appends L6 Attention+FFN
+// to the SAME local FIFO and publishes one completion per full layer.
+// PC must wait for each stage before retiring its preceding output.
+struct ggml_rpc_cycle_phone_region_stage {
+    int32_t layer;
+    int32_t chunk;
+    uint64_t seq;
+    uint64_t graph_id;
+    uint64_t attention_graph_uid;
+    uint64_t ffn_graph_uid;
+    const struct ggml_tensor * input_source;
+    const struct ggml_tensor * attention_input;
+    const struct ggml_tensor * attention_outputs[4];
+    const struct ggml_tensor * ffn_inputs[4];
+};
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_arm_phone_region(
+        ggml_backend_t backend,
+        const struct ggml_rpc_cycle_phone_region_stage stages[2]);
+// Uses the same completion channel as V3; each call waits for one Full
+// layer's Attention+FFN+ADD, NOT for the entire two-layer region.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_region_stage(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id);
 

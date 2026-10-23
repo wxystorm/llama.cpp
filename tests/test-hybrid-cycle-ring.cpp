@@ -622,7 +622,53 @@ static void test_pc_cuda_full_fifo() {
     expect_empty(ring, llama_hybrid_cycle_queue::PC_CPU);
 }
 
+// V4-only guard: C1 may have BOTH FFN branches ready while C0 still
+// owns an in-flight Phone FFN. Do not dispatch C1 REDUCE (and therefore
+// a premature L5 waiting task) before the C0 REDUCE has finished.
+static void test_v4_ordered_c2p_reduce() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_C2P};
+    llama_hybrid_cycle_task_ring ring(
+        layout, 2, 2, false, false, true);
+    ring.start();
+
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 0, 1));
+
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                       llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                       llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 1));
+    const auto phone_ffn_c0 = take(
+        ring, llama_hybrid_cycle_queue::PHONE_GPU,
+        llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 0);
+    const auto phone_ffn_c1 = take(
+        ring, llama_hybrid_cycle_queue::PHONE_GPU,
+        llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 1);
+    ring.complete(phone_ffn_c1); // C1's Phone FFN finishes first.
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                       llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                       llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 1));
+
+    // C1 is ready on BOTH branches, but it must not jump ahead of C0.
+    expect_empty(ring, llama_hybrid_cycle_queue::PHONE_GPU);
+    ring.complete(phone_ffn_c0);
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 1));
+    assert(ring.finished());
+}
+
 int main() {
+    test_v4_ordered_c2p_reduce();
     test_pc_cuda_full_fifo();
     test_one_cycle();
     test_p2c_fifo_worker_runtime();

@@ -4954,6 +4954,25 @@ static bool cycle_real_execute_period_fifo(
             run_phase);
         return false;
     }
+    // V4: a C2P Reduce completion arms a two-layer Phone region. The
+    // global Ring still receives separate L5 and L6 FULL acknowledgements
+    // so predecessor credits and GPU buffer leases remain independent.
+    const bool phone_full_region_auto = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_REGION_AUTO");
+    if (phone_full_region_auto &&
+        (!phone_full_auto_ffn || !phone_full_auto_relay ||
+         !phone_ordered_handoff || !phone_full_fuse ||
+         !phone_full_rpc_replay || !phone_full_session ||
+         !attn_graph_reuse || !attn_scratch_session_reuse ||
+         layout.y != 2 || window < 1 || window > 2 ||
+         cycle_real_env_flag("LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK") ||
+         cycle_real_env_flag("LLAMA_HYBRID_CYCLE_NUMERIC_TRACE"))) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_V4] phase=%s status=FAIL "
+            "reason=REQUIRES_V3_FULL_SESSION_WINDOW1_OR_2_"
+            "NO_INTERMEDIATE_READBACK\n", run_phase);
+        return false;
+    }
     if (phone_full_local_ffn &&
         (!phone_ordered_handoff || !phone_full_fuse ||
          !phone_full_rpc_replay || !phone_full_reuse)) {
@@ -5355,6 +5374,14 @@ static bool cycle_real_execute_period_fifo(
     uint64_t v2_attn_completed = 0;
     uint64_t v3_full_pairs_armed = 0;
     uint64_t v3_next_full_completed = 0;
+    // Sole writer: PC PHONE_GPU callback queue. A C2P Reduce may finish
+    // ahead of the window: keep its ready flag until L6 returns a credit.
+    std::vector<uint8_t> v4_c2p_ready(size_t(n_chunks), 0);
+    int v4_next_arm_chunk = 0;
+    int64_t v4_registered_l5_tokens = 0;
+    uint64_t v4_region_armed = 0;
+    uint64_t v4_l5_completed = 0;
+    uint64_t v4_l6_completed = 0;
     // The PC-side PHONE_GPU FIFO exclusively owns these counters.
     // Registration can lead device completion, which can in turn lead
     // the acknowledgements recorded in kv[].committed_tokens.
@@ -5406,7 +5433,17 @@ static bool cycle_real_execute_period_fifo(
             "scratch_pool=UNCHANGED\n",
             run_phase, window, layout.y);
     }
-    if (phone_full_auto_ffn) {
+    if (phone_full_region_auto) {
+        std::printf(
+            "[CYCLE_PHONE_V4_PLAN] phase=%s enabled=1 "
+            "trigger=C2P_REDUCE_ACK phone_full_layers=[%d,%d] "
+            "mode=LOCAL_FIFO_REGION_TWO_STAGE "
+            "window=%d output_credit=DOWNSTREAM_CONSUMED "
+            "kv=IN_ORDER graph_cache=UNCHANGED "
+            "scratch_pool=UNCHANGED\n",
+            run_phase, layout.x + 1, layout.x + 2, window);
+    }
+    if (phone_full_auto_ffn && !phone_full_region_auto) {
         std::printf(
             "[CYCLE_PHONE_V3_PLAN] phase=%s enabled=1 "
             "mode=PHONE_LOCAL_FULL_PAIR "
@@ -5528,6 +5565,115 @@ static bool cycle_real_execute_period_fifo(
                 sample.gpu_buffer_alloc_ms += slot->gpu_alloc_ms;
             }
             st.phone_output = std::move(slot);
+        }
+        return true;
+    };
+
+    // V4 is triggered at the C2P REDUCE completion boundary. A REDUCE
+    // can complete out-of-order (two FFN branches race), so first collect
+    // its readiness and drain in token/Chunk order, never blocking the
+    // sole PHONE_GPU PC worker waiting on a predecessor's REDUCE.
+    //
+    // Crucially, do not arm beyond the TWO active Phone Full slot credits:
+    // the L5 producer slot is only safe to recycle after L6 has consumed
+    // it. This is separate from the global Ring's layer-entry credits.
+    const auto try_arm_phone_v4_regions = [&]() -> bool {
+        if (!phone_full_region_auto) return true;
+        const size_t queue_index = static_cast<size_t>(
+            llama_hybrid_cycle_queue::PHONE_GPU);
+        while (v4_next_arm_chunk < n_chunks &&
+               v4_c2p_ready[size_t(v4_next_arm_chunk)] != 0 &&
+               v4_region_armed - v4_l6_completed < uint64_t(window)) {
+            const int c = v4_next_arm_chunk;
+            auto & c2p = *states[size_t(layout.x)][size_t(c)];
+            auto & l5 = *states[size_t(layout.x + 1)][size_t(c)];
+            auto & l6 = *states[size_t(layout.x + 2)][size_t(c)];
+            if (!c2p.phone_output || !c2p.phone_output->output ||
+                l5.start != v4_registered_l5_tokens ||
+                l6.start != v2_registered_kv_tokens) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_V4] side=PC event=REGISTER "
+                    "chunk=%d start=%lld l5_registered=%lld "
+                    "l6_registered=%lld status=FAIL "
+                    "reason=PREFIX_OR_C2P_OUTPUT\n",
+                    c, (long long)l5.start,
+                    (long long)v4_registered_l5_tokens,
+                    (long long)v2_registered_kv_tokens);
+                return false;
+            }
+            const std::vector<float> no_host_input;
+            if (!acquire_phone_full_slot(layout.x + 1, c, queue_index))
+                return false;
+            double l5_prep_ms = 0.0;
+            bool ok = cycle_real_execute_phone_attention_pre(
+                phone, model.layers[size_t(layout.x + 1)],
+                model.hparams, no_host_input, hidden, l5.tokens,
+                topk, experts, l5.ready, l5_prep_ms, nullptr,
+                kv[size_t(layout.x + 1)].get(), l5.start, 1,
+                c2p.phone_output->output, true,
+                perf_mode ? &attn_profile[queue_index] : nullptr,
+                nullptr, attn_scratch[size_t(layout.x + 1)],
+                graph_cache_by_layer[size_t(layout.x + 1)],
+                {}, true);
+            if (!ok || !acquire_phone_full_slot(
+                    layout.x + 2, c, queue_index)) return false;
+            double l6_prep_ms = 0.0;
+            ok = cycle_real_execute_phone_attention_pre(
+                phone, model.layers[size_t(layout.x + 2)],
+                model.hparams, no_host_input, hidden, l6.tokens,
+                topk, experts, l6.ready, l6_prep_ms, nullptr,
+                kv[size_t(layout.x + 2)].get(), l6.start, 1,
+                l5.phone_output->output, true,
+                perf_mode ? &attn_profile[queue_index] : nullptr,
+                nullptr, attn_scratch[size_t(layout.x + 2)],
+                graph_cache_by_layer[size_t(layout.x + 2)],
+                {}, true);
+            if (!ok) return false;
+
+            ggml_rpc_cycle_phone_region_stage stages[2] {};
+            for (int k = 0; k < 2; ++k) {
+                const int layer_id = layout.x + 1 + k;
+                const auto & current = *states[size_t(layer_id)][size_t(c)];
+                auto & plan = stages[k];
+                plan.layer = layer_id;
+                plan.chunk = c;
+                plan.seq = current.wire.seq;
+                plan.graph_id = current.wire.graph_id;
+                plan.attention_graph_uid =
+                    current.ready.prepared_attention_graph_uid;
+                plan.ffn_graph_uid =
+                    current.phone_output->registered_full_graph_uid;
+                plan.input_source = k == 0 ?
+                    c2p.phone_output->output : l5.phone_output->output;
+                plan.attention_input =
+                    current.ready.prepared_attention_input;
+                const auto & ready = current.ready.phone_graph;
+                plan.attention_outputs[0] = ready.residual;
+                plan.attention_outputs[1] = ready.ffn_norm;
+                plan.attention_outputs[2] = ready.topk_ids;
+                plan.attention_outputs[3] = ready.topk_weights;
+                plan.ffn_inputs[0] = current.phone_output->residual;
+                plan.ffn_inputs[1] = current.phone_output->inputs.norm;
+                plan.ffn_inputs[2] = current.phone_output->inputs.topk_ids;
+                plan.ffn_inputs[3] = current.phone_output->inputs.topk_weights;
+            }
+            if (!ggml_backend_rpc_cycle_arm_phone_region(phone, stages))
+                return false;
+            ++v4_region_armed;
+            ++v2_attn_prepared; // L6 graph is included in this single ARM.
+            v4_registered_l5_tokens += l5.tokens;
+            v2_registered_kv_tokens += l6.tokens;
+            v4_c2p_ready[size_t(c)] = 0;
+            ++v4_next_arm_chunk;
+            std::printf(
+                "[CYCLE_PHONE_V4] side=PC event=REGION_ARMED "
+                "chunk=%d first_layer=%d last_layer=%d "
+                "l5_registered=%lld l6_registered=%lld "
+                "active=%" PRIu64 " window=%d status=OK\n",
+                c, layout.x + 1, layout.x + 2,
+                (long long)v4_registered_l5_tokens,
+                (long long)v2_registered_kv_tokens,
+                v4_region_armed - v4_l6_completed, window);
         }
         return true;
     };
@@ -5734,6 +5880,73 @@ static bool cycle_real_execute_period_fifo(
                         st.ready.routing.clear();
                         st.ready.router_probs.clear();
                     } else if (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU) {
+                        if (phone_full_region_auto) {
+                            // The REAL computation is already in the Phone
+                            // FIFO, triggered by the preceding C2P Reduce.
+                            // These two Ring callbacks are ACK/ownership
+                            // boundaries, not fresh Graph submissions.
+                            const bool valid_layer =
+                                l == layout.x + 1 || l == layout.x + 2;
+                            const uint64_t expected_chunk = l == layout.x + 1 ?
+                                v4_l5_completed : v4_l6_completed;
+                            const int64_t registered = l == layout.x + 1 ?
+                                v4_registered_l5_tokens :
+                                v2_registered_kv_tokens;
+                            const bool prefix_ok = valid_layer && kv[size_t(l)] &&
+                                kv[size_t(l)]->committed_tokens == st.start &&
+                                registered >= st.start + st.tokens &&
+                                expected_chunk == uint64_t(c);
+                            ok = prefix_ok && st.phone_output &&
+                                st.phone_output->is_full_layer &&
+                                st.phone_output->fused_full_graph &&
+                                st.phone_output->registered_full_graph_uid != 0 &&
+                                st.ready.prepared_attention_graph_uid != 0 &&
+                                st.ready.prepared_attention_input != nullptr &&
+                                ggml_backend_rpc_cycle_wait_phone_region_stage(
+                                    phone, l, c, st.wire.seq, st.wire.graph_id);
+                            if (ok) {
+                                kv[size_t(l)]->committed_tokens =
+                                    st.start + st.tokens;
+                                // The stage ACK means BOTH Attention and
+                                // FFN+ADD completed on Phone. It is now
+                                // safe to release this Attention's scratch
+                                // lease and its PREDECESSOR's l_out.
+                                st.ready.release_phone_graph();
+                                retire_device_output(l - 1, c);
+                                ++ordered_full_handoffs;
+                                if (l == layout.x + 1) {
+                                    ++v4_l5_completed;
+                                } else {
+                                    ++v4_l6_completed;
+                                    ++v2_attn_completed;
+                                    // A previously completed C2P Reduce
+                                    // may have been waiting for a Region
+                                    // credit. L6 completed: L5's old FFN
+                                    // slot is now safe to reuse.
+                                    ok = try_arm_phone_v4_regions();
+                                }
+                                std::printf(
+                                    "[CYCLE_PHONE_V4] side=PC event=FULL_ACK "
+                                    "phase=%s layer=%d chunk=%d "
+                                    "prefix=%lld active=%" PRIu64
+                                    " status=%s\n",
+                                    run_phase, l, c,
+                                    (long long)kv[size_t(l)]->committed_tokens,
+                                    v4_region_armed - v4_l6_completed,
+                                    ok ? "OK" : "FAIL");
+                            } else {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PHONE_V4] side=PC event=FULL_ACK "
+                                    "phase=%s layer=%d chunk=%d "
+                                    "prefix=%lld registered=%lld "
+                                    "expected_chunk=%" PRIu64
+                                    " status=FAIL\n",
+                                    run_phase, l, c,
+                                    (long long)(kv[size_t(l)] ?
+                                        kv[size_t(l)]->committed_tokens : -1),
+                                    (long long)registered, expected_chunk);
+                            }
+                        } else {
                         const auto * local_input = take_device_input(l, c);
                         const bool boundary_trace = cycle_real_env_flag(
                             "LLAMA_HYBRID_CYCLE_BOUNDARY_READBACK");
@@ -6127,6 +6340,7 @@ static bool cycle_real_execute_period_fifo(
                                 }
                             }
                         }
+                        } // V3 and prior PC-controlled Phone FULL path
                     }
                     break;
                 }
@@ -6667,6 +6881,16 @@ static bool cycle_real_execute_period_fifo(
                                     cycle_real_path_elapsed_ms(ack_begin);
                             }
                         }
+                        // V4 starts from the SAME C2P Reduce completion
+                        // boundary as V3's producer handoff. The RPC FINISH
+                        // plus PARTIAL ACK above guarantee l_out is ready.
+                        // Collect out-of-order REDUCE completions and arm
+                        // Phone regions strictly in Chunk order, bounded
+                        // by their two-layer output-buffer credit window.
+                        if (ok && phone_full_region_auto) {
+                            v4_c2p_ready[size_t(c)] = 1;
+                            ok = try_arm_phone_v4_regions();
+                        }
                         // The GPU output MUST survive for the next Phone
                         // FULL_LAYER; do not free it at this boundary.
                         if (ok && cycle_real_env_flag(
@@ -6836,7 +7060,7 @@ static bool cycle_real_execute_period_fifo(
             }
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr,
-        pc_reduce_priority);
+        pc_reduce_priority, phone_full_region_auto);
     const auto fifo_done = std::chrono::steady_clock::now();
     if (phone_p2c_local_ffn) {
         std::printf(
@@ -6865,6 +7089,7 @@ static bool cycle_real_execute_period_fifo(
         (unsigned long long) p2c_phone_local_completed,
         phone_full_local_ffn ? 1 : 0,
         (unsigned long long) (phone_full_local_ffn ? ordered_full_handoffs : 0),
+        phone_full_region_auto ? "ELIDED_BY_PHONE_REGION_ACK" :
         phone_full_local_ffn ? "ELIDED_BY_PHONE_RUN_ACK" : "UNCHANGED");
     if (phone_full_auto_relay) {
         const int64_t committed = kv[size_t(layout.x + 2)] ?
@@ -6883,7 +7108,7 @@ static bool cycle_real_execute_period_fifo(
             n_chunks, window, (long long)v2_registered_kv_tokens,
             (long long)committed, v2_ok ? "OK" : "FAIL");
     }
-    if (phone_full_auto_ffn) {
+    if (phone_full_auto_ffn && !phone_full_region_auto) {
         const bool v3_ok = succeeded &&
             v3_full_pairs_armed == uint64_t(n_chunks) &&
             v3_next_full_completed == uint64_t(n_chunks) &&
@@ -6895,6 +7120,33 @@ static bool cycle_real_execute_period_fifo(
             "status=%s\n",
             run_phase, v3_full_pairs_armed, v3_next_full_completed,
             n_chunks, window, v3_ok ? "OK" : "FAIL");
+    }
+    if (phone_full_region_auto) {
+        const auto & l5_kv = kv[size_t(layout.x + 1)];
+        const auto & l6_kv = kv[size_t(layout.x + 2)];
+        const bool complete =
+            succeeded && v4_region_armed == uint64_t(n_chunks) &&
+            v4_l5_completed == uint64_t(n_chunks) &&
+            v4_l6_completed == uint64_t(n_chunks) &&
+            v4_next_arm_chunk == n_chunks &&
+            v4_registered_l5_tokens == tokens &&
+            v2_registered_kv_tokens == tokens &&
+            l5_kv && l5_kv->committed_tokens == tokens &&
+            l6_kv && l6_kv->committed_tokens == tokens;
+        std::printf(
+            "[CYCLE_PHONE_V4_SUM] phase=%s regions_armed=%" PRIu64
+            " l5_done=%" PRIu64 " l6_done=%" PRIu64
+            " expected=%d window=%d "
+            "l5_registered=%lld l6_registered=%lld "
+            "l5_committed=%lld l6_committed=%lld "
+            "remote_phone_full_launches=0 status=%s\n",
+            run_phase, v4_region_armed, v4_l5_completed,
+            v4_l6_completed, n_chunks, window,
+            (long long)v4_registered_l5_tokens,
+            (long long)v2_registered_kv_tokens,
+            (long long)(l5_kv ? l5_kv->committed_tokens : -1),
+            (long long)(l6_kv ? l6_kv->committed_tokens : -1),
+            complete ? "OK" : "FAIL");
     }
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.
