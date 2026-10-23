@@ -327,6 +327,11 @@ target_include_directories(test-hybrid-cycle-ready-graph PRIVATE ${PROJECT_SOURC
 llama_build_and_test(test-hybrid-cycle-ffn-graph.cpp)
 target_include_directories(test-hybrid-cycle-ffn-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# No model or Phone required: link the extracted libllama Attention/Wire
+# executor and validate failure guards plus graph UID ownership.
+llama_build_and_test(test-hybrid-cycle-attention-runtime.cpp)
+target_include_directories(test-hybrid-cycle-attention-runtime PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-hybrid-cycle-shard-ffn.cpp)
 target_include_directories(test-hybrid-cycle-shard-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

@@ -22,6 +22,8 @@ add_library(llama
             llama-hybrid.cpp
             llama-hybrid-cycle-runtime.cpp
             llama-hybrid-cycle-physical.cpp
+            llama-hybrid-cycle-attention.cpp
+            llama-hybrid-cycle-wire.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp

@@ -23,6 +23,8 @@
 #include "llama-hybrid-cycle.h"
 #include "llama-hybrid-cycle-runtime.h"
 #include "llama-hybrid-cycle-physical.h"
+#include "llama-hybrid-cycle-attention.h"
+#include "llama-hybrid-cycle-wire.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -565,60 +567,7 @@ static bool cycle_real_compare_physical_weight_rows(
 //
 // No historical KV is persisted between calls yet: this validates multi-KV
 // *within one batch*, not cross-chunk KV handoff or production scheduling.
-struct cycle_real_phone_ready {
-    std::vector<float> residual;
-    std::vector<float> norm;
-    std::vector<int32_t> ids;
-    std::vector<float> routing;
-    // Full pre-TopK Softmax distribution for score-margin diagnosis only.
-    // Not serialized in READY and never used by the FFN execution.
-    std::vector<float> router_probs;
-
-    // Keep READY's Phone GPU tensors alive through FFN local input copies.
-    ggml_context * phone_ctx = nullptr;
-    ggml_backend_buffer_t phone_compute_buffer = nullptr;
-    cycle_real_attention_scratch_pool * phone_scratch_pool = nullptr;
-    cycle_real_attention_graph_cache * phone_graph_cache = nullptr;
-    cycle_real_attention_graph_cache::slot * phone_cached_graph = nullptr;
-    llama_hybrid_cycle_ready_graph phone_graph {};
-    // V2: the next Full layer's Attention was registered but not submitted.
-    // These are borrowed only until the Phone worker's completion ACK.
-    uint64_t prepared_attention_graph_uid = 0;
-    ggml_tensor * prepared_attention_input = nullptr;
-
-    cycle_real_phone_ready() = default;
-    cycle_real_phone_ready(const cycle_real_phone_ready &) = delete;
-    cycle_real_phone_ready & operator=(const cycle_real_phone_ready &) = delete;
-    ~cycle_real_phone_ready() { release_phone_graph(); }
-
-    void release_phone_graph() {
-        // FFN already consumed/fenced READY before handing its buffer back.
-        // Graph metadata must not outlive the memory it describes.
-        if (phone_graph_cache && phone_cached_graph) {
-            // This graph is session-owned. Drop tensor bindings so another
-            // Chunk can attach a fresh scratch lease without stale RPC
-            // pointers. Do not destroy its ggml_context.
-            phone_graph_cache->recycle(phone_cached_graph, true);
-        } else if (phone_ctx != nullptr) {
-            ggml_free(phone_ctx);
-        }
-        phone_ctx = nullptr;
-        phone_graph_cache = nullptr;
-        phone_cached_graph = nullptr;
-        if (phone_compute_buffer != nullptr) {
-            if (phone_scratch_pool) {
-                phone_scratch_pool->recycle(phone_compute_buffer);
-            } else {
-                ggml_backend_buffer_free(phone_compute_buffer);
-            }
-            phone_compute_buffer = nullptr;
-        }
-        phone_scratch_pool = nullptr;
-        phone_graph = {};
-        prepared_attention_graph_uid = 0;
-        prepared_attention_input = nullptr;
-    }
-};
+using cycle_real_phone_ready = llama_hybrid_cycle_attention_ready;
 
 // A single GPU-resident, F16 cache for one physical P2C Attention layer.
 // Shape [head_dim, kv_heads, max_tokens] makes each newly written token
@@ -712,12 +661,7 @@ struct cycle_real_pc_cuda_session_pool {
     }
 };
 
-struct cycle_real_live_wire {
-    int32_t layer = -1;
-    int32_t chunk = 0;
-    uint64_t seq = 1;
-    uint64_t graph_id = 1;
-};
+using cycle_real_live_wire = llama_hybrid_cycle_live_wire;
 
 // Reuse the single RPC data-plane RX dispatcher; do not create another
 // socket receiver. Local Phone FFN can queue a prior PARTIAL before the next
@@ -727,105 +671,27 @@ static bool cycle_real_receive_live_wire(
         inference_cycle_payload_kind kind,
         uint32_t tokens, uint32_t hidden, uint32_t topk,
         inference_cycle_message & output) {
-    auto * dev = ggml_backend_get_device(phone);
-    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (!reg) {
-        return false;
-    }
-    auto receive = reinterpret_cast<
-        ggml_backend_rpc_inference_transport_receive_matching_t>(
-            ggml_backend_reg_get_proc_address(
-                reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_RECEIVE_MATCHING_PROC));
-    if (!receive) {
-        return false;
-    }
-    size_t bytes = 0;
-    if (!inference_cycle_payload_size(
-            kind, tokens, hidden,
-            kind == INFERENCE_CYCLE_READY ? topk : 0, bytes)) {
-        return false;
-    }
-    std::vector<uint8_t> frame_data(bytes);
-    const uint16_t stage = kind == INFERENCE_CYCLE_READY ?
-        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
-    ggml_backend_rpc_inference_task task {};
-    task.stage = stage;
-    task.stream_id = 0; // Cycle frames use the default inference stream.
-    task.tensor_role = INFERENCE_CYCLE_PHONE_TO_PC;
-    task.layer = wire.layer;
-    task.chunk = wire.chunk;
-    task.seq = wire.seq;
-    task.graph_id = wire.graph_id;
-    size_t received = 0;
-    if (!receive(phone, &task, frame_data.data(), frame_data.size(),
-                 &received, 30000) || received != bytes) {
-        std::fprintf(stderr,
-            "[CYCLE_REAL_WIRE] side=pc stage=%s status=FAIL "
-            "reason=RECEIVE_MATCH_OR_SIZE expected=%zu got=%zu "
-            "layer=%d chunk=%d seq=%llu\n",
-            kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
-            bytes, received, wire.layer, wire.chunk,
-            (unsigned long long) wire.seq);
-        return false;
-    }
-    inference_frame_header header =
-        inference_make_header(INFERENCE_FRAME_DATA);
-    header.stage = task.stage;
-    header.tensor_role = task.tensor_role;
-    header.layer = task.layer;
-    header.chunk = task.chunk;
-    header.seq = task.seq;
-    header.graph_id = task.graph_id;
-    header.payload_bytes = received;
-    if (task.stage != stage ||
-        task.tensor_role != INFERENCE_CYCLE_PHONE_TO_PC ||
-        task.layer != wire.layer || task.chunk != wire.chunk ||
-        task.seq != wire.seq || task.graph_id != wire.graph_id ||
-        !inference_cycle_decode_frame(
-            header, frame_data.data(), frame_data.size(), output) ||
-        output.direction != INFERENCE_CYCLE_PHONE_TO_PC ||
-        output.kind != kind) {
-        std::fprintf(stderr,
-            "[CYCLE_REAL_WIRE] side=pc stage=%s status=FAIL "
-            "reason=HEADER_OR_DECODE\n",
-            kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL");
-        return false;
-    }
-    std::printf(
-        "[CYCLE_REAL_WIRE] side=pc stage=%s direction=P2C "
-        "layer=%d chunk=%d seq=%llu bytes=%zu "
-        "source=PHONE_GPU_RPC_TENSORS mode=REAL_RPC_DATA_PLANE status=PASS\n",
-        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
-        wire.layer, wire.chunk, (unsigned long long)wire.seq, received);
-    return true;
+    return llama_hybrid_cycle_receive_wire(
+        phone, wire, kind, tokens, hidden, topk, output);
 }
 
 // CPU-observed Attention phases. For RPC the graph_call_ms is ONLY the
 // submission round trip; Phone kernel execution is asynchronous and must
 // be measured by the server. One FIFO worker owns each queue-local sample.
-struct cycle_real_attention_phase_profile {
-    uint64_t count = 0;
-    double graph_build_ms = 0.0;
-    double alloc_ms = 0.0;
-    double input_copy_ms = 0.0;
-    double graph_call_ms = 0.0;
-};
+using cycle_real_attention_phase_profile = llama_hybrid_cycle_attention_phase_profile;
 
-// A single namespace of remote graph UIDs covers FFN and V2 Attention.
-static uint64_t cycle_real_phone_graph_replay_uid();
+// Phone Attention and FFN share the libllama graph UID allocator.
 
+// V5's established RPC plugin hooks remain test-local. The real Attention
+// computation and READY/Graph/Scratch ownership now live in libllama.
 static bool cycle_real_execute_phone_attention_pre(
         ggml_backend_t backend, const llama_layer & layer,
-        const llama_hparams & hp,
-        const std::vector<float> & layer_input,
-        int64_t hidden, int64_t tokens,
-        int64_t topk, int64_t experts,
-        cycle_real_phone_ready & result,
-        double & elapsed_ms,
+        const llama_hparams & hp, const std::vector<float> & layer_input,
+        int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
+        cycle_real_phone_ready & result, double & elapsed_ms,
         const cycle_real_live_wire * wire = nullptr,
         cycle_real_phone_kv_cache * kv_cache = nullptr,
-        int64_t kv_token_start = 0,
-        size_t source_device = 1,
+        int64_t kv_token_start = 0, size_t source_device = 1,
         const ggml_tensor * device_input = nullptr,
         bool retain_device_ready = false,
         cycle_real_attention_phase_profile * phase_profile = nullptr,
@@ -835,590 +701,16 @@ static bool cycle_real_execute_phone_attention_pre(
         const std::function<bool(const llama_hybrid_cycle_ready_graph &)> &
             before_phone_graph_compute = {},
         bool defer_registered_replay = false) {
-    if (defer_registered_replay &&
-        (wire != nullptr || !retain_device_ready ||
-         device_input == nullptr || !ggml_backend_is_rpc(backend))) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_V2] status=FAIL reason=DEFERRED_GRAPH_MODE\n");
-        return false;
-    }
-    if (!backend || ggml_backend_is_meta(backend) ||
-        hidden <= 0 || tokens < 1 || tokens > 128 ||
-        kv_token_start < 0 || kv_token_start + tokens > 128 ||
-        (kv_cache == nullptr && kv_token_start != 0) ||
-        (device_input == nullptr ?
-            layer_input.size() != size_t(hidden * tokens) :
-            (device_input->type != GGML_TYPE_F32 ||
-             ggml_nelements(device_input) != hidden * tokens ||
-             device_input->buffer == nullptr)) ||
-        hp.f_norm_rms_eps <= 0.0f ||
-        topk <= 0 || experts < topk ||
-        hp.rope_type != LLAMA_ROPE_TYPE_NEOX ||
-        // The loader defaults to "linear" even when no RoPE scale key is
-        // present. Linear with factor 1 is numerically identical to NONE.
-        (hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_NONE &&
-         hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_LINEAR) ||
-        std::fabs(hp.rope_freq_scale_train - 1.0f) > 1.0e-6f ||
-        hp.yarn_ext_factor > 0.0f ||
-        std::fabs(hp.rope_attn_factor - 1.0f) > 1.0e-6f ||
-        hp.use_alibi ||
-        layer.wqkv || layer.wq_b || layer.wk_b || layer.wv_b ||
-        layer.wo_b || layer.wq_s || layer.wk_s || layer.wv_s ||
-        layer.wo_s || hp.f_clamp_kqv != 0.0f ||
-        hp.attn_soft_cap || hp.f_max_alibi_bias != 0.0f) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
-            "reason=UNSUPPORTED_CONTIGUOUS_CAUSAL_PREFILL\n");
-        return false;
-    }
-
-    // PC complete layers use their native CPU model weights. Tensor and
-    // Phone layers still borrow physical Meta shards without host transfers.
-    auto get_weight = [backend, source_device](const ggml_tensor * t) -> ggml_tensor * {
-        return llama_hybrid_cycle_resolve_physical_weight(t, backend, source_device);
-    };
-    ggml_tensor * w_attn_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::ATTN_NORM] :
-        get_weight(layer.attn_norm);
-    ggml_tensor * wq = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WQ] :
-        get_weight(layer.wq);
-    ggml_tensor * wk = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WK] :
-        get_weight(layer.wk);
-    ggml_tensor * wv = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WV] :
-        get_weight(layer.wv);
-    ggml_tensor * wo = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::WO] :
-        get_weight(layer.wo);
-    ggml_tensor * wq_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::Q_NORM] :
-        get_weight(layer.attn_q_norm);
-    ggml_tensor * wk_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::K_NORM] :
-        get_weight(layer.attn_k_norm);
-    ggml_tensor * w_ffn_norm = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::FFN_NORM] :
-        get_weight(layer.ffn_norm);
-    ggml_tensor * w_router = cuda_weights ?
-        cuda_weights->tensors[cycle_real_pc_cuda_full_weights::ROUTER] :
-        get_weight(layer.ffn_gate_inp);
-
-    if (!w_attn_norm || !wq || !wk || !wv || !wo ||
-        !wq_norm || !wk_norm || !w_ffn_norm || !w_router) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=PHONE_WEIGHT_MISSING\n");
-        return false;
-    }
-    const int64_t head_dim = wq_norm->ne[0];
-    if (head_dim <= 0 || wk_norm->ne[0] != head_dim ||
-        wq->ne[0] != hidden || wk->ne[0] != hidden ||
-        wv->ne[0] != hidden || wq->ne[1] % head_dim != 0 ||
-        wk->ne[1] % head_dim != 0 ||
-        wv->ne[1] != wk->ne[1] ||
-        wo->ne[0] != wq->ne[1] || wo->ne[1] != hidden ||
-        w_router->ne[0] != hidden || w_router->ne[1] != experts ||
-        w_attn_norm->ne[0] != hidden || w_ffn_norm->ne[0] != hidden ||
-        hp.n_rot_full != uint32_t(head_dim)) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=QKV_SHAPE\n");
-        return false;
-    }
-    const int64_t n_heads = wq->ne[1] / head_dim;
-    const int64_t n_kv_heads = wk->ne[1] / head_dim;
-    if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=GQA_HEADS\n");
-        return false;
-    }
-
-    const int64_t kv_tokens = kv_token_start + tokens;
-    if (kv_cache != nullptr &&
-        (!kv_cache->keys || !kv_cache->values ||
-         kv_cache->head_dim != head_dim ||
-         kv_cache->kv_heads != n_kv_heads ||
-         kv_tokens > kv_cache->max_tokens ||
-         // Registering a future Chunk must not wait for the prior
-         // Attention completion ACK; only live execution requires the
-         // exact committed prefix. Admission order is checked by V2.
-         (defer_registered_replay ?
-             kv_cache->committed_tokens > kv_token_start :
-             kv_cache->committed_tokens != kv_token_start))) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_KV_PERSISTENT] status=FAIL "
-            "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld "
-            "committed=%lld mode=%s\n",
-            (long long)kv_token_start,
-            (long long)(kv_cache ? kv_cache->committed_tokens : -1),
-            defer_registered_replay ? "REGISTER" : "EXECUTE");
-        return false;
-    }
-    const auto graph_build_begin = std::chrono::steady_clock::now();
-    ggml_context * ctx = nullptr;
-    ggml_cgraph * graph = nullptr;
-    ggml_tensor * x = nullptr;
-    ggml_tensor * positions = nullptr;
-    ggml_tensor * causal_mask = nullptr;
-    ggml_tensor * router_probs = nullptr;
-    llama_hybrid_cycle_ready_graph ready {};
-    cycle_real_attention_graph_cache::slot * graph_slot = nullptr;
-    const bool cache_candidate = graph_cache != nullptr && kv_cache != nullptr;
-    if (cache_candidate) {
-        graph_slot = graph_cache->checkout(tokens, kv_tokens, kv_cache);
-        if (graph_slot) {
-            // The compiled graph, physical KV views and weight pointers are
-            // identical to the Warmup graph. Its GPU scratch was detached
-            // after the previous FFN consumer fence.
-            ctx = graph_slot->ctx;
-            graph = graph_slot->graph;
-            x = graph_slot->input;
-            positions = graph_slot->positions;
-            causal_mask = graph_slot->causal_mask;
-            router_probs = graph_slot->router_probs;
-            ready = graph_slot->ready;
-        }
-    }
-    if (!graph_slot) {
-    ggml_init_params p {};
-    p.mem_size = 16 * 1024 * 1024;
-    p.no_alloc = true;
-    ctx = ggml_init(p);
-    if (!ctx) {
-        return false;
-    }
-
-    x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
-    positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
-    // Keys include all PAST tokens and the current causal chunk.
-    causal_mask = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F16, kv_tokens, tokens);
-    ggml_set_input(x);
-    ggml_set_input(positions);
-    ggml_set_input(causal_mask);
-    ggml_set_name(x, "cycle_phone_attn_input");
-    ggml_set_name(positions, "cycle_phone_positions");
-    ggml_set_name(causal_mask, "cycle_phone_causal_kq_mask");
-
-    auto * attn_norm = ggml_mul(
-        ctx, ggml_rms_norm(ctx, x, hp.f_norm_rms_eps), w_attn_norm);
-    auto * q = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, wq, attn_norm), head_dim, n_heads, tokens);
-    auto * k = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, wk, attn_norm), head_dim, n_kv_heads, tokens);
-    auto * v = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, wv, attn_norm), head_dim, n_kv_heads, tokens);
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, hp.f_norm_rms_eps), wq_norm);
-    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, hp.f_norm_rms_eps), wk_norm);
-
-    // RoPE is now essential: position 1..N-1 must not be treated as 0.
-    // The standalone Qwen3-MoE check rejects nondefault YaRN/scaling above.
-    const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
-        int(hp.n_ctx_orig_yarn) : int(hp.n_ctx_train);
-    const float rope_base = hp.rope_freq_base_train > 0 ?
-        hp.rope_freq_base_train : 10000.0f;
-    const float rope_scale = hp.rope_freq_scale_train > 0 ?
-        hp.rope_freq_scale_train : 1.0f;
-    q = ggml_rope_ext(ctx, q, positions, nullptr,
-        int(head_dim), GGML_ROPE_TYPE_NEOX, ctx_orig,
-        rope_base, rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(ctx, k, positions, nullptr,
-        int(head_dim), GGML_ROPE_TYPE_NEOX, ctx_orig,
-        rope_base, rope_scale, 0.0f, 1.0f, 32.0f, 1.0f);
-
-    // Same no-Flash GQA layout as llm_graph_context::build_attn_mha():
-    // [head_dim, tokens, heads, stream]. The reference cache stores K/V
-    // in F16; preserve that rounding before the attention projection.
-    // In this single-batch test, K/V at positions [0,N) are the entire
-    // transient cache. The mask below implements the same causal rule
-    // as llama_kv_cache::set_input_kq_mask (key_pos > query_pos -> -inf).
-    k = ggml_cast(ctx, k, GGML_TYPE_F16);
-    v = ggml_cast(ctx, v, GGML_TYPE_F16);
-    ggml_tensor * kv_k_write = nullptr;
-    ggml_tensor * kv_v_write = nullptr;
-    if (kv_cache != nullptr) {
-        // NEW K/V are contiguous [head_dim,kv_heads,chunk_tokens].
-        // Persist them in the same Phone GPU buffer before reading all
-        // historical keys; no historical K/V is ever sent to the PC.
-        auto * dst_k = ggml_view_3d(
-            ctx, kv_cache->keys, head_dim, n_kv_heads, tokens,
-            kv_cache->keys->nb[1], kv_cache->keys->nb[2],
-            size_t(kv_token_start) * kv_cache->keys->nb[2]);
-        auto * dst_v = ggml_view_3d(
-            ctx, kv_cache->values, head_dim, n_kv_heads, tokens,
-            kv_cache->values->nb[1], kv_cache->values->nb[2],
-            size_t(kv_token_start) * kv_cache->values->nb[2]);
-        kv_k_write = ggml_cpy(ctx, k, dst_k);
-        kv_v_write = ggml_cpy(ctx, v, dst_v);
-        k = ggml_view_3d(
-            ctx, kv_cache->keys, head_dim, n_kv_heads, kv_tokens,
-            kv_cache->keys->nb[1], kv_cache->keys->nb[2], 0);
-        v = ggml_view_3d(
-            ctx, kv_cache->values, head_dim, n_kv_heads, kv_tokens,
-            kv_cache->values->nb[1], kv_cache->values->nb[2], 0);
-    }
-    q = ggml_permute(ctx, q, 0, 2, 1, 3);
-    k = ggml_permute(ctx, k, 0, 2, 1, 3);
-    v = ggml_permute(ctx, v, 0, 2, 1, 3);
-    auto * kq = ggml_mul_mat(ctx, k, q);
-    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    auto * probs = ggml_soft_max_ext(
-        ctx, kq, causal_mask,
-        1.0f / std::sqrt(float(head_dim)), 0.0f);
-    auto * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
-    auto * kqv = ggml_mul_mat(ctx, vt, probs);
-
-    // The concatenated attention width is n_heads * head_dim (4096 on
-    // Qwen3-30B-A3B), NOT the residual/hidden width (2048). The WO
-    // projection is responsible for mapping 4096 -> 2048. Previously,
-    // requesting [hidden,1] in ggml_cont_2d aborted at ggml.c:3594.
-    const int64_t attention_width = wq->ne[1];
-    if (ggml_nelements(kqv) != attention_width * tokens) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ATTN_WIDTH "
-            "kqv_elements=%lld expected=%lld hidden=%lld\n",
-            (long long)ggml_nelements(kqv),
-            (long long)(attention_width * tokens), (long long)hidden);
-        ggml_free(ctx);
-        return false;
-    }
-    auto * attn = ggml_cont_2d(ctx,
-        ggml_permute(ctx, kqv, 0, 2, 1, 3), attention_width, tokens);
-
-    std::printf(
-        "[CYCLE_PHONE_ATTN_SHAPE] hidden=%lld head_dim=%lld "
-        "heads=%lld kv_heads=%lld attn_width=%lld wo_out=%lld "
-        "query_tokens=%lld kv_tokens=%lld status=PASS\n",
-        (long long)hidden, (long long)head_dim,
-        (long long)n_heads, (long long)n_kv_heads,
-        (long long)attention_width, (long long)wo->ne[1],
-        (long long)tokens, (long long)kv_tokens);
-
-    auto * attn_output = ggml_mul_mat(ctx, wo, attn);
-    auto * residual = ggml_add(ctx, attn_output, x);
-    ggml_set_name(residual, "cycle_num_attn_residual");
-    auto * norm = ggml_mul(
-        ctx, ggml_rms_norm(ctx, residual, hp.f_norm_rms_eps), w_ffn_norm);
-    ggml_set_name(norm, "cycle_num_attn_ffn_norm");
-    auto * router_logits = ggml_mul_mat(ctx, w_router, norm);
-    router_probs = ggml_soft_max(ctx, router_logits);
-    auto * ids = ggml_cont(ctx, ggml_argsort_top_k(
-        ctx, router_probs, int(topk)));
-    auto * router_p3 = ggml_reshape_3d(ctx, router_probs, 1, experts, tokens);
-    auto * weights = ggml_get_rows(ctx, router_p3, ids);
-    weights = ggml_reshape_2d(ctx, weights, topk, tokens);
-    auto * sum = ggml_sum_rows(ctx, weights);
-    sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
-    weights = ggml_div(ctx, weights, sum);
-    weights = ggml_reshape_3d(ctx, weights, 1, topk, tokens);
-    if (hp.expert_weights_scale != 0.0f &&
-        hp.expert_weights_scale != 1.0f) {
-        weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
-    }
-    weights = ggml_cont(ctx, weights);
-
-    ready = {residual, norm, ids, weights};
-    if (!llama_hybrid_cycle_ready_graph_valid(ready, hidden, tokens, topk)) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=READY_SHAPES\n");
-        ggml_free(ctx);
-        return false;
-    }
-    graph = ggml_new_graph_custom(ctx, 512, false);
-    // Enforce GPU cache writes before subsequent prefix attention reads.
-    if (kv_cache != nullptr) {
-        ggml_build_forward_expand(graph, kv_k_write);
-        ggml_build_forward_expand(graph, kv_v_write);
-    }
-    ggml_build_forward_expand(graph, ready.residual);
-    ggml_build_forward_expand(graph, ready.ffn_norm);
-    ggml_build_forward_expand(graph, ready.topk_ids);
-    ggml_build_forward_expand(graph, ready.topk_weights);
-    int unsupported = 0;
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        const ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node->op != GGML_OP_NONE &&
-            !ggml_backend_supports_op(backend, node)) {
-            ++unsupported;
-            std::fprintf(stderr,
-                "[CYCLE_PHONE_ATTN_PRE_OP] node=%d op=%s "
-                "name=%s supported=0\n",
-                i, ggml_op_name(node->op), node->name);
-        }
-    }
-    if (unsupported != 0) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL "
-            "reason=UNSUPPORTED_PHONE_OP count=%d\n", unsupported);
-        ggml_free(ctx);
-        return false;
-    }
-
-    }
-    const auto graph_build_done = std::chrono::steady_clock::now();
-
-    const auto buft = ggml_backend_get_default_buffer_type(backend);
-    const auto alloc_begin = std::chrono::steady_clock::now();
-    ggml_backend_buffer_t compute_buffer = nullptr;
-    bool scratch_pooled = false;
-    const bool allocated = scratch_pool ?
-        scratch_pool->acquire(ctx, compute_buffer, scratch_pooled) :
-        (compute_buffer =
-            ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft)) != nullptr;
-    const auto alloc_done = std::chrono::steady_clock::now();
-    if (!allocated || !compute_buffer) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_ATTN_PRE] status=FAIL reason=ALLOC_PHONE_GRAPH\n");
-        if (graph_slot) {
-            graph_cache->recycle(graph_slot, false);
-        } else {
-            ggml_free(ctx);
-        }
-        return false;
-    }
-
-    const auto release_compute_buffer = [&] {
-        if (scratch_pooled && scratch_pool) {
-            scratch_pool->recycle(compute_buffer);
-        } else {
-            ggml_backend_buffer_free(compute_buffer);
-        }
-    };
-
-    // Input layout: token-major hidden vectors; positions increment 0..N-1.
-    // The F16 mask's dimension 0 is the KV index and dimension 1 is query.
-    std::vector<int32_t> position_data(size_t(tokens), 0);
-    std::vector<ggml_fp16_t> mask_data(size_t(tokens * kv_tokens));
-    const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
-    const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
-    int64_t masked_future = 0;
-    for (int64_t query = 0; query < tokens; ++query) {
-        const int64_t global_pos = kv_token_start + query;
-        position_data[size_t(query)] = int32_t(global_pos);
-        for (int64_t key = 0; key < kv_tokens; ++key) {
-            const bool future = key > global_pos;
-            mask_data[size_t(query * kv_tokens + key)] = future ? drop : keep;
-            masked_future += future ? 1 : 0;
-        }
-    }
-    if (masked_future != tokens * (tokens - 1) / 2) {
-        std::fprintf(stderr,
-            "[CYCLE_PHONE_KV] status=FAIL reason=MASK_VALIDATION\n");
-        if (graph_slot) {
-            graph_cache->recycle(graph_slot, false);
-        } else {
-            ggml_free(ctx);
-        }
-        release_compute_buffer();
-        return false;
-    }
-    std::printf("[CYCLE_PHONE_KV] query_tokens=%lld kv_tokens=%lld "
-                "position_start=%lld position_end=%lld "
-                "masked_future=%lld mask_type=F16 scope=%s "
-                "status=PASS\n",
-                (long long)tokens, (long long)kv_tokens,
-                (long long)kv_token_start, (long long)(kv_tokens - 1),
-                (long long)masked_future,
-                kv_cache == nullptr ? "SINGLE_UBATCH" :
-            source_device == 0 ? "PC_PERSISTENT" : "PHONE_PERSISTENT");
-
-    // Arm the Phone continuation before the ordered Attention Graph and
-    // READY stage. Failure must return both Graph and Scratch leases.
-    if (before_phone_graph_compute &&
-        !before_phone_graph_compute(ready)) {
-        if (graph_slot) {
-            graph_cache->recycle(graph_slot, false);
-        } else {
-            ggml_free(ctx);
-        }
-        release_compute_buffer();
-        return false;
-    }
-    const auto begin = std::chrono::steady_clock::now();
-    if (device_input != nullptr) {
-        // Both immediate and deferred Phone Full handoffs must validate
-        // exactly the same shape/strides. In V2 the source l_out is NOT yet
-        // produced: the Phone worker will COPY after the producer FFN+ADD.
-        // Never upload the empty host vector as an Attention input.
-        bool layout_ok = ggml_are_same_shape(device_input, x) &&
-                         device_input->type == x->type;
-        for (int d = 0; d < GGML_MAX_DIMS && layout_ok; ++d) {
-            layout_ok = device_input->nb[d] == x->nb[d];
-        }
-        if (!layout_ok ||
-            (!defer_registered_replay &&
-             !ggml_backend_buffer_copy_tensor(device_input, x))) {
-            std::fprintf(stderr,
-                "[CYCLE_PHONE_LOCAL_HANDOFF] status=FAIL "
-                "reason=%s\n",
-                !layout_ok ? "TENSOR_LAYOUT_MISMATCH" :
-                             "DEVICE_COPY_UNSUPPORTED");
-            if (graph_slot) {
-                graph_cache->recycle(graph_slot, false);
-            } else {
-                ggml_free(ctx);
-            }
-            release_compute_buffer();
-            return false;
-        }
-        std::printf(
-            "[CYCLE_PHONE_LOCAL_HANDOFF] backend=%s "
-            "bytes=%zu source=PHONE_GPU_PREVIOUS_LAYER "
-            "destination=PHONE_GPU_ATTENTION "
-            "action=%s status=OK\n",
-            ggml_backend_name(backend), ggml_nbytes(x),
-            defer_registered_replay ?
-                "DEFER_TO_PHONE_FIFO" : "DEVICE_COPY");
-    } else {
-        // Host upload is valid only for a genuinely host-resident input;
-        // deferred replay requires a non-null physical GPU producer.
-        ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
-    }
-    ggml_backend_tensor_set(positions, position_data.data(), 0,
-                            ggml_nbytes(positions));
-    ggml_backend_tensor_set(causal_mask, mask_data.data(), 0,
-                            ggml_nbytes(causal_mask));
-    const auto input_done = std::chrono::steady_clock::now();
-    uint64_t deferred_graph_uid = 0;
-    bool graph_submitted = false;
-    if (defer_registered_replay) {
-        deferred_graph_uid = cycle_real_phone_graph_replay_uid();
-        ggml_graph_set_uid(graph, deferred_graph_uid);
-        graph_submitted = ggml_backend_rpc_cycle_register_graph(
-            backend, graph);
-        std::printf(
-            "[CYCLE_PHONE_V2] side=PC event=REGISTER_NEXT_ATTN "
-            "uid=%" PRIu64 " tokens=%lld prefix=%lld status=%s\n",
-            deferred_graph_uid, (long long)tokens,
-            (long long)kv_token_start,
-            graph_submitted ? "OK" : "FAIL");
-    } else {
-        graph_submitted = ggml_backend_graph_compute(backend, graph) ==
-            GGML_STATUS_SUCCESS;
-    }
-    const auto submit_done = std::chrono::steady_clock::now();
-    if (phase_profile) {
-        ++phase_profile->count;
-        phase_profile->graph_build_ms +=
-            std::chrono::duration<double, std::milli>(
-                graph_build_done - graph_build_begin).count();
-        phase_profile->alloc_ms +=
-            std::chrono::duration<double, std::milli>(
-                alloc_done - alloc_begin).count();
-        phase_profile->input_copy_ms +=
-            std::chrono::duration<double, std::milli>(
-                input_done - begin).count();
-        phase_profile->graph_call_ms +=
-            std::chrono::duration<double, std::milli>(
-                submit_done - input_done).count();
-    }
-    if (std::getenv("LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr) {
-        std::printf(
-            "[CYCLE_ATTN_PROFILE] backend=%s "
-            "graph_build_ms=%.3f gpu_alloc_ms=%.3f "
-            "input_copy_ms=%.3f graph_submit_or_compute_ms=%.3f "
-            "remote_gpu_compute_ms=SEE_CYCLE_GPU_SERVER\n",
-            ggml_backend_name(backend),
-            std::chrono::duration<double, std::milli>(
-                graph_build_done - graph_build_begin).count(),
-            std::chrono::duration<double, std::milli>(
-                alloc_done - alloc_begin).count(),
-            std::chrono::duration<double, std::milli>(
-                input_done - begin).count(),
-            std::chrono::duration<double, std::milli>(
-                submit_done - input_done).count());
-    }
-    bool ok = graph_submitted;
-    if (ok && !defer_registered_replay) {
-        ggml_backend_synchronize(backend);
-        if (kv_cache != nullptr) {
-            kv_cache->committed_tokens = kv_tokens;
-            std::printf(
-                "[CYCLE_PHONE_KV_PERSISTENT] chunk=%d "
-                "position_start=%lld committed=%lld "
-                "total=%lld owner=%s status=OK\n",
-                wire != nullptr ? wire->chunk : -1,
-                (long long)kv_token_start,
-                (long long)kv_cache->committed_tokens,
-                (long long)kv_cache->max_tokens,
-                cuda_weights ? "PC_CUDA" :
-                    source_device == 0 ? "PC_CPU" : "PHONE_GPU");
-        }
-        if (wire != nullptr) {
-            // GPU tensors remain valid until compute_buffer is destroyed.
-            // The Phone RPC server copies directly into its transport TX
-            // slot; no PC-side retransmission is involved.
-            ok = ggml_backend_rpc_cycle_send_ready(
-                backend, wire->layer, wire->chunk,
-                wire->seq, wire->graph_id,
-                ready.residual, ready.ffn_norm,
-                ready.topk_ids, ready.topk_weights);
-            if (!ok) {
-                std::fprintf(stderr,
-                    "[CYCLE_REAL_WIRE] stage=READY status=FAIL "
-                    "reason=PHONE_REMOTE_SEND\n");
-            }
-        }
-    }
-    if (ok && wire == nullptr && !retain_device_ready) {
-        result.residual.resize(size_t(hidden * tokens));
-        result.norm.resize(size_t(hidden * tokens));
-        result.ids.resize(size_t(topk * tokens));
-        result.routing.resize(size_t(topk * tokens));
-        result.router_probs.resize(size_t(experts * tokens));
-        ggml_backend_tensor_get(ready.residual,
-            result.residual.data(), 0, ggml_nbytes(ready.residual));
-        ggml_backend_tensor_get(ready.ffn_norm,
-            result.norm.data(), 0, ggml_nbytes(ready.ffn_norm));
-        ggml_backend_tensor_get(ready.topk_ids,
-            result.ids.data(), 0, ggml_nbytes(ready.topk_ids));
-        ggml_backend_tensor_get(ready.topk_weights,
-            result.routing.data(), 0, ggml_nbytes(ready.topk_weights));
-        ggml_backend_tensor_get(router_probs,
-            result.router_probs.data(), 0, ggml_nbytes(router_probs));
-    }
-    elapsed_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - begin).count();
-    std::printf(
-        "[CYCLE_PHONE_ATTN_PRE] backend=%s "
-        "positions=[%lld,%lld] tokens=%lld kv_tokens=%lld "
-        "heads=%lld kv_heads=%lld graph_nodes=%d "
-        "wall_ms=%.3f status=%s\n",
-        ggml_backend_name(backend),
-        (long long)kv_token_start, (long long)(kv_tokens - 1),
-        (long long)tokens, (long long)kv_tokens,
-        (long long)n_heads, (long long)n_kv_heads,
-        ggml_graph_n_nodes(graph), elapsed_ms,
-        ok ? "OK" : "FAIL");
-
-    if (ok && (wire != nullptr || retain_device_ready)) {
-        // Borrow original Attention tensors until the local Phone FFN
-        // consumes them, preventing a hidden PC->Phone activation upload.
-        if (cache_candidate && !graph_slot) {
-            // Store metadata only. READY still owns the temporary GPU
-            // scratch buffer; the graph remains busy until FFN consumes it.
-            graph_slot = graph_cache->retain(
-                tokens, kv_tokens, kv_cache, ctx, graph,
-                x, positions, causal_mask, router_probs, ready);
-        }
-        result.phone_ctx = graph_slot ? nullptr : ctx;
-        result.phone_compute_buffer = compute_buffer;
-        result.phone_scratch_pool = scratch_pooled ? scratch_pool : nullptr;
-        result.phone_graph_cache = graph_slot ? graph_cache : nullptr;
-        result.phone_cached_graph = graph_slot;
-        result.phone_graph = ready;
-        result.prepared_attention_graph_uid = deferred_graph_uid;
-        result.prepared_attention_input =
-            defer_registered_replay ? x : nullptr;
-        return true;
-    }
-    if (graph_slot) {
-        graph_cache->recycle(graph_slot, false);
-    } else {
-        ggml_free(ctx);
-    }
-    release_compute_buffer();
-    return ok;
+    llama_hybrid_cycle_attention_rpc_ops rpc;
+    rpc.is_rpc = ggml_backend_is_rpc(backend);
+    rpc.register_graph = &ggml_backend_rpc_cycle_register_graph;
+    rpc.send_ready = &ggml_backend_rpc_cycle_send_ready;
+    return llama_hybrid_cycle_execute_attention_pre(
+        backend, layer, hp, layer_input, hidden, tokens, topk, experts,
+        result, elapsed_ms, wire, kv_cache, kv_token_start, source_device,
+        device_input, retain_device_ready, phase_profile, cuda_weights,
+        scratch_pool, graph_cache, before_phone_graph_compute,
+        defer_registered_replay, rpc);
 }
 
 // Intermediate physical FFN taps are opt-in diagnostics. They are borrowed
@@ -2875,14 +2167,7 @@ static bool cycle_real_probe_full_ffn_f64_oracle(
 // A fresh process-time namespace and monotonic counter prevent accidental
 // reuse of a stale server-side graph when its device buffers were freed.
 // Never enable replay for a graph whose buffer lifetime is not owned here.
-static uint64_t cycle_real_phone_graph_replay_uid() {
-    static std::atomic<uint64_t> next_uid {
-        uint64_t(std::chrono::steady_clock::now()
-            .time_since_epoch().count()) | UINT64_C(1)
-    };
-    const uint64_t uid = next_uid.fetch_add(1, std::memory_order_relaxed);
-    return uid != 0 ? uid : 1;
-}
+// Unique graph UIDs now come from the production Attention module.
 
 struct cycle_real_c2p_phone_chunk {
     ggml_context * ctx = nullptr;
@@ -2998,9 +2283,9 @@ struct cycle_real_c2p_phone_chunk {
         output = reduced.output;
         reduce_graph = reduced.reduce_graph;
         const uint64_t phone_full_graph_uid = rpc_full_replay ?
-            cycle_real_phone_graph_replay_uid() : 0;
+            llama_hybrid_cycle_graph_replay_uid() : 0;
         const uint64_t c2p_reduce_graph_uid = rpc_full_replay && reduce_graph ?
-            cycle_real_phone_graph_replay_uid() : 0;
+            llama_hybrid_cycle_graph_replay_uid() : 0;
         if (rpc_full_replay) {
             // Replayed graph references exactly these persistent FFN,
             // residual and output buffers. A freed graph must NEVER reuse
@@ -3573,7 +2858,7 @@ struct cycle_real_p2c_ffn_slot {
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
         ggml_build_forward_expand(graph, inputs.ffn_output);
         const uint64_t phone_local_graph_uid = phone_local_chain ?
-            cycle_real_phone_graph_replay_uid() : 0;
+            llama_hybrid_cycle_graph_replay_uid() : 0;
         if (phone_local_chain) {
             // A fresh UID owns precisely this retained Graph/Buffer Slot.
             ggml_graph_set_uid(graph, phone_local_graph_uid);
@@ -3633,14 +2918,11 @@ struct cycle_real_p2c_ffn_slot {
     }
 };
 
-struct cycle_real_wire_submit_timing {
-    size_t payload_bytes = 0;
-    double encode_ms = 0.0;
-    double enqueue_call_ms = 0.0;
-};
+using cycle_real_wire_submit_timing =
+    llama_hybrid_cycle_wire_submit_timing;
 
-// PC-side breakdown only: encoding and queuing are not the network wire
-// duration. Remote delivery/processing is later reflected in ACK waits.
+// The real V5 stage callback calls the same production wire encoder and
+// matching receiver used by the future full-model runtime.
 static bool cycle_real_send_c2p_frame(
         ggml_backend_t phone, const cycle_real_live_wire & wire,
         inference_cycle_payload_kind kind,
@@ -3648,72 +2930,8 @@ static bool cycle_real_send_c2p_frame(
         const std::vector<float> & partial,
         uint32_t tokens, uint32_t hidden, uint32_t topk,
         cycle_real_wire_submit_timing * timing = nullptr) {
-    const auto encode_begin = std::chrono::steady_clock::now();
-    size_t bytes = 0;
-    if (!inference_cycle_payload_size(
-            kind, tokens, hidden,
-            kind == INFERENCE_CYCLE_READY ? topk : 0, bytes)) {
-        return false;
-    }
-    std::vector<uint8_t> frame(bytes);
-    size_t written = 0;
-    bool ok = false;
-    if (kind == INFERENCE_CYCLE_READY) {
-        const inference_cycle_ready_view value {
-            tokens, hidden, topk,
-            ready.residual.data(), ready.norm.data(),
-            ready.ids.data(), ready.routing.data()
-        };
-        ok = ready.residual.size() == size_t(tokens) * hidden &&
-             ready.norm.size() == size_t(tokens) * hidden &&
-             ready.ids.size() == size_t(tokens) * topk &&
-             ready.routing.size() == size_t(tokens) * topk &&
-             inference_cycle_write_ready(
-                 frame.data(), frame.size(), value, written);
-    } else {
-        const inference_cycle_partial_view value {
-            tokens, hidden, partial.data()
-        };
-        ok = partial.size() == size_t(tokens) * hidden &&
-             inference_cycle_write_partial(
-                 frame.data(), frame.size(), value, written);
-    }
-    if (!ok || written != bytes) {
-        return false;
-    }
-    auto * dev = ggml_backend_get_device(phone);
-    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    auto submit = reg ?
-        reinterpret_cast<ggml_backend_rpc_inference_transport_submit_t>(
-            ggml_backend_reg_get_proc_address(
-                reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_SUBMIT_PROC)) :
-        nullptr;
-    ggml_backend_rpc_inference_task task {};
-    task.layer = wire.layer;
-    task.chunk = wire.chunk;
-    task.seq = wire.seq;
-    task.graph_id = wire.graph_id;
-    task.stage = kind == INFERENCE_CYCLE_READY ?
-        INFERENCE_STAGE_CYCLE_READY : INFERENCE_STAGE_CYCLE_PARTIAL;
-    task.tensor_role = INFERENCE_CYCLE_PC_TO_PHONE;
-    const auto enqueue_begin = std::chrono::steady_clock::now();
-    const bool submitted = submit != nullptr &&
-        submit(phone, &task, frame.data(), frame.size());
-    if (timing) {
-        timing->payload_bytes = bytes;
-        timing->encode_ms = std::chrono::duration<double, std::milli>(
-            enqueue_begin - encode_begin).count();
-        timing->enqueue_call_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - enqueue_begin).count();
-    }
-    std::printf(
-        "[CYCLE_C2P_WIRE] side=pc action=SEND kind=%s layer=%d chunk=%d "
-        "seq=%llu bytes=%zu direction=PC_TO_PHONE status=%s\n",
-        kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
-        wire.layer, wire.chunk, (unsigned long long)wire.seq,
-        bytes, submitted ? "QUEUED" : "FAIL");
-    return submitted;
+    return llama_hybrid_cycle_send_c2p_frame(
+        phone, wire, kind, ready, partial, tokens, hidden, topk, timing);
 }
 
 struct cycle_real_p2c_chunk {
