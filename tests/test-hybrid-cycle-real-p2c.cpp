@@ -6617,6 +6617,41 @@ static bool cycle_real_execute_period_fifo(
                             }
                         }
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+                        if (phone_main_p2c) {
+                            // The Phone MAIN Worker already owns and runs
+                            // the prepared L7 Attention/READY/FFN sequence.
+                            // PC only observes the READY staging event and
+                            // advances the causal global Ring/KV prefix.
+                            const bool prefix_ok = kv[size_t(l)] &&
+                                kv[size_t(l)]->committed_tokens == st.start &&
+                                v5_p2c_registered_tokens >=
+                                    st.start + st.tokens &&
+                                st.ready.prepared_attention_graph_uid != 0 &&
+                                st.p2c_main_ffn &&
+                                st.p2c_main_ffn->registered_graph_uid != 0;
+                            ok = prefix_ok &&
+                                ggml_backend_rpc_cycle_wait_phone_p2c_ready(
+                                    phone, l, c, st.wire.seq, st.wire.graph_id);
+                            if (ok) {
+                                kv[size_t(l)]->committed_tokens =
+                                    st.start + st.tokens;
+                                ++v5_p2c_ready_completed;
+                                ++ordered_p2c_handoffs;
+                                std::printf(
+                                    "[CYCLE_PHONE_V5_P2C] side=PC "
+                                    "event=ATTN_READY_ACK layer=%d "
+                                    "chunk=%d committed_kv=%lld "
+                                    "status=OK\n",
+                                    l, c,
+                                    (long long)kv[size_t(l)]->committed_tokens);
+                            } else {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PHONE_V5_P2C] side=PC "
+                                    "event=ATTN_READY_ACK layer=%d "
+                                    "chunk=%d status=FAIL "
+                                    "reason=PREFIX_OR_REMOTE_READY\n", l, c);
+                            }
+                        } else {
                         const auto * local_input = take_device_input(l, c);
                         const std::vector<float> empty;
                         ok = local_input != nullptr;
@@ -6715,6 +6750,7 @@ static bool cycle_real_execute_period_fifo(
                                 }
                             }
                         }
+                        } // Legacy PC-issued P2C Attention.
                     }
                     break;
                 }
