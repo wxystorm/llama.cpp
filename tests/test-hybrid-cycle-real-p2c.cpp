@@ -3126,6 +3126,8 @@ struct cycle_real_c2p_phone_chunk {
     // Nonzero only when the persistent, fused Full-layer FFN+ADD graph
     // has been registered on this Phone RPC backend without executing.
     uint64_t registered_full_graph_uid = 0;
+    uint64_t registered_c2p_ffn_uid = 0;
+    uint64_t registered_c2p_reduce_uid = 0;
     // Persisted FFN/Reduce graph is safe to replay ONLY for the same
     // physical layer (owned by its per-layer pool) and token shape.
     int64_t prepared_tokens = 0;
@@ -3150,6 +3152,8 @@ struct cycle_real_c2p_phone_chunk {
         fused_full_graph = false;
         rpc_full_replay = false;
         registered_full_graph_uid = 0;
+        registered_c2p_ffn_uid = 0;
+        registered_c2p_reduce_uid = 0;
         prepared_tokens = 0;
         reduce_graph_call_ms = 0.0;
         reduce_backend_sync_ms = 0.0;
@@ -3161,7 +3165,8 @@ struct cycle_real_c2p_phone_chunk {
             int64_t hidden, int64_t tokens, int64_t topk, int64_t experts,
             bool full_layer = false, bool fuse_full = false,
             bool enable_rpc_replay = false,
-            bool enable_phone_full_local = false) {
+            bool enable_phone_full_local = false,
+            bool enable_c2p_local = false) {
         const auto build_begin = std::chrono::steady_clock::now();
         release();
         ggml_init_params params {};
@@ -3173,7 +3178,14 @@ struct cycle_real_c2p_phone_chunk {
         }
         is_full_layer = full_layer;
         fused_full_graph = full_layer && fuse_full;
-        rpc_full_replay = full_layer && enable_rpc_replay;
+        rpc_full_replay = (full_layer || enable_c2p_local) &&
+            (enable_rpc_replay || enable_c2p_local);
+        if (enable_c2p_local && full_layer) {
+            std::fprintf(stderr,
+                "[CYCLE_PHONE_V5] status=FAIL reason=C2P_NOT_FULL_LAYER\\n");
+            release();
+            return false;
+        }
         if (enable_phone_full_local &&
             (!is_full_layer || !fused_full_graph || !rpc_full_replay)) {
             std::fprintf(stderr,
@@ -3232,13 +3244,15 @@ struct cycle_real_c2p_phone_chunk {
         }
         const uint64_t phone_full_graph_uid = rpc_full_replay ?
             cycle_real_phone_graph_replay_uid() : 0;
+        const uint64_t c2p_reduce_graph_uid = rpc_full_replay && reduce_graph ?
+            cycle_real_phone_graph_replay_uid() : 0;
         if (rpc_full_replay) {
             // Replayed graph references exactly these persistent FFN,
             // residual and output buffers. A freed graph must NEVER reuse
             // its UID; only this object's subsequent Chunk may replay it.
             ggml_graph_set_uid(ffn_graph, phone_full_graph_uid);
             if (reduce_graph) {
-                ggml_graph_set_uid(reduce_graph, cycle_real_phone_graph_replay_uid());
+                ggml_graph_set_uid(reduce_graph, c2p_reduce_graph_uid);
             }
         }
         const auto build_end = std::chrono::steady_clock::now();
@@ -3263,6 +3277,20 @@ struct cycle_real_c2p_phone_chunk {
                 return false;
             }
             registered_full_graph_uid = phone_full_graph_uid;
+        }
+        if (enable_c2p_local) {
+            // Register once per physical slot; both graphs reference the
+            // existing retained buffers. Registration does not execute.
+            if (!reduce_graph ||
+                !ggml_backend_rpc_cycle_register_graph(phone, ffn_graph) ||
+                !ggml_backend_rpc_cycle_register_graph(phone, reduce_graph)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_V5] phase=REGISTER_C2P status=FAIL\\n");
+                release();
+                return false;
+            }
+            registered_c2p_ffn_uid = phone_full_graph_uid;
+            registered_c2p_reduce_uid = c2p_reduce_graph_uid;
         }
         const auto alloc_end = std::chrono::steady_clock::now();
         graph_build_ms = std::chrono::duration<double, std::milli>(
