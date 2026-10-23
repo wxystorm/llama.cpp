@@ -10,8 +10,11 @@
 // LLAMA_HYBRID_CYCLE_REAL_P2C=1 additionally runs all six P2C stages
 // with real Phone Attention/FFN, independent P2C READY/PARTIAL transport,
 // PC destination FFN, exclusive PC Reduce, and real reverse ACK.
-// Then all 48 physical layers compute on SYNTHETIC hidden input; embedding,
-// logits, and strict reference parity remain NOT RUN.
+// Without LLAMA_HYBRID_CYCLE_REAL_REFERENCE=1, all 48 layers use a SYNTHETIC
+// hidden input and no numerical oracle. With the flag, first run an ordinary
+// CPU-only llama_decode on real tokens, capture embedding + all six P2C l_out,
+// RELEASE that model, then run all 48 real physical layers and enforce the
+// same strict full/chunk parity bound as V5. Logits remain NOT RUN.
 // Without these flags, preserve the established regression paths.
 // This is NOT a 48-layer Transformer forward or a numeric parity test.
 //
@@ -29,6 +32,7 @@
 #include "llama-hybrid-cycle-phone-regions.h"
 #include "llama-hybrid-cycle-wire.h"
 #include "inference-cycle-reduce.h"
+#include "hybrid-cycle-full-reference.h"
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -146,10 +150,41 @@ int main(int argc, char ** argv) {
             "reason=REAL_P2C_REQUIRES_REAL_PHONE_FULL\n");
         return 2;
     }
+    const char * reference_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_REAL_REFERENCE");
+    if (reference_env && std::strcmp(reference_env, "0") != 0 &&
+        std::strcmp(reference_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=BAD_REFERENCE_FLAG\n");
+        return 2;
+    }
+    const bool use_cpu_reference = reference_env &&
+        std::strcmp(reference_env, "1") == 0;
+    if (use_cpu_reference && !real_p2c) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=REAL_REFERENCE_REQUIRES_REAL_48_LAYERS\n");
+        return 2;
+    }
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(
         GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=CPU_NOT_REGISTERED\n");
+        return 1;
+    }
+    // The independent CPU-only model/context is destroyed INSIDE run()
+    // before any PC/Phone shard model or Phone transport is opened.
+    // Keep only the captured ~7x(token*hidden) F32 host arrays.
+    cycle_full_reference::baseline reference;
+    if (use_cpu_reference &&
+        !reference.run(argv[1], cpu_dev, n_tokens)) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=CPU_ORACLE\n");
+        return 1;
+    }
     const auto rpc_reg = ggml_backend_rpc_add_server(argv[2]);
     if (!cpu_dev || !rpc_reg ||
         ggml_backend_reg_dev_count(rpc_reg) != 1) {
@@ -269,6 +304,24 @@ int main(int argc, char ** argv) {
                         for (size_t i = 0; i < total; ++i) {
                             initial_hidden[i] = 0.02f + 0.01f *
                                 std::sin(float((i % 127) + 1) * 0.03f);
+                        }
+                        if (use_cpu_reference) {
+                            // Same absolute token positions and F32 embedding
+                            // as the independent standard llama_decode oracle.
+                            // No synthetic activation can enter the real test.
+                            const bool input_ok =
+                                reference.n_tokens == n_tokens &&
+                                reference.hidden == hidden &&
+                                reference.embedding.size() == total;
+                            if (input_ok) {
+                                initial_hidden = reference.embedding;
+                            } else {
+                                ok = false;
+                            }
+                            std::printf(
+                                "[CYCLE_FULL_REFERENCE_INPUT] source=CPU_TOKEN_EMBD "
+                                "tokens=%d elements=%zu status=%s\n",
+                                n_tokens, total, input_ok ? "PASS" : "FAIL");
                         }
 
                         // Mock Phone device activations live until all FIFO
@@ -949,13 +1002,15 @@ int main(int argc, char ** argv) {
                                 "layers=48 chunks=%d max_inflight=%d "
                                 "pc_full=REAL_CPU c2p_pc=REAL_CPU "
                                 "c2p_phone=%s phone_full=%s p2c=%s "
-                                "wire=%s source=SYNTHETIC_HIDDEN status=BEGIN\n",
+                                "wire=%s source=%s status=BEGIN\n",
                                 n_chunks, max_inflight,
                                 real_c2p_phone ? "REAL_GPU_ONLY" : "MOCK_ONLY",
                                 real_phone_full ? "REAL_GPU_DEVICE_CHAIN" : "MOCK_ONLY",
                                 real_p2c ? "REAL_GPU_CPU_SPLIT" : "MOCK_ONLY",
                                 real_p2c ? "REAL_BIDIRECTIONAL_RPC" :
-                                    (real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY"));
+                                    (real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY"),
+                                use_cpu_reference ?
+                                    "REAL_TOKEN_EMBEDDING" : "SYNTHETIC_HIDDEN");
                             ok = runtime.run(stages, nullptr, &timeline);
                             if (real_c2p_phone &&
                                 !ggml_backend_rpc_cycle_wait_tx_idle(phone, 30000)) {
@@ -1179,6 +1234,45 @@ int main(int argc, char ** argv) {
                             ok = std::isfinite(sum) && std::isfinite(max_abs) &&
                                  max_abs > 0.0;
                         }
+                        // Six independent physical boundaries. The CPU
+                        // reference is a NORMAL llama_decode full graph,
+                        // not the same custom Attention/FFN graph run on CPU.
+                        // This optional check adds NO GPU readbacks: all six
+                        // P2C outputs are already immutable PC-host tensors.
+                        bool parity_ok = true;
+                        int parity_checked = 0;
+                        if (ok && use_cpu_reference) {
+                            for (int period = 0; period < 6; ++period) {
+                                const int layer = 8 * period + 7;
+                                std::vector<float> actual(total);
+                                for (int c = 0; c < n_chunks; ++c) {
+                                    const auto & st = session.at(layer, c);
+                                    const size_t offset =
+                                        size_t(st.start) * size_t(hidden);
+                                    std::copy(
+                                        st.host_output.begin(),
+                                        st.host_output.end(),
+                                        actual.begin() + offset);
+                                }
+                                const bool passed =
+                                    cycle_full_reference::compare_period(
+                                        actual,
+                                        reference.after_period[size_t(period)],
+                                        layer, n_tokens, chunk_tokens, hidden);
+                                parity_ok = parity_ok && passed;
+                                ++parity_checked;
+                            }
+                            std::printf(
+                                "[CYCLE_FULL_REFERENCE_SUM] periods=%d "
+                                "expected=6 all_strict=%s "
+                                "cpu_model=RELEASED_BEFORE_HYBRID "
+                                "status=%s\n",
+                                parity_checked,
+                                parity_ok ? "PASS" : "FAIL",
+                                parity_ok && parity_checked == 6 ?
+                                    "PASS" : "FAIL");
+                            ok = ok && parity_ok && parity_checked == 6;
+                        }
                         std::printf(
                             "[CYCLE_REAL_PC_RING] layers=48 "
                             "pc_full_layers=%d pc_full=REAL_CPU "
@@ -1200,8 +1294,8 @@ int main(int argc, char ** argv) {
                             "p2c_slot_reuse=%d "
                             "region_stage_calls=%d expected_region_stage_calls=%d "
                             "cross_period_early=%d "
-                            "full_48_forward=%s strict_parity=NOT_RUN logits=NOT_RUN "
-                            "sum=%.9g max_abs=%.9g status=%s\n",
+                            "full_48_forward=%s source=%s strict_parity=%s "
+                            "logits=NOT_RUN sum=%.9g max_abs=%.9g status=%s\n",
                             pc_layers, c2p_pc_layers,
                             real_c2p_phone ? (real_phone_full ?
                                 "REAL_GPU_DEVICE_CHAIN" :
@@ -1227,8 +1321,15 @@ int main(int argc, char ** argv) {
                             p2c_slot_reuse.load(),
                             mock_stages.load(), 6 * n_chunks * 14,
                             earlier_than_previous_last,
-                            real_p2c ? "REAL_SYNTHETIC_INPUT_UNVALIDATED" :
-                                       "NOT_RUN",
+                            real_p2c ?
+                                (use_cpu_reference ? "REAL_TOKEN_EMBEDDING" :
+                                    "REAL_SYNTHETIC_INPUT_UNVALIDATED") :
+                                "NOT_RUN",
+                            use_cpu_reference ?
+                                "CPU_REFERENCE_EMBEDDING" : "SYNTHETIC_HIDDEN",
+                            !use_cpu_reference ? "NOT_RUN" :
+                                parity_checked != 6 ? "NOT_CHECKED" :
+                                    parity_ok ? "PASS" : "FAIL",
                             sum, max_abs, ok ? "PASS" : "FAIL");
                     }
                 }
