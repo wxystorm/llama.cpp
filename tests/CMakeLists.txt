@@ -368,6 +368,14 @@ if (TARGET ggml-rpc)
         ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-hybrid-cycle-real-resources PRIVATE ggml-rpc)
 
+    # REAL CPU PC Full execution for physical L0-L3 using the loaded
+    # Qwen3-MoE model. Synthetic activations, persistent K/V, no Phone
+    # compute and NO automatic CTest registration.
+    llama_build(test-hybrid-cycle-real-pc-prefix.cpp)
+    target_include_directories(test-hybrid-cycle-real-pc-prefix PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-hybrid-cycle-real-pc-prefix PRIVATE ggml-rpc)
+
     # First complete physical Cycle period. Exercises the EXISTING five
     # backend FIFO queues with the actual PC full layers, C2P split,
     # Phone full layers and final P2C split. Hardware/model required;
