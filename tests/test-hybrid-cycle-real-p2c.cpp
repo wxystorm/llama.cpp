@@ -5733,11 +5733,84 @@ static bool cycle_real_execute_period_fifo(
                 plan.ffn_inputs[2] = current.phone_output->inputs.topk_ids;
                 plan.ffn_inputs[3] = current.phone_output->inputs.topk_weights;
             }
-            const bool registered = phone_c2p_local ?
-                ggml_backend_rpc_cycle_register_phone_region_after_c2p(
-                    phone, stages, layout.x,
-                    c2p.wire.seq, c2p.wire.graph_id) :
-                ggml_backend_rpc_cycle_arm_phone_region(phone, stages);
+            bool registered = false;
+            if (phone_main_p2c) {
+                auto & p2c = *states[size_t(n_layers - 1)][size_t(c)];
+                if (!l6.phone_output || !l6.phone_output->output ||
+                    p2c.start != v5_p2c_registered_tokens) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PHONE_V5_P2C] phase=%s event=PREPARE "
+                        "chunk=%d prefix=%lld registered=%lld "
+                        "status=FAIL reason=KV_OR_PRODUCER\n",
+                        run_phase, c, (long long)p2c.start,
+                        (long long)v5_p2c_registered_tokens);
+                    return false;
+                }
+                double p2c_prepare_ms = 0.0;
+                bool prepared = cycle_real_execute_phone_attention_pre(
+                    phone, model.layers[size_t(n_layers - 1)],
+                    model.hparams, no_host_input, hidden, p2c.tokens,
+                    topk, experts, p2c.ready, p2c_prepare_ms, nullptr,
+                    kv[size_t(n_layers - 1)].get(), p2c.start, 1,
+                    l6.phone_output->output, true,
+                    perf_mode ? &attn_profile[queue_index] : nullptr,
+                    nullptr, attn_scratch[size_t(n_layers - 1)],
+                    graph_cache_by_layer[size_t(n_layers - 1)],
+                    {}, true);
+                if (!prepared) return false;
+                p2c.p2c_main_ffn =
+                    std::make_unique<cycle_real_p2c_ffn_slot>();
+                prepared = p2c.p2c_main_ffn->prepare(
+                    phone, full_shard(n_layers - 1, 1),
+                    hidden, p2c.tokens, topk, experts, true);
+                if (!prepared) return false;
+
+                ggml_rpc_cycle_phone_p2c_plan next {};
+                next.layer = n_layers - 1;
+                next.chunk = c;
+                next.seq = p2c.wire.seq;
+                next.graph_id = p2c.wire.graph_id;
+                next.attention_graph_uid =
+                    p2c.ready.prepared_attention_graph_uid;
+                next.ffn_graph_uid =
+                    p2c.p2c_main_ffn->registered_graph_uid;
+                next.input_source = l6.phone_output->output;
+                next.attention_input =
+                    p2c.ready.prepared_attention_input;
+                const auto & ready = p2c.ready.phone_graph;
+                next.ready_outputs[0] = ready.residual;
+                next.ready_outputs[1] = ready.ffn_norm;
+                next.ready_outputs[2] = ready.topk_ids;
+                next.ready_outputs[3] = ready.topk_weights;
+                next.ffn_inputs[0] = p2c.p2c_main_ffn->inputs.norm;
+                next.ffn_inputs[1] = p2c.p2c_main_ffn->inputs.topk_ids;
+                next.ffn_inputs[2] =
+                    p2c.p2c_main_ffn->inputs.topk_weights;
+                next.ffn_partial =
+                    p2c.p2c_main_ffn->inputs.ffn_output;
+
+                registered =
+                    ggml_backend_rpc_cycle_register_phone_region_p2c(
+                        phone, stages, layout.x,
+                        c2p.wire.seq, c2p.wire.graph_id, &next);
+                if (registered) {
+                    v5_p2c_registered_tokens += p2c.tokens;
+                    ++p2c_ffn_prepares;
+                    std::printf(
+                        "[CYCLE_PHONE_V5_P2C] phase=%s "
+                        "event=REGISTER_L7 chunk=%d start=%lld "
+                        "attn_uid=%" PRIu64 " ffn_uid=%" PRIu64
+                        " status=OK\n",
+                        run_phase, c, (long long)p2c.start,
+                        next.attention_graph_uid, next.ffn_graph_uid);
+                }
+            } else {
+                registered = phone_c2p_local ?
+                    ggml_backend_rpc_cycle_register_phone_region_after_c2p(
+                        phone, stages, layout.x,
+                        c2p.wire.seq, c2p.wire.graph_id) :
+                    ggml_backend_rpc_cycle_arm_phone_region(phone, stages);
+            }
             if (!registered) return false;
             ++v4_region_armed;
             ++v2_attn_prepared; // L6 graph is included in this single ARM.
