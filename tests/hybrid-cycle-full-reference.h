@@ -68,6 +68,13 @@ private:
     bool ok_ = false;
 };
 
+// Attention/FFN checkpoints are intentionally LIMITED to first divergence
+// L4/L5/L6 and the late L44/L45/L46/L47 discontinuity.
+inline bool stage_focus(int layer) {
+    return layer == 4 || layer == 5 || layer == 6 ||
+           layer == 44 || layer == 45 || layer == 46 || layer == 47;
+}
+
 struct capture {
     int64_t hidden = 0;
     int tokens = 0;
@@ -75,13 +82,25 @@ struct capture {
     std::vector<std::string> name;
     std::vector<int> counts;
     std::vector<std::vector<float>> values;
+    size_t required_captures = 0;
 
-    capture(int64_t n_hidden, int n_tokens, bool all_physical_layers)
+    capture(int64_t n_hidden, int n_tokens, bool all_physical_layers,
+            bool stages)
         : hidden(n_hidden), tokens(n_tokens) {
         name.push_back("embd");
         for (int l = 0; l < 48; ++l) {
             if (all_physical_layers || (l % 8 == 7)) {
                 name.push_back("l_out-" + std::to_string(l));
+            }
+        }
+        // Existing compulsory l_out/embedding checks are unchanged.
+        required_captures = name.size();
+        if (stages) {
+            for (int l = 0; l < 48; ++l) {
+                if (!stage_focus(l)) continue;
+                name.push_back("ffn_inp-" + std::to_string(l));
+                name.push_back("ffn_norm-" + std::to_string(l));
+                name.push_back("ffn_moe_out-" + std::to_string(l));
             }
         }
         counts.resize(name.size(), 0);
@@ -154,7 +173,7 @@ struct capture {
 
     bool complete() const {
         if (error) return false;
-        for (size_t i = 0; i < name.size(); ++i) {
+        for (size_t i = 0; i < required_captures; ++i) {
             if (counts[i] != 1 ||
                 values[i].size() != size_t(hidden) * size_t(tokens)) {
                 return false;
@@ -162,6 +181,15 @@ struct capture {
             for (float v : values[i]) {
                 if (!std::isfinite(v)) return false;
             }
+        }
+        // Extra stage callbacks can be absent on a graph variant; report
+        // MISSING instead of falsely failing six-layer CPU l_out capture.
+        for (size_t i = required_captures; i < name.size(); ++i) {
+            const bool present = counts[i] == 1 &&
+                values[i].size() == size_t(hidden) * size_t(tokens);
+            std::printf(
+                "[CYCLE_STAGE_REFERENCE] tensor=%s count=%d status=%s\n",
+                name[i].c_str(), counts[i], present ? "PASS" : "MISSING");
         }
         return true;
     }
@@ -174,9 +202,13 @@ struct baseline {
     std::array<std::vector<float>, 6> after_period;
     // Only retained with the expensive, explicit 48-layer diagnostic.
     std::array<std::vector<float>, 48> after_layer;
+    std::array<std::vector<float>, 48> after_attention;
+    std::array<std::vector<float>, 48> after_ffn_norm;
+    std::array<std::vector<float>, 48> after_ffn;
 
     bool run(const char * model_path, ggml_backend_dev_t cpu_device,
-             int required_tokens, bool trace_all_layers = false) {
+             int required_tokens, bool trace_all_layers = false,
+             bool trace_stages = false) {
         if (!model_path || !cpu_device ||
             required_tokens < 1 || required_tokens > 64) {
             return false;
@@ -208,7 +240,8 @@ struct baseline {
                 "[CYCLE_FULL_REFERENCE] status=FAIL reason=MODEL\n");
             return false;
         }
-        capture state(model->hparams.n_embd, required_tokens, trace_all_layers);
+        capture state(model->hparams.n_embd, required_tokens,
+                      trace_all_layers, trace_stages);
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 512;
         cp.n_batch = 128;
@@ -304,6 +337,33 @@ struct baseline {
                     std::move(state.values[size_t(period + 1)]);
             }
         }
+        if (trace_stages) {
+            // The regular CPU graph may omit a named intermediate; keep
+            // the full l_out oracle valid and log absence explicitly.
+            for (size_t i = state.required_captures; i < state.name.size(); ++i) {
+                if (state.counts[i] != 1 ||
+                    state.values[i].size() !=
+                        size_t(hidden) * size_t(n_tokens)) {
+                    continue;
+                }
+                for (int l = 0; l < 48; ++l) {
+                    if (!stage_focus(l)) continue;
+                    const auto lstr = std::to_string(l);
+                    if (state.name[i] == "ffn_inp-" + lstr) {
+                        after_attention[size_t(l)] = std::move(state.values[i]);
+                        break;
+                    }
+                    if (state.name[i] == "ffn_norm-" + lstr) {
+                        after_ffn_norm[size_t(l)] = std::move(state.values[i]);
+                        break;
+                    }
+                    if (state.name[i] == "ffn_moe_out-" + lstr) {
+                        after_ffn[size_t(l)] = std::move(state.values[i]);
+                        break;
+                    }
+                }
+            }
+        }
         std::printf(
             "[CYCLE_FULL_REFERENCE] model=CPU_ONLY "
             "capture=%s "
@@ -389,17 +449,20 @@ inline bool compare_layer_chunk(
         const std::vector<float> & actual,
         const std::vector<float> & reference,
         int layer, int chunk, int64_t start, int64_t tokens,
-        int64_t hidden, const char * backend) {
+        int64_t hidden, const char * backend,
+        const char * stage = nullptr) {
     const bool shape_ok = layer >= 0 && layer < 48 && chunk >= 0 &&
         start >= 0 && tokens > 0 && hidden > 0 &&
         actual.size() == size_t(tokens) * size_t(hidden) &&
         size_t(start + tokens) * size_t(hidden) <= reference.size();
     if (!shape_ok) {
         std::printf(
-            "[CYCLE_LAYER_PARITY] layer=%d chunk=%d backend=%s "
+            "[%s] layer=%d chunk=%d backend=%s point=%s "
             "status=FAIL reason=SHAPE_OR_REFERENCE "
             "actual=%zu reference=%zu tokens=%lld start=%lld\n",
-            layer, chunk, backend, actual.size(), reference.size(),
+            stage ? "CYCLE_STAGE_PARITY" : "CYCLE_LAYER_PARITY",
+            layer, chunk, backend, stage ? stage : "L_OUT",
+            actual.size(), reference.size(),
             (long long) tokens, (long long) start);
         return false;
     }
@@ -433,12 +496,13 @@ inline bool compare_layer_chunk(
     const double tolerance = 0.02 + 0.00002 * max_ref;
     const bool passed = finite && worst_abs <= tolerance;
     std::printf(
-        "[CYCLE_LAYER_PARITY] layer=%d chunk=%d backend=%s "
+        "[%s] layer=%d chunk=%d backend=%s point=%s "
         "positions=[%lld,%lld] max_abs=%.9g rms=%.9g "
         "cosine=%.9g max_ref=%.9g strict_tolerance=%.9g "
         "worst_token=%lld worst_channel=%lld "
         "worst_actual=%.9g worst_reference=%.9g status=%s\n",
-        layer, chunk, backend,
+        stage ? "CYCLE_STAGE_PARITY" : "CYCLE_LAYER_PARITY",
+        layer, chunk, backend, stage ? stage : "L_OUT",
         (long long) start, (long long)(start + tokens - 1),
         worst_abs, rms, cosine, max_ref, tolerance,
         (long long) (start + int64_t(worst / size_t(hidden))),

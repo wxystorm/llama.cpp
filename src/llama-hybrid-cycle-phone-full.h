@@ -4,6 +4,7 @@
 #include "llama-hybrid-cycle-resources.h"
 
 #include <cstdint>
+#include <functional>
 
 struct llama_model;
 
@@ -25,4 +26,6 @@ LLAMA_API bool llama_hybrid_cycle_execute_phone_full(
     int64_t tokens,
     const ggml_tensor * device_input,
     llama_hybrid_cycle_attention_ready & ready,
-    llama_hybrid_cycle_phone_ffn_slot & output_slot);
+    llama_hybrid_cycle_phone_ffn_slot & output_slot,
+    const std::function<void(const ggml_tensor *, const ggml_tensor *,
+                             const ggml_tensor *)> & stage_probe = {});

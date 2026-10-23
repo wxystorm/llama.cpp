@@ -182,6 +182,20 @@ int main(int argc, char ** argv) {
             "reason=TRACE_PARITY_REQUIRES_CPU_REFERENCE\n");
         return 2;
     }
+    const char * stage_env = std::getenv("LLAMA_HYBRID_CYCLE_TRACE_STAGES");
+    if (stage_env && std::strcmp(stage_env, "0") != 0 &&
+        std::strcmp(stage_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=BAD_TRACE_STAGES_FLAG\n");
+        return 2;
+    }
+    const bool trace_stages = stage_env && std::strcmp(stage_env, "1") == 0;
+    if (trace_stages && !trace_parity) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=TRACE_STAGES_REQUIRES_TRACE_PARITY\n");
+        return 2;
+    }
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(
@@ -196,7 +210,8 @@ int main(int argc, char ** argv) {
     // Keep only the captured ~7x(token*hidden) F32 host arrays.
     cycle_full_reference::baseline reference;
     if (use_cpu_reference &&
-        !reference.run(argv[1], cpu_dev, n_tokens, trace_parity)) {
+        !reference.run(argv[1], cpu_dev, n_tokens, trace_parity,
+                       trace_stages)) {
         std::fprintf(stderr,
             "[CYCLE_REAL_PC_RING] status=FAIL reason=CPU_ORACLE\n");
         return 1;
@@ -396,6 +411,56 @@ int main(int argc, char ** argv) {
                             trace_host(layer, chunk, position,
                                        tokens, host, backend);
                         };
+                        const auto trace_stage_host = [&](
+                                int l, int c, int64_t start, int64_t ntok,
+                                const std::vector<float> & values,
+                                const char * backend, const char * point) {
+                            if (!trace_stages ||
+                                !cycle_full_reference::stage_focus(l)) return;
+                            const std::vector<float> * ref = nullptr;
+                            if (std::strcmp(point, "ATTN_RESIDUAL") == 0) {
+                                ref = &reference.after_attention[size_t(l)];
+                            } else if (std::strcmp(point, "FFN_NORM") == 0) {
+                                ref = &reference.after_ffn_norm[size_t(l)];
+                            } else if (std::strcmp(point, "FFN_OUTPUT") == 0) {
+                                ref = &reference.after_ffn[size_t(l)];
+                            }
+                            if (!ref || ref->empty()) {
+                                std::printf(
+                                    "[CYCLE_STAGE_PARITY] layer=%d chunk=%d "
+                                    "backend=%s point=%s status=NOT_CAPTURED\n",
+                                    l, c, backend, point);
+                                return;
+                            }
+                            cycle_full_reference::compare_layer_chunk(
+                                values, *ref, l, c, start, ntok,
+                                hidden, backend, point);
+                        };
+                        const auto trace_stage_gpu = [&](
+                                int l, int c, int64_t start, int64_t ntok,
+                                const ggml_tensor * tensor,
+                                const char * backend, const char * point) {
+                            if (!trace_stages ||
+                                !cycle_full_reference::stage_focus(l)) return;
+                            std::vector<float> values;
+                            const size_t elements =
+                                size_t(ntok) * size_t(hidden);
+                            if (tensor && tensor->buffer &&
+                                tensor->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(tensor) &&
+                                ggml_nelements(tensor) == int64_t(elements)) {
+                                values.resize(elements);
+                                // Phone FFN/Reduce or Attention has completed
+                                // and the GPU slot is still owned. Diagnostic
+                                // copies are never part of normal FIFO flow.
+                                ggml_backend_tensor_get(
+                                    tensor, values.data(), 0,
+                                    elements * sizeof(float));
+                            }
+                            trace_stage_host(l, c, start, ntok, values,
+                                             backend, point);
+                        };
+
                         std::function<void(
                             int, int, int64_t, int64_t,
                             const std::vector<float> &)> pc_trace;
@@ -503,6 +568,16 @@ int main(int argc, char ** argv) {
                                                     *model, *r, cpu, l,
                                                     state.start, state.tokens,
                                                     host_input, state.ready);
+                                            if (valid && trace_stages) {
+                                                trace_stage_host(
+                                                    l, c, state.start, state.tokens,
+                                                    state.ready.residual,
+                                                    "C2P_PC_ATTN", "ATTN_RESIDUAL");
+                                                trace_stage_host(
+                                                    l, c, state.start, state.tokens,
+                                                    state.ready.norm,
+                                                    "C2P_PC_ATTN", "FFN_NORM");
+                                            }
                                             if (valid && real_c2p_phone) {
                                                 auto * bank = phone_slot_banks.by_index(
                                                     region.location.cycle_index);
@@ -643,6 +718,33 @@ int main(int argc, char ** argv) {
                                                         slot->output,
                                                         "C2P_PHONE_GPU");
                                                 }
+                                                if (valid && trace_stages &&
+                                                    cycle_full_reference::stage_focus(l)) {
+                                                    // Full FFN is the PC shard +
+                                                    // PHONE_GPU shard before ADD
+                                                    // residual. Read only the
+                                                    // Phone shard for diagnosis.
+                                                    std::vector<float> full_ffn;
+                                                    const auto * phone_shard =
+                                                        slot->inputs.ffn_output;
+                                                    if (phone_shard && phone_shard->buffer &&
+                                                        phone_shard->type == GGML_TYPE_F32 &&
+                                                        ggml_is_contiguous(phone_shard) &&
+                                                        ggml_nelements(phone_shard) ==
+                                                            int64_t(expected)) {
+                                                        full_ffn.resize(expected);
+                                                        ggml_backend_tensor_get(
+                                                            phone_shard, full_ffn.data(),
+                                                            0, expected * sizeof(float));
+                                                        for (size_t i = 0; i < expected; ++i) {
+                                                            full_ffn[i] += state.partial[i];
+                                                        }
+                                                    }
+                                                    trace_stage_host(
+                                                        l, c, state.start,
+                                                        state.tokens, full_ffn,
+                                                        "C2P_PC_PLUS_PHONE", "FFN_OUTPUT");
+                                                }
                                                 if (valid && !real_phone_full) {
                                                     // Legacy diagnostic Host bridge
                                                     // to the old MOCK L5/L13/... layer.
@@ -733,11 +835,34 @@ int main(int argc, char ** argv) {
                                                     full_slot = std::make_unique<
                                                         llama_hybrid_cycle_phone_ffn_slot>();
                                                 }
+                                                std::function<void(
+                                                    const ggml_tensor *,
+                                                    const ggml_tensor *,
+                                                    const ggml_tensor *)> stage_probe;
+                                                if (trace_stages &&
+                                                    cycle_full_reference::stage_focus(l)) {
+                                                    stage_probe = [&](const ggml_tensor * residual,
+                                                                      const ggml_tensor * norm,
+                                                                      const ggml_tensor * ffn) {
+                                                        trace_stage_gpu(
+                                                            l, c, state.start,
+                                                            state.tokens, residual,
+                                                            "PHONE_GPU_FULL", "ATTN_RESIDUAL");
+                                                        trace_stage_gpu(
+                                                            l, c, state.start,
+                                                            state.tokens, norm,
+                                                            "PHONE_GPU_FULL", "FFN_NORM");
+                                                        trace_stage_gpu(
+                                                            l, c, state.start,
+                                                            state.tokens, ffn,
+                                                            "PHONE_GPU_FULL", "FFN_OUTPUT");
+                                                    };
+                                                }
                                                 valid = llama_hybrid_cycle_execute_phone_full(
                                                     *model, *r, phone, l,
                                                     state.start, state.tokens,
                                                     predecessor, state.ready,
-                                                    *full_slot);
+                                                    *full_slot, stage_probe);
                                             }
                                             if (valid) {
                                                 state.phone_output = std::move(full_slot);
@@ -806,6 +931,18 @@ int main(int argc, char ** argv) {
                                                         *model, *resource, phone, l,
                                                         state.start, state.tokens,
                                                         predecessor, wire, state.ready, rpc);
+                                                if (valid && trace_stages) {
+                                                    trace_stage_gpu(
+                                                        l, c, state.start,
+                                                        state.tokens,
+                                                        state.ready.phone_graph.residual,
+                                                        "P2C_PHONE_ATTN", "ATTN_RESIDUAL");
+                                                    trace_stage_gpu(
+                                                        l, c, state.start,
+                                                        state.tokens,
+                                                        state.ready.phone_graph.ffn_norm,
+                                                        "P2C_PHONE_ATTN", "FFN_NORM");
+                                                }
                                                 if (valid) {
                                                     // Phone Attention has consumed L6
                                                     // on the same GPU, and the READY TX
@@ -964,6 +1101,23 @@ int main(int argc, char ** argv) {
                                                     state.host_output.size()) &&
                                                     cycle_pc_ring_finite(
                                                         state.host_output, expected);
+                                                if (valid && trace_stages &&
+                                                    cycle_full_reference::stage_focus(l)) {
+                                                    // Numerical probe of
+                                                    // complete two-sided FFN
+                                                    // before residual ADD;
+                                                    // PC is the sole Reduce.
+                                                    std::vector<float> full_ffn(expected);
+                                                    for (size_t i = 0; i < expected; ++i) {
+                                                        full_ffn[i] =
+                                                            state.partial[i] +
+                                                            state.recv_partial.partial.partial[i];
+                                                    }
+                                                    trace_stage_host(
+                                                        l, c, state.start,
+                                                        state.tokens, full_ffn,
+                                                        "P2C_PC_REDUCE", "FFN_OUTPUT");
+                                                }
                                                 if (valid && trace_parity) {
                                                     trace_host(
                                                         l, c, state.start,

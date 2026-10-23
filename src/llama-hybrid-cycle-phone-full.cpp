@@ -13,7 +13,9 @@ bool llama_hybrid_cycle_execute_phone_full(
         int physical_layer, int64_t position_start, int64_t tokens,
         const ggml_tensor * device_input,
         llama_hybrid_cycle_attention_ready & ready,
-        llama_hybrid_cycle_phone_ffn_slot & output_slot) {
+        llama_hybrid_cycle_phone_ffn_slot & output_slot,
+        const std::function<void(const ggml_tensor *, const ggml_tensor *,
+                                 const ggml_tensor *)> & stage_probe) {
     const int64_t hidden = model.hparams.n_embd;
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
@@ -91,6 +93,15 @@ bool llama_hybrid_cycle_execute_phone_full(
     if (!ok) {
         // Failure must never recycle scratch while Phone may be using it.
         ggml_backend_synchronize(phone);
+    }
+    if (ok && stage_probe) {
+        // Explicit numerical trace only. All FFN and Reduce GPU work is
+        // synchronized by execute_reduce(); the original READY/scratch and
+        // FFN compute buffer are still alive here. Nothing enters the
+        // normal scheduling path, and no graph output owner is changed.
+        stage_probe(ready.phone_graph.residual,
+                    ready.phone_graph.ffn_norm,
+                    output_slot.inputs.ffn_output);
     }
     // FFN is complete (or backend has been synchronized on failure). No
     // consumer still needs this layer's Attention scratch/Graph lease.
