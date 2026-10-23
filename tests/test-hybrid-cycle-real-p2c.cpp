@@ -4829,6 +4829,7 @@ struct cycle_real_p2c_overlap_events {
 // Different FIFO workers may write different slots concurrently; only
 // the joined coordinator reads the snapshot. No locks or cross-host clocks.
 struct cycle_real_pc_stage_span {
+    llama_hybrid_cycle_queue queue = llama_hybrid_cycle_queue::COUNT;
     std::chrono::steady_clock::time_point queued {};
     std::chrono::steady_clock::time_point begin {};
     std::chrono::steady_clock::time_point end {};
@@ -5888,6 +5889,7 @@ static bool cycle_real_execute_period_fifo(
             if (critical_path) {
                 auto & span = st.pc_stage_spans[
                     static_cast<size_t>(task.stage)];
+                span.queue = task.queue;
                 span.queued = task.queued_at;
                 span.begin = t0;
             }
@@ -8261,6 +8263,209 @@ static bool cycle_real_execute_period_fifo(
             "cross_queue_time_addition=INVALID\n",
             run_phase, fifo_ms, layout.x, n_layers - 1);
     }
+    // Opt-in, low-overhead PC clock waterfall. Log only AFTER all workers
+    // have joined and the perf measurement has ended; logging cannot delay
+    // the measured FIFO, and no Phone/PC clock subtraction is attempted.
+    if (critical_path) {
+        using clock_type = std::chrono::steady_clock;
+        using time_point = clock_type::time_point;
+        const auto valid_time = [](time_point t) {
+            return t.time_since_epoch().count() != 0;
+        };
+        const auto rel = [&](time_point t) -> double {
+            return valid_time(t) ?
+                std::chrono::duration<double, std::milli>(
+                    t - critical_path_origin).count() : -1.0;
+        };
+        const auto delta = [&](time_point a, time_point b) -> double {
+            return valid_time(a) && valid_time(b) ?
+                std::chrono::duration<double, std::milli>(
+                    b - a).count() : -1.0;
+        };
+        const auto & observation = [&](int l, int c,
+                llama_hybrid_cycle_stage stage)
+                -> const cycle_real_pc_stage_span & {
+            return states[size_t(l)][size_t(c)]
+                ->pc_stage_spans[static_cast<size_t>(stage)];
+        };
+        const int c2p_layer = layout.x;
+        const int p2c_layer = n_layers - 1;
+        uint64_t pc_cpu_ffn_last = 0;
+        uint64_t phone_partial_last = 0;
+        double reduce_schedule_wait_sum_ms = 0.0;
+        double reduce_schedule_wait_max_ms = 0.0;
+        double max_chunk_span_ms = 0.0;
+
+        for (int c = 0; c < n_chunks; ++c) {
+            for (int l = 0; l < n_layers; ++l) {
+                for (size_t s = 0; s < n_stages; ++s) {
+                    const auto stage =
+                        static_cast<llama_hybrid_cycle_stage>(s);
+                    const auto & t = observation(l, c, stage);
+                    if (!valid_time(t.begin)) continue;
+                    std::printf(
+                        "[CYCLE_PATH_TASK] phase=%s epoch=%" PRIu64
+                        " layer=%d chunk=%d stage=%s queue=%s "
+                        "queued_rel_ms=%.3f start_rel_ms=%.3f "
+                        "end_rel_ms=%.3f queue_wait_ms=%.3f "
+                        "callback_ms=%.3f status=%s\n",
+                        run_phase, wire_epoch, l, c,
+                        llama_hybrid_cycle_stage_name(stage),
+                        llama_hybrid_cycle_queue_name(t.queue),
+                        rel(t.queued), rel(t.begin), rel(t.end),
+                        delta(t.queued, t.begin),
+                        delta(t.begin, t.end),
+                        t.completed_ok ? "OK" : "FAIL");
+                }
+            }
+            const auto & c2p_attn =
+                observation(c2p_layer, c,
+                    llama_hybrid_cycle_stage::ATTN_PRE);
+            const auto & c2p_ready =
+                observation(c2p_layer, c,
+                    llama_hybrid_cycle_stage::SEND_ACTIVATION);
+            const auto & c2p_pc_ffn =
+                observation(c2p_layer, c,
+                    llama_hybrid_cycle_stage::FFN_SOURCE);
+            const auto & c2p_partial =
+                observation(c2p_layer, c,
+                    llama_hybrid_cycle_stage::SEND_PARTIAL);
+            const auto & c2p_reduce =
+                observation(c2p_layer, c,
+                    llama_hybrid_cycle_stage::REDUCE);
+            const auto & l5 =
+                observation(c2p_layer + 1, c,
+                    llama_hybrid_cycle_stage::FULL_LAYER);
+            const auto & l6 =
+                observation(c2p_layer + 2, c,
+                    llama_hybrid_cycle_stage::FULL_LAYER);
+            const auto & p2c_attn =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::ATTN_PRE);
+            const auto & p2c_ready =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::SEND_ACTIVATION);
+            const auto & p2c_cpu_ffn =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::FFN_DESTINATION);
+            const auto & p2c_phone_ffn =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::FFN_SOURCE);
+            const auto & p2c_partial =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::SEND_PARTIAL);
+            const auto & p2c_reduce =
+                observation(p2c_layer, c,
+                    llama_hybrid_cycle_stage::REDUCE);
+
+            time_point join_ready {};
+            if (valid_time(p2c_cpu_ffn.end) &&
+                valid_time(p2c_partial.end)) {
+                join_ready = std::max(p2c_cpu_ffn.end, p2c_partial.end);
+                if (p2c_cpu_ffn.end > p2c_partial.end) {
+                    ++pc_cpu_ffn_last;
+                } else {
+                    ++phone_partial_last;
+                }
+            }
+            const double join_schedule_wait =
+                delta(join_ready, p2c_reduce.begin);
+            if (join_schedule_wait >= 0) {
+                reduce_schedule_wait_sum_ms += join_schedule_wait;
+                reduce_schedule_wait_max_ms = std::max(
+                    reduce_schedule_wait_max_ms, join_schedule_wait);
+            }
+            const double chunk_span =
+                delta(c2p_attn.begin, p2c_reduce.end);
+            if (chunk_span >= 0)
+                max_chunk_span_ms = std::max(max_chunk_span_ms, chunk_span);
+            std::printf(
+                "[CYCLE_PATH_CHUNK] phase=%s epoch=%" PRIu64
+                " chunk=%d tokens=%lld "
+                "c2p_attn_end_ms=%.3f c2p_ready_pc_ack_ms=%.3f "
+                "c2p_pc_ffn_end_ms=%.3f c2p_partial_pc_ack_ms=%.3f "
+                "c2p_reduce_pc_ack_ms=%.3f l5_pc_ack_ms=%.3f "
+                "l6_pc_ack_ms=%.3f p2c_ready_phone_ack_ms=%.3f "
+                "p2c_ready_pc_rx_ms=%.3f "
+                "p2c_cpu_ffn_end_ms=%.3f "
+                "p2c_phone_ffn_pc_ack_ms=%.3f "
+                "p2c_partial_pc_rx_ms=%.3f p2c_cpu_reduce_end_ms=%.3f "
+                "c2p_to_p2c_end_ms=%.3f "
+                "ready_rx_to_cpu_ffn_start_ms=%.3f "
+                "join_ready_to_cpu_reduce_start_ms=%.3f "
+                "last_p2c_dependency=%s\n",
+                run_phase, wire_epoch, c,
+                (long long)states[size_t(p2c_layer)][size_t(c)]->tokens,
+                rel(c2p_attn.end), rel(c2p_ready.end),
+                rel(c2p_pc_ffn.end), rel(c2p_partial.end),
+                rel(c2p_reduce.end), rel(l5.end), rel(l6.end),
+                rel(p2c_attn.end), rel(p2c_ready.end),
+                rel(p2c_cpu_ffn.end), rel(p2c_phone_ffn.end),
+                rel(p2c_partial.end), rel(p2c_reduce.end),
+                chunk_span, delta(p2c_ready.end, p2c_cpu_ffn.begin),
+                join_schedule_wait,
+                !valid_time(join_ready) ? "MISSING" :
+                    p2c_cpu_ffn.end > p2c_partial.end ?
+                        "PC_CPU_FFN" : "PHONE_PARTIAL_RX");
+        }
+        for (size_t l = 0; l < fifo_profile.credit_layers.size(); ++l) {
+            const auto & credit = fifo_profile.credit_layers[l];
+            std::printf(
+                "[CYCLE_PATH_CREDIT] phase=%s epoch=%" PRIu64
+                " layer=%zu max_inflight=%d admitted=%llu "
+                "credit_blocked_chunks=%llu credit_wait_sum_ms=%.3f "
+                "credit_wait_max_ms=%.3f "
+                "semantics=OLDEST_READY_CHUNK_WINDOW_FULL\n",
+                run_phase, wire_epoch, l, window,
+                (unsigned long long)credit.admitted_chunks,
+                (unsigned long long)credit.credit_blocked_chunks,
+                credit.credit_wait_sum_ms, credit.credit_wait_max_ms);
+            for (size_t c = 0;
+                 c < credit.credit_wait_by_chunk_ms.size(); ++c) {
+                if (credit.credit_wait_by_chunk_ms[c] <= 0.0) continue;
+                std::printf(
+                    "[CYCLE_PATH_CREDIT_CHUNK] phase=%s epoch=%" PRIu64
+                    " layer=%zu chunk=%zu credit_head_wait_ms=%.3f\n",
+                    run_phase, wire_epoch, l, c,
+                    credit.credit_wait_by_chunk_ms[c]);
+            }
+        }
+        const auto & first_cuda =
+            observation(0, 0, llama_hybrid_cycle_stage::FULL_LAYER);
+        const auto & first_return =
+            observation(p2c_layer, 0,
+                llama_hybrid_cycle_stage::REDUCE);
+        const auto & last_return =
+            observation(p2c_layer, n_chunks-1,
+                llama_hybrid_cycle_stage::REDUCE);
+        std::printf(
+            "[CYCLE_PATH_SUM] phase=%s epoch=%" PRIu64
+            " chunks=%d window=%d fifo_wall_ms=%.3f "
+            "first_pc_cuda_start_ms=%.3f "
+            "first_pc_reduce_complete_ms=%.3f "
+            "last_pc_reduce_complete_ms=%.3f "
+            "first_to_last_return_ms=%.3f "
+            "max_c2p_to_p2c_chunk_span_ms=%.3f "
+            "p2c_last_ready_dependency_pc_cpu_ffn=%llu "
+            "p2c_last_ready_dependency_phone_partial=%llu "
+            "pc_reduce_join_schedule_wait_sum_ms=%.3f "
+            "pc_reduce_join_schedule_wait_max_ms=%.3f "
+            "next_cuda=NOT_PRESENT_IN_THIS_8_LAYER_PERIOD "
+            "clock_scope=PC_STEADY_CLOCK "
+            "phone_compute_clock=PHONE_LOG_ONLY "
+            "stage_times=PC_CALLBACKS_AND_RPC_ACK "
+            "queue_waits_and_credit_waits=NON_ADDITIVE\n",
+            run_phase, wire_epoch, n_chunks, window, fifo_ms,
+            rel(first_cuda.begin),
+            rel(first_return.end), rel(last_return.end),
+            delta(first_return.end, last_return.end),
+            max_chunk_span_ms,
+            (unsigned long long)pc_cpu_ffn_last,
+            (unsigned long long)phone_partial_last,
+            reduce_schedule_wait_sum_ms,
+            reduce_schedule_wait_max_ms);
+    }
+
     std::printf(
         "[CYCLE_PERIOD_SUM] phase=%s epoch=%" PRIu64
         " layers=%d x=%d y=%d chunks=%d tokens=%d "
