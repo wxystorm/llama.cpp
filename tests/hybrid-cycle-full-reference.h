@@ -110,10 +110,28 @@ struct capture {
             ggml_nbytes(tensor) == sizeof(float) *
                 size_t(self.hidden) * size_t(self.tokens);
         if (!valid) {
+            // The last Transformer layer can be pruned to n_outputs=1
+            // when llama_batch::logits only requests the final position.
+            // Print the actual tensor contract rather than hiding whether
+            // the failure was shape, type, buffer, or a duplicate callback.
             std::fprintf(stderr,
                 "[CYCLE_FULL_REFERENCE_CAPTURE] name=%s "
-                "status=FAIL reason=TYPE_SHAPE_OR_DUPLICATE\n",
-                self.name[index].c_str());
+                "status=FAIL reason=TYPE_SHAPE_OR_DUPLICATE "
+                "count=%d actual_type=%s actual_ne=[%lld,%lld,%lld,%lld] "
+                "actual_contiguous=%d buffer=%d actual_bytes=%zu "
+                "expected_type=F32 expected_ne=[%lld,%d] "
+                "expected_bytes=%zu\n",
+                self.name[index].c_str(), self.counts[index],
+                ggml_type_name(tensor->type),
+                (long long) tensor->ne[0],
+                (long long) tensor->ne[1],
+                (long long) tensor->ne[2],
+                (long long) tensor->ne[3],
+                ggml_is_contiguous(tensor) ? 1 : 0,
+                tensor->buffer ? 1 : 0,
+                ggml_nbytes(tensor),
+                (long long) self.hidden, self.tokens,
+                sizeof(float) * size_t(self.hidden) * size_t(self.tokens));
             self.error = true;
             return false;
         }
@@ -238,8 +256,18 @@ struct baseline {
             batch.pos[i] = i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = i == required_tokens - 1;
+            // The CPU oracle captures l_out-47 for ALL input tokens.
+            // Request every logit so llama.cpp's last-layer output pruning
+            // cannot reduce l_out-47 to only the final position. Other
+            // captured periods do not need this, but the final one does.
+            batch.logits[i] = 1;
         }
+        std::printf(
+            "[CYCLE_FULL_REFERENCE] phase=DECODE "
+            "tokens=%d logits_requested=%d "
+            "last_layer_output_pruning=DISABLED\n",
+            required_tokens, required_tokens);
+        std::fflush(stdout);
         const int status = llama_decode(context.get(), batch);
         llama_synchronize(context.get());
         llama_batch_free(batch);
