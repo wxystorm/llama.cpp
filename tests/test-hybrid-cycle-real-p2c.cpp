@@ -3354,6 +3354,56 @@ struct cycle_real_c2p_phone_chunk {
             next_ready.prepared_attention_input);
     }
 
+    // V3: L5 finishes on Phone, then its FIFO replays L6 Attention AND
+    // registered L6 FFN+ADD. The PC issues no separate L6 FFN command.
+    // Both L6 Attention READY and FFN slot outlive the completion WAIT.
+    bool execute_full_server_pair(
+            ggml_backend_t phone,
+            const cycle_real_phone_ready & ready,
+            int layer, int chunk, uint64_t seq,
+            int next_layer, uint64_t next_seq, uint64_t next_graph_id,
+            const cycle_real_phone_ready & next_ready,
+            const cycle_real_c2p_phone_chunk & next_full) {
+        if (!is_full_layer || !fused_full_graph ||
+            registered_full_graph_uid == 0 || !output ||
+            !next_full.is_full_layer || !next_full.fused_full_graph ||
+            next_full.registered_full_graph_uid == 0 ||
+            next_ready.prepared_attention_graph_uid == 0 ||
+            !next_ready.prepared_attention_input ||
+            !residual || !inputs.norm || !inputs.topk_ids ||
+            !inputs.topk_weights || !next_full.residual ||
+            !next_full.inputs.norm || !next_full.inputs.topk_ids ||
+            !next_full.inputs.topk_weights) {
+            return false;
+        }
+        const ggml_tensor * const sources[4] = {
+            ready.phone_graph.residual,
+            ready.phone_graph.ffn_norm,
+            ready.phone_graph.topk_ids,
+            ready.phone_graph.topk_weights,
+        };
+        const ggml_tensor * const destinations[4] = {
+            residual, inputs.norm, inputs.topk_ids, inputs.topk_weights,
+        };
+        const ggml_tensor * const next_sources[4] = {
+            next_ready.phone_graph.residual,
+            next_ready.phone_graph.ffn_norm,
+            next_ready.phone_graph.topk_ids,
+            next_ready.phone_graph.topk_weights,
+        };
+        const ggml_tensor * const next_destinations[4] = {
+            next_full.residual, next_full.inputs.norm,
+            next_full.inputs.topk_ids, next_full.inputs.topk_weights,
+        };
+        return ggml_backend_rpc_cycle_run_phone_full_pair(
+            phone, layer, chunk, seq, registered_full_graph_uid,
+            sources, destinations, next_layer, next_seq, next_graph_id,
+            next_ready.prepared_attention_graph_uid, output,
+            next_ready.prepared_attention_input,
+            next_full.registered_full_graph_uid,
+            next_sources, next_destinations);
+    }
+
     bool execute_ffn() {
         const auto begin = std::chrono::steady_clock::now();
         const bool ok = executor.execute_device_ready();
@@ -4893,6 +4943,17 @@ static bool cycle_real_execute_period_fifo(
             "LOCAL_FFN_SESSION_GRAPH_AND_SCRATCH_REUSE\n", run_phase);
         return false;
     }
+    const bool phone_full_auto_ffn = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_FULL_AUTO_FFN");
+    if (phone_full_auto_ffn &&
+        (!phone_full_auto_relay || !phone_full_local_ffn ||
+         layout.y != 2 || window < 1 || window > 2)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_V3] phase=%s status=FAIL "
+            "reason=REQUIRES_V2_TWO_PHONE_LAYERS_WINDOW1_OR_2\n",
+            run_phase);
+        return false;
+    }
     if (phone_full_local_ffn &&
         (!phone_ordered_handoff || !phone_full_fuse ||
          !phone_full_rpc_replay || !phone_full_reuse)) {
@@ -5292,6 +5353,8 @@ static bool cycle_real_execute_period_fifo(
     uint64_t ordered_p2c_handoffs = 0;
     uint64_t v2_attn_prepared = 0;
     uint64_t v2_attn_completed = 0;
+    uint64_t v3_full_pairs_armed = 0;
+    uint64_t v3_next_full_completed = 0;
     // The PC-side PHONE_GPU FIFO exclusively owns these counters.
     // Registration can lead device completion, which can in turn lead
     // the acknowledgements recorded in kv[].committed_tokens.
@@ -5342,6 +5405,15 @@ static bool cycle_real_execute_period_fifo(
             "kv_order=STRICT graph_cache=UNCHANGED "
             "scratch_pool=UNCHANGED\n",
             run_phase, window, layout.y);
+    }
+    if (phone_full_auto_ffn) {
+        std::printf(
+            "[CYCLE_PHONE_V3_PLAN] phase=%s enabled=1 "
+            "mode=PHONE_LOCAL_FULL_PAIR "
+            "start=L5_FFN continuation=L6_ATTN_L6_FFN_ADD "
+            "remote_ffn_launches_removed=1 "
+            "window=%d kv_order=STRICT ownership=UNCHANGED\n",
+            run_phase, window);
     }
     llama_hybrid_cycle_layout period = layout;
     period.pc_cuda_full = pc_cuda_full;
@@ -5397,6 +5469,67 @@ static bool cycle_real_execute_period_fifo(
         } else {
             owned.reset();
         }
+    };
+
+    // Only the PC-side PHONE_GPU FIFO owns these per-layer pools and
+    // prepares Full FFN slots. V3 may prepare L6's slot while executing
+    // L5, before the global Ring has marked L6 FULL_LAYER ready.
+    // The slot and its output then stay attached to the same Chunk until
+    // L6's FULL completion ACK and the successor's input handoff.
+    const auto acquire_phone_full_slot = [&](
+            int full_layer, int chunk, size_t queue_index) -> bool {
+        if (full_layer <= layout.x ||
+            full_layer > layout.x + layout.y ||
+            chunk < 0 || chunk >= n_chunks) return false;
+        auto & st = *states[size_t(full_layer)][size_t(chunk)];
+        const auto usable = [&](const cycle_real_c2p_phone_chunk & slot) {
+            return slot.is_full_layer &&
+                slot.prepared_tokens == st.tokens &&
+                slot.fused_full_graph == phone_full_fuse &&
+                slot.rpc_full_replay == phone_full_rpc_replay &&
+                ((slot.registered_full_graph_uid != 0) ==
+                    phone_full_local_ffn);
+        };
+        if (st.phone_output) {
+            if (!usable(*st.phone_output)) {
+                std::fprintf(stderr,
+                    "[CYCLE_PHONE_V3] side=PC event=ACQUIRE_FULL_SLOT "
+                    "layer=%d chunk=%d reason=PREPARED_SLOT_MISMATCH "
+                    "status=FAIL\n", full_layer, chunk);
+                return false;
+            }
+            return true;
+        }
+        if (phone_full_reuse) {
+            auto & pool = phone_full_pool[size_t(full_layer)];
+            for (auto it = pool.begin(); it != pool.end(); ++it) {
+                if (usable(**it)) {
+                    st.phone_output = std::move(*it);
+                    pool.erase(it);
+                    ++phone_reuse_stats[size_t(full_layer)].hits;
+                    break;
+                }
+            }
+        }
+        if (!st.phone_output) {
+            auto slot = std::make_unique<cycle_real_c2p_phone_chunk>();
+            const auto weights = full_shard(full_layer, 1);
+            if (!slot->prepare(
+                    phone, weights, hidden, st.tokens,
+                    topk, experts, true, phone_full_fuse,
+                    phone_full_rpc_replay, phone_full_local_ffn))
+                return false;
+            if (phone_full_reuse)
+                ++phone_reuse_stats[size_t(full_layer)].misses;
+            if (perf_mode) {
+                auto & sample = gpu_prepare_profile[queue_index];
+                ++sample.count;
+                sample.graph_build_ms += slot->graph_build_ms;
+                sample.gpu_buffer_alloc_ms += slot->gpu_alloc_ms;
+            }
+            st.phone_output = std::move(slot);
+        }
+        return true;
     };
 
     const bool succeeded = llama_hybrid_cycle_run_fifo(
@@ -5633,15 +5766,36 @@ static bool cycle_real_execute_period_fifo(
                                 v2_attn_completed == uint64_t(c);
                             const bool registered_ok =
                                 v2_registered_kv_tokens >= st.start + st.tokens;
+                            const bool full_slot_valid =
+                                !phone_full_auto_ffn ||
+                                (st.phone_output &&
+                                 st.phone_output->is_full_layer &&
+                                 st.phone_output->fused_full_graph &&
+                                 st.phone_output->registered_full_graph_uid != 0);
                             ok = local_input != nullptr && kv_prefix_ok &&
-                                registered_ok &&
+                                registered_ok && full_slot_valid &&
                                 st.ready.prepared_attention_graph_uid != 0 &&
-                                ggml_backend_rpc_cycle_wait_phone_next_attention(
-                                    phone, l, c, st.wire.seq, st.wire.graph_id);
+                                (phone_full_auto_ffn ?
+                                    ggml_backend_rpc_cycle_wait_phone_next_full(
+                                        phone, l, c, st.wire.seq,
+                                        st.wire.graph_id) :
+                                    ggml_backend_rpc_cycle_wait_phone_next_attention(
+                                        phone, l, c, st.wire.seq,
+                                        st.wire.graph_id));
                             if (ok) {
                                 kv[size_t(l)]->committed_tokens =
                                     st.start + st.tokens;
                                 ++v2_attn_completed;
+                                if (phone_full_auto_ffn) {
+                                    ++v3_next_full_completed;
+                                    std::printf(
+                                        "[CYCLE_PHONE_V3] side=PC "
+                                        "event=NEXT_FULL_ACK "
+                                        "layer=%d chunk=%d seq=%" PRIu64
+                                        " prefix=%lld status=OK\n",
+                                        l, c, st.wire.seq,
+                                        (long long)kv[size_t(l)]->committed_tokens);
+                                }
                                 std::printf(
                                     "[CYCLE_PHONE_V2] side=PC event=KV_COMMIT "
                                     "layer=%d chunk=%d prefix=%lld "
@@ -5736,42 +5890,7 @@ static bool cycle_real_execute_period_fifo(
                             if (!phone_ordered_handoff) {
                                 retire_device_output(l - 1, c);
                             }
-                            if (phone_full_reuse) {
-                                auto & pool = phone_full_pool[size_t(l)];
-                                for (auto it = pool.begin(); it != pool.end(); ++it) {
-                                    if ((*it)->is_full_layer &&
-                                        (*it)->prepared_tokens == st.tokens &&
-                                        (*it)->fused_full_graph == phone_full_fuse &&
-                                        (*it)->rpc_full_replay == phone_full_rpc_replay &&
-                                        ((*it)->registered_full_graph_uid != 0) ==
-                                            phone_full_local_ffn) {
-                                        st.phone_output = std::move(*it);
-                                        pool.erase(it);
-                                        ++phone_reuse_stats[size_t(l)].hits;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!st.phone_output) {
-                                st.phone_output =
-                                    std::make_unique<cycle_real_c2p_phone_chunk>();
-                                const auto weights = full_shard(l, 1);
-                                ok = st.phone_output->prepare(
-                                    phone, weights, hidden, st.tokens,
-                                    topk, experts, true, phone_full_fuse,
-                                    phone_full_rpc_replay, phone_full_local_ffn);
-                                if (ok && phone_full_reuse) {
-                                    ++phone_reuse_stats[size_t(l)].misses;
-                                }
-                                if (ok && perf_mode) {
-                                    auto & sample = gpu_prepare_profile[queue_index];
-                                    ++sample.count;
-                                    sample.graph_build_ms +=
-                                        st.phone_output->graph_build_ms;
-                                    sample.gpu_buffer_alloc_ms +=
-                                        st.phone_output->gpu_alloc_ms;
-                                }
-                            }
+                            ok = acquire_phone_full_slot(l, c, queue_index);
                         }
                         if (perf_mode) {
                             full_detail.pool_checkout_and_prepare_ms +=
@@ -5824,15 +5943,59 @@ static bool cycle_real_execute_period_fifo(
                                     window);
                             }
                         }
+                        if (ok && v2_chain && phone_full_auto_ffn) {
+                            // Register L6 Full FFN+ADD before the L5 kickoff.
+                            // This is the SAME layer-owned slot that L6's
+                            // Ring callback will consume after the Phone
+                            // worker confirms both graphs are device-done.
+                            ok = acquire_phone_full_slot(
+                                l + 1, c, queue_index);
+                            if (ok) {
+                                const auto & next_st =
+                                    *states[size_t(l + 1)][size_t(c)];
+                                std::printf(
+                                    "[CYCLE_PHONE_V3] side=PC "
+                                    "event=PREPARE_NEXT_FULL "
+                                    "layer=%d chunk=%d ffn_uid=%" PRIu64
+                                    " status=OK\n",
+                                    l + 1, c,
+                                    next_st.phone_output->registered_full_graph_uid);
+                            }
+                        }
                         const auto full_ffn_call_begin =
                             std::chrono::steady_clock::now();
                         if (ok) {
                             if (v2_chain) {
                                 auto & next_st = *states[size_t(l + 1)][size_t(c)];
-                                ok = st.phone_output->execute_full_server_chain(
-                                    phone, st.ready, l, c, st.wire.seq,
-                                    l + 1, next_st.wire.seq,
-                                    next_st.wire.graph_id, next_st.ready);
+                                if (phone_full_auto_ffn) {
+                                    ok = next_st.phone_output &&
+                                        st.phone_output->execute_full_server_pair(
+                                            phone, st.ready, l, c, st.wire.seq,
+                                            l + 1, next_st.wire.seq,
+                                            next_st.wire.graph_id, next_st.ready,
+                                            *next_st.phone_output);
+                                    if (ok) ++v3_full_pairs_armed;
+                                } else {
+                                    ok = st.phone_output->execute_full_server_chain(
+                                        phone, st.ready, l, c, st.wire.seq,
+                                        l + 1, next_st.wire.seq,
+                                        next_st.wire.graph_id, next_st.ready);
+                                }
+                            } else if (phone_full_auto_ffn &&
+                                       l == layout.x + 2) {
+                                // The Phone worker has already completed
+                                // this FFN+ADD before NEXT_FULL_DONE returned.
+                                // Never issue a duplicate PC-to-Phone FFN RPC.
+                                ok = st.phone_output &&
+                                    st.phone_output->fused_full_graph &&
+                                    st.phone_output->registered_full_graph_uid != 0;
+                                if (ok) {
+                                    std::printf(
+                                        "[CYCLE_PHONE_V3] side=PC "
+                                        "event=SKIP_REMOTE_FFN "
+                                        "layer=%d chunk=%d reason=PHONE_FIFO_DONE "
+                                        "status=OK\n", l, c);
+                                }
                             } else {
                                 ok = phone_full_local_ffn ?
                                     st.phone_output->execute_full_server(
@@ -6719,6 +6882,19 @@ static bool cycle_real_execute_period_fifo(
             run_phase, v2_attn_prepared, v2_attn_completed,
             n_chunks, window, (long long)v2_registered_kv_tokens,
             (long long)committed, v2_ok ? "OK" : "FAIL");
+    }
+    if (phone_full_auto_ffn) {
+        const bool v3_ok = succeeded &&
+            v3_full_pairs_armed == uint64_t(n_chunks) &&
+            v3_next_full_completed == uint64_t(n_chunks) &&
+            v2_attn_completed == uint64_t(n_chunks);
+        std::printf(
+            "[CYCLE_PHONE_V3_SUM] phase=%s pairs_armed=%" PRIu64
+            " next_full_completed=%" PRIu64
+            " expected=%d window=%d remote_next_ffn_launches=0 "
+            "status=%s\n",
+            run_phase, v3_full_pairs_armed, v3_next_full_completed,
+            n_chunks, window, v3_ok ? "OK" : "FAIL");
     }
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.

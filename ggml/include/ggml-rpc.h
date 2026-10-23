@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    29
+#define RPC_PROTO_PATCH_VERSION    30
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -405,7 +405,7 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full(
 // Protocol 29, opt-in V2: after completing this Full FFN+ADD, the Phone
 // server enqueues the NEXT layer's pre-registered Attention graph on its
 // local FIFO. No PC-side second Attention submit and no device readback.
-// This initial safe mode requires a single in-flight Chunk per layer.
+// V2 supports one or two in-flight Chunks with ordered KV admission.
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full_chain(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t ffn_graph_uid,
@@ -416,6 +416,30 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full_chain(
         const struct ggml_tensor * full_output,
         const struct ggml_tensor * next_attention_input);
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_next_attention(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
+
+// Protocol 30, opt-in V3: one L5 Full-FFN kickoff also arms the Phone
+// worker to perform L6 Attention followed by its locally registered
+// FFN+ADD. The next Full layer is device-complete before its WAIT ACK.
+// PC continues to own the global Ring, buffers and KV completion prefix.
+// No device activation crosses the PC boundary in this local pair.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_run_phone_full_pair(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t ffn_graph_uid,
+        const ggml_tensor * const sources[4],
+        const ggml_tensor * const destinations[4],
+        int32_t next_layer, uint64_t next_seq, uint64_t next_graph_id,
+        uint64_t next_attention_graph_uid,
+        const ggml_tensor * full_output,
+        const ggml_tensor * next_attention_input,
+        uint64_t next_ffn_graph_uid,
+        const ggml_tensor * const next_ffn_sources[4],
+        const ggml_tensor * const next_ffn_destinations[4]);
+
+// Uses the same Phone FIFO completion channel as V2; in V3 that channel
+// signals BOTH next Attention and next FFN+ADD have completed.
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_next_full(
         ggml_backend_t backend, int32_t layer, int32_t chunk,
         uint64_t seq, uint64_t graph_id);
 
