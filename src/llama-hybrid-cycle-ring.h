@@ -92,12 +92,14 @@ public:
             const llama_hybrid_cycle_layout & layout, int n_chunks,
             int max_inflight = 0, bool credit_until_handoff = false,
             bool pc_cpu_reduce_priority = false,
-            bool ordered_c2p_reduce = false)
+            bool ordered_c2p_reduce = false,
+            bool phone_main_priority = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
           credit_until_handoff_(credit_until_handoff),
           pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
-          ordered_c2p_reduce_(ordered_c2p_reduce) {
+          ordered_c2p_reduce_(ordered_c2p_reduce),
+          phone_main_priority_(phone_main_priority) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -142,6 +144,28 @@ public:
                         llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                     selected = it;
                     break;
+                }
+            }
+        }
+        if (phone_main_priority_ &&
+            queue == llama_hybrid_cycle_queue::PHONE_GPU) {
+            bool picked = false;
+            int best_chunk = 0, best_stage = 0;
+            for (auto it = ready.begin(); it != ready.end(); ++it) {
+                const auto kind = layout_.kinds[size_t(it->layer)];
+                const int priority = kind ==
+                    llama_hybrid_cycle_layer_kind::TENSOR_P2C ?
+                    (it->stage == llama_hybrid_cycle_stage::FFN_SOURCE ? 3 :
+                     it->stage == llama_hybrid_cycle_stage::ATTN_PRE ? 2 : 0) :
+                    (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU &&
+                     it->stage == llama_hybrid_cycle_stage::FULL_LAYER ? 1 : 0);
+                if (priority > 0 &&
+                    (!picked || it->chunk < best_chunk ||
+                     (it->chunk == best_chunk && priority > best_stage))) {
+                    selected = it;
+                    picked = true;
+                    best_chunk = it->chunk;
+                    best_stage = priority;
                 }
             }
         }
@@ -385,6 +409,7 @@ private:
     bool credit_until_handoff_ = false;
     bool pc_cpu_reduce_priority_ = false;
     bool ordered_c2p_reduce_ = false;
+    bool phone_main_priority_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
