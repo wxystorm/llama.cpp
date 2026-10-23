@@ -376,6 +376,14 @@ if (TARGET ggml-rpc)
         ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-hybrid-cycle-real-pc-prefix PRIVATE ggml-rpc)
 
+    # Explicit mixed hardware probe: all 24 physical PC Full layers execute
+    # real CPU kernels through ONE 48-layer FIFO. Phone tasks are MOCK ONLY;
+    # no 48-layer Transformer forward, and no automatic CTest registration.
+    llama_build(test-hybrid-cycle-real-pc-ring.cpp)
+    target_include_directories(test-hybrid-cycle-real-pc-ring PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-hybrid-cycle-real-pc-ring PRIVATE ggml-rpc)
+
     # First complete physical Cycle period. Exercises the EXISTING five
     # backend FIFO queues with the actual PC full layers, C2P split,
     # Phone full layers and final P2C split. Hardware/model required;
