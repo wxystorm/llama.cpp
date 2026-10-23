@@ -2953,20 +2953,24 @@ bool ggml_backend_rpc_cycle_wait_phone_next_full(
 
 // A single C2P-completion kickoff replaces all L5/L6 Graph submissions.
 // This API transmits descriptors only; no hidden-state device readback.
-bool ggml_backend_rpc_cycle_arm_phone_region(
+static bool rpc_cycle_send_phone_region(
         ggml_backend_t backend,
-        const ggml_rpc_cycle_phone_region_stage stages[2]) {
+        const ggml_rpc_cycle_phone_region_stage stages[2],
+        bool deferred, int32_t c2p_layer, uint64_t c2p_seq,
+        uint64_t c2p_graph_id) {
     if (!ggml_backend_is_rpc(backend) || !stages ||
         stages[0].layer < 0 ||
         stages[1].layer != stages[0].layer + 1 ||
         stages[0].chunk < 0 || stages[0].chunk != stages[1].chunk ||
-        stages[0].seq == 0 || stages[1].seq == 0)
+        stages[0].seq == 0 || stages[1].seq == 0 ||
+        (deferred && (c2p_layer != stages[0].layer - 1 ||
+                      c2p_seq == 0)))
         return false;
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
-    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 31) {
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < (deferred ? 32 : 31)) {
         GGML_LOG_ERROR(
             "[CYCLE_PHONE_V4] side=PC status=FAIL "
-            "reason=PHONE_RPC_PATCH31_REQUIRED\n");
+            "reason=PHONE_RPC_PATCH31_OR_32_REQUIRED\n");
         return false;
     }
     const auto valid_tensor = [&](const ggml_tensor * tensor,
@@ -3014,19 +3018,107 @@ bool ggml_backend_rpc_cycle_arm_phone_region(
     }
     const auto sock = get_socket(ctx->endpoint);
     if (!sock) return false;
+    rpc_msg_inference_cycle_v5_region_req v5_request {};
+    if (deferred) {
+        v5_request.region = request;
+        v5_request.c2p_layer = c2p_layer;
+        v5_request.c2p_seq = c2p_seq;
+        v5_request.c2p_graph_id = c2p_graph_id;
+    }
     rpc_msg_inference_cycle_send_rsp response {};
     const int64_t started = ggml_time_us();
     const bool ok = send_rpc_cmd(
-        sock, RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
-        &request, sizeof(request), &response, sizeof(response)) &&
+        sock, deferred ? RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER :
+                         RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
+        deferred ? static_cast<const void *>(&v5_request) :
+                   static_cast<const void *>(&request),
+        deferred ? sizeof(v5_request) : sizeof(request),
+        &response, sizeof(response)) &&
         response.result == 1;
     GGML_LOG_INFO(
-        "[CYCLE_PHONE_V4] side=PC event=ARM_REGION "
+        "[CYCLE_PHONE_REGION] side=PC event=%s "
         "first_layer=%d next_layer=%d chunk=%d seq=%" PRIu64
         " ack_ms=%.3f status=%s\n",
+        deferred ? "REGISTER_DEFERRED" : "ARM_REGION",
         stages[0].layer, stages[1].layer, stages[0].chunk,
         stages[0].seq, (ggml_time_us() - started) / 1000.0,
         ok ? "OK" : "FAIL");
+    return ok;
+}
+
+
+bool ggml_backend_rpc_cycle_arm_phone_region(
+        ggml_backend_t backend,
+        const ggml_rpc_cycle_phone_region_stage stages[2]) {
+    return rpc_cycle_send_phone_region(
+        backend, stages, false, -1, 0, 0);
+}
+
+bool ggml_backend_rpc_cycle_register_phone_region_after_c2p(
+        ggml_backend_t backend,
+        const ggml_rpc_cycle_phone_region_stage stages[2],
+        int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id) {
+    return rpc_cycle_send_phone_region(
+        backend, stages, true, c2p_layer, c2p_seq, c2p_graph_id);
+}
+
+bool ggml_backend_rpc_cycle_arm_c2p_local(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        uint64_t ffn_graph_uid, uint64_t reduce_graph_uid) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0 || ffn_graph_uid == 0 || reduce_graph_uid == 0)
+        return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 32)
+        return false;
+    const auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_v5_c2p_arm_req req {};
+    req.device = ctx->device;
+    req.layer = layer;
+    req.chunk = chunk;
+    req.seq = seq;
+    req.graph_id = graph_id;
+    req.ffn_graph_uid = ffn_graph_uid;
+    req.reduce_graph_uid = reduce_graph_uid;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM,
+        &req, sizeof(req), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO("[CYCLE_PHONE_V5] side=PC event=ARM_C2P "
+                 "layer=%d chunk=%d seq=%" PRIu64 " status=%s\n",
+                 layer, chunk, seq, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool ggml_backend_rpc_cycle_wait_c2p_local_reduce(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 || seq == 0)
+        return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 32)
+        return false;
+    const auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_p2c_wait_req req {};
+    req.layer = layer;
+    req.chunk = chunk;
+    req.seq = seq;
+    req.graph_id = graph_id;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const int64_t t0 = ggml_time_us();
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT,
+        &req, sizeof(req), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO("[CYCLE_PHONE_V5] side=PC event=REDUCE_DONE "
+                 "layer=%d chunk=%d seq=%" PRIu64
+                 " wait_ms=%.3f status=%s\n",
+                 layer, chunk, seq, (ggml_time_us() - t0) / 1000.0,
+                 ok ? "OK" : "FAIL");
     return ok;
 }
 
