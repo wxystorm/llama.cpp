@@ -13812,7 +13812,7 @@ struct rpc_cycle_p2c_fifo_v1 {
     using key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
     enum class kind {
         P2C_FFN, NEXT_ATTENTION, NEXT_ATTENTION_FULL, PHONE_REGION_STAGE,
-        C2P_V5_FFN, C2P_V5_REDUCE
+        C2P_V5_FFN, C2P_V5_REDUCE, P2C_V6_MAIN
     };
     struct job {
         key id {};
@@ -13826,11 +13826,15 @@ struct rpc_cycle_p2c_fifo_v1 {
         bool region_has_next = false;
         bool v5_main_continuation = false;
         rpc_msg_inference_cycle_v5_c2p_arm_req c2p_v5 {};
+        rpc_msg_inference_cycle_v6_p2c_req p2c_v6 {};
+        bool region_has_p2c = false;
     };
     struct c2p_v5_state {
         rpc_msg_inference_cycle_v5_c2p_arm_req arm {};
         rpc_msg_inference_cycle_phone_region_req region {};
         bool region_registered = false;
+        bool p2c_registered = false;
+        rpc_msg_inference_cycle_v6_p2c_req p2c {};
         bool ready_applied = false;
         bool partial_applied = false;
         bool ffn_queued = false;
@@ -13852,6 +13856,9 @@ struct rpc_cycle_p2c_fifo_v1 {
     uint64_t v5_epoch_head_seq = 0;
     std::set<key> pending;
     std::map<key, bool> completed;
+    // READY completes once Phone has copied GPU outputs to independent
+    // TX staging. P2C FFN/PARTIAL is a distinct completion.
+    std::map<key, bool> p2c_v6_ready_result;
     bool stopping = false;
     std::thread worker;
     uint64_t jobs_started = 0, jobs_finished = 0;
@@ -13927,7 +13934,8 @@ struct rpc_cycle_p2c_fifo_v1 {
     }
 
     bool register_c2p_region(
-            const rpc_msg_inference_cycle_v5_region_req & req) {
+            const rpc_msg_inference_cycle_v5_region_req & req,
+            const rpc_msg_inference_cycle_v6_p2c_req * p2c = nullptr) {
         const auto & first = req.region.stages[0];
         const auto & second = req.region.stages[1];
         const key k {req.c2p_layer, first.chunk, req.c2p_seq,
@@ -13944,6 +13952,29 @@ struct rpc_cycle_p2c_fifo_v1 {
             !first.attention_graph_uid || !first.ffn_graph_uid ||
             !second.attention_graph_uid || !second.ffn_graph_uid)
             return false;
+        if (p2c) {
+            if (p2c->device != it->second.arm.device ||
+                p2c->layer != second.layer + 1 ||
+                p2c->chunk != second.chunk ||
+                p2c->ready.kind != INFERENCE_CYCLE_READY ||
+                p2c->ffn.partial.kind != INFERENCE_CYCLE_PARTIAL ||
+                p2c->ready.layer != p2c->layer ||
+                p2c->ffn.partial.layer != p2c->layer ||
+                p2c->ready.chunk != p2c->chunk ||
+                p2c->ffn.partial.chunk != p2c->chunk ||
+                p2c->ready.seq != p2c->ffn.partial.seq ||
+                p2c->ready.graph_id != p2c->ffn.partial.graph_id ||
+                !p2c->attention_graph_uid || !p2c->ffn.ffn_graph_uid ||
+                !p2c->input_source.buffer ||
+                !p2c->attention_input.buffer ||
+                !p2c->ready.tokens || !p2c->ready.hidden ||
+                !p2c->ready.topk ||
+                p2c->ffn.partial.tokens != p2c->ready.tokens ||
+                p2c->ffn.partial.hidden != p2c->ready.hidden)
+                return false;
+            it->second.p2c = *p2c;
+            it->second.p2c_registered = true;
+        }
         it->second.region = req.region;
         it->second.region_registered = true;
         admit_c2p_reduces_locked();
@@ -14016,6 +14047,19 @@ struct rpc_cycle_p2c_fifo_v1 {
                 std::get<2>(found->first), jobs.size());
             cv.notify_one();
         }
+    }
+
+    bool wait_p2c_v6_ready(const key & k) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool signaled = cv.wait_for(
+            lock, std::chrono::seconds(30), [&] {
+                return stopping || p2c_v6_ready_result.count(k) != 0;
+            });
+        auto found = p2c_v6_ready_result.find(k);
+        if (!signaled || found == p2c_v6_ready_result.end()) return false;
+        const bool result = found->second;
+        p2c_v6_ready_result.erase(found);
+        return result;
     }
 
     bool wait_c2p_reduce(const key & k) {
@@ -14146,14 +14190,15 @@ struct rpc_cycle_p2c_fifo_v1 {
     // stays ahead of the newly-ready next-layer L6 Chunk.
     bool enqueue_phone_region(
             const rpc_msg_inference_cycle_phone_region_req & request,
-            bool v5_main = false) {
+            bool v5_main = false,
+            const rpc_msg_inference_cycle_v6_p2c_req * p2c = nullptr) {
         const auto & first = request.stages[0];
         const auto & second = request.stages[1];
         const key a {first.layer, first.chunk, first.seq, first.graph_id};
         const key b {second.layer, second.chunk, second.seq, second.graph_id};
         std::lock_guard<std::mutex> lock(mutex);
         if (!enabled || stopping || jobs.size() >= 31 ||
-            pending.size() + completed.size() >= 62 ||
+            pending.size() + completed.size() >= (p2c ? 61 : 62) ||
             a == b || pending.count(a) || pending.count(b) ||
             completed.count(a) || completed.count(b)) return false;
         const bool first_chunk = first.chunk == 0;
@@ -14191,6 +14236,15 @@ struct rpc_cycle_p2c_fifo_v1 {
                 return false;
             }
         }
+        const key p2c_key = p2c ?
+            key {p2c->layer, p2c->chunk,
+                 p2c->ready.seq, p2c->ready.graph_id} : key {};
+        if (p2c && (!v5_main ||
+            p2c->layer != second.layer + 1 ||
+            p2c->chunk != second.chunk ||
+            pending.count(p2c_key) || completed.count(p2c_key) ||
+            p2c_v6_ready_result.count(p2c_key)))
+            return false;
         job next {};
         next.id = a;
         next.type = kind::PHONE_REGION_STAGE;
@@ -14198,11 +14252,14 @@ struct rpc_cycle_p2c_fifo_v1 {
         next.region_next = second;
         next.region_has_next = true;
         next.v5_main_continuation = v5_main;
+        next.region_has_p2c = p2c != nullptr;
+        if (p2c) next.p2c_v6 = *p2c;
         next.enqueue_us = ggml_time_us();
         if (v5_main) jobs.push_front(std::move(next));
         else jobs.push_back(std::move(next));
         pending.insert(a);
         pending.insert(b);
+        if (p2c) pending.insert(p2c_key);
         jobs_started += 2;
         v4_last_layer = first.layer;
         v4_last_chunk = first.chunk;
