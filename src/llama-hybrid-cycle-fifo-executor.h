@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-hybrid-cycle-ring.h"
+#include "llama-hybrid-cycle-chunk-profile.h"
 
 #include <algorithm>
 #include <array>
@@ -56,7 +57,8 @@ inline bool llama_hybrid_cycle_run_fifo(
         llama_hybrid_cycle_fifo_profile * profile = nullptr,
         bool pc_cpu_reduce_priority = false,
         bool ordered_c2p_reduce = false,
-        bool phone_main_priority = false) {
+        bool phone_main_priority = false,
+        llama_hybrid_cycle_chunk_timeline * chunk_timeline = nullptr) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
@@ -64,7 +66,7 @@ inline bool llama_hybrid_cycle_run_fifo(
     llama_hybrid_cycle_task_ring ring(
         layout, n_chunks, max_inflight, credit_until_handoff,
         pc_cpu_reduce_priority, ordered_c2p_reduce,
-        phone_main_priority);
+        phone_main_priority, chunk_timeline != nullptr);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
@@ -91,6 +93,8 @@ inline bool llama_hybrid_cycle_run_fifo(
         // stages in two different queues run concurrently.
         auto * stats = profile ?
             &profile->queues[static_cast<size_t>(queue)] : nullptr;
+        auto * trace = chunk_timeline ?
+            &chunk_timeline->by_queue[static_cast<size_t>(queue)] : nullptr;
         while (!failed.load() && !ring.finished()) {
             uint64_t seen_epoch = 0;
             {
@@ -152,14 +156,20 @@ inline bool llama_hybrid_cycle_run_fifo(
                     task.layer, task.chunk);
                 failed.store(true);
             }
-            if (stats) {
-                const double elapsed_ms =
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - execute_begin).count();
-                ++stats->tasks;
-                stats->execute_ms += elapsed_ms;
-                stats->max_execute_ms =
-                    std::max(stats->max_execute_ms, elapsed_ms);
+            if (stats || trace) {
+                const auto execute_end = std::chrono::steady_clock::now();
+                if (trace) {
+                    trace->push_back({task, execute_begin, execute_end, ok});
+                }
+                if (stats) {
+                    const double elapsed_ms =
+                        std::chrono::duration<double, std::milli>(
+                            execute_end - execute_begin).count();
+                    ++stats->tasks;
+                    stats->execute_ms += elapsed_ms;
+                    stats->max_execute_ms =
+                        std::max(stats->max_execute_ms, elapsed_ms);
+                }
             }
             signal();
         }
