@@ -4840,6 +4840,10 @@ struct cycle_real_period_chunk {
     inference_cycle_message recv_ready;
     inference_cycle_message recv_partial;
     std::unique_ptr<cycle_real_c2p_phone_chunk> phone_output;
+    // Patch 33: each pre-registered L7 FFN owns its own buffer slot.
+    // A single shared P2C FFN slot would be unsafe with window=2 while
+    // the next Chunk is registered before the previous FFN completed.
+    std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_main_ffn;
 };
 
 static bool cycle_real_execute_period_fifo(
@@ -5037,6 +5041,18 @@ static bool cycle_real_execute_period_fifo(
         std::fprintf(stderr,
             "[CYCLE_P2C_LOCAL] phase=%s status=FAIL "
             "reason=REQUIRES_PHONE_ORDERED_HANDOFF_AND_P2C_FFN_REUSE\n",
+            run_phase);
+        return false;
+    }
+    const bool phone_main_p2c = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_MAIN_P2C");
+    if (phone_main_p2c &&
+        (!phone_c2p_local || !phone_p2c_local_ffn ||
+         !attn_graph_reuse || !attn_scratch_session_reuse ||
+         layout.y != 2 || window < 1 || window > 2)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_V5_P2C] phase=%s status=FAIL "
+            "reason=REQUIRES_V5_P2C_FFN_AND_WINDOW1_OR_2\n",
             run_phase);
         return false;
     }
@@ -5423,6 +5439,8 @@ static bool cycle_real_execute_period_fifo(
     uint64_t v4_region_armed = 0;
     uint64_t v4_l5_completed = 0;
     uint64_t v4_l6_completed = 0;
+    int64_t v5_p2c_registered_tokens = 0;
+    uint64_t v5_p2c_ready_completed = 0;
     // The PC-side PHONE_GPU FIFO exclusively owns these counters.
     // Registration can lead device completion, which can in turn lead
     // the acknowledgements recorded in kv[].committed_tokens.
@@ -5473,6 +5491,14 @@ static bool cycle_real_execute_period_fifo(
             "kv_order=STRICT graph_cache=UNCHANGED "
             "scratch_pool=UNCHANGED\n",
             run_phase, window, layout.y);
+    }
+    if (phone_main_p2c) {
+        std::printf(
+            "[CYCLE_PHONE_V5_P2C_PLAN] phase=%s enabled=1 "
+            "region=L5_L6_L7_P2C main_priority=1 "
+            "ready=PHONE_TX_STAGED_BEFORE_FFN "
+            "partial=PHONE_TX_STAGED_FROM_MAIN "
+            "window=%d\n", run_phase, window);
     }
     if (phone_c2p_local) {
         std::printf(
