@@ -13664,7 +13664,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 struct rpc_cycle_p2c_fifo_v1 {
     using key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
     enum class kind {
-        P2C_FFN, NEXT_ATTENTION, NEXT_ATTENTION_FULL, PHONE_REGION_STAGE
+        P2C_FFN, NEXT_ATTENTION, NEXT_ATTENTION_FULL, PHONE_REGION_STAGE,
+        C2P_V5_FFN, C2P_V5_REDUCE
     };
     struct job {
         key id {};
@@ -13676,12 +13677,32 @@ struct rpc_cycle_p2c_fifo_v1 {
         rpc_msg_inference_cycle_phone_region_stage_req region {};
         rpc_msg_inference_cycle_phone_region_stage_req region_next {};
         bool region_has_next = false;
+        bool v5_main_continuation = false;
+        rpc_msg_inference_cycle_v5_c2p_arm_req c2p_v5 {};
+    };
+    struct c2p_v5_state {
+        rpc_msg_inference_cycle_v5_c2p_arm_req arm {};
+        rpc_msg_inference_cycle_phone_region_req region {};
+        bool region_registered = false;
+        bool ready_applied = false;
+        bool partial_applied = false;
+        bool ffn_queued = false;
+        bool ffn_done = false;
+        bool ffn_failed = false;
+        bool reduce_queued = false;
+        bool reduce_done = false;
+        bool reduce_failed = false;
     };
     rpc_server & server;
     bool enabled;
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<job> jobs;
+    std::deque<job> jobs;                  // MAIN: priority FIFO
+    std::deque<job> c2p_v5_ffn_jobs;      // background C2P FFN only
+    std::map<key, c2p_v5_state> c2p_v5;  // two-readiness join
+    int32_t v5_next_reduce_chunk = 0;
+    int32_t v5_c2p_layer = -1;
+    uint64_t v5_epoch_head_seq = 0;
     std::set<key> pending;
     std::map<key, bool> completed;
     bool stopping = false;
@@ -13712,6 +13733,156 @@ struct rpc_cycle_p2c_fifo_v1 {
                 "enqueued=%" PRIu64 " completed=%" PRIu64 "\n",
                 jobs_started, jobs_finished);
         }
+    }
+
+    // All three readiness notifications use only the short scheduler lock.
+    // No worker holds the GPU gate while waiting for PC data.
+    bool arm_c2p_v5(const rpc_msg_inference_cycle_v5_c2p_arm_req & plan) {
+        const key k {plan.layer, plan.chunk, plan.seq, plan.graph_id};
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!enabled || stopping || plan.device >= server.backends.size() ||
+            plan.layer < 0 || plan.chunk < 0 || !plan.seq ||
+            !plan.ffn_graph_uid || !plan.reduce_graph_uid ||
+            c2p_v5.count(k) || c2p_v5.size() >= 64) return false;
+        if (plan.chunk == 0) {
+            // The previous period must have consumed all its C2P ACKs.
+            if (!c2p_v5.empty() || plan.seq <= v5_epoch_head_seq)
+                return false;
+            v5_epoch_head_seq = plan.seq;
+            v5_c2p_layer = plan.layer;
+            v5_next_reduce_chunk = 0;
+        } else if (plan.layer != v5_c2p_layer ||
+                   plan.seq != v5_epoch_head_seq + uint64_t(plan.chunk)) {
+            return false;
+        }
+        if (!worker.joinable()) {
+            try {
+                worker = std::thread([this] { run(); });
+                GGML_LOG_INFO(
+                    "[CYCLE_PHONE_V5] side=PHONE event=WORKER_START "
+                    "queue=MAIN_PRIORITY background=C2P_FFN status=OK\n");
+            } catch (...) {
+                return false;
+            }
+        }
+        c2p_v5_state s {};
+        s.arm = plan;
+        c2p_v5.emplace(k, std::move(s));
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_V5] side=PHONE event=ARM_C2P layer=%d "
+            "chunk=%d seq=%" PRIu64 " status=OK\n",
+            plan.layer, plan.chunk, plan.seq);
+        return true;
+    }
+
+    bool register_c2p_region(
+            const rpc_msg_inference_cycle_v5_region_req & req) {
+        const auto & first = req.region.stages[0];
+        const auto & second = req.region.stages[1];
+        const key k {req.c2p_layer, first.chunk, req.c2p_seq,
+                     req.c2p_graph_id};
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = c2p_v5.find(k);
+        if (it == c2p_v5.end() || it->second.region_registered ||
+            first.layer != req.c2p_layer + 1 ||
+            second.layer != first.layer + 1 ||
+            second.chunk != first.chunk ||
+            first.seq == 0 || second.seq == 0 ||
+            first.device != it->second.arm.device ||
+            second.device != first.device ||
+            !first.attention_graph_uid || !first.ffn_graph_uid ||
+            !second.attention_graph_uid || !second.ffn_graph_uid)
+            return false;
+        it->second.region = req.region;
+        it->second.region_registered = true;
+        admit_c2p_reduces_locked();
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_V5] side=PHONE event=REGION_REGISTERED "
+            "chunk=%d first_layer=%d last_layer=%d status=OK\n",
+            first.chunk, first.layer, second.layer);
+        return true;
+    }
+
+    bool c2p_device_ready(const key & k, bool partial) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = c2p_v5.find(k);
+        if (it == c2p_v5.end()) return false;
+        auto & s = it->second;
+        if (partial) {
+            if (s.partial_applied) return false;
+            s.partial_applied = true;
+            admit_c2p_reduces_locked();
+        } else {
+            if (s.ready_applied || s.ffn_queued) return false;
+            s.ready_applied = true;
+            s.ffn_queued = true;
+            job ff {};
+            ff.id = k;
+            ff.type = kind::C2P_V5_FFN;
+            ff.c2p_v5 = s.arm;
+            ff.enqueue_us = ggml_time_us();
+            c2p_v5_ffn_jobs.push_back(std::move(ff));
+            ++jobs_started;
+            cv.notify_one();
+        }
+        GGML_LOG_INFO(
+            "[CYCLE_PHONE_V5] side=PHONE event=%s "
+            "chunk=%d seq=%" PRIu64 " main_depth=%zu ffn_depth=%zu\n",
+            partial ? "PC_PARTIAL_GPU_READY" : "C2P_READY_GPU_READY",
+            std::get<1>(k), std::get<2>(k),
+            jobs.size(), c2p_v5_ffn_jobs.size());
+        return true;
+    }
+
+    void admit_c2p_reduces_locked() {
+        // Only the OLDEST ready Chunk can enter MAIN. Later Chunks stay
+        // registered, never parked as blocking jobs inside MAIN.
+        while (true) {
+            auto found = std::find_if(c2p_v5.begin(), c2p_v5.end(),
+                [&](const auto & v) {
+                    return std::get<1>(v.first) == v5_next_reduce_chunk &&
+                        std::get<0>(v.first) == v5_c2p_layer &&
+                        std::get<2>(v.first) ==
+                            v5_epoch_head_seq + uint64_t(v5_next_reduce_chunk);
+                });
+            if (found == c2p_v5.end()) break;
+            auto & s = found->second;
+            if (!s.ffn_done || !s.partial_applied ||
+                !s.region_registered || s.reduce_queued) break;
+            s.reduce_queued = true;
+            job task {};
+            task.id = found->first;
+            task.type = kind::C2P_V5_REDUCE;
+            task.c2p_v5 = s.arm;
+            task.enqueue_us = ggml_time_us();
+            jobs.push_back(std::move(task));
+            ++jobs_started;
+            ++v5_next_reduce_chunk;
+            GGML_LOG_INFO(
+                "[CYCLE_PHONE_V5] side=PHONE event=MAIN_REDUCE_ADMIT "
+                "chunk=%d seq=%" PRIu64 " main_depth=%zu status=OK\n",
+                std::get<1>(found->first),
+                std::get<2>(found->first), jobs.size());
+            cv.notify_one();
+        }
+    }
+
+    bool wait_c2p_reduce(const key & k) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool signaled = cv.wait_for(
+            lock, std::chrono::seconds(30), [&] {
+                const auto it = c2p_v5.find(k);
+                return stopping || (it != c2p_v5.end() &&
+                    (it->second.reduce_done || it->second.reduce_failed ||
+                     it->second.ffn_failed));
+            });
+        const auto it = c2p_v5.find(k);
+        if (!signaled || it == c2p_v5.end() ||
+            !it->second.reduce_done) return false;
+        // Region has already been queued in MAIN. No live worker needs
+        // this C2P record after its completion has been consumed by PC.
+        c2p_v5.erase(it);
+        return true;
     }
 
     bool can_arm(const key & k) {
@@ -13823,7 +13994,8 @@ struct rpc_cycle_p2c_fifo_v1 {
     // This preserves the original FIFO rule: a previously queued L5 Chunk
     // stays ahead of the newly-ready next-layer L6 Chunk.
     bool enqueue_phone_region(
-            const rpc_msg_inference_cycle_phone_region_req & request) {
+            const rpc_msg_inference_cycle_phone_region_req & request,
+            bool v5_main = false) {
         const auto & first = request.stages[0];
         const auto & second = request.stages[1];
         const key a {first.layer, first.chunk, first.seq, first.graph_id};
@@ -13874,8 +14046,10 @@ struct rpc_cycle_p2c_fifo_v1 {
         next.region = first;
         next.region_next = second;
         next.region_has_next = true;
+        next.v5_main_continuation = v5_main;
         next.enqueue_us = ggml_time_us();
-        jobs.push_back(std::move(next));
+        if (v5_main) jobs.push_front(std::move(next));
+        else jobs.push_back(std::move(next));
         pending.insert(a);
         pending.insert(b);
         jobs_started += 2;
@@ -13916,13 +14090,21 @@ struct rpc_cycle_p2c_fifo_v1 {
             job item {};
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] { return stopping || !jobs.empty(); });
-                if (jobs.empty()) {
+                cv.wait(lock, [&] {
+                    return stopping || !jobs.empty() ||
+                        !c2p_v5_ffn_jobs.empty();
+                });
+                if (jobs.empty() && c2p_v5_ffn_jobs.empty()) {
                     if (stopping) return;
                     continue;
                 }
-                item = std::move(jobs.front());
-                jobs.pop_front();
+                if (!jobs.empty()) {
+                    item = std::move(jobs.front());
+                    jobs.pop_front();
+                } else {
+                    item = std::move(c2p_v5_ffn_jobs.front());
+                    c2p_v5_ffn_jobs.pop_front();
+                }
             }
             const int64_t t0 = ggml_time_us();
             int64_t lock_acquired_us = t0;
