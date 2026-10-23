@@ -13323,6 +13323,28 @@ bool rpc_server::graph_compute(
             std::unique(graph_entry.cycle_buffer_dependencies.begin(),
                         graph_entry.cycle_buffer_dependencies.end()),
             graph_entry.cycle_buffer_dependencies.end());
+
+        // Snapshot the actual byte ranges borrowed by this registered
+        // graph ONCE, while registration owns the Phone GPU metadata gate.
+        // If any tensor is unresolvable, the entire stage becomes opaque
+        // for transfer admission; we never guess at an alias.
+        graph_entry.cycle_ranges.clear();
+        graph_entry.cycle_ranges.reserve(n_tensors);
+        graph_entry.cycle_ranges_known = true;
+        for (uint32_t i = 0; i < n_tensors; ++i) {
+            if (!tensors[i].buffer) continue;
+            cycle_gpu_span span {};
+            if (!cycle_gpu_tensor_span(tensors[i], span)) {
+                graph_entry.cycle_ranges_known = false;
+                break;
+            }
+            graph_entry.cycle_ranges.push_back(span);
+        }
+        if (graph_entry.cycle_ranges_known) {
+            cycle_gpu_merge_spans(graph_entry.cycle_ranges);
+        } else {
+            graph_entry.cycle_ranges.clear();
+        }
         graph_entry.cycle_registered = true;
         graph_entry.graph = graph;
         GGML_LOG_INFO(
@@ -14876,14 +14898,20 @@ struct rpc_cycle_p2c_fifo_v1 {
                 lock_acquired_us = ggml_time_us();
                 // Publish the actual allocations borrowed by this stage.
                 // Old FFN/MAIN FIFO ordering and GPU gate are unchanged.
-                std::vector<uint64_t> stage_buffers;
+                std::vector<rpc_server::cycle_gpu_span> stage_ranges;
                 bool stage_known = true;
                 const auto add_tensor = [&](const rpc_tensor & t) {
-                    if (t.buffer) stage_buffers.push_back(t.buffer);
+                    if (!t.buffer) return;
+                    rpc_server::cycle_gpu_span span {};
+                    if (!server.cycle_gpu_tensor_span(t, span)) {
+                        stage_known = false;
+                    } else {
+                        stage_ranges.push_back(span);
+                    }
                 };
                 const auto add_graph = [&](uint32_t dev, uint64_t uid) {
-                    if (!server.cycle_gpu_graph_allocations(
-                            dev, uid, stage_buffers)) stage_known = false;
+                    if (!server.cycle_gpu_graph_ranges(
+                            dev, uid, stage_ranges)) stage_known = false;
                 };
                 if (item.type == kind::C2P_V5_FFN) {
                     add_graph(item.c2p_v5.device,
@@ -14916,14 +14944,14 @@ struct rpc_cycle_p2c_fifo_v1 {
                 if (rpc_server::cycle_gpu_transfer_enabled()) {
                     GGML_LOG_INFO(
                         "[CYCLE_GPU_OWNERSHIP_STAGE] layer=%d chunk=%d "
-                        "seq=%" PRIu64 " allocations=%zu known=%d "
+                        "seq=%" PRIu64 " spans=%zu known=%d "
                         "scope=REGISTERED_GRAPH_AND_EXPLICIT_RPC_TENSORS\n",
                         std::get<0>(item.id), std::get<1>(item.id),
-                        std::get<2>(item.id), stage_buffers.size(),
+                        std::get<2>(item.id), stage_ranges.size(),
                         stage_known ? 1 : 0);
                 }
                 rpc_server::cycle_gpu_stage_guard stage_guard(
-                    server, std::move(stage_buffers), stage_known,
+                    server, std::move(stage_ranges), stage_known,
                     rpc_server::cycle_gpu_transfer_enabled());
                 if (item.type == kind::C2P_V5_FFN) {
                     rpc_msg_graph_recompute_req run {};
