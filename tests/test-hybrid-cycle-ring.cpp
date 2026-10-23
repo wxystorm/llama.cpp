@@ -997,6 +997,30 @@ static void test_cycle_execution_session_8_and_48() {
         assert(!session.kv_complete(64));
         kv.back()->committed_tokens = 64;
 
+        std::vector<float> received;
+        assert(!session.copy_predecessor_host_input(1, 0, 2, received));
+        auto & first = session.at(0, 0);
+        first.host_output.assign(size_t(16 * 2), 7.0f);
+        assert(!session.publish_host_output(0, 0, 3));  // Wrong width.
+        assert(session.publish_host_output(0, 0, 2));
+        assert(!session.publish_host_output(0, 0, 2)); // Duplicate publication.
+        assert(session.copy_predecessor_host_input(1, 0, 2, received));
+        assert(received == first.host_output);
+        assert(!session.copy_predecessor_host_input(5, 0, 2, received));
+        assert(!session.phone_predecessor_output(1, 0)); // PC -> PC.
+        assert(!session.phone_predecessor_output(5, 0)); // Not yet ready.
+
+        if (layers == 48) {
+            // Exact P2C/PC CUDA handoff at the first Cycle boundary:
+            // no conversion through Phone RPC/CPU oracle, no all-Chunk wait.
+            auto & p2c = session.at(7, 0);
+            p2c.host_output.assign(size_t(16 * 2), 11.0f);
+            assert(!session.copy_predecessor_host_input(8, 0, 2, received));
+            assert(session.publish_host_output(7, 0, 2));
+            assert(session.copy_predecessor_host_input(8, 0, 2, received));
+            assert(received == p2c.host_output);
+        }
+
         // A GPU output is NOT retired by a task completion. Only the
         // consumer-side handoff path can move this Graph Slot.
         auto & c2p = session.at(4, 0);
@@ -1141,7 +1165,178 @@ static void test_cycle_runtime_physical_8_and_48() {
     }
 }
 
+// Full physical model MOCK: no phone, CUDA or weights. Unlike a mere task
+// counter, every Stage produces and consumes a typed Chunk activation through
+// the same Session handoff API used by V5. The PHONE path remains simulated
+// device-local; L7 P2C publishes a HOST result and L8 CUDA consumes it.
+// All 48 layers run through ONE global Ring with no per-Cycle join barrier.
+static void test_cycle_48_layer_cross_period_handoff() {
+    constexpr int n_layers = 48;
+    constexpr int n_chunks = 4;
+    constexpr int chunk_tokens = 16;
+    constexpr int64_t hidden = 2;
+
+    llama_hybrid_cycle_runtime_config cfg;
+    cfg.layout = llama_hybrid_build_cycle_layout(n_layers, 4, 2);
+    cfg.layout.pc_cuda_full = true;
+    cfg.n_chunks = n_chunks;
+    cfg.max_inflight = 2;
+    cfg.credit_until_handoff = true;
+    cfg.ordered_c2p_reduce = true;
+    cfg.phone_main_priority = true;
+    cfg.pc_cpu_reduce_priority = true;
+    llama_hybrid_cycle_runtime runtime(cfg);
+
+    llama_hybrid_cycle_execution_session_config state_cfg;
+    state_cfg.layout = cfg.layout;
+    state_cfg.physical_layer_count = n_layers;
+    state_cfg.tokens = n_chunks * chunk_tokens;
+    state_cfg.chunk_tokens = chunk_tokens;
+    llama_hybrid_cycle_execution_session<> session(state_cfg);
+
+    const size_t count = size_t(n_layers * n_chunks);
+    const size_t width = size_t(chunk_tokens * hidden);
+    // Mock GPU values are NEVER read back by the Host path. They are
+    // exchanged only by successive simulated Phone execution Stages.
+    std::vector<std::vector<float>> phone_values(count);
+    std::vector<std::vector<float>> prepared(count);
+    std::vector<std::atomic<int>> p2c_finished(size_t(n_layers / 8));
+    for (auto & c : p2c_finished) c.store(0);
+    std::atomic<int> cross_region_first_chunks {0};
+    std::atomic<int> published_host_chunks {0};
+
+    const auto execute = [&](const llama_hybrid_cycle_task & task) -> bool {
+        if (task.layer < 0 || task.layer >= n_layers ||
+            task.chunk < 0 || task.chunk >= n_chunks) {
+            return false;
+        }
+        const int l = task.layer;
+        const int c = task.chunk;
+        const auto kind = cfg.layout.kinds[size_t(l)];
+        const size_t index = size_t(l * n_chunks + c);
+        auto & state = session.at(l, c);
+
+        if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER) {
+            if (kind == llama_hybrid_cycle_layer_kind::PC_CPU ||
+                kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL) {
+                std::vector<float> input;
+                if (l == 0) {
+                    input.resize(width);
+                    for (size_t i = 0; i < width; ++i) {
+                        input[i] = float(c * 100 + int(i));
+                    }
+                } else if (!session.copy_predecessor_host_input(
+                               l, c, hidden, input)) {
+                    return false;
+                }
+                // max_inflight=2 cannot retire L7 C2/C3 before L8 C0
+                // has actually run. This proves there is NO 8-layer
+                // barrier waiting for every Chunk's P2C Reduce.
+                if (l > 0 && l % 8 == 0 && c == 0) {
+                    const int previous_done =
+                        p2c_finished[size_t(l / 8 - 1)].load();
+                    if (previous_done < 1 || previous_done >= n_chunks) {
+                        return false;
+                    }
+                    ++cross_region_first_chunks;
+                }
+                if (input.size() != width) return false;
+                state.host_output = std::move(input);
+                for (auto & value : state.host_output) value += 1.0f;
+                if (!session.publish_host_output(l, c, hidden)) return false;
+                ++published_host_chunks;
+                return true;
+            }
+            if (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU && l > 0) {
+                const auto & previous = phone_values[
+                    size_t((l - 1) * n_chunks + c)];
+                if (previous.size() != width) return false;
+                phone_values[index] = previous;
+                for (auto & value : phone_values[index]) value += 1.0f;
+                return true;
+            }
+            return false;
+        }
+
+        if (task.stage == llama_hybrid_cycle_stage::ATTN_PRE) {
+            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                return session.copy_predecessor_host_input(
+                    l, c, hidden, prepared[index]);
+            }
+            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C && l > 0) {
+                const auto & previous = phone_values[
+                    size_t((l - 1) * n_chunks + c)];
+                if (previous.size() != width) return false;
+                prepared[index] = previous;
+                return true;
+            }
+            return false;
+        }
+
+        if (task.stage == llama_hybrid_cycle_stage::REDUCE) {
+            if (prepared[index].size() != width) return false;
+            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                phone_values[index] = prepared[index];
+                for (auto & value : phone_values[index]) value += 1.0f;
+                return true;
+            }
+            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+                state.host_output = prepared[index];
+                for (auto & value : state.host_output) value += 1.0f;
+                if (!session.publish_host_output(l, c, hidden)) return false;
+                ++published_host_chunks;
+                ++p2c_finished[size_t(l / 8)];
+                return true;
+            }
+            return false;
+        }
+
+        // The four intermediate Tensor tasks are separately scheduled by
+        // the real Ring. They do not produce an additional transformer layer.
+        return kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+               kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+    };
+
+    llama_hybrid_cycle_stage_dispatcher stages(cfg.layout);
+    for (int l = 0; l < n_layers; ++l) {
+        const auto kind = cfg.layout.kinds[size_t(l)];
+        if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+            kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            for (const auto stage : {
+                    llama_hybrid_cycle_stage::ATTN_PRE,
+                    llama_hybrid_cycle_stage::SEND_ACTIVATION,
+                    llama_hybrid_cycle_stage::FFN_SOURCE,
+                    llama_hybrid_cycle_stage::FFN_DESTINATION,
+                    llama_hybrid_cycle_stage::SEND_PARTIAL,
+                    llama_hybrid_cycle_stage::REDUCE}) {
+                assert(stages.bind(l, stage, execute));
+            }
+        } else {
+            assert(stages.bind(
+                l, llama_hybrid_cycle_stage::FULL_LAYER, execute));
+        }
+    }
+    std::string reason;
+    assert(stages.validate(reason));
+    assert(runtime.run(stages));
+    assert(cross_region_first_chunks.load() == 5);
+    assert(published_host_chunks.load() == 6 * (4 + 1) * n_chunks);
+    for (const auto & cycle : p2c_finished) {
+        assert(cycle.load() == n_chunks);
+    }
+    for (int c = 0; c < n_chunks; ++c) {
+        const auto & result = session.at(n_layers - 1, c);
+        assert(result.host_output_published.load(std::memory_order_acquire));
+        assert(result.host_output.size() == width);
+        for (size_t i = 0; i < width; ++i) {
+            assert(result.host_output[i] ==
+                   float(c * 100 + int(i) + n_layers));
+        }
+    }
+}
+
 int main() {
+    test_cycle_48_layer_cross_period_handoff();
     test_cycle_execution_session_8_and_48();
     test_cycle_runtime_physical_route_guard();
     test_cycle_runtime_missing_stage_fails_closed();

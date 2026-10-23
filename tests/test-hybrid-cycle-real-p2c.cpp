@@ -3898,14 +3898,38 @@ static bool cycle_real_execute_period_fifo(
     period.kinds.resize(size_t(n_layers));
     period.tail_begin = n_layers;
     const auto host_input = [&](int l, int c) -> std::vector<float> {
-        const auto & st = *states[size_t(l)][size_t(c)];
-        if (l == 0) {
-            const size_t offset = size_t(st.start * hidden);
+        const auto & st = execution_session.at(l, c);
+        if (l == execution_session.first_layer()) {
+            const int64_t relative_start = st.start -
+                execution_session.config().token_position_base;
+            if (relative_start < 0 || st.tokens <= 0 || hidden <= 0 ||
+                uint64_t(relative_start) > std::numeric_limits<size_t>::max() /
+                                           uint64_t(hidden) ||
+                uint64_t(st.tokens) > std::numeric_limits<size_t>::max() /
+                                      uint64_t(hidden)) {
+                return {};
+            }
+            const size_t offset = size_t(relative_start) * size_t(hidden);
+            const size_t n = size_t(st.tokens) * size_t(hidden);
+            if (offset > embedding.size() || n > embedding.size() - offset) {
+                return {};
+            }
             return std::vector<float>(
-                embedding.begin() + offset,
-                embedding.begin() + offset + size_t(st.tokens * hidden));
+                embedding.begin() + offset, embedding.begin() + offset + n);
         }
-        return states[size_t(l - 1)][size_t(c)]->host_output;
+        // The predecessor's P2C REDUCE / PC FULL stage must publish the
+        // correct Chunk BEFORE the global FIFO enqueues this consumer.
+        // L7 -> L8 is a PC-host activation; never read back Phone GPU state.
+        std::vector<float> input;
+        if (!execution_session.copy_predecessor_host_input(
+                l, c, hidden, input)) {
+            std::fprintf(stderr,
+                "[CYCLE_SESSION_HANDOFF] layer=%d chunk=%d "
+                "from_layer=%d location=PC_HOST "
+                "status=FAIL reason=PREDECESSOR_NOT_PUBLISHED\n",
+                l, c, l - 1);
+        }
+        return input;
     };
     const auto full_shard = [&](int l, size_t device) {
         const auto & weights = model.layers[size_t(l)];
@@ -3919,11 +3943,9 @@ static bool cycle_real_execute_period_fifo(
         };
     };
     const auto take_device_input = [&](int l, int c) -> const ggml_tensor * {
-        if (l <= layout.x || c < 0 || l >= n_layers) {
-            return nullptr;
-        }
-        const auto & previous = *states[size_t(l - 1)][size_t(c)];
-        return previous.phone_output ? previous.phone_output->output : nullptr;
+        // C2P->Phone Full->P2C remains entirely device-local, borrowing the
+        // previous Graph Slot while the consumer's input fence is pending.
+        return execution_session.phone_predecessor_output(l, c);
     };
     // Called by the sole PHONE_GPU worker after the consumer has safely
     // finished reading the producer's l_out: in legacy mode after Attention
@@ -5683,6 +5705,25 @@ static bool cycle_real_execute_period_fifo(
                     }
                     break;
                 }
+            }
+            // No task is allowed to tell the Ring "finished" before its
+            // host activation has been completely written and published.
+            // The output stays immutable until its next-layer consumer
+            // copies it (e.g. physical L7 P2C -> L8 PC CUDA).
+            const bool host_output_stage =
+                (task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+                 (kind == llama_hybrid_cycle_layer_kind::PC_CPU ||
+                  kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL)) ||
+                (task.stage == llama_hybrid_cycle_stage::REDUCE &&
+                 kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C);
+            if (ok && host_output_stage &&
+                !execution_session.publish_host_output(l, c, hidden)) {
+                std::fprintf(stderr,
+                    "[CYCLE_SESSION_HANDOFF] layer=%d chunk=%d "
+                    "location=PC_HOST status=FAIL "
+                    "reason=INVALID_OR_ALREADY_PUBLISHED\n",
+                    l, c);
+                ok = false;
             }
             const double stage_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();

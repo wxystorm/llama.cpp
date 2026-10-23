@@ -5,6 +5,7 @@
 #include "llama-hybrid-cycle-runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,10 @@ struct llama_hybrid_cycle_chunk_state {
     llama_hybrid_cycle_attention_ready ready;
     std::vector<float> partial;
     std::vector<float> host_output;
+    // The publishing Stage is the ONLY writer. It stores RELEASE after
+    // completing every host write (and P2C ACK). The next layer loads
+    // ACQUIRE before copying, never observing an incomplete activation.
+    std::atomic<bool> host_output_published {false};
     inference_cycle_message recv_ready;
     inference_cycle_message recv_partial;
     std::unique_ptr<PhoneSlot> phone_output;
@@ -176,6 +181,85 @@ public:
                        .at(static_cast<size_t>(checked_chunk(chunk)));
     }
 
+    // Complete a PC CPU/CUDA full layer or P2C REDUCE output. The caller
+    // must publish AFTER all device readbacks/host reduction and remote
+    // acknowledgements, and BEFORE telling the FIFO Ring that this Stage
+    // completed. The owned host vector must remain immutable afterwards.
+    bool publish_host_output(int physical_layer, int chunk, int64_t hidden) {
+        if (!contains_layer(physical_layer) ||
+            chunk < 0 || chunk >= n_chunks_ ||
+            !produces_host_output(
+                config_.layout.kinds[static_cast<size_t>(physical_layer)])) {
+            return false;
+        }
+        auto & state = at(physical_layer, chunk);
+        if (hidden <= 0 || state.tokens <= 0 ||
+            uint64_t(hidden) > std::numeric_limits<size_t>::max() /
+                               uint64_t(state.tokens) ||
+            state.host_output.size() !=
+                size_t(hidden) * size_t(state.tokens)) {
+            return false;
+        }
+        bool unpublished = false;
+        return state.host_output_published.compare_exchange_strong(
+            unpublished, true,
+            std::memory_order_release, std::memory_order_relaxed);
+    }
+
+    // A PC full layer immediately after P2C (L8, L16, ...) receives this
+    // Chunk's HOST result, not a Phone GPU tensor or a CPU reference output.
+    // It is legal to call only after the predecessor's Stage has completed;
+    // return false instead of accidentally consuming uninitialized data.
+    bool copy_predecessor_host_input(
+            int consumer_layer, int chunk, int64_t hidden,
+            std::vector<float> & output) const {
+        if (!contains_layer(consumer_layer) ||
+            consumer_layer == first_layer() ||
+            chunk < 0 || chunk >= n_chunks_ ||
+            !produces_host_output(
+                config_.layout.kinds[static_cast<size_t>(consumer_layer - 1)])) {
+            return false;
+        }
+        const auto & prior = at(consumer_layer - 1, chunk);
+        const auto & target = at(consumer_layer, chunk);
+        if (prior.start != target.start || prior.tokens != target.tokens ||
+            !prior.host_output_published.load(std::memory_order_acquire) ||
+            hidden <= 0 || prior.tokens <= 0 ||
+            uint64_t(hidden) > std::numeric_limits<size_t>::max() /
+                               uint64_t(prior.tokens) ||
+            prior.host_output.size() !=
+                size_t(hidden) * size_t(prior.tokens)) {
+            return false;
+        }
+        output = prior.host_output;
+        return true;
+    }
+
+    // This is the separate PHONE-GPU-local path (C2P -> Phone Full ->
+    // Phone Full -> P2C). The RPC Graph Slot stays borrowed until an actual
+    // successor input-consumed fence/ACK; no host readback is introduced.
+    // The caller guarantees the previous Stage has signalled device-ready.
+    const ggml_tensor * phone_predecessor_output(
+            int consumer_layer, int chunk) const {
+        if (!contains_layer(consumer_layer) ||
+            consumer_layer == first_layer() ||
+            chunk < 0 || chunk >= n_chunks_) {
+            return nullptr;
+        }
+        const auto previous_kind =
+            config_.layout.kinds[static_cast<size_t>(consumer_layer - 1)];
+        if (previous_kind != llama_hybrid_cycle_layer_kind::TENSOR_C2P &&
+            previous_kind != llama_hybrid_cycle_layer_kind::PHONE_GPU) {
+            return nullptr;
+        }
+        const auto & prior = at(consumer_layer - 1, chunk);
+        const auto & consumer = at(consumer_layer, chunk);
+        if (prior.start != consumer.start || prior.tokens != consumer.tokens) {
+            return nullptr;
+        }
+        return prior.phone_output ? prior.phone_output->output : nullptr;
+    }
+
     // The existing model/session owns actual KV allocation. Borrow only
     // until the FIFO workers have joined and before KV is returned to Graph
     // caches. Never free or reset an externally-owned KV tensor here.
@@ -215,6 +299,12 @@ public:
     }
 
 private:
+    static bool produces_host_output(llama_hybrid_cycle_layer_kind kind) {
+        return kind == llama_hybrid_cycle_layer_kind::PC_CPU ||
+               kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL ||
+               kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+    }
+
     bool contains_layer(int layer) const {
         return layer >= config_.physical_layer_begin &&
                int64_t(layer) < int64_t(config_.physical_layer_begin) +
