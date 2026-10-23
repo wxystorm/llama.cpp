@@ -7708,22 +7708,125 @@ public:
     // Shared GPU/Graph/Buffer gate for the opt-in Phone P2C FIFO worker.
     std::mutex & cycle_p2c_gpu_gate() { return cycle_p2c_gpu_gate_; }
 
-    // Opt-in independent OpenCL transfer queue: the OWNERSHIP domain is
-    // the underlying ggml_backend_buffer allocation, not a tensor name.
-    // A different view of the same allocation always conflicts in v1.
-    // Called under the original GPU gate, so registered_graph maps cannot
-    // be modified while the worker reads their borrowed buffers.
-    bool cycle_gpu_graph_allocations(
+    // Exact GPU-visible buffer range, in the server-side RPC virtual address
+    // space. Views/aliases share one allocation. Half-open byte intervals
+    // within the SAME allocation are compared for read/write conflicts.
+    struct cycle_gpu_span {
+        uint64_t allocation = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
+    };
+
+    static bool cycle_gpu_span_conflicts(
+            const cycle_gpu_span & a, const cycle_gpu_span & b) {
+        return a.allocation == b.allocation &&
+               a.begin < b.end && b.begin < a.end;
+    }
+    static bool cycle_gpu_span_equal(
+            const cycle_gpu_span & a, const cycle_gpu_span & b) {
+        return a.allocation == b.allocation &&
+               a.begin == b.begin && a.end == b.end;
+    }
+    static void cycle_gpu_merge_spans(
+            std::vector<cycle_gpu_span> & spans) {
+        std::sort(spans.begin(), spans.end(),
+            [](const cycle_gpu_span & a, const cycle_gpu_span & b) {
+                if (a.allocation != b.allocation)
+                    return a.allocation < b.allocation;
+                if (a.begin != b.begin) return a.begin < b.begin;
+                return a.end < b.end;
+            });
+        size_t n = 0;
+        for (const auto & span : spans) {
+            if (n > 0 && spans[n - 1].allocation == span.allocation &&
+                spans[n - 1].end >= span.begin) {
+                spans[n - 1].end = std::max(spans[n - 1].end, span.end);
+            } else {
+                spans[n++] = span;
+            }
+        }
+        spans.resize(n);
+    }
+
+    // Reconstruct a conservative storage span from RPC tensor metadata.
+    // For malformed or unsupported strides, use the WHOLE allocation.
+    // strict=true is used for F32/I32 upload destinations and rejects any
+    // imprecise interval rather than incorrectly proving non-overlap.
+    bool cycle_gpu_tensor_span(
+            const rpc_tensor & desc, cycle_gpu_span & out,
+            bool strict = false) const {
+        if (!desc.buffer) return false;
+        const auto buffer = reinterpret_cast<ggml_backend_buffer_t>(
+            desc.buffer);
+        if (buffers.find(buffer) == buffers.end()) return false;
+        const uint64_t base = reinterpret_cast<uint64_t>(
+            ggml_backend_buffer_get_base(buffer));
+        const uint64_t alloc_size = ggml_backend_buffer_get_size(buffer);
+        if (!base || !alloc_size || alloc_size > UINT64_MAX - base)
+            return false;
+        out = {desc.buffer, base, base + alloc_size};
+        const auto imprecise = [&] { return !strict; };
+
+        if (desc.type >= GGML_TYPE_COUNT || !desc.data ||
+            desc.data < base || desc.data >= out.end)
+            return imprecise();
+        const ggml_type dtype = static_cast<ggml_type>(desc.type);
+        const int64_t block_size = ggml_blck_size(dtype);
+        if (block_size <= 0 || !desc.ne[0] ||
+            desc.ne[0] % uint64_t(block_size) != 0)
+            return imprecise();
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (!desc.ne[d]) return imprecise();
+        }
+        // ggml_row_size includes the quantized block format; nb[1..3]
+        // cover the possibly strided higher dimensions.
+        const size_t row_bytes = ggml_row_size(dtype, desc.ne[0]);
+        if (!row_bytes) return imprecise();
+        uint64_t extent = row_bytes;
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            const uint64_t count = uint64_t(desc.ne[d] - 1);
+            const uint64_t stride = desc.nb[d];
+            if (count && stride > (UINT64_MAX - extent) / count)
+                return imprecise();
+            extent += count * stride;
+        }
+        if (extent == 0 || extent > alloc_size)
+            return imprecise();
+        uint64_t begin = desc.data;
+        uint64_t end = desc.data + extent;
+        if (end < begin || end > base + alloc_size)
+            return imprecise();
+
+        // An OpenCL view extra may reference its parent plus view_offs.
+        // Cover both the data pointer and this parent-relative location.
+        if (desc.view_src && desc.view_offs) {
+            if (desc.view_offs > UINT64_MAX - desc.data)
+                return imprecise();
+            const uint64_t alt = desc.data + desc.view_offs;
+            if (alt > UINT64_MAX - extent ||
+                alt + extent > base + alloc_size)
+                return imprecise();
+            end = std::max(end, alt + extent);
+        }
+        out.begin = begin;
+        out.end = end;
+        return true;
+    }
+
+    // Called under the existing GPU gate so graph registrations cannot
+    // mutate a replay graph's borrowed buffer set during this lookup.
+    bool cycle_gpu_graph_ranges(
             uint32_t device, uint64_t uid,
-            std::vector<uint64_t> & out) const {
+            std::vector<cycle_gpu_span> & out) const {
         if (!uid || device >= stored_graphs.size()) return false;
         const auto & graphs = stored_graphs[device];
         const auto it = graphs.find(uid);
         if (it == graphs.end() || !it->second.cycle_registered ||
-            !it->second.graph) return false;
+            !it->second.graph || !it->second.cycle_ranges_known)
+            return false;
         out.insert(out.end(),
-            it->second.cycle_buffer_dependencies.begin(),
-            it->second.cycle_buffer_dependencies.end());
+            it->second.cycle_ranges.begin(),
+            it->second.cycle_ranges.end());
         return true;
     }
 
@@ -7734,42 +7837,43 @@ public:
                v5 && std::strcmp(v5, "1") == 0;
     }
 
-    // Called while the original GPU gate is held. Wait only for uploads
-    // targeting a buffer this exact stage borrows. No system-wide sync.
-    void cycle_gpu_stage_begin(std::vector<uint64_t> buffers, bool known) {
-        std::sort(buffers.begin(), buffers.end());
-        buffers.erase(std::unique(buffers.begin(), buffers.end()), buffers.end());
+    // The metadata lock protects ownership claims, never an entire GPU
+    // kernel. A stage waits only for in-flight writes to overlapping bytes.
+    // Unknown/opaque commands are represented as an exclusive stage.
+    void cycle_gpu_stage_begin(
+            std::vector<cycle_gpu_span> ranges, bool known) {
+        cycle_gpu_merge_spans(ranges);
         std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
         cycle_upload_owner_cv_.wait(lock, [&] {
-            for (const uint64_t id : cycle_upload_inflight_) {
-                if (!known || std::binary_search(buffers.begin(), buffers.end(), id))
-                    return false;
+            if (!known) return cycle_upload_inflight_.empty();
+            for (const auto & a : cycle_upload_inflight_) {
+                for (const auto & b : ranges) {
+                    if (cycle_gpu_span_conflicts(a, b)) return false;
+                }
             }
             return true;
         });
         GGML_ASSERT(!cycle_gpu_stage_active_);
         cycle_gpu_stage_active_ = true;
         cycle_gpu_stage_known_ = known;
-        cycle_gpu_stage_buffers_ = std::move(buffers);
+        cycle_gpu_stage_ranges_ = std::move(ranges);
     }
-
     void cycle_gpu_stage_end() {
         std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
         GGML_ASSERT(cycle_gpu_stage_active_);
         cycle_gpu_stage_active_ = false;
         cycle_gpu_stage_known_ = false;
-        cycle_gpu_stage_buffers_.clear();
+        cycle_gpu_stage_ranges_.clear();
         cycle_upload_owner_cv_.notify_all();
     }
-
     class cycle_gpu_stage_guard {
     public:
         cycle_gpu_stage_guard(rpc_server & server,
-                              std::vector<uint64_t> buffers, bool known,
+                              std::vector<cycle_gpu_span> ranges, bool known,
                               bool active)
             : server_(server), active_(active) {
             if (active_) server_.cycle_gpu_stage_begin(
-                std::move(buffers), known);
+                std::move(ranges), known);
         }
         cycle_gpu_stage_guard(const cycle_gpu_stage_guard &) = delete;
         cycle_gpu_stage_guard & operator=(const cycle_gpu_stage_guard &) = delete;
@@ -7782,56 +7886,67 @@ public:
     };
 
     bool cycle_gpu_try_reserve_upload(
-            std::vector<uint64_t> buffers, const char ** why) {
-        std::sort(buffers.begin(), buffers.end());
-        buffers.erase(std::unique(buffers.begin(), buffers.end()), buffers.end());
+            std::vector<cycle_gpu_span> ranges, const char ** why) {
+        cycle_gpu_merge_spans(ranges);
         std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
-        if (buffers.empty() || !cycle_gpu_stage_active_) {
-            *why = "NO_ACTIVE_STAGE";
+        if (ranges.empty()) {
+            *why = "NO_VALID_UPLOAD_RANGES";
             return false;
         }
-        if (!cycle_gpu_stage_known_) {
+        if (cycle_gpu_stage_active_ && !cycle_gpu_stage_known_) {
             *why = "UNKNOWN_STAGE";
             return false;
         }
-        for (const uint64_t id : buffers) {
-            if (!id ||
-                std::binary_search(cycle_gpu_stage_buffers_.begin(),
-                                   cycle_gpu_stage_buffers_.end(), id)) {
-                *why = "ACTIVE_ALLOCATION_ALIAS";
-                return false;
-            }
-            if (cycle_upload_inflight_.count(id) != 0) {
-                *why = "UPLOAD_ALREADY_ACTIVE";
-                return false;
+        if (cycle_gpu_stage_active_) {
+            for (const auto & a : ranges) {
+                for (const auto & b : cycle_gpu_stage_ranges_) {
+                    if (cycle_gpu_span_conflicts(a, b)) {
+                        *why = "ACTIVE_RANGE_ALIAS";
+                        return false;
+                    }
+                }
             }
         }
-        cycle_upload_inflight_.insert(buffers.begin(), buffers.end());
-        *why = "DISJOINT_ALLOCATIONS";
+        for (const auto & a : ranges) {
+            for (const auto & b : cycle_upload_inflight_) {
+                if (cycle_gpu_span_conflicts(a, b)) {
+                    *why = "UPLOAD_RANGE_BUSY";
+                    return false;
+                }
+            }
+        }
+        const bool idle = !cycle_gpu_stage_active_;
+        cycle_upload_inflight_.insert(
+            cycle_upload_inflight_.end(), ranges.begin(), ranges.end());
+        *why = idle ? "IDLE_SLOT_READY" : "DISJOINT_RANGES";
         return true;
     }
-
-    void cycle_gpu_release_upload(const std::vector<uint64_t> & buffers) {
+    void cycle_gpu_release_upload(
+            const std::vector<cycle_gpu_span> & ranges) {
         std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
-        for (const auto id : buffers) {
-            GGML_ASSERT(cycle_upload_inflight_.erase(id) == 1);
+        for (const auto & span : ranges) {
+            const auto it = std::find_if(
+                cycle_upload_inflight_.begin(), cycle_upload_inflight_.end(),
+                [&](const cycle_gpu_span & s) {
+                    return cycle_gpu_span_equal(span, s);
+                });
+            GGML_ASSERT(it != cycle_upload_inflight_.end());
+            cycle_upload_inflight_.erase(it);
         }
         cycle_upload_owner_cv_.notify_all();
     }
 
-    // Buffer Credit normally prevents FREE before APPLY ACK. Also enforce
-    // this at the RPC allocation lifetime boundary as a backstop.
+    // Buffer Credit belongs to the existing V5 sender/consumer. Also forbid
+    // FREE/CLEAR of any allocation with an unfinished transfer event.
     void cycle_gpu_wait_before_free(uint64_t allocation) {
         if (!cycle_gpu_transfer_enabled()) return;
         std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
         cycle_upload_owner_cv_.wait(lock, [&] {
-            return cycle_upload_inflight_.count(allocation) == 0;
+            for (const auto & s : cycle_upload_inflight_)
+                if (s.allocation == allocation) return false;
+            return true;
         });
     }
-
-    // Other RPC GPU operations do not provide the V5 stage's complete
-    // per-graph ownership descriptors. Drain outstanding transfer events
-    // before such an opaque operation gets access to the GPU Backend.
     void cycle_gpu_wait_all_uploads() {
         if (!cycle_gpu_transfer_enabled()) return;
         std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
@@ -7843,23 +7958,25 @@ public:
     class cycle_gpu_upload_lease {
     public:
         cycle_gpu_upload_lease(
-                rpc_server & server, std::vector<uint64_t> buffers)
-            : server_(server), buffers_(std::move(buffers)) {}
+                rpc_server & server, std::vector<cycle_gpu_span> ranges)
+            : server_(server), ranges_(std::move(ranges)) {
+            cycle_gpu_merge_spans(ranges_);
+        }
         cycle_gpu_upload_lease(const cycle_gpu_upload_lease &) = delete;
         cycle_gpu_upload_lease & operator=(const cycle_gpu_upload_lease &) = delete;
         ~cycle_gpu_upload_lease() { release(); }
         bool acquire(const char ** why) {
-            active_ = server_.cycle_gpu_try_reserve_upload(buffers_, why);
+            active_ = server_.cycle_gpu_try_reserve_upload(ranges_, why);
             return active_;
         }
         void release() {
             if (!active_) return;
-            server_.cycle_gpu_release_upload(buffers_);
+            server_.cycle_gpu_release_upload(ranges_);
             active_ = false;
         }
     private:
         rpc_server & server_;
-        std::vector<uint64_t> buffers_;
+        std::vector<cycle_gpu_span> ranges_;
         bool active_ = false;
     };
 
@@ -8411,7 +8528,9 @@ public:
         // not leave a runnable graph pointing to stale OpenCL allocations.
         // Ordinary RPC graph caching keeps its existing lifetime behavior.
         bool cycle_registered = false;
+        bool cycle_ranges_known = false;
         std::vector<uint64_t> cycle_buffer_dependencies;
+        std::vector<cycle_gpu_span> cycle_ranges;
     };
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -8531,8 +8650,8 @@ private:
     // upload. Does not replace Buffer Credit or graph/scratch leases.
     std::mutex cycle_upload_owner_mutex_;
     std::condition_variable cycle_upload_owner_cv_;
-    std::vector<uint64_t> cycle_gpu_stage_buffers_;
-    std::set<uint64_t> cycle_upload_inflight_;
+    std::vector<cycle_gpu_span> cycle_gpu_stage_ranges_;
+    std::vector<cycle_gpu_span> cycle_upload_inflight_;
     bool cycle_gpu_stage_active_ = false;
     bool cycle_gpu_stage_known_ = false;
     std::mutex cycle_gpu_upload_mutex_;
