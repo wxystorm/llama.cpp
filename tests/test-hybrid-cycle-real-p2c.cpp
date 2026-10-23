@@ -4825,7 +4825,20 @@ struct cycle_real_p2c_overlap_events {
     std::chrono::steady_clock::time_point partial_received {};
 };
 
+// Each (layer, Chunk, stage) is executed once and owns its own slot.
+// Different FIFO workers may write different slots concurrently; only
+// the joined coordinator reads the snapshot. No locks or cross-host clocks.
+struct cycle_real_pc_stage_span {
+    std::chrono::steady_clock::time_point queued {};
+    std::chrono::steady_clock::time_point begin {};
+    std::chrono::steady_clock::time_point end {};
+    bool completed_ok = false;
+};
+
 struct cycle_real_period_chunk {
+    std::array<cycle_real_pc_stage_span,
+        static_cast<size_t>(llama_hybrid_cycle_stage::REDUCE) + 1>
+        pc_stage_spans {};
     cycle_real_c2p_path_timing c2p_timing {};
     cycle_real_p2c_path_timing p2c_timing {};
     cycle_real_p2c_overlap_events p2c_overlap {};
@@ -5407,6 +5420,8 @@ static bool cycle_real_execute_period_fifo(
     // breakdown. No additional synchronization or remote profiling calls.
     const bool path_timing =
         cycle_real_env_flag("LLAMA_HYBRID_CYCLE_PATH_TIMING");
+    const bool critical_path = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_CRITICAL_PATH");
     const bool stage_detail = std::getenv(
         "LLAMA_HYBRID_CYCLE_STAGE_PROFILE") != nullptr;
     constexpr size_t n_queues =
@@ -5854,6 +5869,9 @@ static bool cycle_real_execute_period_fifo(
         return true;
     };
 
+    // PC-only monotonic time origin. Remote Phone logs use their OWN
+    // origin; do not subtract a PC timestamp from a Phone timestamp.
+    const auto critical_path_origin = std::chrono::steady_clock::now();
     const bool succeeded = llama_hybrid_cycle_run_fifo(
         period, n_chunks, [&](const llama_hybrid_cycle_task & task) -> bool {
             if (task.layer < 0 || task.layer >= n_layers ||
@@ -5867,6 +5885,12 @@ static bool cycle_real_execute_period_fifo(
             const auto kind = period.kinds[size_t(l)];
             const auto & layer = model.layers[size_t(l)];
             const auto t0 = std::chrono::steady_clock::now();
+            if (critical_path) {
+                auto & span = st.pc_stage_spans[
+                    static_cast<size_t>(task.stage)];
+                span.queued = task.queued_at;
+                span.begin = t0;
+            }
             bool ok = false;
             switch (task.stage) {
                 case llama_hybrid_cycle_stage::FULL_LAYER: {
@@ -7308,8 +7332,15 @@ static bool cycle_real_execute_period_fifo(
                     break;
                 }
             }
+            const auto stage_completed = std::chrono::steady_clock::now();
             const double stage_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
+                stage_completed - t0).count();
+            if (critical_path) {
+                auto & span = st.pc_stage_spans[
+                    static_cast<size_t>(task.stage)];
+                span.end = stage_completed;
+                span.completed_ok = ok;
+            }
             if (perf_mode) {
                 // Each row has a unique FIFO worker, so two physical
                 // devices can update their disjoint queue rows concurrently.
@@ -7333,9 +7364,10 @@ static bool cycle_real_execute_period_fifo(
                 std::fflush(stdout);
             }
             return ok;
-        }, window, true, perf_mode ? &fifo_profile : nullptr,
+        }, window, true, (perf_mode || critical_path) ?
+            &fifo_profile : nullptr,
         pc_reduce_priority, phone_full_region_auto,
-        phone_c2p_local);
+        phone_c2p_local, critical_path);
     const auto fifo_done = std::chrono::steady_clock::now();
     if (phone_p2c_local_ffn) {
         std::printf(
