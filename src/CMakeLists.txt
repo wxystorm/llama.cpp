@@ -30,6 +30,7 @@ add_library(llama
             llama-hybrid-cycle-execution-session.cpp
             llama-hybrid-cycle-resources.cpp
             llama-hybrid-cycle-pc-full.cpp
+            llama-hybrid-cycle-phone-regions.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp

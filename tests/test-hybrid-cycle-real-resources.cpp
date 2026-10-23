@@ -13,10 +13,12 @@
 #include "llama-model.h"
 #include "llama-hybrid-cycle-resources.h"
 #include "llama-hybrid-cycle-execution-session.h"
+#include "llama-hybrid-cycle-phone-regions.h"
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -205,6 +207,45 @@ int main(int argc, char ** argv) {
                         "[CYCLE_FULL_RESOURCE_LAYER] physical=%d "
                         "status=FAIL reason=RESOURCE_OR_BACKEND_MISMATCH\n",
                         l);
+                }
+            }
+            if (ok) {
+                // Validate the six independent REAL physical Phone regions:
+                // each C2P, Phone Full and P2C stage must borrow its own
+                // absolute-layer K/V, graph metadata and scratch owner.
+                // No RPC graph is executed by this resource-only probe.
+                llama_hybrid_cycle_phone_regions phone_regions;
+                const int chunk_size = 16;
+                const int chunks = int((kv_tokens + chunk_size - 1) /
+                                       chunk_size);
+                const int inflight = std::min(2, chunks);
+                ok = phone_regions.prepare(
+                    selected, int64_t(kv_tokens), chunk_size,
+                    inflight, error) &&
+                    phone_regions.validate_resources(resource_pool, error) &&
+                    phone_regions.region_count() == 6;
+                if (!ok) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FULL_PHONE_REGION] status=FAIL reason=%s\n",
+                        error.c_str());
+                }
+                for (int cycle = 0;
+                     cycle < phone_regions.region_count() && ok; ++cycle) {
+                    const auto * region = phone_regions.by_index(cycle);
+                    if (!region) {
+                        ok = false;
+                        break;
+                    }
+                    std::printf(
+                        "[CYCLE_FULL_PHONE_REGION] cycle=%d c2p=%d "
+                        "phone=[%d,%d) p2c=%d chunks=%d "
+                        "max_inflight=%d resource_owner=PHYSICAL_LAYER "
+                        "status=READY\n",
+                        cycle, region->location.c2p_layer,
+                        region->location.phone_begin,
+                        region->location.phone_end,
+                        region->location.p2c_layer,
+                        region->n_chunks, region->max_inflight);
                 }
             }
             if (ok) {

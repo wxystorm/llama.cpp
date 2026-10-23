@@ -29,6 +29,7 @@
 #include "llama-hybrid-cycle-p2c-ffn.h"
 #include "llama-hybrid-cycle-ffn-shard.h"
 #include "llama-hybrid-cycle-execution-session.h"
+#include "llama-hybrid-cycle-phone-regions.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -3225,6 +3226,30 @@ static bool cycle_real_execute_period_fifo(
         "LLAMA_HYBRID_CYCLE_C2P_FFN_REUSE");
     const bool c2p_ffn_session_reuse = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_C2P_FFN_SESSION_REUSE");
+    // One absolute physical Phone-region ledger per Cycle. This established
+    // 8-layer V5 probe initializes region 0; the production registry can
+    // independently initialize all six regions for the 48-layer executor.
+    llama_hybrid_cycle_layout physical_period_layout =
+        llama_hybrid_build_cycle_layout(n_layers, layout.x, layout.y);
+    physical_period_layout.pc_cuda_full = pc_cuda_full;
+    llama_hybrid_cycle_phone_regions phone_regions;
+    std::string phone_region_error;
+    if (!phone_regions.prepare(
+            physical_period_layout, tokens, chunk_tokens, window,
+            phone_region_error) ||
+        phone_regions.region_count() != 1) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_REGION] phase=%s status=FAIL reason=%s\n",
+            run_phase, phone_region_error.c_str());
+        return false;
+    }
+    auto * phone_region = phone_regions.by_index(0);
+    // No RPC-ready buffers are moved or copied by this bank. It keeps the
+    // V5 physical GPU FFN slot pools disjoint from future L12/L20/... peers.
+    llama_hybrid_cycle_phone_region_slot_banks<
+        cycle_real_c2p_phone_chunk, cycle_real_p2c_ffn_slot> phone_slot_banks;
+    phone_slot_banks.prepare(phone_regions);
+    auto & phone_bank = *phone_slot_banks.by_index(0);
     if (c2p_ffn_session_reuse != (c2p_ffn_session != nullptr) ||
         (c2p_ffn_session_reuse &&
          (!c2p_ffn_reuse ||
@@ -3716,10 +3741,8 @@ static bool cycle_real_execute_period_fifo(
     // FFN graph owns the very same GPU allocation and borrowed model weights
     // it used on the last Chunk. No CPU/GPU hidden activation is cached.
     using phone_chunk_ptr = std::unique_ptr<cycle_real_c2p_phone_chunk>;
-    std::vector<std::vector<phone_chunk_ptr>> period_phone_full_pool(
-        static_cast<size_t>(n_layers));
     auto & phone_full_pool = phone_full_session ?
-        phone_full_session->idle_by_layer : period_phone_full_pool;
+        phone_full_session->idle_by_layer : phone_bank.full_idle_by_layer;
     std::vector<size_t> phone_full_cached_at_period_start(
         static_cast<size_t>(n_layers), 0);
     if (phone_full_session) {
@@ -3731,15 +3754,12 @@ static bool cycle_real_execute_period_fifo(
     // C2P setup runs on PC_CPU. PHONE_GPU returns slots only after the
     // successor's Attention fence; neither worker changes its FIFO order.
     // This same pointer-transfer lock serves either a period or a session.
-    std::mutex period_c2p_pool_mutex;
-    std::vector<phone_chunk_ptr> period_c2p_pool;
-    size_t period_c2p_live_slots = 0;
     auto & c2p_pool_mutex = c2p_ffn_session ?
-        c2p_ffn_session->mutex : period_c2p_pool_mutex;
+        c2p_ffn_session->mutex : phone_bank.c2p_mutex;
     auto & c2p_pool = c2p_ffn_session ?
-        c2p_ffn_session->idle : period_c2p_pool;
+        c2p_ffn_session->idle : phone_bank.c2p_idle;
     size_t & c2p_live_slots = c2p_ffn_session ?
-        c2p_ffn_session->live_slots : period_c2p_live_slots;
+        c2p_ffn_session->live_slots : phone_bank.c2p_live_slots;
     const size_t c2p_cached_at_period_start =
         c2p_ffn_session ? c2p_pool.size() : 0;
     uint64_t c2p_prepares = 0;
@@ -3783,34 +3803,34 @@ static bool cycle_real_execute_period_fifo(
         static_cast<size_t>(n_layers));
     std::vector<cycle_real_pc_cuda_full_detail> pc_cuda_detail(
         static_cast<size_t>(n_layers));
-    // Each counter has only one writer: the PHONE_GPU FIFO worker.
-    uint64_t ordered_full_handoffs = 0;
-    uint64_t ordered_p2c_handoffs = 0;
-    uint64_t v2_attn_prepared = 0;
-    uint64_t v2_attn_completed = 0;
-    uint64_t v3_full_pairs_armed = 0;
-    uint64_t v3_next_full_completed = 0;
-    // Sole writer: PC PHONE_GPU callback queue. A C2P Reduce may finish
-    // ahead of the window: keep its ready flag until L6 returns a credit.
-    std::vector<uint8_t> v4_c2p_ready(size_t(n_chunks), 0);
-    int v4_next_arm_chunk = 0;
-    int64_t v4_registered_l5_tokens = 0;
-    uint64_t v4_region_armed = 0;
-    uint64_t v4_l5_completed = 0;
-    uint64_t v4_l6_completed = 0;
-    int64_t v5_p2c_registered_tokens = 0;
-    uint64_t v5_p2c_ready_completed = 0;
-    uint64_t v5_p2c_ffn_completed = 0;
-    // The PC-side PHONE_GPU FIFO exclusively owns these counters.
-    // Registration can lead device completion, which can in turn lead
-    // the acknowledgements recorded in kv[].committed_tokens.
-    int64_t v2_registered_kv_tokens = 0;
+    // These counters now belong to physical Phone region 0, rather than
+    // anonymous L5/L6/L7 locals. They remain single-writer by the same
+    // PHONE_GPU FIFO callbacks: the RPC wire/order protocol is unchanged.
+    auto & ordered_full_handoffs = phone_region->ordered_full_handoffs;
+    auto & ordered_p2c_handoffs = phone_region->ordered_p2c_handoffs;
+    auto & v2_attn_prepared = phone_region->next_attention_prepared;
+    auto & v2_attn_completed = phone_region->next_attention_completed;
+    auto & v3_full_pairs_armed = phone_region->full_pairs_armed;
+    auto & v3_next_full_completed = phone_region->next_full_completed;
+    auto & v4_c2p_ready = phone_region->c2p_ready_chunks;
+    auto & v4_next_arm_chunk = phone_region->next_arm_chunk;
+    auto & v4_registered_l5_tokens =
+        phone_region->first_phone_registered_tokens;
+    auto & v4_region_armed = phone_region->region_armed;
+    auto & v4_l5_completed = phone_region->first_phone_completed;
+    auto & v4_l6_completed = phone_region->last_phone_completed;
+    auto & v5_p2c_registered_tokens =
+        phone_region->p2c_registered_tokens;
+    auto & v5_p2c_ready_completed = phone_region->p2c_ready_completed;
+    auto & v5_p2c_ffn_completed = phone_region->p2c_ffn_completed;
+    auto & v2_registered_kv_tokens =
+        phone_region->next_attention_registered_tokens;
     // Owned exclusively by the PHONE_GPU FIFO worker. One shape-specific
     // slot is enough: this worker executes FFN_SOURCE tasks serially.
     std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_ffn_slot;
     // V5 MAIN: at most WINDOW physical L7 FFN slots. All transfers to
     // the idle pool are performed by the sole PC PHONE_GPU callback.
-    std::vector<std::unique_ptr<cycle_real_p2c_ffn_slot>> p2c_main_idle;
+    auto & p2c_main_idle = phone_bank.p2c_idle;
     uint64_t p2c_main_hits = 0;
     uint64_t p2c_ffn_prepares = 0;
     uint64_t p2c_ffn_hits = 0;
@@ -3893,10 +3913,9 @@ static bool cycle_real_execute_period_fifo(
             "window=%d kv_order=STRICT ownership=UNCHANGED\n",
             run_phase, window);
     }
-    llama_hybrid_cycle_layout period = layout;
-    period.pc_cuda_full = pc_cuda_full;
-    period.kinds.resize(size_t(n_layers));
-    period.tail_begin = n_layers;
+    // Canonical one-cycle topology: cycles=1, tail_begin=8. The real
+    // multi-cycle registry uses the SAME absolute 48-layer descriptor.
+    llama_hybrid_cycle_layout period = physical_period_layout;
     const auto host_input = [&](int l, int c) -> std::vector<float> {
         const auto & st = execution_session.at(l, c);
         if (l == execution_session.first_layer()) {
@@ -5753,25 +5772,28 @@ static bool cycle_real_execute_period_fifo(
         };
 
     llama_hybrid_cycle_stage_dispatcher stage_dispatcher(period);
+    // Bind C2P/Phone Full/P2C through the production absolute-layer
+    // registry; the actual RPC computation remains the SAME V5 callback.
+    if (!phone_regions.bind_phone_stages(
+            stage_dispatcher,
+            [&execute_stage](llama_hybrid_cycle_phone_region_progress & region,
+                             const llama_hybrid_cycle_task & task) {
+                return region.location.cycle_index == 0 &&
+                       execute_stage(task);
+            }, phone_region_error)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_REGION] phase=%s status=FAIL "
+            "reason=BIND_PHONE_STAGES detail=%s\n",
+            run_phase, phone_region_error.c_str());
+        return false;
+    }
     for (int layer = 0; layer < n_layers; ++layer) {
         const auto kind = period.kinds[size_t(layer)];
-        if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
-            kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
-            for (const auto stage : {
-                    llama_hybrid_cycle_stage::ATTN_PRE,
-                    llama_hybrid_cycle_stage::SEND_ACTIVATION,
-                    llama_hybrid_cycle_stage::FFN_SOURCE,
-                    llama_hybrid_cycle_stage::FFN_DESTINATION,
-                    llama_hybrid_cycle_stage::SEND_PARTIAL,
-                    llama_hybrid_cycle_stage::REDUCE}) {
-                if (!stage_dispatcher.bind(layer, stage, execute_stage)) {
-                    return false;
-                }
-            }
-        } else if (!stage_dispatcher.bind(
-                       layer, llama_hybrid_cycle_stage::FULL_LAYER,
-                       execute_stage)) {
-            return false;
+        if (kind == llama_hybrid_cycle_layer_kind::PC_CPU ||
+            kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL) {
+            if (!stage_dispatcher.bind(
+                    layer, llama_hybrid_cycle_stage::FULL_LAYER,
+                    execute_stage)) return false;
         }
     }
     std::string stage_error;

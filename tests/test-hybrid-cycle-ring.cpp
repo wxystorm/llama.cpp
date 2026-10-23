@@ -3,6 +3,7 @@
 #include "llama-hybrid-cycle-runtime.h"
 #include "llama-hybrid-cycle-execution-session.h"
 #include "llama-hybrid-cycle-resources.h"
+#include "llama-hybrid-cycle-phone-regions.h"
 
 #include <algorithm>
 #include <array>
@@ -1135,25 +1136,30 @@ static void test_cycle_runtime_physical_8_and_48() {
             return true;
         };
 
-        // Bind actual physical stages, not a test-only "any task" callback.
-        // The same dispatcher is used for the six-period 48-layer Ring.
+        // Bind all REAL physical Phone stages through independent cycle
+        // ledgers. One global Ring still dispatches all 48 layer/chunk tasks.
         llama_hybrid_cycle_stage_dispatcher stages(runtime.config().layout);
+        llama_hybrid_cycle_phone_regions phone_regions;
+        std::string region_error;
+        assert(phone_regions.prepare(
+            runtime.config().layout, chunks * 16, 16, 2,
+            region_error));
+        assert(phone_regions.region_count() == layers / 8);
+        assert(phone_regions.bind_phone_stages(
+            stages,
+            [&](llama_hybrid_cycle_phone_region_progress & region,
+                const llama_hybrid_cycle_task & task) {
+                assert(task.layer >= region.location.c2p_layer);
+                assert(task.layer <= region.location.p2c_layer);
+                assert(region.location.cycle_index == task.layer / 8);
+                return run_stage(task);
+            }, region_error));
         for (int layer = 0; layer < layers; ++layer) {
             const auto kind = runtime.config().layout.kinds[size_t(layer)];
-            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
-                kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
-                for (const auto stage : {
-                        llama_hybrid_cycle_stage::ATTN_PRE,
-                        llama_hybrid_cycle_stage::SEND_ACTIVATION,
-                        llama_hybrid_cycle_stage::FFN_SOURCE,
-                        llama_hybrid_cycle_stage::FFN_DESTINATION,
-                        llama_hybrid_cycle_stage::SEND_PARTIAL,
-                        llama_hybrid_cycle_stage::REDUCE}) {
-                    assert(stages.bind(layer, stage, run_stage));
-                }
-            } else {
-                assert(stages.bind(layer,
-                    llama_hybrid_cycle_stage::FULL_LAYER, run_stage));
+            if (kind == llama_hybrid_cycle_layer_kind::PC_CPU ||
+                kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL) {
+                assert(stages.bind(
+                    layer, llama_hybrid_cycle_stage::FULL_LAYER, run_stage));
             }
         }
         std::string invalid_reason;
@@ -1454,7 +1460,92 @@ static void test_cycle_48_cuda_budget_selection() {
     assert(reason == "INVALID_LAYOUT_OR_ESTIMATE_VECTOR");
 }
 
+// Phone MAIN's L5/L6/L7 command state must be period-local, including
+// the READY bitmaps and Graph Slot banks. Simulate independent registration
+// before any actual GPU calls, then reject mismatched topology/handler binds.
+static void test_cycle_phone_regions_independent_ledgers() {
+    const auto layout = llama_hybrid_build_cycle_layout(48, 4, 2);
+    llama_hybrid_cycle_phone_regions regions;
+    std::string reason;
+    assert(regions.prepare(layout, 64, 16, 2, reason));
+    assert(regions.region_count() == 6);
+    assert(regions.n_chunks() == 4);
+    llama_hybrid_cycle_phone_region_slot_banks<
+        llama_hybrid_cycle_phone_ffn_slot,
+        llama_hybrid_cycle_p2c_ffn_slot> slots;
+    slots.prepare(regions);
+    assert(slots.size() == 6);
+    for (int c = 0; c < 6; ++c) {
+        auto * ledger = regions.by_index(c);
+        auto * bank = slots.by_index(c);
+        assert(ledger && bank);
+        assert(ledger->location.cycle_index == c);
+        assert(ledger->location.c2p_layer == 8 * c + 4);
+        assert(ledger->location.phone_begin == 8 * c + 5);
+        assert(ledger->location.phone_end == 8 * c + 7);
+        assert(ledger->location.p2c_layer == 8 * c + 7);
+        assert(bank->c2p_layer == 8 * c + 4);
+        assert(bank->p2c_layer == 8 * c + 7);
+        assert(bank->full_idle_by_layer.size() == 48);
+        assert(regions.for_layer(8 * c) == ledger);
+        assert(regions.for_layer(8 * c + 7) == ledger);
+        assert(ledger->c2p_ready_chunks.size() == 4);
+        assert(ledger->first_phone_registered_tokens == 0);
+        assert(ledger->p2c_registered_tokens == 0);
+    }
+    assert(regions.by_index(-1) == nullptr);
+    assert(regions.for_layer(48) == nullptr);
+    assert(slots.by_index(6) == nullptr);
+    // Full and P2C Graph Slots are separately owned by EACH period:
+    // retiring a C2P output in period 0 cannot be reused in period 1.
+    auto * first = slots.by_index(0);
+    auto * second = slots.by_index(1);
+    first->c2p_idle.push_back(
+        std::make_unique<llama_hybrid_cycle_phone_ffn_slot>());
+    first->p2c_idle.push_back(
+        std::make_unique<llama_hybrid_cycle_p2c_ffn_slot>());
+    first->full_idle_by_layer[5].push_back(
+        std::make_unique<llama_hybrid_cycle_phone_ffn_slot>());
+    assert(second->c2p_idle.empty());
+    assert(second->p2c_idle.empty());
+    assert(second->full_idle_by_layer[5].empty());
+    auto * p0 = regions.by_index(0);
+    p0->c2p_ready_chunks[0] = 1;
+    p0->next_arm_chunk = 1;
+    p0->first_phone_registered_tokens = 16;
+    p0->next_attention_registered_tokens = 16;
+    p0->p2c_registered_tokens = 16;
+    p0->first_phone_completed = 1;
+    p0->p2c_ffn_completed = 1;
+    for (int i = 1; i < 6; ++i) {
+        const auto * peer = regions.by_index(i);
+        assert(peer->c2p_ready_chunks[0] == 0);
+        assert(peer->next_arm_chunk == 0);
+        assert(peer->first_phone_registered_tokens == 0);
+        assert(peer->next_attention_registered_tokens == 0);
+        assert(peer->p2c_registered_tokens == 0);
+        assert(peer->first_phone_completed == 0);
+        assert(peer->p2c_ffn_completed == 0);
+    }
+
+    // Reject a foreign dispatcher, repeated stage registration and bad
+    // physical layer topology before running any FIFO worker.
+    auto foreign = llama_hybrid_build_cycle_layout(48, 5, 1);
+    llama_hybrid_cycle_stage_dispatcher foreign_stages(foreign);
+    assert(!regions.bind_phone_stages(
+        foreign_stages,
+        [](auto &, const auto &) { return true; }, reason));
+    auto corrupt = layout;
+    corrupt.kinds[15] = llama_hybrid_cycle_layer_kind::PHONE_GPU;
+    assert(!regions.prepare(corrupt, 64, 16, 2, reason));
+    assert(reason.find("PHYSICAL_REGION_ROLE_MISMATCH") !=
+           std::string::npos);
+    assert(!regions.prepare(layout, 64, 16, 5, reason));
+    assert(reason == "MAX_INFLIGHT_EXCEEDS_CHUNKS");
+}
+
 int main() {
+    test_cycle_phone_regions_independent_ledgers();
     test_cycle_48_cuda_budget_selection();
     test_cycle_48_selective_cuda_full_layers();
     test_cycle_48_layer_cross_period_handoff();
