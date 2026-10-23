@@ -5449,6 +5449,10 @@ static bool cycle_real_execute_period_fifo(
     // Owned exclusively by the PHONE_GPU FIFO worker. One shape-specific
     // slot is enough: this worker executes FFN_SOURCE tasks serially.
     std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_ffn_slot;
+    // V5 MAIN: at most WINDOW physical L7 FFN slots. All transfers to
+    // the idle pool are performed by the sole PC PHONE_GPU callback.
+    std::vector<std::unique_ptr<cycle_real_p2c_ffn_slot>> p2c_main_idle;
+    uint64_t p2c_main_hits = 0;
     uint64_t p2c_ffn_prepares = 0;
     uint64_t p2c_ffn_hits = 0;
     uint64_t p2c_ffn_replacements = 0;
@@ -5762,12 +5766,25 @@ static bool cycle_real_execute_period_fifo(
                     graph_cache_by_layer[size_t(n_layers - 1)],
                     {}, true);
                 if (!prepared) return false;
-                p2c.p2c_main_ffn =
-                    std::make_unique<cycle_real_p2c_ffn_slot>();
-                prepared = p2c.p2c_main_ffn->prepare(
-                    phone, full_shard(n_layers - 1, 1),
-                    hidden, p2c.tokens, topk, experts, true);
-                if (!prepared) return false;
+                for (auto it = p2c_main_idle.begin();
+                     it != p2c_main_idle.end(); ++it) {
+                    if (*it && (*it)->prepared_tokens == p2c.tokens &&
+                        (*it)->registered_graph_uid != 0) {
+                        p2c.p2c_main_ffn = std::move(*it);
+                        p2c_main_idle.erase(it);
+                        ++p2c_main_hits;
+                        break;
+                    }
+                }
+                if (!p2c.p2c_main_ffn) {
+                    p2c.p2c_main_ffn =
+                        std::make_unique<cycle_real_p2c_ffn_slot>();
+                    prepared = p2c.p2c_main_ffn->prepare(
+                        phone, full_shard(n_layers - 1, 1),
+                        hidden, p2c.tokens, topk, experts, true);
+                    if (!prepared) return false;
+                    ++p2c_ffn_prepares;
+                }
 
                 ggml_rpc_cycle_phone_p2c_plan next {};
                 next.layer = n_layers - 1;
@@ -5799,7 +5816,6 @@ static bool cycle_real_execute_period_fifo(
                         c2p.wire.seq, c2p.wire.graph_id, &next);
                 if (registered) {
                     v5_p2c_registered_tokens += p2c.tokens;
-                    ++p2c_ffn_prepares;
                     std::printf(
                         "[CYCLE_PHONE_V5_P2C] phase=%s "
                         "event=REGISTER_L7 chunk=%d start=%lld "
@@ -6904,6 +6920,14 @@ static bool cycle_real_execute_period_fifo(
                                 retire_device_output(l - 1, c);
                                 ++p2c_phone_local_completed;
                                 if (phone_main_p2c) {
+                                    // FFN and both TX staging transactions
+                                    // are device-complete. Release old L7
+                                    // Attention scratch BEFORE admitting C2.
+                                    st.ready.release_phone_graph();
+                                    if (st.p2c_main_ffn) {
+                                        p2c_main_idle.push_back(
+                                            std::move(st.p2c_main_ffn));
+                                    }
                                     ++v5_p2c_ffn_completed;
                                     ok = try_arm_phone_v4_regions();
                                 }
