@@ -3182,7 +3182,7 @@ struct cycle_real_c2p_phone_chunk {
             (enable_rpc_replay || enable_c2p_local);
         if (enable_c2p_local && full_layer) {
             std::fprintf(stderr,
-                "[CYCLE_PHONE_V5] status=FAIL reason=C2P_NOT_FULL_LAYER\\n");
+                "[CYCLE_PHONE_V5] status=FAIL reason=C2P_NOT_FULL_LAYER\n");
             release();
             return false;
         }
@@ -3285,7 +3285,7 @@ struct cycle_real_c2p_phone_chunk {
                 !ggml_backend_rpc_cycle_register_graph(phone, ffn_graph) ||
                 !ggml_backend_rpc_cycle_register_graph(phone, reduce_graph)) {
                 std::fprintf(stderr,
-                    "[CYCLE_PHONE_V5] phase=REGISTER_C2P status=FAIL\\n");
+                    "[CYCLE_PHONE_V5] phase=REGISTER_C2P status=FAIL\n");
                 release();
                 return false;
             }
@@ -5010,7 +5010,7 @@ static bool cycle_real_execute_period_fifo(
          window > 2)) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_V5] phase=%s status=FAIL "
-            "reason=REQUIRES_V4_AND_C2P_REUSE_WINDOW1_OR_2\\n",
+            "reason=REQUIRES_V4_AND_C2P_REUSE_WINDOW1_OR_2\n",
             run_phase);
         return false;
     }
@@ -5480,7 +5480,7 @@ static bool cycle_real_execute_period_fifo(
             "phone_queues=MAIN_PRIORITY,C2P_FFN "
             "trigger=BOTH_DEVICE_READY_C2P "
             "reduce=PHONE_LOCAL next=L5_L6_PHONE_FIFO "
-            "p2c=V4_CONTINUATION window=%d\\n",
+            "p2c=V4_CONTINUATION window=%d\n",
             run_phase, window);
     }
     if (phone_full_region_auto) {
@@ -7224,7 +7224,7 @@ static bool cycle_real_execute_period_fifo(
             "c2p_reduce=PHONE_MAIN_STARTED_BY_TWO_READY "
             "ffn_queue=C2P_ONLY main_priority=1 "
             "region_registered=%" PRIu64 " expected=%d "
-            "p2c=V4_PC_DISPATCH status=%s\\n",
+            "p2c=V4_PC_DISPATCH status=%s\n",
             run_phase, v4_region_armed, n_chunks,
             succeeded && v4_region_armed == uint64_t(n_chunks) ?
                 "OK" : "FAIL");
