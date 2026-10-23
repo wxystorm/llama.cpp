@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 
@@ -18,6 +19,17 @@ static llama_hybrid_cycle_task take(
         int chunk) {
     llama_hybrid_cycle_task task;
     assert(ring.try_pop(queue, task));
+    if (task.queue != queue || task.stage != stage ||
+        task.layer != layer || task.chunk != chunk) {
+        std::fprintf(stderr,
+            "[CYCLE_RING_TEST_ORDER] expected=%s/%s L%d C%d "
+            "actual=%s/%s L%d C%d\n",
+            llama_hybrid_cycle_queue_name(queue),
+            llama_hybrid_cycle_stage_name(stage), layer, chunk,
+            llama_hybrid_cycle_queue_name(task.queue),
+            llama_hybrid_cycle_stage_name(task.stage),
+            task.layer, task.chunk);
+    }
     assert(task.queue == queue);
     assert(task.stage == stage);
     assert(task.layer == layer);
@@ -829,13 +841,24 @@ static void test_v5_ready_c2p_reduce_beats_next_region_prepare() {
     llama_hybrid_cycle_task_ring ring(
         layout, 2, 2, true, false, true, true);
     ring.start();
+    // start() queues ATTN_PRE for C0 and C1. Completing C0 Attention
+    // appends C0 FFN_SOURCE AFTER C1 Attention in the SAME PC_CPU FIFO.
+    // Drain both Attention tasks before any FFN_SOURCE, and likewise
+    // preserve SEND_ACTIVATION before SEND_PARTIAL on the PC->Phone FIFO.
+    // Only PHONE_GPU has the opt-in V5 priority policy exercised below.
     for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
                            llama_hybrid_cycle_stage::ATTN_PRE, 0, c));
+    }
+    for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
                            llama_hybrid_cycle_stage::FFN_SOURCE, 0, c));
+    }
+    for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
                            llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, c));
+    }
+    for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
                            llama_hybrid_cycle_stage::SEND_PARTIAL, 0, c));
     }
