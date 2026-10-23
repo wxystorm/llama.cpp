@@ -303,6 +303,12 @@ llama_context::llama_context(
         }
         backends.emplace_back(phone);
 
+        // Unlike the ordinary constructor's long initialization route,
+        // this early-return Cycle path must value-initialize every
+        // llama_cparams scalar before assigning its supported subset.
+        // Otherwise getters for unused optional features could read
+        // uninitialized flags/sizes.
+        cparams = {};
         // All fixed Cycle Attention/KV buffers have an explicit 128-token
         // capacity. Report that TRUE capacity to ordinary llama.cpp users.
         const uint32_t requested_ctx =
