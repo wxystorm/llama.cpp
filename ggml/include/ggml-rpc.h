@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    32
+#define RPC_PROTO_PATCH_VERSION    33
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -480,6 +480,33 @@ GGML_BACKEND_API bool ggml_backend_rpc_cycle_register_phone_region_after_c2p(
         ggml_backend_t backend,
         const struct ggml_rpc_cycle_phone_region_stage stages[2],
         int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id);
+
+// Patch 33: the L6 Phone Full completion directly continues with L7
+// Attention, stages READY into independent Phone TX storage, then performs
+// Phone's P2C FFN and stages PARTIAL. All graphs and buffers are prepared
+// before the C2P Reduce can trigger the region. No PC compute/ARM between
+// the L6 and L7 stages. READY and FFN completions remain distinct.
+struct ggml_rpc_cycle_phone_p2c_plan {
+    int32_t layer;
+    int32_t chunk;
+    uint64_t seq;
+    uint64_t graph_id;
+    uint64_t attention_graph_uid;
+    uint64_t ffn_graph_uid;
+    const struct ggml_tensor * input_source;
+    const struct ggml_tensor * attention_input;
+    const struct ggml_tensor * ready_outputs[4];
+    const struct ggml_tensor * ffn_inputs[3];
+    const struct ggml_tensor * ffn_partial;
+};
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_register_phone_region_p2c(
+        ggml_backend_t backend,
+        const struct ggml_rpc_cycle_phone_region_stage stages[2],
+        int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id,
+        const struct ggml_rpc_cycle_phone_p2c_plan * p2c);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_p2c_ready(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
 
 // Uses the same completion channel as V3; each call waits for one Full
 // layer's Attention+FFN+ADD, NOT for the entire two-layer region.
