@@ -14352,20 +14352,90 @@ struct rpc_cycle_p2c_fifo_v1 {
                     // a previously admitted C1 Reduce, and L6 before C1.
                     if (ok) {
                         rpc_msg_inference_cycle_phone_region_req region {};
+                        rpc_msg_inference_cycle_v6_p2c_req p2c {};
+                        bool has_p2c = false;
                         {
                             std::lock_guard<std::mutex> lock(mutex);
                             const auto it = c2p_v5.find(item.id);
                             ok = it != c2p_v5.end() &&
                                 it->second.region_registered;
-                            if (ok) region = it->second.region;
+                            if (ok) {
+                                region = it->second.region;
+                                has_p2c = it->second.p2c_registered;
+                                if (has_p2c) p2c = it->second.p2c;
+                            }
                         }
-                        if (ok) ok = enqueue_phone_region(region, true);
+                        if (ok) ok = enqueue_phone_region(
+                            region, true, has_p2c ? &p2c : nullptr);
                     }
                     GGML_LOG_INFO(
                         "[CYCLE_PHONE_V5] side=PHONE event=MAIN_REDUCE_DONE "
                         "chunk=%d seq=%" PRIu64 " "
                         "region=ENQUEUE_FRONT status=%s\n",
                         item.c2p_v5.chunk, item.c2p_v5.seq,
+                        ok ? "OK" : "FAIL");
+                } else if (item.type == kind::P2C_V6_MAIN) {
+                    const auto & p = item.p2c_v6;
+                    const key ready_key {p.layer, p.chunk,
+                        p.ready.seq, p.ready.graph_id};
+                    rpc_msg_copy_tensor_req input {};
+                    input.src = p.input_source;
+                    input.dst = p.attention_input;
+                    rpc_msg_copy_tensor_rsp copied {};
+                    ok = server.copy_tensor(input, copied) &&
+                         copied.result != 0;
+                    t1 = ggml_time_us();
+                    if (ok) {
+                        rpc_msg_graph_recompute_req run {};
+                        run.device = p.device;
+                        run.graph_uid = p.attention_graph_uid;
+                        ok = server.graph_recompute(run);
+                    }
+                    t2 = ggml_time_us();
+                    if (ok) ok = server.send_inference_cycle(p.ready);
+                    // READY has independent TX staging; PC CPU may start
+                    // its FFN without waiting for the Phone FFN.
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        p2c_v6_ready_result[ready_key] = ok;
+                    }
+                    cv.notify_all();
+                    const int64_t ready_staged_us = ggml_time_us();
+                    GGML_LOG_INFO(
+                        "[CYCLE_PHONE_V5_P2C] side=PHONE event=READY_STAGED "
+                        "layer=%d chunk=%d attn_ms=%.3f "
+                        "ready_copy_ms=%.3f status=%s\n",
+                        p.layer, p.chunk, (t2 - t1) / 1000.0,
+                        (ready_staged_us - t2) / 1000.0,
+                        ok ? "OK" : "FAIL");
+                    if (ok) {
+                        for (int i = 0; i < 3 && ok; ++i) {
+                            rpc_msg_copy_tensor_req copy {};
+                            copy.src = p.ffn.ready_inputs[i];
+                            copy.dst = p.ffn.ffn_inputs[i];
+                            rpc_msg_copy_tensor_rsp response {};
+                            ok = server.copy_tensor(copy, response) &&
+                                 response.result != 0;
+                        }
+                    }
+                    const int64_t ffn_input_ready = ggml_time_us();
+                    if (ok) {
+                        rpc_msg_graph_recompute_req run {};
+                        run.device = p.device;
+                        run.graph_uid = p.ffn.ffn_graph_uid;
+                        ok = server.graph_recompute(run);
+                    }
+                    const int64_t ffn_done = ggml_time_us();
+                    if (ok) ok = server.send_inference_cycle(p.ffn.partial);
+                    t3 = ggml_time_us();
+                    GGML_LOG_INFO(
+                        "[CYCLE_PHONE_V5_P2C] side=PHONE event=PARTIAL_STAGED "
+                        "layer=%d chunk=%d ffn_input_ms=%.3f "
+                        "ffn_ms=%.3f tx_stage_ms=%.3f status=%s\n",
+                        p.layer, p.chunk,
+                        (ffn_input_ready - ready_staged_us) / 1000.0,
+                        (ffn_done - ffn_input_ready) / 1000.0,
+                        (t3 - ffn_done) / 1000.0,
                         ok ? "OK" : "FAIL");
                 } else if (item.type == kind::PHONE_REGION_STAGE) {
                     // One Full layer is an atomic compute stage on the GPU.
@@ -14508,6 +14578,9 @@ struct rpc_cycle_p2c_fifo_v1 {
                 } else {
                     pending.erase(item.id);
                     completed.emplace(item.id, ok);
+                    if (item.type == kind::P2C_V6_MAIN &&
+                        !p2c_v6_ready_result.count(item.id))
+                        p2c_v6_ready_result.emplace(item.id, false);
                 }
                 ++jobs_finished;
                 if (item.type == kind::PHONE_REGION_STAGE &&
@@ -14523,6 +14596,9 @@ struct rpc_cycle_p2c_fifo_v1 {
                         follow.region = plan;
                         follow.region_has_next = false;
                         follow.v5_main_continuation = item.v5_main_continuation;
+                        follow.region_has_p2c = item.region_has_p2c;
+                        if (item.region_has_p2c)
+                            follow.p2c_v6 = item.p2c_v6;
                         follow.enqueue_us = ggml_time_us();
                         // V5 promotes the active Chunk to the FRONT.
                         // Enqueue AT THE BACK of the existing FIFO. This
@@ -14541,6 +14617,37 @@ struct rpc_cycle_p2c_fifo_v1 {
                         pending.erase(next_key);
                         completed.emplace(next_key, false);
                         ++jobs_finished;
+                        if (item.region_has_p2c) {
+                            const auto & p = item.p2c_v6;
+                            const key k {p.layer, p.chunk, p.ready.seq,
+                                         p.ready.graph_id};
+                            pending.erase(k);
+                            completed.emplace(k, false);
+                            p2c_v6_ready_result.emplace(k, false);
+                        }
+                    }
+                }
+                if (item.type == kind::PHONE_REGION_STAGE &&
+                    !item.region_has_next && item.region_has_p2c) {
+                    const auto & p = item.p2c_v6;
+                    const key k {p.layer, p.chunk, p.ready.seq,
+                                 p.ready.graph_id};
+                    if (ok) {
+                        job follow {};
+                        follow.id = k;
+                        follow.type = kind::P2C_V6_MAIN;
+                        follow.p2c_v6 = p;
+                        follow.enqueue_us = ggml_time_us();
+                        jobs.push_front(std::move(follow));
+                        ++jobs_started;
+                        GGML_LOG_INFO(
+                            "[CYCLE_PHONE_V5_P2C] side=PHONE event=APPEND_P2C "
+                            "chunk=%d layer=%d queue=MAIN status=OK\n",
+                            p.chunk, p.layer);
+                    } else {
+                        pending.erase(k);
+                        completed.emplace(k, false);
+                        p2c_v6_ready_result.emplace(k, false);
                     }
                 }
             }
@@ -14554,6 +14661,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                 "partial_stage_ms=%.3f status=%s\n",
                 item.type == kind::C2P_V5_FFN ? "C2P_FFN" :
                 item.type == kind::C2P_V5_REDUCE ? "C2P_REDUCE" :
+                item.type == kind::P2C_V6_MAIN ? "P2C_MAIN" :
                 item.type == kind::PHONE_REGION_STAGE ?
                     "PHONE_REGION_FULL" :
                     item.type == kind::NEXT_ATTENTION_FULL ?
@@ -14566,6 +14674,8 @@ struct rpc_cycle_p2c_fifo_v1 {
                     item.c2p_v5.ffn_graph_uid :
                 item.type == kind::C2P_V5_REDUCE ?
                     item.c2p_v5.reduce_graph_uid :
+                item.type == kind::P2C_V6_MAIN ?
+                    item.p2c_v6.ffn.ffn_graph_uid :
                 item.type == kind::PHONE_REGION_STAGE ?
                     item.region.ffn_graph_uid :
                     item.type == kind::NEXT_ATTENTION_FULL ?
