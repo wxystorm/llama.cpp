@@ -7708,6 +7708,63 @@ public:
     // Shared GPU/Graph/Buffer gate for the opt-in Phone P2C FIFO worker.
     std::mutex & cycle_p2c_gpu_gate() { return cycle_p2c_gpu_gate_; }
 
+    // Experimental priority at GPU *task boundaries* only. It does not
+    // overlap kernel execution with GPU uploads: APPLY must still take the
+    // same gate and synchronize before publishing DEVICE_READY. The normal
+    // V5 MAIN/FFN FIFO order and buffer credit rules are unchanged.
+    static bool cycle_gpu_upload_priority_enabled() {
+        const char * policy = std::getenv("GGML_CYCLE_C2P_UPLOAD_PRIORITY_V1");
+        const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
+        return policy && std::strcmp(policy, "1") == 0 &&
+               v5 && std::strcmp(v5, "1") == 0;
+    }
+
+    void cycle_gpu_note_upload_waiting() {
+        std::lock_guard<std::mutex> lock(cycle_gpu_upload_mutex_);
+        ++cycle_gpu_upload_waiters_;
+    }
+    void cycle_gpu_note_upload_acquired() {
+        std::lock_guard<std::mutex> lock(cycle_gpu_upload_mutex_);
+        GGML_ASSERT(cycle_gpu_upload_waiters_ > 0);
+        --cycle_gpu_upload_waiters_;
+        cycle_gpu_upload_cv_.notify_all();
+    }
+    bool cycle_gpu_upload_pending() {
+        std::lock_guard<std::mutex> lock(cycle_gpu_upload_mutex_);
+        return cycle_gpu_upload_waiters_ != 0;
+    }
+    int64_t cycle_gpu_wait_upload_at_boundary_us() {
+        if (!cycle_gpu_upload_priority_enabled()) return 0;
+        std::unique_lock<std::mutex> lock(cycle_gpu_upload_mutex_);
+        if (cycle_gpu_upload_waiters_ == 0) return 0;
+        const int64_t begin_us = ggml_time_us();
+        cycle_gpu_upload_cv_.wait(lock, [&] {
+            return cycle_gpu_upload_waiters_ == 0;
+        });
+        return ggml_time_us() - begin_us;
+    }
+
+    // Automatically drops a pending notification if mutex acquisition
+    // throws; releases priority as soon as APPLY owns the GPU gate.
+    class cycle_gpu_upload_ticket {
+    public:
+        cycle_gpu_upload_ticket(rpc_server & server, bool active)
+            : server_(server), active_(active) {
+            if (active_) server_.cycle_gpu_note_upload_waiting();
+        }
+        cycle_gpu_upload_ticket(const cycle_gpu_upload_ticket &) = delete;
+        cycle_gpu_upload_ticket & operator=(const cycle_gpu_upload_ticket &) = delete;
+        ~cycle_gpu_upload_ticket() { acquired(); }
+        void acquired() {
+            if (!active_) return;
+            server_.cycle_gpu_note_upload_acquired();
+            active_ = false;
+        }
+    private:
+        rpc_server & server_;
+        bool active_ = false;
+    };
+
     using cycle_v5_key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
     enum class cycle_v5_notice_status { NO_OWNER, APPLIED, FAILED };
     bool bind_cycle_v5_owner(
@@ -8315,6 +8372,9 @@ private:
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::mutex cycle_p2c_gpu_gate_;
+    std::mutex cycle_gpu_upload_mutex_;
+    std::condition_variable cycle_gpu_upload_cv_;
+    unsigned cycle_gpu_upload_waiters_ = 0;
     // V5-only, protocol-keyed cross-control-connection event handoff.
     // Weak owners prevent a closed COMPUTE connection from keeping an
     // executor (and its borrowed graph buffers) alive unexpectedly.
@@ -10225,19 +10285,27 @@ bool rpc_server::apply_inference_cycle(
 
     // C2P APPLY first waits for its HOST frame. Do not hold the Phone GPU
     // worker gate during that wait: the P2C worker can have ready work.
-    // Lock only while uploading GPU inputs and synchronizing their use.
-    // This is opt-in timing only: it does not change mutex scope or ordering.
+    // The optional upload-priority ticket is posted ONLY after HOST RX,
+    // so MAIN never pauses for a Chunk whose data has not yet arrived.
+    // GPU writes still hold the ORIGINAL GPU gate and synchronize fully.
     const bool gpu_stage_timing =
         std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr;
+    const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1");
+    const bool needs_gpu_gate = v1 && std::strcmp(v1, "1") == 0;
+    const bool upload_priority = needs_gpu_gate &&
+        cycle_gpu_upload_priority_enabled();
+    cycle_gpu_upload_ticket upload_ticket(*this, upload_priority);
     const int64_t gpu_gate_enter_us =
         gpu_stage_timing ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> cycle_p2c_apply_gpu_guard;
-    if (const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1")) {
-        if (std::strcmp(v1, "1") == 0) {
-            cycle_p2c_apply_gpu_guard =
-                std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
-        }
+    if (needs_gpu_gate) {
+        cycle_p2c_apply_gpu_guard =
+            std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
     }
+    // Notify the worker only after GPU ownership is acquired. If the
+    // pending notice raced with the worker's acquire, the worker retries
+    // at this safe boundary instead of starting the next graph.
+    upload_ticket.acquired();
     const int64_t gpu_gate_acquired_us =
         gpu_stage_timing ? ggml_time_us() : 0;
     const size_t count = ready ? 4 : 1;
@@ -10320,7 +10388,7 @@ bool rpc_server::apply_inference_cycle(
             "[CYCLE_C2P_RX_PROFILE] kind=%s layer=%d chunk=%d "
             "seq=%" PRIu64 " rx_wait_ms=%.3f "
             "input_copy_ms=%.3f gpu_gate_wait_ms=%.3f "
-            "gpu_copy_sync_ms=%.3f "
+            "gpu_copy_sync_ms=%.3f upload_priority=%d "
             "scope=PHONE_SERVER_GPU_UPLOAD "
             "gpu_copy_semantics=BACKEND_UPLOAD_AND_SYNC_NOT_KERNEL_ONLY\n",
             ready ? "READY" : "PARTIAL", request.layer,
@@ -10328,7 +10396,8 @@ bool rpc_server::apply_inference_cycle(
             (rx_ready_us - apply_begin_us) / 1000.0,
             (gpu_input_ready_us - rx_ready_us) / 1000.0,
             (gpu_gate_acquired_us - gpu_gate_enter_us) / 1000.0,
-            (gpu_input_ready_us - gpu_gate_acquired_us) / 1000.0);
+            (gpu_input_ready_us - gpu_gate_acquired_us) / 1000.0,
+            upload_priority ? 1 : 0);
     }
     return true;
 }
@@ -14380,11 +14449,26 @@ struct rpc_cycle_p2c_fifo_v1 {
             const int64_t t0 = ggml_time_us();
             int64_t lock_acquired_us = t0;
             int64_t t1 = t0, t2 = t0, t3 = t0;
+            int64_t upload_boundary_yield_us = 0;
             bool ok = true;
             try {
-                // The WAIT handler never owns this mutex. Other GPU RPCs
-                // serialize here to protect graph_map and borrowed buffers.
-                std::lock_guard<std::mutex> gpu(server.cycle_p2c_gpu_gate());
+                // At most one short APPLY upload may pass between two
+                // complete Phone GPU tasks. No running kernel is preempted.
+                // Recheck after acquiring the original GPU mutex to close
+                // the pending-ticket vs worker-acquire race.
+                std::unique_lock<std::mutex> gpu(
+                    server.cycle_p2c_gpu_gate(), std::defer_lock);
+                if (rpc_server::cycle_gpu_upload_priority_enabled()) {
+                    for (;;) {
+                        upload_boundary_yield_us +=
+                            server.cycle_gpu_wait_upload_at_boundary_us();
+                        gpu.lock();
+                        if (!server.cycle_gpu_upload_pending()) break;
+                        gpu.unlock();
+                    }
+                } else {
+                    gpu.lock();
+                }
                 lock_acquired_us = ggml_time_us();
                 if (item.type == kind::C2P_V5_FFN) {
                     rpc_msg_graph_recompute_req run {};
@@ -14720,6 +14804,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                 "stage=%s layer=%d chunk=%d seq=%" PRIu64
                 " uid=%" PRIu64
                 " queue_wait_ms=%.3f gpu_gate_wait_ms=%.3f "
+                "upload_boundary_yield_ms=%.3f "
                 "copy_ms=%.3f graph_ms=%.3f "
                 "partial_stage_ms=%.3f status=%s\n",
                 item.type == kind::C2P_V5_FFN ? "C2P_FFN" :
@@ -14748,6 +14833,7 @@ struct rpc_cycle_p2c_fifo_v1 {
                             item.plan.ffn_graph_uid,
                 (t0 - item.enqueue_us) / 1000.0,
                 (lock_acquired_us - t0) / 1000.0,
+                upload_boundary_yield_us / 1000.0,
                 (t1 - lock_acquired_us) / 1000.0,
                 (t2 - t1) / 1000.0,
                 (t3 - t2) / 1000.0, ok ? "OK" : "FAIL");
