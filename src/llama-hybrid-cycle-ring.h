@@ -162,8 +162,17 @@ public:
             int best_chunk = 0, best_stage = 0;
             for (auto it = ready.begin(); it != ready.end(); ++it) {
                 const auto kind = layout_.kinds[size_t(it->layer)];
-                const int priority = kind ==
-                    llama_hybrid_cycle_layer_kind::TENSOR_P2C ?
+                // C2P REDUCE is already device-ready and starts Phone MAIN.
+                // Do not let a later Chunk's C2P FFN_DESTINATION proxy
+                // (which synchronously PREPARES/REGISTERS L5/L6/L7) hold up
+                // this older Chunk's completed downstream handoff.
+                // P2C and Phone-full continuations remain prioritized by
+                // Chunk order. This changes only the PC proxy dequeue order,
+                // not Phone MAIN, Buffer Credit, KV or RPC semantics.
+                const int priority =
+                    kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P &&
+                    it->stage == llama_hybrid_cycle_stage::REDUCE ? 4 :
+                    kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C ?
                     (it->stage == llama_hybrid_cycle_stage::FFN_SOURCE ? 3 :
                      it->stage == llama_hybrid_cycle_stage::ATTN_PRE ? 2 : 0) :
                     (kind == llama_hybrid_cycle_layer_kind::PHONE_GPU &&
