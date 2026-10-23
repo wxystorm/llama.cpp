@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    31
+#define RPC_PROTO_PATCH_VERSION    32
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -464,6 +464,23 @@ struct ggml_rpc_cycle_phone_region_stage {
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_arm_phone_region(
         ggml_backend_t backend,
         const struct ggml_rpc_cycle_phone_region_stage stages[2]);
+// Patch 32: Phone-local C2P FFN/Reduce and deferred region handoff.
+// The Phone worker starts FFN only after READY has reached GPU memory, and
+// MAIN Reduce only after BOTH Phone FFN and PC PARTIAL are device-ready.
+// These descriptors borrow the caller's graph/buffer leases until the
+// downstream consumer releases them (the existing V4 ownership contract).
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_arm_c2p_local(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id,
+        uint64_t ffn_graph_uid, uint64_t reduce_graph_uid);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_c2p_local_reduce(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id);
+GGML_BACKEND_API bool ggml_backend_rpc_cycle_register_phone_region_after_c2p(
+        ggml_backend_t backend,
+        const struct ggml_rpc_cycle_phone_region_stage stages[2],
+        int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id);
+
 // Uses the same completion channel as V3; each call waits for one Full
 // layer's Attention+FFN+ADD, NOT for the entire two-layer region.
 GGML_BACKEND_API bool ggml_backend_rpc_cycle_wait_phone_region_stage(
