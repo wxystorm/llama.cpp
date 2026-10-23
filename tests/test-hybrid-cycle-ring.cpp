@@ -757,12 +757,16 @@ static void test_v5_pc_phone_proxy_main_priority() {
     for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
                            llama_hybrid_cycle_stage::ATTN_PRE, 0, c));
+    }
+    for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
                            llama_hybrid_cycle_stage::FFN_SOURCE, 0, c));
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
                            llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, c));
         ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
                            llama_hybrid_cycle_stage::FFN_DESTINATION, 0, c));
+    }
+    for (int c = 0; c < 2; ++c) {
         ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
                            llama_hybrid_cycle_stage::SEND_PARTIAL, 0, c));
     }
