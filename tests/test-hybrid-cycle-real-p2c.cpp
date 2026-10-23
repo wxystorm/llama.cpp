@@ -6835,10 +6835,20 @@ static bool cycle_real_execute_period_fifo(
                 }
                 case llama_hybrid_cycle_stage::FFN_DESTINATION: {
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
-                        ok = st.phone_output && st.phone_output->execute_ffn();
-                        if (path_timing && st.phone_output) {
-                            st.c2p_timing.phone_ffn_submit_rpc_ms =
-                                st.phone_output->ffn_graph_submit_ms;
+                        if (phone_c2p_local) {
+                            // C2P FFN was armed BEFORE READY. The Phone
+                            // worker executes it only after GPU READY.
+                            // Now pre-register the complete L5/L6 region;
+                            // do not submit a Phone FFN Graph from PC.
+                            v4_c2p_ready[size_t(c)] = 1;
+                            ok = try_arm_phone_v4_regions();
+                        } else {
+                            ok = st.phone_output &&
+                                st.phone_output->execute_ffn();
+                            if (path_timing && st.phone_output) {
+                                st.c2p_timing.phone_ffn_submit_rpc_ms =
+                                    st.phone_output->ffn_graph_submit_ms;
+                            }
                         }
                     } else {
                         const auto pc_ffn_begin =
@@ -6921,23 +6931,37 @@ static bool cycle_real_execute_period_fifo(
                 }
                 case llama_hybrid_cycle_stage::REDUCE: {
                     if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
-                        ok = st.phone_output &&
-                            st.phone_output->execute_reduce(phone);
-                        if (path_timing && st.phone_output) {
-                            st.c2p_timing.reduce_graph_rpc_ms =
-                                st.phone_output->reduce_graph_call_ms;
-                            st.c2p_timing.reduce_backend_sync_ms =
-                                st.phone_output->reduce_backend_sync_ms;
-                        }
-                        if (ok) {
-                            const auto finish_begin =
+                        if (phone_c2p_local) {
+                            // The real Reduce, FINISH/ACK and L5 kickoff
+                            // happen in Phone's MAIN queue, not PC.
+                            const auto wait_begin =
                                 std::chrono::steady_clock::now();
-                            ok = ggml_backend_rpc_cycle_finish_reduce(
+                            ok = ggml_backend_rpc_cycle_wait_c2p_local_reduce(
                                 phone, st.wire.layer, st.wire.chunk,
                                 st.wire.seq, st.wire.graph_id);
                             if (path_timing) {
                                 st.c2p_timing.reduce_finish_rpc_ms =
-                                    cycle_real_path_elapsed_ms(finish_begin);
+                                    cycle_real_path_elapsed_ms(wait_begin);
+                            }
+                        } else {
+                            ok = st.phone_output &&
+                                st.phone_output->execute_reduce(phone);
+                            if (path_timing && st.phone_output) {
+                                st.c2p_timing.reduce_graph_rpc_ms =
+                                    st.phone_output->reduce_graph_call_ms;
+                                st.c2p_timing.reduce_backend_sync_ms =
+                                    st.phone_output->reduce_backend_sync_ms;
+                            }
+                            if (ok) {
+                                const auto finish_begin =
+                                    std::chrono::steady_clock::now();
+                                ok = ggml_backend_rpc_cycle_finish_reduce(
+                                    phone, st.wire.layer, st.wire.chunk,
+                                    st.wire.seq, st.wire.graph_id);
+                                if (path_timing) {
+                                    st.c2p_timing.reduce_finish_rpc_ms =
+                                        cycle_real_path_elapsed_ms(finish_begin);
+                                }
                             }
                         }
                         if (ok) {
@@ -6958,7 +6982,8 @@ static bool cycle_real_execute_period_fifo(
                         // Collect out-of-order REDUCE completions and arm
                         // Phone regions strictly in Chunk order, bounded
                         // by their two-layer output-buffer credit window.
-                        if (ok && phone_full_region_auto) {
+                        if (ok && phone_full_region_auto &&
+                            !phone_c2p_local) {
                             v4_c2p_ready[size_t(c)] = 1;
                             ok = try_arm_phone_v4_regions();
                         }
@@ -7192,6 +7217,17 @@ static bool cycle_real_execute_period_fifo(
             "status=%s\n",
             run_phase, v3_full_pairs_armed, v3_next_full_completed,
             n_chunks, window, v3_ok ? "OK" : "FAIL");
+    }
+    if (phone_c2p_local) {
+        std::printf(
+            "[CYCLE_PHONE_V5_SUM] phase=%s "
+            "c2p_reduce=PHONE_MAIN_STARTED_BY_TWO_READY "
+            "ffn_queue=C2P_ONLY main_priority=1 "
+            "region_registered=%" PRIu64 " expected=%d "
+            "p2c=V4_PC_DISPATCH status=%s\\n",
+            run_phase, v4_region_armed, n_chunks,
+            succeeded && v4_region_armed == uint64_t(n_chunks) ?
+                "OK" : "FAIL");
     }
     if (phone_full_region_auto) {
         const auto & l5_kv = kv[size_t(layout.x + 1)];
