@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-ring.h"
+#include "llama-hybrid-cycle-phone-local.h"
 #include "llama-hybrid-cycle-fifo-executor.h"
 
 #include <array>
@@ -667,7 +668,81 @@ static void test_v4_ordered_c2p_reduce() {
     assert(ring.finished());
 }
 
+// V5 policy: the PC partial may arrive before or after Phone C2P FFN.
+// No unready Reduce may block MAIN; admitted reduces preserve Chunk order,
+// but the active Chunk's continuation stays ahead of following reductions.
+static void test_v5_phone_main_priority() {
+    using sched = llama_hybrid_cycle_phone_local;
+    sched ring(3, 2);
+    sched::task t {};
+    // PC chunk1 is ready before C0, but may not enter MAIN.
+    ring.pc_partial_ready(1);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_FFN && t.chunk == 0);
+    ring.complete(t);
+    assert(ring.main_pending() == 0);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_FFN && t.chunk == 1);
+    ring.complete(t);
+    assert(ring.main_pending() == 0);
+    ring.pc_partial_ready(0);
+    assert(ring.main_pending() == 2);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_REDUCE && t.chunk == 0);
+    ring.complete(t);
+    // C0 MUST beat the already-queued C1 Reduce.
+    const sched::stage expected[] = {
+        sched::stage::PHONE_FULL, sched::stage::PHONE_FULL,
+        sched::stage::P2C_ATTN, sched::stage::P2C_READY_STAGED,
+        sched::stage::P2C_FFN, sched::stage::P2C_PARTIAL_STAGED
+    };
+    for (int step = 0; step < 6; ++step) {
+        assert(ring.pop(t) && t.chunk == 0 && t.op == expected[step]);
+        if (t.op == sched::stage::PHONE_FULL)
+            assert(t.full_layer == step);
+        ring.complete(t);
+    }
+    assert(ring.completed() == 1);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_REDUCE && t.chunk == 1);
+    ring.complete(t);
+    for (auto op : expected) {
+        assert(ring.pop(t) && t.chunk == 1 && t.op == op);
+        ring.complete(t);
+    }
+    assert(ring.completed() == 2);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_FFN && t.chunk == 2);
+    ring.complete(t);
+    assert(!ring.pop(t)); // No GPU Worker wait for C2's network data.
+    ring.pc_partial_ready(2);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_REDUCE && t.chunk == 2);
+    ring.complete(t);
+    for (auto op : expected) {
+        assert(ring.pop(t) && t.chunk == 2 && t.op == op);
+        ring.complete(t);
+    }
+    assert(ring.finished());
+}
+
+static void test_v5_phone_rx_first() {
+    using sched = llama_hybrid_cycle_phone_local;
+    sched ring(1, 0);
+    ring.pc_partial_ready(0);
+    sched::task t {};
+    assert(ring.pop(t) && t.op == sched::stage::C2P_FFN);
+    ring.complete(t);
+    assert(ring.pop(t) && t.op == sched::stage::C2P_REDUCE);
+    ring.complete(t);
+    const sched::stage sequence[] = {
+        sched::stage::P2C_ATTN, sched::stage::P2C_READY_STAGED,
+        sched::stage::P2C_FFN, sched::stage::P2C_PARTIAL_STAGED
+    };
+    for (auto op : sequence) {
+        assert(ring.pop(t) && t.op == op);
+        ring.complete(t);
+    }
+    assert(ring.finished());
+}
+
 int main() {
+    test_v5_phone_main_priority();
+    test_v5_phone_rx_first();
     test_v4_ordered_c2p_reduce();
     test_pc_cuda_full_fifo();
     test_one_cycle();
