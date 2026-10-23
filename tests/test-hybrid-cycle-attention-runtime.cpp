@@ -2,6 +2,7 @@
 #include "llama-hybrid-cycle-wire.h"
 #include "llama-hybrid-cycle-phone-executor.h"
 #include "llama-hybrid-cycle-p2c-ffn.h"
+#include "llama-hybrid-cycle-ffn-shard.h"
 #include "llama-model.h"
 
 #include <cassert>
@@ -55,6 +56,19 @@ int main() {
     p2c_slot.release();
     assert(p2c_slot.registered_graph_uid == 0);
 
+
+    // Production FFN shard must fail closed before constructing a graph,
+    // including a P2C wire send without a registered RPC hook.
+    llama_hybrid_cycle_ffn_shard_weights no_shard {};
+    llama_hybrid_cycle_ffn_stages no_stages;
+    std::vector<float> no_ffn;
+    const std::vector<int32_t> no_ids;
+    assert(!llama_hybrid_cycle_execute_ffn_shard(
+        nullptr, no_shard, no_input, no_ids, no_input,
+        2048, 16, 8, 128, no_ffn, nullptr, &no_stages));
+    assert(!llama_hybrid_cycle_execute_ffn_shard(
+        nullptr, no_shard, no_input, no_ids, no_input,
+        2048, 16, 8, 128, no_ffn, nullptr, nullptr, &p2c_wire));
 
     // Invalid READY shape must be rejected before any transport backend
     // proc is invoked (including when Phone is unavailable).

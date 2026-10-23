@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 static llama_hybrid_cycle_task take(
         llama_hybrid_cycle_task_ring & ring,
@@ -874,6 +875,77 @@ static void test_v5_ready_c2p_reduce_beats_next_region_prepare() {
     assert(ring.finished());
 }
 
+// The dispatch path must honor the true backend queue and ownership,
+// not merely dispatch any task with a plausible layer/stage index.
+static void test_cycle_runtime_physical_route_guard() {
+    llama_hybrid_cycle_layout cuda_layout;
+    cuda_layout.kinds = {llama_hybrid_cycle_layer_kind::PC_CPU};
+    cuda_layout.pc_cuda_full = true;
+    llama_hybrid_cycle_stage_dispatcher cuda(cuda_layout);
+    int executed = 0;
+    assert(cuda.bind(0, llama_hybrid_cycle_stage::FULL_LAYER,
+                     [&](const llama_hybrid_cycle_task &) {
+                         ++executed;
+                         return true;
+                     }));
+    std::string reason;
+    assert(cuda.validate(reason));
+    llama_hybrid_cycle_task task {};
+    task.layer = 0;
+    task.chunk = 0;
+    task.stage = llama_hybrid_cycle_stage::FULL_LAYER;
+    task.owner = llama_hybrid_cycle_owner::PC_CUDA;
+    task.queue = llama_hybrid_cycle_queue::PC_CUDA;
+    assert(cuda.execute(task));
+    task.queue = llama_hybrid_cycle_queue::PC_CPU;
+    assert(!cuda.execute(task));
+    assert(executed == 1);
+
+    llama_hybrid_cycle_layout c2p_layout;
+    c2p_layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_C2P};
+    llama_hybrid_cycle_stage_dispatcher c2p(c2p_layout);
+    assert(c2p.bind(0, llama_hybrid_cycle_stage::SEND_PARTIAL,
+                    [&](const llama_hybrid_cycle_task &) {
+                        ++executed;
+                        return true;
+                    }));
+    task.stage = llama_hybrid_cycle_stage::SEND_PARTIAL;
+    task.owner = llama_hybrid_cycle_owner::PC_CPU;
+    task.queue = llama_hybrid_cycle_queue::PC_TO_PHONE;
+    assert(c2p.execute(task));
+    task.queue = llama_hybrid_cycle_queue::PHONE_TO_PC;
+    assert(!c2p.execute(task));
+    task.queue = llama_hybrid_cycle_queue::PC_TO_PHONE;
+    task.owner = llama_hybrid_cycle_owner::PHONE_GPU;
+    assert(!c2p.execute(task));
+    assert(executed == 2);
+}
+
+static void test_cycle_runtime_missing_stage_fails_closed() {
+    const auto layout = llama_hybrid_build_cycle_layout(8, 4, 2);
+    llama_hybrid_cycle_stage_dispatcher stages(layout);
+    std::string reason;
+    assert(!stages.validate(reason));
+    assert(reason.find("UNBOUND_PHYSICAL_STAGE") != std::string::npos);
+    assert(!stages.bind(0, llama_hybrid_cycle_stage::SEND_PARTIAL,
+                        [](const llama_hybrid_cycle_task &) { return true; }));
+    assert(stages.bind(0, llama_hybrid_cycle_stage::FULL_LAYER,
+                       [](const llama_hybrid_cycle_task &) { return true; }));
+    assert(!stages.bind(0, llama_hybrid_cycle_stage::FULL_LAYER,
+                        [](const llama_hybrid_cycle_task &) { return true; }));
+    llama_hybrid_cycle_runtime_config config;
+    config.layout = layout;
+    config.n_chunks = 2;
+    llama_hybrid_cycle_runtime runtime(config);
+    assert(!runtime.run(stages)); // No workers launch with unbound stages.
+
+    // Fail closed on a foreign physical layout rather than reusing the
+    // wrong model's backend placement or a different C2P/P2C direction.
+    const auto foreign = llama_hybrid_build_cycle_layout(8, 5, 1);
+    llama_hybrid_cycle_stage_dispatcher wrong(foreign);
+    assert(!runtime.run(wrong));
+}
+
 // Verify the compiled libllama Cycle runtime across both the original
 // eight-layer region and all 48 physical model layers. The callback acts as
 // a mock backend: no RPC, phone, weights or CPU reference are required.
@@ -911,7 +983,7 @@ static void test_cycle_runtime_physical_8_and_48() {
         std::atomic<int> tasks {0};
         std::atomic<int> c2p_sends {0};
         std::atomic<int> p2c_sends {0};
-        const bool ok = runtime.run([&](const llama_hybrid_cycle_task & task) {
+        const auto run_stage = [&](const llama_hybrid_cycle_task & task) {
             assert(task.layer >= 0 && task.layer < layers);
             assert(task.chunk >= 0 && task.chunk < chunks);
             const auto kind = runtime.config().layout.kinds[size_t(task.layer)];
@@ -940,7 +1012,32 @@ static void test_cycle_runtime_physical_8_and_48() {
             }
             ++tasks;
             return true;
-        });
+        };
+
+        // Bind actual physical stages, not a test-only "any task" callback.
+        // The same dispatcher is used for the six-period 48-layer Ring.
+        llama_hybrid_cycle_stage_dispatcher stages(runtime.config().layout);
+        for (int layer = 0; layer < layers; ++layer) {
+            const auto kind = runtime.config().layout.kinds[size_t(layer)];
+            if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+                kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+                for (const auto stage : {
+                        llama_hybrid_cycle_stage::ATTN_PRE,
+                        llama_hybrid_cycle_stage::SEND_ACTIVATION,
+                        llama_hybrid_cycle_stage::FFN_SOURCE,
+                        llama_hybrid_cycle_stage::FFN_DESTINATION,
+                        llama_hybrid_cycle_stage::SEND_PARTIAL,
+                        llama_hybrid_cycle_stage::REDUCE}) {
+                    assert(stages.bind(layer, stage, run_stage));
+                }
+            } else {
+                assert(stages.bind(layer,
+                    llama_hybrid_cycle_stage::FULL_LAYER, run_stage));
+            }
+        }
+        std::string invalid_reason;
+        assert(stages.validate(invalid_reason));
+        const bool ok = runtime.run(stages);
         assert(ok);
         for (auto & flag : completed) assert(flag.load() == 1);
         assert(tasks.load() == (layers / 8) * chunks * 18);
@@ -950,6 +1047,8 @@ static void test_cycle_runtime_physical_8_and_48() {
 }
 
 int main() {
+    test_cycle_runtime_physical_route_guard();
+    test_cycle_runtime_missing_stage_fails_closed();
     test_cycle_runtime_physical_8_and_48();
     test_v5_ready_c2p_reduce_beats_next_region_prepare();
     test_chunk_trace_observational();

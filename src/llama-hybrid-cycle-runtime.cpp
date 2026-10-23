@@ -234,6 +234,128 @@ bool llama_hybrid_cycle_runtime_validate_model(
     return true;
 }
 
+namespace {
+
+bool cycle_runtime_stage_applies(
+        llama_hybrid_cycle_layer_kind kind, llama_hybrid_cycle_stage stage) {
+    const bool tensor = kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+                        kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+    const auto index = static_cast<size_t>(stage);
+    if (index > static_cast<size_t>(llama_hybrid_cycle_stage::REDUCE)) {
+        return false;
+    }
+    return tensor ? stage != llama_hybrid_cycle_stage::FULL_LAYER :
+                    stage == llama_hybrid_cycle_stage::FULL_LAYER;
+}
+
+llama_hybrid_cycle_queue cycle_runtime_owner_queue(llama_hybrid_cycle_owner owner) {
+    switch (owner) {
+        case llama_hybrid_cycle_owner::PC_CPU:
+            return llama_hybrid_cycle_queue::PC_CPU;
+        case llama_hybrid_cycle_owner::PHONE_GPU:
+            return llama_hybrid_cycle_queue::PHONE_GPU;
+        case llama_hybrid_cycle_owner::PC_CUDA:
+            return llama_hybrid_cycle_queue::PC_CUDA;
+    }
+    return llama_hybrid_cycle_queue::COUNT;
+}
+
+bool cycle_runtime_task_route_matches(
+        const llama_hybrid_cycle_layout & layout, const llama_hybrid_cycle_task & task) {
+    if (task.layer < 0 || static_cast<size_t>(task.layer) >= layout.kinds.size() ||
+        task.chunk < 0 || !cycle_runtime_stage_applies(
+            layout.kinds[static_cast<size_t>(task.layer)], task.stage)) {
+        return false;
+    }
+    const auto kind = layout.kinds[static_cast<size_t>(task.layer)];
+    auto expected_owner = llama_hybrid_cycle_attn_owner(kind);
+    if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+        kind == llama_hybrid_cycle_layer_kind::PC_CPU && layout.pc_cuda_full) {
+        expected_owner = llama_hybrid_cycle_owner::PC_CUDA;
+    } else if (task.stage == llama_hybrid_cycle_stage::FFN_DESTINATION ||
+               task.stage == llama_hybrid_cycle_stage::REDUCE) {
+        expected_owner = llama_hybrid_cycle_output_owner(kind);
+    }
+    auto expected_queue = cycle_runtime_owner_queue(expected_owner);
+    if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION ||
+        task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
+        expected_queue = kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ?
+            llama_hybrid_cycle_queue::PC_TO_PHONE :
+            llama_hybrid_cycle_queue::PHONE_TO_PC;
+    }
+    return task.owner == expected_owner && task.queue == expected_queue;
+}
+
+} // namespace
+
+llama_hybrid_cycle_stage_dispatcher::llama_hybrid_cycle_stage_dispatcher(
+        const llama_hybrid_cycle_layout & physical_layout)
+    : layout_(physical_layout), handlers_(physical_layout.kinds.size()) {
+    if (!layout_.enabled()) {
+        throw std::invalid_argument("cycle Stage dispatcher needs physical layers");
+    }
+}
+
+bool llama_hybrid_cycle_stage_dispatcher::bind(
+        int physical_layer, llama_hybrid_cycle_stage stage, handler execute) {
+    if (physical_layer < 0 ||
+        static_cast<size_t>(physical_layer) >= handlers_.size() ||
+        !cycle_runtime_stage_applies(layout_.kinds[static_cast<size_t>(physical_layer)],
+                                     stage) || !execute) {
+        return false;
+    }
+    auto & slot = handlers_[static_cast<size_t>(physical_layer)]
+                           [static_cast<size_t>(stage)];
+    if (slot) {
+        return false;
+    }
+    slot = std::move(execute);
+    return true;
+}
+
+bool llama_hybrid_cycle_stage_dispatcher::validate(std::string & reason) const {
+    reason.clear();
+    if (handlers_.size() != layout_.kinds.size() || handlers_.empty()) {
+        reason = "LAYOUT_SIZE_MISMATCH";
+        return false;
+    }
+    for (size_t layer = 0; layer < handlers_.size(); ++layer) {
+        for (size_t stage = 0; stage < stages_per_layer; ++stage) {
+            const bool needed = cycle_runtime_stage_applies(
+                layout_.kinds[layer], static_cast<llama_hybrid_cycle_stage>(stage));
+            if (needed && !handlers_[layer][stage]) {
+                reason = "UNBOUND_PHYSICAL_STAGE layer=" + std::to_string(layer) +
+                         " stage=" + llama_hybrid_cycle_stage_name(
+                             static_cast<llama_hybrid_cycle_stage>(stage));
+                return false;
+            }
+            if (!needed && handlers_[layer][stage]) {
+                reason = "INVALID_PHYSICAL_STAGE layer=" + std::to_string(layer);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_hybrid_cycle_stage_dispatcher::matches(
+        const llama_hybrid_cycle_layout & other) const {
+    return layout_.kinds == other.kinds && layout_.x == other.x &&
+           layout_.y == other.y && layout_.cycle_size == other.cycle_size &&
+           layout_.cycles == other.cycles && layout_.tail_begin == other.tail_begin &&
+           layout_.pc_cuda_full == other.pc_cuda_full;
+}
+
+bool llama_hybrid_cycle_stage_dispatcher::execute(
+        const llama_hybrid_cycle_task & task) const {
+    if (!cycle_runtime_task_route_matches(layout_, task)) {
+        return false;
+    }
+    const auto & execute = handlers_[static_cast<size_t>(task.layer)]
+                                    [static_cast<size_t>(task.stage)];
+    return execute && execute(task);
+}
+
 llama_hybrid_cycle_runtime::llama_hybrid_cycle_runtime(
         llama_hybrid_cycle_runtime_config config)
     : config_(std::move(config)) {
@@ -297,6 +419,23 @@ bool llama_hybrid_cycle_runtime::run(
         config_.credit_until_handoff, profile,
         config_.pc_cpu_reduce_priority, config_.ordered_c2p_reduce,
         config_.phone_main_priority, timeline);
+}
+
+bool llama_hybrid_cycle_runtime::run(
+        const llama_hybrid_cycle_stage_dispatcher & stages,
+        llama_hybrid_cycle_fifo_profile * profile,
+        llama_hybrid_cycle_chunk_timeline * timeline) const {
+    std::string reason;
+    if (!stages.matches(config_.layout) || !stages.validate(reason)) {
+        std::fprintf(stderr,
+            "[CYCLE_RUNTIME_STAGE] status=FAIL reason=%s\n",
+            !stages.matches(config_.layout) ? "FOREIGN_PHYSICAL_LAYOUT" :
+                                                 reason.c_str());
+        return false;
+    }
+    return run([&stages](const llama_hybrid_cycle_task & task) {
+        return stages.execute(task);
+    }, profile, timeline);
 }
 
 const llama_hybrid_cycle_runtime_config & llama_hybrid_cycle_runtime::config() const {

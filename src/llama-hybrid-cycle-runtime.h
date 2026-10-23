@@ -2,8 +2,10 @@
 
 #include "llama-hybrid-cycle-fifo-executor.h"
 
+#include <array>
 #include <functional>
 #include <string>
+#include <vector>
 
 struct llama_model;
 
@@ -45,6 +47,38 @@ LLAMA_API bool llama_hybrid_cycle_runtime_validate_model(
     const llama_hybrid_cycle_layout & layout,
     std::string & reason);
 
+// Typed, physical-layer Stage callback registry. A single instance is
+// populated before worker start, then read concurrently by the five FIFO
+// workers. Handlers retain ownership of real GPU/CPU/RPC objects and must
+// complete device/transfer dependencies before returning true. No graph is
+// built or silently routed to Meta by the dispatcher.
+//
+// Production and the original V5 real-cycle test share this same dispatch:
+// FULL_LAYER for PC/Phone, six ordered Tensor stages for C2P/P2C.
+class llama_hybrid_cycle_stage_dispatcher {
+public:
+    using handler = std::function<bool(const llama_hybrid_cycle_task &)>;
+
+    LLAMA_API explicit llama_hybrid_cycle_stage_dispatcher(
+        const llama_hybrid_cycle_layout & physical_layout);
+
+    // A physical (layer, stage) can be bound only once. A stage not present
+    // in the layer's placement is rejected instead of dropped at runtime.
+    LLAMA_API bool bind(int physical_layer, llama_hybrid_cycle_stage stage,
+                        handler execute);
+
+    // Check all required Stage handlers before any background workers start.
+    LLAMA_API bool validate(std::string & reason) const;
+    LLAMA_API bool matches(const llama_hybrid_cycle_layout & other) const;
+    LLAMA_API bool execute(const llama_hybrid_cycle_task & task) const;
+
+private:
+    static constexpr size_t stages_per_layer =
+        static_cast<size_t>(llama_hybrid_cycle_stage::REDUCE) + 1;
+    llama_hybrid_cycle_layout layout_;
+    std::vector<std::array<handler, stages_per_layer>> handlers_;
+};
+
 class llama_hybrid_cycle_runtime {
 public:
     LLAMA_API explicit llama_hybrid_cycle_runtime(llama_hybrid_cycle_runtime_config config);
@@ -60,6 +94,13 @@ public:
     // silently recomputed or converted to a legacy Meta full-model graph.
     LLAMA_API bool run(
         const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
+        llama_hybrid_cycle_fifo_profile * profile = nullptr,
+        llama_hybrid_cycle_chunk_timeline * timeline = nullptr) const;
+
+    // New physical Stage registry: fail closed on an incomplete/foreign
+    // layout before starting workers; the legacy callback form is retained.
+    LLAMA_API bool run(
+        const llama_hybrid_cycle_stage_dispatcher & stages,
         llama_hybrid_cycle_fifo_profile * profile = nullptr,
         llama_hybrid_cycle_chunk_timeline * timeline = nullptr) const;
 

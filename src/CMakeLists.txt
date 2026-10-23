@@ -26,6 +26,7 @@ add_library(llama
             llama-hybrid-cycle-wire.cpp
             llama-hybrid-cycle-phone-executor.cpp
             llama-hybrid-cycle-p2c-ffn.cpp
+            llama-hybrid-cycle-ffn-shard.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
