@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -51,7 +52,9 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
     llama_hybrid_cycle_execution_session<PhoneSlot, P2cSlot> & session,
     const std::vector<float> & initial_hidden,
     int64_t hidden,
-    std::string & reason) {
+    std::string & reason,
+    std::function<void(int, int, int64_t, int64_t,
+                       const std::vector<float> &)> trace_output = {}) {
     reason.clear();
     const auto & layout = resources.execution_layout();
     const auto & state_layout = session.config().layout;
@@ -85,7 +88,8 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
         }
         const bool bound = stages.bind(l, llama_hybrid_cycle_stage::FULL_LAYER,
             [l, hidden, pc_cpu, &resources, &session, &model,
-             &initial_hidden](const llama_hybrid_cycle_task & task) {
+             &initial_hidden, trace_output](
+                const llama_hybrid_cycle_task & task) {
                 if (task.layer != l || task.chunk < 0 ||
                     task.chunk >= session.chunks_per_layer() ||
                     task.stage != llama_hybrid_cycle_stage::FULL_LAYER) {
@@ -126,6 +130,13 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                         chunk.start, chunk.tokens, input,
                         chunk.host_output)) {
                     return false;
+                }
+                // Diagnostic capture is executed only on this PC Full's
+                // owning FIFO worker after the real computation completed,
+                // before its immutable Host output is published downstream.
+                if (trace_output) {
+                    trace_output(l, task.chunk, chunk.start, chunk.tokens,
+                                 chunk.host_output);
                 }
                 return session.publish_host_output(l, task.chunk, hidden);
             });

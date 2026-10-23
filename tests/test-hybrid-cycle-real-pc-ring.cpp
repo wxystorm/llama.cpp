@@ -45,6 +45,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -166,6 +167,21 @@ int main(int argc, char ** argv) {
             "reason=REAL_REFERENCE_REQUIRES_REAL_48_LAYERS\n");
         return 2;
     }
+    const char * trace_env = std::getenv("LLAMA_HYBRID_CYCLE_TRACE_PARITY");
+    if (trace_env && std::strcmp(trace_env, "0") != 0 &&
+        std::strcmp(trace_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=BAD_TRACE_PARITY_FLAG\n");
+        return 2;
+    }
+    const bool trace_parity = trace_env &&
+        std::strcmp(trace_env, "1") == 0;
+    if (trace_parity && !use_cpu_reference) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=TRACE_PARITY_REQUIRES_CPU_REFERENCE\n");
+        return 2;
+    }
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(
@@ -180,7 +196,7 @@ int main(int argc, char ** argv) {
     // Keep only the captured ~7x(token*hidden) F32 host arrays.
     cycle_full_reference::baseline reference;
     if (use_cpu_reference &&
-        !reference.run(argv[1], cpu_dev, n_tokens)) {
+        !reference.run(argv[1], cpu_dev, n_tokens, trace_parity)) {
         std::fprintf(stderr,
             "[CYCLE_REAL_PC_RING] status=FAIL reason=CPU_ORACLE\n");
         return 1;
@@ -324,6 +340,74 @@ int main(int argc, char ** argv) {
                                 n_tokens, total, input_ok ? "PASS" : "FAIL");
                         }
 
+                        // Diagnostic mode: compare every immutable layer
+                        // output against the ordinary llama_decode CPU oracle.
+                        // Normally DISABLED: GPU readback here would distort
+                        // latency and must not become part of the real pipeline.
+                        std::atomic<int> trace_seen {0};
+                        std::atomic<int> trace_failed {0};
+                        std::atomic<int> trace_first_bad {48};
+                        const auto trace_host = [&](int layer, int chunk,
+                                int64_t position, int64_t tokens,
+                                const std::vector<float> & actual,
+                                const char * backend) {
+                            if (!trace_parity) return;
+                            const bool pass =
+                                cycle_full_reference::compare_layer_chunk(
+                                    actual,
+                                    reference.after_layer[size_t(layer)],
+                                    layer, chunk, position, tokens,
+                                    hidden, backend);
+                            trace_seen.fetch_add(1, std::memory_order_relaxed);
+                            if (!pass) {
+                                trace_failed.fetch_add(
+                                    1, std::memory_order_relaxed);
+                                // Many FIFO workers may finish out-of-order.
+                                // Report the FIRST PHYSICAL layer with a
+                                // strict mismatch, not the first log timestamp.
+                                int first = trace_first_bad.load(
+                                    std::memory_order_relaxed);
+                                while (layer < first &&
+                                       !trace_first_bad.compare_exchange_weak(
+                                            first, layer,
+                                            std::memory_order_relaxed)) {}
+                            }
+                        };
+                        const auto trace_gpu = [&](int layer, int chunk,
+                                int64_t position, int64_t tokens,
+                                const ggml_tensor * tensor,
+                                const char * backend) {
+                            if (!trace_parity) return;
+                            const size_t expected =
+                                size_t(tokens) * size_t(hidden);
+                            std::vector<float> host;
+                            if (tensor && tensor->buffer &&
+                                tensor->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(tensor) &&
+                                ggml_nelements(tensor) == int64_t(expected)) {
+                                // Device-complete, immutable output BEFORE
+                                // downstream slot retirement/reuse. This is
+                                // an explicit diagnostic transfer ONLY.
+                                host.resize(expected);
+                                ggml_backend_tensor_get(
+                                    tensor, host.data(), 0,
+                                    expected * sizeof(float));
+                            }
+                            trace_host(layer, chunk, position,
+                                       tokens, host, backend);
+                        };
+                        std::function<void(
+                            int, int, int64_t, int64_t,
+                            const std::vector<float> &)> pc_trace;
+                        if (trace_parity) {
+                            pc_trace = [&](int l, int c, int64_t start,
+                                           int64_t tokens,
+                                           const std::vector<float> & v) {
+                                trace_host(
+                                    l, c, start, tokens, v, "PC_CPU_FULL");
+                            };
+                        }
+
                         // Mock Phone device activations live until all FIFO
                         // workers join. Exactly one producing stage writes
                         // each (physical layer, Chunk); dependencies in the
@@ -377,7 +461,7 @@ int main(int argc, char ** argv) {
                         llama_hybrid_cycle_stage_dispatcher stages(layout);
                         if (ok && !llama_hybrid_cycle_bind_pc_full_stages(
                                 stages, *model, resources, cpu, session,
-                                initial_hidden, hidden, reason)) {
+                                initial_hidden, hidden, reason, pc_trace)) {
                             std::fprintf(stderr,
                                 "[CYCLE_REAL_PC_RING] status=FAIL "
                                 "reason=BIND_REAL_PC detail=%s\n",
@@ -552,6 +636,13 @@ int main(int argc, char ** argv) {
                                                         phone, INFERENCE_CYCLE_PARTIAL,
                                                         wire.layer, wire.chunk,
                                                         wire.seq, wire.graph_id, 30000);
+                                                if (valid && trace_parity) {
+                                                    trace_gpu(
+                                                        l, c, state.start,
+                                                        state.tokens,
+                                                        slot->output,
+                                                        "C2P_PHONE_GPU");
+                                                }
                                                 if (valid && !real_phone_full) {
                                                     // Legacy diagnostic Host bridge
                                                     // to the old MOCK L5/L13/... layer.
@@ -650,6 +741,13 @@ int main(int argc, char ** argv) {
                                             }
                                             if (valid) {
                                                 state.phone_output = std::move(full_slot);
+                                                if (trace_parity) {
+                                                    trace_gpu(
+                                                        l, c, state.start,
+                                                        state.tokens,
+                                                        state.phone_output->output,
+                                                        "PHONE_GPU_FULL");
+                                                }
                                                 // The previous physical GPU l_out was
                                                 // read by this Attention and the backend
                                                 // synchronized. This is the ONLY safe
@@ -866,6 +964,13 @@ int main(int argc, char ** argv) {
                                                     state.host_output.size()) &&
                                                     cycle_pc_ring_finite(
                                                         state.host_output, expected);
+                                                if (valid && trace_parity) {
+                                                    trace_host(
+                                                        l, c, state.start,
+                                                        state.tokens,
+                                                        state.host_output,
+                                                        "P2C_PC_REDUCE");
+                                                }
                                                 if (valid) ++real_p2c_reduce;
                                                 if (valid) {
                                                     // Remote FFN TX buffer is ACKed
@@ -1234,6 +1339,28 @@ int main(int argc, char ** argv) {
                             ok = std::isfinite(sum) && std::isfinite(max_abs) &&
                                  max_abs > 0.0;
                         }
+                        if (trace_parity && ok) {
+                            const int samples = trace_seen.load(
+                                std::memory_order_relaxed);
+                            const int failed = trace_failed.load(
+                                std::memory_order_relaxed);
+                            const int first_bad = trace_first_bad.load(
+                                std::memory_order_relaxed);
+                            std::printf(
+                                "[CYCLE_LAYER_PARITY_SUM] "
+                                "layers=48 chunks=%d "
+                                "compared=%d expected=%d "
+                                "strict_failed=%d first_failed_layer=%d "
+                                "gpu_readback=DIAGNOSTIC_ONLY "
+                                "status=%s\n",
+                                n_chunks, samples, 48 * n_chunks,
+                                failed, first_bad == 48 ? -1 : first_bad,
+                                samples == 48 * n_chunks ? "COMPLETE" : "FAIL");
+                            if (samples != 48 * n_chunks) {
+                                ok = false;
+                            }
+                        }
+
                         // Six independent physical boundaries. The CPU
                         // reference is a NORMAL llama_decode full graph,
                         // not the same custom Attention/FFN graph run on CPU.

@@ -72,16 +72,20 @@ struct capture {
     int64_t hidden = 0;
     int tokens = 0;
     bool error = false;
-    std::array<std::string, 7> name;
-    std::array<int, 7> counts {};
-    std::array<std::vector<float>, 7> values;
+    std::vector<std::string> name;
+    std::vector<int> counts;
+    std::vector<std::vector<float>> values;
 
-    capture(int64_t n_hidden, int n_tokens)
+    capture(int64_t n_hidden, int n_tokens, bool all_physical_layers)
         : hidden(n_hidden), tokens(n_tokens) {
-        name[0] = "embd";
-        for (int i = 1; i <= 6; ++i) {
-            name[size_t(i)] = "l_out-" + std::to_string(i * 8 - 1);
+        name.push_back("embd");
+        for (int l = 0; l < 48; ++l) {
+            if (all_physical_layers || (l % 8 == 7)) {
+                name.push_back("l_out-" + std::to_string(l));
+            }
         }
+        counts.resize(name.size(), 0);
+        values.resize(name.size());
     }
 
     static bool callback(ggml_tensor * tensor, bool ask, void * user) {
@@ -168,9 +172,11 @@ struct baseline {
     int64_t hidden = 0;
     std::vector<float> embedding;
     std::array<std::vector<float>, 6> after_period;
+    // Only retained with the expensive, explicit 48-layer diagnostic.
+    std::array<std::vector<float>, 48> after_layer;
 
     bool run(const char * model_path, ggml_backend_dev_t cpu_device,
-             int required_tokens) {
+             int required_tokens, bool trace_all_layers = false) {
         if (!model_path || !cpu_device ||
             required_tokens < 1 || required_tokens > 64) {
             return false;
@@ -202,7 +208,7 @@ struct baseline {
                 "[CYCLE_FULL_REFERENCE] status=FAIL reason=MODEL\n");
             return false;
         }
-        capture state(model->hparams.n_embd, required_tokens);
+        capture state(model->hparams.n_embd, required_tokens, trace_all_layers);
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 512;
         cp.n_batch = 128;
@@ -280,15 +286,31 @@ struct baseline {
         n_tokens = required_tokens;
         hidden = state.hidden;
         embedding = std::move(state.values[0]);
-        for (int i = 0; i < 6; ++i) {
-            after_period[size_t(i)] =
-                std::move(state.values[size_t(i + 1)]);
+        if (trace_all_layers) {
+            // Every layer is retained for optional numerical localization.
+            // The additional CPU host storage is at most 48*64*2048*4B,
+            // far less than a second 30B model allocation.
+            for (int l = 0; l < 48; ++l) {
+                after_layer[size_t(l)] =
+                    std::move(state.values[size_t(l + 1)]);
+            }
+            for (int period = 0; period < 6; ++period) {
+                after_period[size_t(period)] =
+                    after_layer[size_t(8 * period + 7)];
+            }
+        } else {
+            for (int period = 0; period < 6; ++period) {
+                after_period[size_t(period)] =
+                    std::move(state.values[size_t(period + 1)]);
+            }
         }
         std::printf(
             "[CYCLE_FULL_REFERENCE] model=CPU_ONLY "
-            "capture=EMBEDDING_AND_SIX_L_OUT "
+            "capture=%s "
             "model_lifetime=SEPARATE_BEFORE_HYBRID "
             "tokens=%d hidden=%lld status=PASS\n",
+            trace_all_layers ? "EMBEDDING_AND_ALL_48_L_OUT" :
+                "EMBEDDING_AND_SIX_L_OUT",
             n_tokens, (long long) hidden);
         return true;
     }
@@ -357,6 +379,72 @@ inline bool compare_period(const std::vector<float> & actual,
             (long long)(worst % size_t(hidden)),
             ok ? "PASS" : "FAIL");
     }
+    return passed;
+}
+
+// Trace-only, fine-grained check for one immutable output Chunk of an
+// absolute physical layer. Threshold is EXACTLY the V5 strict period bound,
+// without relaxed cosine-only acceptance or hardware-specific exceptions.
+inline bool compare_layer_chunk(
+        const std::vector<float> & actual,
+        const std::vector<float> & reference,
+        int layer, int chunk, int64_t start, int64_t tokens,
+        int64_t hidden, const char * backend) {
+    const bool shape_ok = layer >= 0 && layer < 48 && chunk >= 0 &&
+        start >= 0 && tokens > 0 && hidden > 0 &&
+        actual.size() == size_t(tokens) * size_t(hidden) &&
+        size_t(start + tokens) * size_t(hidden) <= reference.size();
+    if (!shape_ok) {
+        std::printf(
+            "[CYCLE_LAYER_PARITY] layer=%d chunk=%d backend=%s "
+            "status=FAIL reason=SHAPE_OR_REFERENCE "
+            "actual=%zu reference=%zu tokens=%lld start=%lld\n",
+            layer, chunk, backend, actual.size(), reference.size(),
+            (long long) tokens, (long long) start);
+        return false;
+    }
+    const size_t n = actual.size();
+    const size_t first = size_t(start) * size_t(hidden);
+    double worst_abs = 0, max_ref = 0;
+    double squared = 0, dot = 0, actual2 = 0, reference2 = 0;
+    size_t worst = 0;
+    bool finite = true;
+    for (size_t i = 0; i < n; ++i) {
+        const double a = actual[i], b = reference[first + i];
+        if (!std::isfinite(a) || !std::isfinite(b)) {
+            finite = false;
+            worst = i;
+            break;
+        }
+        const double delta = std::fabs(a - b);
+        if (delta > worst_abs) {
+            worst_abs = delta;
+            worst = i;
+        }
+        max_ref = std::max(max_ref, std::fabs(b));
+        squared += delta * delta;
+        dot += a * b;
+        actual2 += a * a;
+        reference2 += b * b;
+    }
+    const double rms = finite ? std::sqrt(squared / double(n)) : 0;
+    const double cosine = finite && actual2 > 0 && reference2 > 0 ?
+        dot / std::sqrt(actual2 * reference2) : 0;
+    const double tolerance = 0.02 + 0.00002 * max_ref;
+    const bool passed = finite && worst_abs <= tolerance;
+    std::printf(
+        "[CYCLE_LAYER_PARITY] layer=%d chunk=%d backend=%s "
+        "positions=[%lld,%lld] max_abs=%.9g rms=%.9g "
+        "cosine=%.9g max_ref=%.9g strict_tolerance=%.9g "
+        "worst_token=%lld worst_channel=%lld "
+        "worst_actual=%.9g worst_reference=%.9g status=%s\n",
+        layer, chunk, backend,
+        (long long) start, (long long)(start + tokens - 1),
+        worst_abs, rms, cosine, max_ref, tolerance,
+        (long long) (start + int64_t(worst / size_t(hidden))),
+        (long long) (worst % size_t(hidden)),
+        actual[worst], reference[first + worst],
+        passed ? "PASS" : "FAIL");
     return passed;
 }
 
