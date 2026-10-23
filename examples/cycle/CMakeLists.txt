@@ -17,4 +17,10 @@ if (TARGET ggml-rpc)
         llama-cycle-runtime ${CMAKE_THREAD_LIBS_INIT})
     target_compile_features(llama-cycle-prefill PRIVATE cxx_std_17)
     install(TARGETS llama-cycle-prefill RUNTIME)
+
+    add_executable(llama-cycle-cli llama-cycle-cli.cpp)
+    target_link_libraries(llama-cycle-cli PRIVATE
+        llama-cycle-runtime ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(llama-cycle-cli PRIVATE cxx_std_17)
+    install(TARGETS llama-cycle-cli RUNTIME)
 endif()

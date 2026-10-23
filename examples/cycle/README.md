@@ -34,8 +34,10 @@ returns **one next-token logit decision**.
 
 ## Boundaries still to integrate
 
-- A long-lived physical-KV evaluation session for incremental decode. The
-  one-shot prefill API must NOT be called repeatedly for generation.
+- Long-lived incremental generation is now available through the
+  separate `llama-cycle-cli` target; see [DECODE.md](DECODE.md).
+  The one-shot `llama_hybrid_cycle_forward_prefill` remains intentionally
+  a one-call API and must not be repeatedly invoked as decode.
 - Standard `llama_context::decode()` and `llama_get_logits()` interoperability:
   the native Cycle output is currently owned by this standalone CLI rather
   than the regular llama_context memory manager.

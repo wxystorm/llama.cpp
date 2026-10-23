@@ -4,10 +4,12 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 struct llama_model;
+class llama_hybrid_cycle_physical_resource_pool;
 
 // Executable 48-physical-layer Cycle prefill, independent of the test binary.
 // The caller owns its already-loaded *physically sharded* model and the CPU
@@ -50,3 +52,42 @@ bool llama_hybrid_cycle_forward_prefill(
     llama_hybrid_cycle_forward_metrics * metrics = nullptr,
     int chunk_tokens = 16,
     int max_inflight = 2);
+
+// Persistent physical KV session for Prefill and incremental one-token Decode.
+// Every append is a new global FIFO invocation with absolute position and a
+// distinct wire epoch; all 48 physical KV tensors survive between calls.
+// Attention's current hard limit remains 128 total tokens, not long context.
+class llama_hybrid_cycle_session {
+public:
+    llama_hybrid_cycle_session();
+    ~llama_hybrid_cycle_session();
+    llama_hybrid_cycle_session(const llama_hybrid_cycle_session &) = delete;
+    llama_hybrid_cycle_session & operator=(const llama_hybrid_cycle_session &) = delete;
+
+    bool prepare(const llama_model & model, ggml_backend_t cpu,
+                 ggml_backend_t phone_rpc_gpu, int64_t max_total_tokens,
+                 std::string & reason,
+                 int chunk_tokens = 16, int max_inflight = 2);
+
+    // After prompt evaluation, call with ONE next-token embedding.
+    // Every successful call commits the absolute physical KV prefix.
+    bool evaluate(const std::vector<float> & embeddings, int tokens,
+                  std::vector<float> & final_hidden, std::string & reason,
+                  llama_hybrid_cycle_forward_metrics * metrics = nullptr);
+
+    int64_t committed_tokens() const;
+    bool usable() const;
+    void reset();
+
+private:
+    const llama_model * model_ = nullptr;
+    ggml_backend_t cpu_ = nullptr;
+    ggml_backend_t phone_ = nullptr;
+    std::unique_ptr<llama_hybrid_cycle_physical_resource_pool> resources_;
+    int64_t prefix_ = 0;
+    int64_t capacity_ = 0;
+    uint64_t wire_epoch_ = 0;
+    int chunk_tokens_ = 16;
+    int max_inflight_ = 2;
+    bool poisoned_ = false;
+};

@@ -45,10 +45,13 @@ static bool cycle_core_env_default(const char * key, const char * value) {
 #endif
 }
 
-bool llama_hybrid_cycle_forward_prefill(
+static bool cycle_core_evaluate_with_kv(
         const llama_model & loaded_model,
         ggml_backend_t pc_cpu,
         ggml_backend_t phone_rpc_gpu,
+        llama_hybrid_cycle_physical_resource_pool & resources,
+        int64_t position_base,
+        uint64_t wire_epoch,
         const std::vector<float> & token_embeddings,
         int n_tokens,
         std::vector<float> & final_hidden,
@@ -67,6 +70,7 @@ bool llama_hybrid_cycle_forward_prefill(
         model->arch != LLM_ARCH_QWEN3MOE ||
         llama_model_n_layer(model) != 48 ||
         hidden <= 0 || n_tokens < 1 || n_tokens > 64 ||
+        position_base < 0 || position_base > 128 - n_tokens ||
         chunk_tokens < 1 || chunk_tokens > 16 ||
         max_inflight < 1 || max_inflight > 2 ||
         n_tokens > std::numeric_limits<int>::max() - chunk_tokens + 1 ||
@@ -80,22 +84,28 @@ bool llama_hybrid_cycle_forward_prefill(
             return false;
         }
     }
-    llama_hybrid_cycle_layout physical;
-    if (!llama_hybrid_cycle_layout_from_env(48, physical) ||
-        physical.x != 4 || physical.y != 2 ||
-        physical.cycle_size != 8 || physical.cycles != 6) {
-        reason = "EXPECTED_REAL_48_LAYER_X4_Y2_LAYOUT";
+    const auto & loaded_layout = resources.execution_layout();
+    if (!loaded_layout.enabled() ||
+        loaded_layout.kinds.size() != 48 ||
+        loaded_layout.x != 4 || loaded_layout.y != 2 ||
+        loaded_layout.cycle_size != 8 || loaded_layout.cycles != 6 ||
+        resources.prepared_layers() != 48) {
+        reason = "PHYSICAL_48_LAYOUT_NOT_PREPARED";
         return false;
+    }
+    // A new invocation can only append to an EXACT physical KV prefix.
+    // No stale P2C/Phone handoff or previous graph may be recomputed.
+    for (int l = 0; l < 48; ++l) {
+        const auto * r = resources.layer(l);
+        if (!r || !r->kv ||
+            r->kv->max_tokens < position_base + n_tokens ||
+            r->kv->committed_tokens != position_base) {
+            reason = "PHYSICAL_KV_PREFIX_NOT_PREPARED";
+            return false;
+        }
     }
     const int n_chunks = (n_tokens + chunk_tokens - 1) / chunk_tokens;
     if (max_inflight > n_chunks) max_inflight = n_chunks;
-    llama_hybrid_cycle_physical_resource_pool resources;
-    llama_hybrid_cycle_resource_config resource_config;
-    resource_config.kv_tokens = n_tokens;
-    resource_config.max_inflight = max_inflight;
-    resource_config.cuda_weight_budget_bytes = 0;
-    if (!resources.prepare(*model, physical, cpu, phone, nullptr,
-                           resource_config, reason)) return false;
     bool ok = true;
     {
         const auto & layout = resources.execution_layout();
@@ -125,6 +135,8 @@ bool llama_hybrid_cycle_forward_prefill(
             sc.physical_layer_count = 48;
             sc.tokens = n_tokens;
             sc.chunk_tokens = chunk_tokens;
+            sc.token_position_base = position_base;
+            sc.wire_epoch = wire_epoch;
             llama_hybrid_cycle_execution_session<> session(sc);
             for (int layer = 0; layer < 48; ++layer) {
                 const auto * r = resources.layer(layer);
@@ -945,7 +957,7 @@ bool llama_hybrid_cycle_forward_prefill(
                 if (!ok) reason = "REAL_RPC_TX_NOT_DRAINED";
             }
             if (!ok) ggml_backend_synchronize(phone);
-            if (ok && !session.kv_complete(n_tokens)) {
+            if (ok && !session.kv_complete(position_base + n_tokens)) {
                 reason = "REAL_PHYSICAL_KV_INCOMPLETE";
                 ok = false;
             }
@@ -989,7 +1001,7 @@ bool llama_hybrid_cycle_forward_prefill(
                     std::copy(
                         output.host_output.begin(),output.host_output.end(),
                         final_hidden.begin() +
-                            size_t(output.start)*size_t(hidden));
+                            size_t(output.start - position_base)*size_t(hidden));
                 }
             }
             if (ok) {
@@ -1017,13 +1029,14 @@ bool llama_hybrid_cycle_forward_prefill(
                 metrics->p2c_ready_received = real_p2c_ready_rx.load();
                 metrics->p2c_partial_received = real_p2c_partial_rx.load();
                 metrics->p2c_reduce_ack = real_p2c_partial_ack.load();
-                metrics->all_kv_complete = session.kv_complete(n_tokens);
+                metrics->all_kv_complete = session.kv_complete(position_base + n_tokens);
                 metrics->all_host_outputs_published = !final_hidden.empty();
                 metrics->all_phone_slots_retired = ok;
             }
         } // all Stage handlers, Session & Phone slots destroyed here.
     }
-    resources.clear(); // physical KV after all FIFO worker/scratch destructors
+    // The owning session retains physical K/V after the per-append FIFO
+    // workers and their temporary Graph Slots have been destroyed.
     if (!ok) {
         final_hidden.clear();
         if (reason.empty()) reason = "REAL_FIFO_OR_DEPENDENCY_FAILED";
@@ -1041,3 +1054,132 @@ bool llama_hybrid_cycle_forward_prefill(
 }
 
 #undef cycle_pc_ring_finite
+
+bool llama_hybrid_cycle_forward_prefill(
+        const llama_model & model, ggml_backend_t pc_cpu,
+        ggml_backend_t phone_rpc_gpu,
+        const std::vector<float> & token_embeddings, int n_tokens,
+        std::vector<float> & final_hidden, std::string & reason,
+        llama_hybrid_cycle_forward_metrics * metrics,
+        int chunk_tokens, int max_inflight) {
+    llama_hybrid_cycle_session session;
+    if (!session.prepare(model, pc_cpu, phone_rpc_gpu, n_tokens,
+                         reason, chunk_tokens, max_inflight)) {
+        final_hidden.clear();
+        return false;
+    }
+    return session.evaluate(token_embeddings, n_tokens,
+                            final_hidden, reason, metrics);
+}
+
+llama_hybrid_cycle_session::llama_hybrid_cycle_session() = default;
+llama_hybrid_cycle_session::~llama_hybrid_cycle_session() {
+    reset();
+}
+
+bool llama_hybrid_cycle_session::prepare(
+        const llama_model & model, ggml_backend_t cpu,
+        ggml_backend_t phone, int64_t max_total_tokens,
+        std::string & reason, int chunk_tokens, int max_inflight) {
+    reset();
+    reason.clear();
+    if (!cpu || !phone ||
+        model.arch != LLM_ARCH_QWEN3MOE ||
+        llama_model_n_layer(&model) != 48 ||
+        !ggml_backend_is_rpc(phone) ||
+        max_total_tokens < 1 || max_total_tokens > 128 ||
+        chunk_tokens < 1 || chunk_tokens > 16 ||
+        max_inflight < 1 || max_inflight > 2) {
+        reason = "INVALID_CYCLE_SESSION_CONFIG";
+        return false;
+    }
+    llama_hybrid_cycle_layout layout;
+    if (!llama_hybrid_cycle_layout_from_env(48, layout) ||
+        layout.x != 4 || layout.y != 2 ||
+        layout.cycle_size != 8 || layout.cycles != 6) {
+        reason = "EXPECTED_REAL_48_LAYER_X4_Y2_LAYOUT";
+        return false;
+    }
+    auto pool = std::make_unique<llama_hybrid_cycle_physical_resource_pool>();
+    llama_hybrid_cycle_resource_config config;
+    config.kv_tokens = max_total_tokens;
+    config.max_inflight = max_inflight;
+    config.cuda_weight_budget_bytes = 0;
+    if (!pool->prepare(model, layout, cpu, phone, nullptr,
+                       config, reason)) return false;
+    model_ = &model;
+    cpu_ = cpu;
+    phone_ = phone;
+    capacity_ = max_total_tokens;
+    chunk_tokens_ = chunk_tokens;
+    max_inflight_ = max_inflight;
+    resources_ = std::move(pool);
+    prefix_ = 0;
+    wire_epoch_ = 0;
+    poisoned_ = false;
+    std::printf(
+        "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
+        "layers=48 window=%d phone_gpu=REAL status=PASS\n",
+        (long long) capacity_, max_inflight_);
+    return true;
+}
+
+bool llama_hybrid_cycle_session::evaluate(
+        const std::vector<float> & embeddings, int tokens,
+        std::vector<float> & hidden, std::string & reason,
+        llama_hybrid_cycle_forward_metrics * metrics) {
+    hidden.clear();
+    reason.clear();
+    if (!usable() || tokens < 1 || tokens > 64 ||
+        int64_t(tokens) > capacity_ - prefix_) {
+        reason = "SESSION_NOT_READY_OR_KV_CAPACITY";
+        return false;
+    }
+    const bool ok = cycle_core_evaluate_with_kv(
+        *model_, cpu_, phone_, *resources_,
+        prefix_, wire_epoch_, embeddings, tokens,
+        hidden, reason, metrics, chunk_tokens_, max_inflight_);
+    if (ok) {
+        prefix_ += tokens;
+        ++wire_epoch_;
+        std::printf(
+            "[CYCLE_SESSION] phase=COMMIT "
+            "absolute_kv_prefix=%lld epoch=%llu "
+            "appended_tokens=%d status=PASS\n",
+            (long long) prefix_,
+            (unsigned long long) wire_epoch_, tokens);
+    } else {
+        // The failed graph may have committed only some physical K/V.
+        // Poison the session: never mix those prefixes on a retry.
+        poisoned_ = true;
+        hidden.clear();
+        std::fprintf(stderr,
+            "[CYCLE_SESSION] phase=COMMIT status=FAIL "
+            "session=POISONED reason=%s\n", reason.c_str());
+    }
+    return ok;
+}
+
+bool llama_hybrid_cycle_session::usable() const {
+    return model_ && cpu_ && phone_ && resources_ && !poisoned_ &&
+           prefix_ >= 0 && prefix_ <= capacity_;
+}
+
+int64_t llama_hybrid_cycle_session::committed_tokens() const {
+    return prefix_;
+}
+
+void llama_hybrid_cycle_session::reset() {
+    // evaluate() is synchronous: no Stage worker can outlive its call.
+    if (resources_) resources_->clear();
+    resources_.reset();
+    model_ = nullptr;
+    cpu_ = nullptr;
+    phone_ = nullptr;
+    prefix_ = 0;
+    capacity_ = 0;
+    wire_epoch_ = 0;
+    chunk_tokens_ = 16;
+    max_inflight_ = 2;
+    poisoned_ = false;
+}
