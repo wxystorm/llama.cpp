@@ -33,9 +33,16 @@ public:
         if (chunks <= 0 || phone_full_layers < 0) {
             throw std::invalid_argument("invalid Phone-local cycle topology");
         }
-        for (int c = 0; c < chunks; ++c) {
-            ffn_queue_.push_back({stage::C2P_FFN, c, -1});
-        }
+    }
+
+    // Data-plane READY has been applied to the actual Phone GPU buffers.
+    // Do NOT run the FFN merely because a Chunk was registered.
+    void phone_ready(int chunk) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto & s = get(chunk);
+        if (s.ready) throw std::logic_error("duplicate Phone READY");
+        s.ready = true;
+        ffn_queue_.push_back({stage::C2P_FFN, chunk, -1});
     }
 
     // Same admission call may originate from RX or FFN completion; no
@@ -126,6 +133,7 @@ public:
     }
 private:
     struct chunk_state {
+        bool ready = false;
         bool ffn_done = false;
         bool pc_partial = false;
         bool reduce_admitted = false;
