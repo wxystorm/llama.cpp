@@ -10177,6 +10177,11 @@ bool rpc_server::apply_inference_cycle(
     // C2P APPLY first waits for its HOST frame. Do not hold the Phone GPU
     // worker gate during that wait: the P2C worker can have ready work.
     // Lock only while uploading GPU inputs and synchronizing their use.
+    // This is opt-in timing only: it does not change mutex scope or ordering.
+    const bool gpu_stage_timing =
+        std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr;
+    const int64_t gpu_gate_enter_us =
+        gpu_stage_timing ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> cycle_p2c_apply_gpu_guard;
     if (const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1")) {
         if (std::strcmp(v1, "1") == 0) {
@@ -10184,6 +10189,8 @@ bool rpc_server::apply_inference_cycle(
                 std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
         }
     }
+    const int64_t gpu_gate_acquired_us =
+        gpu_stage_timing ? ggml_time_us() : 0;
     const size_t count = ready ? 4 : 1;
     for (size_t i = 0; i < count; ++i) {
         const rpc_tensor & dst = request.tensors[i];
@@ -10255,7 +10262,7 @@ bool rpc_server::apply_inference_cycle(
         ready ? "READY" : "PARTIAL",
         request.layer, request.chunk, request.seq,
         (ready ? 2 * n + 2 * routes : n) * sizeof(float));
-    if (std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr) {
+    if (gpu_stage_timing) {
         cycle_server_record_c2p(
             ready, (rx_ready_us - apply_begin_us) / 1000.0,
             (gpu_input_ready_us - rx_ready_us) / 1000.0,
@@ -10263,11 +10270,16 @@ bool rpc_server::apply_inference_cycle(
         GGML_LOG_INFO(
             "[CYCLE_C2P_RX_PROFILE] kind=%s layer=%d chunk=%d "
             "seq=%" PRIu64 " rx_wait_ms=%.3f "
-            "input_copy_ms=%.3f scope=PHONE_SERVER_GPU_UPLOAD\n",
+            "input_copy_ms=%.3f gpu_gate_wait_ms=%.3f "
+            "gpu_copy_sync_ms=%.3f "
+            "scope=PHONE_SERVER_GPU_UPLOAD "
+            "gpu_copy_semantics=BACKEND_UPLOAD_AND_SYNC_NOT_KERNEL_ONLY\n",
             ready ? "READY" : "PARTIAL", request.layer,
             request.chunk, request.seq,
             (rx_ready_us - apply_begin_us) / 1000.0,
-            (gpu_input_ready_us - rx_ready_us) / 1000.0);
+            (gpu_input_ready_us - rx_ready_us) / 1000.0,
+            (gpu_gate_acquired_us - gpu_gate_enter_us) / 1000.0,
+            (gpu_input_ready_us - gpu_gate_acquired_us) / 1000.0);
     }
     return true;
 }
