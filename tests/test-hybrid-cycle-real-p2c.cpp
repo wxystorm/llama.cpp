@@ -5001,6 +5001,19 @@ static bool cycle_real_execute_period_fifo(
             "NO_INTERMEDIATE_READBACK\n", run_phase);
         return false;
     }
+    // V5 keeps the V4 region and buffer-ownership contract, but moves
+    // the C2P FFN/Reduce execution and L5 kickoff into Phone's own FIFO.
+    const bool phone_c2p_local = cycle_real_env_flag(
+        "LLAMA_HYBRID_CYCLE_PHONE_MAIN_PRIORITY_V5");
+    if (phone_c2p_local &&
+        (!phone_full_region_auto || !c2p_ffn_reuse || window < 1 ||
+         window > 2)) {
+        std::fprintf(stderr,
+            "[CYCLE_PHONE_V5] phase=%s status=FAIL "
+            "reason=REQUIRES_V4_AND_C2P_REUSE_WINDOW1_OR_2\\n",
+            run_phase);
+        return false;
+    }
     if (phone_full_local_ffn &&
         (!phone_ordered_handoff || !phone_full_fuse ||
          !phone_full_rpc_replay || !phone_full_reuse)) {
@@ -5461,6 +5474,15 @@ static bool cycle_real_execute_period_fifo(
             "scratch_pool=UNCHANGED\n",
             run_phase, window, layout.y);
     }
+    if (phone_c2p_local) {
+        std::printf(
+            "[CYCLE_PHONE_V5_PLAN] phase=%s enabled=1 "
+            "phone_queues=MAIN_PRIORITY,C2P_FFN "
+            "trigger=BOTH_DEVICE_READY_C2P "
+            "reduce=PHONE_LOCAL next=L5_L6_PHONE_FIFO "
+            "p2c=V4_CONTINUATION window=%d\\n",
+            run_phase, window);
+    }
     if (phone_full_region_auto) {
         std::printf(
             "[CYCLE_PHONE_V4_PLAN] phase=%s enabled=1 "
@@ -5685,8 +5707,12 @@ static bool cycle_real_execute_period_fifo(
                 plan.ffn_inputs[2] = current.phone_output->inputs.topk_ids;
                 plan.ffn_inputs[3] = current.phone_output->inputs.topk_weights;
             }
-            if (!ggml_backend_rpc_cycle_arm_phone_region(phone, stages))
-                return false;
+            const bool registered = phone_c2p_local ?
+                ggml_backend_rpc_cycle_register_phone_region_after_c2p(
+                    phone, stages, layout.x,
+                    c2p.wire.seq, c2p.wire.graph_id) :
+                ggml_backend_rpc_cycle_arm_phone_region(phone, stages);
+            if (!registered) return false;
             ++v4_region_armed;
             ++v2_attn_prepared; // L6 graph is included in this single ARM.
             v4_registered_l5_tokens += l5.tokens;
@@ -6409,7 +6435,10 @@ static bool cycle_real_execute_period_fifo(
                                     for (auto it = c2p_pool.begin();
                                          it != c2p_pool.end(); ++it) {
                                         if ((*it)->prepared_tokens == st.tokens &&
-                                            !(*it)->is_full_layer) {
+                                            !(*it)->is_full_layer &&
+                                            (!phone_c2p_local ||
+                                             ((*it)->registered_c2p_ffn_uid &&
+                                              (*it)->registered_c2p_reduce_uid))) {
                                             st.phone_output = std::move(*it);
                                             c2p_pool.erase(it);
                                             ++c2p_hits;
@@ -6453,7 +6482,8 @@ static bool cycle_real_execute_period_fifo(
                                 const auto weights = full_shard(l, 1);
                                 ok = st.phone_output->prepare(
                                     phone, weights, hidden, st.tokens,
-                                    topk, experts);
+                                    topk, experts, false, false, false, false,
+                                    phone_c2p_local);
                                 if (!ok && c2p_ffn_reuse) {
                                     st.phone_output.reset();
                                     std::lock_guard<std::mutex> lock(c2p_pool_mutex);
@@ -6472,6 +6502,19 @@ static bool cycle_real_execute_period_fifo(
                                 st.c2p_timing.phone_slot_prepare_ms =
                                     cycle_real_path_elapsed_ms(
                                         phone_prepare_begin);
+                            }
+                            if (ok && phone_c2p_local) {
+                                // ARM before either data-plane frame can
+                                // arrive. READY will wake the low FFN FIFO;
+                                // PC PARTIAL may arrive in either order.
+                                const auto & slot = *st.phone_output;
+                                ok = slot.registered_c2p_ffn_uid != 0 &&
+                                    slot.registered_c2p_reduce_uid != 0 &&
+                                    ggml_backend_rpc_cycle_arm_c2p_local(
+                                        phone, l, c, st.wire.seq,
+                                        st.wire.graph_id,
+                                        slot.registered_c2p_ffn_uid,
+                                        slot.registered_c2p_reduce_uid);
                             }
                         }
                     } else if (kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
@@ -7088,7 +7131,8 @@ static bool cycle_real_execute_period_fifo(
             }
             return ok;
         }, window, true, perf_mode ? &fifo_profile : nullptr,
-        pc_reduce_priority, phone_full_region_auto);
+        pc_reduce_priority, phone_full_region_auto,
+        phone_c2p_local);
     const auto fifo_done = std::chrono::steady_clock::now();
     if (phone_p2c_local_ffn) {
         std::printf(
