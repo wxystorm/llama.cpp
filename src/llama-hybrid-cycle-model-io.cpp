@@ -78,7 +78,7 @@ bool llama_hybrid_cycle_embed_tokens(
     embeddings.clear();
     reason.clear();
     const int64_t hidden = model.hparams.n_embd;
-    const int64_t vocab = model.vocab.n_tokens();
+    const int64_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(&model));
     if (model.arch != LLM_ARCH_QWEN3MOE || hidden <= 0 ||
         tokens.empty() || tokens.size() > 64 ||
         size_t(hidden) > std::numeric_limits<size_t>::max()/tokens.size()) {
@@ -143,7 +143,7 @@ bool llama_hybrid_cycle_project_last_token(
     logits.clear();
     reason.clear();
     const int64_t n_embd = model.hparams.n_embd;
-    const int64_t n_vocab = model.vocab.n_tokens();
+    const int64_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(&model));
     if (model.arch != LLM_ARCH_QWEN3MOE ||
         n_tokens < 1 || n_embd <= 0 || n_vocab <= 0 ||
         size_t(n_tokens)*size_t(n_embd) != hidden.size() ||
