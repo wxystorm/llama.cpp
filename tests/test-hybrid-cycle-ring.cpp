@@ -1,6 +1,7 @@
 #include "llama-hybrid-cycle-ring.h"
 #include "llama-hybrid-cycle-phone-local.h"
 #include "llama-hybrid-cycle-runtime.h"
+#include "llama-hybrid-cycle-execution-session.h"
 
 #include <array>
 #include <cassert>
@@ -8,7 +9,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -946,6 +949,98 @@ static void test_cycle_runtime_missing_stage_fails_closed() {
     assert(!runtime.run(wrong));
 }
 
+// Session tests do NOT start GPU/RPC work. They verify exactly the same
+// chunk/seq descriptors used by V5, and prove [0,48) has no 8-layer barrier.
+static void test_cycle_execution_session_8_and_48() {
+    for (const int layers : {8, 48}) {
+        llama_hybrid_cycle_execution_session_config cfg;
+        cfg.layout = llama_hybrid_build_cycle_layout(layers, 4, 2);
+        cfg.physical_layer_begin = 0;
+        cfg.physical_layer_count = layers;
+        cfg.tokens = 64;
+        cfg.chunk_tokens = 16;
+        cfg.wire_epoch = 1;
+        cfg.token_position_base = 0;
+        std::string reason;
+        assert(llama_hybrid_cycle_validate_session_config(cfg, reason));
+        llama_hybrid_cycle_execution_session<> session(cfg);
+        assert(session.first_layer() == 0);
+        assert(session.layer_count() == layers);
+        assert(session.chunks_per_layer() == 4);
+        assert(session.states().size() == size_t(layers));
+
+        std::set<uint64_t> ids;
+        std::vector<std::unique_ptr<llama_hybrid_cycle_physical_kv_cache>> kv;
+        for (int l = 0; l < layers; ++l) {
+            auto cache = std::make_unique<llama_hybrid_cycle_physical_kv_cache>();
+            cache->committed_tokens = 64;
+            assert(session.borrow_kv(l, cache.get()));
+            assert(!session.borrow_kv(l, cache.get()));
+            kv.push_back(std::move(cache));
+            for (int c = 0; c < 4; ++c) {
+                const auto & state = session.at(l, c);
+                assert(state.layer == l && state.chunk == c);
+                assert(state.start == int64_t(c * 16));
+                assert(state.tokens == 16);
+                assert(state.wire.layer == l);
+                assert(state.wire.chunk == c);
+                assert(state.wire.graph_id == 1);
+                const auto seq = uint64_t(100000) +
+                                 uint64_t(l + 1) * 1000 + uint64_t(c + 1);
+                assert(state.wire.seq == seq);
+                assert(ids.insert(seq).second);
+            }
+        }
+        assert(ids.size() == size_t(layers * 4));
+        assert(session.kv_complete(64));
+        kv.back()->committed_tokens = 63;
+        assert(!session.kv_complete(64));
+        kv.back()->committed_tokens = 64;
+
+        // A GPU output is NOT retired by a task completion. Only the
+        // consumer-side handoff path can move this Graph Slot.
+        auto & c2p = session.at(4, 0);
+        c2p.phone_output =
+            std::make_unique<llama_hybrid_cycle_phone_ffn_slot>();
+        c2p.phone_output->prepared_tokens = 16;
+        assert(!session.retire_phone_output_after_handoff(4, 6, 0));
+        assert(c2p.phone_output);
+        auto slot = session.retire_phone_output_after_handoff(4, 5, 0);
+        assert(slot && slot->prepared_tokens == 16);
+        assert(!c2p.phone_output);
+        assert(!session.retire_phone_output_after_handoff(4, 5, 0));
+    }
+
+    // Support a nonzero physical-layer base for later six-region binding,
+    // while preserving the original wire IDs and absolute token positions.
+    auto cfg = llama_hybrid_cycle_execution_session_config {};
+    cfg.layout = llama_hybrid_build_cycle_layout(48, 4, 2);
+    cfg.physical_layer_begin = 8;
+    cfg.physical_layer_count = 8;
+    cfg.tokens = 38;
+    cfg.chunk_tokens = 16;
+    cfg.wire_epoch = 1;
+    cfg.token_position_base = 256;
+    llama_hybrid_cycle_execution_session<> sub(cfg);
+    assert(sub.chunks_per_layer() == 3);
+    assert(sub.at(8, 0).start == 256);
+    assert(sub.at(8, 2).start == 288);
+    assert(sub.at(8, 2).tokens == 6);
+    assert(sub.at(15, 2).wire.seq == 116003);
+
+    cfg.physical_layer_begin = 43;
+    std::string reason;
+    assert(!llama_hybrid_cycle_validate_session_config(cfg, reason));
+    assert(reason == "INVALID_PHYSICAL_LAYER_RANGE");
+    cfg.physical_layer_begin = 0;
+    cfg.chunk_tokens = 0;
+    assert(!llama_hybrid_cycle_validate_session_config(cfg, reason));
+    assert(reason == "INVALID_TOKEN_WINDOW");
+    assert(llama_hybrid_cycle_session_wire_seq(0, 0, 0) == 1001);
+    assert(llama_hybrid_cycle_session_wire_seq(1, 47, 3) == 148004);
+    assert(llama_hybrid_cycle_session_wire_seq(0, 99, 0) == 0);
+}
+
 // Verify the compiled libllama Cycle runtime across both the original
 // eight-layer region and all 48 physical model layers. The callback acts as
 // a mock backend: no RPC, phone, weights or CPU reference are required.
@@ -1047,6 +1142,7 @@ static void test_cycle_runtime_physical_8_and_48() {
 }
 
 int main() {
+    test_cycle_execution_session_8_and_48();
     test_cycle_runtime_physical_route_guard();
     test_cycle_runtime_missing_stage_fails_closed();
     test_cycle_runtime_physical_8_and_48();

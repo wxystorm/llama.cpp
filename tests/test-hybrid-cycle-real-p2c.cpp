@@ -28,6 +28,7 @@
 #include "llama-hybrid-cycle-phone-executor.h"
 #include "llama-hybrid-cycle-p2c-ffn.h"
 #include "llama-hybrid-cycle-ffn-shard.h"
+#include "llama-hybrid-cycle-execution-session.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -3150,37 +3151,8 @@ struct cycle_real_pc_cuda_full_detail {
 // Per-Chunk timers are written by their owning FIFO stage/worker and read
 // only after the full FIFO joins. No new locks, device fences or RPCs.
 // All RPC durations are PC-client-observed; they are not kernel event times.
-struct cycle_real_c2p_path_timing {
-    double pc_attn_call_ms = 0.0;
-    double phone_slot_prepare_ms = 0.0;
-    double pc_ffn_call_ms = 0.0;
-    double phone_ffn_submit_rpc_ms = 0.0;
-    cycle_real_wire_submit_timing ready_tx {};
-    double ready_apply_rpc_ms = 0.0;
-    double ready_ack_wait_ms = 0.0;
-    cycle_real_wire_submit_timing partial_tx {};
-    double partial_apply_rpc_ms = 0.0;
-    double reduce_graph_rpc_ms = 0.0;
-    double reduce_backend_sync_ms = 0.0;
-    double reduce_finish_rpc_ms = 0.0;
-    double reduce_ack_wait_ms = 0.0;
-};
-
-struct cycle_real_p2c_path_timing {
-    size_t ready_rx_bytes = 0;
-    size_t partial_rx_bytes = 0;
-    double ready_receive_decode_ms = 0.0;
-    double ready_ack_rpc_ms = 0.0;
-    double phone_ffn_prepare_ms = 0.0;
-    double phone_ffn_submit_rpc_ms = 0.0;
-    double phone_send_partial_rpc_ms = 0.0;
-    // Fallback without FFN pool includes the output-send RPC.
-    double phone_ffn_fallback_call_ms = 0.0;
-    double pc_ffn_call_ms = 0.0;
-    double partial_receive_decode_ms = 0.0;
-    double pc_reduce_call_ms = 0.0;
-    double partial_ack_rpc_ms = 0.0;
-};
+using cycle_real_c2p_path_timing = llama_hybrid_cycle_c2p_path_timing;
+using cycle_real_p2c_path_timing = llama_hybrid_cycle_p2c_path_timing;
 
 static double cycle_real_path_elapsed_ms(
         std::chrono::steady_clock::time_point start) {
@@ -3191,33 +3163,14 @@ static double cycle_real_path_elapsed_ms(
 // PC-only event timestamps. These are published before each FIFO stage
 // completes (under the ring mutex); REDUCE reads them only after BOTH PC FFN
 // and Phone PARTIAL have joined. No cross-device clock arithmetic is used.
-struct cycle_real_p2c_overlap_events {
-    std::chrono::steady_clock::time_point ready_received {};
-    std::chrono::steady_clock::time_point cpu_ffn_started {};
-    std::chrono::steady_clock::time_point cpu_ffn_finished {};
-    std::chrono::steady_clock::time_point partial_received {};
-};
+using cycle_real_p2c_overlap_events = llama_hybrid_cycle_p2c_overlap_events;
 
-struct cycle_real_period_chunk {
-    cycle_real_c2p_path_timing c2p_timing {};
-    cycle_real_p2c_path_timing p2c_timing {};
-    cycle_real_p2c_overlap_events p2c_overlap {};
-    int layer = 0;
-    int chunk = 0;
-    int64_t start = 0;
-    int64_t tokens = 0;
-    cycle_real_live_wire wire {};
-    cycle_real_phone_ready ready;
-    std::vector<float> partial;
-    std::vector<float> host_output;
-    inference_cycle_message recv_ready;
-    inference_cycle_message recv_partial;
-    std::unique_ptr<cycle_real_c2p_phone_chunk> phone_output;
-    // Patch 33: each pre-registered L7 FFN owns its own buffer slot.
-    // A single shared P2C FFN slot would be unsafe with window=2 while
-    // the next Chunk is registered before the previous FFN completed.
-    std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_main_ffn;
-};
+// V5 continues using the same typed RPC adapters. The generic owner lives
+// in libllama; owning unique_ptrs retain the EXACT derived type, avoiding
+// deletion through a nonvirtual production Phone/P2C base destructor.
+using cycle_real_execution_session = llama_hybrid_cycle_execution_session<
+    cycle_real_c2p_phone_chunk, cycle_real_p2c_ffn_slot>;
+using cycle_real_period_chunk = cycle_real_execution_session::chunk_state;
 
 static bool cycle_real_execute_period_fifo(
         ggml_backend_t phone, ggml_backend_dev_t cpu_dev,
@@ -3727,8 +3680,38 @@ static bool cycle_real_execute_period_fifo(
         }
     }
 
-    using state_ptr = std::unique_ptr<cycle_real_period_chunk>;
-    std::vector<std::vector<state_ptr>> states(static_cast<size_t>(n_layers));
+    llama_hybrid_cycle_execution_session_config execution_config;
+    execution_config.layout = layout;
+    execution_config.physical_layer_begin = 0;
+    execution_config.physical_layer_count = n_layers;
+    execution_config.tokens = tokens;
+    execution_config.chunk_tokens = chunk_tokens;
+    execution_config.wire_epoch = wire_epoch;
+    // The same object can span [0,48) for six periods. In this V5 real
+    // regression we still execute only the established physical [0,8).
+    std::string session_reason;
+    if (!llama_hybrid_cycle_validate_session_config(
+            execution_config, session_reason)) {
+        std::fprintf(stderr,
+            "[CYCLE_EXECUTION_SESSION] status=FAIL reason=%s\n",
+            session_reason.c_str());
+        ggml_backend_free(cpu);
+        return false;
+    }
+    cycle_real_execution_session execution_session(std::move(execution_config));
+    if (execution_session.chunks_per_layer() != n_chunks) {
+        ggml_backend_free(cpu);
+        return false;
+    }
+    auto & states = execution_session.states();
+    for (int l = 0; l < n_layers; ++l) {
+        // KV remains under its existing period/session Graph Cache owner.
+        // This registered pointer is observed only after workers join.
+        if (!execution_session.borrow_kv(l, kv[size_t(l)].get())) {
+            ggml_backend_free(cpu);
+            return false;
+        }
+    }
     // Only the PHONE_GPU worker accesses this per-layer pool. Every cached
     // FFN graph owns the very same GPU allocation and borrowed model weights
     // it used on the last Chunk. No CPU/GPU hidden activation is cached.
@@ -3769,25 +3752,9 @@ static bool cycle_real_execute_period_fifo(
         uint64_t recycled = 0;
     };
     std::vector<phone_reuse_layer_stats> phone_reuse_stats(static_cast<size_t>(n_layers));
-    for (int l = 0; l < n_layers; ++l) {
-        auto & row = states[size_t(l)];
-        row.reserve(size_t(n_chunks));
-        for (int c = 0; c < n_chunks; ++c) {
-            auto st = std::make_unique<cycle_real_period_chunk>();
-            st->layer = l;
-            st->chunk = c;
-            st->start = int64_t(c) * chunk_tokens;
-            st->tokens = std::min(
-                int64_t(chunk_tokens), int64_t(tokens) - st->start);
-            // Each run has disjoint wire seq IDs. The first (warmup) run
-            // keeps legacy IDs, while the measured run uses the next epoch.
-            // Both runs share the model and one transport connection.
-            st->wire = {l, c,
-                wire_epoch * 100000 + uint64_t(l + 1) * 1000 +
-                    uint64_t(c + 1), 1};
-            row.push_back(std::move(st));
-        }
-    }
+    // Chunk descriptors (physical layer, absolute token window and wire
+    // identity) were constructed by the production ExecutionSession.
+    // Do not reinitialize them here or duplicate their buffer ownership.
     std::vector<float> final_output(size_t(tokens * hidden), 0.0f);
     // Keep strict CPU parity for correctness runs. Performance runs still
     // REPORT parity, but it is independently non-gating: only real compute,
@@ -3964,11 +3931,13 @@ static bool cycle_real_execute_period_fifo(
     // RPC completes, or after the P2C READY RPC has staged its payload.
     // Keep per-layer FFN/Reduce GPU buffers for the next compatible Chunk.
     const auto retire_device_output = [&](int producer_layer, int chunk) {
-        auto & owned = states[size_t(producer_layer)][size_t(chunk)]->phone_output;
+        // Every caller is AFTER the successor's input-consumed fence/ACK.
+        // Moving through the session does not signal completion or recycle
+        // earlier than the original owner-specific handoff.
+        auto owned = execution_session.retire_phone_output_after_handoff(
+            producer_layer, producer_layer + 1, chunk);
         if (c2p_ffn_reuse && owned && !owned->is_full_layer &&
             producer_layer == layout.x) {
-            // This callback runs only AFTER the next layer's Attention
-            // fence, guaranteeing it no longer reads the C2P output.
             std::lock_guard<std::mutex> lock(c2p_pool_mutex);
             c2p_pool.push_back(std::move(owned));
             ++c2p_retired;
@@ -5987,7 +5956,10 @@ static bool cycle_real_execute_period_fifo(
         }
     }
     const auto phone_pool_release_done = std::chrono::steady_clock::now();
-    bool kv_ok = true;
+    // The session borrows (never owns or resets) the per-layer KV buffers.
+    // Observe their completed prefixes only after all FIFO workers joined.
+    bool kv_ok = n_chunks == 1 ||
+                 execution_session.kv_complete(tokens);
     for (int l = 0; l < n_layers; ++l) {
         kv_ok = kv_ok && (n_chunks == 1 ||
             kv[size_t(l)]->committed_tokens == tokens);
