@@ -7708,6 +7708,140 @@ public:
     // Shared GPU/Graph/Buffer gate for the opt-in Phone P2C FIFO worker.
     std::mutex & cycle_p2c_gpu_gate() { return cycle_p2c_gpu_gate_; }
 
+    // Opt-in independent OpenCL transfer queue: the OWNERSHIP domain is
+    // the underlying ggml_backend_buffer allocation, not a tensor name.
+    // A different view of the same allocation always conflicts in v1.
+    // Called under the original GPU gate, so registered_graph maps cannot
+    // be modified while the worker reads their borrowed buffers.
+    bool cycle_gpu_graph_allocations(
+            uint32_t device, uint64_t uid,
+            std::vector<uint64_t> & out) const {
+        if (!uid || device >= stored_graphs.size()) return false;
+        const auto & graphs = stored_graphs[device];
+        const auto it = graphs.find(uid);
+        if (it == graphs.end() || !it->second.cycle_registered ||
+            !it->second.graph) return false;
+        out.insert(out.end(),
+            it->second.cycle_buffer_dependencies.begin(),
+            it->second.cycle_buffer_dependencies.end());
+        return true;
+    }
+
+    static bool cycle_gpu_transfer_enabled() {
+        const char * on = std::getenv("GGML_CYCLE_C2P_TRANSFER_QUEUE_V1");
+        const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
+        return on && std::strcmp(on, "1") == 0 &&
+               v5 && std::strcmp(v5, "1") == 0;
+    }
+
+    // Called while the original GPU gate is held. Wait only for uploads
+    // targeting a buffer this exact stage borrows. No system-wide sync.
+    void cycle_gpu_stage_begin(std::vector<uint64_t> buffers, bool known) {
+        std::sort(buffers.begin(), buffers.end());
+        buffers.erase(std::unique(buffers.begin(), buffers.end()), buffers.end());
+        std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
+        cycle_upload_owner_cv_.wait(lock, [&] {
+            for (const uint64_t id : cycle_upload_inflight_) {
+                if (!known || std::binary_search(buffers.begin(), buffers.end(), id))
+                    return false;
+            }
+            return true;
+        });
+        GGML_ASSERT(!cycle_gpu_stage_active_);
+        cycle_gpu_stage_active_ = true;
+        cycle_gpu_stage_known_ = known;
+        cycle_gpu_stage_buffers_ = std::move(buffers);
+    }
+
+    void cycle_gpu_stage_end() {
+        std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
+        GGML_ASSERT(cycle_gpu_stage_active_);
+        cycle_gpu_stage_active_ = false;
+        cycle_gpu_stage_known_ = false;
+        cycle_gpu_stage_buffers_.clear();
+        cycle_upload_owner_cv_.notify_all();
+    }
+
+    class cycle_gpu_stage_guard {
+    public:
+        cycle_gpu_stage_guard(rpc_server & server,
+                              std::vector<uint64_t> buffers, bool known,
+                              bool active)
+            : server_(server), active_(active) {
+            if (active_) server_.cycle_gpu_stage_begin(
+                std::move(buffers), known);
+        }
+        cycle_gpu_stage_guard(const cycle_gpu_stage_guard &) = delete;
+        cycle_gpu_stage_guard & operator=(const cycle_gpu_stage_guard &) = delete;
+        ~cycle_gpu_stage_guard() {
+            if (active_) server_.cycle_gpu_stage_end();
+        }
+    private:
+        rpc_server & server_;
+        bool active_;
+    };
+
+    bool cycle_gpu_try_reserve_upload(
+            std::vector<uint64_t> buffers, const char ** why) {
+        std::sort(buffers.begin(), buffers.end());
+        buffers.erase(std::unique(buffers.begin(), buffers.end()), buffers.end());
+        std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
+        if (buffers.empty() || !cycle_gpu_stage_active_) {
+            *why = "NO_ACTIVE_STAGE";
+            return false;
+        }
+        if (!cycle_gpu_stage_known_) {
+            *why = "UNKNOWN_STAGE";
+            return false;
+        }
+        for (const uint64_t id : buffers) {
+            if (!id ||
+                std::binary_search(cycle_gpu_stage_buffers_.begin(),
+                                   cycle_gpu_stage_buffers_.end(), id)) {
+                *why = "ACTIVE_ALLOCATION_ALIAS";
+                return false;
+            }
+            if (cycle_upload_inflight_.count(id) != 0) {
+                *why = "UPLOAD_ALREADY_ACTIVE";
+                return false;
+            }
+        }
+        cycle_upload_inflight_.insert(buffers.begin(), buffers.end());
+        *why = "DISJOINT_ALLOCATIONS";
+        return true;
+    }
+
+    void cycle_gpu_release_upload(const std::vector<uint64_t> & buffers) {
+        std::lock_guard<std::mutex> lock(cycle_upload_owner_mutex_);
+        for (const auto id : buffers) {
+            GGML_ASSERT(cycle_upload_inflight_.erase(id) == 1);
+        }
+        cycle_upload_owner_cv_.notify_all();
+    }
+
+    class cycle_gpu_upload_lease {
+    public:
+        cycle_gpu_upload_lease(
+                rpc_server & server, std::vector<uint64_t> buffers)
+            : server_(server), buffers_(std::move(buffers)) {}
+        cycle_gpu_upload_lease(const cycle_gpu_upload_lease &) = delete;
+        cycle_gpu_upload_lease & operator=(const cycle_gpu_upload_lease &) = delete;
+        ~cycle_gpu_upload_lease() { release(); }
+        bool acquire(const char ** why) {
+            active_ = server_.cycle_gpu_try_reserve_upload(buffers_, why);
+            return active_;
+        }
+        void release() {
+            if (!active_) return;
+            server_.cycle_gpu_release_upload(buffers_);
+            active_ = false;
+        }
+    private:
+        rpc_server & server_;
+        std::vector<uint64_t> buffers_;
+        bool active_ = false;
+    };
+
     // Experimental priority at GPU *task boundaries* only. It does not
     // overlap kernel execution with GPU uploads: APPLY must still take the
     // same gate and synchronize before publishing DEVICE_READY. The normal
@@ -8372,6 +8506,14 @@ private:
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::mutex cycle_p2c_gpu_gate_;
+    // Experimental V5 allocation-level ownership for independent OpenCL
+    // upload. Does not replace Buffer Credit or graph/scratch leases.
+    std::mutex cycle_upload_owner_mutex_;
+    std::condition_variable cycle_upload_owner_cv_;
+    std::vector<uint64_t> cycle_gpu_stage_buffers_;
+    std::set<uint64_t> cycle_upload_inflight_;
+    bool cycle_gpu_stage_active_ = false;
+    bool cycle_gpu_stage_known_ = false;
     std::mutex cycle_gpu_upload_mutex_;
     std::condition_variable cycle_gpu_upload_cv_;
     unsigned cycle_gpu_upload_waiters_ = 0;
