@@ -791,7 +791,45 @@ static void test_v5_pc_phone_proxy_main_priority() {
                        llama_hybrid_cycle_stage::REDUCE, 0, 1));
 }
 
+// An entry-credit stall begins only when the causal head Chunk is
+// device-input ready AND max_inflight is exhausted. It ends at admission,
+// not at graph completion, so it is distinct from FIFO queue_wait.
+static void test_path_entry_credit_profile() {
+    llama_hybrid_cycle_layout fragment;
+    fragment.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_P2C};
+    llama_hybrid_cycle_task_ring ring(
+        fragment, 3, 2, false, false, false, false, true);
+    ring.start();
+    {
+        const auto samples = ring.credit_profiles();
+        assert(samples.size() == 1);
+        assert(samples[0].admitted_chunks == 2);
+        assert(samples[0].credit_blocked_chunks == 1);
+        assert(samples[0].credit_wait_by_chunk_ms.size() == 3);
+    }
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::ATTN_PRE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_SOURCE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_TO_PC,
+                       llama_hybrid_cycle_stage::SEND_PARTIAL, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 0));
+    const auto samples = ring.credit_profiles();
+    assert(samples[0].admitted_chunks == 3);
+    assert(samples[0].credit_blocked_chunks == 1);
+    assert(samples[0].credit_wait_by_chunk_ms[0] == 0.0);
+    assert(samples[0].credit_wait_by_chunk_ms[1] == 0.0);
+    assert(samples[0].credit_wait_by_chunk_ms[2] >= 0.0);
+    assert(samples[0].credit_wait_sum_ms >= 0.0);
+}
+
 int main() {
+    test_path_entry_credit_profile();
     test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
     test_v5_phone_rx_first();
