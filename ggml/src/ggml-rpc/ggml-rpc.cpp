@@ -14452,8 +14452,8 @@ struct rpc_cycle_p2c_fifo_v1 {
             int64_t upload_boundary_yield_us = 0;
             bool ok = true;
             try {
-                // At most one short APPLY upload may pass between two
-                // complete Phone GPU tasks. No running kernel is preempted.
+                // Already-arrived APPLY uploads may pass between complete
+                // Phone GPU tasks. No running kernel is preempted.
                 // Recheck after acquiring the original GPU mutex to close
                 // the pending-ticket vs worker-acquire race.
                 std::unique_lock<std::mutex> gpu(
