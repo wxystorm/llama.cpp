@@ -564,6 +564,13 @@ struct ggml_backend_opencl_context {
     cl_context context;
     cl_command_queue queue;
 
+    // V5 C2P activations: an independent in-order transfer queue. Created
+    // lazily, never used by graph execution or ordinary set_tensor().
+    // The submit lock protects creation and grouped enqueue only; GPU work
+    // on the compute queue is NOT held by this lock.
+    cl_command_queue cycle_transfer_queue = nullptr;
+    std::mutex cycle_transfer_submit_mutex;
+
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
@@ -1042,9 +1049,22 @@ struct ggml_backend_opencl_context {
 
     void free() {
         clFinish(queue);
+        // A queued upload may still own Host staging or GPU allocations.
+        // Draining before the final context teardown is mandatory.
+        {
+            std::lock_guard<std::mutex> lock(cycle_transfer_submit_mutex);
+            if (cycle_transfer_queue) {
+                CL_CHECK(clFinish(cycle_transfer_queue));
+            }
+        }
 
         ref_count--;
         if (ref_count == 0) {
+            std::lock_guard<std::mutex> lock(cycle_transfer_submit_mutex);
+            if (cycle_transfer_queue) {
+                CL_CHECK(clReleaseCommandQueue(cycle_transfer_queue));
+                cycle_transfer_queue = nullptr;
+            }
 #ifdef GGML_OPENCL_PROFILING
             flush_profiling_batch();
             write_profiling_info();
@@ -10146,6 +10166,140 @@ static bool ggml_backend_opencl_set_tensor_rpc_async_write(
     return true;
 }
 
+
+// C2P activation transfer queue. This is intentionally NOT the ordinary
+// ggml_backend_set_tensor_async path, which uses the compute queue and
+// does not return an event. The RPC caller owns Host bytes until WAIT returns.
+// No OpenCL metadata objects are initialized or mutated on this path: RPC
+// must restore and validate all tensor extra metadata before calling it.
+//
+// All accesses are to contiguous F32/I32 activations. Quantized weights,
+// views with unsupported bounds, and aliasing writes are rejected. Queue
+// ordering within this batch is retained; completion of the last event
+// implies all earlier writes in this batch are complete.
+static bool ggml_backend_opencl_cycle_upload_batch(
+        ggml_tensor * const * tensors,
+        const void * const * payloads,
+        const size_t * sizes,
+        size_t count,
+        void ** event_out) {
+    if (!event_out) return false;
+    *event_out = nullptr;
+    if (!tensors || !payloads || !sizes || count == 0 || count > 4) {
+        return false;
+    }
+
+    struct upload_span {
+        cl_mem allocation;
+        size_t offset;
+        size_t size;
+    };
+    std::vector<upload_span> spans;
+    spans.reserve(count);
+    ggml_backend_opencl_context * backend_ctx = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        ggml_tensor * t = tensors[i];
+        if (!t || !payloads[i] || !t->buffer || !t->buffer->buft ||
+            !t->extra || !ggml_is_contiguous(t) ||
+            (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) ||
+            sizes[i] != ggml_nbytes(t)) {
+            return false;
+        }
+        auto * dev_ctx = static_cast<ggml_backend_opencl_device_context *>(
+            t->buffer->buft->device->context);
+        if (!dev_ctx || !dev_ctx->backend_ctx ||
+            (backend_ctx && backend_ctx != dev_ctx->backend_ctx)) {
+            return false;
+        }
+        backend_ctx = dev_ctx->backend_ctx;
+        auto * extra = static_cast<ggml_tensor_extra_cl *>(t->extra);
+        if (!extra->data_device) return false;
+        const uint64_t off = uint64_t(extra->offset) +
+                             uint64_t(t->view_offs);
+        if (off < uint64_t(extra->offset) || off > SIZE_MAX ||
+            sizes[i] > SIZE_MAX - size_t(off)) {
+            return false;
+        }
+        size_t cl_bytes = 0;
+        if (clGetMemObjectInfo(extra->data_device, CL_MEM_SIZE,
+                               sizeof(cl_bytes), &cl_bytes, nullptr) != CL_SUCCESS ||
+            size_t(off) > cl_bytes || sizes[i] > cl_bytes - size_t(off)) {
+            return false;
+        }
+        for (const auto & prev : spans) {
+            if (prev.allocation == extra->data_device &&
+                size_t(off) < prev.offset + prev.size &&
+                prev.offset < size_t(off) + sizes[i]) {
+                return false;
+            }
+        }
+        spans.push_back({extra->data_device, size_t(off), sizes[i]});
+    }
+    if (!backend_ctx) return false;
+
+    std::lock_guard<std::mutex> lock(backend_ctx->cycle_transfer_submit_mutex);
+    if (!backend_ctx->cycle_transfer_queue) {
+        cl_int err = CL_SUCCESS;
+        backend_ctx->cycle_transfer_queue =
+            clCreateCommandQueue(backend_ctx->context,
+                                 backend_ctx->device, 0, &err);
+        if (err != CL_SUCCESS || !backend_ctx->cycle_transfer_queue) {
+            GGML_LOG_ERROR("ggml_opencl: C2P transfer queue init failed (%d)\n",
+                           int(err));
+            backend_ctx->cycle_transfer_queue = nullptr;
+            return false;
+        }
+        GGML_LOG_INFO("ggml_opencl: C2P separate transfer queue created\n");
+    }
+
+    cl_event final = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        cl_event next = nullptr;
+        const cl_int err = clEnqueueWriteBuffer(
+            backend_ctx->cycle_transfer_queue, spans[i].allocation,
+            CL_FALSE, spans[i].offset, spans[i].size,
+            payloads[i], 0, nullptr, &next);
+        if (err != CL_SUCCESS || !next) {
+            // A partially enqueued batch must finish BEFORE returning to
+            // RPC: otherwise fallback or destruction could reuse Host data.
+            clFinish(backend_ctx->cycle_transfer_queue);
+            if (final) clReleaseEvent(final);
+            if (next) clReleaseEvent(next);
+            GGML_LOG_ERROR("ggml_opencl: C2P async upload enqueue failed "
+                           "index=%zu error=%d\n", i, int(err));
+            return false;
+        }
+        if (final) clReleaseEvent(final);
+        final = next;
+    }
+    if (clFlush(backend_ctx->cycle_transfer_queue) != CL_SUCCESS) {
+        clFinish(backend_ctx->cycle_transfer_queue);
+        clReleaseEvent(final);
+        return false;
+    }
+    *event_out = reinterpret_cast<void *>(final);
+    return true;
+}
+
+// Consumes the event on either success or failure. Source Host bytes and
+// destination allocations must remain leased until the function returns.
+static bool ggml_backend_opencl_cycle_upload_wait(void * event_handle) {
+    cl_event ev = reinterpret_cast<cl_event>(event_handle);
+    if (!ev) return false;
+    const cl_int status = clWaitForEvents(1, &ev);
+    if (status != CL_SUCCESS) {
+        // Avoid freeing/overwriting the source while a failed wait may
+        // still leave commands in-flight.
+        cl_command_queue queue = nullptr;
+        if (clGetEventInfo(ev, CL_EVENT_COMMAND_QUEUE, sizeof(queue),
+                           &queue, nullptr) == CL_SUCCESS && queue) {
+            clFinish(queue);
+        }
+    }
+    const cl_int release = clReleaseEvent(ev);
+    return status == CL_SUCCESS && release == CL_SUCCESS;
+}
+
 static bool ggml_backend_opencl_get_tensor_batch3(
         const ggml_tensor * tensor0,
         void * data0,
@@ -10528,6 +10682,16 @@ static void * ggml_backend_opencl_reg_get_proc_address(
             GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_opencl_set_tensor_rpc_async_write);
+    }
+    if (std::strcmp(name,
+            GGML_BACKEND_OPENCL_CYCLE_UPLOAD_BATCH_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_opencl_cycle_upload_batch);
+    }
+    if (std::strcmp(name,
+            GGML_BACKEND_OPENCL_CYCLE_UPLOAD_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_opencl_cycle_upload_wait);
     }
     return nullptr;
 }
