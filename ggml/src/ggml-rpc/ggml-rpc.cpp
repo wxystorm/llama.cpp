@@ -13737,6 +13737,11 @@ struct rpc_cycle_p2c_fifo_v1 {
 
     // All three readiness notifications use only the short scheduler lock.
     // No worker holds the GPU gate while waiting for PC data.
+    bool has_c2p_v5(const key & k) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return c2p_v5.count(k) != 0;
+    }
+
     bool arm_c2p_v5(const rpc_msg_inference_cycle_v5_c2p_arm_req & plan) {
         const key k {plan.layer, plan.chunk, plan.seq, plan.graph_id};
         std::lock_guard<std::mutex> lock(mutex);
@@ -14377,6 +14382,9 @@ static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
         case RPC_CMD_INFERENCE_DATA_PLANE_OPEN:
         case RPC_CMD_INFERENCE_CYCLE_P2C_ARM:
         case RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM: // FIFO enqueue only
+        case RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM:
+        case RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT:
+        case RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER:
         case RPC_CMD_INFERENCE_CYCLE_P2C_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_PHONE_NEXT_ATTN_WAIT:
         case RPC_CMD_INFERENCE_CYCLE_APPLY: // waits HOST RX; locks GPU internally
@@ -15928,6 +15936,66 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     ok ? "OK" : "FAIL");
                 break;
             }
+            case RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM: {
+                rpc_msg_inference_cycle_v5_c2p_arm_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
+                const bool ok = v5 && std::strcmp(v5, "1") == 0 &&
+                    executor.enabled && request.device < device_count &&
+                    executor.arm_c2p_v5(request);
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER: {
+                rpc_msg_inference_cycle_v5_region_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto & first = request.region.stages[0];
+                const auto & second = request.region.stages[1];
+                const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
+                bool ok = v5 && std::strcmp(v5, "1") == 0 &&
+                    executor.enabled &&
+                    first.device < device_count &&
+                    second.device == first.device &&
+                    first.layer == request.c2p_layer + 1 &&
+                    second.layer == first.layer + 1 &&
+                    first.chunk == second.chunk &&
+                    request.c2p_seq != 0;
+                for (int k = 0; k < 2 && ok; ++k) {
+                    const auto & s = request.region.stages[k];
+                    ok = s.seq != 0 && s.chunk >= 0 &&
+                        s.attention_graph_uid != 0 && s.ffn_graph_uid != 0 &&
+                        s.input_source.buffer != 0 &&
+                        s.attention_input.buffer != 0 &&
+                        s.input_source.type == GGML_TYPE_F32 &&
+                        s.attention_input.type == GGML_TYPE_F32;
+                    for (int i = 0; i < 4 && ok; ++i) {
+                        const auto type = i == 2 ? GGML_TYPE_I32 : GGML_TYPE_F32;
+                        ok = s.ready_outputs[i].buffer != 0 &&
+                             s.ffn_inputs[i].buffer != 0 &&
+                             s.ready_outputs[i].type == type &&
+                             s.ffn_inputs[i].type == type;
+                    }
+                }
+                if (ok) ok = executor.register_c2p_region(request);
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = ok ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT: {
+                rpc_msg_inference_cycle_p2c_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                const auto k = p2c_key(
+                    request.layer, request.chunk, request.seq,
+                    request.graph_id);
+                rpc_msg_inference_cycle_send_rsp response {};
+                response.result = executor.enabled &&
+                    executor.wait_c2p_reduce(k) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
             case RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM: {
                 rpc_msg_inference_cycle_phone_region_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) return;
@@ -16003,6 +16071,18 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     cycle_order_trace ? ggml_time_us() : 0;
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.apply_inference_cycle(request) ? 1 : 0;
+                // C2P GPU input is now genuinely device-consumable.
+                // An ACK to PC is not a prerequisite for Phone scheduling.
+                if (response.result != 0 && executor.enabled) {
+                    const auto k = p2c_key(
+                        request.layer, request.chunk, request.seq,
+                        request.graph_id);
+                    if (executor.has_c2p_v5(k)) {
+                        response.result = executor.c2p_device_ready(
+                            k, request.kind == INFERENCE_CYCLE_PARTIAL) ?
+                                1 : 0;
+                    }
+                }
                 const int64_t handler_done_us =
                     cycle_order_trace ? ggml_time_us() : 0;
                 if (!send_msg(sock, &response, sizeof(response))) {
