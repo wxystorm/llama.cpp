@@ -773,9 +773,48 @@ int main(int argc, char ** argv) {
                                     n_tokens, ok ? "PASS" : "FAIL");
                             }
                         }
+                        // Check physical Phone KV and Device Output
+                        // ownership after the full FIFO has joined. Every
+                        // C2P producer must have been consumed by L5, each
+                        // L5 producer by L6, and every L6 producer by the
+                        // explicit P2C diagnostic bridge. No active graph
+                        // slot may remain attached to a completed Chunk.
+                        int phone_full_kv_layers = 0;
+                        if (ok && real_phone_full) {
+                            for (int cycle = 0; cycle < 6 && ok; ++cycle) {
+                                const int c2p = cycle * 8 + 4;
+                                 // Do not check only the last Chunk: a missing
+                                // earlier ownership ACK could silently leak
+                                // a GPU slot despite a finite output.
+                                for (int c = 0; c < n_chunks && ok; ++c) {
+                                    ok = session.at(c2p, c).phone_output == nullptr;
+                                }
+                                for (int l = c2p + 1; l <= c2p + 2 && ok; ++l) {
+                                    const auto * r = resources.layer(l);
+                                    ok = r && r->kv &&
+                                         r->kv->committed_tokens == n_tokens;
+                                    for (int c = 0; c < n_chunks && ok; ++c) {
+                                        const auto & st = session.at(l, c);
+                                        ok = st.phone_output == nullptr &&
+                                             st.ready.phone_compute_buffer == nullptr;
+                                    }
+                                    if (ok) ++phone_full_kv_layers;
+                                    std::printf(
+                                        "[CYCLE_REAL_PHONE_FULL_KV] "
+                                        "layer=%d committed=%lld expected=%d "
+                                        "output_slot=DRAINED status=%s\n",
+                                        l,
+                                        (long long)(r && r->kv ?
+                                            r->kv->committed_tokens : -1),
+                                        n_tokens, ok ? "PASS" : "FAIL");
+                                }
+                            }
+                        }
                         if (ok) {
                             ok = pc_layers == 24 &&
                                  c2p_pc_layers == 6 &&
+                                 (!real_phone_full ||
+                                  phone_full_kv_layers == 12) &&
                                  real_c2p_attn.load() == 6 * n_chunks &&
                                  real_c2p_ffn.load() == 6 * n_chunks &&
                                  mock_stages.load() == 6 * n_chunks * 14 &&
