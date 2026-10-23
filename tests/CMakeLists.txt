@@ -381,7 +381,8 @@ if (TARGET ggml-rpc)
     # no 48-layer Transformer forward, and no automatic CTest registration.
     llama_build(test-hybrid-cycle-real-pc-ring.cpp)
     target_include_directories(test-hybrid-cycle-real-pc-ring PRIVATE
-        ${PROJECT_SOURCE_DIR}/src)
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
     target_link_libraries(test-hybrid-cycle-real-pc-ring PRIVATE ggml-rpc)
 
     # First complete physical Cycle period. Exercises the EXISTING five

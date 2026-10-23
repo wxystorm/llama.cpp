@@ -7,8 +7,11 @@
 // LLAMA_HYBRID_CYCLE_REAL_C2P_PHONE=1 enables legacy V5 REAL C2P GPU.
 // LLAMA_HYBRID_CYCLE_REAL_PHONE_FULL=1 additionally executes all 12
 // Phone Full layers using direct GPU l_out handoffs (requires REAL C2P).
-// In that mode the ONLY diagnostic GPU readback occurs at the still-MOCK
-// P2C Attention boundary. No period barrier or Meta re-execution.
+// LLAMA_HYBRID_CYCLE_REAL_P2C=1 additionally runs all six P2C stages
+// with real Phone Attention/FFN, independent P2C READY/PARTIAL transport,
+// PC destination FFN, exclusive PC Reduce, and real reverse ACK.
+// Then all 48 physical layers compute on SYNTHETIC hidden input; embedding,
+// logits, and strict reference parity remain NOT RUN.
 // Without these flags, preserve the established regression paths.
 // This is NOT a 48-layer Transformer forward or a numeric parity test.
 //
@@ -22,8 +25,10 @@
 #include "llama-hybrid-cycle-pc-full.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-full.h"
+#include "llama-hybrid-cycle-p2c-real.h"
 #include "llama-hybrid-cycle-phone-regions.h"
 #include "llama-hybrid-cycle-wire.h"
+#include "inference-cycle-reduce.h"
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -123,6 +128,22 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[CYCLE_REAL_PC_RING] status=FAIL "
             "reason=REAL_PHONE_FULL_REQUIRES_REAL_C2P\n");
+        return 2;
+    }
+    const char * real_p2c_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_REAL_P2C");
+    if (real_p2c_env && std::strcmp(real_p2c_env, "0") != 0 &&
+        std::strcmp(real_p2c_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL reason=BAD_REAL_P2C_FLAG\n");
+        return 2;
+    }
+    const bool real_p2c = real_p2c_env &&
+        std::strcmp(real_p2c_env, "1") == 0;
+    if (real_p2c && !real_phone_full) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=REAL_P2C_REQUIRES_REAL_PHONE_FULL\n");
         return 2;
     }
 
@@ -282,6 +303,15 @@ int main(int argc, char ** argv) {
                         std::atomic<int> phone_full_device_handoffs {0};
                         std::atomic<int> phone_full_p2c_readbacks {0};
                         std::atomic<int> phone_full_slot_reuse {0};
+                        std::atomic<int> real_p2c_attn {0};
+                        std::atomic<int> real_p2c_ready_rx {0};
+                        std::atomic<int> real_p2c_phone_ffn {0};
+                        std::atomic<int> real_p2c_pc_ffn {0};
+                        std::atomic<int> real_p2c_partial_rx {0};
+                        std::atomic<int> real_p2c_reduce {0};
+                        std::atomic<int> real_p2c_partial_ack {0};
+                        std::atomic<int> p2c_device_handoffs {0};
+                        std::atomic<int> p2c_slot_reuse {0};
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -603,14 +633,230 @@ int main(int argc, char ** argv) {
                                         }
                                     } else if (kind ==
                                                llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
-                                        if (task.stage ==
-                                            llama_hybrid_cycle_stage::ATTN_PRE) {
+                                        if (real_p2c) {
+                                            const auto & wire = state.wire;
+                                            const int64_t topk =
+                                                model->hparams.n_expert_used;
+                                            if (task.stage ==
+                                                llama_hybrid_cycle_stage::ATTN_PRE) {
+                                                const auto * predecessor =
+                                                    session.phone_predecessor_output(l, c);
+                                                const auto * resource =
+                                                    resources.layer(l);
+                                                auto * bank =
+                                                    phone_slot_banks.by_index(
+                                                        region.location.cycle_index);
+                                                llama_hybrid_cycle_attention_rpc_ops rpc {};
+                                                rpc.is_rpc = ggml_backend_is_rpc(phone);
+                                                rpc.send_ready =
+                                                    &ggml_backend_rpc_cycle_send_ready;
+                                                valid = predecessor && resource && bank &&
+                                                    llama_hybrid_cycle_execute_p2c_phone_attention(
+                                                        *model, *resource, phone, l,
+                                                        state.start, state.tokens,
+                                                        predecessor, wire, state.ready, rpc);
+                                                if (valid) {
+                                                    // Phone Attention has consumed L6
+                                                    // on the same GPU, and the READY TX
+                                                    // source is now independently staged.
+                                                    auto old_slot =
+                                                        session.retire_phone_output_after_handoff(
+                                                            l - 1, l, c);
+                                                    valid = old_slot != nullptr;
+                                                    if (valid) {
+                                                        bank->full_idle_by_layer[
+                                                            size_t(l - 1)].push_back(
+                                                                std::move(old_slot));
+                                                        ++p2c_device_handoffs;
+                                                        ++real_p2c_attn;
+                                                    }
+                                                }
+                                            } else if (task.stage ==
+                                                       llama_hybrid_cycle_stage::SEND_ACTIVATION) {
+                                                valid = llama_hybrid_cycle_receive_wire(
+                                                    phone, wire, INFERENCE_CYCLE_READY,
+                                                    uint32_t(state.tokens),
+                                                    uint32_t(hidden), uint32_t(topk),
+                                                    state.recv_ready);
+                                                if (valid) {
+                                                    const auto & v = state.recv_ready.ready;
+                                                    valid = v.tokens == uint32_t(state.tokens) &&
+                                                        v.hidden == uint32_t(hidden) &&
+                                                        v.topk == uint32_t(topk) &&
+                                                        cycle_pc_ring_finite(
+                                                            v.residual, expected) &&
+                                                        cycle_pc_ring_finite(
+                                                            v.ffn_norm, expected) &&
+                                                        v.topk_ids.size() ==
+                                                            size_t(state.tokens * topk) &&
+                                                        cycle_pc_ring_finite(
+                                                            v.topk_weights,
+                                                            size_t(state.tokens * topk));
+                                                }
+                                                if (valid) {
+                                                    // Send READY ACK only after the
+                                                    // matching host RX has decoded it.
+                                                    valid = ggml_backend_rpc_cycle_send_ack(
+                                                        phone, wire.layer, wire.chunk,
+                                                        wire.seq, wire.graph_id,
+                                                        INFERENCE_CYCLE_READY, true);
+                                                }
+                                                if (valid) ++real_p2c_ready_rx;
+                                            } else if (task.stage ==
+                                                       llama_hybrid_cycle_stage::FFN_SOURCE) {
+                                                auto * bank =
+                                                    phone_slot_banks.by_index(
+                                                        region.location.cycle_index);
+                                                valid = bank &&
+                                                    state.ready.phone_graph.ffn_norm &&
+                                                    state.ready.phone_graph.topk_ids &&
+                                                    state.ready.phone_graph.topk_weights;
+                                                std::unique_ptr<
+                                                    llama_hybrid_cycle_p2c_ffn_slot> slot;
+                                                if (valid) {
+                                                    // Only PHONE_GPU worker touches
+                                                    // the P2C idle bank for this region.
+                                                    for (auto it = bank->p2c_idle.begin();
+                                                         it != bank->p2c_idle.end(); ++it) {
+                                                        if (*it &&
+                                                            (*it)->prepared_tokens ==
+                                                                state.tokens) {
+                                                            slot = std::move(*it);
+                                                            bank->p2c_idle.erase(it);
+                                                            ++p2c_slot_reuse;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if (valid && !slot) {
+                                                    const auto & lw = model->layers[size_t(l)];
+                                                    const llama_hybrid_cycle_ffn_shard_weights
+                                                        shard {
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_up_exps, phone, 1),
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_gate_exps, phone, 1),
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_down_exps, phone, 1),
+                                                        };
+                                                    slot = std::make_unique<
+                                                        llama_hybrid_cycle_p2c_ffn_slot>();
+                                                    slot->rpc_ops.send_partial =
+                                                        &ggml_backend_rpc_cycle_send_partial;
+                                                    valid = shard.available() &&
+                                                        slot->prepare(
+                                                            phone, shard, hidden,
+                                                            state.tokens, topk,
+                                                            model->hparams.n_expert);
+                                                }
+                                                if (valid) {
+                                                    state.p2c_main_ffn = std::move(slot);
+                                                    valid = state.p2c_main_ffn->execute_and_send(
+                                                        phone, state.ready.phone_graph,
+                                                        wire, nullptr);
+                                                }
+                                                if (!valid) {
+                                                    // Failed GPU work may not free its
+                                                    // borrowed READY Graph/Scratch early.
+                                                    ggml_backend_synchronize(phone);
+                                                }
+                                                state.ready.release_phone_graph();
+                                                if (valid) {
+                                                    // send_partial RPC stages its own
+                                                    // immutable Phone TX buffer first.
+                                                    bank->p2c_idle.push_back(
+                                                        std::move(state.p2c_main_ffn));
+                                                    ++real_p2c_phone_ffn;
+                                                } else {
+                                                    state.p2c_main_ffn.reset();
+                                                }
+                                            } else if (task.stage ==
+                                                       llama_hybrid_cycle_stage::FFN_DESTINATION) {
+                                                const auto * resource =
+                                                    resources.layer(l);
+                                                const auto & v =
+                                                    state.recv_ready.ready;
+                                                valid = resource &&
+                                                    llama_hybrid_cycle_execute_p2c_pc_ffn(
+                                                        *model, *resource, cpu, l,
+                                                        state.tokens, v.ffn_norm,
+                                                        v.topk_ids, v.topk_weights,
+                                                        state.partial);
+                                                if (valid) ++real_p2c_pc_ffn;
+                                            } else if (task.stage ==
+                                                       llama_hybrid_cycle_stage::SEND_PARTIAL) {
+                                                valid = llama_hybrid_cycle_receive_wire(
+                                                    phone, wire, INFERENCE_CYCLE_PARTIAL,
+                                                    uint32_t(state.tokens),
+                                                    uint32_t(hidden), 0,
+                                                    state.recv_partial);
+                                                if (valid) {
+                                                    const auto & v =
+                                                        state.recv_partial.partial;
+                                                    valid = v.tokens == uint32_t(state.tokens) &&
+                                                        v.hidden == uint32_t(hidden) &&
+                                                        cycle_pc_ring_finite(
+                                                            v.partial, expected);
+                                                }
+                                                if (valid) ++real_p2c_partial_rx;
+                                            } else if (task.stage ==
+                                                       llama_hybrid_cycle_stage::REDUCE) {
+                                                // One PC Reduce is the host output
+                                                // owner. It waits for both partials.
+                                                state.host_output.resize(expected);
+                                                valid = inference_cycle_reduce_p2c_pc_cpu(
+                                                    state.recv_ready.ready,
+                                                    state.partial.data(),
+                                                    state.partial.size(),
+                                                    state.recv_partial.partial,
+                                                    state.host_output.data(),
+                                                    state.host_output.size()) &&
+                                                    cycle_pc_ring_finite(
+                                                        state.host_output, expected);
+                                                if (valid) ++real_p2c_reduce;
+                                                if (valid) {
+                                                    // Remote FFN TX buffer is ACKed
+                                                    // only AFTER PC has read PARTIAL.
+                                                    valid = ggml_backend_rpc_cycle_send_ack(
+                                                        phone, wire.layer, wire.chunk,
+                                                        wire.seq, wire.graph_id,
+                                                        INFERENCE_CYCLE_PARTIAL, true);
+                                                    if (valid) ++real_p2c_partial_ack;
+                                                }
+                                                if (valid) {
+                                                    valid = session.publish_host_output(
+                                                        l, c, hidden);
+                                                }
+                                                if (valid) {
+                                                    ++p2c_completed[size_t(
+                                                        region.location.cycle_index)];
+                                                    std::printf(
+                                                        "[CYCLE_REAL_P2C] layer=%d "
+                                                        "chunk=%d seq=%llu "
+                                                        "attn=PHONE_GPU "
+                                                        "ffn=PHONE_GPU_PLUS_PC_CPU "
+                                                        "reduce=PC_CPU "
+                                                        "host_output=PUBLISHED "
+                                                        "status=PASS\n",
+                                                        l, c,
+                                                        (unsigned long long)wire.seq);
+                                                }
+                                            } else {
+                                                valid = false;
+                                            }
+                                            if (!valid) {
+                                                std::fprintf(stderr,
+                                                    "[CYCLE_REAL_P2C] layer=%d "
+                                                    "chunk=%d stage=%s status=FAIL\n",
+                                                    l, c,
+                                                    llama_hybrid_cycle_stage_name(
+                                                        task.stage));
+                                            }
+                                        } else if (task.stage ==
+                                                   llama_hybrid_cycle_stage::ATTN_PRE) {
+                                            // Preserve old MOCK P2C and the one
+                                            // final diagnostic Phone readback.
                                             if (real_phone_full) {
-                                                // P2C Attention is still MOCK.
-                                                // Read back ONLY the final Phone Full
-                                                // l_out once at this diagnostic
-                                                // boundary; earlier C2P/L5 handoffs
-                                                // stayed entirely on Phone GPU.
                                                 const auto * producer =
                                                     session.phone_predecessor_output(l, c);
                                                 valid = producer &&
@@ -630,14 +876,14 @@ int main(int argc, char ** argv) {
                                                     auto * bank =
                                                         phone_slot_banks.by_index(
                                                             region.location.cycle_index);
-                                                    auto retired =
+                                                    auto old_slot =
                                                         session.retire_phone_output_after_handoff(
                                                             l - 1, l, c);
-                                                    valid = bank && retired;
+                                                    valid = bank && old_slot;
                                                     if (valid) {
                                                         bank->full_idle_by_layer[
                                                             size_t(l - 1)].push_back(
-                                                                std::move(retired));
+                                                                std::move(old_slot));
                                                         ++phone_full_p2c_readbacks;
                                                     }
                                                 }
@@ -653,9 +899,8 @@ int main(int argc, char ** argv) {
                                             valid = cycle_pc_ring_finite(
                                                 target, expected);
                                             if (valid) {
-                                                auto & output = session.at(l, c);
-                                                output.host_output = target;
-                                                for (float & v : output.host_output) {
+                                                state.host_output = target;
+                                                for (float & v : state.host_output) {
                                                     v += 0.001f;
                                                 }
                                                 valid = session.publish_host_output(
@@ -703,12 +948,14 @@ int main(int argc, char ** argv) {
                                 "[CYCLE_REAL_PC_RING] phase=FORWARD "
                                 "layers=48 chunks=%d max_inflight=%d "
                                 "pc_full=REAL_CPU c2p_pc=REAL_CPU "
-                                "c2p_phone=%s phone_full=%s p2c=MOCK_ONLY "
+                                "c2p_phone=%s phone_full=%s p2c=%s "
                                 "wire=%s source=SYNTHETIC_HIDDEN status=BEGIN\n",
                                 n_chunks, max_inflight,
                                 real_c2p_phone ? "REAL_GPU_ONLY" : "MOCK_ONLY",
                                 real_phone_full ? "REAL_GPU_DEVICE_CHAIN" : "MOCK_ONLY",
-                                real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY");
+                                real_p2c ? "REAL_GPU_CPU_SPLIT" : "MOCK_ONLY",
+                                real_p2c ? "REAL_BIDIRECTIONAL_RPC" :
+                                    (real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY"));
                             ok = runtime.run(stages, nullptr, &timeline);
                             if (real_c2p_phone &&
                                 !ggml_backend_rpc_cycle_wait_tx_idle(phone, 30000)) {
@@ -810,9 +1057,41 @@ int main(int argc, char ** argv) {
                                 }
                             }
                         }
+                        // The six physical P2C KV prefixes and published
+                        // host outputs are checked after all workers join.
+                        // There must be no retained READY Graph or active FFN.
+                        int p2c_kv_layers = 0;
+                        if (ok && real_p2c) {
+                            for (int l = 7; l < 48 && ok; l += 8) {
+                                const auto * r = resources.layer(l);
+                                ok = r && r->kv &&
+                                     r->kv->committed_tokens == n_tokens;
+                                for (int c = 0; c < n_chunks && ok; ++c) {
+                                    const auto & st = session.at(l, c);
+                                    ok = st.ready.phone_compute_buffer == nullptr &&
+                                         st.p2c_main_ffn == nullptr &&
+                                         st.host_output_published.load(
+                                             std::memory_order_acquire) &&
+                                         cycle_pc_ring_finite(
+                                             st.host_output,
+                                             size_t(st.tokens) * size_t(hidden));
+                                }
+                                if (ok) ++p2c_kv_layers;
+                                std::printf(
+                                    "[CYCLE_REAL_P2C_KV] layer=%d "
+                                    "committed=%lld expected=%d "
+                                    "graph_slot=DRAINED host_output=PUBLISHED "
+                                    "status=%s\n",
+                                    l,
+                                    (long long)(r && r->kv ?
+                                        r->kv->committed_tokens : -1),
+                                    n_tokens, ok ? "PASS" : "FAIL");
+                            }
+                        }
                         if (ok) {
                             ok = pc_layers == 24 &&
                                  c2p_pc_layers == 6 &&
+                                 (!real_p2c || p2c_kv_layers == 6) &&
                                  (!real_phone_full ||
                                   phone_full_kv_layers == 12) &&
                                  real_c2p_attn.load() == 6 * n_chunks &&
@@ -827,7 +1106,18 @@ int main(int argc, char ** argv) {
                                   (real_phone_full_calls.load() == 12 * n_chunks &&
                                    c2p_device_handoffs.load() == 6 * n_chunks &&
                                    phone_full_device_handoffs.load() == 6 * n_chunks &&
-                                   phone_full_p2c_readbacks.load() == 6 * n_chunks));
+                                   (real_p2c ?
+                                        (phone_full_p2c_readbacks.load() == 0 &&
+                                         p2c_device_handoffs.load() == 6 * n_chunks) :
+                                        phone_full_p2c_readbacks.load() == 6 * n_chunks))) &&
+                                 (!real_p2c ||
+                                  (real_p2c_attn.load() == 6 * n_chunks &&
+                                   real_p2c_ready_rx.load() == 6 * n_chunks &&
+                                   real_p2c_phone_ffn.load() == 6 * n_chunks &&
+                                   real_p2c_pc_ffn.load() == 6 * n_chunks &&
+                                   real_p2c_partial_rx.load() == 6 * n_chunks &&
+                                   real_p2c_reduce.load() == 6 * n_chunks &&
+                                   real_p2c_partial_ack.load() == 6 * n_chunks));
                             for (int cycle = 0; cycle < 6 && ok; ++cycle) {
                                 ok = p2c_completed[size_t(cycle)].load() ==
                                     n_chunks;
@@ -894,25 +1184,32 @@ int main(int argc, char ** argv) {
                             "pc_full_layers=%d pc_full=REAL_CPU "
                             "c2p_pc_layers=%d c2p_pc=REAL_CPU "
                             "c2p_phone=%s phone_rpc_compute=%s "
-                            "phone_full=%s p2c=MOCK_ONLY "
+                            "phone_full=%s p2c=%s "
                             "tokens=%d chunks=%d max_inflight=%d "
                             "real_c2p_attn_calls=%d real_c2p_ffn_calls=%d "
                             "real_c2p_ready_acks=%d real_c2p_phone_ffn=%d "
                             "real_c2p_partial_applies=%d real_c2p_reduces=%d "
                             "real_phone_full_calls=%d "
                             "c2p_device_handoffs=%d phone_full_device_handoffs=%d "
-                            "phone_full_p2c_readbacks=%d "
+                            "phone_full_p2c_readbacks=%d p2c_device_handoffs=%d "
+                            "real_p2c_attn_calls=%d real_p2c_ready_rx=%d "
+                            "real_p2c_phone_ffn=%d real_p2c_pc_ffn=%d "
+                            "real_p2c_partial_rx=%d real_p2c_reduce=%d "
+                            "real_p2c_partial_acks=%d "
                             "c2p_slot_reuse=%d phone_full_slot_reuse=%d "
+                            "p2c_slot_reuse=%d "
                             "region_stage_calls=%d expected_region_stage_calls=%d "
                             "cross_period_early=%d "
-                            "full_48_forward=NOT_RUN logits=NOT_RUN "
+                            "full_48_forward=%s strict_parity=NOT_RUN logits=NOT_RUN "
                             "sum=%.9g max_abs=%.9g status=%s\n",
                             pc_layers, c2p_pc_layers,
                             real_c2p_phone ? (real_phone_full ?
                                 "REAL_GPU_DEVICE_CHAIN" :
                                 "REAL_GPU_WITH_HOST_BRIDGE") : "MOCK_ONLY",
-                            real_c2p_phone ? "C2P_ONLY" : "NOT_RUN",
+                            real_p2c ? "C2P_AND_P2C" :
+                                (real_c2p_phone ? "C2P_ONLY" : "NOT_RUN"),
                             real_phone_full ? "REAL_GPU_DEVICE_CHAIN" : "MOCK_ONLY",
+                            real_p2c ? "REAL_GPU_CPU_SPLIT" : "MOCK_ONLY",
                             n_tokens, n_chunks, max_inflight,
                             real_c2p_attn.load(), real_c2p_ffn.load(),
                             phone_c2p_ready.load(), phone_c2p_ffn.load(),
@@ -921,9 +1218,17 @@ int main(int argc, char ** argv) {
                             c2p_device_handoffs.load(),
                             phone_full_device_handoffs.load(),
                             phone_full_p2c_readbacks.load(),
+                            p2c_device_handoffs.load(),
+                            real_p2c_attn.load(), real_p2c_ready_rx.load(),
+                            real_p2c_phone_ffn.load(), real_p2c_pc_ffn.load(),
+                            real_p2c_partial_rx.load(), real_p2c_reduce.load(),
+                            real_p2c_partial_ack.load(),
                             c2p_slot_reuse.load(), phone_full_slot_reuse.load(),
+                            p2c_slot_reuse.load(),
                             mock_stages.load(), 6 * n_chunks * 14,
                             earlier_than_previous_last,
+                            real_p2c ? "REAL_SYNTHETIC_INPUT_UNVALIDATED" :
+                                       "NOT_RUN",
                             sum, max_abs, ok ? "PASS" : "FAIL");
                     }
                 }
