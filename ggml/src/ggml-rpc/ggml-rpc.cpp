@@ -14123,14 +14123,16 @@ struct rpc_cycle_p2c_fifo_v1 {
                     rpc_msg_graph_recompute_req run {};
                     run.device = item.c2p_v5.device;
                     run.graph_uid = item.c2p_v5.ffn_graph_uid;
+                    t1 = lock_acquired_us;
                     ok = server.graph_recompute(run);
-                    t1 = t2 = t3 = ggml_time_us();
+                    t2 = t3 = ggml_time_us();
                 } else if (item.type == kind::C2P_V5_REDUCE) {
                     rpc_msg_graph_recompute_req run {};
                     run.device = item.c2p_v5.device;
                     run.graph_uid = item.c2p_v5.reduce_graph_uid;
+                    t1 = lock_acquired_us;
                     ok = server.graph_recompute(run);
-                    t1 = t2 = ggml_time_us();
+                    t2 = ggml_time_us();
                     if (ok) {
                         rpc_msg_inference_cycle_send_req finish {};
                         finish.device = item.c2p_v5.device;
