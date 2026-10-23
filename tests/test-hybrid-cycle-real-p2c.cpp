@@ -5847,7 +5847,9 @@ static bool cycle_real_execute_period_fifo(
                 c, layout.x + 1, layout.x + 2,
                 (long long)v4_registered_l5_tokens,
                 (long long)v2_registered_kv_tokens,
-                v4_region_armed - v4_l6_completed, window);
+                v4_region_armed -
+                    (phone_main_p2c ? v5_p2c_ffn_completed :
+                                      v4_l6_completed), window);
         }
         return true;
     };
@@ -6111,7 +6113,10 @@ static bool cycle_real_execute_period_fifo(
                                     " status=%s\n",
                                     run_phase, l, c,
                                     (long long)kv[size_t(l)]->committed_tokens,
-                                    v4_region_armed - v4_l6_completed,
+                                    v4_region_armed -
+                                        (phone_main_p2c ?
+                                            v5_p2c_ffn_completed :
+                                            v4_l6_completed),
                                     ok ? "OK" : "FAIL");
                             } else {
                                 std::fprintf(stderr,
