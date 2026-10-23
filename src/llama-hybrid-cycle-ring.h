@@ -46,6 +46,9 @@ struct llama_hybrid_cycle_task {
     // Set only when the task enters its real FIFO. It does not alter
     // scheduling order, dependencies or buffer ownership.
     std::chrono::steady_clock::time_point queued_at {};
+    // Nonzero for an opt-in per-layer entry trace. This captures the time
+    // the predecessor made this Chunk ready, BEFORE credits/order allow enqueue.
+    std::chrono::steady_clock::time_point entry_ready_at {};
 };
 
 inline const char * llama_hybrid_cycle_stage_name(llama_hybrid_cycle_stage stage) {
@@ -93,13 +96,15 @@ public:
             int max_inflight = 0, bool credit_until_handoff = false,
             bool pc_cpu_reduce_priority = false,
             bool ordered_c2p_reduce = false,
-            bool phone_main_priority = false)
+            bool phone_main_priority = false,
+            bool trace_entry_gate = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
           credit_until_handoff_(credit_until_handoff),
           pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
           ordered_c2p_reduce_(ordered_c2p_reduce),
-          phone_main_priority_(phone_main_priority) {
+          phone_main_priority_(phone_main_priority),
+          trace_entry_gate_(trace_entry_gate) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -110,6 +115,10 @@ public:
         layer_inflight_.assign(layout_.kinds.size(), 0);
         tensor_ready_.assign(layout_.kinds.size(), std::vector<tensor_join_state>(n_chunks_));
         next_c2p_reduce_chunk_.assign(layout_.kinds.size(), 0);
+        if (trace_entry_gate_) {
+            entry_ready_times_.assign(layout_.kinds.size(),
+                std::vector<std::chrono::steady_clock::time_point>(size_t(n_chunks_)));
+        }
     }
 
     void start() {
@@ -330,8 +339,10 @@ private:
         return task;
     }
 
-    void enqueue(int layer, int chunk, llama_hybrid_cycle_stage stage) {
+    void enqueue(int layer, int chunk, llama_hybrid_cycle_stage stage,
+                 std::chrono::steady_clock::time_point entry_ready_at = {}) {
         auto task = make_task(layer, chunk, stage);
+        task.entry_ready_at = entry_ready_at;
         task.queued_at = std::chrono::steady_clock::now();
         if (!seen_.insert(task_key(task)).second) {
             throw std::logic_error("duplicate cycle task enqueue");
@@ -360,6 +371,10 @@ private:
             throw std::logic_error("duplicate cycle layer entry");
         }
         entry_ready_[layer][chunk] = 1;
+        if (trace_entry_gate_) {
+            entry_ready_times_[size_t(layer)][size_t(chunk)] =
+                std::chrono::steady_clock::now();
+        }
         drain_entry_window(layer);
     }
 
@@ -373,10 +388,13 @@ private:
                layer_inflight_[layer] < max_inflight_) {
             const int ready_chunk = next_chunk_[layer]++;
             ++layer_inflight_[layer];
-            enqueue(layer, ready_chunk,
-                    is_tensor(layout_.kinds[layer]) ?
-                        llama_hybrid_cycle_stage::ATTN_PRE :
-                        llama_hybrid_cycle_stage::FULL_LAYER);
+            const auto stage = is_tensor(layout_.kinds[layer]) ?
+                llama_hybrid_cycle_stage::ATTN_PRE :
+                llama_hybrid_cycle_stage::FULL_LAYER;
+            const auto entry_at = trace_entry_gate_ ?
+                entry_ready_times_[size_t(layer)][size_t(ready_chunk)] :
+                std::chrono::steady_clock::time_point{};
+            enqueue(layer, ready_chunk, stage, entry_at);
         }
     }
 
@@ -410,6 +428,7 @@ private:
     bool pc_cpu_reduce_priority_ = false;
     bool ordered_c2p_reduce_ = false;
     bool phone_main_priority_ = false;
+    bool trace_entry_gate_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
@@ -418,6 +437,7 @@ private:
     std::map<task_id, llama_hybrid_cycle_task> running_;
     std::set<task_id> seen_;
     std::vector<std::vector<uint8_t>> entry_ready_;
+    std::vector<std::vector<std::chrono::steady_clock::time_point>> entry_ready_times_;
     std::vector<int> next_chunk_;
     std::vector<int> layer_inflight_;
     std::vector<int> next_c2p_reduce_chunk_;
