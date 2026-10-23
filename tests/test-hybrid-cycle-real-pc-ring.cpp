@@ -4,11 +4,12 @@
 // real Qwen3-MoE Attention/RoPE/Router/FFN on their physical CPU weights,
 // using physical persistent KV and actual Session host handoffs.
 // C2P PC Attention and its FFN_SOURCE shard ALSO execute real CPU weights.
-// LLAMA_HYBRID_CYCLE_REAL_C2P_PHONE=1 enables the established legacy V5
-// PC->Phone READY/PARTIAL, Phone FFN and exclusive Reduce for all 6 C2P
-// regions. A DIAGNOSTIC Phone->PC readback bridges their real GPU output to
-// the still-MOCK Phone Full layer. No period barrier or Meta re-execution.
-// Without this env flag, retain the previous fully-MOCK Phone path.
+// LLAMA_HYBRID_CYCLE_REAL_C2P_PHONE=1 enables legacy V5 REAL C2P GPU.
+// LLAMA_HYBRID_CYCLE_REAL_PHONE_FULL=1 additionally executes all 12
+// Phone Full layers using direct GPU l_out handoffs (requires REAL C2P).
+// In that mode the ONLY diagnostic GPU readback occurs at the still-MOCK
+// P2C Attention boundary. No period barrier or Meta re-execution.
+// Without these flags, preserve the established regression paths.
 // This is NOT a 48-layer Transformer forward or a numeric parity test.
 //
 // Usage:
@@ -20,6 +21,7 @@
 #include "llama-model.h"
 #include "llama-hybrid-cycle-pc-full.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
+#include "llama-hybrid-cycle-phone-full.h"
 #include "llama-hybrid-cycle-phone-regions.h"
 #include "llama-hybrid-cycle-wire.h"
 
@@ -106,6 +108,23 @@ int main(int argc, char ** argv) {
     }
     const bool real_c2p_phone =
         real_phone_env && std::strcmp(real_phone_env, "1") == 0;
+    const char * real_full_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_REAL_PHONE_FULL");
+    if (real_full_env && std::strcmp(real_full_env, "0") != 0 &&
+        std::strcmp(real_full_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=REAL_PHONE_FULL_REQUIRES_0_OR_1\n");
+        return 2;
+    }
+    const bool real_phone_full =
+        real_full_env && std::strcmp(real_full_env, "1") == 0;
+    if (real_phone_full && !real_c2p_phone) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=REAL_PHONE_FULL_REQUIRES_REAL_C2P\n");
+        return 2;
+    }
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(
@@ -258,6 +277,11 @@ int main(int argc, char ** argv) {
                         std::atomic<int> phone_c2p_partial {0};
                         std::atomic<int> phone_c2p_reduce {0};
                         std::atomic<int> c2p_slot_reuse {0};
+                        std::atomic<int> real_phone_full_calls {0};
+                        std::atomic<int> c2p_device_handoffs {0};
+                        std::atomic<int> phone_full_device_handoffs {0};
+                        std::atomic<int> phone_full_p2c_readbacks {0};
+                        std::atomic<int> phone_full_slot_reuse {0};
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -445,46 +469,46 @@ int main(int argc, char ** argv) {
                                                         phone, INFERENCE_CYCLE_PARTIAL,
                                                         wire.layer, wire.chunk,
                                                         wire.seq, wire.graph_id, 30000);
-                                                if (valid) {
-                                                    // ONLY a diagnostic Host bridge:
-                                                    // next Phone Full is still MOCK.
-                                                    // GPU data is device-complete before
-                                                    // this blocking readback. The future
-                                                    // real Phone Full directly borrows
-                                                    // slot->output and removes this step.
+                                                if (valid && !real_phone_full) {
+                                                    // Legacy diagnostic Host bridge
+                                                    // to the old MOCK L5/L13/... layer.
                                                     target.resize(expected);
                                                     ggml_backend_tensor_get(
                                                         slot->output, target.data(), 0,
                                                         target.size() * sizeof(float));
                                                     valid = cycle_pc_ring_finite(
                                                         target, expected);
-                                                }
-                                                if (valid) {
-                                                    auto * bank =
-                                                        phone_slot_banks.by_index(
-                                                            region.location.cycle_index);
-                                                    valid = bank != nullptr;
                                                     if (valid) {
-                                                        // The host bridge has now consumed
-                                                        // the final l_out after the RPC ACK.
-                                                        // Return the slot to its physical
-                                                        // period, never another period.
-                                                        std::lock_guard<std::mutex> lock(
-                                                            bank->c2p_mutex);
-                                                        bank->c2p_idle.push_back(
-                                                            std::move(state.phone_output));
+                                                        auto * bank =
+                                                            phone_slot_banks.by_index(
+                                                                region.location.cycle_index);
+                                                        valid = bank != nullptr;
+                                                        if (valid) {
+                                                            // The Host readback has consumed
+                                                            // the output; no GPU successor.
+                                                            std::lock_guard<std::mutex> lock(
+                                                                bank->c2p_mutex);
+                                                            bank->c2p_idle.push_back(
+                                                                std::move(state.phone_output));
+                                                        }
                                                     }
                                                 }
+                                                // With REAL Phone Full, L4's GPU slot
+                                                // remains owned by THIS chunk until
+                                                // L5's Attention finishes consuming it.
+                                                // Never recycle on C2P Reduce ACK.
                                                 if (valid) {
                                                     ++phone_c2p_reduce;
                                                     std::printf(
                                                         "[CYCLE_REAL_C2P_PHONE] layer=%d "
                                                         "chunk=%d seq=%llu "
                                                         "compute=REAL_GPU reduce=REAL_GPU "
-                                                        "host_bridge=DIAGNOSTIC_READBACK "
-                                                        "status=PASS\n",
+                                                        "handoff=%s status=PASS\n",
                                                         l, c,
-                                                        (unsigned long long)wire.seq);
+                                                        (unsigned long long)wire.seq,
+                                                        real_phone_full ?
+                                                            "GPU_DEVICE_OWNED_UNTIL_L5" :
+                                                            "DIAGNOSTIC_READBACK");
                                                 }
                                             } else if (valid) {
                                                 // Original mock result: keep the
@@ -505,22 +529,125 @@ int main(int argc, char ** argv) {
                                             llama_hybrid_cycle_stage::FULL_LAYER) {
                                             return false;
                                         }
-                                        const auto & prior = mock_at(l - 1, c);
-                                        valid = cycle_pc_ring_finite(
-                                            prior, expected);
-                                        if (valid) {
-                                            target = prior;
-                                            for (float & v : target) v += 0.001f;
+                                        if (real_phone_full) {
+                                            const auto * predecessor =
+                                                session.phone_predecessor_output(l, c);
+                                            const auto * r = resources.layer(l);
+                                            auto * bank = phone_slot_banks.by_index(
+                                                region.location.cycle_index);
+                                            valid = predecessor && r && bank;
+                                            std::unique_ptr<
+                                                llama_hybrid_cycle_phone_ffn_slot> full_slot;
+                                            if (valid) {
+                                                // The sole PHONE_GPU FIFO worker owns
+                                                // every idle Full slot in this region.
+                                                auto & idle =
+                                                    bank->full_idle_by_layer[size_t(l)];
+                                                for (auto it = idle.begin();
+                                                     it != idle.end(); ++it) {
+                                                    if (*it && (*it)->is_full_layer &&
+                                                        (*it)->prepared_tokens ==
+                                                            state.tokens &&
+                                                        !(*it)->fused_full_graph) {
+                                                        full_slot = std::move(*it);
+                                                        idle.erase(it);
+                                                        ++phone_full_slot_reuse;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!full_slot) {
+                                                    full_slot = std::make_unique<
+                                                        llama_hybrid_cycle_phone_ffn_slot>();
+                                                }
+                                                valid = llama_hybrid_cycle_execute_phone_full(
+                                                    *model, *r, phone, l,
+                                                    state.start, state.tokens,
+                                                    predecessor, state.ready,
+                                                    *full_slot);
+                                            }
+                                            if (valid) {
+                                                state.phone_output = std::move(full_slot);
+                                                // The previous physical GPU l_out was
+                                                // read by this Attention and the backend
+                                                // synchronized. This is the ONLY safe
+                                                // ownership transfer point for the slot.
+                                                auto previous =
+                                                    session.retire_phone_output_after_handoff(
+                                                        l - 1, l, c);
+                                                valid = previous != nullptr;
+                                                if (valid) {
+                                                    if (l - 1 ==
+                                                        region.location.c2p_layer) {
+                                                        std::lock_guard<std::mutex> lock(
+                                                            bank->c2p_mutex);
+                                                        bank->c2p_idle.push_back(
+                                                            std::move(previous));
+                                                        ++c2p_device_handoffs;
+                                                    } else {
+                                                        bank->full_idle_by_layer[
+                                                            size_t(l - 1)].push_back(
+                                                                std::move(previous));
+                                                        ++phone_full_device_handoffs;
+                                                    }
+                                                }
+                                            }
+                                            if (valid) ++real_phone_full_calls;
+                                        } else {
+                                            const auto & prior = mock_at(l - 1, c);
+                                            valid = cycle_pc_ring_finite(
+                                                prior, expected);
+                                            if (valid) {
+                                                target = prior;
+                                                for (float & v : target) v += 0.001f;
+                                            }
                                         }
                                     } else if (kind ==
                                                llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                                         if (task.stage ==
                                             llama_hybrid_cycle_stage::ATTN_PRE) {
-                                            const auto & prior =
-                                                mock_at(l - 1, c);
-                                            valid = cycle_pc_ring_finite(
-                                                prior, expected);
-                                            if (valid) target = prior;
+                                            if (real_phone_full) {
+                                                // P2C Attention is still MOCK.
+                                                // Read back ONLY the final Phone Full
+                                                // l_out once at this diagnostic
+                                                // boundary; earlier C2P/L5 handoffs
+                                                // stayed entirely on Phone GPU.
+                                                const auto * producer =
+                                                    session.phone_predecessor_output(l, c);
+                                                valid = producer &&
+                                                    producer->type == GGML_TYPE_F32 &&
+                                                    ggml_is_contiguous(producer) &&
+                                                    ggml_nelements(producer) ==
+                                                        int64_t(expected);
+                                                if (valid) {
+                                                    target.resize(expected);
+                                                    ggml_backend_tensor_get(
+                                                        producer, target.data(), 0,
+                                                        target.size() * sizeof(float));
+                                                    valid = cycle_pc_ring_finite(
+                                                        target, expected);
+                                                }
+                                                if (valid) {
+                                                    auto * bank =
+                                                        phone_slot_banks.by_index(
+                                                            region.location.cycle_index);
+                                                    auto retired =
+                                                        session.retire_phone_output_after_handoff(
+                                                            l - 1, l, c);
+                                                    valid = bank && retired;
+                                                    if (valid) {
+                                                        bank->full_idle_by_layer[
+                                                            size_t(l - 1)].push_back(
+                                                                std::move(retired));
+                                                        ++phone_full_p2c_readbacks;
+                                                    }
+                                                }
+                                            } else {
+                                                const auto & prior =
+                                                    mock_at(l - 1, c);
+                                                valid = cycle_pc_ring_finite(
+                                                    prior, expected);
+                                                if (valid) target = prior;
+                                            }
                                         } else if (task.stage ==
                                                    llama_hybrid_cycle_stage::REDUCE) {
                                             valid = cycle_pc_ring_finite(
@@ -576,10 +703,11 @@ int main(int argc, char ** argv) {
                                 "[CYCLE_REAL_PC_RING] phase=FORWARD "
                                 "layers=48 chunks=%d max_inflight=%d "
                                 "pc_full=REAL_CPU c2p_pc=REAL_CPU "
-                                "c2p_phone=%s wire=%s "
-                                "source=SYNTHETIC_HIDDEN status=BEGIN\n",
+                                "c2p_phone=%s phone_full=%s p2c=MOCK_ONLY "
+                                "wire=%s source=SYNTHETIC_HIDDEN status=BEGIN\n",
                                 n_chunks, max_inflight,
                                 real_c2p_phone ? "REAL_GPU_ONLY" : "MOCK_ONLY",
+                                real_phone_full ? "REAL_GPU_DEVICE_CHAIN" : "MOCK_ONLY",
                                 real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY");
                             ok = runtime.run(stages, nullptr, &timeline);
                             if (real_c2p_phone &&
@@ -655,7 +783,12 @@ int main(int argc, char ** argv) {
                                   (phone_c2p_ready.load() == 6 * n_chunks &&
                                    phone_c2p_ffn.load() == 6 * n_chunks &&
                                    phone_c2p_partial.load() == 6 * n_chunks &&
-                                   phone_c2p_reduce.load() == 6 * n_chunks));
+                                   phone_c2p_reduce.load() == 6 * n_chunks)) &&
+                                 (!real_phone_full ||
+                                  (real_phone_full_calls.load() == 12 * n_chunks &&
+                                   c2p_device_handoffs.load() == 6 * n_chunks &&
+                                   phone_full_device_handoffs.load() == 6 * n_chunks &&
+                                   phone_full_p2c_readbacks.load() == 6 * n_chunks));
                             for (int cycle = 0; cycle < 6 && ok; ++cycle) {
                                 ok = p2c_completed[size_t(cycle)].load() ==
                                     n_chunks;
@@ -722,24 +855,34 @@ int main(int argc, char ** argv) {
                             "pc_full_layers=%d pc_full=REAL_CPU "
                             "c2p_pc_layers=%d c2p_pc=REAL_CPU "
                             "c2p_phone=%s phone_rpc_compute=%s "
-                            "phone_full=MOCK_ONLY p2c=MOCK_ONLY "
+                            "phone_full=%s p2c=MOCK_ONLY "
                             "tokens=%d chunks=%d max_inflight=%d "
                             "real_c2p_attn_calls=%d real_c2p_ffn_calls=%d "
                             "real_c2p_ready_acks=%d real_c2p_phone_ffn=%d "
                             "real_c2p_partial_applies=%d real_c2p_reduces=%d "
-                            "c2p_slot_reuse=%d "
+                            "real_phone_full_calls=%d "
+                            "c2p_device_handoffs=%d phone_full_device_handoffs=%d "
+                            "phone_full_p2c_readbacks=%d "
+                            "c2p_slot_reuse=%d phone_full_slot_reuse=%d "
                             "region_stage_calls=%d expected_region_stage_calls=%d "
                             "cross_period_early=%d "
                             "full_48_forward=NOT_RUN logits=NOT_RUN "
                             "sum=%.9g max_abs=%.9g status=%s\n",
                             pc_layers, c2p_pc_layers,
-                            real_c2p_phone ? "REAL_GPU_WITH_HOST_BRIDGE" : "MOCK_ONLY",
+                            real_c2p_phone ? (real_phone_full ?
+                                "REAL_GPU_DEVICE_CHAIN" :
+                                "REAL_GPU_WITH_HOST_BRIDGE") : "MOCK_ONLY",
                             real_c2p_phone ? "C2P_ONLY" : "NOT_RUN",
+                            real_phone_full ? "REAL_GPU_DEVICE_CHAIN" : "MOCK_ONLY",
                             n_tokens, n_chunks, max_inflight,
                             real_c2p_attn.load(), real_c2p_ffn.load(),
                             phone_c2p_ready.load(), phone_c2p_ffn.load(),
                             phone_c2p_partial.load(), phone_c2p_reduce.load(),
-                            c2p_slot_reuse.load(),
+                            real_phone_full_calls.load(),
+                            c2p_device_handoffs.load(),
+                            phone_full_device_handoffs.load(),
+                            phone_full_p2c_readbacks.load(),
+                            c2p_slot_reuse.load(), phone_full_slot_reuse.load(),
                             mock_stages.load(), 6 * n_chunks * 14,
                             earlier_than_previous_last,
                             sum, max_abs, ok ? "PASS" : "FAIL");
