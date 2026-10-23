@@ -73,6 +73,18 @@ inline const char * llama_hybrid_cycle_queue_name(llama_hybrid_cycle_queue queue
     return "UNKNOWN";
 }
 
+// Snapshot of real entry-credit head-of-line blocking. These are PC
+// ring-clock durations, NOT remote GPU runtime or an additive wall-time
+// breakdown. A layer is blocked only when its next causal Chunk is ready
+// but its max_inflight entry credits are exhausted.
+struct llama_hybrid_cycle_credit_layer_profile {
+    uint64_t admitted_chunks = 0;
+    uint64_t credit_blocked_chunks = 0;
+    double credit_wait_sum_ms = 0.0;
+    double credit_wait_max_ms = 0.0;
+    std::vector<double> credit_wait_by_chunk_ms;
+};
+
 // Per-task readiness order:
 //
 //   ATTN_PRE -> SEND_ACTIVATION -> FFN_DESTINATION ---+
@@ -93,13 +105,15 @@ public:
             int max_inflight = 0, bool credit_until_handoff = false,
             bool pc_cpu_reduce_priority = false,
             bool ordered_c2p_reduce = false,
-            bool phone_main_priority = false)
+            bool phone_main_priority = false,
+            bool track_entry_credit = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
           credit_until_handoff_(credit_until_handoff),
           pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
           ordered_c2p_reduce_(ordered_c2p_reduce),
-          phone_main_priority_(phone_main_priority) {
+          phone_main_priority_(phone_main_priority),
+          track_entry_credit_(track_entry_credit) {
         if (!layout_.enabled() || n_chunks_ <= 0 ||
             max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
@@ -110,6 +124,14 @@ public:
         layer_inflight_.assign(layout_.kinds.size(), 0);
         tensor_ready_.assign(layout_.kinds.size(), std::vector<tensor_join_state>(n_chunks_));
         next_c2p_reduce_chunk_.assign(layout_.kinds.size(), 0);
+        if (track_entry_credit_) {
+            credit_layers_.resize(layout_.kinds.size());
+            credit_block_head_.assign(layout_.kinds.size(), -1);
+            credit_block_start_.resize(layout_.kinds.size());
+            for (auto & layer : credit_layers_) {
+                layer.credit_wait_by_chunk_ms.assign(size_t(n_chunks_), 0.0);
+            }
+        }
     }
 
     void start() {
@@ -265,6 +287,12 @@ public:
         return layer_outputs_done_;
     }
 
+    std::vector<llama_hybrid_cycle_credit_layer_profile>
+    credit_profiles() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return credit_layers_;
+    }
+
     size_t pending(llama_hybrid_cycle_queue queue) const {
         std::lock_guard<std::mutex> lock(mu_);
         const size_t i = static_cast<size_t>(queue);
@@ -373,10 +401,42 @@ private:
                layer_inflight_[layer] < max_inflight_) {
             const int ready_chunk = next_chunk_[layer]++;
             ++layer_inflight_[layer];
+            if (track_entry_credit_) {
+                auto & stats = credit_layers_[size_t(layer)];
+                ++stats.admitted_chunks;
+                if (credit_block_head_[size_t(layer)] == ready_chunk) {
+                    const double blocked_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() -
+                            credit_block_start_[size_t(layer)]).count();
+                    stats.credit_wait_by_chunk_ms[size_t(ready_chunk)] =
+                        blocked_ms;
+                    stats.credit_wait_sum_ms += blocked_ms;
+                    stats.credit_wait_max_ms = std::max(
+                        stats.credit_wait_max_ms, blocked_ms);
+                    credit_block_head_[size_t(layer)] = -1;
+                }
+            }
             enqueue(layer, ready_chunk,
                     is_tensor(layout_.kinds[layer]) ?
                         llama_hybrid_cycle_stage::ATTN_PRE :
                         llama_hybrid_cycle_stage::FULL_LAYER);
+        }
+        // Only the oldest ready Chunk can be declared credit-blocked.
+        // A later, out-of-order Chunk does not cause a spurious credit
+        // measurement before its missing predecessor is ready.
+        if (track_entry_credit_ &&
+            next_chunk_[layer] < n_chunks_ &&
+            entry_ready_[layer][next_chunk_[layer]] != 0 &&
+            layer_inflight_[layer] == max_inflight_) {
+            const size_t index = size_t(layer);
+            const int head = next_chunk_[layer];
+            if (credit_block_head_[index] != head) {
+                credit_block_head_[index] = head;
+                credit_block_start_[index] =
+                    std::chrono::steady_clock::now();
+                ++credit_layers_[index].credit_blocked_chunks;
+            }
         }
     }
 
@@ -410,6 +470,7 @@ private:
     bool pc_cpu_reduce_priority_ = false;
     bool ordered_c2p_reduce_ = false;
     bool phone_main_priority_ = false;
+    bool track_entry_credit_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
 
@@ -422,4 +483,7 @@ private:
     std::vector<int> layer_inflight_;
     std::vector<int> next_c2p_reduce_chunk_;
     std::vector<std::vector<tensor_join_state>> tensor_ready_;
+    std::vector<llama_hybrid_cycle_credit_layer_profile> credit_layers_;
+    std::vector<int> credit_block_head_;
+    std::vector<std::chrono::steady_clock::time_point> credit_block_start_;
 };
