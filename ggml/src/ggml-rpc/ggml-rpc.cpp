@@ -10425,32 +10425,136 @@ bool rpc_server::apply_inference_cycle(
         source[0] = msg.partial.partial.data();
     }
 
-    // C2P APPLY first waits for its HOST frame. Do not hold the Phone GPU
-    // worker gate during that wait: the P2C worker can have ready work.
-    // The optional upload-priority ticket is posted ONLY after HOST RX,
-    // so MAIN never pauses for a Chunk whose data has not yet arrived.
-    // GPU writes still hold the ORIGINAL GPU gate and synchronize fully.
+    // Phase B: real OpenCL transfer queue + completion event. The v1
+    // ownership check is allocation-conservative. No overlap is allowed
+    // for ANY view within an allocation borrowed by the active GPU job.
+    // On an uncertain alias, metadata miss or unsupported Backend, use
+    // the old gated/synchronous upload instead of guessing.
     const bool gpu_stage_timing =
         std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr;
     const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1");
     const bool needs_gpu_gate = v1 && std::strcmp(v1, "1") == 0;
-    const bool upload_priority = needs_gpu_gate &&
+    const size_t count = ready ? 4 : 1;
+    bool uploaded_async = false;
+    int64_t transfer_submit_us = 0;
+    int64_t transfer_event_wait_us = 0;
+    const bool async_candidate =
+        needs_gpu_gate && cycle_gpu_transfer_enabled() &&
+        !cycle_phone_numeric_enabled();
+    if (async_candidate) {
+        std::vector<uint64_t> target_buffers;
+        target_buffers.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            target_buffers.push_back(request.tensors[i].buffer);
+        }
+        cycle_gpu_upload_lease lease(*this, std::move(target_buffers));
+        const char * fallback_reason = "UNSUPPORTED_OPENCL_TENSOR";
+        if (lease.acquire(&fallback_reason)) {
+            // These objects live through event completion. Restore cached
+            // OpenCL Tensor Extra ONLY; do not create/modify GPU metadata
+            // under a running compute kernel.
+            struct ggml_init_params params {
+                /* .mem_size = */ ggml_tensor_overhead() * (count + 1),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc = */ true,
+            };
+            ggml_context_ptr ctx {ggml_init(params)};
+            ggml_tensor * tensors[4] {};
+            size_t bytes[4] {};
+            ggml_backend_reg_t reg = nullptr;
+            bool prepared = ctx != nullptr;
+            for (size_t i = 0; i < count && prepared; ++i) {
+                const rpc_tensor & dst = request.tensors[i];
+                const uint32_t expected = ready && i == 2 ?
+                    GGML_TYPE_I32 : GGML_TYPE_F32;
+                const size_t elements = ready && i >= 2 ? routes : n;
+                if (dst.type != expected || !dst.buffer ||
+                    dst.nb[0] != sizeof(float)) {
+                    prepared = false;
+                    break;
+                }
+                tensors[i] = deserialize_tensor(ctx.get(), &dst);
+                prepared = tensors[i] && is_opencl_tensor(tensors[i]) &&
+                    ggml_is_contiguous(tensors[i]) &&
+                    ggml_nelements(tensors[i]) == int64_t(elements) &&
+                    restore_opencl_tensor_extra(tensors[i]);
+                if (!prepared) break;
+                bytes[i] = elements * sizeof(float);
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(
+                    tensors[i]->buffer->buft);
+                ggml_backend_reg_t this_reg = dev ?
+                    ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (!this_reg || (reg && reg != this_reg)) {
+                    prepared = false;
+                    break;
+                }
+                reg = this_reg;
+            }
+            if (prepared && reg) {
+                const auto submit = reinterpret_cast<
+                    ggml_backend_opencl_cycle_upload_batch_t>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_OPENCL_CYCLE_UPLOAD_BATCH_PROC));
+                const auto wait = reinterpret_cast<
+                    ggml_backend_opencl_cycle_upload_wait_t>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_OPENCL_CYCLE_UPLOAD_WAIT_PROC));
+                if (submit && wait) {
+                    void * event = nullptr;
+                    const int64_t submit_begin_us = ggml_time_us();
+                    const bool queued = submit(
+                        tensors, source, bytes, count, &event);
+                    transfer_submit_us = ggml_time_us() - submit_begin_us;
+                    if (queued && event) {
+                        const int64_t wait_begin_us = ggml_time_us();
+                        const bool completed = wait(event); // releases event
+                        transfer_event_wait_us =
+                            ggml_time_us() - wait_begin_us;
+                        if (!completed) {
+                            GGML_LOG_ERROR(
+                                "[CYCLE_C2P_ASYNC] kind=%s layer=%d chunk=%d "
+                                "status=FAIL reason=TRANSFER_EVENT\n",
+                                ready ? "READY" : "PARTIAL",
+                                request.layer, request.chunk);
+                            return false;
+                        }
+                        uploaded_async = true;
+                    } else if (event) {
+                        // Defensive: a backend must not return a live event
+                        // after reporting failed submission.
+                        (void)wait(event);
+                    }
+                }
+            }
+            if (!uploaded_async)
+                fallback_reason = "ASYNC_PREPARE_OR_SUBMIT_FAILED";
+        }
+        GGML_LOG_INFO(
+            "[CYCLE_GPU_OWNERSHIP] side=PHONE layer=%d chunk=%d kind=%s "
+            "decision=%s reason=%s buffers=%zu\n",
+            request.layer, request.chunk, ready ? "READY" : "PARTIAL",
+            uploaded_async ? "TRANSFER_QUEUE" : "GATED_FALLBACK",
+            uploaded_async ? "DISJOINT_ALLOCATIONS" : fallback_reason,
+            count);
+    }
+
+    // Legacy, always-safe path. A successful independent upload has already
+    // completed its cl_event before this point and must NOT synchronize the
+    // unrelated compute queue or re-upload the same activation.
+    const bool upload_priority = !uploaded_async && needs_gpu_gate &&
         cycle_gpu_upload_priority_enabled();
     cycle_gpu_upload_ticket upload_ticket(*this, upload_priority);
     const int64_t gpu_gate_enter_us =
         gpu_stage_timing ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> cycle_p2c_apply_gpu_guard;
-    if (needs_gpu_gate) {
+    if (needs_gpu_gate && !uploaded_async) {
         cycle_p2c_apply_gpu_guard =
             std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
     }
-    // Notify the worker only after GPU ownership is acquired. If the
-    // pending notice raced with the worker's acquire, the worker retries
-    // at this safe boundary instead of starting the next graph.
     upload_ticket.acquired();
     const int64_t gpu_gate_acquired_us =
         gpu_stage_timing ? ggml_time_us() : 0;
-    const size_t count = ready ? 4 : 1;
+    if (!uploaded_async) {
     for (size_t i = 0; i < count; ++i) {
         const rpc_tensor & dst = request.tensors[i];
         const uint32_t type = ready && i == 2 ?
@@ -10498,6 +10602,7 @@ bool rpc_server::apply_inference_cycle(
             }
         }
     }
+    }
     const int64_t gpu_input_ready_us = ggml_time_us();
     if (cycle_p2c_apply_gpu_guard.owns_lock()) {
         cycle_p2c_apply_gpu_guard.unlock();
@@ -10531,6 +10636,8 @@ bool rpc_server::apply_inference_cycle(
             "seq=%" PRIu64 " rx_wait_ms=%.3f "
             "input_copy_ms=%.3f gpu_gate_wait_ms=%.3f "
             "gpu_copy_sync_ms=%.3f upload_priority=%d "
+            "async_transfer=%d transfer_submit_ms=%.3f "
+            "transfer_event_wait_ms=%.3f "
             "scope=PHONE_SERVER_GPU_UPLOAD "
             "gpu_copy_semantics=BACKEND_UPLOAD_AND_SYNC_NOT_KERNEL_ONLY\n",
             ready ? "READY" : "PARTIAL", request.layer,
@@ -10539,7 +10646,10 @@ bool rpc_server::apply_inference_cycle(
             (gpu_input_ready_us - rx_ready_us) / 1000.0,
             (gpu_gate_acquired_us - gpu_gate_enter_us) / 1000.0,
             (gpu_input_ready_us - gpu_gate_acquired_us) / 1000.0,
-            upload_priority ? 1 : 0);
+            upload_priority ? 1 : 0,
+            uploaded_async ? 1 : 0,
+            transfer_submit_us / 1000.0,
+            transfer_event_wait_us / 1000.0);
     }
     return true;
 }
