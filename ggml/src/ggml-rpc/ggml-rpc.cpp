@@ -948,6 +948,10 @@ struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
+    // Opt-in dedicated connection for C2P APPLY control commands. Keep a
+    // strong reference so the role cache does not reconnect each Chunk.
+    std::mutex cycle_apply_socket_mutex;
+    std::shared_ptr<socket_t> cycle_apply_socket;
     rpc_graph_snapshot_context graph_snapshot;
 
     // Diagnostic-only record of the most recent graph successfully submitted
@@ -1495,6 +1499,7 @@ static bool negotiate_hello(
 }
 enum class rpc_socket_role {
     COMPUTE,
+    CYCLE_APPLY,
     TRANSFER,
     SNAPSHOT_TRANSFER_0,
     SNAPSHOT_TRANSFER_1,
@@ -1514,6 +1519,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
     switch (role) {
         case rpc_socket_role::COMPUTE:
             suffix = "_compute";
+            break;
+        case rpc_socket_role::CYCLE_APPLY:
+            suffix = "_cycle_apply";
             break;
         case rpc_socket_role::TRANSFER:
             suffix = "_transfer";
@@ -1579,6 +1587,21 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return get_socket_role(endpoint, rpc_socket_role::COMPUTE);
+}
+
+// C2P data frames still use the independent persistent inference data plane.
+// This connection carries only APPLY descriptors/replies so a concurrent
+// Phone MAIN WAIT/region registration cannot monopolize its RPC mutex.
+// All GPU buffer writes remain serialized by Phone's existing GPU gate.
+static std::shared_ptr<socket_t> get_cycle_apply_socket(
+        ggml_backend_rpc_context * ctx) {
+    if (!ctx) return nullptr;
+    std::lock_guard<std::mutex> lock(ctx->cycle_apply_socket_mutex);
+    if (!ctx->cycle_apply_socket) {
+        ctx->cycle_apply_socket = get_socket_role(
+            ctx->endpoint, rpc_socket_role::CYCLE_APPLY);
+    }
+    return ctx->cycle_apply_socket;
 }
 
 static std::shared_ptr<socket_t> get_transfer_socket(const std::string & endpoint) {
@@ -2302,7 +2325,12 @@ static bool rpc_cycle_apply_inbound_tensors(
         }
         request.tensors[i] = serialize_tensor(t);
     }
-    auto sock = get_socket(ctx->endpoint);
+    const char * const apply_socket_env =
+        std::getenv("LLAMA_HYBRID_CYCLE_SPLIT_APPLY_SOCKET");
+    const bool split_apply_socket =
+        apply_socket_env && std::strcmp(apply_socket_env, "1") == 0;
+    auto sock = split_apply_socket ?
+        get_cycle_apply_socket(ctx) : get_socket(ctx->endpoint);
     if (!sock) {
         return false;
     }
@@ -2322,12 +2350,13 @@ static bool rpc_cycle_apply_inbound_tensors(
         rpc_cmd_roundtrip_profile_active = previous_profile;
         GGML_LOG_INFO(
             "[CYCLE_RPC_APPLY_DETAIL] side=PC kind=%s "
-            "layer=%d chunk=%d seq=%" PRIu64 " "
+            "socket=%s layer=%d chunk=%d seq=%" PRIu64 " "
             "socket_lock_wait_ms=%.3f request_send_ms=%.3f "
             "response_header_wait_ms=%.3f "
             "response_body_wait_ms=%.3f total_rpc_ms=%.3f "
             "status=%s scope=CLIENT_CONTROL_SOCKET\n",
             kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
+            split_apply_socket ? "CYCLE_APPLY" : "COMPUTE",
             layer, chunk, seq,
             rpc_timing.socket_lock_wait_us / 1000.0,
             rpc_timing.request_send_us / 1000.0,
