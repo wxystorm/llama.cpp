@@ -7698,10 +7698,24 @@ rpc_phone_npu_find_ffn_stages(
     return result;
 }
 
+// V5 ARM/WAIT and APPLY may arrive on different RPC control connections.
+// Preserve the owning connection's FIFO executor, forwarding only ready
+// notifications by exact per-Chunk protocol identity.
+struct rpc_cycle_p2c_fifo_v1;
+
 class rpc_server {
 public:
     // Shared GPU/Graph/Buffer gate for the opt-in Phone P2C FIFO worker.
     std::mutex & cycle_p2c_gpu_gate() { return cycle_p2c_gpu_gate_; }
+
+    using cycle_v5_key = std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
+    enum class cycle_v5_notice_status { NO_OWNER, APPLIED, FAILED };
+    bool bind_cycle_v5_owner(
+        const cycle_v5_key & key,
+        const std::shared_ptr<rpc_cycle_p2c_fifo_v1> & owner);
+    cycle_v5_notice_status forward_cycle_v5_notice(
+        const cycle_v5_key & key, bool partial);
+    void unbind_cycle_v5_owner(const cycle_v5_key & key);
 
     rpc_server(
             std::vector<ggml_backend_t> all_backends,
@@ -8301,6 +8315,12 @@ private:
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     std::mutex cycle_p2c_gpu_gate_;
+    // V5-only, protocol-keyed cross-control-connection event handoff.
+    // Weak owners prevent a closed COMPUTE connection from keeping an
+    // executor (and its borrowed graph buffers) alive unexpectedly.
+    std::mutex cycle_v5_owner_mutex;
+    std::map<cycle_v5_key, std::weak_ptr<rpc_cycle_p2c_fifo_v1>>
+        cycle_v5_owners;
 
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
@@ -14735,6 +14755,64 @@ struct rpc_cycle_p2c_fifo_v1 {
     }
 };
 
+// Register the executor that actually handled ARM on the original COMPUTE
+// connection. The separate APPLY connection has its own local RPC handler,
+// but it MUST NOT create/consume a different V5 readiness state.
+bool rpc_server::bind_cycle_v5_owner(
+        const cycle_v5_key & key,
+        const std::shared_ptr<rpc_cycle_p2c_fifo_v1> & owner) {
+    std::lock_guard<std::mutex> lock(cycle_v5_owner_mutex);
+    auto & slot = cycle_v5_owners[key];
+    if (auto existing = slot.lock()) {
+        if (existing != owner) {
+            GGML_LOG_ERROR(
+                "[CYCLE_PHONE_V5] side=PHONE event=OWNER_BIND "
+                "layer=%d chunk=%d seq=%" PRIu64
+                " status=FAIL reason=DUPLICATE_LIVE_OWNER\n",
+                std::get<0>(key), std::get<1>(key),
+                std::get<2>(key));
+            return false;
+        }
+    }
+    slot = owner;
+    return true;
+}
+
+rpc_server::cycle_v5_notice_status rpc_server::forward_cycle_v5_notice(
+        const cycle_v5_key & key, bool partial) {
+    std::shared_ptr<rpc_cycle_p2c_fifo_v1> owner;
+    {
+        std::lock_guard<std::mutex> lock(cycle_v5_owner_mutex);
+        const auto it = cycle_v5_owners.find(key);
+        if (it == cycle_v5_owners.end()) return cycle_v5_notice_status::NO_OWNER;
+        owner = it->second.lock();
+    }
+    if (!owner) {
+        GGML_LOG_ERROR(
+            "[CYCLE_PHONE_V5] side=PHONE event=APPLY_FORWARD "
+            "kind=%s layer=%d chunk=%d seq=%" PRIu64
+            " status=FAIL reason=OWNER_CONNECTION_CLOSED\n",
+            partial ? "PARTIAL" : "READY",
+            std::get<0>(key), std::get<1>(key), std::get<2>(key));
+        return cycle_v5_notice_status::FAILED;
+    }
+    const bool ok = owner->c2p_device_ready(key, partial);
+    GGML_LOG_INFO(
+        "[CYCLE_PHONE_V5] side=PHONE event=APPLY_FORWARD "
+        "kind=%s layer=%d chunk=%d seq=%" PRIu64
+        " status=%s scope=ARM_OWNER_EXECUTOR\n",
+        partial ? "PARTIAL" : "READY",
+        std::get<0>(key), std::get<1>(key), std::get<2>(key),
+        ok ? "OK" : "FAIL");
+    return ok ? cycle_v5_notice_status::APPLIED :
+                cycle_v5_notice_status::FAILED;
+}
+
+void rpc_server::unbind_cycle_v5_owner(const cycle_v5_key & key) {
+    std::lock_guard<std::mutex> lock(cycle_v5_owner_mutex);
+    cycle_v5_owners.erase(key);
+}
+
 // Data-plane receive and the completion wait must never hold the GPU gate.
 static bool rpc_cycle_p2c_v1_gpu_command(rpc_cmd cmd) {
     switch (cmd) {
@@ -14812,9 +14890,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
     size_t return_bulk_credit_inflight = 0;
     size_t return_bulk_credit_limit = 0;
 
-    // Opt-in Phone-local P2C continuation state, tied to this COMPUTE
-    // connection. Every armed job is removed after its READY command; DONE
-    // survives until the PC Phone worker safely returns its scratch lease.
+    // The owning COMPUTE connection keeps the Phone-local FIFO alive;
+    // opt-in APPLY connections only forward keyed readiness notifications.
+    // Every armed job is removed after READY; DONE remains until PC releases
+    // its scratch lease after WAIT.
     using p2c_task_key =
         std::tuple<int32_t, int32_t, uint64_t, uint64_t>;
     const auto p2c_key = [](int32_t layer, int32_t chunk,
@@ -14824,8 +14903,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
     std::map<p2c_task_key, rpc_msg_inference_cycle_p2c_arm_req> p2c_armed;
     std::map<p2c_task_key, bool> p2c_completed; // Original inline path.
     const char * cycle_p2c_v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1");
-    rpc_cycle_p2c_fifo_v1 executor(
+    auto executor_owner = std::make_shared<rpc_cycle_p2c_fifo_v1>(
         server, cycle_p2c_v1 && std::strcmp(cycle_p2c_v1, "1") == 0);
+    rpc_cycle_p2c_fifo_v1 & executor = *executor_owner;
 
     // Diagnostic-only per-COMPUTE-connection order. The command sequence is
     // assigned when the server receives each command byte, including commands
@@ -16301,9 +16381,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_inference_cycle_v5_c2p_arm_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) return;
                 const char * v5 = std::getenv("GGML_CYCLE_PHONE_EXECUTOR_V5");
-                const bool ok = v5 && std::strcmp(v5, "1") == 0 &&
+                const bool armed = v5 && std::strcmp(v5, "1") == 0 &&
                     executor.enabled && request.device < device_count &&
                     executor.arm_c2p_v5(request);
+                const rpc_server::cycle_v5_key owner_key {
+                    request.layer, request.chunk, request.seq, request.graph_id
+                };
+                const bool ok = armed &&
+                    server.bind_cycle_v5_owner(owner_key, executor_owner);
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = ok ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) return;
@@ -16451,6 +16536,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = executor.enabled &&
                     executor.wait_c2p_reduce(k) ? 1 : 0;
+                // All C2P APPLY events must have been consumed before the
+                // REDUCE wait can succeed. Erase even on failure/timeout so
+                // an old protocol key is never reused by another session.
+                server.unbind_cycle_v5_owner(k);
                 if (!send_msg(sock, &response, sizeof(response))) return;
                 break;
             }
@@ -16530,15 +16619,26 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_inference_cycle_send_rsp response {};
                 response.result = server.apply_inference_cycle(request) ? 1 : 0;
                 // C2P GPU input is now genuinely device-consumable.
-                // An ACK to PC is not a prerequisite for Phone scheduling.
+                // When APPLY uses a dedicated RPC connection, its local
+                // executor is not the one that received ARM. Forward the
+                // exact-key readiness event back to ARM's executor.
+                // Preserve the old same-connection fast path unchanged.
                 if (response.result != 0 && executor.enabled) {
                     const auto k = p2c_key(
                         request.layer, request.chunk, request.seq,
                         request.graph_id);
+                    const bool partial =
+                        request.kind == INFERENCE_CYCLE_PARTIAL;
                     if (executor.has_c2p_v5(k)) {
-                        response.result = executor.c2p_device_ready(
-                            k, request.kind == INFERENCE_CYCLE_PARTIAL) ?
-                                1 : 0;
+                        response.result =
+                            executor.c2p_device_ready(k, partial) ? 1 : 0;
+                    } else {
+                        const auto result =
+                            server.forward_cycle_v5_notice(k, partial);
+                        if (result != rpc_server::cycle_v5_notice_status::NO_OWNER)
+                            response.result =
+                                result == rpc_server::cycle_v5_notice_status::APPLIED ?
+                                    1 : 0;
                     }
                 }
                 const int64_t handler_done_us =
