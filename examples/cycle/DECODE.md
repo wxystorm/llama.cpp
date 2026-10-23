@@ -21,7 +21,9 @@ poisons the session: a partially committed physical KV cannot be retried.
 
 Current constraints: Qwen3-MoE 48-layer layout 4/2, 16-token Chunk,
 1..64 token prompt, 128-token total causal KV, one sequence, greedy decoding.
-No CPU oracle/model duplicate is loaded. The normal `llama_context` API,
-multi-sequence KV management, and longer contexts remain separate integration
-tasks. Numerical CPU/GPU parity differences remain unresolved and are not
-suppressed by these changes.
+No CPU oracle/model duplicate is loaded. An opt-in, public
+`llama_context` / `llama_decode` adapter has now been added in
+[STANDARD_DECODE.md](STANDARD_DECODE.md), sharing the SAME physical core.
+Multi-sequence KV management, arbitrary KV edits, and longer contexts remain
+separate tasks. Numerical CPU/GPU parity differences remain unresolved and
+are not suppressed by these changes.

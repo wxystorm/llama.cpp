@@ -41,7 +41,7 @@ struct llama_hybrid_cycle_forward_metrics {
     bool all_phone_slots_retired = false;
 };
 
-bool llama_hybrid_cycle_forward_prefill(
+LLAMA_API bool llama_hybrid_cycle_forward_prefill(
     const llama_model & model,
     ggml_backend_t pc_cpu,
     ggml_backend_t phone_rpc_gpu,
@@ -59,25 +59,25 @@ bool llama_hybrid_cycle_forward_prefill(
 // Attention's current hard limit remains 128 total tokens, not long context.
 class llama_hybrid_cycle_session {
 public:
-    llama_hybrid_cycle_session();
-    ~llama_hybrid_cycle_session();
+    LLAMA_API llama_hybrid_cycle_session();
+    LLAMA_API ~llama_hybrid_cycle_session();
     llama_hybrid_cycle_session(const llama_hybrid_cycle_session &) = delete;
     llama_hybrid_cycle_session & operator=(const llama_hybrid_cycle_session &) = delete;
 
-    bool prepare(const llama_model & model, ggml_backend_t cpu,
+    LLAMA_API bool prepare(const llama_model & model, ggml_backend_t cpu,
                  ggml_backend_t phone_rpc_gpu, int64_t max_total_tokens,
                  std::string & reason,
                  int chunk_tokens = 16, int max_inflight = 2);
 
     // After prompt evaluation, call with ONE next-token embedding.
     // Every successful call commits the absolute physical KV prefix.
-    bool evaluate(const std::vector<float> & embeddings, int tokens,
+    LLAMA_API bool evaluate(const std::vector<float> & embeddings, int tokens,
                   std::vector<float> & final_hidden, std::string & reason,
                   llama_hybrid_cycle_forward_metrics * metrics = nullptr);
 
-    int64_t committed_tokens() const;
-    bool usable() const;
-    void reset();
+    LLAMA_API int64_t committed_tokens() const;
+    LLAMA_API bool usable() const;
+    LLAMA_API void reset();
 
 private:
     const llama_model * model_ = nullptr;

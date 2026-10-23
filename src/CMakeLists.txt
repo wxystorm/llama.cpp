@@ -75,3 +75,15 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+# Native Cycle runs as part of libllama when the RPC backend is built.
+# Avoid a duplicate static Cycle implementation in the example executable:
+# llama_context::decode and llama-cycle-cli must use the SAME code and KV rules.
+if (TARGET ggml-rpc)
+    target_sources(llama PRIVATE
+        llama-hybrid-cycle-forward.cpp
+        llama-hybrid-cycle-model-io.cpp)
+    target_include_directories(llama PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+    target_link_libraries(llama PRIVATE ggml-rpc)
+    target_compile_definitions(llama PRIVATE LLAMA_CYCLE_RPC_ENABLED=1)
+endif()

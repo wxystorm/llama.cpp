@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_hybrid_cycle_session;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -164,6 +165,10 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    // Opt-in regular llama_decode() adapter for the 48-layer physical
+    // Cycle. It is never routed through the legacy Meta scheduler.
+    int decode_cycle(const llama_batch & batch_inp);
+    bool reset_cycle();
 
     //
     // state save/load
@@ -413,6 +418,12 @@ private:
     //
 
     const llama_model & model;
+
+    // Only non-null for LLAMA_HYBRID_CYCLE_STANDARD_DECODE=1. The new
+    // physical KV manager is owned by this Context; normal llama_memory
+    // must never become a second KV owner for the same sequence.
+    llama_hybrid_cycle_session * cycle_session = nullptr;
+    std::vector<float> cycle_logits_storage;
 
     llama_cparams cparams;
 

@@ -15,7 +15,7 @@ struct llama_model;
 //
 // This module owns only temporary GGML input/compute buffers. It never
 // creates a second GGUF model, KV cache, scheduler, or inference session.
-bool llama_hybrid_cycle_embed_tokens(
+LLAMA_API bool llama_hybrid_cycle_embed_tokens(
     const llama_model & model,
     ggml_backend_t cpu,
     const std::vector<llama_token> & tokens,
@@ -25,7 +25,7 @@ bool llama_hybrid_cycle_embed_tokens(
 // Applies actual output_norm + output weight to the *final token* hidden
 // state. Returns n_vocab F32 logits. For generation, the next-token sampler
 // consumes these logits; never treat the L47 raw hidden state as logits.
-bool llama_hybrid_cycle_project_last_token(
+LLAMA_API bool llama_hybrid_cycle_project_last_token(
     const llama_model & model,
     ggml_backend_t cpu,
     const std::vector<float> & hidden,

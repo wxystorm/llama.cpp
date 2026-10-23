@@ -119,6 +119,10 @@ void llama_backend_free(void) {
     ggml_quantize_free();
 }
 
+bool llama_cycle_context_reset(struct llama_context * ctx) {
+    return ctx != nullptr && ctx->reset_cycle();
+}
+
 int64_t llama_time_us(void) {
     return ggml_time_us();
 }

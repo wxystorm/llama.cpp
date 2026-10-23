@@ -6,6 +6,10 @@
 #include "llama-graph.h"
 #include "llama-hybrid.h"
 #include "llama-hybrid-cycle.h"
+#if defined(LLAMA_CYCLE_RPC_ENABLED)
+#include "llama-hybrid-cycle-forward.h"
+#include "llama-hybrid-cycle-model-io.h"
+#endif
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -238,16 +242,114 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
-    // The unfinished fixed Cycle layout is a *weight-placement* policy, not
-    // a replacement scheduler. Never execute it through the legacy Meta
-    // full-model graph. The independent CPU-only reference used by the
-    // Cycle numerical probe has split_mode=LAYER and must remain allowed,
-    // even when the Cycle placement environment is set for a later model.
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-            llama_hybrid_cycle_requested()) {
+    // The 48-layer Cycle is now executable through the SAME physical FIFO
+    // used by llama-cycle-cli. Normal llama_context remains untouched unless
+    // BOTH fixed physical placement and the explicit standard-API switch
+    // are requested. The independent CPU-only reference still works with
+    // split_mode=LAYER, even if the placement environment is present.
+    const bool fixed_cycle_model =
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        llama_hybrid_cycle_requested();
+    const char * cycle_standard_env =
+        std::getenv("LLAMA_HYBRID_CYCLE_STANDARD_DECODE");
+    const bool cycle_standard_requested =
+        cycle_standard_env && std::strcmp(cycle_standard_env, "1") == 0;
+    if (fixed_cycle_model && cycle_standard_requested) {
+#if defined(LLAMA_CYCLE_RPC_ENABLED)
+        if (model.arch != LLM_ARCH_QWEN3MOE ||
+            model.hparams.n_layer() != 48 ||
+            params.n_seq_max != 1 ||
+            params.embeddings ||
+            params.samplers != nullptr ||
+            params.n_samplers != 0 ||
+            (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) ||
+            (params.pooling_type != LLAMA_POOLING_TYPE_NONE &&
+             params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED)) {
+            throw std::runtime_error(
+                "Cycle standard decode requires Qwen3-MoE 48 layers, "
+                "one sequence, external sampler, no embeddings/pooling");
+        }
+
+        auto * cpu_dev =
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_dev_t phone_dev = nullptr;
+        int phone_count = 0;
+        // Explicitly require exactly ONE registered Phone RPC GPU. With
+        // multiple RPC GPUs, fail instead of binding a different model's
+        // physical weights or routing READY/PARTIAL to the wrong endpoint.
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (dev && reg &&
+                std::strcmp(ggml_backend_reg_name(reg), "RPC") == 0 &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                phone_dev = dev;
+                ++phone_count;
+            }
+        }
+        if (!cpu_dev || phone_count != 1) {
+            throw std::runtime_error(
+                "Cycle standard decode needs CPU plus exactly one RPC GPU");
+        }
+        ggml_backend_t pc = ggml_backend_dev_init(cpu_dev, nullptr);
+        if (!pc) {
+            throw std::runtime_error("Cycle standard CPU backend init failed");
+        }
+        backends.emplace_back(pc);
+        backend_cpu = pc;
+        ggml_backend_t phone = ggml_backend_dev_init(phone_dev, nullptr);
+        if (!phone) {
+            throw std::runtime_error("Cycle standard Phone backend init failed");
+        }
+        backends.emplace_back(phone);
+
+        // All fixed Cycle Attention/KV buffers have an explicit 128-token
+        // capacity. Report that TRUE capacity to ordinary llama.cpp users.
+        const uint32_t requested_ctx =
+            params.n_ctx == 0 ? 128u : params.n_ctx;
+        cparams.n_ctx = std::min<uint32_t>(requested_ctx, 128);
+        cparams.n_ctx_seq = cparams.n_ctx;
+        cparams.n_seq_max = 1;
+        cparams.n_batch = std::max<uint32_t>(
+            1, std::min<uint32_t>(params.n_batch, 64));
+        cparams.n_ubatch = std::min<uint32_t>(
+            cparams.n_batch,
+            params.n_ubatch ? params.n_ubatch : cparams.n_batch);
+        cparams.n_outputs_max = 1;
+        cparams.n_threads = params.n_threads;
+        cparams.n_threads_batch = params.n_threads_batch;
+        cparams.embeddings = false;
+        cparams.causal_attn = true;
+        cparams.kv_unified = true;
+        cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        cparams.no_perf = params.no_perf;
+        t_start_us = model.t_start_us;
+        t_load_us = model.t_load_us;
+        const int64_t capacity = cparams.n_ctx;
+        std::string reason;
+        auto native = std::make_unique<llama_hybrid_cycle_session>();
+        if (!native->prepare(model, pc, phone, capacity, reason, 16, 2)) {
+            throw std::runtime_error(
+                "Cycle standard physical KV prepare failed: " + reason);
+        }
+        cycle_session = native.release();
+        LLAMA_LOG_INFO(
+            "[CYCLE_STANDARD] action=CONTEXT_INIT capacity=%lld "
+            "physical_layers=48 backend=CPU_RPC "
+            "execution=GLOBAL_FIVE_QUEUE_FIFO status=PASS\n",
+            (long long) capacity);
+        return; // No legacy Meta scheduler or second llama_memory is made.
+#else
         throw std::runtime_error(
-            "fixed hybrid cycle layout is placement-only: "
-            "C2P/P2C execution is not implemented yet");
+            "Cycle standard decode requires a build with ggml-rpc enabled");
+#endif
+    }
+    if (fixed_cycle_model) {
+        throw std::runtime_error(
+            "fixed hybrid Cycle placement requires "
+            "LLAMA_HYBRID_CYCLE_STANDARD_DECODE=1 for llama_decode; "
+            "use llama-cycle-cli otherwise");
     }
 
     t_start_us = model.t_start_us;
@@ -626,6 +728,15 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#if defined(LLAMA_CYCLE_RPC_ENABLED)
+    // The physical 48-layer KV pool must be released BEFORE backend handles
+    // (which are owned by this context's backends vector).
+    if (cycle_session) {
+        delete cycle_session;
+        cycle_session = nullptr;
+        return; // No standard scheduler/memory exists in Cycle mode.
+    }
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -4438,7 +4549,152 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// Native physical Cycle adapter for the PUBLIC llama_decode() API.
+// It honors one sequence's absolute token positions and maps the requested
+// final token logits to the usual llama_get_logits() / _ith() buffers.
+// This code cannot use the legacy llama_memory or Meta graph: those would
+// duplicate physical K/V, require a second Reduce, and break FIFO causality.
+bool llama_context::reset_cycle() {
+#if !defined(LLAMA_CYCLE_RPC_ENABLED)
+    return false;
+#else
+    if (!cycle_session || !cycle_session->usable() ||
+        backends.size() != 2 || !backend_cpu) {
+        // A failed physical FIFO may have committed KV on only a subset
+        // of devices. Never reset/reuse a poisoned context over that state.
+        return false;
+    }
+    std::string reason;
+    const bool ok = cycle_session->prepare(
+        model, backend_cpu, backends[1].get(),
+        cparams.n_ctx, reason, 16, 2);
+    cycle_logits_storage.clear();
+    logits = {nullptr, 0};
+    output_ids.clear();
+    output_swaps.clear();
+    n_outputs = 0;
+    LLAMA_LOG_INFO(
+        "[CYCLE_STANDARD] stage=CONTEXT_RESET physical_kv=CLEARED "
+        "status=%s reason=%s\n",
+        ok ? "PASS" : "FAIL", ok ? "NONE" : reason.c_str());
+    return ok;
+#endif
+}
+
+int llama_context::decode_cycle(const llama_batch & batch) {
+#if !defined(LLAMA_CYCLE_RPC_ENABLED)
+    (void) batch;
+    return -2;
+#else
+    if (!cycle_session || !cycle_session->usable() ||
+        batch.n_tokens < 1 || batch.n_tokens > 64 ||
+        (!batch.token && !batch.embd)) {
+        LLAMA_LOG_ERROR(
+            "[CYCLE_STANDARD] stage=INPUT status=FAIL "
+            "reason=SESSION_OR_BATCH_INVALID\n");
+        return -1;
+    }
+    const int64_t prefix = cycle_session->committed_tokens();
+    const int64_t hidden = model.hparams.n_embd;
+    const int n = batch.n_tokens;
+    if (prefix + n > cparams.n_ctx) {
+        LLAMA_LOG_ERROR(
+            "[CYCLE_STANDARD] stage=INPUT status=FAIL "
+            "reason=PHYSICAL_KV_LIMIT prefix=%lld tokens=%d capacity=%u\n",
+            (long long) prefix, n, cparams.n_ctx);
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        // Reject branching sequences, positions with holes, and attempts
+        // to reuse KV without a physical reset. No silent fallback.
+        if ((batch.pos && batch.pos[i] != prefix + i) ||
+            (batch.n_seq_id && batch.n_seq_id[i] != 1) ||
+            (batch.seq_id && (!batch.seq_id[i] ||
+                              batch.seq_id[i][0] != 0)) ||
+            (batch.logits && i != n - 1 && batch.logits[i] != 0)) {
+            LLAMA_LOG_ERROR(
+                "[CYCLE_STANDARD] stage=INPUT status=FAIL "
+                "reason=NONCAUSAL_POS_SEQ_OR_MULTI_OUTPUT "
+                "index=%d expected_pos=%lld\n",
+                i, (long long) (prefix + i));
+            return -1;
+        }
+    }
+
+    cycle_logits_storage.clear();
+    logits = {nullptr, 0};
+    n_outputs = 0;
+    output_swaps.clear();
+    output_ids.assign(size_t(n), -1);
+    std::string reason;
+    std::vector<float> embeddings;
+    if (batch.embd) {
+        embeddings.assign(
+            batch.embd, batch.embd + size_t(n) * size_t(hidden));
+        for (float x : embeddings) {
+            if (!std::isfinite(x)) {
+                LLAMA_LOG_ERROR(
+                    "[CYCLE_STANDARD] stage=INPUT status=FAIL "
+                    "reason=NONFINITE_EMBEDDINGS\n");
+                return -1;
+            }
+        }
+    } else {
+        std::vector<llama_token> tokens(
+            batch.token, batch.token + n);
+        if (!llama_hybrid_cycle_embed_tokens(
+                model, backend_cpu, tokens, embeddings, reason)) {
+            LLAMA_LOG_ERROR(
+                "[CYCLE_STANDARD] stage=EMBED status=FAIL reason=%s\n",
+                reason.c_str());
+            return -2;
+        }
+    }
+
+    std::vector<float> output;
+    llama_hybrid_cycle_forward_metrics stats;
+    if (!cycle_session->evaluate(
+            embeddings, n, output, reason, &stats)) {
+        LLAMA_LOG_ERROR(
+            "[CYCLE_STANDARD] stage=FORWARD status=FAIL "
+            "reason=%s physical_KV=POISONED\n",
+            reason.c_str());
+        return -2;
+    }
+
+    const bool want_logits = !batch.logits || batch.logits[n - 1] != 0;
+    if (want_logits) {
+        if (!llama_hybrid_cycle_project_last_token(
+                model, backend_cpu, output, n,
+                cycle_logits_storage, reason)) {
+            LLAMA_LOG_ERROR(
+                "[CYCLE_STANDARD] stage=LOGITS status=FAIL "
+                "reason=%s physical_KV=COMMITTED\n",
+                reason.c_str());
+            return -2;
+        }
+        logits = {cycle_logits_storage.data(), cycle_logits_storage.size()};
+        n_outputs = 1;
+        output_ids[size_t(n - 1)] = 0;
+    }
+    has_evaluated_once = true;
+    if (n > 1) n_p_eval += n;
+    else ++n_eval;
+    LLAMA_LOG_INFO(
+        "[CYCLE_STANDARD] stage=DECODE tokens=%d "
+        "kv_prefix=%lld outputs=%d c2p=%d full=%d p2c=%d "
+        "five_fifo=REAL status=PASS\n",
+        n, (long long) cycle_session->committed_tokens(),
+        int(n_outputs), stats.completed_c2p,
+        stats.completed_phone_full, stats.completed_p2c);
+    return 0;
+#endif
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (cycle_session) {
+        return decode_cycle(batch_inp);
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

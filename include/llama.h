@@ -1022,6 +1022,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Experimental: clear and reinitialize the physical KV of an opt-in
+    // fixed Cycle context. For a normal context this returns false.
+    // Cycle KV is NOT managed by the ordinary llama_memory* APIs.
+    LLAMA_API bool llama_cycle_context_reset(struct llama_context * ctx);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

@@ -38,14 +38,16 @@ returns **one next-token logit decision**.
   separate `llama-cycle-cli` target; see [DECODE.md](DECODE.md).
   The one-shot `llama_hybrid_cycle_forward_prefill` remains intentionally
   a one-call API and must not be repeatedly invoked as decode.
-- Standard `llama_context::decode()` and `llama_get_logits()` interoperability:
-  the native Cycle output is currently owned by this standalone CLI rather
-  than the regular llama_context memory manager.
+- An **experimental, explicit** standard `llama_decode()` and
+  `llama_get_logits()` adapter is now provided; see
+  [STANDARD_DECODE.md](STANDARD_DECODE.md). The Context uses the very same
+  physical Cycle forward and owns its own physical KV. Standard
+  `llama_memory` editing/snapshot APIs are not yet supported for Cycle KV.
 - Larger context windows, multi-user batches, checkpoint/rollback and
   sampler selection remain unimplemented.
 - The previously reported CPU/GPU numeric parity differences are not fixed
   or hidden; this production migration does not relax numeric tolerances.
 
 The existing `test-hybrid-cycle-real-pc-ring` remains the separate structural
-and numerical regression harness. Neither it nor `llama_decode()` is silently
-replaced by the native runner.
+and numerical regression harness. Normal `llama_decode()` remains unchanged
+unless both Cycle placement and the explicit standard adapter opt-in are set.

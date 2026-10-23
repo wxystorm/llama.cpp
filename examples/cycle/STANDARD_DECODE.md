@@ -1,0 +1,62 @@
+# Standard llama.cpp Context → native Cycle FIFO (opt-in)
+
+This mode routes the **public** `llama_decode()` API into the SAME
+`llama_hybrid_cycle_session` already used by `llama-cycle-cli`, with no
+duplicate forward implementation and no legacy Meta scheduler execution.
+
+The standard API adapter owns a long-lived 48-layer physical K/V pool and
+exposes the final token's model Logits through normal
+`llama_get_logits()` / `llama_get_logits_ith(ctx, -1)`.
+
+## Build and run
+
+```powershell
+git pull --ff-only origin feat/cycle-runtime-integration-20261023
+cmake -S . -B .\build-cycle-test -DLLAMA_BUILD_EXAMPLES=ON
+cmake --build .\build-cycle-test --config Debug --target llama-cycle-standard
+
+$env:LLAMA_HYBRID_CYCLE_PC_LAYERS = "4"
+$env:LLAMA_HYBRID_CYCLE_PHONE_LAYERS = "2"
+$env:LLAMA_HYBRID_CYCLE_STANDARD_DECODE = "1"
+
+.\build-cycle-test\bin\Debug\llama-cycle-standard.exe `
+    E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf `
+    10.39.52.114:50053 `
+    "Hello, how are you?" 4
+```
+
+`llama-cycle-standard` only calls PUBLIC model/context/decode/logits APIs.
+The original `llama-cycle-cli` remains available for A/B regression.
+
+## Contract and safety
+
+1. Requires precisely `Qwen3-MoE, 48 layers` with the existing Cycle physical
+   CPU/RPC weight layout (4 PC Full + 1 C2P + 2 Phone Full + 1 P2C) × 6.
+2. The activation is **explicit**: `LLAMA_HYBRID_CYCLE_STANDARD_DECODE=1`
+   and the fixed Cycle placement environment. Other models' `llama_decode`
+   implementation is unchanged.
+3. Single causal sequence 0, sequential **absolute** token positions.
+   A decode batch is limited to 64 tokens. Max total KV is 128 tokens.
+   Only the last token may request output Logits. Full all-position logits,
+   multi-sequence, packed multi-user batches and layer embeddings are rejected.
+4. The physical KV state is owned by the Cycle Session, not by ordinary
+   `llama_memory`. Therefore `llama_get_memory(ctx)` does NOT expose a
+   mutable standard KV-cache object for Cycle contexts yet. Do not call
+   standard KV editing/defragmentation/snapshot/rollback APIs expecting them
+   to control Cycle KV. To start another sequence in a healthy Cycle
+   Context, call `llama_cycle_context_reset(ctx)` and restart at position 0,
+   or create a fresh Context. Reset returns false on ordinary Contexts
+   and on poisoned Cycle Contexts.
+5. This mode does NOT support speculative sampling, backend samplers,
+   LoRA hot-swap, noncausal attention, extra Context features or >128 KV.
+   The default Context path must not attempt to execute the fixed Cycle
+   layout using Meta.
+6. Failure after partial physical KV execution is fatal for that context.
+   A new Context is required; trying to append to partially-committed KV
+   is unsafe.
+7. This is an implementation handoff, not a guarantee of CPU numerical
+   equivalence. Previously observed MoE numeric differences remain known.
+
+The stage dispatcher, physical KV, GPU/CPU ownership, and two-way RPC remain
+exactly those used by `llama-cycle-cli`. The old test harness is preserved
+until this public API route passes compilation and real PC/Phone tests.
