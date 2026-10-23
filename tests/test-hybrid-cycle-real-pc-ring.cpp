@@ -1,11 +1,14 @@
-// Opt-in mixed Cycle probe: REAL PC Full and C2P PC source, MOCK Phone GPU/wire.
+// Opt-in mixed Cycle probe: real PC Full/C2P and optionally real Phone C2P.
 //
 // All 48 layers share ONE five-worker FIFO. The 24 PC Full layers execute
 // real Qwen3-MoE Attention/RoPE/Router/FFN on their physical CPU weights,
 // using physical persistent KV and actual Session host handoffs.
 // C2P PC Attention and its FFN_SOURCE shard ALSO execute real CPU weights.
-// C2P Phone-side destination, Phone Full, P2C and both network directions
-// remain MOCK; no Phone FFN/Reduce is executed or claimed as real.
+// LLAMA_HYBRID_CYCLE_REAL_C2P_PHONE=1 enables the established legacy V5
+// PC->Phone READY/PARTIAL, Phone FFN and exclusive Reduce for all 6 C2P
+// regions. A DIAGNOSTIC Phone->PC readback bridges their real GPU output to
+// the still-MOCK Phone Full layer. No period barrier or Meta re-execution.
+// Without this env flag, retain the previous fully-MOCK Phone path.
 // This is NOT a 48-layer Transformer forward or a numeric parity test.
 //
 // Usage:
@@ -18,6 +21,7 @@
 #include "llama-hybrid-cycle-pc-full.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-regions.h"
+#include "llama-hybrid-cycle-wire.h"
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -27,11 +31,25 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+
+// Match V5's low-memory data-plane settings without overriding user values.
+// The slots/payload are initialized before opening Phone inference transport.
+static bool cycle_pc_ring_env_default(
+        const char * name, const char * value) {
+    if (std::getenv(name)) return true;
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 0) == 0;
+#endif
+}
 
 static bool cycle_pc_ring_finite(const std::vector<float> & values,
                                 size_t expected) {
@@ -77,6 +95,17 @@ int main(int argc, char ** argv) {
     constexpr int chunk_tokens = 16;
     const int n_chunks = (n_tokens + chunk_tokens - 1) / chunk_tokens;
     const int max_inflight = std::min(2, n_chunks);
+    const char * real_phone_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_REAL_C2P_PHONE");
+    if (real_phone_env && std::strcmp(real_phone_env, "0") != 0 &&
+        std::strcmp(real_phone_env, "1") != 0) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PC_RING] status=FAIL "
+            "reason=REAL_C2P_PHONE_REQUIRES_0_OR_1\n");
+        return 2;
+    }
+    const bool real_c2p_phone =
+        real_phone_env && std::strcmp(real_phone_env, "1") == 0;
 
     llama_backend_init();
     const auto cpu_dev = ggml_backend_dev_by_type(
@@ -155,6 +184,30 @@ int main(int argc, char ** argv) {
                             "reason=PHONE_REGION detail=%s\n",
                             reason.c_str());
                     }
+                    if (ok && real_c2p_phone) {
+                        // V5 uses two 1-MiB TX/RX slots for 16-token READY.
+                        // This probe has one global transport, not six sockets.
+                        auto * dev = ggml_backend_get_device(phone);
+                        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                        const auto open = reg ?
+                            reinterpret_cast<
+                                ggml_backend_rpc_inference_transport_open_t>(
+                                ggml_backend_reg_get_proc_address(
+                                    reg,
+                                    GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC)) :
+                            nullptr;
+                        ok = cycle_pc_ring_env_default(
+                                 "GGML_INFERENCE_TRANSPORT_SLOTS", "2") &&
+                             cycle_pc_ring_env_default(
+                                 "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB", "1") &&
+                             ggml_backend_is_rpc(phone) &&
+                             open && open(phone);
+                        std::printf(
+                            "[CYCLE_REAL_C2P_PHONE] phase=TRANSPORT_OPEN "
+                            "regions=6 slots=ENV_OR_DEFAULT "
+                            "mode=REAL_RPC_DATA_PLANE status=%s\n",
+                            ok ? "PASS" : "FAIL");
+                    }
                     if (ok) {
                         llama_hybrid_cycle_execution_session_config sc;
                         sc.layout = layout;
@@ -191,9 +244,20 @@ int main(int argc, char ** argv) {
                         };
                         std::array<std::atomic<int>, 6> p2c_completed {};
                         for (auto & count : p2c_completed) count.store(0);
+                        // Each period owns its FFN buffers. Idle slots can
+                        // cross worker queues only under the period mutex.
+                        llama_hybrid_cycle_phone_region_slot_banks<
+                            llama_hybrid_cycle_phone_ffn_slot,
+                            llama_hybrid_cycle_p2c_ffn_slot> phone_slot_banks;
+                        if (real_c2p_phone) phone_slot_banks.prepare(phone_regions);
                         std::atomic<int> mock_stages {0};
                         std::atomic<int> real_c2p_attn {0};
                         std::atomic<int> real_c2p_ffn {0};
+                        std::atomic<int> phone_c2p_ffn {0};
+                        std::atomic<int> phone_c2p_ready {0};
+                        std::atomic<int> phone_c2p_partial {0};
+                        std::atomic<int> phone_c2p_reduce {0};
+                        std::atomic<int> c2p_slot_reuse {0};
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -248,7 +312,86 @@ int main(int argc, char ** argv) {
                                                     *model, *r, cpu, l,
                                                     state.start, state.tokens,
                                                     host_input, state.ready);
+                                            if (valid && real_c2p_phone) {
+                                                auto * bank = phone_slot_banks.by_index(
+                                                    region.location.cycle_index);
+                                                valid = bank != nullptr;
+                                                std::unique_ptr<
+                                                    llama_hybrid_cycle_phone_ffn_slot> slot;
+                                                if (valid) {
+                                                    std::lock_guard<std::mutex> lock(
+                                                        bank->c2p_mutex);
+                                                    for (auto it = bank->c2p_idle.begin();
+                                                         it != bank->c2p_idle.end(); ++it) {
+                                                        if (*it &&
+                                                            (*it)->prepared_tokens ==
+                                                                state.tokens &&
+                                                            !(*it)->is_full_layer) {
+                                                            slot = std::move(*it);
+                                                            bank->c2p_idle.erase(it);
+                                                            ++c2p_slot_reuse;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if (valid && !slot) {
+                                                    const auto & lw = model->layers[size_t(l)];
+                                                    const llama_hybrid_cycle_ffn_shard_weights
+                                                        shard {
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_up_exps, phone, 1),
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_gate_exps, phone, 1),
+                                                            llama_hybrid_cycle_resolve_physical_weight(
+                                                                lw.ffn_down_exps, phone, 1),
+                                                        };
+                                                    slot = std::make_unique<
+                                                        llama_hybrid_cycle_phone_ffn_slot>();
+                                                    // Legacy V5: FFN and Reduce graphs are
+                                                    // submitted by their real FIFO stages.
+                                                    valid = shard.available() &&
+                                                        slot->prepare(
+                                                            phone, shard, hidden,
+                                                            state.tokens,
+                                                            model->hparams.n_expert_used,
+                                                            model->hparams.n_expert);
+                                                    if (!valid) slot.reset();
+                                                }
+                                                if (valid) {
+                                                    state.phone_output = std::move(slot);
+                                                }
+                                                if (!valid) {
+                                                    std::fprintf(stderr,
+                                                        "[CYCLE_REAL_C2P_PHONE] "
+                                                        "layer=%d chunk=%d stage=PREPARE "
+                                                        "status=FAIL\n", l, c);
+                                                }
+                                            }
                                             if (valid) ++real_c2p_attn;
+                                        } else if (task.stage ==
+                                                   llama_hybrid_cycle_stage::SEND_ACTIVATION &&
+                                                   real_c2p_phone) {
+                                            const auto & wire = state.wire;
+                                            const auto * slot = state.phone_output.get();
+                                            valid = slot &&
+                                                llama_hybrid_cycle_send_c2p_frame(
+                                                    phone, wire,
+                                                    INFERENCE_CYCLE_READY,
+                                                    state.ready, state.partial,
+                                                    uint32_t(state.tokens),
+                                                    uint32_t(hidden),
+                                                    uint32_t(model->hparams.n_expert_used)) &&
+                                                ggml_backend_rpc_cycle_apply_ready(
+                                                    phone, wire.layer, wire.chunk,
+                                                    wire.seq, wire.graph_id,
+                                                    slot->residual, slot->inputs.norm,
+                                                    slot->inputs.topk_ids,
+                                                    slot->inputs.topk_weights) &&
+                                                ggml_backend_rpc_cycle_wait_ack(
+                                                    phone, INFERENCE_CYCLE_READY,
+                                                    wire.layer, wire.chunk,
+                                                    wire.seq, wire.graph_id, 30000);
+                                            if (valid) ++phone_c2p_ready;
                                         } else if (task.stage ==
                                                    llama_hybrid_cycle_stage::FFN_SOURCE) {
                                             const auto * r = resources.layer(l);
@@ -258,15 +401,94 @@ int main(int argc, char ** argv) {
                                                     state.ready, state.partial);
                                             if (valid) ++real_c2p_ffn;
                                         } else if (task.stage ==
+                                                   llama_hybrid_cycle_stage::FFN_DESTINATION &&
+                                                   real_c2p_phone) {
+                                            valid = state.phone_output &&
+                                                state.phone_output->execute_ffn();
+                                            if (valid) ++phone_c2p_ffn;
+                                        } else if (task.stage ==
+                                                   llama_hybrid_cycle_stage::SEND_PARTIAL &&
+                                                   real_c2p_phone) {
+                                            const auto & wire = state.wire;
+                                            valid = state.phone_output &&
+                                                llama_hybrid_cycle_send_c2p_frame(
+                                                    phone, wire,
+                                                    INFERENCE_CYCLE_PARTIAL,
+                                                    state.ready, state.partial,
+                                                    uint32_t(state.tokens),
+                                                    uint32_t(hidden),
+                                                    uint32_t(model->hparams.n_expert_used)) &&
+                                                ggml_backend_rpc_cycle_apply_partial(
+                                                    phone, wire.layer, wire.chunk,
+                                                    wire.seq, wire.graph_id,
+                                                    state.phone_output->pc_partial);
+                                            if (valid) ++phone_c2p_partial;
+                                        } else if (task.stage ==
                                                    llama_hybrid_cycle_stage::REDUCE) {
-                                            // Missing Phone FFN remains EXPLICITLY
-                                            // mocked. This is NOT a correct
-                                            // Transformer layer output.
                                             valid = cycle_pc_ring_finite(
                                                 state.ready.residual, expected) &&
                                                 cycle_pc_ring_finite(
                                                     state.partial, expected);
-                                            if (valid) {
+                                            if (valid && real_c2p_phone) {
+                                                auto * slot = state.phone_output.get();
+                                                const auto & wire = state.wire;
+                                                valid = slot && slot->output &&
+                                                    slot->output->type == GGML_TYPE_F32 &&
+                                                    ggml_is_contiguous(slot->output) &&
+                                                    ggml_nelements(slot->output) ==
+                                                        int64_t(expected) &&
+                                                    slot->execute_reduce(phone) &&
+                                                    ggml_backend_rpc_cycle_finish_reduce(
+                                                        phone, wire.layer, wire.chunk,
+                                                        wire.seq, wire.graph_id) &&
+                                                    ggml_backend_rpc_cycle_wait_ack(
+                                                        phone, INFERENCE_CYCLE_PARTIAL,
+                                                        wire.layer, wire.chunk,
+                                                        wire.seq, wire.graph_id, 30000);
+                                                if (valid) {
+                                                    // ONLY a diagnostic Host bridge:
+                                                    // next Phone Full is still MOCK.
+                                                    // GPU data is device-complete before
+                                                    // this blocking readback. The future
+                                                    // real Phone Full directly borrows
+                                                    // slot->output and removes this step.
+                                                    target.resize(expected);
+                                                    ggml_backend_tensor_get(
+                                                        slot->output, target.data(), 0,
+                                                        target.size() * sizeof(float));
+                                                    valid = cycle_pc_ring_finite(
+                                                        target, expected);
+                                                }
+                                                if (valid) {
+                                                    auto * bank =
+                                                        phone_slot_banks.by_index(
+                                                            region.location.cycle_index);
+                                                    valid = bank != nullptr;
+                                                    if (valid) {
+                                                        // The host bridge has now consumed
+                                                        // the final l_out after the RPC ACK.
+                                                        // Return the slot to its physical
+                                                        // period, never another period.
+                                                        std::lock_guard<std::mutex> lock(
+                                                            bank->c2p_mutex);
+                                                        bank->c2p_idle.push_back(
+                                                            std::move(state.phone_output));
+                                                    }
+                                                }
+                                                if (valid) {
+                                                    ++phone_c2p_reduce;
+                                                    std::printf(
+                                                        "[CYCLE_REAL_C2P_PHONE] layer=%d "
+                                                        "chunk=%d seq=%llu "
+                                                        "compute=REAL_GPU reduce=REAL_GPU "
+                                                        "host_bridge=DIAGNOSTIC_READBACK "
+                                                        "status=PASS\n",
+                                                        l, c,
+                                                        (unsigned long long)wire.seq);
+                                                }
+                                            } else if (valid) {
+                                                // Original mock result: keep the
+                                                // already-passing legacy test.
                                                 target.resize(expected);
                                                 for (size_t i = 0; i < expected; ++i) {
                                                     target[i] =
@@ -354,10 +576,24 @@ int main(int argc, char ** argv) {
                                 "[CYCLE_REAL_PC_RING] phase=FORWARD "
                                 "layers=48 chunks=%d max_inflight=%d "
                                 "pc_full=REAL_CPU c2p_pc=REAL_CPU "
-                                "phone_gpu=MOCK_ONLY wire=MOCK_ONLY "
+                                "c2p_phone=%s wire=%s "
                                 "source=SYNTHETIC_HIDDEN status=BEGIN\n",
-                                n_chunks, max_inflight);
+                                n_chunks, max_inflight,
+                                real_c2p_phone ? "REAL_GPU_ONLY" : "MOCK_ONLY",
+                                real_c2p_phone ? "REAL_C2P_ONLY" : "MOCK_ONLY");
                             ok = runtime.run(stages, nullptr, &timeline);
+                            if (real_c2p_phone &&
+                                !ggml_backend_rpc_cycle_wait_tx_idle(phone, 30000)) {
+                                std::fprintf(stderr,
+                                    "[CYCLE_REAL_C2P_PHONE] phase=TX_DRAIN "
+                                    "status=FAIL\n");
+                                ok = false;
+                            }
+                            if (!ok && real_c2p_phone) {
+                                // On failed RPC submission, do not release a
+                                // borrowed Graph allocation with work in flight.
+                                ggml_backend_synchronize(phone);
+                            }
                         }
 
                         int pc_layers = 0;
@@ -414,7 +650,12 @@ int main(int argc, char ** argv) {
                                  c2p_pc_layers == 6 &&
                                  real_c2p_attn.load() == 6 * n_chunks &&
                                  real_c2p_ffn.load() == 6 * n_chunks &&
-                                 mock_stages.load() == 6 * n_chunks * 14;
+                                 mock_stages.load() == 6 * n_chunks * 14 &&
+                                 (!real_c2p_phone ||
+                                  (phone_c2p_ready.load() == 6 * n_chunks &&
+                                   phone_c2p_ffn.load() == 6 * n_chunks &&
+                                   phone_c2p_partial.load() == 6 * n_chunks &&
+                                   phone_c2p_reduce.load() == 6 * n_chunks));
                             for (int cycle = 0; cycle < 6 && ok; ++cycle) {
                                 ok = p2c_completed[size_t(cycle)].load() ==
                                     n_chunks;
@@ -480,17 +721,25 @@ int main(int argc, char ** argv) {
                             "[CYCLE_REAL_PC_RING] layers=48 "
                             "pc_full_layers=%d pc_full=REAL_CPU "
                             "c2p_pc_layers=%d c2p_pc=REAL_CPU "
-                            "phone_gpu=MOCK_ONLY wire=MOCK_ONLY "
-                            "phone_rpc_compute=NOT_RUN "
+                            "c2p_phone=%s phone_rpc_compute=%s "
+                            "phone_full=MOCK_ONLY p2c=MOCK_ONLY "
                             "tokens=%d chunks=%d max_inflight=%d "
                             "real_c2p_attn_calls=%d real_c2p_ffn_calls=%d "
+                            "real_c2p_ready_acks=%d real_c2p_phone_ffn=%d "
+                            "real_c2p_partial_applies=%d real_c2p_reduces=%d "
+                            "c2p_slot_reuse=%d "
                             "region_stage_calls=%d expected_region_stage_calls=%d "
                             "cross_period_early=%d "
                             "full_48_forward=NOT_RUN logits=NOT_RUN "
                             "sum=%.9g max_abs=%.9g status=%s\n",
                             pc_layers, c2p_pc_layers,
+                            real_c2p_phone ? "REAL_GPU_WITH_HOST_BRIDGE" : "MOCK_ONLY",
+                            real_c2p_phone ? "C2P_ONLY" : "NOT_RUN",
                             n_tokens, n_chunks, max_inflight,
                             real_c2p_attn.load(), real_c2p_ffn.load(),
+                            phone_c2p_ready.load(), phone_c2p_ffn.load(),
+                            phone_c2p_partial.load(), phone_c2p_reduce.load(),
+                            c2p_slot_reuse.load(),
                             mock_stages.load(), 6 * n_chunks * 14,
                             earlier_than_previous_last,
                             sum, max_abs, ok ? "PASS" : "FAIL");
