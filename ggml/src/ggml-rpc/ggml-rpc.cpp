@@ -7758,6 +7758,9 @@ public:
         if (!desc.buffer) return false;
         const auto buffer = reinterpret_cast<ggml_backend_buffer_t>(
             desc.buffer);
+        // APPLY can arrive on a separate RPC socket while COMPUTE allocates
+        // or retires a Buffer. Protect the address/size snapshot, not GPU.
+        std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
         if (buffers.find(buffer) == buffers.end()) return false;
         const uint64_t base = reinterpret_cast<uint64_t>(
             ggml_backend_buffer_get_base(buffer));
@@ -8626,6 +8629,7 @@ private:
 
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    mutable std::mutex cycle_gpu_buffer_table_mutex_;
 
     // Non-owning OpenCL-only tensor state. Entries are removed before the
     // corresponding backend buffer is freed.
@@ -9283,7 +9287,11 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
         GGML_LOG_INFO("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        {
+            std::lock_guard<std::mutex> table_lock(
+                cycle_gpu_buffer_table_mutex_);
+            buffers.insert(buffer);
+        }
     } else {
         //LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -9329,6 +9337,9 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     cycle_gpu_wait_before_free(request.remote_ptr);
+    // Keep allocation alive while a separate APPLY snapshots its span.
+    // The opaque GPU stage already prevents new transfer admissions.
+    std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
