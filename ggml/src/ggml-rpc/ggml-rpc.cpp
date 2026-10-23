@@ -297,6 +297,10 @@ enum rpc_cmd {
     RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR,
     // Patch 31: enqueue an entire Phone Full region from C2P completion.
     RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
+    // Patch 32: deferred, two-readiness Phone-local C2P.
+    RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM,
+    RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT,
+    RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER,
     RPC_CMD_COUNT,
 };
 
@@ -338,6 +342,9 @@ static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR == 47,
               "RPC_CMD_INFERENCE_CYCLE_PHONE_FULL_PAIR must be 47");
 static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM == 48,
               "RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM must be 48");
+static_assert(RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM == 49, "V5 C2P ARM must be 49");
+static_assert(RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT == 50, "V5 C2P WAIT must be 50");
+static_assert(RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER == 51, "V5 REGION must be 51");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -464,6 +471,24 @@ struct rpc_msg_inference_cycle_phone_region_stage_req {
 };
 struct rpc_msg_inference_cycle_phone_region_req {
     rpc_msg_inference_cycle_phone_region_stage_req stages[2] {};
+};
+
+struct rpc_msg_inference_cycle_v5_c2p_arm_req {
+    uint32_t device = 0;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint32_t reserved = 0;
+    uint64_t seq = 0;
+    uint64_t graph_id = 0;
+    uint64_t ffn_graph_uid = 0;
+    uint64_t reduce_graph_uid = 0;
+};
+struct rpc_msg_inference_cycle_v5_region_req {
+    rpc_msg_inference_cycle_phone_region_req region {};
+    int32_t c2p_layer = -1;
+    uint32_t reserved = 0;
+    uint64_t c2p_seq = 0;
+    uint64_t c2p_graph_id = 0;
 };
 
 struct rpc_msg_device_count_rsp {
