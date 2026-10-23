@@ -1154,12 +1154,19 @@ static bool cycle_real_execute_phone_attention_pre(
          kv_cache->head_dim != head_dim ||
          kv_cache->kv_heads != n_kv_heads ||
          kv_tokens > kv_cache->max_tokens ||
-         kv_cache->committed_tokens != kv_token_start)) {
+         // Registering a future Chunk must not wait for the prior
+         // Attention completion ACK; only live execution requires the
+         // exact committed prefix. Admission order is checked by V2.
+         (defer_registered_replay ?
+             kv_cache->committed_tokens > kv_token_start :
+             kv_cache->committed_tokens != kv_token_start))) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_KV_PERSISTENT] status=FAIL "
-            "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld expected=%lld\n",
+            "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld "
+            "committed=%lld mode=%s\n",
             (long long)kv_token_start,
-            (long long)(kv_cache ? kv_cache->committed_tokens : -1));
+            (long long)(kv_cache ? kv_cache->committed_tokens : -1),
+            defer_registered_replay ? "REGISTER" : "EXECUTE");
         return false;
     }
     const auto graph_build_begin = std::chrono::steady_clock::now();
@@ -4870,19 +4877,19 @@ static bool cycle_real_execute_period_fifo(
     // completion transaction, reusing the existing FFN graph and buffers.
     const bool phone_full_local_ffn = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_LOCAL_FFN");
-    // V2 first correctness gate: one in-flight Chunk prevents Phone NEXT
-    // Attention from jumping ahead of a previously queued Phone Full task.
-    // The graph metadata is pre-registered on PC, while GPU execution
-    // happens only in the Phone FIFO following the preceding FFN+ADD.
+    // Two-credit V2: the PC prepares Graphs in Chunk order, while the
+    // Phone FIFO executes Attention and commits causal KV in Chunk order.
+    // PC completion ACKs may lag behind the next Graph registration.
     const bool phone_full_auto_relay = cycle_real_env_flag(
         "LLAMA_HYBRID_CYCLE_PHONE_FULL_AUTORELAY");
     if (phone_full_auto_relay &&
-        (window != 1 || layout.y != 2 || !phone_full_local_ffn ||
-         !attn_graph_reuse || !attn_scratch_session_reuse ||
-         !phone_full_session || !phone_full_reuse)) {
+        (window < 1 || window > 2 || layout.y != 2 ||
+         !phone_full_local_ffn || !attn_graph_reuse ||
+         !attn_scratch_session_reuse || !phone_full_session ||
+         !phone_full_reuse)) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_V2] phase=%s status=FAIL "
-            "reason=REQUIRES_WINDOW1_TWO_PHONE_LAYERS_"
+            "reason=REQUIRES_WINDOW1_OR_2_TWO_PHONE_LAYERS_"
             "LOCAL_FFN_SESSION_GRAPH_AND_SCRATCH_REUSE\n", run_phase);
         return false;
     }
@@ -5285,6 +5292,10 @@ static bool cycle_real_execute_period_fifo(
     uint64_t ordered_p2c_handoffs = 0;
     uint64_t v2_attn_prepared = 0;
     uint64_t v2_attn_completed = 0;
+    // The PC-side PHONE_GPU FIFO exclusively owns these counters.
+    // Registration can lead device completion, which can in turn lead
+    // the acknowledgements recorded in kv[].committed_tokens.
+    int64_t v2_registered_kv_tokens = 0;
     // Owned exclusively by the PHONE_GPU FIFO worker. One shape-specific
     // slot is enough: this worker executes FFN_SOURCE tasks serially.
     std::unique_ptr<cycle_real_p2c_ffn_slot> p2c_ffn_slot;
@@ -5614,9 +5625,16 @@ static bool cycle_real_execute_period_fifo(
                         const auto attn_call_begin =
                             std::chrono::steady_clock::now();
                         if (phone_full_auto_relay && l == layout.x + 2) {
+                            // The server may execute C1 before the PC has
+                            // ACKed C0. Commit only consecutive prefixes;
+                            // a later Chunk can never skip an earlier one.
                             const bool kv_prefix_ok = kv[size_t(l)] &&
-                                kv[size_t(l)]->committed_tokens == st.start;
+                                kv[size_t(l)]->committed_tokens == st.start &&
+                                v2_attn_completed == uint64_t(c);
+                            const bool registered_ok =
+                                v2_registered_kv_tokens >= st.start + st.tokens;
                             ok = local_input != nullptr && kv_prefix_ok &&
+                                registered_ok &&
                                 st.ready.prepared_attention_graph_uid != 0 &&
                                 ggml_backend_rpc_cycle_wait_phone_next_attention(
                                     phone, l, c, st.wire.seq, st.wire.graph_id);
@@ -5626,9 +5644,22 @@ static bool cycle_real_execute_period_fifo(
                                 ++v2_attn_completed;
                                 std::printf(
                                     "[CYCLE_PHONE_V2] side=PC event=KV_COMMIT "
-                                    "layer=%d chunk=%d prefix=%lld status=OK\n",
+                                    "layer=%d chunk=%d prefix=%lld "
+                                    "registered=%lld status=OK\n",
                                     l, c,
-                                    (long long)kv[size_t(l)]->committed_tokens);
+                                    (long long)kv[size_t(l)]->committed_tokens,
+                                    (long long)v2_registered_kv_tokens);
+                            } else {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PHONE_V2] side=PC event=KV_COMMIT "
+                                    "layer=%d chunk=%d start=%lld "
+                                    "committed=%lld registered=%lld "
+                                    "completed_chunks=%" PRIu64 " status=FAIL\n",
+                                    l, c, (long long)st.start,
+                                    (long long)(kv[size_t(l)] ?
+                                        kv[size_t(l)]->committed_tokens : -1),
+                                    (long long)v2_registered_kv_tokens,
+                                    v2_attn_completed);
                             }
                         } else {
                             ok = local_input != nullptr &&
@@ -5748,27 +5779,50 @@ static bool cycle_real_execute_period_fifo(
                                     std::chrono::steady_clock::now() -
                                     full_prepare_begin).count();
                         }
-                        // In V2 only the FIRST Phone Full layer arms its
-                        // successor. A one-credit window guarantees the
-                        // successor's KV prefix is committed before the next
-                        // Chunk is allowed to enter this layer.
+                        // V2 advances Graph registration in strict token
+                        // order, independently of KV completion ACKs. With
+                        // two credits, Chunk C1 can register while C0 is
+                        // queued in the Phone worker but not yet ACKed.
                         const bool v2_chain = phone_full_auto_relay &&
                             l == layout.x + 1;
                         if (ok && v2_chain) {
                             auto & next_st = *states[size_t(l + 1)][size_t(c)];
-                            double prepared_ms = 0.0;
-                            ok = cycle_real_execute_phone_attention_pre(
-                                phone, model.layers[size_t(l + 1)],
-                                model.hparams, empty,
-                                hidden, next_st.tokens, topk, experts,
-                                next_st.ready, prepared_ms, nullptr,
-                                n_chunks > 1 ? kv[size_t(l + 1)].get() : nullptr,
-                                next_st.start, 1, st.phone_output->output, true,
-                                perf_mode ? &attn_profile[queue_index] : nullptr,
-                                nullptr, attn_scratch[size_t(l + 1)],
-                                graph_cache_by_layer[size_t(l + 1)],
-                                {}, true);
-                            if (ok) ++v2_attn_prepared;
+                            if (next_st.start != v2_registered_kv_tokens) {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PHONE_V2_PREFIX] side=PC "
+                                    "event=REGISTER layer=%d chunk=%d "
+                                    "start=%lld expected=%lld status=FAIL\n",
+                                    l + 1, c, (long long)next_st.start,
+                                    (long long)v2_registered_kv_tokens);
+                                ok = false;
+                            }
+                            if (ok) {
+                                double prepared_ms = 0.0;
+                                ok = cycle_real_execute_phone_attention_pre(
+                                    phone, model.layers[size_t(l + 1)],
+                                    model.hparams, empty,
+                                    hidden, next_st.tokens, topk, experts,
+                                    next_st.ready, prepared_ms, nullptr,
+                                    n_chunks > 1 ? kv[size_t(l + 1)].get() : nullptr,
+                                    next_st.start, 1, st.phone_output->output, true,
+                                    perf_mode ? &attn_profile[queue_index] : nullptr,
+                                    nullptr, attn_scratch[size_t(l + 1)],
+                                    graph_cache_by_layer[size_t(l + 1)],
+                                    {}, true);
+                            }
+                            if (ok) {
+                                ++v2_attn_prepared;
+                                v2_registered_kv_tokens += next_st.tokens;
+                                std::printf(
+                                    "[CYCLE_PHONE_V2_PREFIX] side=PC "
+                                    "phase=%s event=REGISTER layer=%d chunk=%d "
+                                    "registered=%lld committed=%lld "
+                                    "window=%d status=OK\n",
+                                    run_phase, l + 1, c,
+                                    (long long)v2_registered_kv_tokens,
+                                    (long long)kv[size_t(l + 1)]->committed_tokens,
+                                    window);
+                            }
                         }
                         const auto full_ffn_call_begin =
                             std::chrono::steady_clock::now();
@@ -6650,15 +6704,21 @@ static bool cycle_real_execute_period_fifo(
         (unsigned long long) (phone_full_local_ffn ? ordered_full_handoffs : 0),
         phone_full_local_ffn ? "ELIDED_BY_PHONE_RUN_ACK" : "UNCHANGED");
     if (phone_full_auto_relay) {
+        const int64_t committed = kv[size_t(layout.x + 2)] ?
+            kv[size_t(layout.x + 2)]->committed_tokens : -1;
+        const bool v2_ok = succeeded &&
+            v2_attn_prepared == uint64_t(n_chunks) &&
+            v2_attn_completed == uint64_t(n_chunks) &&
+            v2_registered_kv_tokens == tokens &&
+            committed == tokens;
         std::printf(
             "[CYCLE_PHONE_V2_SUM] phase=%s next_attn_registered=%" PRIu64
             " next_attn_completed=%" PRIu64
-            " expected=%d status=%s\n",
+            " expected=%d window=%d registered_kv=%lld "
+            "committed_kv=%lld status=%s\n",
             run_phase, v2_attn_prepared, v2_attn_completed,
-            n_chunks, (succeeded &&
-                v2_attn_prepared == size_t(n_chunks) &&
-                v2_attn_completed == size_t(n_chunks)) ?
-                    "OK" : "FAIL");
+            n_chunks, window, (long long)v2_registered_kv_tokens,
+            (long long)committed, v2_ok ? "OK" : "FAIL");
     }
     // All FIFO workers have joined; FFN no longer borrows any READY tensors.
     // Explicit cleanup also handles exceptional/failure-path READY objects.

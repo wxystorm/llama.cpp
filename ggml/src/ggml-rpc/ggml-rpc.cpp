@@ -13315,6 +13315,11 @@ struct rpc_cycle_p2c_fifo_v1 {
     bool stopping = false;
     std::thread worker;
     uint64_t jobs_started = 0, jobs_finished = 0;
+    // Enqueue admission for V2 Attention only. P2C FFN jobs do not
+    // affect the causal per-layer KV order of NEXT_ATTENTION tasks.
+    int32_t v2_last_layer = -1;
+    int32_t v2_last_chunk = -1;
+    uint64_t v2_last_seq = 0;
 
     rpc_cycle_p2c_fifo_v1(rpc_server & s, bool on) : server(s), enabled(on) {}
     ~rpc_cycle_p2c_fifo_v1() {
@@ -13373,6 +13378,30 @@ struct rpc_cycle_p2c_fifo_v1 {
         if (!enabled || stopping ||
             jobs.size() >= 32 || pending.size() + completed.size() >= 64 ||
             pending.count(k) || completed.count(k)) return false;
+        // NEXT_ATTENTION must be admitted in Chunk order, even if the
+        // PC hasn't yet observed the preceding Chunk's completion. The
+        // single worker below runs these jobs FIFO and the KV writes
+        // are performed synchronously inside each graph replay.
+        const bool first = plan.next_chunk == 0;
+        const bool in_order = first ?
+            plan.next_seq > v2_last_seq :
+            (plan.next_layer == v2_last_layer &&
+             plan.next_chunk == v2_last_chunk + 1 &&
+             plan.next_seq == v2_last_seq + 1);
+        if (plan.next_layer < 0 || plan.next_chunk < 0 ||
+            plan.next_seq == 0 || !in_order ||
+            std::get<0>(k) != plan.next_layer ||
+            std::get<1>(k) != plan.next_chunk ||
+            std::get<2>(k) != plan.next_seq) {
+            GGML_LOG_ERROR(
+                "[CYCLE_PHONE_V2] side=PHONE event=KV_ADMISSION "
+                "layer=%d chunk=%d seq=%" PRIu64
+                " last_layer=%d last_chunk=%d last_seq=%" PRIu64
+                " status=FAIL reason=OUT_OF_ORDER\n",
+                plan.next_layer, plan.next_chunk, plan.next_seq,
+                v2_last_layer, v2_last_chunk, v2_last_seq);
+            return false;
+        }
         // The first V2 Attention is Layer 6, before any P2C task reaches
         // this connection. Start the worker here as well as in P2C enqueue.
         if (!worker.joinable()) {
@@ -13396,6 +13425,9 @@ struct rpc_cycle_p2c_fifo_v1 {
         jobs.push_back(std::move(next));
         pending.insert(k);
         ++jobs_started;
+        v2_last_layer = plan.next_layer;
+        v2_last_chunk = plan.next_chunk;
+        v2_last_seq = plan.next_seq;
         GGML_LOG_INFO(
             "[CYCLE_PHONE_V2] side=PHONE event=ENQUEUE_NEXT_ATTN "
             "layer=%d chunk=%d seq=%" PRIu64 " depth=%zu\n",
