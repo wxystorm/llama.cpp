@@ -301,6 +301,9 @@ enum rpc_cmd {
     RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM,
     RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT,
     RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER,
+    // Patch 33: L6 -> L7 Attention/READY/FFN/PARTIAL MAIN continuation.
+    RPC_CMD_INFERENCE_CYCLE_V6_REGION_REGISTER,
+    RPC_CMD_INFERENCE_CYCLE_V6_P2C_READY_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -345,6 +348,8 @@ static_assert(RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM == 48,
 static_assert(RPC_CMD_INFERENCE_CYCLE_V5_C2P_ARM == 49, "V5 C2P ARM must be 49");
 static_assert(RPC_CMD_INFERENCE_CYCLE_V5_C2P_WAIT == 50, "V5 C2P WAIT must be 50");
 static_assert(RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER == 51, "V5 REGION must be 51");
+static_assert(RPC_CMD_INFERENCE_CYCLE_V6_REGION_REGISTER == 52, "V6 REGION must be 52");
+static_assert(RPC_CMD_INFERENCE_CYCLE_V6_P2C_READY_WAIT == 53, "V6 READY WAIT must be 53");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -489,6 +494,24 @@ struct rpc_msg_inference_cycle_v5_region_req {
     uint32_t reserved = 0;
     uint64_t c2p_seq = 0;
     uint64_t c2p_graph_id = 0;
+};
+// Patch 33: one extra, already-registered P2C graph/FFN continuation.
+// Input/outputs and the TX frames borrow fixed RPC tensor allocations;
+// only the existing server TX staging makes independent network copies.
+struct rpc_msg_inference_cycle_v6_p2c_req {
+    uint32_t device = 0;
+    int32_t layer = -1;
+    int32_t chunk = -1;
+    uint32_t reserved = 0;
+    uint64_t attention_graph_uid = 0;
+    rpc_tensor input_source {};
+    rpc_tensor attention_input {};
+    rpc_msg_inference_cycle_send_req ready {};
+    rpc_msg_inference_cycle_p2c_arm_req ffn {};
+};
+struct rpc_msg_inference_cycle_v6_region_req {
+    rpc_msg_inference_cycle_v5_region_req prefix {};
+    rpc_msg_inference_cycle_v6_p2c_req p2c {};
 };
 
 struct rpc_msg_device_count_rsp {
