@@ -203,9 +203,11 @@ public:
     // separate from the task completion and does not add a backend sync.
     std::unique_ptr<PhoneSlot> retire_phone_output_after_handoff(
             int producer_layer, int successor_layer, int chunk) {
-        if (successor_layer != producer_layer + 1 ||
-            !contains_layer(producer_layer) ||
+        // Validate both indices BEFORE testing adjacency: producer_layer
+        // comes from the caller and must never overflow an int increment.
+        if (!contains_layer(producer_layer) ||
             !contains_layer(successor_layer) ||
+            int64_t(successor_layer) != int64_t(producer_layer) + 1 ||
             chunk < 0 || chunk >= n_chunks_) {
             return {};
         }
