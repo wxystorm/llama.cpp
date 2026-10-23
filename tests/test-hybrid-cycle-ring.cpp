@@ -1,6 +1,6 @@
 #include "llama-hybrid-cycle-ring.h"
 #include "llama-hybrid-cycle-phone-local.h"
-#include "llama-hybrid-cycle-fifo-executor.h"
+#include "llama-hybrid-cycle-runtime.h"
 
 #include <array>
 #include <cassert>
@@ -851,7 +851,83 @@ static void test_v5_ready_c2p_reduce_beats_next_region_prepare() {
     assert(ring.finished());
 }
 
+// Verify the compiled libllama Cycle runtime across both the original
+// eight-layer region and all 48 physical model layers. The callback acts as
+// a mock backend: no RPC, phone, weights or CPU reference are required.
+static void test_cycle_runtime_physical_8_and_48() {
+    for (const int layers : {8, 48}) {
+        constexpr int chunks = 4;
+        llama_hybrid_cycle_runtime_config cfg;
+        cfg.layout = llama_hybrid_build_cycle_layout(layers, 4, 2);
+        cfg.layout.pc_cuda_full = true;
+        cfg.n_chunks = chunks;
+        cfg.max_inflight = 2;
+        cfg.credit_until_handoff = true;
+        cfg.ordered_c2p_reduce = true;
+        cfg.phone_main_priority = true;
+        cfg.pc_cpu_reduce_priority = true;
+        llama_hybrid_cycle_runtime runtime(std::move(cfg));
+
+        for (int cycle = 0; cycle < layers / 8; ++cycle) {
+            llama_hybrid_cycle_runtime_region region;
+            assert(runtime.region_for_layer(cycle * 8, region));
+            assert(runtime.region_for_layer(cycle * 8 + 7, region));
+            assert(region.cycle_index == cycle);
+            assert(region.begin == cycle * 8);
+            assert(region.c2p_layer == cycle * 8 + 4);
+            assert(region.phone_begin == cycle * 8 + 5);
+            assert(region.phone_end == cycle * 8 + 7);
+            assert(region.p2c_layer == cycle * 8 + 7);
+            assert(region.end == cycle * 8 + 8);
+        }
+        llama_hybrid_cycle_runtime_region outside;
+        assert(!runtime.region_for_layer(layers, outside));
+
+        std::vector<std::atomic<int>> completed(size_t(layers * chunks));
+        for (auto & flag : completed) flag.store(0);
+        std::atomic<int> tasks {0};
+        std::atomic<int> c2p_sends {0};
+        std::atomic<int> p2c_sends {0};
+        const bool ok = runtime.run([&](const llama_hybrid_cycle_task & task) {
+            assert(task.layer >= 0 && task.layer < layers);
+            assert(task.chunk >= 0 && task.chunk < chunks);
+            const auto kind = runtime.config().layout.kinds[size_t(task.layer)];
+            if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER ||
+                task.stage == llama_hybrid_cycle_stage::ATTN_PRE) {
+                if (task.layer > 0) {
+                    assert(completed[size_t((task.layer - 1) * chunks +
+                                           task.chunk)].load() == 1);
+                }
+            }
+            if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION ||
+                task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
+                if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
+                    assert(task.queue == llama_hybrid_cycle_queue::PC_TO_PHONE);
+                    ++c2p_sends;
+                } else {
+                    assert(kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C);
+                    assert(task.queue == llama_hybrid_cycle_queue::PHONE_TO_PC);
+                    ++p2c_sends;
+                }
+            }
+            if (task.stage == llama_hybrid_cycle_stage::REDUCE ||
+                task.stage == llama_hybrid_cycle_stage::FULL_LAYER) {
+                assert(completed[size_t(task.layer * chunks +
+                                       task.chunk)].exchange(1) == 0);
+            }
+            ++tasks;
+            return true;
+        });
+        assert(ok);
+        for (auto & flag : completed) assert(flag.load() == 1);
+        assert(tasks.load() == (layers / 8) * chunks * 18);
+        assert(c2p_sends.load() == (layers / 8) * chunks * 2);
+        assert(p2c_sends.load() == (layers / 8) * chunks * 2);
+    }
+}
+
 int main() {
+    test_cycle_runtime_physical_8_and_48();
     test_v5_ready_c2p_reduce_beats_next_region_prepare();
     test_chunk_trace_observational();
     test_v5_pc_phone_proxy_main_priority();

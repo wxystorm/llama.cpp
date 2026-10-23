@@ -21,7 +21,7 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "llama-hybrid-cycle.h"
-#include "llama-hybrid-cycle-fifo-executor.h"
+#include "llama-hybrid-cycle-runtime.h"
 #include "llama-hybrid-cycle-ffn-executor.h"
 #include "inference-cycle-transport.h"
 #include "inference-cycle-reduce.h"
@@ -5857,9 +5857,21 @@ static bool cycle_real_execute_period_fifo(
         return true;
     };
 
+    // Same physical V5 stage callback, now driven through libllama's
+    // reusable runtime rather than a test-local inline FIFO scheduler.
+    llama_hybrid_cycle_runtime_config runtime_config;
+    runtime_config.layout = period;
+    runtime_config.n_chunks = n_chunks;
+    runtime_config.max_inflight = window;
+    runtime_config.credit_until_handoff = true;
+    runtime_config.pc_cpu_reduce_priority = pc_reduce_priority;
+    runtime_config.ordered_c2p_reduce = phone_full_region_auto;
+    runtime_config.phone_main_priority = phone_c2p_local;
+    llama_hybrid_cycle_runtime cycle_runtime(std::move(runtime_config));
+
     const auto fifo_trace_begin = std::chrono::steady_clock::now();
-    const bool succeeded = llama_hybrid_cycle_run_fifo(
-        period, n_chunks, [&](const llama_hybrid_cycle_task & task) -> bool {
+    const bool succeeded = cycle_runtime.run(
+        [&](const llama_hybrid_cycle_task & task) -> bool {
             if (task.layer < 0 || task.layer >= n_layers ||
                 task.chunk < 0 || task.chunk >= n_chunks) {
                 return false;
@@ -7337,9 +7349,8 @@ static bool cycle_real_execute_period_fifo(
                 std::fflush(stdout);
             }
             return ok;
-        }, window, true, perf_mode ? &fifo_profile : nullptr,
-        pc_reduce_priority, phone_full_region_auto,
-        phone_c2p_local, chunk_path_trace ? &chunk_timeline : nullptr);
+        }, perf_mode ? &fifo_profile : nullptr,
+        chunk_path_trace ? &chunk_timeline : nullptr);
     const auto fifo_done = std::chrono::steady_clock::now();
     if (chunk_path_trace) {
         std::printf("[CYCLE_CHUNK_TRACE_PHASE] phase=%s\n", run_phase);

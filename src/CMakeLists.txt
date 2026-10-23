@@ -20,6 +20,7 @@ add_library(llama
             llama-grammar.cpp
             llama-graph.cpp
             llama-hybrid.cpp
+            llama-hybrid-cycle-runtime.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
