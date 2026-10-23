@@ -1443,20 +1443,24 @@ static bool cycle_real_execute_phone_attention_pre(
         return false;
     }
     const auto begin = std::chrono::steady_clock::now();
-    if (device_input != nullptr && !defer_registered_replay) {
-        // A FULL Phone layer hands off its computed l_out to the next
-        // layer through a direct Phone-GPU-to-Phone-GPU copy. Never call
-        // ggml_backend_tensor_copy here; that could secretly RPC GET/SET.
+    if (device_input != nullptr) {
+        // Both immediate and deferred Phone Full handoffs must validate
+        // exactly the same shape/strides. In V2 the source l_out is NOT yet
+        // produced: the Phone worker will COPY after the producer FFN+ADD.
+        // Never upload the empty host vector as an Attention input.
         bool layout_ok = ggml_are_same_shape(device_input, x) &&
                          device_input->type == x->type;
         for (int d = 0; d < GGML_MAX_DIMS && layout_ok; ++d) {
             layout_ok = device_input->nb[d] == x->nb[d];
         }
         if (!layout_ok ||
-            !ggml_backend_buffer_copy_tensor(device_input, x)) {
+            (!defer_registered_replay &&
+             !ggml_backend_buffer_copy_tensor(device_input, x))) {
             std::fprintf(stderr,
                 "[CYCLE_PHONE_LOCAL_HANDOFF] status=FAIL "
-                "reason=DEVICE_COPY_UNSUPPORTED\n");
+                "reason=%s\n",
+                !layout_ok ? "TENSOR_LAYOUT_MISMATCH" :
+                             "DEVICE_COPY_UNSUPPORTED");
             if (graph_slot) {
                 graph_cache->recycle(graph_slot, false);
             } else {
@@ -1468,9 +1472,14 @@ static bool cycle_real_execute_phone_attention_pre(
         std::printf(
             "[CYCLE_PHONE_LOCAL_HANDOFF] backend=%s "
             "bytes=%zu source=PHONE_GPU_PREVIOUS_LAYER "
-            "destination=PHONE_GPU_ATTENTION status=OK\n",
-            ggml_backend_name(backend), ggml_nbytes(x));
+            "destination=PHONE_GPU_ATTENTION "
+            "action=%s status=OK\n",
+            ggml_backend_name(backend), ggml_nbytes(x),
+            defer_registered_replay ?
+                "DEFER_TO_PHONE_FIFO" : "DEVICE_COPY");
     } else {
+        // Host upload is valid only for a genuinely host-resident input;
+        // deferred replay requires a non-null physical GPU producer.
         ggml_backend_tensor_set(x, layer_input.data(), 0, ggml_nbytes(x));
     }
     ggml_backend_tensor_set(positions, position_data.data(), 0,
