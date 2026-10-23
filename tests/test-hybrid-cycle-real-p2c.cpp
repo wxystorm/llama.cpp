@@ -5441,6 +5441,7 @@ static bool cycle_real_execute_period_fifo(
     uint64_t v4_l6_completed = 0;
     int64_t v5_p2c_registered_tokens = 0;
     uint64_t v5_p2c_ready_completed = 0;
+    uint64_t v5_p2c_ffn_completed = 0;
     // The PC-side PHONE_GPU FIFO exclusively owns these counters.
     // Registration can lead device completion, which can in turn lead
     // the acknowledgements recorded in kv[].committed_tokens.
@@ -5659,7 +5660,10 @@ static bool cycle_real_execute_period_fifo(
             llama_hybrid_cycle_queue::PHONE_GPU);
         while (v4_next_arm_chunk < n_chunks &&
                v4_c2p_ready[size_t(v4_next_arm_chunk)] != 0 &&
-               v4_region_armed - v4_l6_completed < uint64_t(window)) {
+               v4_region_armed -
+                    (phone_main_p2c ? v5_p2c_ffn_completed :
+                                      v4_l6_completed) <
+                    uint64_t(window)) {
             const int c = v4_next_arm_chunk;
             auto & c2p = *states[size_t(layout.x)][size_t(c)];
             auto & l5 = *states[size_t(layout.x + 1)][size_t(c)];
@@ -6076,7 +6080,12 @@ static bool cycle_real_execute_period_fifo(
                                     // may have been waiting for a Region
                                     // credit. L6 completed: L5's old FFN
                                     // slot is now safe to reuse.
-                                    ok = try_arm_phone_v4_regions();
+                                    // In V5 P2C mode the Region owns its
+                                    // L7 scratch and FFN slot until P2C
+                                    // PARTIAL is staged. Releasing credit at
+                                    // L6 would exceed the two-slot pool.
+                                    if (!phone_main_p2c)
+                                        ok = try_arm_phone_v4_regions();
                                 }
                                 std::printf(
                                     "[CYCLE_PHONE_V4] side=PC event=FULL_ACK "
@@ -6894,6 +6903,10 @@ static bool cycle_real_execute_period_fifo(
                                 // worker or at asynchronous submit time.
                                 retire_device_output(l - 1, c);
                                 ++p2c_phone_local_completed;
+                                if (phone_main_p2c) {
+                                    ++v5_p2c_ffn_completed;
+                                    ok = try_arm_phone_v4_regions();
+                                }
                             }
                         } else if (!p2c_ffn_reuse) {
                             const auto fallback_begin =
@@ -7363,6 +7376,25 @@ static bool cycle_real_execute_period_fifo(
             run_phase, v4_region_armed, n_chunks,
             succeeded && v4_region_armed == uint64_t(n_chunks) ?
                 "OK" : "FAIL");
+    }
+    if (phone_main_p2c) {
+        const auto & p2c_kv = kv[size_t(n_layers - 1)];
+        const bool complete = succeeded &&
+            v5_p2c_registered_tokens == tokens &&
+            v5_p2c_ready_completed == uint64_t(n_chunks) &&
+            v5_p2c_ffn_completed == uint64_t(n_chunks) &&
+            p2c_kv && p2c_kv->committed_tokens == tokens;
+        std::printf(
+            "[CYCLE_PHONE_V5_P2C_SUM] phase=%s "
+            "registered_tokens=%lld ready_done=%llu ffn_done=%llu "
+            "expected=%d p2c_committed_kv=%lld window=%d "
+            "status=%s\n",
+            run_phase, (long long)v5_p2c_registered_tokens,
+            (unsigned long long)v5_p2c_ready_completed,
+            (unsigned long long)v5_p2c_ffn_completed,
+            n_chunks, (long long)(p2c_kv ?
+                p2c_kv->committed_tokens : -1),
+            window, complete ? "OK" : "FAIL");
     }
     if (phone_full_region_auto) {
         const auto & l5_kv = kv[size_t(layout.x + 1)];
