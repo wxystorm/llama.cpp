@@ -674,6 +674,9 @@ static void test_v4_ordered_c2p_reduce() {
 static void test_v5_phone_main_priority() {
     using sched = llama_hybrid_cycle_phone_local;
     sched ring(3, 2);
+    ring.phone_ready(0);
+    ring.phone_ready(1);
+    ring.phone_ready(2);
     sched::task t {};
     // PC chunk1 is ready before C0, but may not enter MAIN.
     ring.pc_partial_ready(1);
@@ -724,6 +727,7 @@ static void test_v5_phone_rx_first() {
     using sched = llama_hybrid_cycle_phone_local;
     sched ring(1, 0);
     ring.pc_partial_ready(0);
+    ring.phone_ready(0);
     sched::task t {};
     assert(ring.pop(t) && t.op == sched::stage::C2P_FFN);
     ring.complete(t);
