@@ -58,8 +58,8 @@ bool cpu_weight(ggml_backend_t cpu, const ggml_tensor * src,
     }
     out = llama_hybrid_cycle_resolve_physical_weight(src, cpu, 0);
     if (!out || !out->buffer) return false;
-    const auto * dev = ggml_backend_get_device(cpu);
-    const auto * wt_buft = ggml_backend_buffer_get_type(out->buffer);
+    auto * dev = ggml_backend_get_device(cpu);
+    auto * wt_buft = ggml_backend_buffer_get_type(out->buffer);
     return wt_buft &&
            ggml_backend_dev_supports_buft(dev, wt_buft);
 }
