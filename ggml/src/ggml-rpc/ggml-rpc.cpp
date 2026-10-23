@@ -13740,8 +13740,7 @@ struct rpc_cycle_p2c_fifo_v1 {
     bool arm_c2p_v5(const rpc_msg_inference_cycle_v5_c2p_arm_req & plan) {
         const key k {plan.layer, plan.chunk, plan.seq, plan.graph_id};
         std::lock_guard<std::mutex> lock(mutex);
-        if (!enabled || stopping || plan.device >= server.backends.size() ||
-            plan.layer < 0 || plan.chunk < 0 || !plan.seq ||
+        if (!enabled || stopping || plan.layer < 0 || plan.chunk < 0 || !plan.seq ||
             !plan.ffn_graph_uid || !plan.reduce_graph_uid ||
             c2p_v5.count(k) || c2p_v5.size() >= 64) return false;
         if (plan.chunk == 0) {
@@ -14115,7 +14114,49 @@ struct rpc_cycle_p2c_fifo_v1 {
                 // serialize here to protect graph_map and borrowed buffers.
                 std::lock_guard<std::mutex> gpu(server.cycle_p2c_gpu_gate());
                 lock_acquired_us = ggml_time_us();
-                if (item.type == kind::PHONE_REGION_STAGE) {
+                if (item.type == kind::C2P_V5_FFN) {
+                    rpc_msg_graph_recompute_req run {};
+                    run.device = item.c2p_v5.device;
+                    run.graph_uid = item.c2p_v5.ffn_graph_uid;
+                    ok = server.graph_recompute(run);
+                    t1 = t2 = t3 = ggml_time_us();
+                } else if (item.type == kind::C2P_V5_REDUCE) {
+                    rpc_msg_graph_recompute_req run {};
+                    run.device = item.c2p_v5.device;
+                    run.graph_uid = item.c2p_v5.reduce_graph_uid;
+                    ok = server.graph_recompute(run);
+                    t1 = t2 = ggml_time_us();
+                    if (ok) {
+                        rpc_msg_inference_cycle_send_req finish {};
+                        finish.device = item.c2p_v5.device;
+                        finish.kind = INFERENCE_CYCLE_PARTIAL;
+                        finish.layer = item.c2p_v5.layer;
+                        finish.chunk = item.c2p_v5.chunk;
+                        finish.seq = item.c2p_v5.seq;
+                        finish.graph_id = item.c2p_v5.graph_id;
+                        ok = server.finish_inference_cycle(finish);
+                    }
+                    t3 = ggml_time_us();
+                    // High-priority continuation: C0 L5 must run before
+                    // a previously admitted C1 Reduce, and L6 before C1.
+                    if (ok) {
+                        rpc_msg_inference_cycle_phone_region_req region {};
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            const auto it = c2p_v5.find(item.id);
+                            ok = it != c2p_v5.end() &&
+                                it->second.region_registered;
+                            if (ok) region = it->second.region;
+                        }
+                        if (ok) ok = enqueue_phone_region(region, true);
+                    }
+                    GGML_LOG_INFO(
+                        "[CYCLE_PHONE_V5] side=PHONE event=MAIN_REDUCE_DONE "
+                        "chunk=%d seq=%" PRIu64 " "
+                        "region=ENQUEUE_FRONT status=%s\\n",
+                        item.c2p_v5.chunk, item.c2p_v5.seq,
+                        ok ? "OK" : "FAIL");
+                } else if (item.type == kind::PHONE_REGION_STAGE) {
                     // One Full layer is an atomic compute stage on the GPU.
                     // The next layer is NOT run inline: it is appended to
                     // the FIFO only after this stage's completion, so older
@@ -14239,8 +14280,24 @@ struct rpc_cycle_p2c_fifo_v1 {
             }
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                pending.erase(item.id);
-                completed.emplace(item.id, ok);
+                if (item.type == kind::C2P_V5_FFN ||
+                    item.type == kind::C2P_V5_REDUCE) {
+                    const auto it = c2p_v5.find(item.id);
+                    if (it != c2p_v5.end()) {
+                        auto & c2p = it->second;
+                        if (item.type == kind::C2P_V5_FFN) {
+                            c2p.ffn_done = ok;
+                            c2p.ffn_failed = !ok;
+                            if (ok) admit_c2p_reduces_locked();
+                        } else {
+                            c2p.reduce_done = ok;
+                            c2p.reduce_failed = !ok;
+                        }
+                    }
+                } else {
+                    pending.erase(item.id);
+                    completed.emplace(item.id, ok);
+                }
                 ++jobs_finished;
                 if (item.type == kind::PHONE_REGION_STAGE &&
                     item.region_has_next) {
@@ -14254,10 +14311,14 @@ struct rpc_cycle_p2c_fifo_v1 {
                         follow.type = kind::PHONE_REGION_STAGE;
                         follow.region = plan;
                         follow.region_has_next = false;
+                        follow.v5_main_continuation = item.v5_main_continuation;
                         follow.enqueue_us = ggml_time_us();
+                        // V5 promotes the active Chunk to the FRONT.
                         // Enqueue AT THE BACK of the existing FIFO. This
                         // is the essential cross-layer Chunk ordering rule.
-                        jobs.push_back(std::move(follow));
+                        if (item.v5_main_continuation)
+                            jobs.push_front(std::move(follow));
+                        else jobs.push_back(std::move(follow));
                         GGML_LOG_INFO(
                             "[CYCLE_PHONE_V4] side=PHONE event=APPEND_NEXT "
                             "layer=%d chunk=%d seq=%" PRIu64
@@ -14280,6 +14341,8 @@ struct rpc_cycle_p2c_fifo_v1 {
                 " queue_wait_ms=%.3f gpu_gate_wait_ms=%.3f "
                 "copy_ms=%.3f graph_ms=%.3f "
                 "partial_stage_ms=%.3f status=%s\n",
+                item.type == kind::C2P_V5_FFN ? "C2P_FFN" :
+                item.type == kind::C2P_V5_REDUCE ? "C2P_REDUCE" :
                 item.type == kind::PHONE_REGION_STAGE ?
                     "PHONE_REGION_FULL" :
                     item.type == kind::NEXT_ATTENTION_FULL ?
@@ -14288,6 +14351,10 @@ struct rpc_cycle_p2c_fifo_v1 {
                             "NEXT_ATTENTION" : "P2C_FFN",
                 std::get<0>(item.id), std::get<1>(item.id),
                 std::get<2>(item.id),
+                item.type == kind::C2P_V5_FFN ?
+                    item.c2p_v5.ffn_graph_uid :
+                item.type == kind::C2P_V5_REDUCE ?
+                    item.c2p_v5.reduce_graph_uid :
                 item.type == kind::PHONE_REGION_STAGE ?
                     item.region.ffn_graph_uid :
                     item.type == kind::NEXT_ATTENTION_FULL ?
