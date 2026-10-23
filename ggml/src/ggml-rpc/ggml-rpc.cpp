@@ -7755,7 +7755,7 @@ public:
     bool cycle_gpu_tensor_span(
             const rpc_tensor & desc, cycle_gpu_span & out,
             bool strict = false) const {
-        if (!desc.buffer) return false;
+        if (!desc.buffer || (strict && desc.view_src)) return false;
         const auto buffer = reinterpret_cast<ggml_backend_buffer_t>(
             desc.buffer);
         // APPLY can arrive on a separate RPC socket while COMPUTE allocates
@@ -13369,6 +13369,16 @@ bool rpc_server::graph_compute(
         graph_entry.cycle_ranges_known = true;
         for (uint32_t i = 0; i < n_tensors; ++i) {
             if (!tensors[i].buffer) continue;
+            if (tensors[i].view_src) {
+                const auto parent = tensor_ptrs.find(tensors[i].view_src);
+                if (parent == tensor_ptrs.end() ||
+                    parent->second->buffer != tensors[i].buffer) {
+                    // A view backed by a different or unknown Allocation
+                    // cannot be proven disjoint using this descriptor.
+                    graph_entry.cycle_ranges_known = false;
+                    break;
+                }
+            }
             cycle_gpu_span span {};
             if (!cycle_gpu_tensor_span(tensors[i], span)) {
                 graph_entry.cycle_ranges_known = false;
