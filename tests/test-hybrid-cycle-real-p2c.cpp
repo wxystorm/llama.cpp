@@ -7427,7 +7427,7 @@ static bool cycle_real_execute_period_fifo(
             n_chunks, (long long)(p2c_kv ?
                 p2c_kv->committed_tokens : -1),
             window, (unsigned long long)p2c_main_hits,
-            p2c_main_idle_at_fifo_end,
+            p2c_main_idle.size(),
             complete ? "OK" : "FAIL");
     }
     if (phone_full_region_auto) {
@@ -7495,7 +7495,6 @@ static bool cycle_real_execute_period_fifo(
     }
     const auto attn_scratch_release_done = std::chrono::steady_clock::now();
     const bool p2c_ffn_cached_at_end = p2c_ffn_slot != nullptr;
-    const size_t p2c_main_idle_at_fifo_end = p2c_main_idle.size();
     // Release the cached RPC allocation BEFORE the period timer stops.
     // No borrowed input or output outlives the FIFO workers.
     p2c_ffn_slot.reset();
