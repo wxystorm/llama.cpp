@@ -10579,6 +10579,10 @@ bool rpc_server::apply_inference_cycle(
     if (needs_gpu_gate && !uploaded_async) {
         cycle_p2c_apply_gpu_guard =
             std::unique_lock<std::mutex>(cycle_p2c_gpu_gate_);
+        // A fallback may race a separate APPLY connection that has already
+        // submitted an event-backed upload. The old GPU mutex alone cannot
+        // serialize commands on the NEW transfer queue.
+        cycle_gpu_wait_all_uploads();
     }
     upload_ticket.acquired();
     const int64_t gpu_gate_acquired_us =
