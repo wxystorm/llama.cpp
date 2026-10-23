@@ -19,7 +19,7 @@ bool llama_hybrid_cycle_execute_ffn_shard(
         int64_t hidden, int64_t tokens,
         int64_t topk, int64_t experts,
         std::vector<float> & partial,
-        std::vector<float> * raw_down_out = nullptr,
+        std::vector<float> * raw_down_out,
         llama_hybrid_cycle_ffn_stages * stages_out,
         const llama_hybrid_cycle_live_wire * wire,
         const llama_hybrid_cycle_ready_graph * local_phone_ready,
