@@ -7829,6 +7829,17 @@ public:
         });
     }
 
+    // Other RPC GPU operations do not provide the V5 stage's complete
+    // per-graph ownership descriptors. Drain outstanding transfer events
+    // before such an opaque operation gets access to the GPU Backend.
+    void cycle_gpu_wait_all_uploads() {
+        if (!cycle_gpu_transfer_enabled()) return;
+        std::unique_lock<std::mutex> lock(cycle_upload_owner_mutex_);
+        cycle_upload_owner_cv_.wait(lock, [&] {
+            return cycle_upload_inflight_.empty();
+        });
+    }
+
     class cycle_gpu_upload_lease {
     public:
         cycle_gpu_upload_lease(
@@ -15390,6 +15401,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             rpc_cycle_p2c_v1_gpu_command(static_cast<rpc_cmd>(cmd))) {
             cycle_gpu_guard = std::unique_lock<std::mutex>(
                 server.cycle_p2c_gpu_gate());
+            // Opaque commands outside the Phone MAIN Worker have no
+            // per-Chunk buffer borrow set. Conservatively join transfer
+            // events before touching the shared Backend/graph metadata.
+            server.cycle_gpu_wait_all_uploads();
         }
         if (return_bulk_credit_held &&
                 cmd != RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT) {
