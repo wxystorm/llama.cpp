@@ -820,7 +820,39 @@ static void test_chunk_trace_observational() {
     assert(samples == 4);
 }
 
+// A ready C2P Reduce must start the older Chunk's Phone MAIN ahead of
+// the next Chunk's FFN_DESTINATION region preparation on the PC proxy.
+// This is an opt-in V5 scheduling policy, not a Phone GPU kernel ordering test.
+static void test_v5_ready_c2p_reduce_beats_next_region_prepare() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::TENSOR_C2P};
+    llama_hybrid_cycle_task_ring ring(
+        layout, 2, 2, true, false, true, true);
+    ring.start();
+    for (int c = 0; c < 2; ++c) {
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                           llama_hybrid_cycle_stage::ATTN_PRE, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_CPU,
+                           llama_hybrid_cycle_stage::FFN_SOURCE, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                           llama_hybrid_cycle_stage::SEND_ACTIVATION, 0, c));
+        ring.complete(take(ring, llama_hybrid_cycle_queue::PC_TO_PHONE,
+                           llama_hybrid_cycle_stage::SEND_PARTIAL, 0, c));
+    }
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 0));
+    // C1 FFN_DESTINATION is still queued. C0 Reduce is now ready.
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 0));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::FFN_DESTINATION, 0, 1));
+    ring.complete(take(ring, llama_hybrid_cycle_queue::PHONE_GPU,
+                       llama_hybrid_cycle_stage::REDUCE, 0, 1));
+    assert(ring.finished());
+}
+
 int main() {
+    test_v5_ready_c2p_reduce_beats_next_region_prepare();
     test_chunk_trace_observational();
     test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
