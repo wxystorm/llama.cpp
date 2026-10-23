@@ -14784,6 +14784,15 @@ struct rpc_cycle_p2c_fifo_v1 {
                     // No complete graph/Buffer ownership audit for legacy jobs.
                     stage_known = false;
                 }
+                if (rpc_server::cycle_gpu_transfer_enabled()) {
+                    GGML_LOG_INFO(
+                        "[CYCLE_GPU_OWNERSHIP_STAGE] layer=%d chunk=%d "
+                        "seq=%" PRIu64 " allocations=%zu known=%d "
+                        "scope=REGISTERED_GRAPH_AND_EXPLICIT_RPC_TENSORS\n",
+                        std::get<0>(item.id), std::get<1>(item.id),
+                        std::get<2>(item.id), stage_buffers.size(),
+                        stage_known ? 1 : 0);
+                }
                 rpc_server::cycle_gpu_stage_guard stage_guard(
                     server, std::move(stage_buffers), stage_known,
                     rpc_server::cycle_gpu_transfer_enabled());
