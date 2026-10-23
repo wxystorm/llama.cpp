@@ -10567,11 +10567,11 @@ bool rpc_server::apply_inference_cycle(
         source[0] = msg.partial.partial.data();
     }
 
-    // Phase B: real OpenCL transfer queue + completion event. The v1
-    // ownership check is allocation-conservative. No overlap is allowed
-    // for ANY view within an allocation borrowed by the active GPU job.
-    // On an uncertain alias, metadata miss or unsupported Backend, use
-    // the old gated/synchronous upload instead of guessing.
+    // Transfer Queue admission is based on actual byte ranges and the
+    // destination Chunk Slot lifetime, not on whether a GPU task happens
+    // to be active. IDLE_SLOT_READY is an ordinary successful admission.
+    // Active compute is only a conflict if it BORROWS overlapping bytes.
+    // On uncertain aliases or unsupported Backend, use the gated path.
     const bool gpu_stage_timing =
         std::getenv("GGML_CYCLE_GPU_STAGE_TIMING") != nullptr;
     const char * v1 = std::getenv("GGML_CYCLE_P2C_EXECUTOR_V1");
@@ -10586,14 +10586,22 @@ bool rpc_server::apply_inference_cycle(
         needs_gpu_gate && cycle_gpu_transfer_enabled() &&
         !cycle_phone_numeric_enabled();
     if (async_candidate) {
-        std::vector<uint64_t> target_buffers;
-        target_buffers.reserve(count);
+        std::vector<cycle_gpu_span> target_ranges;
+        target_ranges.reserve(count);
+        bool ranges_valid = true;
         for (size_t i = 0; i < count; ++i) {
-            target_buffers.push_back(request.tensors[i].buffer);
+            cycle_gpu_span range {};
+            if (!cycle_gpu_tensor_span(request.tensors[i], range,
+                                        /* strict = */ true)) {
+                ranges_valid = false;
+                break;
+            }
+            target_ranges.push_back(range);
         }
-        cycle_gpu_upload_lease lease(*this, std::move(target_buffers));
-        const char * fallback_reason = "UNSUPPORTED_OPENCL_TENSOR";
-        if (lease.acquire(&fallback_reason)) {
+        cycle_gpu_upload_lease lease(*this, std::move(target_ranges));
+        const char * admission_reason = ranges_valid ?
+            "UNSUPPORTED_OPENCL_TENSOR" : "INVALID_UPLOAD_RANGE";
+        if (ranges_valid && lease.acquire(&admission_reason)) {
             // These objects live through event completion. Restore cached
             // OpenCL Tensor Extra ONLY; do not create/modify GPU metadata
             // under a running compute kernel.
@@ -10673,17 +10681,17 @@ bool rpc_server::apply_inference_cycle(
                 }
             }
             if (!uploaded_async)
-                fallback_reason = "ASYNC_PREPARE_OR_SUBMIT_FAILED";
+                admission_reason = "ASYNC_PREPARE_OR_SUBMIT_FAILED";
         }
         GGML_LOG_INFO(
             "[CYCLE_GPU_OWNERSHIP] side=PHONE layer=%d chunk=%d kind=%s "
-            "decision=%s reason=%s buffers=%zu "
+            "decision=%s reason=%s spans=%zu "
             "transfer_submit_begin_us=%" PRId64
             " transfer_complete_us=%" PRId64 "\n",
             request.layer, request.chunk, ready ? "READY" : "PARTIAL",
             uploaded_async ? "TRANSFER_QUEUE" : "GATED_FALLBACK",
-            uploaded_async ? "DISJOINT_ALLOCATIONS" : fallback_reason,
-            count, transfer_submit_begin_us, transfer_complete_us);
+            admission_reason, count,
+            transfer_submit_begin_us, transfer_complete_us);
     }
 
     // Legacy, always-safe path. A successful independent upload has already
