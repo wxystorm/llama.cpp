@@ -9251,21 +9251,31 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     }
 
     LOG_DBG("[%s] device: %d, buffer: %p, data: %p\n", __func__, dev_id, (void*)tensor->buffer, tensor->data);
-    if (tensor->buffer == nullptr) {
-        //No buffer allocated.
-        buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
-    } else {
-        buft = tensor->buffer->buft;
+    // GET_ALLOC_SIZE does not hold the GPU gate. A buffer can be retired
+    // between descriptor deserialization and buft use, so revalidate under
+    // the same metadata lock and keep it through the allocation-size query.
+    {
+        std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
+        if (tensor->buffer && buffers.find(tensor->buffer) == buffers.end()) {
+            tensor->buffer = nullptr;
+        }
+        for (ggml_tensor * src : tensor->src) {
+            if (src && src->buffer && buffers.find(src->buffer) == buffers.end()) {
+                src->buffer = nullptr;
+            }
+        }
+        buft = tensor->buffer ?
+            tensor->buffer->buft :
+            ggml_backend_get_default_buffer_type(backends[dev_id]);
+        if (cycle_ffn_diag) {
+            GGML_LOG_INFO(
+                "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=BACKEND_BEGIN "
+                "tensor=%s op=%s type=%s buft=%s\n",
+                tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+                ggml_backend_buft_name(buft));
+        }
+        response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
     }
-
-    if (cycle_ffn_diag) {
-        GGML_LOG_INFO(
-            "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=BACKEND_BEGIN "
-            "tensor=%s op=%s type=%s buft=%s\n",
-            tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
-            ggml_backend_buft_name(buft));
-    }
-    response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
     if (cycle_ffn_diag) {
         GGML_LOG_INFO(
             "[CYCLE_LIVE_FFN_RPC] side=phone cmd=GET_ALLOC_SIZE stage=END "
@@ -9327,6 +9337,8 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    // GET_BASE is exempt from the GPU gate; FREE must not race this lookup.
+    std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
@@ -9382,6 +9394,9 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     cycle_gpu_wait_before_free(request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    // CLEAR is infrequent and must hold the allocation alive through the
+    // backend operation; V5's opaque GPU stage still handles transfer order.
+    std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
@@ -9416,17 +9431,21 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
-        result->buffer = nullptr;
-    }
-
     if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
-        uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        // APPLY may deserialize on a separate connection while another RPC
+        // allocates/frees buffers. Validate both membership and bounds under
+        // the same short metadata lock; the caller's GPU gate or upload lease
+        // continues to protect the buffer lifetime during subsequent use.
+        std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
+        if (buffers.find(result->buffer) == buffers.end()) {
+            result->buffer = nullptr;
+        } else {
+            const uint64_t tensor_size = uint64_t(ggml_nbytes(result));
+            const uint64_t buffer_start = uint64_t(ggml_backend_buffer_get_base(result->buffer));
+            const uint64_t buffer_size = uint64_t(ggml_backend_buffer_get_size(result->buffer));
+            GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
+            GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -9691,11 +9710,14 @@ bool rpc_server::set_tensor_async_return(
 
     ggml_backend_buffer_t payload_buffer =
         reinterpret_cast<ggml_backend_buffer_t>(in_tensor.buffer);
-    if (payload_buffer != nullptr &&
-            buffers.find(payload_buffer) != buffers.end() &&
-            payload_buffer->buft != nullptr) {
-        payload_dev =
-            ggml_backend_buft_get_device(payload_buffer->buft);
+    if (payload_buffer != nullptr) {
+        // A separate control connection may retire unrelated buffers.
+        std::lock_guard<std::mutex> table_lock(cycle_gpu_buffer_table_mutex_);
+        if (buffers.find(payload_buffer) != buffers.end() &&
+                payload_buffer->buft != nullptr) {
+            payload_dev =
+                ggml_backend_buft_get_device(payload_buffer->buft);
+        }
     }
 
     if (payload_dev != nullptr) {
