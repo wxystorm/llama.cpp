@@ -23,6 +23,25 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
 #define GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC \
     "ggml_backend_opencl_set_tensor_async"
 
+// Optional V5 C2P upload on a separate in-order OpenCL command queue.
+// A successful submit returns an owned, opaque cl_event through event_out.
+// The caller must keep ALL host payloads and GPU allocations alive until
+// cycle_upload_wait consumes that event (including on failure paths).
+#define GGML_BACKEND_OPENCL_CYCLE_UPLOAD_BATCH_PROC \
+    "ggml_backend_opencl_cycle_upload_batch"
+#define GGML_BACKEND_OPENCL_CYCLE_UPLOAD_WAIT_PROC \
+    "ggml_backend_opencl_cycle_upload_wait"
+
+typedef bool (*ggml_backend_opencl_cycle_upload_batch_t)(
+        struct ggml_tensor * const * tensors,
+        const void * const * payloads,
+        const size_t * sizes,
+        size_t count,
+        void ** event_out);
+
+typedef bool (*ggml_backend_opencl_cycle_upload_wait_t)(
+        void * event);
+
 typedef bool (*ggml_backend_opencl_set_tensor_async_t)(
         struct ggml_tensor * tensor,
         const void * data,
