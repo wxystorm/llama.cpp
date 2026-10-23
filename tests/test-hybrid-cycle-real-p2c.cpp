@@ -5511,8 +5511,9 @@ static bool cycle_real_execute_period_fifo(
             "phone_queues=MAIN_PRIORITY,C2P_FFN "
             "trigger=BOTH_DEVICE_READY_C2P "
             "reduce=PHONE_LOCAL next=L5_L6_PHONE_FIFO "
-            "p2c=V4_CONTINUATION window=%d\n",
-            run_phase, window);
+            "p2c=%s window=%d\n",
+            run_phase, phone_main_p2c ? "PHONE_MAIN" :
+                "V4_CONTINUATION", window);
     }
     if (phone_full_region_auto) {
         std::printf(
@@ -7396,8 +7397,9 @@ static bool cycle_real_execute_period_fifo(
             "c2p_reduce=PHONE_MAIN_STARTED_BY_TWO_READY "
             "ffn_queue=C2P_ONLY main_priority=1 "
             "region_registered=%" PRIu64 " expected=%d "
-            "p2c=V4_PC_DISPATCH status=%s\n",
+            "p2c=%s status=%s\n",
             run_phase, v4_region_armed, n_chunks,
+            phone_main_p2c ? "PHONE_MAIN" : "V4_PC_DISPATCH",
             succeeded && v4_region_armed == uint64_t(n_chunks) ?
                 "OK" : "FAIL");
     }
@@ -7412,13 +7414,15 @@ static bool cycle_real_execute_period_fifo(
             "[CYCLE_PHONE_V5_P2C_SUM] phase=%s "
             "registered_tokens=%lld ready_done=%llu ffn_done=%llu "
             "expected=%d p2c_committed_kv=%lld window=%d "
+            "ffn_pool_hits=%llu idle_ffn_slots=%zu "
             "status=%s\n",
             run_phase, (long long)v5_p2c_registered_tokens,
             (unsigned long long)v5_p2c_ready_completed,
             (unsigned long long)v5_p2c_ffn_completed,
             n_chunks, (long long)(p2c_kv ?
                 p2c_kv->committed_tokens : -1),
-            window, complete ? "OK" : "FAIL");
+            window, (unsigned long long)p2c_main_hits,
+            p2c_main_idle.size(), complete ? "OK" : "FAIL");
     }
     if (phone_full_region_auto) {
         const auto & l5_kv = kv[size_t(layout.x + 1)];
