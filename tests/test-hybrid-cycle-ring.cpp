@@ -791,7 +791,37 @@ static void test_v5_pc_phone_proxy_main_priority() {
                        llama_hybrid_cycle_stage::REDUCE, 0, 1));
 }
 
+// Trace is observational: one producer per queue, no change to credits
+// or task ordering. Both entry-ready and worker intervals are monotonic.
+static void test_chunk_trace_observational() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {llama_hybrid_cycle_layer_kind::PC_CPU,
+                    llama_hybrid_cycle_layer_kind::PC_CPU};
+    llama_hybrid_cycle_chunk_timeline timeline;
+    std::atomic<int> executed {0};
+    const bool ok = llama_hybrid_cycle_run_fifo(
+        layout, 2, [&](const llama_hybrid_cycle_task & task) {
+            assert(task.stage == llama_hybrid_cycle_stage::FULL_LAYER);
+            ++executed;
+            return true;
+        }, 1, true, nullptr, false, false, false, &timeline);
+    assert(ok && executed.load() == 4);
+    size_t samples = 0;
+    for (const auto & queue : timeline.by_queue) {
+        for (const auto & sample : queue) {
+            assert(sample.success);
+            assert(sample.task.entry_ready_at.time_since_epoch().count() != 0);
+            assert(sample.task.entry_ready_at <= sample.task.queued_at);
+            assert(sample.task.queued_at <= sample.start);
+            assert(sample.start <= sample.finish);
+            ++samples;
+        }
+    }
+    assert(samples == 4);
+}
+
 int main() {
+    test_chunk_trace_observational();
     test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
     test_v5_phone_rx_first();
