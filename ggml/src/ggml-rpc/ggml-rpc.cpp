@@ -10461,6 +10461,8 @@ bool rpc_server::apply_inference_cycle(
     bool uploaded_async = false;
     int64_t transfer_submit_us = 0;
     int64_t transfer_event_wait_us = 0;
+    int64_t transfer_submit_begin_us = 0;
+    int64_t transfer_complete_us = 0;
     const bool async_candidate =
         needs_gpu_gate && cycle_gpu_transfer_enabled() &&
         !cycle_phone_numeric_enabled();
@@ -10528,6 +10530,7 @@ bool rpc_server::apply_inference_cycle(
                     const bool queued = submit(
                         tensors, source, bytes, count, &event);
                     transfer_submit_us = ggml_time_us() - submit_begin_us;
+                    transfer_submit_begin_us = submit_begin_us;
                     if (queued && event) {
                         const int64_t wait_begin_us = ggml_time_us();
                         const bool completed = wait(event); // releases event
@@ -10541,6 +10544,7 @@ bool rpc_server::apply_inference_cycle(
                                 request.layer, request.chunk);
                             return false;
                         }
+                        transfer_complete_us = ggml_time_us();
                         uploaded_async = true;
                     } else if (event) {
                         // Defensive: a backend must not return a live event
@@ -10554,11 +10558,13 @@ bool rpc_server::apply_inference_cycle(
         }
         GGML_LOG_INFO(
             "[CYCLE_GPU_OWNERSHIP] side=PHONE layer=%d chunk=%d kind=%s "
-            "decision=%s reason=%s buffers=%zu\n",
+            "decision=%s reason=%s buffers=%zu "
+            "transfer_submit_begin_us=%" PRId64
+            " transfer_complete_us=%" PRId64 "\n",
             request.layer, request.chunk, ready ? "READY" : "PARTIAL",
             uploaded_async ? "TRANSFER_QUEUE" : "GATED_FALLBACK",
             uploaded_async ? "DISJOINT_ALLOCATIONS" : fallback_reason,
-            count);
+            count, transfer_submit_begin_us, transfer_complete_us);
     }
 
     // Legacy, always-safe path. A successful independent upload has already
@@ -15125,6 +15131,15 @@ struct rpc_cycle_p2c_fifo_v1 {
                 }
             }
             cv.notify_all();
+            if (rpc_server::cycle_gpu_transfer_enabled()) {
+                GGML_LOG_INFO(
+                    "[CYCLE_GPU_STAGE_WINDOW] side=PHONE layer=%d chunk=%d "
+                    "seq=%" PRIu64 " start_us=%" PRId64
+                    " finish_us=%" PRId64 " status=%s\n",
+                    std::get<0>(item.id), std::get<1>(item.id),
+                    std::get<2>(item.id), lock_acquired_us, t3,
+                    ok ? "OK" : "FAIL");
+            }
             GGML_LOG_INFO(
                 "[CYCLE_PHONE_EXECUTOR_V1] side=PHONE event=DONE "
                 "stage=%s layer=%d chunk=%d seq=%" PRIu64
