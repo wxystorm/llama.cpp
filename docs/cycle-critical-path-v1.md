@@ -80,7 +80,8 @@ is an intentional coverage boundary, not a missing event.
    `CYCLE_PATH_TASK` queued/start records and the existing PC_CPU queue profile.
 4. If `CYCLE_PATH_CREDIT` has large blocking spans, inspect the Phone
    and P2C task progression before modifying the window size. The current
-   full-main implementation was validated with windows of 1 and 2 only;
+   full-main implementation allows windows of 1 and 2, while the supplied
+   run logs currently establish window 2;
    do not raise the window to 3 without verifying additional buffer leases.
 5. If Phone `main_admit_to_partial_ms` is small while the overall PC
    Chunk span is large, the bottleneck is outside this local Phone chain.
