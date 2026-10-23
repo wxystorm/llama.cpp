@@ -9173,7 +9173,16 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    const char * cycle_api_env = std::getenv(
+        "LLAMA_HYBRID_CYCLE_STANDARD_DECODE");
+    const bool physical_cycle_context =
+        model->split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        llama_hybrid_cycle_requested() &&
+        cycle_api_env && std::strcmp(cycle_api_env, "1") == 0;
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        !physical_cycle_context) {
+        // Normal Tensor Meta graph requires Flash Attention. This remains
+        // unchanged for all regular llama_context callers.
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -9182,6 +9191,12 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
         }
+    } else if (physical_cycle_context) {
+        // Cycle owns its own Attention Graph and persistent physical K/V,
+        // bypassing the old Meta scheduler entirely.
+        LLAMA_LOG_INFO(
+            "[CYCLE_STANDARD] stage=CONTEXT_PRECHECK "
+            "flash_attention=NOT_REQUIRED reason=PHYSICAL_ATTENTION\n");
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
