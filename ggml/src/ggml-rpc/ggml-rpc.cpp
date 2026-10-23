@@ -2980,7 +2980,8 @@ static bool rpc_cycle_send_phone_region(
         ggml_backend_t backend,
         const ggml_rpc_cycle_phone_region_stage stages[2],
         bool deferred, int32_t c2p_layer, uint64_t c2p_seq,
-        uint64_t c2p_graph_id) {
+        uint64_t c2p_graph_id,
+        const ggml_rpc_cycle_phone_p2c_plan * p2c = nullptr) {
     if (!ggml_backend_is_rpc(backend) || !stages ||
         stages[0].layer < 0 ||
         stages[1].layer != stages[0].layer + 1 ||
@@ -2990,7 +2991,8 @@ static bool rpc_cycle_send_phone_region(
                       c2p_seq == 0)))
         return false;
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
-    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < (deferred ? 32 : 31)) {
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") <
+            (p2c ? 33 : deferred ? 32 : 31)) {
         GGML_LOG_ERROR(
             "[CYCLE_PHONE_V4] side=PC status=FAIL "
             "reason=PHONE_RPC_PATCH31_OR_32_REQUIRED\n");
@@ -3048,21 +3050,103 @@ static bool rpc_cycle_send_phone_region(
         v5_request.c2p_seq = c2p_seq;
         v5_request.c2p_graph_id = c2p_graph_id;
     }
+    rpc_msg_inference_cycle_v6_region_req v6_request {};
+    if (p2c) {
+        if (!deferred || p2c->layer != stages[1].layer + 1 ||
+            p2c->chunk != stages[0].chunk || p2c->seq == 0 ||
+            p2c->attention_graph_uid == 0 || p2c->ffn_graph_uid == 0 ||
+            !valid_tensor(p2c->input_source, GGML_TYPE_F32) ||
+            !valid_tensor(p2c->attention_input, GGML_TYPE_F32) ||
+            !ggml_are_same_shape(p2c->input_source, p2c->attention_input))
+            return false;
+        auto & dest = v6_request.p2c;
+        v6_request.prefix = v5_request;
+        dest.device = ctx->device;
+        dest.layer = p2c->layer;
+        dest.chunk = p2c->chunk;
+        dest.attention_graph_uid = p2c->attention_graph_uid;
+        dest.input_source = serialize_tensor(p2c->input_source);
+        dest.attention_input = serialize_tensor(p2c->attention_input);
+        const ggml_tensor * residual = p2c->ready_outputs[0];
+        const ggml_tensor * ids = p2c->ready_outputs[2];
+        if (!residual || !ids || residual->ne[0] <= 0 ||
+            residual->ne[1] <= 0 || ids->ne[0] <= 0 ||
+            residual->ne[0] > 65536 || residual->ne[1] > 128)
+            return false;
+        const uint32_t tokens = uint32_t(residual->ne[1]);
+        const uint32_t hidden = uint32_t(residual->ne[0]);
+        if (ggml_nelements(ids) % tokens != 0) return false;
+        const uint32_t topk = uint32_t(ggml_nelements(ids) / tokens);
+        if (!topk || topk > 128) return false;
+        auto & ready = dest.ready;
+        ready.device = ctx->device;
+        ready.kind = INFERENCE_CYCLE_READY;
+        ready.layer = p2c->layer;
+        ready.chunk = p2c->chunk;
+        ready.seq = p2c->seq;
+        ready.graph_id = p2c->graph_id;
+        ready.tokens = tokens;
+        ready.hidden = hidden;
+        ready.topk = topk;
+        for (int i = 0; i < 4; ++i) {
+            const auto type = i == 2 ? GGML_TYPE_I32 : GGML_TYPE_F32;
+            const ggml_tensor * src = p2c->ready_outputs[i];
+            const uint64_t count = uint64_t(tokens) *
+                (i >= 2 ? topk : hidden);
+            if (!valid_tensor(src, type) ||
+                uint64_t(ggml_nelements(src)) != count)
+                return false;
+            ready.tensors[i] = serialize_tensor(src);
+        }
+        auto & ffn = dest.ffn;
+        ffn.ffn_graph_uid = p2c->ffn_graph_uid;
+        ffn.partial.device = ctx->device;
+        ffn.partial.kind = INFERENCE_CYCLE_PARTIAL;
+        ffn.partial.layer = p2c->layer;
+        ffn.partial.chunk = p2c->chunk;
+        ffn.partial.seq = p2c->seq;
+        ffn.partial.graph_id = p2c->graph_id;
+        ffn.partial.tokens = tokens;
+        ffn.partial.hidden = hidden;
+        if (!valid_tensor(p2c->ffn_partial, GGML_TYPE_F32) ||
+            uint64_t(ggml_nelements(p2c->ffn_partial)) !=
+                uint64_t(tokens) * hidden)
+            return false;
+        ffn.partial.tensors[0] = serialize_tensor(p2c->ffn_partial);
+        for (int i = 0; i < 3; ++i) {
+            const int r = i + 1;
+            const auto type = r == 2 ? GGML_TYPE_I32 : GGML_TYPE_F32;
+            const ggml_tensor * src = p2c->ready_outputs[r];
+            const ggml_tensor * dst = p2c->ffn_inputs[i];
+            if (!valid_tensor(dst, type) ||
+                !ggml_are_same_shape(src, dst) ||
+                ggml_nbytes(src) != ggml_nbytes(dst))
+                return false;
+            ffn.ready_inputs[i] = serialize_tensor(src);
+            ffn.ffn_inputs[i] = serialize_tensor(dst);
+        }
+    }
     rpc_msg_inference_cycle_send_rsp response {};
     const int64_t started = ggml_time_us();
-    const bool ok = send_rpc_cmd(
-        sock, deferred ? RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER :
-                         RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM,
+    const rpc_cmd command = p2c ?
+        RPC_CMD_INFERENCE_CYCLE_V6_REGION_REGISTER :
+        deferred ? RPC_CMD_INFERENCE_CYCLE_V5_REGION_REGISTER :
+                   RPC_CMD_INFERENCE_CYCLE_PHONE_REGION_ARM;
+    const void * payload = p2c ?
+        static_cast<const void *>(&v6_request) :
         deferred ? static_cast<const void *>(&v5_request) :
-                   static_cast<const void *>(&request),
-        deferred ? sizeof(v5_request) : sizeof(request),
-        &response, sizeof(response)) &&
-        response.result == 1;
+                   static_cast<const void *>(&request);
+    const size_t payload_size = p2c ? sizeof(v6_request) :
+        deferred ? sizeof(v5_request) : sizeof(request);
+    const bool ok = send_rpc_cmd(
+        sock, command, payload, payload_size,
+        &response, sizeof(response)) && response.result == 1;
     GGML_LOG_INFO(
         "[CYCLE_PHONE_REGION] side=PC event=%s "
         "first_layer=%d next_layer=%d chunk=%d seq=%" PRIu64
         " ack_ms=%.3f status=%s\n",
-        deferred ? "REGISTER_DEFERRED" : "ARM_REGION",
+        p2c ? "REGISTER_DEFERRED_P2C" :
+              deferred ? "REGISTER_DEFERRED" : "ARM_REGION",
         stages[0].layer, stages[1].layer, stages[0].chunk,
         stages[0].seq, (ggml_time_us() - started) / 1000.0,
         ok ? "OK" : "FAIL");
@@ -3083,6 +3167,46 @@ bool ggml_backend_rpc_cycle_register_phone_region_after_c2p(
         int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id) {
     return rpc_cycle_send_phone_region(
         backend, stages, true, c2p_layer, c2p_seq, c2p_graph_id);
+}
+
+bool ggml_backend_rpc_cycle_register_phone_region_p2c(
+        ggml_backend_t backend,
+        const ggml_rpc_cycle_phone_region_stage stages[2],
+        int32_t c2p_layer, uint64_t c2p_seq, uint64_t c2p_graph_id,
+        const ggml_rpc_cycle_phone_p2c_plan * p2c) {
+    if (!p2c) return false;
+    return rpc_cycle_send_phone_region(
+        backend, stages, true, c2p_layer, c2p_seq, c2p_graph_id, p2c);
+}
+
+bool ggml_backend_rpc_cycle_wait_phone_p2c_ready(
+        ggml_backend_t backend, int32_t layer, int32_t chunk,
+        uint64_t seq, uint64_t graph_id) {
+    if (!ggml_backend_is_rpc(backend) || layer < 0 || chunk < 0 ||
+        seq == 0) return false;
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx || rpc_get_remote_patch(ctx->endpoint + "_compute") < 33)
+        return false;
+    const auto sock = get_socket(ctx->endpoint);
+    if (!sock) return false;
+    rpc_msg_inference_cycle_p2c_wait_req req {};
+    req.layer = layer;
+    req.chunk = chunk;
+    req.seq = seq;
+    req.graph_id = graph_id;
+    rpc_msg_inference_cycle_send_rsp response {};
+    const int64_t begin = ggml_time_us();
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_INFERENCE_CYCLE_V6_P2C_READY_WAIT,
+        &req, sizeof(req), &response, sizeof(response)) &&
+        response.result == 1;
+    GGML_LOG_INFO("[CYCLE_PHONE_V5_P2C] side=PC event=READY_STAGED "
+                 "layer=%d chunk=%d seq=%" PRIu64
+                 " wait_ms=%.3f status=%s\n",
+                 layer, chunk, seq,
+                 (ggml_time_us() - begin) / 1000.0,
+                 ok ? "OK" : "FAIL");
+    return ok;
 }
 
 bool ggml_backend_rpc_cycle_arm_c2p_local(
