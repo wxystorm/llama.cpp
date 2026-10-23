@@ -80,11 +80,46 @@ struct llama_hybrid_cycle_layout {
     // Opt-in real Cycle policy: execute an entire PC full layer on PC CUDA.
     // Physical Meta placement and both tensor boundaries are unchanged.
     bool pc_cuda_full = false;
+    // When nonempty, select CUDA FULL_LAYER execution PER PHYSICAL LAYER.
+    // The legacy pc_cuda_full flag is used only when this map is empty.
+    // Tensor/Phone layers cannot be selected for a CUDA weight mirror.
+    std::vector<uint8_t> pc_cuda_layers;
     std::vector<llama_hybrid_cycle_layer_kind> kinds;
 
     bool enabled() const { return !kinds.empty(); }
     int remainder() const { return int(kinds.size()) - tail_begin; }
 };
+
+inline bool llama_hybrid_cycle_cuda_layers_valid(
+        const llama_hybrid_cycle_layout & layout) {
+    if (layout.pc_cuda_layers.empty()) return true;
+    if (layout.pc_cuda_layers.size() != layout.kinds.size()) return false;
+    for (size_t i = 0; i < layout.pc_cuda_layers.size(); ++i) {
+        if (layout.pc_cuda_layers[i] > 1 ||
+            (layout.pc_cuda_layers[i] &&
+             layout.kinds[i] != llama_hybrid_cycle_layer_kind::PC_CPU)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool llama_hybrid_cycle_full_layer_on_cuda(
+        const llama_hybrid_cycle_layout & layout, int physical_layer) {
+    if (physical_layer < 0 ||
+        static_cast<size_t>(physical_layer) >= layout.kinds.size()) {
+        return false;
+    }
+    const auto kind = layout.kinds[static_cast<size_t>(physical_layer)];
+    if (kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL) return true;
+    if (kind != llama_hybrid_cycle_layer_kind::PC_CPU) return false;
+    if (!layout.pc_cuda_layers.empty()) {
+        return static_cast<size_t>(physical_layer) <
+                   layout.pc_cuda_layers.size() &&
+               layout.pc_cuda_layers[static_cast<size_t>(physical_layer)] == 1;
+    }
+    return layout.pc_cuda_full;
+}
 
 inline llama_hybrid_cycle_layout llama_hybrid_build_cycle_layout(int n_layers, int x, int y) {
     const int64_t period = int64_t(x) + y + 2;

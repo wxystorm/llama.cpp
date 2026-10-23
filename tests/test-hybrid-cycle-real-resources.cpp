@@ -1,0 +1,240 @@
+// Opt-in REAL 48-layer resource preflight, not a full-model forward pass.
+// Loads ONLY the physical PC/Phone Cycle model: no 30B CPU oracle, no
+// additional RPC connection, no generated logits, no llama_decode().
+//
+// Usage (PowerShell, after setting the Cycle X/Y placement variables):
+//   test-hybrid-cycle-real-resources.exe <model.gguf> <phone:rpc-port>
+//                                        [kv_tokens=64] [cuda_budget_mib=0]
+//
+// CUDA budget=0 is intentional: all PC full layers fall back to CPU.
+// Larger budgets mirror only as many PC full layers as fit after reserving
+// 512 MiB CUDA headroom. The effective per-physical-layer layout is printed.
+#include "llama.h"
+#include "llama-model.h"
+#include "llama-hybrid-cycle-resources.h"
+#include "llama-hybrid-cycle-execution-session.h"
+
+#include "ggml-backend.h"
+#include "ggml-rpc.h"
+
+#include <cerrno>
+#include <cinttypes>
+#include <cstdio>
+#include <exception>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <string>
+
+static bool cycle_resource_parse_uint(
+        const char * str, uint64_t maximum, uint64_t & value) {
+    if (!str || !*str || *str == '-') return false;
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(str, &end, 10);
+    if (errno || end == str || !end || *end != '\0' ||
+        parsed > maximum) {
+        return false;
+    }
+    value = uint64_t(parsed);
+    return true;
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 3 || argc > 5 || !llama_hybrid_cycle_requested()) {
+        std::fprintf(stderr,
+            "Usage: test-hybrid-cycle-real-resources <model.gguf> "
+            "<phone:rpc-port> [kv_tokens=64] [cuda_budget_mib=0]\n"
+            "Set LLAMA_HYBRID_CYCLE_PC_LAYERS=4 and "
+            "LLAMA_HYBRID_CYCLE_PHONE_LAYERS=2 before loading.\n");
+        return 2;
+    }
+    uint64_t kv_tokens = 64, budget_mib = 0;
+    if ((argc >= 4 &&
+         !cycle_resource_parse_uint(argv[3], 128, kv_tokens)) ||
+        (argc >= 5 &&
+         !cycle_resource_parse_uint(argv[4], 16384, budget_mib)) ||
+        kv_tokens == 0 || kv_tokens > 128) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=BAD_KV_TOKENS_OR_CUDA_BUDGET\n");
+        return 2;
+    }
+
+    llama_backend_init();
+    const auto cpu_dev =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL reason=NO_CPU_DEVICE\n");
+        return 1;
+    }
+    ggml_backend_dev_t cuda_dev = nullptr;
+    if (budget_mib > 0) {
+        cuda_dev = ggml_backend_dev_by_name("CUDA0");
+        if (!cuda_dev) {
+            ggml_backend_load_all();
+            cuda_dev = ggml_backend_dev_by_name("CUDA0");
+        }
+        if (!cuda_dev ||
+            ggml_backend_dev_type(cuda_dev) !=
+                GGML_BACKEND_DEVICE_TYPE_GPU) {
+            std::fprintf(stderr,
+                "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+                "reason=CUDA_BUDGET_REQUIRES_CUDA0\n");
+            return 1;
+        }
+    }
+    const auto rpc_reg = ggml_backend_rpc_add_server(argv[2]);
+    if (!rpc_reg || ggml_backend_reg_dev_count(rpc_reg) != 1) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL reason=RPC_DEVICE_COUNT\n");
+        return 1;
+    }
+    const auto phone_dev = ggml_backend_reg_dev_get(rpc_reg, 0);
+    if (!phone_dev ||
+        ggml_backend_dev_type(phone_dev) !=
+            GGML_BACKEND_DEVICE_TYPE_GPU) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=PHONE_GPU_UNAVAILABLE\n");
+        return 1;
+    }
+    ggml_backend_dev_t devices[] = {cpu_dev, phone_dev, nullptr};
+    llama_model_params mp = llama_model_default_params();
+    mp.devices = devices;
+    mp.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    mp.hybrid_auto = false;
+    mp.use_extra_bufts = false; // Avoid a second, CPU_REPACK model.
+    std::printf("[CYCLE_FULL_RESOURCE_PROBE] phase=MODEL_LOAD "
+                "split_mode=TENSOR hybrid_auto=0 status=BEGIN\n");
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+        llama_model_load_from_file(argv[1], mp), &llama_model_free);
+    if (!model) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=PHYSICAL_MODEL_LOAD_FAILED\n");
+        return 1;
+    }
+    const int n_layers = llama_model_n_layer(model.get());
+    llama_hybrid_cycle_layout layout;
+    try {
+        if (!llama_hybrid_cycle_layout_from_env(n_layers, layout) ||
+            n_layers != 48 || layout.cycle_size != 8 ||
+            layout.cycles != 6 || layout.x != 4 || layout.y != 2) {
+            std::fprintf(stderr,
+                "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+                "reason=EXPECTED_QWEN3_48_LAYER_X4_Y2 "
+                "model_layers=%d\n", n_layers);
+            return 1;
+        }
+    } catch (const std::exception & error) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=BAD_CYCLE_PLACEMENT detail=%s\n", error.what());
+        return 1;
+    }
+
+    const auto cpu = ggml_backend_dev_init(cpu_dev, nullptr);
+    const auto phone = ggml_backend_dev_init(phone_dev, nullptr);
+    const auto cuda = cuda_dev ?
+        ggml_backend_dev_init(cuda_dev, nullptr) : nullptr;
+    if (!cpu || !phone || (budget_mib > 0 && !cuda)) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=BACKEND_INITIALIZATION\n");
+        if (cuda) ggml_backend_free(cuda);
+        if (phone) ggml_backend_free(phone);
+        if (cpu) ggml_backend_free(cpu);
+        return 1;
+    }
+
+    bool ok = false;
+    {
+        llama_hybrid_cycle_physical_resource_pool resource_pool;
+        llama_hybrid_cycle_resource_config config;
+        config.kv_tokens = int64_t(kv_tokens);
+        config.max_inflight = 2;
+        config.cuda_weight_budget_bytes =
+            size_t(budget_mib) * 1024 * 1024;
+        config.cuda_safety_reserve_bytes = 512ULL * 1024 * 1024;
+        config.attention_graph_cache = true;
+        config.attention_scratch_pool = true;
+        std::string error;
+        ok = resource_pool.prepare(
+            *model, layout, cpu, phone, cuda, config, error);
+        if (!ok) {
+            std::fprintf(stderr,
+                "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+                "phase=PREPARE reason=%s\n", error.c_str());
+        } else {
+            const auto & selected = resource_pool.execution_layout();
+            ok = selected.pc_cuda_layers.size() == size_t(n_layers) &&
+                resource_pool.prepared_layers() == n_layers;
+            for (int l = 0; l < n_layers && ok; ++l) {
+                const auto * item = resource_pool.layer(l);
+                const bool mirrored =
+                    selected.pc_cuda_layers[size_t(l)] != 0;
+                ok = item && item->physical_layer == l &&
+                    item->kv && item->kv->buffer &&
+                    item->kv->keys && item->kv->values &&
+                    item->kv->max_tokens == int64_t(kv_tokens) &&
+                    item->kv->committed_tokens == 0 &&
+                    item->graph_cache && item->scratch_pool &&
+                    (item->cuda_weights != nullptr) == mirrored &&
+                    item->attn_backend ==
+                        (selected.kinds[size_t(l)] ==
+                            llama_hybrid_cycle_layer_kind::PHONE_GPU ||
+                         selected.kinds[size_t(l)] ==
+                            llama_hybrid_cycle_layer_kind::TENSOR_P2C ?
+                         phone :
+                         mirrored ? cuda : cpu);
+                if (ok) {
+                    std::printf(
+                        "[CYCLE_FULL_RESOURCE_LAYER] physical=%d kind=%s "
+                        "attn=%s kv_tokens=%" PRId64
+                        " cuda_weight_mirror=%d graph_cache=1 scratch_pool=1 "
+                        "status=READY\n",
+                        l,
+                        llama_hybrid_cycle_kind_name(
+                            selected.kinds[size_t(l)]),
+                        ggml_backend_name(item->attn_backend),
+                        item->kv->max_tokens, mirrored ? 1 : 0);
+                } else {
+                    std::fprintf(stderr,
+                        "[CYCLE_FULL_RESOURCE_LAYER] physical=%d "
+                        "status=FAIL reason=RESOURCE_OR_BACKEND_MISMATCH\n",
+                        l);
+                }
+            }
+            if (ok) {
+                // State descriptors are independent of graph/KV ownership.
+                // The same 48-layer layout feeds the ONE global task ring.
+                llama_hybrid_cycle_execution_session_config desc;
+                desc.layout = selected;
+                desc.physical_layer_count = n_layers;
+                desc.tokens = int64_t(kv_tokens);
+                desc.chunk_tokens = 16;
+                llama_hybrid_cycle_execution_session<> session(desc);
+                for (int l = 0; l < n_layers && ok; ++l) {
+                    ok = session.borrow_kv(
+                        l, resource_pool.layer(l)->kv.get());
+                }
+                ok = ok && session.layer_count() == n_layers &&
+                    session.at(7, 0).tokens == session.at(8, 0).tokens &&
+                    session.at(7, 0).start == session.at(8, 0).start;
+            }
+        }
+        // All resources are freed BEFORE model/Backends go away.
+        // No GPU/RPC task was ever submitted by this resource-only test.
+        resource_pool.clear();
+    }
+    model.reset();
+    if (cuda) ggml_backend_free(cuda);
+    ggml_backend_free(phone);
+    ggml_backend_free(cpu);
+    std::printf("[CYCLE_FULL_RESOURCE_PROBE] layers=%d "
+                "actual_forward=NOT_RUN logits=NOT_RUN "
+                "status=%s\n", n_layers, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}

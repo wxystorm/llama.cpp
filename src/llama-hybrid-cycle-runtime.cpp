@@ -270,7 +270,7 @@ bool cycle_runtime_task_route_matches(
     const auto kind = layout.kinds[static_cast<size_t>(task.layer)];
     auto expected_owner = llama_hybrid_cycle_attn_owner(kind);
     if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
-        kind == llama_hybrid_cycle_layer_kind::PC_CPU && layout.pc_cuda_full) {
+        llama_hybrid_cycle_full_layer_on_cuda(layout, task.layer)) {
         expected_owner = llama_hybrid_cycle_owner::PC_CUDA;
     } else if (task.stage == llama_hybrid_cycle_stage::FFN_DESTINATION ||
                task.stage == llama_hybrid_cycle_stage::REDUCE) {
@@ -291,8 +291,8 @@ bool cycle_runtime_task_route_matches(
 llama_hybrid_cycle_stage_dispatcher::llama_hybrid_cycle_stage_dispatcher(
         const llama_hybrid_cycle_layout & physical_layout)
     : layout_(physical_layout), handlers_(physical_layout.kinds.size()) {
-    if (!layout_.enabled()) {
-        throw std::invalid_argument("cycle Stage dispatcher needs physical layers");
+    if (!layout_.enabled() || !llama_hybrid_cycle_cuda_layers_valid(layout_)) {
+        throw std::invalid_argument("cycle Stage dispatcher needs valid physical layers and CUDA selection");
     }
 }
 
@@ -343,7 +343,8 @@ bool llama_hybrid_cycle_stage_dispatcher::matches(
     return layout_.kinds == other.kinds && layout_.x == other.x &&
            layout_.y == other.y && layout_.cycle_size == other.cycle_size &&
            layout_.cycles == other.cycles && layout_.tail_begin == other.tail_begin &&
-           layout_.pc_cuda_full == other.pc_cuda_full;
+           layout_.pc_cuda_full == other.pc_cuda_full &&
+           layout_.pc_cuda_layers == other.pc_cuda_layers;
 }
 
 bool llama_hybrid_cycle_stage_dispatcher::execute(
@@ -359,7 +360,9 @@ bool llama_hybrid_cycle_stage_dispatcher::execute(
 llama_hybrid_cycle_runtime::llama_hybrid_cycle_runtime(
         llama_hybrid_cycle_runtime_config config)
     : config_(std::move(config)) {
-    if (!config_.layout.enabled() || config_.n_chunks <= 0 ||
+    if (!config_.layout.enabled() ||
+        !llama_hybrid_cycle_cuda_layers_valid(config_.layout) ||
+        config_.n_chunks <= 0 ||
         config_.max_inflight < 0 ||
         config_.max_inflight > config_.n_chunks) {
         throw std::invalid_argument(

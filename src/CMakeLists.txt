@@ -28,6 +28,7 @@ add_library(llama
             llama-hybrid-cycle-p2c-ffn.cpp
             llama-hybrid-cycle-ffn-shard.cpp
             llama-hybrid-cycle-execution-session.cpp
+            llama-hybrid-cycle-resources.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp

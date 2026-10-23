@@ -105,8 +105,9 @@ public:
           ordered_c2p_reduce_(ordered_c2p_reduce),
           phone_main_priority_(phone_main_priority),
           trace_entry_gate_(trace_entry_gate) {
-        if (!layout_.enabled() || n_chunks_ <= 0 ||
-            max_inflight_ <= 0 || max_inflight_ > n_chunks_) {
+        if (!layout_.enabled() || !llama_hybrid_cycle_cuda_layers_valid(layout_) ||
+            n_chunks_ <= 0 || max_inflight_ <= 0 ||
+            max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
                 "cycle task ring requires positive chunks and valid in-flight window");
         }
@@ -324,8 +325,7 @@ private:
 
         switch (stage) {
             case llama_hybrid_cycle_stage::FULL_LAYER:
-                if (layout_.pc_cuda_full &&
-                    kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
+                if (llama_hybrid_cycle_full_layer_on_cuda(layout_, layer)) {
                     task.owner = llama_hybrid_cycle_owner::PC_CUDA;
                     task.queue = llama_hybrid_cycle_queue::PC_CUDA;
                 }

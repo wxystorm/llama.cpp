@@ -360,6 +360,14 @@ if (TARGET ggml-rpc)
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
     target_link_libraries(test-hybrid-cycle-real-c2p PRIVATE ggml-rpc)
 
+    # Physical 48-layer resource preflight. Loads the REAL placement model
+    # and initializes all physical K/V, per-layer graph metadata and scratch
+    # owners. Never run by automatic CTest: needs a Phone RPC endpoint.
+    llama_build(test-hybrid-cycle-real-resources.cpp)
+    target_include_directories(test-hybrid-cycle-real-resources PRIVATE
+        ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-hybrid-cycle-real-resources PRIVATE ggml-rpc)
+
     # First complete physical Cycle period. Exercises the EXISTING five
     # backend FIFO queues with the actual PC full layers, C2P split,
     # Phone full layers and final P2C split. Hardware/model required;

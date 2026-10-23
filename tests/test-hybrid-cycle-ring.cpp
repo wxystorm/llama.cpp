@@ -2,7 +2,9 @@
 #include "llama-hybrid-cycle-phone-local.h"
 #include "llama-hybrid-cycle-runtime.h"
 #include "llama-hybrid-cycle-execution-session.h"
+#include "llama-hybrid-cycle-resources.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <atomic>
@@ -1335,7 +1337,126 @@ static void test_cycle_48_layer_cross_period_handoff() {
     }
 }
 
+// Unlike the original 8-layer experiment, a 48-layer physical model must
+// not unconditionally mirror all 24 PC full layers into CUDA. The global
+// FIFO and Stage owner routing must honor the per-layer residency mask.
+static void test_cycle_48_selective_cuda_full_layers() {
+    llama_hybrid_cycle_runtime_config cfg;
+    cfg.layout = llama_hybrid_build_cycle_layout(48, 4, 2);
+    cfg.layout.pc_cuda_full = true; // Legacy flag overridden by explicit map.
+    cfg.layout.pc_cuda_layers.assign(48, 0);
+    for (const int layer : {0, 8, 24}) {
+        cfg.layout.pc_cuda_layers[size_t(layer)] = 1;
+    }
+    cfg.n_chunks = 4;
+    cfg.max_inflight = 2;
+    cfg.credit_until_handoff = true;
+    assert(llama_hybrid_cycle_cuda_layers_valid(cfg.layout));
+    llama_hybrid_cycle_runtime runtime(cfg);
+    llama_hybrid_cycle_stage_dispatcher stages(cfg.layout);
+    std::atomic<int> pc_cpu_tasks {0};
+    std::atomic<int> pc_cuda_tasks {0};
+    std::atomic<int> phone_tasks {0};
+    const auto execute = [&](const llama_hybrid_cycle_task & task) {
+        if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+            cfg.layout.kinds[size_t(task.layer)] ==
+                llama_hybrid_cycle_layer_kind::PC_CPU) {
+            if (cfg.layout.pc_cuda_layers[size_t(task.layer)] == 1) {
+                assert(task.queue == llama_hybrid_cycle_queue::PC_CUDA);
+                assert(task.owner == llama_hybrid_cycle_owner::PC_CUDA);
+                ++pc_cuda_tasks;
+            } else {
+                assert(task.queue == llama_hybrid_cycle_queue::PC_CPU);
+                assert(task.owner == llama_hybrid_cycle_owner::PC_CPU);
+                ++pc_cpu_tasks;
+            }
+        } else {
+            ++phone_tasks;
+        }
+        return true;
+    };
+    for (int layer = 0; layer < 48; ++layer) {
+        const auto kind = cfg.layout.kinds[size_t(layer)];
+        if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P ||
+            kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
+            for (const auto stage : {
+                    llama_hybrid_cycle_stage::ATTN_PRE,
+                    llama_hybrid_cycle_stage::SEND_ACTIVATION,
+                    llama_hybrid_cycle_stage::FFN_SOURCE,
+                    llama_hybrid_cycle_stage::FFN_DESTINATION,
+                    llama_hybrid_cycle_stage::SEND_PARTIAL,
+                    llama_hybrid_cycle_stage::REDUCE}) {
+                assert(stages.bind(layer, stage, execute));
+            }
+        } else {
+            assert(stages.bind(layer, llama_hybrid_cycle_stage::FULL_LAYER,
+                               execute));
+        }
+    }
+    assert(runtime.run(stages));
+    assert(pc_cuda_tasks.load() == 3 * 4);
+    assert(pc_cpu_tasks.load() == (24 - 3) * 4);
+
+    // Missing/invalid mask can never schedule a task on an unprepared GPU.
+    cfg.layout.pc_cuda_layers[4] = 1; // C2P is not a PC full layer.
+    assert(!llama_hybrid_cycle_cuda_layers_valid(cfg.layout));
+    cfg.layout.pc_cuda_layers[4] = 0;
+    cfg.layout.pc_cuda_layers.pop_back();
+    assert(!llama_hybrid_cycle_cuda_layers_valid(cfg.layout));
+    assert(!llama_hybrid_cycle_full_layer_on_cuda(cfg.layout, 47));
+}
+
+// The real resource pool uses this pure policy before touching CUDA.
+// 24 PC FULL layers must never default to 24 CUDA weight mirrors.
+static void test_cycle_48_cuda_budget_selection() {
+    auto layout = llama_hybrid_build_cycle_layout(48, 4, 2);
+    layout.pc_cuda_full = true;
+    std::vector<size_t> estimates(48, 0);
+    for (int l = 0; l < 48; ++l) {
+        if (layout.kinds[size_t(l)] ==
+            llama_hybrid_cycle_layer_kind::PC_CPU) {
+            estimates[size_t(l)] = 100;
+        }
+    }
+    std::vector<uint8_t> selected;
+    size_t bytes = 999;
+    std::string reason;
+    assert(llama_hybrid_cycle_select_cuda_full_layers(
+        layout, estimates, 0, selected, bytes, reason));
+    assert(bytes == 0);
+    assert(std::count(selected.begin(), selected.end(), uint8_t(1)) == 0);
+    layout.pc_cuda_layers = selected;
+    assert(!llama_hybrid_cycle_full_layer_on_cuda(layout, 0));
+
+    layout.pc_cuda_layers.clear();
+    assert(llama_hybrid_cycle_select_cuda_full_layers(
+        layout, estimates, 350, selected, bytes, reason));
+    assert(bytes == 300);
+    assert(std::count(selected.begin(), selected.end(), uint8_t(1)) == 3);
+    assert(selected[0] && selected[1] && selected[2] &&
+           !selected[3] && !selected[4] && !selected[8]);
+
+    // A Planner's explicit physical-layer selection is a hard contract:
+    // it must not be silently weakened on memory shortfall.
+    layout.pc_cuda_layers.assign(48, 0);
+    layout.pc_cuda_layers[8] = 1;
+    layout.pc_cuda_layers[16] = 1;
+    assert(!llama_hybrid_cycle_select_cuda_full_layers(
+        layout, estimates, 150, selected, bytes, reason));
+    assert(reason.find("CUDA_MIRROR_BUDGET_EXCEEDED") != std::string::npos);
+    assert(llama_hybrid_cycle_select_cuda_full_layers(
+        layout, estimates, 200, selected, bytes, reason));
+    assert(bytes == 200 && selected[8] == 1 && selected[16] == 1);
+    assert(selected[0] == 0);
+    layout.pc_cuda_layers[7] = 1;
+    assert(!llama_hybrid_cycle_select_cuda_full_layers(
+        layout, estimates, 2000, selected, bytes, reason));
+    assert(reason == "INVALID_LAYOUT_OR_ESTIMATE_VECTOR");
+}
+
 int main() {
+    test_cycle_48_cuda_budget_selection();
+    test_cycle_48_selective_cuda_full_layers();
     test_cycle_48_layer_cross_period_handoff();
     test_cycle_execution_session_8_and_48();
     test_cycle_runtime_physical_route_guard();
