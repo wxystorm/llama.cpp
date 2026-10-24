@@ -10501,13 +10501,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             ggml_tensor * pc_out_chunk =
                 get_node_aux(pc_partial);
-            pc_out_chunk->view_src = pc_l_out;
-            pc_out_chunk->view_offs = chunk_offset;
             pc_out_chunk->op = GGML_OP_ADD;
             pc_out_chunk->src[0] = pc_partial;
             pc_out_chunk->src[1] = pc_tmp;
             pc_out_chunk->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            ggml_backend_view_init(pc_out_chunk);
+            if (region_window2) {
+                bind_region_boundary_output_chunk(
+                    pc_out_chunk,
+                    j_dst,
+                    ggml_nbytes(pc_l_out),
+                    chunk_offset);
+            } else {
+                pc_out_chunk->view_src = pc_l_out;
+                pc_out_chunk->view_offs = chunk_offset;
+                ggml_backend_view_init(pc_out_chunk);
+            }
             GGML_ASSERT(
                 chunk_offset + ggml_nbytes(pc_out_chunk) <=
                 ggml_nbytes(pc_l_out));
@@ -10802,6 +10810,50 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 "BOUNDARY_DRAIN");
                         if (status != GGML_STATUS_SUCCESS) {
                             return status;
+                        }
+
+                        ggml_tensor * staged_l_out =
+                            get_node_aux(pc_l_out);
+                        bind_region_boundary_output_full(
+                            staged_l_out,
+                            j_dst,
+                            ggml_nbytes(pc_l_out));
+
+                        const int64_t commit_begin_us =
+                            ggml_time_us();
+                        ggml_backend_tensor_copy_async(
+                            pc_cfg.backend,
+                            pc_cfg.backend,
+                            staged_l_out,
+                            pc_l_out);
+                        ggml_backend_synchronize(
+                            pc_cfg.backend);
+                        const int64_t commit_us =
+                            ggml_time_us() - commit_begin_us;
+
+                        if (c2p_self_check &&
+                                staged_l_out->type == GGML_TYPE_F32 &&
+                                pc_l_out->type == GGML_TYPE_F32) {
+                            directional_wire_parity(
+                                "P2C",
+                                prefill_down_layer_0,
+                                -1,
+                                "BOUNDARY_OUTPUT_COMMIT",
+                                j_dst,
+                                j_dst,
+                                staged_l_out,
+                                pc_l_out);
+                        }
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[REGION_BOUNDARY_OUTPUT_COMMIT] "
+                                "direction=P2C layer=%d "
+                                "bytes=%zu commit_ms=%.3f "
+                                "owner=PC status=OK\n",
+                                prefill_down_layer_0,
+                                ggml_nbytes(pc_l_out),
+                                commit_us / 1000.0);
                         }
                     }
 
