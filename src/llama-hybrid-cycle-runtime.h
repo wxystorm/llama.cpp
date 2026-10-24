@@ -19,8 +19,8 @@ struct llama_model;
 struct llama_hybrid_cycle_runtime_config {
     llama_hybrid_cycle_layout layout;
     int n_chunks = 0;
-    int max_inflight = 0;            // 0 = n_chunks (legacy unbounded window)
-    bool credit_until_handoff = true;
+    int max_inflight = 0;            // 0 = no admission window; ready chunks enqueue immediately
+    bool credit_until_handoff = false; // device slot ownership survives independently
     bool pc_cpu_reduce_priority = false;
     bool ordered_c2p_reduce = false;
     bool phone_main_priority = false;
