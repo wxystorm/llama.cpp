@@ -23,7 +23,7 @@ class llama_hybrid_cycle_physical_resource_pool;
 // transport. The result is [n_tokens,n_embd] F32 final hidden on the host.
 //
 // Boundaries of THIS API:
-// - Prefill may cover the full <=512-token physical context in one call; <=128/chunk.
+// - Prefill may cover the full <=512-token physical context in one call; <=64/chunk.
 // - K/V belongs to this invocation and is reclaimed after all FIFO joins.
 // - It is not yet a persistent autoregressive decode session. Do not loop
 //   this API for one-token decode and assume it retains the old KV state.
@@ -59,7 +59,7 @@ LLAMA_API bool llama_hybrid_cycle_forward_prefill(
 // Every append is a new global FIFO invocation with absolute position and a
 // distinct wire epoch; all 48 physical KV tensors survive between calls.
 // Physical K/V supports 512 total tokens. Prefill is one global FIFO append
-// with 64-token Chunks by default (up to 128 supported); no KV shifting or
+// with 64-token Chunks; no KV shifting or
 // multi-sequence manager yet.
 class llama_hybrid_cycle_session {
 public:
