@@ -255,9 +255,6 @@ static bool cycle_core_evaluate_with_kv(
                                     return false;
                                 }
                                 auto & st = session.at(layer, chunk);
-                                if (resource->kv->committed_tokens > st.start) {
-                                    return false;
-                                }
 
                                 std::unique_ptr<llama_hybrid_cycle_phone_ffn_slot> slot;
                                 {
