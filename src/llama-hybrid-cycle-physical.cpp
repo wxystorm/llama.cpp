@@ -142,12 +142,23 @@ bool llama_hybrid_cycle_physical_kv_cache::init(ggml_backend_t backend,
               size_t source_device,
               const llama_hybrid_cycle_cuda_full_weights * cuda_weights) {
         release();
+        const auto backend_dev = backend ?
+            ggml_backend_get_device(backend) : nullptr;
+        const bool pc_cuda_lazy_shape =
+            cuda_weights == nullptr && source_device == 0 && backend_dev &&
+            ggml_backend_dev_type(backend_dev) ==
+                GGML_BACKEND_DEVICE_TYPE_GPU;
+        // Lazy PC Full residency has no CUDA weight mirror yet. KV allocation
+        // only needs the logical K-norm/WK dimensions, so do not require a
+        // physical CPU/CUDA weight buffer just to discover the shape.
         const auto * norm = cuda_weights ?
             cuda_weights->tensors[llama_hybrid_cycle_cuda_full_weights::K_NORM] :
+            pc_cuda_lazy_shape ? layer.attn_k_norm :
             llama_hybrid_cycle_resolve_physical_weight(
                 layer.attn_k_norm, backend, source_device);
         const auto * wk = cuda_weights ?
             cuda_weights->tensors[llama_hybrid_cycle_cuda_full_weights::WK] :
+            pc_cuda_lazy_shape ? layer.wk :
             llama_hybrid_cycle_resolve_physical_weight(
                 layer.wk, backend, source_device);
         if (!backend || !norm || !wk ||
