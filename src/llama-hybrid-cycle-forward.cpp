@@ -575,12 +575,47 @@ static bool cycle_core_evaluate_with_kv(
                                                             "PHONE_GPU_FULL", "FFN_OUTPUT");
                                                     };
                                                 }
+                                                // Attention completion is the exact last
+                                                // read of predecessor l_out. Return that
+                                                // physical slot FIRST, then release the
+                                                // Ring credit so another worker cannot
+                                                // race ahead and allocate a replacement.
+                                                const std::function<bool()> input_consumed =
+                                                    [&]() -> bool {
+                                                        auto previous =
+                                                            session.retire_phone_output_after_handoff(
+                                                                l - 1, l, c);
+                                                        if (!previous) {
+                                                            std::fprintf(stderr,
+                                                                "[CYCLE_PHONE_FULL_HANDOFF] "
+                                                                "layer=%d chunk=%d "
+                                                                "reason=PREDECESSOR_SLOT "
+                                                                "status=FAIL\n", l, c);
+                                                            return false;
+                                                        }
+                                                        if (l - 1 ==
+                                                            region.location.c2p_layer) {
+                                                            std::lock_guard<std::mutex> lock(
+                                                                bank->c2p_mutex);
+                                                            bank->c2p_idle.push_back(
+                                                                std::move(previous));
+                                                            ++c2p_device_handoffs;
+                                                        } else {
+                                                            bank->full_idle_by_layer[
+                                                                size_t(l - 1)].push_back(
+                                                                    std::move(previous));
+                                                            ++phone_full_device_handoffs;
+                                                        }
+                                                        return !task.input_consumed ||
+                                                            task.input_consumed();
+                                                    };
                                                 valid = llama_hybrid_cycle_execute_phone_full(
                                                     *model, *r, phone, l, c,
                                                     state.wire.seq,
                                                     state.start, state.tokens,
                                                     predecessor, state.ready,
-                                                    *full_slot, stage_probe);
+                                                    *full_slot, stage_probe,
+                                                    input_consumed);
                                             }
                                             if (valid) {
                                                 state.phone_output = std::move(full_slot);
@@ -590,29 +625,6 @@ static bool cycle_core_evaluate_with_kv(
                                                         state.tokens,
                                                         state.phone_output->output,
                                                         "PHONE_GPU_FULL");
-                                                }
-                                                // The previous physical GPU l_out was
-                                                // read by this Attention and the backend
-                                                // synchronized. This is the ONLY safe
-                                                // ownership transfer point for the slot.
-                                                auto previous =
-                                                    session.retire_phone_output_after_handoff(
-                                                        l - 1, l, c);
-                                                valid = previous != nullptr;
-                                                if (valid) {
-                                                    if (l - 1 ==
-                                                        region.location.c2p_layer) {
-                                                        std::lock_guard<std::mutex> lock(
-                                                            bank->c2p_mutex);
-                                                        bank->c2p_idle.push_back(
-                                                            std::move(previous));
-                                                        ++c2p_device_handoffs;
-                                                    } else {
-                                                        bank->full_idle_by_layer[
-                                                            size_t(l - 1)].push_back(
-                                                                std::move(previous));
-                                                        ++phone_full_device_handoffs;
-                                                    }
                                                 }
                                             }
                                             if (valid) ++real_phone_full_calls;
