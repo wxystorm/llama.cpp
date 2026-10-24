@@ -110,10 +110,10 @@ has not yet been compiled or hardware-verified.
 ## Exact present limitations
 
 Only the 48-layer Qwen3-30B-A3B fixed `X=4,Y=2` layout, one sequence,
-one single-turn **model Chat Template or raw completion** prompt, <=64 tokens per `llama_decode` invocation,
+one single-turn **model Chat Template or raw completion** prompt, <=128 tokens per `llama_decode` invocation,
 <=512 total physical KV, and only final-token Logits are supported.
 
-The direct CLI evaluates the prompt in <=64-token batches and generates
+The direct CLI evaluates the prompt in <=128-token batches and generates
 up to the requested `-n`, provided `prompt_tokens + n_predict - 1 <=
 n_ctx <= 512`. If the request exceeds capacity it **fails explicitly**;
 it does not silently shift, truncate, replay or edit physical KV.
@@ -136,7 +136,7 @@ The former 128-token API and CLI behavior is preserved when using
 `-c 128` or omitting `-c`. To allocate additional persistent physical K/V,
 request `-c 256` or `-c 512` explicitly. The model is still loaded once;
 each new Token appends K/V to its actual absolute position on all 48 layers.
-The existing per-evaluation 64-token and per-Chunk 16-token limits remain.
+The per-evaluation limit is now 128 tokens while the proven per-Chunk 16-token limit remains.
 
 ```powershell
 # Check the existing regression before the extension:
@@ -206,7 +206,7 @@ disabling performance text. When output is piped, color support is
 also terminal-dependent.
 
 The official CLI explicitly sets Prompt phase for *all* Prompt chunks,
-including the final single-token chunk of a 64+1 split. This avoids
+including the final tail chunk of a multi-batch Prompt. This avoids
 incorrectly attributing the one-token tail to Decode. Non-Cycle
 contexts and the normal server-based CLI path are unchanged.
 
@@ -248,12 +248,17 @@ $env:LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB = "1536"
 ```
 
 The selected PC GPU is the first registered **local CUDA backend** (not the
-Phone RPC GPU). The existing resource pool estimates weights for PC Full layers,
-reserves 512 MiB of reported free VRAM, and mirrors **only** layers that fit the
-requested budget. All unselected PC Full layers retain CPU execution. This is
-**not** an automatic Planner, and the model's CPU/Phone physical weight layout
-and 48-layer Cycle pattern do not change. For reproducibility, compare the
-`[CYCLE_FULL_RESOURCE_PLAN]` line and record `cuda_mirror_layers`,
+Phone RPC GPU). The resource pool estimates weights for PC Full layers,
+reserves 512 MiB of reported free VRAM, and mirrors only as many layers as fit
+the requested budget. When no explicit PC-CUDA bitmap is supplied, affordable
+mirrors are selected from evenly spaced strata over the complete repeated
+48-layer Cycle instead of greedily consuming the first physical PC layers.
+All unselected PC Full layers retain CPU execution. This is still a static
+startup placement policy, not a measured-time automatic Planner, and the
+model's CPU/Phone physical weight layout and 48-layer Cycle pattern do not
+change. For reproducibility, record the new `[CYCLE_CUDA_SELECTION]` line
+(`policy`, exact physical `layers`, planned MiB), plus
+`[CYCLE_FULL_RESOURCE_PLAN]` values `cuda_mirror_layers`,
 `cuda_estimated_mib`, and `pc_cpu_fallback`. A nonzero budget with no
 registered CUDA backend fails instead of silently changing the experiment.
 
