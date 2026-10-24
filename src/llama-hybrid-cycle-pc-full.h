@@ -18,8 +18,9 @@ struct llama_model;
 // Attention/Router + MoE FFN + residual ADD for one Chunk and commits this
 // physical layer's K/V prefix. It never submits Phone RPC/Meta graphs.
 //
-// A layer placed on CUDA MUST have a budgeted CUDA mirror in the pool;
-// otherwise it executes on CPU. No implicit full-model CUDA copies.
+// Every ordinary PC Full layer executes on CUDA. Its full-weight mirror may
+// be resident already or populated on demand by the bounded resource-pool
+// LRU. Missing residency is never permission to execute the Full layer on CPU.
 struct llama_hybrid_cycle_pc_full_timing {
     double attention_ms = 0.0;
     double ffn_ms = 0.0;
@@ -47,7 +48,7 @@ template <class PhoneSlot, class P2cSlot>
 bool llama_hybrid_cycle_bind_pc_full_stages(
     llama_hybrid_cycle_stage_dispatcher & stages,
     const llama_model & model,
-    const llama_hybrid_cycle_physical_resource_pool & resources,
+    llama_hybrid_cycle_physical_resource_pool & resources,
     ggml_backend_t pc_cpu,
     llama_hybrid_cycle_execution_session<PhoneSlot, P2cSlot> & session,
     const std::vector<float> & initial_hidden,
@@ -79,10 +80,8 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
             continue;
         }
         const auto * resource = resources.layer(l);
-        if (!resource || !resource->kv ||
-            !resource->attn_backend ||
-            (llama_hybrid_cycle_full_layer_on_cuda(layout, l) !=
-             (resource->cuda_weights != nullptr))) {
+        if (!resource || !resource->kv || !resource->attn_backend ||
+            !llama_hybrid_cycle_full_layer_on_cuda(layout, l)) {
             reason = "PC_FULL_UNPREPARED_LAYER layer=" + std::to_string(l);
             return false;
         }
@@ -125,8 +124,19 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                         l, task.chunk);
                     return false;
                 }
-                if (!llama_hybrid_cycle_execute_pc_full_layer(
-                        model, *resources.layer(l), pc_cpu, l,
+                std::string residency_reason;
+                if (!resources.ensure_pc_full_cuda_resident(
+                        l, residency_reason)) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PC_FULL] layer=%d chunk=%d "
+                        "reason=CUDA_RESIDENCY detail=%s status=FAIL\n",
+                        l, task.chunk, residency_reason.c_str());
+                    return false;
+                }
+                const auto * resident = resources.layer(l);
+                if (!resident || !resident->cuda_weights ||
+                    !llama_hybrid_cycle_execute_pc_full_layer(
+                        model, *resident, pc_cpu, l,
                         chunk.start, chunk.tokens, input,
                         chunk.host_output)) {
                     return false;
