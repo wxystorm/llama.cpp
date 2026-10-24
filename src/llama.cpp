@@ -123,6 +123,11 @@ bool llama_cycle_context_reset(struct llama_context * ctx) {
     return ctx != nullptr && ctx->reset_cycle();
 }
 
+bool llama_cycle_context_set_prompt_phase(
+        struct llama_context * ctx, bool is_prompt) {
+    return ctx != nullptr && ctx->set_cycle_prompt_phase(is_prompt);
+}
+
 int64_t llama_time_us(void) {
     return ggml_time_us();
 }

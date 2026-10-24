@@ -1027,6 +1027,15 @@ extern "C" {
     // Cycle KV is NOT managed by the ordinary llama_memory* APIs.
     LLAMA_API bool llama_cycle_context_reset(struct llama_context * ctx);
 
+    // Experimental Cycle-only performance accounting hint. The normal
+    // llama_decode() API does not distinguish the last one-token Prompt
+    // chunk from an incremental Decode call. Set true before feeding Prompt
+    // chunks and false before generation; normal Contexts return false.
+    // This only affects timing counters (llama_perf_context()), not KV,
+    // Attention, sampling, or execution order.
+    LLAMA_API bool llama_cycle_context_set_prompt_phase(
+        struct llama_context * ctx, bool is_prompt);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

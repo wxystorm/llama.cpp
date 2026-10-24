@@ -109,3 +109,40 @@ session); the existing Attention Scratch Pool, Phone FFN cache and data-plane
 Buffer Ownership remain active. This avoids retaining 16 large, never-reused
 host graph metadata allocations per physical layer. No change is made to
 128-token session reuse behavior.
+
+## Official Prompt / Eval performance and UI
+
+Cycle direct mode now uses the **same** `llama_perf_context()` counters
+and `common_perf_print()` formatter as ordinary llama.cpp. Timed work
+includes token Embedding, the complete synchronous 48-layer five-FIFO,
+exposed PC/Phone RPC waits and output RMSNorm / LM Head. The one-way
+`GRAPH_COMPUTE` socket-submit time is **not** used as eval duration.
+
+With the default `--show-timings`, performance accounting enabled, and
+`--color on` on a compatible terminal, the end of generation shows
+official load / prompt eval / eval / sampling / total time and the same
+purple UI summary as standard llama-cli:
+
+    [ Prompt: 10.0 t/s | Generation: 3.0 t/s ]
+
+These numbers are **examples**, not measured results. Detailed timing
+comes from official `common_perf_print`; the purple line uses the
+upstream `ui::show_info`. The ordinary `graphs reused` field does NOT
+include Cycle's private Attention / FFN graph-cache hit counters.
+
+The last generated token does not need a further decode, so 4 generated
+tokens normally correspond to **3 eval runs**. Generation t/s refers
+to those actual evaluated runs, following llama.cpp's performance
+convention. If no incremental eval has occurred (such as `-n 1`),
+the summary says `Generation: n/a` instead of displaying infinity.
+
+`--no-show-timings` suppresses the timing report and UI summary.
+`--no-perf` disables internal performance tracking, and the Cycle
+CLI respects it. `--color off` disables terminal colors without
+disabling performance text. When output is piped, color support is
+also terminal-dependent.
+
+The official CLI explicitly sets Prompt phase for *all* Prompt chunks,
+including the final single-token chunk of a 64+1 split. This avoids
+incorrectly attributing the one-token tail to Decode. Non-Cycle
+contexts and the normal server-based CLI path are unchanged.

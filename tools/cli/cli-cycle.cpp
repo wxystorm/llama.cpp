@@ -1,7 +1,9 @@
 #include "cli-cycle.h"
 #include "cli-context.h"
+#include "cli-ui.h"
 
 #include "common.h"
+#include "log.h"
 #include "sampling.h"
 #include "llama.h"
 
@@ -51,6 +53,60 @@ static bool cli_cycle_eval(
         start, count, int(want_last_logits), code,
         code == 0 ? "PASS" : "FAIL");
     return code == 0;
+}
+
+// Reuse the official llama.cpp performance structures, formatter, and
+// terminal info style. Unlike ordinary llama-cli's server timing JSON,
+// Cycle obtains the measurements from its local llama_context directly.
+static void cli_cycle_show_timings(
+        const common_params & params, llama_context * ctx,
+        const common_sampler * sampler) {
+    if (!params.show_timings || params.no_perf || !ctx) {
+        return;
+    }
+    const auto perf = llama_perf_context(ctx);
+    const double prompt_tps = perf.t_p_eval_ms > 0.0 ?
+        1e3 * perf.n_p_eval / perf.t_p_eval_ms : 0.0;
+    const bool evaluated_decode = perf.t_eval_ms > 0.0;
+    const double decode_tps = evaluated_decode ?
+        1e3 * perf.n_eval / perf.t_eval_ms : 0.0;
+
+    // common_perf_print uses LOG_INF. The current CLI filters INFO by
+    // default, so allow INFO for this final report only, then restore it.
+    // Do not call the upstream formatter without any decode measurement:
+    // n_eval is clamped to one and a zero t_eval_ms would print infinity.
+    if (perf.t_p_eval_ms > 0.0 && evaluated_decode) {
+        const int old_verbosity = common_log_get_verbosity_thold();
+        common_log_set_verbosity_thold(
+            std::max(old_verbosity, LOG_LEVEL_TRACE));
+        common_perf_print(ctx, sampler);
+        common_log_flush(common_log_main());
+        common_log_set_verbosity_thold(old_verbosity);
+        std::fprintf(stderr,
+            "[CYCLE_PERF] note=GGML_GRAPH_REUSE_COUNT_EXCLUDES_CYCLE_CACHE "
+            "prompt_tokens=%d eval_runs=%d "
+            "prompt_ms=%.3f decode_ms=%.3f status=MEASURED\n",
+            perf.n_p_eval, perf.n_eval, perf.t_p_eval_ms, perf.t_eval_ms);
+    } else {
+        std::fprintf(stderr,
+            "[CYCLE_PERF] prompt_tokens=%d prompt_ms=%.3f "
+            "decode_runs=0 decode_ms=0 "
+            "detail=NO_INCREMENTAL_EVALUATION status=MEASURED\n",
+            perf.n_p_eval, perf.t_p_eval_ms);
+    }
+
+    // Do not change terminal input modes while -p / stdin are being read.
+    // Use official UI styling at the end of the single-prompt run.
+    ui::init(params);
+    if (evaluated_decode) {
+        ui::show_info(string_format(
+            "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+            prompt_tps, decode_tps));
+    } else {
+        ui::show_info(string_format(
+            "\n[ Prompt: %.1f t/s | Generation: n/a (no decode eval) ]",
+            prompt_tps));
+    }
 }
 
 int cli_cycle_run(common_params & params) {
@@ -169,6 +225,14 @@ int cli_cycle_run(common_params & params) {
         return 2;
     }
 
+    // Prompt timing must include a final one-token chunk, e.g. 64+1.
+    if (!llama_cycle_context_set_prompt_phase(ctx, true)) {
+        std::fprintf(stderr,
+            "[CYCLE_OFFICIAL_CLI] status=FAIL "
+            "reason=CYCLE_PROMPT_PERF_PHASE_UNAVAILABLE\n");
+        return 1;
+    }
+
     // Preserve the selected official sampler's repetition-history state.
     for (const llama_token tok : prompt_tokens) {
         common_sampler_accept(sampler, tok, /* is_generated */ false);
@@ -192,9 +256,16 @@ int cli_cycle_run(common_params & params) {
         "prompt_tokens=%zu kv_prefix=%zu "
         "source=REAL_MODEL status=PASS\n",
         prompt_tokens.size(), prompt_tokens.size());
+    if (!llama_cycle_context_set_prompt_phase(ctx, false)) {
+        std::fprintf(stderr,
+            "[CYCLE_OFFICIAL_CLI] status=FAIL "
+            "reason=CYCLE_DECODE_PERF_PHASE_UNAVAILABLE\n");
+        return 1;
+    }
     if (predict == 0) {
         std::fprintf(stderr,
             "[CYCLE_OFFICIAL_CLI] phase=COMPLETE generated=0 status=PASS\n");
+        cli_cycle_show_timings(params, ctx, sampler);
         return 0;
     }
 
@@ -258,5 +329,6 @@ int cli_cycle_run(common_params & params) {
         "prompt_tokens=%zu generated=%zu "
         "sampling=COMMON_EXTERNAL status=PASS\n",
         prompt_tokens.size(), generated);
+    cli_cycle_show_timings(params, ctx, sampler);
     return 0;
 }

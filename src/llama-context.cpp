@@ -4591,11 +4591,27 @@ bool llama_context::reset_cycle() {
     output_ids.clear();
     output_swaps.clear();
     n_outputs = 0;
+    cycle_perf_phase_explicit = false;
+    cycle_perf_is_prompt = false;
     LLAMA_LOG_INFO(
         "[CYCLE_STANDARD] stage=CONTEXT_RESET physical_kv=CLEARED "
         "status=%s reason=%s\n",
         ok ? "PASS" : "FAIL", ok ? "NONE" : reason.c_str());
     return ok;
+#endif
+}
+
+bool llama_context::set_cycle_prompt_phase(bool is_prompt) {
+#if !defined(LLAMA_CYCLE_RPC_ENABLED)
+    (void) is_prompt;
+    return false;
+#else
+    if (!cycle_session || !cycle_session->usable()) {
+        return false;
+    }
+    cycle_perf_phase_explicit = true;
+    cycle_perf_is_prompt = is_prompt;
+    return true;
 #endif
 }
 
@@ -4639,11 +4655,25 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         }
     }
 
+    // Prompt-vs-Decode classification also determines the correct PC CPU
+    // thread setting: a trailing one-token Prompt chunk uses -tb, not -t.
+    // The official CLI explicitly marks Prompt chunks; generic standard
+    // API callers retain the native fallback without an extra hint.
+    const bool is_prompt_eval = cycle_perf_phase_explicit ?
+        cycle_perf_is_prompt : (n > 1 || prefix == 0);
+
+    // Follow llama_context::synchronize()'s accounting model: time the
+    // complete, synchronous physical evaluation (Embedding, five FIFO
+    // queues, Phone/PC transfer waits, and LM head if requested). Unlike
+    // GRAPH_COMPUTE socket-submit timings this is actual exposed wall time.
+    const int64_t cycle_compute_start_us =
+        cparams.no_perf ? 0 : ggml_time_us();
+
     // Normal llama_context installs CPU threadpools later in its scheduler
     // initialization, which the physical Cycle intentionally bypasses.
     // Apply the official -t / -tb flags directly to the one PC CPU backend
     // before launching the global 48-layer FIFO for this invocation.
-    const int cpu_threads = n > 1 ?
+    const int cpu_threads = is_prompt_eval ?
         cparams.n_threads_batch : cparams.n_threads;
     if (backend_cpu && cpu_threads > 0) {
         ggml_backend_cpu_set_n_threads(backend_cpu, cpu_threads);
@@ -4705,9 +4735,25 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         n_outputs = 1;
         output_ids[size_t(n - 1)] = 0;
     }
-    has_evaluated_once = true;
-    if (n > 1) n_p_eval += n;
-    else ++n_eval;
+    if (!cparams.no_perf) {
+        const int64_t elapsed_us = ggml_time_us() - cycle_compute_start_us;
+        if (is_prompt_eval) {
+            t_p_eval_us += elapsed_us;
+        } else {
+            t_eval_us += elapsed_us;
+        }
+    }
+    if (is_prompt_eval) {
+        n_p_eval += n;
+    } else {
+        ++n_eval;
+    }
+    // Ordinary Context records a more representative load time on the
+    // first successful evaluation, then keeps the same start timestamp.
+    if (!has_evaluated_once) {
+        t_load_us = ggml_time_us() - t_start_us;
+        has_evaluated_once = true;
+    }
     LLAMA_LOG_INFO(
         "[CYCLE_STANDARD] stage=DECODE tokens=%d "
         "kv_prefix=%lld outputs=%d c2p=%d full=%d p2c=%d "

@@ -169,6 +169,9 @@ struct llama_context {
     // Cycle. It is never routed through the legacy Meta scheduler.
     int decode_cycle(const llama_batch & batch_inp);
     bool reset_cycle();
+    // Optional explicit prompt-vs-incremental classification for physical
+    // Cycle timings. No standard scheduler or KV state is modified.
+    bool set_cycle_prompt_phase(bool is_prompt);
 
     //
     // state save/load
@@ -424,6 +427,8 @@ private:
     // must never become a second KV owner for the same sequence.
     llama_hybrid_cycle_session * cycle_session = nullptr;
     std::vector<float> cycle_logits_storage;
+    bool cycle_perf_phase_explicit = false;
+    bool cycle_perf_is_prompt = false;
 
     llama_cparams cparams;
 

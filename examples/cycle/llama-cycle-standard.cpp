@@ -144,8 +144,19 @@ int main(int argc, char ** argv) {
         std::printf(
             "[CYCLE_STANDARD_APP] phase=INIT context_api=PUBLIC_LLAMA "
             "kv_capacity=%u status=PASS\n",llama_n_ctx(ctx.get()));
-        bool ok = decode_batch(
-            ctx.get(),ids.data(),int(ids.size()),0);
+        bool ok = llama_cycle_context_set_prompt_phase(ctx.get(),true);
+        if (!ok) {
+            std::fprintf(stderr,
+                "[CYCLE_STANDARD_APP] phase=PERF_HINT "
+                "reason=SET_PROMPT_PHASE status=FAIL\n");
+        }
+        if (ok) {
+            ok = decode_batch(
+                ctx.get(),ids.data(),int(ids.size()),0);
+        }
+        if (ok) {
+            ok = llama_cycle_context_set_prompt_phase(ctx.get(),false);
+        }
         if (ok) {
             std::printf("[CYCLE_STANDARD_APP_TEXT] ");
             int emitted = 0;
@@ -169,6 +180,19 @@ int main(int argc, char ** argv) {
                 ok = decode_batch(
                     ctx.get(),&token,1,n + i);
             }
+            const auto perf = llama_perf_context(ctx.get());
+            const bool perf_ok =
+                perf.t_p_eval_ms > 0.0 && perf.n_p_eval == n &&
+                (emitted <= 1 || (perf.t_eval_ms > 0.0 &&
+                                  perf.n_eval >= emitted - 1));
+            std::printf(
+                "\n[CYCLE_STANDARD_PERF] prompt_ms=%.3f "
+                "eval_ms=%.3f prompt_tokens=%d eval_runs=%d "
+                "status=%s\n",
+                perf.t_p_eval_ms, perf.t_eval_ms,
+                perf.n_p_eval, perf.n_eval,
+                perf_ok ? "PASS" : "FAIL");
+            ok = ok && perf_ok;
             std::printf(
                 "\n[CYCLE_STANDARD_APP] phase=COMPLETE "
                 "requested=%d generated=%d "

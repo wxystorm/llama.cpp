@@ -67,3 +67,34 @@ larger physical KV session; `n_ctx=0` still selects the previously verified
 128-token default. Values above 512 are rejected rather than silently
 clamped. Physical Attention and CPU/Phone GPU precision at >128 positions
 still require real-device verification.
+
+## Public API performance counters
+
+`llama_perf_context(ctx)` and `llama_perf_context_print(ctx)` now
+report real Cycle elapsed times through the original
+`t_p_eval_ms`, `t_eval_ms`, `n_p_eval`, and `n_eval` fields.
+
+When using the public C API directly, optionally classify Prompt and
+Decode by calling:
+
+    llama_cycle_context_set_prompt_phase(ctx, true);   // Before Prompt
+    // llama_decode(ctx, prompt_chunk) ... perhaps multiple <=64-token calls
+    llama_cycle_context_set_prompt_phase(ctx, false);  // Before generation
+    // llama_decode(ctx, one_generated_token) ...
+
+The helper returns false for ordinary Contexts or an invalid Cycle
+Session and only changes timing classification. It does **not**
+affect KV, device ownership, scheduling, or numerical results.
+Without the explicit hint, Cycle uses the native fallback:
+`n_tokens > 1` or first KV prefix zero is counted as Prompt. This
+cannot distinguish the final one-token Prompt chunk of a long Prompt.
+
+Timing covers Embedding, the synchronous physical FIFO, RPC/device
+waiting, and output Head. The standard `no_perf` flag is respected.
+A finished generation does not need to decode the last sampled token,
+so reported eval runs can be one less than emitted tokens. Standard
+`graphs reused` does not represent Cycle-specific Attention/FFN caches.
+
+The `llama-cycle-standard` hardware regression now checks that these
+public counters are populated and have consistent Prompt / Decode
+classification.

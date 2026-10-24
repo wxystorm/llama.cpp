@@ -1,7 +1,8 @@
 # Physical Cycle integration
 
 **Official `llama-cli` entrypoint:** see
-[OFFICIAL_CLI.md](OFFICIAL_CLI.md). Explicitly enabling
+[OFFICIAL_CLI.md](OFFICIAL_CLI.md), including official
+Prompt / Eval statistics and the purple terminal summary. Explicitly enabling
 `LLAMA_HYBRID_CYCLE_STANDARD_DECODE=1` routes the official executable
 through the public Context API and real five-queue Cycle, without
 starting its normal HTTP server. This is currently single-prompt
