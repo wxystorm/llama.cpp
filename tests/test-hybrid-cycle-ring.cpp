@@ -878,11 +878,7 @@ static void test_chunk_trace_observational() {
 // Once that task completes, the same Chunk's logical continuation must drain
 // before a newer Chunk starts another Region graph.
 static void test_pc_cuda_region_continuation_priority() {
-    llama_hybrid_cycle_layout layout;
-    layout.kinds = {
-        llama_hybrid_cycle_layer_kind::PC_CPU,
-        llama_hybrid_cycle_layer_kind::PC_CPU
-    };
+    auto layout = llama_hybrid_build_cycle_layout(5, 2, 1);
     layout.pc_cuda_full = true;
     llama_hybrid_cycle_task_ring ring(
         layout, 2, 2, true, false, false, false, true);
