@@ -710,7 +710,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         const bool defer_last_output_rows =
             il == n_layer - 1 &&
             inp_out_ids != nullptr &&
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+            llama_hybrid_layer_mode_tensor_attention_on_phone(hybrid_mode);
 
         // Normally the last layer is pruned to only the requested output rows
         // before the FFN.  TENSOR_PHONE_PRIMARY needs the same full-token
@@ -734,10 +734,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         const int n_decode_chunks =
             std::min<int64_t>(qwen3moe_ffn_chunk_count(), n_embd);
         const bool tensor_split_layer =
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+            llama_hybrid_layer_mode_is_tensor(hybrid_mode);
         const bool phone_primary_router =
-            hybrid_mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+            llama_hybrid_layer_mode_tensor_attention_on_phone(hybrid_mode);
         const bool use_decode_chunked_moe =
             n_tokens == 1 &&
             n_decode_chunks > 1 &&
