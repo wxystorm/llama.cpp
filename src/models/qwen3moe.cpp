@@ -305,12 +305,21 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         region_chunk_cont_requested &&
         !stage_graph &&
         n_tokens > 1 &&
+        ubatch.token != nullptr &&
+        ubatch.embd == nullptr &&
         ubatch.n_pos == 1 &&
         ubatch.n_seqs_unq == 1 &&
         (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
         planned_chunk_tokens > 0 &&
         model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-        loras->empty();
+        loras->empty() &&
+        !params.cparams.embeddings &&
+        !params.cparams.embeddings_nextn &&
+        params.cparams.cb_eval == nullptr &&
+        std::none_of(
+            params.cparams.embeddings_layer_inp.begin(),
+            params.cparams.embeddings_layer_inp.end(),
+            [](bool enabled) { return enabled; });
 
     if (directional_region_chunk_cont) {
         for (int il = 0; il < n_layer; ++il) {
