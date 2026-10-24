@@ -1048,6 +1048,15 @@ static bool cycle_core_evaluate_with_kv(
                 reason = "REAL_PHYSICAL_STAGES_INCOMPLETE";
                 ok = false;
             }
+            if (n_tokens > 1) {
+                std::printf(
+                    "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
+                    "fused_ffn_add=1 calls=%d slot_reuse=%d "
+                    "legacy_client_reduce=0 status=%s\n",
+                    real_phone_full_calls.load(),
+                    phone_full_slot_reuse.load(),
+                    ok ? "PASS" : "FAIL");
+            }
             if (ok) {
                 final_hidden.assign(
                     size_t(n_tokens) * size_t(hidden), 0.0f);
