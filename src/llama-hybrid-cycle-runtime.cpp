@@ -28,6 +28,7 @@ bool llama_hybrid_cycle_run_fifo(
         bool pc_cpu_reduce_priority,
         bool ordered_c2p_reduce,
         bool phone_main_priority,
+        bool pc_cuda_chunk_priority,
         llama_hybrid_cycle_chunk_timeline * chunk_timeline) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
@@ -36,7 +37,8 @@ bool llama_hybrid_cycle_run_fifo(
     llama_hybrid_cycle_task_ring ring(
         layout, n_chunks, max_inflight, credit_until_handoff,
         pc_cpu_reduce_priority, ordered_c2p_reduce,
-        phone_main_priority, chunk_timeline != nullptr);
+        phone_main_priority, pc_cuda_chunk_priority,
+        chunk_timeline != nullptr);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
@@ -436,7 +438,8 @@ bool llama_hybrid_cycle_runtime::run(
         config_.layout, config_.n_chunks, execute, config_.max_inflight,
         config_.credit_until_handoff, profile,
         config_.pc_cpu_reduce_priority, config_.ordered_c2p_reduce,
-        config_.phone_main_priority, timeline);
+        config_.phone_main_priority, config_.pc_cuda_chunk_priority,
+        timeline);
 }
 
 bool llama_hybrid_cycle_runtime::run(
