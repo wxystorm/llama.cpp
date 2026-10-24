@@ -464,3 +464,29 @@ still finishes all L34 chunks before entering the full Phone L35-L45 graph.
 The later full Region pipeline step will chunk the local full-region graph so
 that an earlier chunk can already advance through L35-L46 while the next
 chunk is still in the incoming C2P FFN queue.
+
+
+### Keep Phone-local before P2C
+
+For the directional pair
+
+```text
+L35-L45 Phone Full
+  -> L46 P2C, Attention/Router on Phone
+```
+
+the L45 full activation remains Phone-owned. A generic Phone-owner-exit mirror
+must not copy the complete `l_out-45` back to PC before L46, because the PC
+side of L46 only consumes the explicit P2C READY/Router payload and its FFN
+shard inputs.
+
+The Prefill-only guard emits:
+
+```text
+[REGION_KEEP_PHONE_EXIT] ... layer=45 next_layer=46
+reason=NEXT_P2C_PHONE_ATTN status=OK
+```
+
+Expected effect: the full L45 `1->0` mirror disappears; the intentional L46
+P2C READY/PARTIAL transfers remain unchanged. Decode and non-directional
+Phone-owner exits retain the legacy handoff behavior.
