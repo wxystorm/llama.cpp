@@ -12866,7 +12866,145 @@ auto prefill_norm_sg_has_prework =
             }
         }
     } else {
-        compute_status = compute_workers.compute(i);
+        // Generic C2P MoE subgraphs (notably single-token decode) also require
+        // the PC-owned Router result before the Phone expert graph starts.
+        // Detect the explicit C2P route output in this subgraph and serialize
+        // only this dependency; all non-C2P subgraphs keep the legacy parallel
+        // compute_workers.compute() behavior.
+        int c2p_exec_layer = -1;
+        int c2p_exec_chunk = -1;
+        bool c2p_exec_route = false;
+        if (n_backends == 2) {
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            if (pc_graph != nullptr) {
+                for (int k = 0; k < pc_graph->n_nodes; ++k) {
+                    int route_chunk = -1;
+                    int route_layer = -1;
+                    if (ggml_backend_meta_parse_c2p_route_weights(
+                            pc_graph->nodes[k]->name,
+                            route_chunk,
+                            route_layer) &&
+                            ggml_backend_meta_tensor_c2p_layer(
+                                backend_ctx, route_layer)) {
+                        c2p_exec_layer = route_layer;
+                        c2p_exec_chunk = route_chunk;
+                        c2p_exec_route = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (c2p_exec_route) {
+            compute_workers.start(0, i);
+            const ggml_status pc_status =
+                compute_workers.wait(0);
+
+            ggml_status phone_status = GGML_STATUS_SUCCESS;
+            if (pc_status == GGML_STATUS_SUCCESS) {
+                char topk_name[96];
+                char weights_name[96];
+                if (c2p_exec_chunk >= 0) {
+                    std::snprintf(
+                        topk_name, sizeof(topk_name),
+                        "c2p_prefill_route_topk_chunk_%d-%d",
+                        c2p_exec_chunk, c2p_exec_layer);
+                    std::snprintf(
+                        weights_name, sizeof(weights_name),
+                        "c2p_prefill_route_weights_chunk_%d-%d",
+                        c2p_exec_chunk, c2p_exec_layer);
+                } else {
+                    std::snprintf(
+                        topk_name, sizeof(topk_name),
+                        "c2p_moe_route_topk-%d",
+                        c2p_exec_layer);
+                    std::snprintf(
+                        weights_name, sizeof(weights_name),
+                        "c2p_moe_route_weights-%d",
+                        c2p_exec_layer);
+                }
+
+                ggml_tensor * src_topk =
+                    find_exact_named_tensor(0, topk_name);
+                ggml_tensor * dst_topk =
+                    find_exact_named_tensor(1, topk_name);
+                ggml_tensor * src_weights =
+                    find_exact_named_tensor(0, weights_name);
+                ggml_tensor * dst_weights =
+                    find_exact_named_tensor(1, weights_name);
+
+                GGML_ASSERT(src_topk != nullptr);
+                GGML_ASSERT(dst_topk != nullptr);
+                GGML_ASSERT(src_weights != nullptr);
+                GGML_ASSERT(dst_weights != nullptr);
+                GGML_ASSERT(
+                    ggml_nbytes(src_topk) ==
+                    ggml_nbytes(dst_topk));
+                GGML_ASSERT(
+                    ggml_nbytes(src_weights) ==
+                    ggml_nbytes(dst_weights));
+
+                auto & pc_cfg =
+                    backend_ctx->backend_configs[0];
+                auto & phone_cfg =
+                    backend_ctx->backend_configs[1];
+
+                ggml_backend_synchronize(pc_cfg.backend);
+
+                const int64_t topk_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    pc_cfg.backend,
+                    phone_cfg.backend,
+                    src_topk,
+                    dst_topk);
+                ggml_backend_synchronize(phone_cfg.backend);
+                const int64_t topk_us =
+                    ggml_time_us() - topk_begin_us;
+                record_copy_wait(topk_us);
+                record_meta_copy(
+                    i, 0, 1, src_topk, topk_us);
+                record_direct_copy();
+
+                const int64_t weights_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    pc_cfg.backend,
+                    phone_cfg.backend,
+                    src_weights,
+                    dst_weights);
+                ggml_backend_synchronize(phone_cfg.backend);
+                const int64_t weights_us =
+                    ggml_time_us() - weights_begin_us;
+                record_copy_wait(weights_us);
+                record_meta_copy(
+                    i, 0, 1, src_weights, weights_us);
+                record_direct_copy();
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_ROUTE] layer=%d chunk=%d "
+                        "direction=PC_TO_PHONE "
+                        "topk_bytes=%zu weights_bytes=%zu "
+                        "topk_ms=%.3f weights_ms=%.3f "
+                        "owner=PC trigger=GENERIC status=OK\n",
+                        c2p_exec_layer,
+                        c2p_exec_chunk,
+                        ggml_nbytes(src_topk),
+                        ggml_nbytes(src_weights),
+                        topk_us / 1000.0,
+                        weights_us / 1000.0);
+                }
+
+                compute_workers.start(1, i);
+                phone_status = compute_workers.wait(1);
+            }
+
+            compute_status =
+                pc_status != GGML_STATUS_SUCCESS ?
+                    pc_status : phone_status;
+        } else {
+            compute_status = compute_workers.compute(i);
+        }
     }
 
     subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
