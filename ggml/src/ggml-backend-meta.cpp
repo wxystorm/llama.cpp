@@ -4517,6 +4517,56 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return false;
         };
 
+    auto subgraph_tensor_c2p_layer =
+        [&](size_t sg, int & layer) -> bool {
+            layer = -1;
+            if (sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            for (size_t backend = 0; backend < n_backends; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    ggml_tensor * node = graph->nodes[k];
+                    int parsed_layer = -1;
+                    int chunk = -1;
+                    int parsed = 0;
+
+                    const bool matched =
+                        std::sscanf(
+                            node->name, "ffn_inp-%d%n",
+                            &parsed_layer, &parsed) == 1 ||
+                        std::sscanf(
+                            node->name, "ffn_norm-%d%n",
+                            &parsed_layer, &parsed) == 1 ||
+                        std::sscanf(
+                            node->name, "ffn_moe_out-%d%n",
+                            &parsed_layer, &parsed) == 1 ||
+                        ggml_backend_meta_parse_prefill_norm_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            node->name, chunk, parsed_layer) ||
+                        ggml_backend_meta_parse_decode_ffn_chunk(
+                            node->name, chunk, parsed_layer);
+
+                    if (matched &&
+                        ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, parsed_layer)) {
+                        layer = parsed_layer;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        };
+
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_is_tensor_phone_primary(layer)) {
             return false;
@@ -7793,14 +7843,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             layer_is_tensor_phone_primary(
                 force_phone_block_layer);
 
+        int c2p_tensor_layer = -1;
+        const bool c2p_tensor_sg =
+            active_count == 1 &&
+            active_backend == 1 &&
+            subgraph_tensor_c2p_layer(
+                i, c2p_tensor_layer);
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
+            !c2p_tensor_sg &&
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
+
+        if (pipeline_debug && c2p_tensor_sg) {
+            printf(
+                "[REGION_C2P_KEEP_PHONE] sg=%zu layer=%d node=%s "
+                "reason=C2P_FFN_INTERMEDIATE status=OK\n",
+                i,
+                c2p_tensor_layer,
+                nodes[1] != nullptr ? nodes[1]->name : "(null)");
+        }
 
         if (pipeline_debug &&
             (phone_primary_tensor_sg ||
@@ -7912,6 +7979,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             const bool pc_needed_next =
                 i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
+            if (c2p_tensor_sg) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_KEEP_PHONE] sg=%zu layer=%d tensor=%s "
+                        "next_pc=%d next_phone=%d action=NO_HANDOFF status=OK\n",
+                        i,
+                        c2p_tensor_layer,
+                        nodes[1]->name,
+                        pc_needed_next ? 1 : 0,
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_phone(i + 1) : -1);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
             if (!pc_needed_next && !phone_owner_exit) {
                 handled = true;
                 if (pipeline_debug) {
