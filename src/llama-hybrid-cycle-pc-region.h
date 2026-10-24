@@ -28,6 +28,14 @@ struct llama_hybrid_cycle_pc_region_timing {
     size_t allocator_bytes = 0;
 };
 
+struct llama_hybrid_cycle_pc_region_cache_stats {
+    uint64_t hits = 0;
+    uint64_t builds = 0;
+    uint64_t evictions = 0;
+    uint64_t allocator_grows = 0;
+    size_t allocator_bytes = 0;
+};
+
 class LLAMA_API llama_hybrid_cycle_pc_region_cache {
 public:
     explicit llama_hybrid_cycle_pc_region_cache(size_t max_graphs = 2);
@@ -93,4 +101,5 @@ LLAMA_API bool llama_hybrid_cycle_bind_pc_region_stages(
     const std::vector<float> & initial_hidden,
     int64_t hidden,
     std::string & reason,
-    std::atomic<int> * region_calls = nullptr);
+    std::atomic<int> * region_calls = nullptr,
+    llama_hybrid_cycle_pc_region_cache_stats * cache_stats = nullptr);
