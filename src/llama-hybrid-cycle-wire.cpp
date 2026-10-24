@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-wire.h"
+#include "llama-hybrid-cycle-log.h"
 #include "../ggml/include/ggml-rpc.h"
 
 #include <chrono>
@@ -76,7 +77,7 @@ bool llama_hybrid_cycle_receive_wire(
             kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL");
         return false;
     }
-    std::printf(
+    if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_WIRE] side=pc stage=%s direction=P2C "
         "layer=%d chunk=%d seq=%llu bytes=%zu "
         "source=PHONE_GPU_RPC_TENSORS mode=REAL_RPC_DATA_PLANE status=PASS\n",
@@ -153,7 +154,7 @@ bool llama_hybrid_cycle_send_c2p_frame(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - enqueue_begin).count();
     }
-    std::printf(
+    if (!submitted || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_C2P_WIRE] side=pc action=SEND kind=%s layer=%d chunk=%d "
         "seq=%llu bytes=%zu direction=PC_TO_PHONE status=%s\n",
         kind == INFERENCE_CYCLE_READY ? "READY" : "PARTIAL",
