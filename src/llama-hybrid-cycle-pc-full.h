@@ -25,6 +25,7 @@ struct llama_hybrid_cycle_pc_full_timing {
     double attention_ms = 0.0;
     double ffn_ms = 0.0;
     double output_readback_ms = 0.0;
+    double output_device_copy_ms = 0.0;
 };
 
 LLAMA_API bool llama_hybrid_cycle_execute_pc_full_layer(
@@ -35,7 +36,9 @@ LLAMA_API bool llama_hybrid_cycle_execute_pc_full_layer(
     const std::vector<float> & input,
     std::vector<float> & output,
     llama_hybrid_cycle_pc_full_timing * timing = nullptr,
-    const std::function<bool()> & input_consumed = {});
+    const std::function<bool()> & input_consumed = {},
+    const ggml_tensor * device_input = nullptr,
+    llama_hybrid_cycle_cuda_activation_slot * device_output = nullptr);
 
 // Bind real PC Full stages by ABSOLUTE model layer number. The other
 // Tensor/Phone stages are intentionally left for their own real executors;
@@ -76,6 +79,15 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
         reason = "PC_FULL_LAYER_RANGE";
         return false;
     }
+    // Numerical tracing intentionally preserves the old Host boundary at
+    // every PC Full layer. Production (no trace_output) uses device-local
+    // handoff across adjacent CUDA Full layers.
+    const bool device_local = !trace_output;
+    auto cuda_idle_by_layer = std::make_shared<
+        std::vector<std::vector<
+            std::unique_ptr<llama_hybrid_cycle_cuda_activation_slot>>>>(
+                layout.kinds.size());
+
     for (int l = begin; l < end; ++l) {
         if (layout.kinds[size_t(l)] != llama_hybrid_cycle_layer_kind::PC_CPU) {
             continue;
@@ -88,7 +100,8 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
         }
         const bool bound = stages.bind(l, llama_hybrid_cycle_stage::FULL_LAYER,
             [l, hidden, pc_cpu, &resources, &session, &model,
-             &initial_hidden, trace_output](
+             &initial_hidden, trace_output, device_local,
+             cuda_idle_by_layer](
                 const llama_hybrid_cycle_task & task) {
                 if (task.layer != l || task.chunk < 0 ||
                     task.chunk >= session.chunks_per_layer() ||
@@ -97,7 +110,28 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                 }
                 auto & chunk = session.at(l, task.chunk);
                 std::vector<float> input;
-                if (l == 0) {
+                const bool cuda_predecessor =
+                    device_local && l > 0 &&
+                    layout.kinds[size_t(l - 1)] ==
+                        llama_hybrid_cycle_layer_kind::PC_CPU &&
+                    llama_hybrid_cycle_full_layer_on_cuda(layout, l - 1);
+                const bool cuda_successor =
+                    device_local && l + 1 < int(layout.kinds.size()) &&
+                    layout.kinds[size_t(l + 1)] ==
+                        llama_hybrid_cycle_layer_kind::PC_CPU &&
+                    llama_hybrid_cycle_full_layer_on_cuda(layout, l + 1);
+                const ggml_tensor * device_input = nullptr;
+                if (cuda_predecessor) {
+                    device_input =
+                        session.cuda_predecessor_output(l, task.chunk);
+                    if (!device_input) {
+                        std::fprintf(stderr,
+                            "[CYCLE_PC_CUDA_HANDOFF] layer=%d chunk=%d "
+                            "reason=PREDECESSOR_DEVICE_OUTPUT status=FAIL\n",
+                            l, task.chunk);
+                        return false;
+                    }
+                } else if (l == 0) {
                     const int64_t start = chunk.start -
                         session.config().token_position_base;
                     if (start < 0 || hidden <= 0 ||
@@ -135,17 +169,80 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                     return false;
                 }
                 const auto * resident = resources.layer(l);
-                if (!resident || !resident->cuda_weights ||
-                    !llama_hybrid_cycle_execute_pc_full_layer(
-                        model, *resident, pc_cpu, l,
-                        chunk.start, chunk.tokens, input,
-                        chunk.host_output, nullptr,
-                        task.input_consumed)) {
+                if (!resident || !resident->cuda_weights) {
                     return false;
                 }
-                // Diagnostic capture is executed only on this PC Full's
-                // owning FIFO worker after the real computation completed,
-                // before its immutable Host output is published downstream.
+
+                std::unique_ptr<llama_hybrid_cycle_cuda_activation_slot>
+                    output_slot;
+                if (cuda_successor) {
+                    auto & idle = (*cuda_idle_by_layer)[size_t(l)];
+                    for (auto it = idle.begin(); it != idle.end(); ++it) {
+                        if (*it && (*it)->matches(
+                                resident->attn_backend, hidden, chunk.tokens)) {
+                            output_slot = std::move(*it);
+                            idle.erase(it);
+                            break;
+                        }
+                    }
+                    if (!output_slot) {
+                        output_slot = std::make_unique<
+                            llama_hybrid_cycle_cuda_activation_slot>();
+                    }
+                    if (!output_slot->prepare(
+                            resident->attn_backend, hidden, chunk.tokens)) {
+                        std::fprintf(stderr,
+                            "[CYCLE_PC_CUDA_HANDOFF] layer=%d chunk=%d "
+                            "reason=OUTPUT_SLOT_PREPARE status=FAIL\n",
+                            l, task.chunk);
+                        return false;
+                    }
+                }
+
+                std::function<bool()> input_consumed = task.input_consumed;
+                if (cuda_predecessor) {
+                    const auto ring_input_consumed = task.input_consumed;
+                    input_consumed =
+                        [l, c = task.chunk, &session, cuda_idle_by_layer,
+                         ring_input_consumed]() -> bool {
+                            auto previous =
+                                session.retire_cuda_output_after_handoff(
+                                    l - 1, l, c);
+                            if (!previous) {
+                                std::fprintf(stderr,
+                                    "[CYCLE_PC_CUDA_HANDOFF] layer=%d chunk=%d "
+                                    "reason=PREDECESSOR_SLOT status=FAIL\n",
+                                    l, c);
+                                return false;
+                            }
+                            (*cuda_idle_by_layer)[size_t(l - 1)].push_back(
+                                std::move(previous));
+                            return !ring_input_consumed ||
+                                ring_input_consumed();
+                        };
+                }
+
+                if (!llama_hybrid_cycle_execute_pc_full_layer(
+                        model, *resident, pc_cpu, l,
+                        chunk.start, chunk.tokens, input,
+                        chunk.host_output, nullptr, input_consumed,
+                        device_input, output_slot.get())) {
+                    return false;
+                }
+                if (cuda_successor) {
+                    chunk.cuda_output = std::move(output_slot);
+                    if (llama_hybrid_cycle_verbose()) {
+                        std::printf(
+                            "[CYCLE_PC_CUDA_HANDOFF] layer=%d chunk=%d "
+                            "bytes=%zu mode=DEVICE_LOCAL status=READY\n",
+                            l, task.chunk,
+                            ggml_nbytes(chunk.cuda_output->tensor));
+                    }
+                    return true;
+                }
+
+                // Only the final CUDA Full layer before a Tensor boundary
+                // materializes Host output. Internal Full layers never do.
                 if (trace_output) {
                     trace_output(l, task.chunk, chunk.start, chunk.tokens,
                                  chunk.host_output);
