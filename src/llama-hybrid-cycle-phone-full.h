@@ -22,6 +22,8 @@ LLAMA_API bool llama_hybrid_cycle_execute_phone_full(
     const llama_hybrid_cycle_physical_layer_resources & resource,
     ggml_backend_t phone,
     int physical_layer,
+    int chunk,
+    uint64_t seq,
     int64_t position_start,
     int64_t tokens,
     const ggml_tensor * device_input,
