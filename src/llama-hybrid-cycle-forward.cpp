@@ -70,7 +70,7 @@ static bool cycle_core_evaluate_with_kv(
         model->arch != LLM_ARCH_QWEN3MOE ||
         llama_model_n_layer(model) != 48 ||
         hidden <= 0 || n_tokens < 1 || n_tokens > 64 ||
-        position_base < 0 || position_base > 128 - n_tokens ||
+        position_base < 0 || position_base > 512 - n_tokens ||
         chunk_tokens < 1 || chunk_tokens > 16 ||
         max_inflight < 1 || max_inflight > 2 ||
         n_tokens > std::numeric_limits<int>::max() - chunk_tokens + 1 ||
@@ -1087,7 +1087,7 @@ bool llama_hybrid_cycle_session::prepare(
         model.arch != LLM_ARCH_QWEN3MOE ||
         llama_model_n_layer(&model) != 48 ||
         !ggml_backend_is_rpc(phone) ||
-        max_total_tokens < 1 || max_total_tokens > 128 ||
+        max_total_tokens < 1 || max_total_tokens > 512 ||
         chunk_tokens < 1 || chunk_tokens > 16 ||
         max_inflight < 1 || max_inflight > 2) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
@@ -1105,6 +1105,14 @@ bool llama_hybrid_cycle_session::prepare(
     config.kv_tokens = max_total_tokens;
     config.max_inflight = max_inflight;
     config.cuda_weight_budget_bytes = 0;
+    // In monotonically growing decode the (query_tokens, kv_tokens) shape
+    // never repeats. For >128-token sessions keep the bounded, reusable GPU
+    // Scratch Pool but do not retain 16 * 48 host-only graph metadata blobs
+    // whose old KV prefix can never be reached again. Small sessions keep
+    // their existing V5 graph-cache behavior unchanged.
+    config.attention_graph_cache = true;
+    config.attention_graph_cache_max_graphs =
+        max_total_tokens <= 128 ? 16 : 0;
     if (!pool->prepare(model, layout, cpu, phone, nullptr,
                        config, reason)) return false;
     model_ = &model;
@@ -1119,8 +1127,10 @@ bool llama_hybrid_cycle_session::prepare(
     poisoned_ = false;
     std::printf(
         "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
-        "layers=48 window=%d phone_gpu=REAL status=PASS\n",
-        (long long) capacity_, max_inflight_);
+        "layers=48 window=%d attention_graph_cache_slots=%zu "
+        "scratch_pool=1 phone_gpu=REAL status=PASS\n",
+        (long long) capacity_, max_inflight_,
+        config.attention_graph_cache_max_graphs);
     return true;
 }
 

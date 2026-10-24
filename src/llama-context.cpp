@@ -316,11 +316,16 @@ llama_context::llama_context(
         // Otherwise getters for unused optional features could read
         // uninitialized flags/sizes.
         cparams = {};
-        // All fixed Cycle Attention/KV buffers have an explicit 128-token
-        // capacity. Report that TRUE capacity to ordinary llama.cpp users.
+        // Physical K/V supports up to 512 causal positions. Preserve the
+        // previous 128-token DEFAULT unless a caller opts into -c 256/512.
         const uint32_t requested_ctx =
             params.n_ctx == 0 ? 128u : params.n_ctx;
-        cparams.n_ctx = std::min<uint32_t>(requested_ctx, 128);
+        if (requested_ctx > 512) {
+            throw std::runtime_error(
+                "Cycle physical KV supports at most 512 tokens; "
+                "request -c 512 or smaller, no implicit truncation");
+        }
+        cparams.n_ctx = requested_ctx;
         cparams.n_ctx_seq = cparams.n_ctx;
         cparams.n_seq_max = 1;
         cparams.n_batch = std::max<uint32_t>(

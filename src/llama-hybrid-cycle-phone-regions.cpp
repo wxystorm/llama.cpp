@@ -34,8 +34,9 @@ bool llama_hybrid_cycle_phone_regions::prepare(
         reason = "INVALID_FULL_PHYSICAL_PERIOD_LAYOUT";
         return false;
     }
-    // The current physical Attention path supports <=128 positions and
-    // the wire ID encoding reserves three decimal digits per chunk.
+    // 'tokens' is this invocation's count (<=64 for native Forward),
+    // not the absolute K/V capacity (now <=512). The wire ID encoding
+    // reserves three decimal digits per Chunk.
     if (tokens <= 0 || tokens > 128 || chunk_tokens <= 0 ||
         max_inflight <= 0 || max_inflight > tokens ||
         1 + (tokens - 1) / chunk_tokens > 999) {

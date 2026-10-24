@@ -335,6 +335,12 @@ target_include_directories(test-hybrid-cycle-attention-runtime PRIVATE ${PROJECT
 llama_build_and_test(test-hybrid-cycle-shard-ffn.cpp)
 target_include_directories(test-hybrid-cycle-shard-ffn PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Hardware-free CPU regression: physical per-layer K/V must allocate 128,
+# 256 and 512 positions with the exact F16 [head_dim, kv_heads, tokens]
+# shape; 513 must fail. Runs in ordinary CTest without a model or RPC.
+llama_build_and_test(test-hybrid-cycle-kv-capacity.cpp)
+target_include_directories(test-hybrid-cycle-kv-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 # Explicit opt-in GPU RPC probe. No automatic CTest registration because it
 # requires a live phone server and must never attempt to connect in CI.
 if (TARGET ggml-rpc)

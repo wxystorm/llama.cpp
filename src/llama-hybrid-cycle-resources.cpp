@@ -138,7 +138,7 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
     };
 
     if (!cpu || !phone || config.kv_tokens <= 0 ||
-        config.kv_tokens > 128 || config.max_inflight <= 0 ||
+        config.kv_tokens > 512 || config.max_inflight <= 0 ||
         !llama_hybrid_cycle_runtime_validate_model(model, layout, reason)) {
         if (reason.empty()) reason = "INVALID_BACKENDS_OR_CONTEXT";
         return false;
@@ -224,6 +224,8 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
         if (config.attention_graph_cache) {
             resource.graph_cache =
                 std::make_unique<cycle_real_attention_graph_cache>();
+            resource.graph_cache->max_graphs =
+                config.attention_graph_cache_max_graphs;
         }
         if (config.attention_scratch_pool) {
             resource.scratch_pool =

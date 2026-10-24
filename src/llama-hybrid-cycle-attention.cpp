@@ -55,7 +55,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
     }
     if (!backend || ggml_backend_is_meta(backend) ||
         hidden <= 0 || tokens < 1 || tokens > 128 ||
-        kv_token_start < 0 || kv_token_start + tokens > 128 ||
+        kv_token_start < 0 || kv_token_start + tokens > 512 ||
         (kv_cache == nullptr && kv_token_start != 0) ||
         (device_input == nullptr ?
             layer_input.size() != size_t(hidden * tokens) :

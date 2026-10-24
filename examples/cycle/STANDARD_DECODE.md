@@ -36,7 +36,7 @@ The original `llama-cycle-cli` remains available for A/B regression.
    and the fixed Cycle placement environment. Other models' `llama_decode`
    implementation is unchanged.
 3. Single causal sequence 0, sequential **absolute** token positions.
-   A decode batch is limited to 64 tokens. Max total KV is 128 tokens.
+   A decode batch is limited to 64 tokens. Max total KV is 512 tokens (128 by default).
    Only the last token may request output Logits. Full all-position logits,
    multi-sequence, packed multi-user batches and layer embeddings are rejected.
 4. The physical KV state is owned by the Cycle Session, not by ordinary
@@ -48,7 +48,7 @@ The original `llama-cycle-cli` remains available for A/B regression.
    or create a fresh Context. Reset returns false on ordinary Contexts
    and on poisoned Cycle Contexts.
 5. This mode does NOT support speculative sampling, backend samplers,
-   LoRA hot-swap, noncausal attention, extra Context features or >128 KV.
+   LoRA hot-swap, noncausal attention, extra Context features or >512 KV.
    The default Context path must not attempt to execute the fixed Cycle
    layout using Meta.
 6. Failure after partial physical KV execution is fatal for that context.
@@ -60,3 +60,10 @@ The original `llama-cycle-cli` remains available for A/B regression.
 The stage dispatcher, physical KV, GPU/CPU ownership, and two-way RPC remain
 exactly those used by `llama-cycle-cli`. The old test harness is preserved
 until this public API route passes compilation and real PC/Phone tests.
+
+
+The public Context accepts `n_ctx=256` or `n_ctx=512` for an explicit
+larger physical KV session; `n_ctx=0` still selects the previously verified
+128-token default. Values above 512 are rejected rather than silently
+clamped. Physical Attention and CPU/Phone GPU precision at >128 positions
+still require real-device verification.

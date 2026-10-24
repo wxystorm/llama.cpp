@@ -93,8 +93,8 @@ struct llama_hybrid_cycle_attention_phase_profile {
 LLAMA_API uint64_t llama_hybrid_cycle_graph_replay_uid();
 
 // Physical Qwen3-MoE attention/router, one contiguous causal Chunk.
-// The 128-token cap and KV limitations are unchanged from the V5 probe;
-// this function is not yet a full llama_decode implementation.
+// Physical K/V may contain up to 512 historical tokens. One Attention call
+// still processes a small Chunk (<=16 tokens in native Cycle Forward).
 LLAMA_API bool llama_hybrid_cycle_execute_attention_pre(
         ggml_backend_t backend, const llama_layer & layer,
         const llama_hparams & hp, const std::vector<float> & layer_input,

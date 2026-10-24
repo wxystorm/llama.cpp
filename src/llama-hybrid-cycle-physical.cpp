@@ -149,7 +149,7 @@ bool llama_hybrid_cycle_physical_kv_cache::init(ggml_backend_t backend,
             llama_hybrid_cycle_resolve_physical_weight(
                 layer.wk, backend, source_device);
         if (!backend || !norm || !wk ||
-            total_tokens <= 0 || total_tokens > 128 ||
+            total_tokens <= 0 || total_tokens > 512 ||
             norm->ne[0] <= 0 || wk->ne[1] % norm->ne[0] != 0) {
             return false;
         }

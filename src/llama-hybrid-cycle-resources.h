@@ -26,12 +26,16 @@ LLAMA_API bool llama_hybrid_cycle_select_cuda_full_layers(
     std::string & reason);
 
 struct llama_hybrid_cycle_resource_config {
-    int64_t kv_tokens = 64;             // Existing physical Attention cap: 128.
+    int64_t kv_tokens = 64;             // Physical KV supports <=512 tokens.
     int max_inflight = 2;               // Graph/Scratch credit slots per layer.
     size_t cuda_weight_budget_bytes = 0; // 0 -> CPU fallback, never mirror all.
     size_t cuda_safety_reserve_bytes = 512ULL * 1024 * 1024;
     bool attention_graph_cache = true;
     bool attention_scratch_pool = true;
+    // Keep any legacy positional aggregate initializers in their original
+    // order above; the new optional knob is deliberately appended last.
+    // The Graph-cache OWNER remains present per layer even when max_graphs=0.
+    size_t attention_graph_cache_max_graphs = 16;
 };
 
 // Backend and model pointers are borrowed. Their owners MUST outlive this

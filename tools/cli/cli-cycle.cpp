@@ -82,11 +82,11 @@ int cli_cycle_run(common_params & params) {
             "reason=REQUIRES_LOCAL_GGUF_MODEL_PATH\n");
         return 2;
     }
-    if (params.n_ctx < 0 || params.n_ctx > 128 ||
+    if (params.n_ctx < 0 || params.n_ctx > 512 ||
         params.n_batch < 1 || params.n_ubatch < 1) {
         std::fprintf(stderr,
             "[CYCLE_OFFICIAL_CLI] status=FAIL "
-            "reason=PHYSICAL_CONTEXT_128_AND_POSITIVE_BATCH_REQUIRED\n");
+            "reason=PHYSICAL_CONTEXT_512_AND_POSITIVE_BATCH_REQUIRED\n");
         return 2;
     }
     if (params.n_predict < -2) {

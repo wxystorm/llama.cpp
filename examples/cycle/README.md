@@ -52,8 +52,11 @@ returns **one next-token logit decision**.
   [STANDARD_DECODE.md](STANDARD_DECODE.md). The Context uses the very same
   physical Cycle forward and owns its own physical KV. Standard
   `llama_memory` editing/snapshot APIs are not yet supported for Cycle KV.
-- Larger context windows, multi-user batches, checkpoint/rollback and
-  sampler selection remain unimplemented.
+- The official Cycle CLI supports an experimental 256/512-token physical
+  KV allocation (the 128-token default remains); see
+  [OFFICIAL_CLI.md](OFFICIAL_CLI.md) for required real-device regression.
+  Multi-user batches, KV shift/checkpoint/rollback and server-based sampling
+  remain unimplemented. Official CLI external sampling is already connected.
 - The previously reported CPU/GPU numeric parity differences are not fixed
   or hidden; this production migration does not relax numeric tolerances.
 

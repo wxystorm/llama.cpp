@@ -56,7 +56,8 @@ LLAMA_API bool llama_hybrid_cycle_forward_prefill(
 // Persistent physical KV session for Prefill and incremental one-token Decode.
 // Every append is a new global FIFO invocation with absolute position and a
 // distinct wire epoch; all 48 physical KV tensors survive between calls.
-// Attention's current hard limit remains 128 total tokens, not long context.
+// Physical K/V supports 512 total tokens, with existing per-call <=64 and
+// per-Chunk <=16 limits; no KV shifting or multi-sequence manager yet.
 class llama_hybrid_cycle_session {
 public:
     LLAMA_API llama_hybrid_cycle_session();
