@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-ffn-shard.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "ggml-alloc.h"
 
@@ -66,7 +67,7 @@ bool llama_hybrid_cycle_execute_ffn_shard(
     bool ok = false;
     {
         const char * backend_name = ggml_backend_name(backend);
-        std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s channels=%lld nodes=%d "
+        if (llama_hybrid_cycle_verbose()) std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s channels=%lld nodes=%d "
                     "stage=PREPARE_BEGIN\n",
                     backend_name, (long long)shard.up->ne[1], ggml_graph_n_nodes(graph));
         llama_hybrid_cycle_ffn_executor executor;
@@ -167,7 +168,7 @@ bool llama_hybrid_cycle_execute_ffn_shard(
                         "reason=PHONE_REMOTE_SEND\n");
                 }
             }
-            std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
+            if (llama_hybrid_cycle_verbose()) std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
                         "elements=%zu status=%s\n",
                         backend_name, partial.size(), ok ? "OK" : "FAIL");
         }
