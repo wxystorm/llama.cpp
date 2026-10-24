@@ -632,7 +632,7 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
     }
 
     if (timing) {
-        timing->graph_build_ms =
+        timing->graph_build_ms = cache_hit ? 0.0 :
             std::chrono::duration<double, std::milli>(
                 graph_build_done - graph_build_begin).count();
         timing->alloc_ms =
@@ -647,19 +647,23 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         timing->readback_ms =
             std::chrono::duration<double, std::milli>(
                 readback_done - readback_begin).count();
-        timing->graph_nodes = ggml_graph_n_nodes(graph);
+        timing->graph_nodes = entry->graph_nodes;
+        timing->cache_hit = cache_hit;
+        timing->allocator_bytes = cache_impl->allocator_size();
     }
 
     if (llama_hybrid_cycle_verbose()) {
         std::printf(
             "[CYCLE_PC_CUDA_REGION] layers=[%d,%d) tokens=%lld "
-            "kv_tokens=%lld graph_nodes=%d input_bytes=%zu output_bytes=%zu "
+            "kv_tokens=%lld cache=%s graph_nodes=%d "
+            "input_bytes=%zu output_bytes=%zu galloc_mib=%.3f "
             "status=PASS\n",
             first_layer, first_layer + layer_count,
             (long long)tokens, (long long)kv_tokens,
-            ggml_graph_n_nodes(graph),
+            cache_hit ? "HIT" : "MISS", entry->graph_nodes,
             input.size() * sizeof(float),
-            output.size() * sizeof(float));
+            output.size() * sizeof(float),
+            double(cache_impl->allocator_size()) / (1024.0 * 1024.0));
     }
 
     return true;
