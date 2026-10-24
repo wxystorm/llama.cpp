@@ -94,7 +94,7 @@ LLAMA_API uint64_t llama_hybrid_cycle_graph_replay_uid();
 
 // Physical Qwen3-MoE attention/router, one contiguous causal Chunk.
 // Physical K/V may contain up to 512 historical tokens. One Attention call
-// still processes a small Chunk (<=16 tokens in native Cycle Forward).
+// processes one production Chunk (<=64 tokens in native Cycle Forward).
 LLAMA_API bool llama_hybrid_cycle_execute_attention_pre(
         ggml_backend_t backend, const llama_layer & layer,
         const llama_hparams & hp, const std::vector<float> & layer_input,
