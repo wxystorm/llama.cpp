@@ -14,9 +14,11 @@
 struct llama_model;
 
 // One PC CUDA Region executes a contiguous run of ordinary Full layers as
-// ONE backend graph. The Region owns no persistent model weights; all CUDA
-// mirrors are pinned in the resource-pool LRU for the duration of the call.
-// Only the Region input/output cross the graph boundary.
+// ONE backend graph. V2 caches graph topology by (query_tokens, kv_tokens)
+// and rebinds borrowed weight/KV aliases to the current physical Region.
+// No cached graph owns model weights, so the bounded CUDA LRU may continue
+// evicting/reloading mirrors between calls. Only Region input/output cross
+// the graph boundary.
 struct llama_hybrid_cycle_pc_region_timing {
     double graph_build_ms = 0.0;
     double alloc_ms = 0.0;
