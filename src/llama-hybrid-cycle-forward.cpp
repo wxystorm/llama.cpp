@@ -534,7 +534,8 @@ static bool cycle_core_evaluate_with_kv(
                                                     if (*it && (*it)->is_full_layer &&
                                                         (*it)->prepared_tokens ==
                                                             state.tokens &&
-                                                        !(*it)->fused_full_graph) {
+                                                        (*it)->fused_full_graph &&
+                                                        (*it)->registered_full_graph_uid != 0) {
                                                         full_slot = std::move(*it);
                                                         idle.erase(it);
                                                         ++phone_full_slot_reuse;
@@ -545,6 +546,12 @@ static bool cycle_core_evaluate_with_kv(
                                                     full_slot = std::make_unique<
                                                         llama_hybrid_cycle_phone_ffn_slot>();
                                                 }
+                                                // Bind Protocol 28 once; prepare() keeps
+                                                // these hooks across slot release/rebuild.
+                                                full_slot->rpc_ops.register_graph =
+                                                    &ggml_backend_rpc_cycle_register_graph;
+                                                full_slot->rpc_ops.run_full =
+                                                    &ggml_backend_rpc_cycle_run_phone_full;
                                                 std::function<void(
                                                     const ggml_tensor *,
                                                     const ggml_tensor *,
@@ -569,7 +576,8 @@ static bool cycle_core_evaluate_with_kv(
                                                     };
                                                 }
                                                 valid = llama_hybrid_cycle_execute_phone_full(
-                                                    *model, *r, phone, l,
+                                                    *model, *r, phone, l, c,
+                                                    state.wire.seq,
                                                     state.start, state.tokens,
                                                     predecessor, state.ready,
                                                     *full_slot, stage_probe);
