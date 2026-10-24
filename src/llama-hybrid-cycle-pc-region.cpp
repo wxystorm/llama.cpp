@@ -245,11 +245,12 @@ llama_hybrid_cycle_pc_region_cache::~llama_hybrid_cycle_pc_region_cache() {
     if (impl_ && llama_hybrid_cycle_verbose()) {
         std::printf(
             "[CYCLE_PC_CUDA_REGION_CACHE_SUM] hits=%llu builds=%llu "
-            "evictions=%llu allocator_grows=%llu galloc_mib=%.3f "
+            "evictions=%llu incompatible=%llu allocator_grows=%llu galloc_mib=%.3f "
             "max_graphs=%zu status=PASS\n",
             (unsigned long long) impl_->hit_count,
             (unsigned long long) impl_->build_count,
             (unsigned long long) impl_->eviction_count,
+            (unsigned long long) impl_->incompatible_count,
             (unsigned long long) impl_->allocator_grow_count,
             double(impl_->allocator_size()) / (1024.0 * 1024.0),
             impl_->max_graphs);
@@ -266,6 +267,10 @@ uint64_t llama_hybrid_cycle_pc_region_cache::builds() const {
 
 uint64_t llama_hybrid_cycle_pc_region_cache::evictions() const {
     return impl_ ? impl_->eviction_count : 0;
+}
+
+uint64_t llama_hybrid_cycle_pc_region_cache::incompatible() const {
+    return impl_ ? impl_->incompatible_count : 0;
 }
 
 uint64_t llama_hybrid_cycle_pc_region_cache::allocator_grows() const {
@@ -983,6 +988,7 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
                     cache_stats->hits = region_cache->hits();
                     cache_stats->builds = region_cache->builds();
                     cache_stats->evictions = region_cache->evictions();
+                    cache_stats->incompatible = region_cache->incompatible();
                     cache_stats->allocator_grows =
                         region_cache->allocator_grows();
                     cache_stats->allocator_bytes =
@@ -995,7 +1001,8 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
                         "alloc_ms=%.3f input_ms=%.3f compute_ms=%.3f "
                         "readback_ms=%.3f nodes=%d galloc_mib=%.3f "
                         "cache_hits=%llu cache_builds=%llu "
-                        "cache_evictions=%llu allocator_grows=%llu "
+                        "cache_evictions=%llu cache_incompatible=%llu "
+                        "allocator_grows=%llu "
                         "status=PASS\n",
                         begin, end, task.chunk,
                         timing.cache_hit ? "HIT" : "MISS",
@@ -1006,6 +1013,7 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
                         (unsigned long long) region_cache->hits(),
                         (unsigned long long) region_cache->builds(),
                         (unsigned long long) region_cache->evictions(),
+                        (unsigned long long) region_cache->incompatible(),
                         (unsigned long long) region_cache->allocator_grows());
                 }
                 return true;
