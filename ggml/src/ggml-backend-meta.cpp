@@ -11331,6 +11331,31 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
+
+        // C2P decode FFN can appear as a PHONE_ONLY_SG because its terminal
+        // ffn_moe_out node is Phone-active, even though the PC Router and PC
+        // expert shard must execute first.  Detect this boundary explicitly
+        // instead of relying on the terminal node's COMPUTE flag.
+        int c2p_decode_ffn_layer = -1;
+        bool c2p_decode_ffn_sg = false;
+        if (n_backends == 2 && is_phone_only_sg) {
+            ggml_cgraph * phone_decode_graph =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            if (phone_decode_graph != nullptr &&
+                    phone_decode_graph->n_nodes > 0) {
+                ggml_tensor * last = phone_decode_graph->nodes[
+                    phone_decode_graph->n_nodes - 1];
+                int parsed = 0;
+                c2p_decode_ffn_sg =
+                    last->ne[1] == 1 &&
+                    std::sscanf(
+                        last->name, "ffn_moe_out-%d%n",
+                        &c2p_decode_ffn_layer, &parsed) == 1 &&
+                    last->name[parsed] == '\0' &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, c2p_decode_ffn_layer);
+            }
+        }
 if (pipeline_debug && is_prefill_norm_sg) {
     auto * g_pc =
         backend_ctx->backend_configs[0]
@@ -12567,6 +12592,106 @@ auto prefill_norm_sg_has_prework =
                 g->nodes[g->n_nodes - 1]->name,
                 g->n_nodes);
         }
+    } else if (c2p_decode_ffn_sg) {
+        // C2P decode is NOT a Phone-only FFN even though the terminal
+        // ffn_moe_out node is Phone-active.  The shared Router is PC-owned,
+        // followed by two expert shards and a Phone-owned final reduction.
+        // Execute PC graph first to materialize its TopK/weights and shard.
+        // Copy the routing outputs, then run the Phone expert graph.
+        if (pipeline_debug) {
+            printf(
+                "[REGION_C2P_DECODE_EXEC] layer=%d sg=%zu "
+                "phase=PC_BEGIN status=BEGIN\n",
+                c2p_decode_ffn_layer, i);
+        }
+
+        compute_workers.start(0, i);
+        const ggml_status c2p_pc_status = compute_workers.wait(0);
+        ggml_status c2p_phone_status = GGML_STATUS_SUCCESS;
+
+        if (c2p_pc_status == GGML_STATUS_SUCCESS) {
+            char topk_name[96];
+            char weights_name[96];
+            std::snprintf(
+                topk_name, sizeof(topk_name),
+                "c2p_moe_route_topk-%d", c2p_decode_ffn_layer);
+            std::snprintf(
+                weights_name, sizeof(weights_name),
+                "c2p_moe_route_weights-%d", c2p_decode_ffn_layer);
+
+            ggml_tensor * src_topk =
+                find_exact_named_tensor(0, topk_name);
+            ggml_tensor * dst_topk =
+                find_exact_named_tensor(1, topk_name);
+            ggml_tensor * src_weights =
+                find_exact_named_tensor(0, weights_name);
+            ggml_tensor * dst_weights =
+                find_exact_named_tensor(1, weights_name);
+
+            GGML_ASSERT(src_topk != nullptr);
+            GGML_ASSERT(dst_topk != nullptr);
+            GGML_ASSERT(src_weights != nullptr);
+            GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(src_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(dst_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(
+                ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
+            GGML_ASSERT(
+                ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
+
+            auto & pc_cfg = backend_ctx->backend_configs[0];
+            auto & phone_cfg = backend_ctx->backend_configs[1];
+
+            ggml_backend_synchronize(pc_cfg.backend);
+            const int64_t topk_begin_us = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, phone_cfg.backend,
+                src_topk, dst_topk);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t topk_us = ggml_time_us() - topk_begin_us;
+            record_copy_wait(topk_us);
+            record_meta_copy(i, 0, 1, src_topk, topk_us);
+            record_direct_copy();
+
+            const int64_t weights_begin_us = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, phone_cfg.backend,
+                src_weights, dst_weights);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t weights_us = ggml_time_us() - weights_begin_us;
+            record_copy_wait(weights_us);
+            record_meta_copy(i, 0, 1, src_weights, weights_us);
+            record_direct_copy();
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_ROUTE] layer=%d chunk=-1 "
+                    "direction=PC_TO_PHONE "
+                    "topk_bytes=%zu weights_bytes=%zu "
+                    "topk_ms=%.3f weights_ms=%.3f "
+                    "owner=PC trigger=DECODE_PHONE_SG status=OK\n",
+                    c2p_decode_ffn_layer,
+                    ggml_nbytes(src_topk),
+                    ggml_nbytes(src_weights),
+                    topk_us / 1000.0,
+                    weights_us / 1000.0);
+            }
+
+            compute_workers.start(1, i);
+            c2p_phone_status = compute_workers.wait(1);
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_DECODE_EXEC] layer=%d sg=%zu "
+                    "phase=PHONE_END status=%d\n",
+                    c2p_decode_ffn_layer, i, (int) c2p_phone_status);
+            }
+        }
+
+        compute_status =
+            c2p_pc_status != GGML_STATUS_SUCCESS ?
+                c2p_pc_status : c2p_phone_status;
     } else if (is_phone_only_sg) {
         size_t phone_block_end = i;
         int first_fused_layer = -1;
