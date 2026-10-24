@@ -87,6 +87,21 @@ bool llama_hybrid_cycle_run_fifo(
                 }
                 continue;
             }
+            // FULL_LAYER can release the predecessor credit before its FFN
+            // finishes. The Ring owns the exactly-once accounting; signal()
+            // wakes a different worker immediately if that release admits work.
+            if (credit_until_handoff &&
+                task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+                task.layer > 0) {
+                const int layer = task.layer;
+                const int chunk = task.chunk;
+                task.input_consumed = [&ring, &signal, layer, chunk] {
+                    const bool released =
+                        ring.mark_full_input_consumed(layer, chunk);
+                    if (released) signal();
+                    return released;
+                };
+            }
             const auto execute_begin = std::chrono::steady_clock::now();
             if (stats && task.queued_at.time_since_epoch().count() != 0) {
                 const double queue_wait_ms =
