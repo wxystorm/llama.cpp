@@ -53,7 +53,7 @@ LLAMA_API bool llama_hybrid_cycle_forward_prefill(
     std::string & reason,
     llama_hybrid_cycle_forward_metrics * metrics = nullptr,
     int chunk_tokens = 64,
-    int max_inflight = 2);
+    int max_inflight = 0);
 
 // Persistent physical KV session for Prefill and incremental one-token Decode.
 // Every append is a new global FIFO invocation with absolute position and a
@@ -71,7 +71,7 @@ public:
     LLAMA_API bool prepare(const llama_model & model, ggml_backend_t cpu,
                  ggml_backend_t phone_rpc_gpu, int64_t max_total_tokens,
                  std::string & reason,
-                 int chunk_tokens = 64, int max_inflight = 2,
+                 int chunk_tokens = 64, int max_inflight = 0,
                  ggml_backend_t pc_cuda = nullptr,
                  size_t cuda_weight_budget_bytes = 0);
 
@@ -104,6 +104,6 @@ private:
     int64_t capacity_ = 0;
     uint64_t wire_epoch_ = 0;
     int chunk_tokens_ = 64;
-    int max_inflight_ = 2;
+    int max_inflight_ = 0;
     bool poisoned_ = false;
 };
