@@ -15321,6 +15321,7 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_prefix_graph = nullptr;
             int c2p_pc_route_stop = -1;
             bool c2p_parallel_ready = false;
+            bool c2p_route_pretransferred = false;
             ggml_cgraph * c2p_pc_suffix_graph = nullptr;
             bool c2p_pc_ffn_started_early = false;
             uint64_t c2p_pc_main_task = 0;
@@ -15339,14 +15340,18 @@ auto prefill_norm_sg_has_prework =
                     "c2p_prefill_route_weights_chunk_%d-%d",
                     prefill_down_chunk, prefill_down_layer);
 
+                // A full-graph hard split may place Router/TopK in the
+                // preceding subgraph while the directional down chunk is the
+                // current subgraph. Names are unique by (layer, chunk), so
+                // resolve them across the whole Meta graph.
                 c2p_src_topk =
-                    find_sg_named_tensor(0, i, topk_name);
+                    find_exact_named_tensor(0, topk_name);
                 c2p_dst_topk =
-                    find_sg_named_tensor(1, i, topk_name);
+                    find_exact_named_tensor(1, topk_name);
                 c2p_src_weights =
-                    find_sg_named_tensor(0, i, weights_name);
+                    find_exact_named_tensor(0, weights_name);
                 c2p_dst_weights =
-                    find_sg_named_tensor(1, i, weights_name);
+                    find_exact_named_tensor(1, weights_name);
 
                 GGML_ASSERT(c2p_src_topk != nullptr);
                 GGML_ASSERT(c2p_dst_topk != nullptr);
@@ -15363,76 +15368,100 @@ auto prefill_norm_sg_has_prework =
                     ggml_are_same_layout(
                         c2p_src_weights, c2p_dst_weights));
 
-                const size_t route_slot =
-                    static_cast<size_t>(
-                        std::max(0, prefill_down_chunk));
-                auto & c2p_slots =
-                    backend_ctx->backend_configs[0].
-                        c2p_route_stage_bufs;
-                if (c2p_slots.size() <= route_slot) {
-                    c2p_slots.resize(route_slot + 1);
-                }
-
-                bind_c2p_route_storage(
-                    c2p_src_topk,
-                    c2p_slots[route_slot][0],
-                    c2p_bindings);
-                bind_c2p_route_storage(
-                    c2p_src_weights,
-                    c2p_slots[route_slot][1],
-                    c2p_bindings);
-
-                // Rebinding graph tensors changes their backing addresses.
-                // Force the local backend to rebuild/rebind this graph instead
-                // of reusing a cached graph prepared for the old arena.
                 c2p_pc_graph =
                     backend_ctx->backend_configs[0]
                         .cgraphs[i].cgraph_main;
                 if (c2p_pc_graph != nullptr) {
                     c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
 
-                    if (region_parallel_ffn) {
-                        const int topk_index =
-                            graph_node_index(
-                                c2p_pc_graph, c2p_src_topk);
-                        const int weights_index =
-                            graph_node_index(
-                                c2p_pc_graph, c2p_src_weights);
-                        c2p_pc_route_stop =
-                            std::max(topk_index, weights_index) + 1;
-                        c2p_parallel_ready =
-                            topk_index >= 0 &&
-                            weights_index >= 0 &&
-                            c2p_pc_route_stop > 0 &&
-                            c2p_pc_route_stop < c2p_pc_graph->n_nodes;
-                        if (c2p_parallel_ready) {
-                            c2p_pc_prefix_graph =
-                                build_region_graph_slice(
-                                    c2p_pc_graph,
-                                    0,
-                                    c2p_pc_route_stop,
-                                    i,
-                                    0x4352505052454649ULL);
-                        }
-                    }
+                    const int topk_index =
+                        graph_node_index(
+                            c2p_pc_graph, c2p_src_topk);
+                    const int weights_index =
+                        graph_node_index(
+                            c2p_pc_graph, c2p_src_weights);
 
-                    if (!c2p_parallel_ready) {
-                        // Serial fallback keeps the old cache invalidation
-                        // because Router tensors were rebound to private storage.
-                        c2p_pc_graph->uid = 0;
+                    // Full-graph directional hard split:
+                    // Router was already produced/copied by the preceding
+                    // generic C2P route subgraph. The current graph contains
+                    // only FFN/down work, so reusing that transfer is both
+                    // correct and avoids a duplicate Router copy.
+                    c2p_route_pretransferred =
+                        topk_index < 0 &&
+                        weights_index < 0;
+
+                    if (!c2p_route_pretransferred) {
+                        const size_t route_slot =
+                            static_cast<size_t>(
+                                std::max(0, prefill_down_chunk));
+                        auto & c2p_slots =
+                            backend_ctx->backend_configs[0].
+                                c2p_route_stage_bufs;
+                        if (c2p_slots.size() <= route_slot) {
+                            c2p_slots.resize(route_slot + 1);
+                        }
+
+                        bind_c2p_route_storage(
+                            c2p_src_topk,
+                            c2p_slots[route_slot][0],
+                            c2p_bindings);
+                        bind_c2p_route_storage(
+                            c2p_src_weights,
+                            c2p_slots[route_slot][1],
+                            c2p_bindings);
+
+                        if (region_parallel_ffn) {
+                            c2p_pc_route_stop =
+                                std::max(
+                                    topk_index,
+                                    weights_index) + 1;
+                            c2p_parallel_ready =
+                                topk_index >= 0 &&
+                                weights_index >= 0 &&
+                                c2p_pc_route_stop > 0 &&
+                                c2p_pc_route_stop <
+                                    c2p_pc_graph->n_nodes;
+                            if (c2p_parallel_ready) {
+                                c2p_pc_prefix_graph =
+                                    build_region_graph_slice(
+                                        c2p_pc_graph,
+                                        0,
+                                        c2p_pc_route_stop,
+                                        i,
+                                        0x4352505052454649ULL);
+                            }
+                        }
+
+                        if (!c2p_parallel_ready) {
+                            // Rebinding Router tensors changes their backing
+                            // addresses, so only the legacy same-SG path needs
+                            // cache invalidation.
+                            c2p_pc_graph->uid = 0;
+                        }
                     }
                 }
 
                 if (pipeline_debug) {
-                    printf(
-                        "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
-                        "topk_bytes=%zu weights_bytes=%zu "
-                        "trigger=PREFILL_DOWN status=READY\n",
-                        prefill_down_layer,
-                        prefill_down_chunk,
-                        i,
-                        ggml_nbytes(c2p_src_topk),
-                        ggml_nbytes(c2p_src_weights));
+                    if (c2p_route_pretransferred) {
+                        printf(
+                            "[REGION_C2P_ROUTE_REUSE] "
+                            "layer=%d chunk=%d sg=%zu "
+                            "source=PREVIOUS_SG "
+                            "status=REUSE_PRETRANSFERRED\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i);
+                    } else {
+                        printf(
+                            "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                            "topk_bytes=%zu weights_bytes=%zu "
+                            "trigger=PREFILL_DOWN status=READY\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i,
+                            ggml_nbytes(c2p_src_topk),
+                            ggml_nbytes(c2p_src_weights));
+                    }
                 }
             }
 
@@ -15515,130 +15544,142 @@ auto prefill_norm_sg_has_prework =
 
                     ggml_backend_synchronize(pc_cfg.backend);
 
-                    if (region_route_overlap &&
-                            c2p_parallel_ready) {
-                        c2p_route_topk_host.resize(
-                            ggml_nbytes(c2p_src_topk));
-                        c2p_route_weights_host.resize(
-                            ggml_nbytes(c2p_src_weights));
-                        ggml_backend_tensor_get(
-                            c2p_src_topk,
-                            c2p_route_topk_host.data(),
-                            0,
-                            c2p_route_topk_host.size());
-                        ggml_backend_tensor_get(
-                            c2p_src_weights,
-                            c2p_route_weights_host.data(),
-                            0,
-                            c2p_route_weights_host.size());
+                    if (!c2p_route_pretransferred) {
+                        if (region_route_overlap &&
+                                c2p_parallel_ready) {
+                            c2p_route_topk_host.resize(
+                                ggml_nbytes(c2p_src_topk));
+                            c2p_route_weights_host.resize(
+                                ggml_nbytes(c2p_src_weights));
+                            ggml_backend_tensor_get(
+                                c2p_src_topk,
+                                c2p_route_topk_host.data(),
+                                0,
+                                c2p_route_topk_host.size());
+                            ggml_backend_tensor_get(
+                                c2p_src_weights,
+                                c2p_route_weights_host.data(),
+                                0,
+                                c2p_route_weights_host.size());
 
-                        c2p_pc_suffix_graph =
-                            build_region_graph_slice(
-                                c2p_pc_graph,
-                                c2p_pc_route_stop,
-                                c2p_pc_graph->n_nodes,
-                                i,
-                                0x4352505355464649ULL);
-                        if (region_priority_queues) {
-                            c2p_pc_main_task =
-                                get_region_exec_worker(0)->enqueue(
-                                    c2p_pc_suffix_graph,
-                                    true);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[REGION_EXEC_QUEUE] side=PC "
-                                    "queue=MAIN priority=HIGH "
-                                    "direction=C2P role=OUTGOING_FFN "
-                                    "layer=%d chunk=%d task=%" PRIu64
-                                    " status=ENQUEUED\n",
-                                    prefill_down_layer,
-                                    prefill_down_chunk,
-                                    c2p_pc_main_task);
+                            c2p_pc_suffix_graph =
+                                build_region_graph_slice(
+                                    c2p_pc_graph,
+                                    c2p_pc_route_stop,
+                                    c2p_pc_graph->n_nodes,
+                                    i,
+                                    0x4352505355464649ULL);
+                            if (region_priority_queues) {
+                                c2p_pc_main_task =
+                                    get_region_exec_worker(0)->enqueue(
+                                        c2p_pc_suffix_graph,
+                                        true);
+                                if (pipeline_debug) {
+                                    printf(
+                                        "[REGION_EXEC_QUEUE] side=PC "
+                                        "queue=MAIN priority=HIGH "
+                                        "direction=C2P role=OUTGOING_FFN "
+                                        "layer=%d chunk=%d task=%" PRIu64
+                                        " status=ENQUEUED\n",
+                                        prefill_down_layer,
+                                        prefill_down_chunk,
+                                        c2p_pc_main_task);
+                                }
+                            } else {
+                                compute_workers.start_graph(
+                                    0, c2p_pc_suffix_graph);
                             }
-                        } else {
-                            compute_workers.start_graph(
-                                0, c2p_pc_suffix_graph);
+                            c2p_pc_ffn_started_early = true;
                         }
-                        c2p_pc_ffn_started_early = true;
-                    }
 
-                    const int64_t topk_begin_us = ggml_time_us();
-                    if (c2p_pc_ffn_started_early) {
-                        ggml_backend_tensor_set(
-                            c2p_dst_topk,
-                            c2p_route_topk_host.data(),
-                            0,
-                            c2p_route_topk_host.size());
-                    } else {
-                        ggml_backend_tensor_copy_async(
-                            pc_cfg.backend,
-                            phone_cfg.backend,
-                            c2p_src_topk,
-                            c2p_dst_topk);
-                        ggml_backend_synchronize(phone_cfg.backend);
-                    }
-                    const int64_t topk_us =
-                        ggml_time_us() - topk_begin_us;
-                    record_copy_wait(topk_us);
-                    record_meta_copy(
-                        i, 0, 1, c2p_src_topk, topk_us);
-                    record_direct_copy();
+                        const int64_t topk_begin_us = ggml_time_us();
+                        if (c2p_pc_ffn_started_early) {
+                            ggml_backend_tensor_set(
+                                c2p_dst_topk,
+                                c2p_route_topk_host.data(),
+                                0,
+                                c2p_route_topk_host.size());
+                        } else {
+                            ggml_backend_tensor_copy_async(
+                                pc_cfg.backend,
+                                phone_cfg.backend,
+                                c2p_src_topk,
+                                c2p_dst_topk);
+                            ggml_backend_synchronize(phone_cfg.backend);
+                        }
+                        const int64_t topk_us =
+                            ggml_time_us() - topk_begin_us;
+                        record_copy_wait(topk_us);
+                        record_meta_copy(
+                            i, 0, 1, c2p_src_topk, topk_us);
+                        record_direct_copy();
 
-                    const int64_t weights_begin_us = ggml_time_us();
-                    if (c2p_pc_ffn_started_early) {
-                        ggml_backend_tensor_set(
-                            c2p_dst_weights,
-                            c2p_route_weights_host.data(),
-                            0,
-                            c2p_route_weights_host.size());
-                    } else {
-                        ggml_backend_tensor_copy_async(
-                            pc_cfg.backend,
-                            phone_cfg.backend,
-                            c2p_src_weights,
-                            c2p_dst_weights);
-                        ggml_backend_synchronize(phone_cfg.backend);
-                    }
-                    const int64_t weights_us =
-                        ggml_time_us() - weights_begin_us;
-                    record_copy_wait(weights_us);
-                    record_meta_copy(
-                        i, 0, 1, c2p_src_weights, weights_us);
-                    record_direct_copy();
+                        const int64_t weights_begin_us = ggml_time_us();
+                        if (c2p_pc_ffn_started_early) {
+                            ggml_backend_tensor_set(
+                                c2p_dst_weights,
+                                c2p_route_weights_host.data(),
+                                0,
+                                c2p_route_weights_host.size());
+                        } else {
+                            ggml_backend_tensor_copy_async(
+                                pc_cfg.backend,
+                                phone_cfg.backend,
+                                c2p_src_weights,
+                                c2p_dst_weights);
+                            ggml_backend_synchronize(phone_cfg.backend);
+                        }
+                        const int64_t weights_us =
+                            ggml_time_us() - weights_begin_us;
+                        record_copy_wait(weights_us);
+                        record_meta_copy(
+                            i, 0, 1, c2p_src_weights, weights_us);
+                        record_direct_copy();
 
-                    directional_wire_parity("C2P", 
-                        prefill_down_layer, prefill_down_chunk,
-                        "ROUTER_TOPK", 0, 1,
-                        c2p_src_topk, c2p_dst_topk);
-                    directional_wire_parity("C2P", 
-                        prefill_down_layer, prefill_down_chunk,
-                        "ROUTER_WEIGHTS", 0, 1,
-                        c2p_src_weights, c2p_dst_weights);
+                        directional_wire_parity("C2P", 
+                            prefill_down_layer, prefill_down_chunk,
+                            "ROUTER_TOPK", 0, 1,
+                            c2p_src_topk, c2p_dst_topk);
+                        directional_wire_parity("C2P", 
+                            prefill_down_layer, prefill_down_chunk,
+                            "ROUTER_WEIGHTS", 0, 1,
+                            c2p_src_weights, c2p_dst_weights);
 
-                    if (ab_trace_requested &&
-                            prefill_down_layer == ab_trace_layer &&
-                            ab_full_tokens() >= ab_min_tokens) {
-                        ab_dump_tensor(
-                            1, prefill_down_chunk,
-                            "router_topk", c2p_dst_topk);
-                        ab_dump_tensor(
-                            1, prefill_down_chunk,
-                            "router_weights", c2p_dst_weights);
-                    }
+                        if (ab_trace_requested &&
+                                prefill_down_layer == ab_trace_layer &&
+                                ab_full_tokens() >= ab_min_tokens) {
+                            ab_dump_tensor(
+                                1, prefill_down_chunk,
+                                "router_topk", c2p_dst_topk);
+                            ab_dump_tensor(
+                                1, prefill_down_chunk,
+                                "router_weights", c2p_dst_weights);
+                        }
 
-                    if (pipeline_debug) {
+                        if (pipeline_debug) {
+                            printf(
+                                "[REGION_C2P_ROUTE] layer=%d chunk=%d "
+                                "direction=PC_TO_PHONE "
+                                "topk_bytes=%zu weights_bytes=%zu "
+                                "topk_ms=%.3f weights_ms=%.3f "
+                                "owner=PC trigger=PREFILL_DOWN status=OK\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                ggml_nbytes(c2p_src_topk),
+                                ggml_nbytes(c2p_src_weights),
+                                topk_us / 1000.0,
+                                weights_us / 1000.0);
+                        }
+
+
+                    } else if (pipeline_debug) {
                         printf(
                             "[REGION_C2P_ROUTE] layer=%d chunk=%d "
-                            "direction=PC_TO_PHONE "
-                            "topk_bytes=%zu weights_bytes=%zu "
-                            "topk_ms=%.3f weights_ms=%.3f "
-                            "owner=PC trigger=PREFILL_DOWN status=OK\n",
+                            "direction=PC_TO_PHONE owner=PC "
+                            "trigger=PREVIOUS_SG action=REUSE "
+                            "status=OK\n",
                             prefill_down_layer,
-                            prefill_down_chunk,
-                            ggml_nbytes(c2p_src_topk),
-                            ggml_nbytes(c2p_src_weights),
-                            topk_us / 1000.0,
-                            weights_us / 1000.0);
+                            prefill_down_chunk);
                     }
 
                     if (c2p_parallel_ready) {
