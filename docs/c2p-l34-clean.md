@@ -70,3 +70,42 @@ binaries; verify both Git commit SHAs before runtime tests.
 
 There is no claim that this commit was compiled, run on Windows/Termux or
 validated for numerical parity yet.
+
+
+## End-to-end correctness localization
+
+Do not use a Phone-only layer such as L46 as the A/B trace target for this
+layout. Trace the actual C2P boundary:
+
+```powershell
+$env:GGML_META_AB_TRACE_LAYER = "34"
+$env:GGML_META_AB_MIN_TOKENS = "16"
+$env:GGML_META_AB_DUMP_DIR = "ab-c2p"
+```
+
+Run the same prompt, context, token limit, temperature and seed once with this
+C2P branch and once with a known-correct baseline. Use a different dump
+directory for the baseline (for example `ab-baseline`).
+
+The diagnostic now captures the authoritative Phone-owned L34 `l_out`
+immediately after the final C2P reduce. It also captures `next_input` and
+`next_norm` only after the subgraph containing `norm-35` has completed; the
+old pre-compute `l47_input` capture could observe stale arena storage.
+
+```powershell
+python tools/compare_region_ab.py ab-c2p ab-baseline --tokens 358
+python tools/compare_token_logits.py c2p.log baseline.log
+```
+
+Interpret the first mismatch in order:
+
+1. `ffn_norm`: L34 activation/normalization is already wrong.
+2. `router_topk` / `router_weights`: Router handoff is the first divergence.
+3. `partial` / combined FFN: expert shard computation diverges.
+4. `l_out`: C2P fold/reduce or ownership is wrong.
+5. `next_norm`: the L35 consumer path is wrong even if L34 `l_out` is valid.
+6. Tensor stages match but token logits diverge: continue downstream toward the
+   Phone-only tail, L47 handoff, output norm and LM head.
+
+Do not begin FFN overlap/windowing work until the first token-divergence point is
+understood.

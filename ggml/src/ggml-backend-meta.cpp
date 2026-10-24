@@ -9753,6 +9753,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         max_abs_diff <= 1e-4 ? "PASS" : "FAIL");
                 }
 
+                if (last_chunk &&
+                        ab_trace_requested &&
+                        prefill_down_layer_0 == ab_trace_layer &&
+                        ab_full_tokens() >= ab_min_tokens) {
+                    // This is the authoritative C2P layer output: all chunks
+                    // have been reduced into the Phone-owned l_out buffer.
+                    ab_dump_tensor(1, -1, "l_out", phone_l_out);
+                    printf(
+                        "[AB_C2P_L_OUT_READY] layer=%d tokens=%" PRId64
+                        " owner=PHONE tensor=%s status=CAPTURED\n",
+                        prefill_down_layer_0,
+                        ab_full_tokens(),
+                        phone_l_out->name);
+                }
+
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
@@ -11618,7 +11633,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
-    bool ab_l47_entry_dumped = false;
+    bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t layer_wall_start_us = ggml_time_us();
@@ -11976,46 +11991,6 @@ auto prefill_norm_sg_has_prework =
 
     const int next_layer = is_prefill_down_sg ? prefill_down_layer : prefill_norm_layer;
     const int next_chunk = is_prefill_down_sg ? prefill_down_chunk : prefill_norm_chunk;
-        // Capture after the ordinary scheduler has waited for any pending
-        // prefill return/handoff. Before that barrier the B/legacy Phone
-        // activation could still contain the previous run's values.
-        // Save the exact Phone input immediately before the next full layer.
-        // This verifies that the C2P l_out buffer is the activation consumed
-        // by L47 rather than merely a correctly reduced, unused copy.
-        if (ab_trace_requested && !ab_l47_entry_dumped &&
-                ab_full_tokens() >= ab_min_tokens) {
-            ggml_cgraph * phone_g =
-                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
-            if (phone_g != nullptr) {
-                const std::string norm_name =
-                    "norm-" + std::to_string(ab_trace_layer + 1);
-                for (int k = 0; k < phone_g->n_nodes; ++k) {
-                    ggml_tensor * node = phone_g->nodes[k];
-                    if (node == nullptr ||
-                            std::strcmp(node->name,
-                                        norm_name.c_str()) != 0 ||
-                            !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                        continue;
-                    }
-                    ab_dump_tensor(1, -1, "l_out",
-                                   find_layer_output(1, ab_trace_layer));
-                    ab_dump_tensor(1, -1, "l47_input", node->src[0]);
-                    if (!ggml_backend_meta_tensor_c2p_layer(
-                            backend_ctx, ab_trace_layer)) {
-                        ab_dump_tensor(0, -1, "l_out",
-                                       find_layer_output(0, ab_trace_layer));
-                    }
-                    ab_l47_entry_dumped = true;
-                    printf("[AB_L47_ENTRY] layer=%d tokens=%" PRId64
-                           " sg=%zu norm=%s input=%s status=CAPTURED\n",
-                           ab_trace_layer, ab_full_tokens(), i,
-                           node->name,
-                           node->src[0] != nullptr ?
-                               node->src[0]->name : "(null)");
-                    break;
-                }
-            }
-        }
     const bool trace_prefill_chunk = pipeline_debug && (is_prefill_down_sg || is_prefill_norm_sg);
     const int64_t next_begin_us = ggml_time_us();
     if (trace_prefill_chunk) {
@@ -13703,6 +13678,56 @@ auto prefill_norm_sg_has_prework =
         return compute_status;
     }
 
+
+    // A/B capture must happen after this subgraph has completed. The old
+    // pre-compute L47-specific probe could read stale graph-arena storage for
+    // Phone-only layers. Capture the selected layer's output plus the actual
+    // next-layer norm input/output at the first graph that computes norm-(L+1).
+    if (ab_trace_requested && !ab_next_entry_dumped &&
+            ab_full_tokens() >= ab_min_tokens && n_backends == 2) {
+        ggml_cgraph * phone_g =
+            backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (phone_g != nullptr) {
+            const std::string norm_name =
+                "norm-" + std::to_string(ab_trace_layer + 1);
+            for (int k = 0; k < phone_g->n_nodes; ++k) {
+                ggml_tensor * node = phone_g->nodes[k];
+                if (node == nullptr ||
+                        std::strcmp(node->name, norm_name.c_str()) != 0 ||
+                        !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    continue;
+                }
+
+                // For C2P, the Phone l_out may already have been captured at
+                // the final reduce. Duplicate file names are intentionally
+                // ignored by ab_dump_tensor().
+                ab_dump_tensor(
+                    1, -1, "l_out",
+                    find_layer_output(1, ab_trace_layer));
+                if (!ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, ab_trace_layer)) {
+                    ab_dump_tensor(
+                        0, -1, "l_out",
+                        find_layer_output(0, ab_trace_layer));
+                }
+                ab_dump_tensor(1, -1, "next_input", node->src[0]);
+                ab_dump_tensor(1, -1, "next_norm", node);
+
+                ab_next_entry_dumped = true;
+                printf(
+                    "[AB_NEXT_ENTRY] layer=%d next_layer=%d tokens=%" PRId64
+                    " sg=%zu norm=%s input=%s status=CAPTURED_AFTER_COMPUTE\n",
+                    ab_trace_layer,
+                    ab_trace_layer + 1,
+                    ab_full_tokens(),
+                    i,
+                    node->name,
+                    node->src[0] != nullptr ?
+                        node->src[0]->name : "(null)");
+                break;
+            }
+        }
+    }
 
     // Both A (C2P) and B (legacy split) are sampled at precisely the same
     // pre-reduction point.  Never sample post-fold PC partials: C2P modifies

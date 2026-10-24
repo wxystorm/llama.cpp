@@ -30,7 +30,9 @@ STAGES = {
     "router_weights": 4,
     "partial": 5,
     "l_out": 6,
-    "l47_input": 7,
+    "next_input": 7,
+    "next_norm": 8,
+    "l47_input": 9,  # compatibility with older dumps
 }
 
 
@@ -342,7 +344,7 @@ def main():
                 "NOTE: Check FFN combined parity before blaming one "
                 "backend's shard: A/B can use different split rotation."
             )
-        print("Compare preceding stages, then check L47 input.")
+        print("Compare preceding stages, then check l_out/next_input/next_norm.")
     else:
         print("All shared stages match within the requested tolerance.")
         if missing_in_a or missing_in_b:
