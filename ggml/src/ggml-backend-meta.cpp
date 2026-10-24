@@ -179,6 +179,46 @@ static bool ggml_backend_meta_parse_phone_route_topk(
                        &layer, &n) == 1 && name[n] == '\0';
 }
 
+static bool ggml_backend_meta_parse_c2p_route_weights(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "c2p_prefill_route_weights_chunk_%d-%d%n",
+                    &chunk, &layer, &n) == 2 && name[n] == '\0') {
+        return true;
+    }
+
+    chunk = -1;
+    n = 0;
+    return std::sscanf(name, "c2p_moe_route_weights-%d%n",
+                       &layer, &n) == 1 && name[n] == '\0';
+}
+
+static bool ggml_backend_meta_parse_c2p_route_topk(
+        const char * name,
+        int & chunk,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(name, "c2p_prefill_route_topk_chunk_%d-%d%n",
+                    &chunk, &layer, &n) == 2 && name[n] == '\0') {
+        return true;
+    }
+
+    chunk = -1;
+    n = 0;
+    return std::sscanf(name, "c2p_moe_route_topk-%d%n",
+                       &layer, &n) == 1 && name[n] == '\0';
+}
+
 static bool ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
         const char * name,
         int & chunk,
@@ -3180,6 +3220,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     in_phone_router = false;
                     phone_router_layer = -1;
+                }
+            }
+        }
+
+        if (n_backends == 2 &&
+                !backend_ctx->tensor_c2p_layer_mask.empty()) {
+            bool in_c2p_router = false;
+            int c2p_router_layer = -1;
+
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * node = cgraph->nodes[i];
+
+                int parsed_layer = -1;
+                int parsed_chars = 0;
+                const bool router_begin =
+                    std::sscanf(node->name, "ffn_moe_logits-%d%n",
+                                &parsed_layer, &parsed_chars) == 1 &&
+                    node->name[parsed_chars] == '\0' &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, parsed_layer);
+
+                if (router_begin) {
+                    in_c2p_router = true;
+                    c2p_router_layer = parsed_layer;
+                }
+
+                if (in_c2p_router) {
+                    backend_ctx->backend_configs[0].nodes[i]->flags |=
+                        GGML_TENSOR_FLAG_COMPUTE;
+                    backend_ctx->backend_configs[1].nodes[i]->flags &=
+                        ~GGML_TENSOR_FLAG_COMPUTE;
+                }
+
+                int route_chunk = -1;
+                int route_layer = -1;
+                if (in_c2p_router &&
+                        ggml_backend_meta_parse_c2p_route_weights(
+                            node->name, route_chunk, route_layer) &&
+                        route_layer == c2p_router_layer) {
+                    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                        printf(
+                            "[REGION_C2P_ROUTER_OWNER] layer=%d chunk=%d "
+                            "begin=ffn_moe_logits end=%s owner=PC\n",
+                            route_layer, route_chunk, node->name);
+                    }
+                    in_c2p_router = false;
+                    c2p_router_layer = -1;
                 }
             }
         }
