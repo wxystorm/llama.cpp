@@ -128,8 +128,9 @@ interchangeable with Cycle physical KV.
 
 `llama-cycle-standard` and `llama-cycle-cli` remain regression tools.
 Before calling the official entry complete, verify the new
-`[CYCLE_OFFICIAL_CLI]` trace on Windows/Phone. The official 128-token route has been reported to pass on real PC/Phone
-hardware; the **256/512-token extension is not yet hardware-verified**. Existing CPU/GPU
+`[CYCLE_OFFICIAL_CLI]` trace on Windows/Phone. The former 128-token route was
+reported to pass on real PC/Phone hardware; the new **whole-Prompt / 64-token
+Chunk production path requires a fresh real-device regression**. Existing CPU/GPU
 numeric differences are not altered or reinterpreted by this migration.
 
 ## Larger physical KV: incremental verification
@@ -138,7 +139,7 @@ The former 128-token API and CLI behavior is preserved when using
 `-c 128` or omitting `-c`. To allocate additional persistent physical K/V,
 request `-c 256` or `-c 512` explicitly. The model is still loaded once;
 each new Token appends K/V to its actual absolute position on all 48 layers.
-The per-evaluation limit is now 128 tokens while the proven per-Chunk 16-token limit remains.
+The production path has no separate 64/128-token evaluation cap: one append may span the full context and the executor alone splits it into 64-token Chunks.
 
 ```powershell
 # Check the existing regression before the extension:
