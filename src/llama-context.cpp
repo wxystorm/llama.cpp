@@ -3551,6 +3551,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int tensor_phone_last_layer = -1;
     std::vector<uint8_t> tensor_phone_layer_mask(
         size_t(hparams.n_layer()), uint8_t(0));
+    std::vector<uint8_t> tensor_c2p_layer_mask(
+        size_t(hparams.n_layer()), uint8_t(0));
     bool directional_region_policy = false;
 
     // The model policy is the execution source of truth. Region Boundary V1
@@ -3561,6 +3563,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         directional_region_policy =
             directional_region_policy ||
             llama_hybrid_layer_mode_directional_tensor(mode);
+        if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+            tensor_c2p_layer_mask[size_t(il)] = 1;
+        }
         if (!llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) {
             continue;
         }
@@ -3578,6 +3583,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 tensor_phone_layer_mask.empty() ? nullptr :
                     tensor_phone_layer_mask.data(),
                 tensor_phone_layer_mask.size());
+            ggml_backend_meta_set_tensor_c2p_layer_mask(
+                backend,
+                tensor_c2p_layer_mask.empty() ? nullptr :
+                    tensor_c2p_layer_mask.data(),
+                tensor_c2p_layer_mask.size());
         } else {
             ggml_backend_meta_set_tensor_phone_primary_layers(
                 backend, tensor_phone_first_layer, tensor_phone_last_layer);
