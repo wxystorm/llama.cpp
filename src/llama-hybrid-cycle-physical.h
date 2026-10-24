@@ -16,6 +16,30 @@ struct llama_layer;
 LLAMA_API ggml_tensor * llama_hybrid_cycle_resolve_physical_weight(
     const ggml_tensor * weight, ggml_backend_t backend, size_t source_device);
 
+// Weight-independent CUDA activation owner used between adjacent PC Full
+// layers. It deliberately owns only one F32 tensor/buffer: no graph and no
+// model weight pointer may survive an LRU residency replacement.
+struct LLAMA_API llama_hybrid_cycle_cuda_activation_slot {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * tensor = nullptr;
+    ggml_backend_t backend = nullptr;
+    int64_t hidden = 0;
+    int64_t tokens = 0;
+
+    llama_hybrid_cycle_cuda_activation_slot() = default;
+    llama_hybrid_cycle_cuda_activation_slot(
+        const llama_hybrid_cycle_cuda_activation_slot &) = delete;
+    llama_hybrid_cycle_cuda_activation_slot & operator=(
+        const llama_hybrid_cycle_cuda_activation_slot &) = delete;
+    ~llama_hybrid_cycle_cuda_activation_slot() { release(); }
+
+    void release();
+    bool matches(ggml_backend_t target, int64_t h, int64_t t) const;
+    bool prepare(ggml_backend_t target, int64_t h, int64_t t);
+    bool store(const ggml_tensor * source);
+};
+
 // CUDA mirrors are explicitly per-layer and must be budgeted; the fixed
 // Cycle model's CPU weight placement is not silently moved to CUDA.
 struct LLAMA_API llama_hybrid_cycle_cuda_full_weights {
