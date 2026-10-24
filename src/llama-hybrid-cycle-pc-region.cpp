@@ -29,6 +29,7 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
         ggml_tensor * positions = nullptr;
         ggml_tensor * causal_mask = nullptr;
         ggml_tensor * output = nullptr;
+        std::vector<ggml_tensor *> transient_tensors;
         int graph_nodes = 0;
         uint64_t last_use = 0;
 
@@ -110,10 +111,21 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
         return result;
     }
 
-    bool allocate_graph(ggml_cgraph * graph) {
-        if (!allocator || !graph) return false;
+    bool allocate_graph(graph_entry & entry) {
+        if (!allocator || !entry.graph) return false;
+        // Cached GGML tensor metadata keeps the previous buffer/data address.
+        // The shared gallocr may have rebound or grown its virtual buffer for
+        // another Region graph since then. Clear ONLY tensors that originally
+        // had no physical backing; external CUDA weights and persistent KV
+        // buffers were never recorded here and remain untouched.
+        for (ggml_tensor * tensor : entry.transient_tensors) {
+            if (!tensor) continue;
+            tensor->buffer = nullptr;
+            tensor->data = nullptr;
+            tensor->extra = nullptr;
+        }
         const size_t before = ggml_gallocr_get_buffer_size(allocator, 0);
-        if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        if (!ggml_gallocr_alloc_graph(allocator, entry.graph)) {
             return false;
         }
         const size_t after = ggml_gallocr_get_buffer_size(allocator, 0);
@@ -557,6 +569,16 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         built->positions = positions;
         built->causal_mask = causal_mask;
         built->output = current;
+        // Snapshot the Region-owned unallocated tensor set BEFORE gallocr
+        // assigns addresses. This includes graph inputs, intermediates and
+        // views over persistent KV; it excludes model weights and physical KV.
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+             tensor != nullptr;
+             tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->buffer == nullptr) {
+                built->transient_tensors.push_back(tensor);
+            }
+        }
         built->graph_nodes = ggml_graph_n_nodes(graph);
         entry = cache_impl->insert(std::move(built));
         if (!entry) {
@@ -578,7 +600,7 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
 
     const auto graph_build_done = std::chrono::steady_clock::now();
     const auto alloc_begin = graph_build_done;
-    if (!cache_impl->allocate_graph(graph)) {
+    if (!cache_impl->allocate_graph(*entry)) {
         return fail("PC_REGION_GALLOC_GRAPH");
     }
     const auto alloc_done = std::chrono::steady_clock::now();
