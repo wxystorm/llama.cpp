@@ -636,11 +636,12 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
 
         auto built =
             std::make_unique<llama_hybrid_cycle_pc_region_cache::impl::graph_entry>();
-        built->first_layer = first_layer;
         built->layer_count = layer_count;
         built->tokens = tokens;
         built->kv_tokens = kv_tokens;
-        built->weight_generations = weight_generations;
+        built->weight_aliases = std::move(template_weight_aliases);
+        built->kv_key_aliases = std::move(template_kv_key_aliases);
+        built->kv_value_aliases = std::move(template_kv_value_aliases);
         built->ctx = ctx;
         built->graph = graph;
         built->input = x;
@@ -830,8 +831,11 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
     // One allocator/cache is shared by all six PC CUDA Regions in this
     // invocation. The PC_CUDA queue has a single worker, so no cache lock is
     // required and the gallocr workspace can be rebound safely per graph.
+    const size_t region_cache_shapes = std::min<size_t>(
+        8, std::max<size_t>(2, size_t(session.chunks_per_layer())));
     auto region_cache =
-        std::make_shared<llama_hybrid_cycle_pc_region_cache>(2);
+        std::make_shared<llama_hybrid_cycle_pc_region_cache>(
+            region_cache_shapes);
 
     for (int cycle = 0; cycle < layout.cycles; ++cycle) {
         const int begin = cycle * layout.cycle_size;
