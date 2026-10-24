@@ -1019,7 +1019,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 "layer_pc_ratio=%.6f\n",
                 tc.il, tensor_name.c_str(), (int) mode,
                 split_state.axis, tc.rotation, split_rotation,
-                split_state.n_segments,
+                (size_t) split_state.n_segments,
                 (long long) pc_size, (long long) phone_size,
                 (double) ud->model->hybrid_tensor_pc_ratio(tc.il));
         }
