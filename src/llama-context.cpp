@@ -6036,10 +6036,62 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                     [](llama_hybrid_layer_mode mode) {
                         return llama_hybrid_layer_mode_is_tensor(mode);
                     });
+            uint64_t chunk_expanded_layers = tensor_layers;
+
+            // Full-graph directional Region continuation also expands the
+            // PHONE_ONLY layers between the C2P/P2C boundaries by chunk.
+            // The two directional Tensor boundary layers are already counted
+            // above, so add only the Phone-local interior here.
+            const char * region_cont_env =
+                std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
+            if (model.arch == LLM_ARCH_QWEN3MOE &&
+                    region_cont_env != nullptr &&
+                    std::atoi(region_cont_env) != 0) {
+                int c2p = -1;
+                int p2c = -1;
+                int c2p_count = 0;
+                int p2c_count = 0;
+                for (int il = 0;
+                        il < (int) model.hybrid_layer_modes.size();
+                        ++il) {
+                    const auto mode =
+                        model.hybrid_layer_modes[(size_t) il];
+                    if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+                        c2p = il;
+                        ++c2p_count;
+                    } else if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+                        p2c = il;
+                        ++p2c_count;
+                    }
+                }
+
+                bool valid_region =
+                    c2p_count == 1 &&
+                    p2c_count == 1 &&
+                    c2p >= 0 &&
+                    p2c > c2p + 1;
+                uint64_t phone_layers = 0;
+                for (int il = c2p + 1;
+                        valid_region && il < p2c;
+                        ++il) {
+                    if (model.hybrid_layer_modes[(size_t) il] !=
+                            llama_hybrid_layer_mode::PHONE_ONLY) {
+                        valid_region = false;
+                        break;
+                    }
+                    ++phone_layers;
+                }
+                if (valid_region) {
+                    chunk_expanded_layers += phone_layers;
+                }
+            }
+
             const uint64_t n_layers = model.hparams.n_layer();
             const uint64_t base_nodes_per_layer = (base + n_layers - 1) / n_layers;
 
-            res += tensor_layers * (n_chunks - 1) * base_nodes_per_layer;
+            res += chunk_expanded_layers *
+                (n_chunks - 1) *
+                base_nodes_per_layer;
         }
     }
 
