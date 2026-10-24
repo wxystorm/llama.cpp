@@ -14491,11 +14491,12 @@ struct rpc_cycle_p2c_fifo_v1 {
     int32_t v2_last_layer = -1;
     int32_t v2_last_chunk = -1;
     uint64_t v2_last_seq = 0;
-    // V4 receives L5 stage requests in causal C2P Chunk order. L6 stages
-    // are appended to the SAME FIFO after their corresponding L5 ends.
-    int32_t v4_last_layer = -1;
-    int32_t v4_last_chunk = -1;
-    uint64_t v4_last_seq = 0;
+    // V4/Protocol31 receives one causal stream PER physical Phone region
+    // (identified by its first Full layer). Production has six regions that
+    // may interleave registrations while sharing this one MAIN FIFO, so one
+    // global last-layer/chunk cursor is incorrect. L6 stages are still
+    // appended to the SAME FIFO only after their corresponding L5 ends.
+    std::map<int32_t, std::pair<int32_t, uint64_t>> v4_region_order;
 
     rpc_cycle_p2c_fifo_v1(rpc_server & s, bool on) : server(s), enabled(on) {}
     ~rpc_cycle_p2c_fifo_v1() {
@@ -14826,12 +14827,17 @@ struct rpc_cycle_p2c_fifo_v1 {
             pending.size() + completed.size() >= (p2c ? 61 : 62) ||
             a == b || pending.count(a) || pending.count(b) ||
             completed.count(a) || completed.count(b)) return false;
+        const auto previous = v4_region_order.find(first.layer);
+        const int32_t last_chunk = previous == v4_region_order.end() ?
+            -1 : previous->second.first;
+        const uint64_t last_seq = previous == v4_region_order.end() ?
+            0 : previous->second.second;
         const bool first_chunk = first.chunk == 0;
         const bool ordered = first_chunk ?
-            (first.seq > v4_last_seq) :
-            (first.layer == v4_last_layer &&
-             first.chunk == v4_last_chunk + 1 &&
-             first.seq == v4_last_seq + 1);
+            (previous == v4_region_order.end() || first.seq > last_seq) :
+            (previous != v4_region_order.end() &&
+             first.chunk == last_chunk + 1 &&
+             first.seq == last_seq + 1);
         if (!ordered || first.layer < 0 ||
             second.layer != first.layer + 1 ||
             first.chunk < 0 || first.chunk != second.chunk ||
@@ -14842,10 +14848,10 @@ struct rpc_cycle_p2c_fifo_v1 {
             GGML_LOG_ERROR(
                 "[CYCLE_PHONE_V4] side=PHONE event=ADMISSION "
                 "layer=%d chunk=%d seq=%" PRIu64
-                " last_layer=%d last_chunk=%d last_seq=%" PRIu64
+                " region_last_chunk=%d region_last_seq=%" PRIu64
                 " status=FAIL reason=OUT_OF_ORDER_OR_BAD_PLAN\n",
                 first.layer, first.chunk, first.seq,
-                v4_last_layer, v4_last_chunk, v4_last_seq);
+                last_chunk, last_seq);
             return false;
         }
         if (!worker.joinable()) {
@@ -14886,9 +14892,8 @@ struct rpc_cycle_p2c_fifo_v1 {
         pending.insert(b);
         if (p2c) pending.insert(p2c_key);
         jobs_started += 2;
-        v4_last_layer = first.layer;
-        v4_last_chunk = first.chunk;
-        v4_last_seq = first.seq;
+        v4_region_order[first.layer] =
+            std::make_pair(first.chunk, first.seq);
         GGML_LOG_INFO(
             "[CYCLE_PHONE_V4] side=PHONE event=ENQUEUE_REGION "
             "first_layer=%d next_layer=%d chunk=%d seq=%" PRIu64
