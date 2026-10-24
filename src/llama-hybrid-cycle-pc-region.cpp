@@ -470,6 +470,10 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
             aliases[llama_hybrid_cycle_cuda_full_weights::FFN_GATE],
             aliases[llama_hybrid_cycle_cuda_full_weights::FFN_DOWN]
         };
+        ggml_tensor * kv_keys =
+            template_kv_key_aliases[size_t(offset)];
+        ggml_tensor * kv_values =
+            template_kv_value_aliases[size_t(offset)];
 
         const int64_t head_dim = wq_norm->ne[0];
         if (head_dim <= 0 || wk_norm->ne[0] != head_dim ||
@@ -522,30 +526,30 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
         auto * dst_k = ggml_view_3d(
-            ctx, resource->kv->keys,
+            ctx, kv_keys,
             head_dim, n_kv_heads, tokens,
-            resource->kv->keys->nb[1],
-            resource->kv->keys->nb[2],
-            size_t(token_start) * resource->kv->keys->nb[2]);
+            kv_keys->nb[1],
+            kv_keys->nb[2],
+            size_t(token_start) * kv_keys->nb[2]);
         auto * dst_v = ggml_view_3d(
-            ctx, resource->kv->values,
+            ctx, kv_values,
             head_dim, n_kv_heads, tokens,
-            resource->kv->values->nb[1],
-            resource->kv->values->nb[2],
-            size_t(token_start) * resource->kv->values->nb[2]);
+            kv_values->nb[1],
+            kv_values->nb[2],
+            size_t(token_start) * kv_values->nb[2]);
         auto * kv_k_write = ggml_cpy(ctx, k, dst_k);
         auto * kv_v_write = ggml_cpy(ctx, v, dst_v);
 
         k = ggml_view_3d(
-            ctx, resource->kv->keys,
+            ctx, kv_keys,
             head_dim, n_kv_heads, kv_tokens,
-            resource->kv->keys->nb[1],
-            resource->kv->keys->nb[2], 0);
+            kv_keys->nb[1],
+            kv_keys->nb[2], 0);
         v = ggml_view_3d(
-            ctx, resource->kv->values,
+            ctx, kv_values,
             head_dim, n_kv_heads, kv_tokens,
-            resource->kv->values->nb[1],
-            resource->kv->values->nb[2], 0);
+            kv_values->nb[1],
+            kv_values->nb[2], 0);
         q = ggml_permute(ctx, q, 0, 2, 1, 3);
         k = ggml_permute(ctx, k, 0, 2, 1, 3);
         v = ggml_permute(ctx, v, 0, 2, 1, 3);
