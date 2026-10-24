@@ -10,10 +10,164 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <memory>
+#include <utility>
 #include <vector>
 
-bool llama_hybrid_cycle_execute_pc_full_region(
+
+struct llama_hybrid_cycle_pc_region_cache::impl {
+    struct graph_entry {
+        int first_layer = -1;
+        int layer_count = 0;
+        int64_t tokens = 0;
+        int64_t kv_tokens = 0;
+        std::vector<uint64_t> weight_generations;
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * positions = nullptr;
+        ggml_tensor * causal_mask = nullptr;
+        ggml_tensor * output = nullptr;
+        int graph_nodes = 0;
+        uint64_t last_use = 0;
+
+        ~graph_entry() {
+            if (ctx) {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+        }
+    };
+
+    explicit impl(size_t maximum)
+        : max_graphs(std::max<size_t>(1, maximum)) {}
+
+    ~impl() {
+        entries.clear();
+        if (allocator) {
+            ggml_gallocr_free(allocator);
+            allocator = nullptr;
+        }
+    }
+
+    bool ensure_backend(ggml_backend_t target) {
+        if (!target) return false;
+        if (backend && backend != target) return false;
+        if (!backend) backend = target;
+        if (!allocator) {
+            allocator = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(target));
+        }
+        return allocator != nullptr;
+    }
+
+    graph_entry * lookup(
+            int first_layer, int layer_count,
+            int64_t tokens, int64_t kv_tokens,
+            const std::vector<uint64_t> & generations) {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            auto & entry = entries[i];
+            if (!entry ||
+                entry->first_layer != first_layer ||
+                entry->layer_count != layer_count ||
+                entry->tokens != tokens ||
+                entry->kv_tokens != kv_tokens) {
+                continue;
+            }
+            if (entry->weight_generations != generations) {
+                entries.erase(entries.begin() + i);
+                ++eviction_count;
+                return nullptr;
+            }
+            entry->last_use = ++clock;
+            ++hit_count;
+            return entry.get();
+        }
+        return nullptr;
+    }
+
+    graph_entry * insert(std::unique_ptr<graph_entry> entry) {
+        if (!entry) return nullptr;
+        if (entries.size() >= max_graphs) {
+            size_t victim = 0;
+            uint64_t oldest = entries[0] ? entries[0]->last_use : 0;
+            for (size_t i = 1; i < entries.size(); ++i) {
+                const uint64_t stamp =
+                    entries[i] ? entries[i]->last_use : 0;
+                if (stamp < oldest) {
+                    oldest = stamp;
+                    victim = i;
+                }
+            }
+            entries.erase(entries.begin() + victim);
+            ++eviction_count;
+        }
+        entry->last_use = ++clock;
+        auto * result = entry.get();
+        entries.push_back(std::move(entry));
+        ++build_count;
+        return result;
+    }
+
+    bool allocate_graph(ggml_cgraph * graph) {
+        if (!allocator || !graph) return false;
+        const size_t before = ggml_gallocr_get_buffer_size(allocator, 0);
+        if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+            return false;
+        }
+        const size_t after = ggml_gallocr_get_buffer_size(allocator, 0);
+        if (after > before) {
+            ++allocator_grow_count;
+        }
+        return true;
+    }
+
+    size_t allocator_size() const {
+        return allocator ? ggml_gallocr_get_buffer_size(allocator, 0) : 0;
+    }
+
+    size_t max_graphs = 2;
+    ggml_backend_t backend = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    std::vector<std::unique_ptr<graph_entry>> entries;
+    uint64_t clock = 0;
+    uint64_t hit_count = 0;
+    uint64_t build_count = 0;
+    uint64_t eviction_count = 0;
+    uint64_t allocator_grow_count = 0;
+};
+
+llama_hybrid_cycle_pc_region_cache::llama_hybrid_cycle_pc_region_cache(
+        size_t max_graphs)
+    : impl_(std::make_unique<impl>(max_graphs)) {}
+
+llama_hybrid_cycle_pc_region_cache::~llama_hybrid_cycle_pc_region_cache() =
+    default;
+
+uint64_t llama_hybrid_cycle_pc_region_cache::hits() const {
+    return impl_ ? impl_->hit_count : 0;
+}
+
+uint64_t llama_hybrid_cycle_pc_region_cache::builds() const {
+    return impl_ ? impl_->build_count : 0;
+}
+
+uint64_t llama_hybrid_cycle_pc_region_cache::evictions() const {
+    return impl_ ? impl_->eviction_count : 0;
+}
+
+uint64_t llama_hybrid_cycle_pc_region_cache::allocator_grows() const {
+    return impl_ ? impl_->allocator_grow_count : 0;
+}
+
+size_t llama_hybrid_cycle_pc_region_cache::allocator_bytes() const {
+    return impl_ ? impl_->allocator_size() : 0;
+}
+
+bool llama_hybrid_cycle_execute_pc_full_region_cached(
         const llama_model & model,
+        llama_hybrid_cycle_physical_resource_pool & resources,
+        llama_hybrid_cycle_pc_region_cache & cache,
         llama_hybrid_cycle_physical_resource_pool & resources,
         int first_layer,
         int layer_count,
