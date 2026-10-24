@@ -98,3 +98,12 @@ so reported eval runs can be one less than emitted tokens. Standard
 The `llama-cycle-standard` hardware regression now checks that these
 public counters are populated and have consistent Prompt / Decode
 classification.
+
+## Physical memory breakdown safety
+
+Cycle Contexts have no regular GGML Scheduler. Their public
+`llama_get_memory_breakdown(ctx)` is routed to owned, physical
+K/V, Attention Scratch, and optional CUDA mirror allocations.
+Normal Contexts continue to query their regular Scheduler.
+The Cycle totals intentionally exclude transient buffers outside the
+session-owned resource pool.

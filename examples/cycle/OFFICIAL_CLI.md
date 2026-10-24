@@ -146,3 +146,28 @@ The official CLI explicitly sets Prompt phase for *all* Prompt chunks,
 including the final single-token chunk of a 64+1 split. This avoids
 incorrectly attributing the one-token tail to Decode. Non-Cycle
 contexts and the normal server-based CLI path are unchanged.
+
+## Cycle physical memory reporting
+
+Cycle Contexts deliberately omit the standard GGML Scheduler. The
+original `common_perf_print()` nevertheless invokes
+`common_memory_breakdown_print()` after reporting `graphs reused`.
+The default `llama_context::memory_breakdown()` previously called
+`ggml_backend_sched_get_buffer_type(nullptr, ...)`, causing
+`GGML_ASSERT(sched)` at the end of a successful generation.
+
+The Cycle branch now enumerates actual session-owned physical buffers
+instead of consulting a nonexistent Scheduler. The standard memory
+categories include persistent K/V as `context`, retained Attention
+Scratch Pool buffers as `compute`, and optional CUDA weight mirrors
+as `model`, grouped by their actual backend buffer types. Original
+model weight usage remains included. This is *not* an exhaustive
+accounting of transient graph allocations or OS/network overhead.
+
+A passing run reports:
+
+    [CYCLE_MEMORY_BREAKDOWN] scheduler=NOT_CREATED kv_bytes=... scratch_bytes=... cuda_mirror_bytes=... scope=SESSION_OWNED_BUFFERS status=PASS
+
+and then reaches the official purple Prompt/Generation summary, without
+the former scheduler assertion. The default Context's original
+Scheduler-based breakdown remains unchanged.

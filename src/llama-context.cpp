@@ -8936,6 +8936,40 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+
+#if defined(LLAMA_CYCLE_RPC_ENABLED)
+    if (cycle_session) {
+        // Physical five-FIFO execution intentionally does not allocate a
+        // regular GGML Scheduler. Using sched.get() here would assert
+        // in ggml_backend_sched_get_buffer_type(sched, backend).
+        std::map<ggml_backend_buffer_type_t, size_t> kv;
+        std::map<ggml_backend_buffer_type_t, size_t> scratch;
+        std::map<ggml_backend_buffer_type_t, size_t> mirrors;
+        cycle_session->memory_allocations(kv, scratch, mirrors);
+        size_t kv_bytes = 0;
+        size_t scratch_bytes = 0;
+        size_t mirror_bytes = 0;
+        for (const auto & [buft, size] : kv) {
+            ret[buft].context += size;
+            kv_bytes += size;
+        }
+        for (const auto & [buft, size] : scratch) {
+            ret[buft].compute += size;
+            scratch_bytes += size;
+        }
+        for (const auto & [buft, size] : mirrors) {
+            ret[buft].model += size;
+            mirror_bytes += size;
+        }
+        LLAMA_LOG_INFO(
+            "[CYCLE_MEMORY_BREAKDOWN] scheduler=NOT_CREATED "
+            "kv_bytes=%zu scratch_bytes=%zu cuda_mirror_bytes=%zu "
+            "scope=SESSION_OWNED_BUFFERS status=PASS\n",
+            kv_bytes, scratch_bytes, mirror_bytes);
+        return ret;
+    }
+#endif
+
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();

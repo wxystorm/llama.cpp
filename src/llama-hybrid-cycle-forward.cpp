@@ -1179,6 +1179,47 @@ int64_t llama_hybrid_cycle_session::committed_tokens() const {
     return prefix_;
 }
 
+void llama_hybrid_cycle_session::memory_allocations(
+        std::map<ggml_backend_buffer_type_t, size_t> & kv,
+        std::map<ggml_backend_buffer_type_t, size_t> & scratch,
+        std::map<ggml_backend_buffer_type_t, size_t> & cuda_mirrors) const {
+    kv.clear();
+    scratch.clear();
+    cuda_mirrors.clear();
+    if (!resources_) return;
+
+    // Only count physical buffers owned by this Session. Buffer metadata
+    // is local even for RPC allocations; no Phone GPU compute is issued.
+    const auto account = [](
+            std::map<ggml_backend_buffer_type_t, size_t> & target,
+            ggml_backend_buffer_t buffer) {
+        if (!buffer) return;
+        target[ggml_backend_buffer_get_type(buffer)] +=
+            ggml_backend_buffer_get_size(buffer);
+    };
+
+    for (int i = 0; i < resources_->prepared_layers(); ++i) {
+        const auto * layer = resources_->layer(i);
+        if (!layer) continue;
+        if (layer->kv) {
+            account(kv, layer->kv->buffer);
+        }
+        if (layer->cuda_weights) {
+            account(cuda_mirrors, layer->cuda_weights->buffer);
+        }
+        if (layer->scratch_pool) {
+            // Synchronous forward normally releases all leases to idle;
+            // include active leases for accurate mid-session inspection.
+            for (const auto & entry : layer->scratch_pool->idle) {
+                account(scratch, entry.buffer);
+            }
+            for (const auto & entry : layer->scratch_pool->active) {
+                account(scratch, entry.first);
+            }
+        }
+    }
+}
+
 void llama_hybrid_cycle_session::reset() {
     // evaluate() is synchronous: no Stage worker can outlive its call.
     if (resources_) resources_->clear();

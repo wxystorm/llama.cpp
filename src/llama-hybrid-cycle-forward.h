@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,14 @@ public:
 
     LLAMA_API int64_t committed_tokens() const;
     LLAMA_API bool usable() const;
+
+    // Cycle has no regular GGML scheduler. Summarize actual buffers owned
+    // by this persistent Session, grouped by their backend buffer type.
+    LLAMA_API void memory_allocations(
+        std::map<ggml_backend_buffer_type_t, size_t> & kv,
+        std::map<ggml_backend_buffer_type_t, size_t> & scratch,
+        std::map<ggml_backend_buffer_type_t, size_t> & cuda_mirrors) const;
+
     LLAMA_API void reset();
 
 private:
