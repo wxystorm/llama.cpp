@@ -1249,6 +1249,8 @@ void llama_hybrid_cycle_session::reset() {
     model_ = nullptr;
     cpu_ = nullptr;
     phone_ = nullptr;
+    cuda_ = nullptr;
+    cuda_weight_budget_bytes_ = 0;
     prefix_ = 0;
     capacity_ = 0;
     wire_epoch_ = 0;
