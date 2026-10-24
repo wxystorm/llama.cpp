@@ -2638,7 +2638,7 @@ struct ggml_backend_meta_priority_compute_worker {
                 // ordering/fences remain owned by the existing Region path.
                 const ggml_status status =
                     ggml_backend_graph_compute_async(
-                        backend, current.graph);
+                        this->backend, current.graph);
                 lock.lock();
 
                 results[current.id] = status;
