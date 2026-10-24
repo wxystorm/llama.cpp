@@ -391,7 +391,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 "c2p=%d phone=[%d,%d) p2c=%d tokens=%" PRId64
                 " XT=%d chunks=%s mode=BOUNDARY_SEED_THEN_CHUNK_MAJOR\n",
                 c2p_layer,
-                layer_end,
+                p2c_layer + 1,
                 c2p_layer,
                 c2p_layer + 1,
                 p2c_layer,
@@ -791,8 +791,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_build_forward_expand(gf, cur);
 
             return cur;
-        
-            GGML_ABORT("directional Region builder did not return output");
         };
 
     if (moe_stage_wavefront) {
