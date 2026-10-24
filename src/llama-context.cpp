@@ -8,6 +8,7 @@
 #include "llama-hybrid-cycle.h"
 #if defined(LLAMA_CYCLE_RPC_ENABLED)
 #include "llama-hybrid-cycle-forward.h"
+#include "llama-hybrid-cycle-log.h"
 #include "llama-hybrid-cycle-model-io.h"
 #endif
 #include "llama-impl.h"
@@ -4786,6 +4787,7 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         t_load_us = ggml_time_us() - t_start_us;
         has_evaluated_once = true;
     }
+    if (llama_hybrid_cycle_verbose()) {
     LLAMA_LOG_INFO(
         "[CYCLE_STANDARD] stage=DECODE tokens=%d "
         "kv_prefix=%lld outputs=%d c2p=%d full=%d p2c=%d "
@@ -4793,6 +4795,7 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         n, (long long) cycle_session->committed_tokens(),
         int(n_outputs), stats.completed_c2p,
         stats.completed_phone_full, stats.completed_p2c);
+    }
     return 0;
 #endif
 }
