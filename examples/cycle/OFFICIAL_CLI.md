@@ -92,7 +92,11 @@ custom `--chat-template` may be supplied using the existing upstream flag.
 To debug the exact rendered text, set
 `LLAMA_HYBRID_CYCLE_VERBOSE=1`; the formatted prompt is printed on
 stderr between `[CYCLE_CHAT_TEMPLATE] formatted_prompt_begin/end` markers.
-Do not use verbose tracing during performance measurements.
+Use `LLAMA_HYBRID_CYCLE_TOKEN_TRACE=1` independently to print exact
+`[CYCLE_TOKEN_TRACE] phase=PROMPT/GENERATE index=... id=...` records, so
+both backends can be checked against the same prompt Token IDs and generated
+IDs (including EOG). The log never strips or rewrites generated text.
+Do not use verbose or Token ID tracing during performance measurements.
 
 **Important numerical comparison:** chat-formatted and raw prompts contain
 *different Token IDs* and therefore naturally produce different logits.
