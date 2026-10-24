@@ -168,7 +168,7 @@ bool llama_hybrid_cycle_execute_ffn_shard(
                         "reason=PHONE_REMOTE_SEND\n");
                 }
             }
-            if (llama_hybrid_cycle_verbose()) std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
+            if (!ok || llama_hybrid_cycle_verbose()) std::printf("[CYCLE_REAL_FFN_SHARD] backend=%s stage=COMPUTE_END "
                         "elements=%zu status=%s\n",
                         backend_name, partial.size(), ok ? "OK" : "FAIL");
         }
