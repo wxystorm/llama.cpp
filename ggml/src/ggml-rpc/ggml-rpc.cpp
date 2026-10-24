@@ -8196,7 +8196,12 @@ public:
             msg.layer, msg.chunk, msg.seq, msg.graph_id, msg.kind);
         {
             std::lock_guard<std::mutex> lock(cycle_rx_mutex);
-            if (cycle_rx_failed || cycle_rx_frames.size() >= 32 ||
+            // Store each validated C2P frame by its exact
+            // (layer, chunk, seq, graph, kind) identity until the GPU
+            // APPLY task consumes it. Do not reject a ready Chunk merely
+            // because an arbitrary 32-frame staging window is occupied.
+            // The data-plane RX slot is independently recycled after decode.
+            if (cycle_rx_failed ||
                 !cycle_rx_frames.emplace(key, std::move(msg)).second) {
                 return false;
             }
