@@ -311,7 +311,9 @@ llama_context::llama_context(
         }
         backends.emplace_back(phone);
         size_t cycle_cuda_budget_bytes = 0;
+        bool cycle_cuda_budget_explicit = false;
         if (const char * value = std::getenv("LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB")) {
+            cycle_cuda_budget_explicit = true;
             char * tail = nullptr;
             const unsigned long long mib = std::strtoull(value, &tail, 10);
             constexpr unsigned long long scale = 1024ULL * 1024ULL;
@@ -321,22 +323,33 @@ llama_context::llama_context(
             }
             cycle_cuda_budget_bytes = size_t(mib * scale);
         }
+
+        // Production Cycle requires local CUDA for every ordinary PC Full
+        // layer. The optional budget limits only the resident weight-cache
+        // size; it no longer enables/disables CUDA execution.
         ggml_backend_t cycle_cuda_backend = nullptr;
-        if (cycle_cuda_budget_bytes) {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                auto * dev = ggml_backend_dev_get(i);
-                auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-                if (!dev || !reg ||
-                    ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
-                    std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) continue;
-                cycle_cuda_backend = ggml_backend_dev_init(dev, nullptr);
-                if (cycle_cuda_backend) {
-                    backends.emplace_back(cycle_cuda_backend);
-                    break;
-                }
+        ggml_backend_dev_t cycle_cuda_dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (!dev || !reg ||
+                ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) continue;
+            cycle_cuda_dev = dev;
+            cycle_cuda_backend = ggml_backend_dev_init(dev, nullptr);
+            if (cycle_cuda_backend) {
+                backends.emplace_back(cycle_cuda_backend);
+                break;
             }
-            if (!cycle_cuda_backend)
-                throw std::runtime_error("Cycle CUDA budget requested but CUDA backend unavailable");
+        }
+        if (!cycle_cuda_backend || !cycle_cuda_dev) {
+            throw std::runtime_error(
+                "Cycle production PC Full requires a local CUDA backend");
+        }
+        if (!cycle_cuda_budget_explicit || cycle_cuda_budget_bytes == 0) {
+            size_t free_gpu = 0, total_gpu = 0;
+            ggml_backend_dev_memory(cycle_cuda_dev, &free_gpu, &total_gpu);
+            cycle_cuda_budget_bytes = free_gpu;
         }
         cycle_cuda_weight_budget_bytes = cycle_cuda_budget_bytes;
 
