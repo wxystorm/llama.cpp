@@ -1055,6 +1055,11 @@ static void test_cycle_execution_session_8_and_48() {
         auto & cuda0 = session.at(0, 1);
         cuda0.cuda_output =
             std::make_unique<llama_hybrid_cycle_cuda_activation_slot>();
+        ggml_tensor fake_cuda_activation {};
+        cuda0.cuda_output->tensor = &fake_cuda_activation;
+        assert(session.cuda_predecessor_output(1, 1) ==
+               &fake_cuda_activation);
+        assert(!session.cuda_predecessor_output(4, 1)); // C2P is not CUDA Full.
         assert(!session.retire_cuda_output_after_handoff(0, 2, 1));
         assert(cuda0.cuda_output);
         auto cuda_slot =
