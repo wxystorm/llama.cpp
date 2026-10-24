@@ -4788,13 +4788,13 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         has_evaluated_once = true;
     }
     if (llama_hybrid_cycle_verbose()) {
-    LLAMA_LOG_INFO(
-        "[CYCLE_STANDARD] stage=DECODE tokens=%d "
-        "kv_prefix=%lld outputs=%d c2p=%d full=%d p2c=%d "
-        "five_fifo=REAL status=PASS\n",
-        n, (long long) cycle_session->committed_tokens(),
-        int(n_outputs), stats.completed_c2p,
-        stats.completed_phone_full, stats.completed_p2c);
+        LLAMA_LOG_INFO(
+            "[CYCLE_STANDARD] stage=DECODE tokens=%d "
+            "kv_prefix=%lld outputs=%d c2p=%d full=%d p2c=%d "
+            "five_fifo=REAL status=PASS\n",
+            n, (long long) cycle_session->committed_tokens(),
+            int(n_outputs), stats.completed_c2p,
+            stats.completed_phone_full, stats.completed_p2c);
     }
     return 0;
 #endif
