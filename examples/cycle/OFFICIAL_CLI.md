@@ -17,7 +17,9 @@ Cycle-only local-completion path in that SAME executable.
 ## Windows example
 
 ```powershell
-git pull --ff-only origin feat/cycle-runtime-integration-20261023
+git fetch origin
+git switch feat/cycle-production-cuda-profile-20261024
+git pull --ff-only origin feat/cycle-production-cuda-profile-20261024
 cmake --build .\build-cycle-test --config Debug --target llama-cli
 
 $env:LLAMA_HYBRID_CYCLE_PC_LAYERS = "4"
@@ -42,12 +44,69 @@ appropriate RPC server(s). The physical weight loader still requires
 exactly PC CPU + Phone GPU.
 
 Without `-p`, direct Cycle mode reads **one line** from terminal input.
-This is not yet the interactive multi-turn, chat-template-driven server UI.
+This is not an interactive multi-turn chat or server UI. Single-turn
+model Chat Template formatting is supported by the Cycle direct CLI.
+
+
+## Single-turn model Chat Template: correctness and raw regression
+
+The official Cycle CLI now formats a **single user message and an unfinished
+assistant prefix** using the same `llama-common` model template renderer
+as regular llama.cpp. In the default `AUTO` mode, it reads the GGUF model's
+chat template if present; if no template is available, it preserves raw
+completion. This does not enable an HTTP server, interactive chat, multiple
+sequences or a second KV cache.
+
+The CLI does **not** manually concatenate Qwen3 special markers. It asks
+`common_chat_templates_apply()` for the model-formatted prompt with
+`add_generation_prompt=true` and then calls `common_tokenize()` with
+special-token parsing **enabled**. The result goes to the same physical
+48-layer `llama_decode()` pipeline and the same external sampler.
+
+For a normal single user instruction:
+
+```powershell
+# Baseline for output semantics; no PC CUDA until correctness is checked.
+$env:LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB = "0"
+.\build-cycle-test\bin\Debug\llama-cli.exe `
+    -m E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf `
+    --rpc 10.39.52.114:50053 --split-mode tensor `
+    -c 256 -n 32 -t 8 --temp 0 --seed 1234 `
+    --no-mmap --no-display-prompt `
+    -p "What is the capital of France?"
+```
+
+Look for `[CYCLE_OFFICIAL_CLI] phase=PROMPT_FORMAT
+mode=MODEL_CHAT_TEMPLATE ... special=1 status=PASS`. The token count
+may be greater than for the same raw text, because message delimiters and
+the assistant prefix are part of the physical KV input.
+
+For **exact historical raw prompt regression**, append
+`--no-conversation` (or `-no-cnv`) to the same command. It selects
+`mode=RAW_COMPLETION` and retains the earlier tokenization behavior.
+`--no-display-prompt` only affects terminal echo; it does **not** change
+the model's input tokens. `--conversation` explicitly requests a template;
+if the model has none, this mode fails instead of inventing one. A
+custom `--chat-template` may be supplied using the existing upstream flag.
+
+To debug the exact rendered text, set
+`LLAMA_HYBRID_CYCLE_VERBOSE=1`; the formatted prompt is printed on
+stderr between `[CYCLE_CHAT_TEMPLATE] formatted_prompt_begin/end` markers.
+Do not use verbose tracing during performance measurements.
+
+**Important numerical comparison:** chat-formatted and raw prompts contain
+*different Token IDs* and therefore naturally produce different logits.
+For correctness tests compare Cycle against the CPU reference with
+**the same formatted prompt and token sequence**, `--temp 0`, and the
+same seed. If the only difference is an unwanted `A:` under raw mode,
+that is not by itself evidence of a numerical bug. This template change
+has not yet been compiled or hardware-verified.
+
 
 ## Exact present limitations
 
 Only the 48-layer Qwen3-30B-A3B fixed `X=4,Y=2` layout, one sequence,
-one raw completion prompt, <=64 tokens per `llama_decode` invocation,
+one single-turn **model Chat Template or raw completion** prompt, <=64 tokens per `llama_decode` invocation,
 <=512 total physical KV, and only final-token Logits are supported.
 
 The direct CLI evaluates the prompt in <=64-token batches and generates
