@@ -430,6 +430,52 @@ static bool llama_hybrid_force_phone_primary_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool llama_hybrid_region_boundary_v1_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_REGION_BOUNDARY_V1");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+static int llama_hybrid_region_boundary_env_int(
+        const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return std::atoi(value);
+}
+
+// Isolated first correctness pass: exactly one PC->Phone Tensor boundary.
+static std::vector<llama_hybrid_layer_mode>
+llama_build_region_boundary_v1_policy(int n_layer) {
+    if (llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_REGION_C2P_ONLY", 1) != 1) {
+        throw std::runtime_error(
+            "C2P L34 clean baseline supports only C2P_ONLY=1");
+    }
+
+    const int default_layer = n_layer == 48 ? 34 : n_layer - 2;
+    const int c2p_layer = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_C2P_LAYER", default_layer);
+    if (n_layer < 2 || c2p_layer < 0 || c2p_layer >= n_layer - 1) {
+        throw std::runtime_error(
+            "invalid C2P-only layer: require 0 <= layer < n_layer-1");
+    }
+
+    std::vector<llama_hybrid_layer_mode> policy(
+        n_layer, llama_hybrid_layer_mode::PC_ONLY);
+    policy[c2p_layer] = llama_hybrid_layer_mode::TENSOR_C2P;
+    std::fill(
+        policy.begin() + c2p_layer + 1,
+        policy.end(),
+        llama_hybrid_layer_mode::PHONE_ONLY);
+
+    LLAMA_LOG_ERROR(
+        "[REGION_BOUNDARY_V1] mode=C2P_ONLY c2p_layer=%d "
+        "pc=[0,%d) phone=[%d,%d) layers=%d status=POLICY_READY\n",
+        c2p_layer, c2p_layer, c2p_layer + 1, n_layer, n_layer);
+    return policy;
+}
+
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
         int n_layer, int pc_layers, int tensor_layers, int phone_layers,
         bool tensor_phone_primary) {
@@ -793,7 +839,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         ud->model->hybrid_layer_mode(tc.il) :
         llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool tensor_phone_primary =
-        mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+        llama_hybrid_layer_mode_tensor_attention_on_phone(mode);
+    const bool directional_tensor =
+        llama_hybrid_layer_mode_directional_tensor(mode);
 
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
@@ -801,7 +849,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // these two heterogeneous roles changes the meaning of R and can collapse
     // the smaller shard after quantized alignment.
     const size_t split_rotation =
-        tensor_phone_primary && is_ffn_split_tensor && ud->n_devices == 2 ?
+        (tensor_phone_primary || directional_tensor) &&
+                is_ffn_split_tensor && ud->n_devices == 2 ?
             0 : tc.rotation;
 
     split_state.axis = tc.axis;
@@ -830,7 +879,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 float split_ratio = tensor_split_scan.back() == 0.0f ?
                     (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
 
-                if (tensor_phone_primary &&
+                if ((tensor_phone_primary || directional_tensor) &&
                     is_ffn_split_tensor &&
                     ud->n_devices == 2 &&
                     j == 0) {
@@ -875,13 +924,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool force_primary =
         (is_attention_tensor &&
          mode != llama_hybrid_layer_mode::PHONE_ONLY &&
-         !tensor_phone_primary) ||
+         !llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) ||
         (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY) ||
         is_output_tensor;
     const bool force_phone =
         (mode == llama_hybrid_layer_mode::PHONE_ONLY &&
          (is_attention_tensor || is_ffn_split_tensor)) ||
-        (tensor_phone_primary && is_attention_tensor);
+        (llama_hybrid_layer_mode_tensor_attention_on_phone(mode) &&
+         is_attention_tensor);
 
     auto force_to_device = [&](size_t device) {
         GGML_ASSERT(device < ud->n_devices);
@@ -904,6 +954,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         force_to_device(1);
     } else if (force_primary) {
         force_to_device(0);
+    }
+
+    // Compare the actual physical MoE FFN weight allocation for A/C2P
+    // and B/legacy tensor split.  Identical nominal R does not necessarily
+    // imply identical shards when the legacy planner uses split rotation.
+    if (const char * ab_layer_env =
+            std::getenv("GGML_META_AB_TRACE_LAYER")) {
+        if (ud->n_devices == 2 && is_ffn_split_tensor &&
+                tc.il == std::atoi(ab_layer_env)) {
+            int64_t pc_size = 0;
+            int64_t phone_size = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                pc_size += split_state.ne[is*2] * split_state.nr[is];
+                phone_size += split_state.ne[is*2 + 1] *
+                              split_state.nr[is];
+            }
+            LLAMA_LOG_ERROR(
+                "[AB_WEIGHT_SPLIT] layer=%d tensor=%s mode=%d "
+                "axis=%d rotation=%zu applied_rotation=%zu "
+                "segments=%zu pc_units=%lld phone_units=%lld "
+                "layer_pc_ratio=%.6f\n",
+                tc.il, tensor_name.c_str(), (int) mode,
+                split_state.axis, tc.rotation, split_rotation,
+                (size_t) split_state.n_segments,
+                (long long) pc_size, (long long) phone_size,
+                (double) ud->model->hybrid_tensor_pc_ratio(tc.il));
+        }
     }
 
     if (tensor_name.rfind("blk.0.", 0) == 0 &&
@@ -1507,17 +1584,43 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
-        hybrid_layer_modes = has_runtime_plan ?
-            llama_build_hybrid_plan_policy(
-                n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
-                runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
-            llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
+        hybrid_layer_modes = llama_hybrid_region_boundary_v1_enabled() ?
+            llama_build_region_boundary_v1_policy(n_layer) :
+            (has_runtime_plan ?
+                llama_build_hybrid_plan_policy(
+                    n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
+                    runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
+                llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout));
 
         hybrid_tensor_pc_ratios.assign(
             n_layer,
             has_runtime_plan ?
                 runtime_plan.tensor_pc_ratio :
                 0.0f);
+        // Keep L34's PC expert share deliberately small. Both backends must
+        // use the same physical FFN weight split; never rotate this C2P shard.
+        if (llama_hybrid_region_boundary_v1_enabled()) {
+            const char * raw = std::getenv("LLAMA_HYBRID_REGION_C2P_PC_RATIO");
+            const float pc_ratio =
+                raw != nullptr && raw[0] != '\0' ?
+                    std::strtof(raw, nullptr) : (1.0f / 3.0f);
+            if (!std::isfinite(pc_ratio) ||
+                    pc_ratio <= 0.0f || pc_ratio >= 1.0f) {
+                throw std::runtime_error(
+                    "LLAMA_HYBRID_REGION_C2P_PC_RATIO must be between 0 and 1");
+            }
+            for (int il = 0; il < n_layer; ++il) {
+                if (hybrid_layer_modes[il] ==
+                        llama_hybrid_layer_mode::TENSOR_C2P) {
+                    hybrid_tensor_pc_ratios[il] = pc_ratio;
+                    LLAMA_LOG_ERROR(
+                        "[REGION_C2P_FFN_RATIO] layer=%d pc=%.6f phone=%.6f "
+                        "status=POLICY_READY\n",
+                        il, (double) pc_ratio, (double) (1.0f - pc_ratio));
+                }
+            }
+        }
+
         if (has_runtime_plan &&
             runtime_plan.tensor_phone_primary &&
             runtime_plan.tensor_layers > 0) {

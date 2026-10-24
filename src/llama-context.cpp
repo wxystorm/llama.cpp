@@ -1039,6 +1039,8 @@ void llama_context::synchronize() {
                         ++n_phone;
                         break;
                     case llama_hybrid_layer_mode::TENSOR_SPLIT:
+                    case llama_hybrid_layer_mode::TENSOR_C2P:
+                    case llama_hybrid_layer_mode::TENSOR_P2C:
                     case llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY:
                         ++n_tensor;
                         break;
@@ -3547,31 +3549,49 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
     int tensor_phone_first_layer = -1;
     int tensor_phone_last_layer = -1;
+    std::vector<uint8_t> tensor_phone_layer_mask(
+        size_t(hparams.n_layer()), uint8_t(0));
+    std::vector<uint8_t> tensor_c2p_layer_mask(
+        size_t(hparams.n_layer()), uint8_t(0));
+    bool directional_region_policy = false;
 
-    // The model policy is the execution source of truth.  Do not gate this on
-    // runtime_plan.tensor_phone_primary: test overrides can intentionally turn
-    // a planner-selected PC-primary Tensor region into TENSOR_PHONE_PRIMARY
-    // after the plan was published.  Meta must receive the range that the
-    // model will actually execute, otherwise its Phone-primary owner/handoff
-    // paths remain disabled and complete control tensors can fall through to
-    // generic all-reduce.
+    // The model policy is the execution source of truth. Region Boundary V1
+    // may contain many sparse P2C Tensor layers, so publish an exact layer mask
+    // rather than widening them into one [first,last) interval.
     for (int il = 0; il < (int) hparams.n_layer(); ++il) {
-        if (model.hybrid_layer_mode(il) != llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY) {
+        const llama_hybrid_layer_mode mode = model.hybrid_layer_mode(il);
+        directional_region_policy =
+            directional_region_policy ||
+            llama_hybrid_layer_mode_directional_tensor(mode);
+        if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+            tensor_c2p_layer_mask[size_t(il)] = 1;
+        }
+        if (!llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) {
             continue;
         }
+        tensor_phone_layer_mask[size_t(il)] = 1;
         if (tensor_phone_first_layer < 0) {
             tensor_phone_first_layer = il;
         }
         tensor_phone_last_layer = il + 1;
     }
-    if (tensor_phone_first_layer >= 0 && has_runtime_plan) {
-        GGML_ASSERT(
-            tensor_phone_last_layer - tensor_phone_first_layer ==
-            runtime_plan.tensor_layers);
-    }
+
     for (ggml_backend_t backend : backend_ptrs) {
-        ggml_backend_meta_set_tensor_phone_primary_layers(
-            backend, tensor_phone_first_layer, tensor_phone_last_layer);
+        if (directional_region_policy) {
+            ggml_backend_meta_set_tensor_phone_primary_layer_mask(
+                backend,
+                tensor_phone_layer_mask.empty() ? nullptr :
+                    tensor_phone_layer_mask.data(),
+                tensor_phone_layer_mask.size());
+            ggml_backend_meta_set_tensor_c2p_layer_mask(
+                backend,
+                tensor_c2p_layer_mask.empty() ? nullptr :
+                    tensor_c2p_layer_mask.data(),
+                tensor_c2p_layer_mask.size());
+        } else {
+            ggml_backend_meta_set_tensor_phone_primary_layers(
+                backend, tensor_phone_first_layer, tensor_phone_last_layer);
+        }
     }
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
@@ -3583,7 +3603,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // Execution follows the model policy, not merely the planner flag.
     // A PHONE-primary plan may intentionally run with legacy TENSOR_SPLIT
     // semantics for correctness A/B testing.
+    // Legacy Phone-primary staged execution assumes one contiguous Tensor
+    // interval. Directional Region Boundary V1 uses sparse P2C boundaries and
+    // must not enable that interval-wide shortcut; per-layer model ownership
+    // plus the Meta masks remain authoritative.
     const bool tensor_phone_primary_exec =
+        !directional_region_policy &&
         tensor_phone_first_layer >= 0 &&
         tensor_phone_last_layer > tensor_phone_first_layer;
 
@@ -5917,8 +5942,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
                     model.hybrid_layer_modes.begin(),
                     model.hybrid_layer_modes.end(),
                     [](llama_hybrid_layer_mode mode) {
-                        return mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
-                               mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+                        return llama_hybrid_layer_mode_is_tensor(mode);
                     });
             const uint64_t n_layers = model.hparams.n_layer();
             const uint64_t base_nodes_per_layer = (base + n_layers - 1) / n_layers;

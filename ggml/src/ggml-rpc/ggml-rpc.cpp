@@ -1029,9 +1029,21 @@ static bool negotiate_hello(
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
-                       response.major, response.minor, response.patch);
+    // This isolated baseline must not send graphs to a different RPC build.
+    // Patch-only compatibility is not sufficient: later patch releases added
+    // commands, runtime features and graph ownership rules.
+    if (response.major != RPC_PROTO_MAJOR_VERSION ||
+            response.minor != RPC_PROTO_MINOR_VERSION ||
+            response.patch != RPC_PROTO_PATCH_VERSION) {
+        GGML_LOG_ERROR(
+            "[RPC_PROTOCOL_MISMATCH] local=%u.%u.%u remote=%u.%u.%u "
+            "action=REBUILD_PC_AND_PHONE_FROM_SAME_COMMIT\n",
+            (unsigned) RPC_PROTO_MAJOR_VERSION,
+            (unsigned) RPC_PROTO_MINOR_VERSION,
+            (unsigned) RPC_PROTO_PATCH_VERSION,
+            (unsigned) response.major,
+            (unsigned) response.minor,
+            (unsigned) response.patch);
         return false;
     }
 

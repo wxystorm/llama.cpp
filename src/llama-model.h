@@ -541,9 +541,36 @@ struct llama_meta_device_get_split_state_userdata {
 enum class llama_hybrid_layer_mode {
     PC_ONLY,
     TENSOR_SPLIT,
+    // Directional Tensor boundaries used by Region Boundary V1.
+    // C2P: Attention/control on PC, final activation handed to Phone.
+    // P2C: Attention/control on Phone, final activation handed to PC.
+    // The first implementation intentionally reuses the proven legacy
+    // Tensor compute path; Meta later replaces the opposite-direction FFN
+    // return with a same-direction partial handoff.
+    TENSOR_C2P,
+    TENSOR_P2C,
     TENSOR_PHONE_PRIMARY,
     PHONE_ONLY,
 };
+
+static inline bool llama_hybrid_layer_mode_is_tensor(llama_hybrid_layer_mode mode) {
+    return mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+           mode == llama_hybrid_layer_mode::TENSOR_C2P ||
+           mode == llama_hybrid_layer_mode::TENSOR_P2C ||
+           mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+}
+
+static inline bool llama_hybrid_layer_mode_tensor_attention_on_phone(
+        llama_hybrid_layer_mode mode) {
+    return mode == llama_hybrid_layer_mode::TENSOR_P2C ||
+           mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+}
+
+static inline bool llama_hybrid_layer_mode_directional_tensor(
+        llama_hybrid_layer_mode mode) {
+    return mode == llama_hybrid_layer_mode::TENSOR_C2P ||
+           mode == llama_hybrid_layer_mode::TENSOR_P2C;
+}
 
 enum class llama_pc_layer_backend {
     CPU,
