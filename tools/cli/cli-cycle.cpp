@@ -12,8 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // The modern llama-cli is ordinarily a llama-server HTTP client.
@@ -266,9 +268,9 @@ int cli_cycle_run(common_params & params) {
             return 2;
         }
     }
-    // The template contains literal <|im_start|>/<|im_end|> or equivalent
-    // model-defined control tokens. Tokenize those as special IDs; treating
-    // them as ordinary text changes the logits at the assistant boundary.
+    // A chat template may contain model-specific structural token spellings.
+    // Tokenize those as special IDs; treating them as ordinary text changes
+    // the logits at the assistant boundary.
     const auto prompt_tokens = common_tokenize(
         vocab, model_prompt, /* add_special */ true,
         use_chat_template ? true : params.parse_special);
