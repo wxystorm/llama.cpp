@@ -18,7 +18,7 @@
 // Moved verbatim from the inline FIFO header: the five-worker scheduler now
 // has a single implementation in libllama. Existing callers keep their ABI,
 // ordering, credit, tracing and error-handling contract.
-bool llama_hybrid_cycle_run_fifo(
+static bool llama_hybrid_cycle_run_fifo_impl(
         const llama_hybrid_cycle_layout & layout,
         int n_chunks,
         const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
@@ -181,6 +181,23 @@ bool llama_hybrid_cycle_run_fifo(
         worker.join();
     }
     return !failed.load() && ring.finished();
+}
+
+bool llama_hybrid_cycle_run_fifo(
+        const llama_hybrid_cycle_layout & layout,
+        int n_chunks,
+        const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
+        int max_inflight,
+        bool credit_until_handoff,
+        llama_hybrid_cycle_fifo_profile * profile,
+        bool pc_cpu_reduce_priority,
+        bool ordered_c2p_reduce,
+        bool phone_main_priority,
+        llama_hybrid_cycle_chunk_timeline * chunk_timeline) {
+    return llama_hybrid_cycle_run_fifo_impl(
+        layout, n_chunks, execute, max_inflight, credit_until_handoff,
+        profile, pc_cpu_reduce_priority, ordered_c2p_reduce,
+        phone_main_priority, chunk_timeline, false);
 }
 
 
@@ -434,7 +451,7 @@ bool llama_hybrid_cycle_runtime::run(
         const std::function<bool(const llama_hybrid_cycle_task &)> & execute,
         llama_hybrid_cycle_fifo_profile * profile,
         llama_hybrid_cycle_chunk_timeline * timeline) const {
-    return llama_hybrid_cycle_run_fifo(
+    return llama_hybrid_cycle_run_fifo_impl(
         config_.layout, config_.n_chunks, execute, config_.max_inflight,
         config_.credit_until_handoff, profile,
         config_.pc_cpu_reduce_priority, config_.ordered_c2p_reduce,
