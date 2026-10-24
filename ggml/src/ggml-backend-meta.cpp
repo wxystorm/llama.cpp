@@ -4852,6 +4852,204 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
+
+    // Read-only A/B correctness captures for a single Tensor layer.
+    // Values are stored in logical element order; GGML VIEW padding/strides
+    // are stripped before writing, especially for argsort TopK I32 views.
+    const char * ab_dump_dir = std::getenv("GGML_META_AB_DUMP_DIR");
+    const char * ab_layer_env = std::getenv("GGML_META_AB_TRACE_LAYER");
+    const bool ab_trace_requested =
+        n_backends == 2 &&
+        ab_dump_dir != nullptr && ab_dump_dir[0] != '\0' &&
+        ab_layer_env != nullptr && ab_layer_env[0] != '\0';
+    const int ab_trace_layer =
+        ab_trace_requested ? std::atoi(ab_layer_env) : -1;
+    const char * ab_min_env = std::getenv("GGML_META_AB_MIN_TOKENS");
+    const int ab_min_tokens =
+        ab_min_env != nullptr ? std::max(2, std::atoi(ab_min_env)) : 16;
+    std::set<std::string> ab_written_files;
+    auto ab_full_tokens = [&]() -> int64_t {
+        if (!ab_trace_requested) {
+            return 0;
+        }
+        ggml_tensor * full =
+            find_layer_output(0, ab_trace_layer);
+        return full != nullptr ? full->ne[1] : 0;
+    };
+    auto ab_dump_tensor = [&](size_t backend, int chunk,
+                              const char * stage, ggml_tensor * tensor) {
+        if (!ab_trace_requested || backend >= n_backends ||
+                tensor == nullptr || stage == nullptr) {
+            return;
+        }
+        const int64_t tokens = ab_full_tokens();
+        if (tokens < ab_min_tokens) {
+            return;
+        }
+        if (tensor->type != GGML_TYPE_F32 &&
+                tensor->type != GGML_TYPE_I32) {
+            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                   " chunk=%d side=%zu stage=%s status=SKIP_TYPE type=%d\n",
+                   ab_trace_layer, tokens, chunk, backend, stage,
+                   (int) tensor->type);
+            return;
+        }
+        if (tensor->buffer == nullptr || tensor->data == nullptr) {
+            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                   " chunk=%d side=%zu stage=%s status=SKIP_BUFFER\n",
+                   ab_trace_layer, tokens, chunk, backend, stage);
+            return;
+        }
+
+        const size_t count = (size_t) ggml_nelements(tensor);
+        const size_t physical = ggml_nbytes(tensor);
+        const size_t elem_size = sizeof(uint32_t);
+        if (count == 0 || physical == 0 ||
+                physical > 64u*1024u*1024u ||
+                count > (64u*1024u*1024u)/elem_size) {
+            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                   " chunk=%d side=%zu stage=%s status=SKIP_SIZE "
+                   "elements=%zu physical=%zu\n",
+                   ab_trace_layer, tokens, chunk, backend, stage,
+                   count, physical);
+            return;
+        }
+
+        std::vector<uint8_t> physical_data(physical);
+        auto & cfg = backend_ctx->backend_configs[backend];
+        ggml_backend_synchronize(cfg.backend);
+        ggml_backend_tensor_get(
+            tensor, physical_data.data(), 0, physical);
+
+        std::vector<uint8_t> packed(count * elem_size);
+        size_t pos = 0;
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0) {
+                        const size_t offs =
+                            (size_t) i0 * tensor->nb[0] +
+                            (size_t) i1 * tensor->nb[1] +
+                            (size_t) i2 * tensor->nb[2] +
+                            (size_t) i3 * tensor->nb[3];
+                        if (offs > physical ||
+                                physical - offs < elem_size ||
+                                pos >= count) {
+                            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                                   " chunk=%d side=%zu stage=%s "
+                                   "status=SKIP_STRIDE offset=%zu "
+                                   "physical=%zu\n",
+                                   ab_trace_layer, tokens, chunk, backend,
+                                   stage, offs, physical);
+                            return;
+                        }
+                        std::memcpy(
+                            packed.data() + pos * elem_size,
+                            physical_data.data() + offs,
+                            elem_size);
+                        ++pos;
+                    }
+                }
+            }
+        }
+
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (uint8_t byte : packed) {
+            hash ^= byte;
+            hash *= UINT64_C(1099511628211);
+        }
+
+        const std::string side = backend == 0 ? "pc" : "phone";
+        const std::string dtype =
+            tensor->type == GGML_TYPE_F32 ? "f32" : "i32";
+        const std::string file =
+            std::string(ab_dump_dir) + "/prefill_t" +
+            std::to_string(tokens) + "_c" +
+            (chunk >= 0 ? std::to_string(chunk) : std::string("full")) +
+            "_" + side + "_" + stage + "_" + dtype + ".bin";
+        if (ab_written_files.count(file) != 0) {
+            return;
+        }
+
+        FILE * out = std::fopen(file.c_str(), "wb");
+        if (out == nullptr) {
+            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                   " chunk=%d side=%s stage=%s status=FILE_ERROR "
+                   "path=%s\n",
+                   ab_trace_layer, tokens, chunk, side.c_str(), stage,
+                   file.c_str());
+            return;
+        }
+        const size_t written =
+            std::fwrite(packed.data(), 1, packed.size(), out);
+        const int close_status = std::fclose(out);
+        if (written != packed.size() || close_status != 0) {
+            printf("[AB_DUMP] layer=%d tokens=%" PRId64
+                   " chunk=%d side=%s stage=%s status=WRITE_ERROR "
+                   "path=%s\n",
+                   ab_trace_layer, tokens, chunk, side.c_str(), stage,
+                   file.c_str());
+            return;
+        }
+        ab_written_files.insert(file);
+
+        double sum = 0.0;
+        double l2 = 0.0;
+        double max_abs = 0.0;
+        for (size_t q = 0; q < count; ++q) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, packed.data() + q*elem_size, elem_size);
+            double v = 0.0;
+            if (tensor->type == GGML_TYPE_F32) {
+                float x = 0.0f;
+                std::memcpy(&x, &bits, elem_size);
+                v = x;
+            } else {
+                int32_t x = 0;
+                std::memcpy(&x, &bits, elem_size);
+                v = x;
+            }
+            sum += v;
+            l2 += v*v;
+            max_abs = std::max(max_abs, std::abs(v));
+        }
+        printf("[AB_DUMP] layer=%d tokens=%" PRId64
+               " chunk=%d side=%s stage=%s tensor=%s "
+               "type=%s n=%zu physical=%zu packed=%zu "
+               "compute=%d sum=%.9g l2=%.9g max=%.9g "
+               "hash=%" PRIu64 " status=OK path=%s\n",
+               ab_trace_layer, tokens, chunk, side.c_str(), stage,
+               tensor->name, dtype.c_str(), count, physical, packed.size(),
+               !!(tensor->flags & GGML_TENSOR_FLAG_COMPUTE),
+               sum, std::sqrt(l2), max_abs, hash, file.c_str());
+    };
+
+    auto ab_find_sg_named =
+        [&](size_t backend, size_t sg,
+            const char * exact_name) -> ggml_tensor * {
+            if (backend >= n_backends ||
+                    sg >= backend_ctx->n_subgraphs) {
+                return nullptr;
+            }
+            ggml_cgraph * g =
+                backend_ctx->backend_configs[backend]
+                    .cgraphs[sg].cgraph_main;
+            if (g == nullptr) {
+                return nullptr;
+            }
+            ggml_tensor * fallback = nullptr;
+            for (int k = 0; k < g->n_nodes; ++k) {
+                ggml_tensor * t = g->nodes[k];
+                if (t != nullptr &&
+                        std::strcmp(t->name, exact_name) == 0) {
+                    fallback = t;
+                    if (t->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                        return t;
+                    }
+                }
+            }
+            return fallback;
+        };
     auto debug_layer_input = [&](size_t backend, size_t sg, int layer, bool after_compute) {
         if (!pipeline_debug || backend >= n_backends || sg >= backend_ctx->n_subgraphs) {
             return;
@@ -11304,8 +11502,46 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
+    bool ab_l47_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        // Save the exact Phone input immediately before the next full layer.
+        // This verifies that the C2P l_out buffer is the activation consumed
+        // by L47 rather than merely a correctly reduced, unused copy.
+        if (ab_trace_requested && !ab_l47_entry_dumped &&
+                ab_full_tokens() >= ab_min_tokens) {
+            ggml_cgraph * phone_g =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            if (phone_g != nullptr) {
+                const std::string norm_name =
+                    "norm-" + std::to_string(ab_trace_layer + 1);
+                for (int k = 0; k < phone_g->n_nodes; ++k) {
+                    ggml_tensor * node = phone_g->nodes[k];
+                    if (node == nullptr ||
+                            std::strcmp(node->name,
+                                        norm_name.c_str()) != 0 ||
+                            !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                        continue;
+                    }
+                    ab_dump_tensor(1, -1, "l_out",
+                                   find_layer_output(1, ab_trace_layer));
+                    ab_dump_tensor(1, -1, "l47_input", node->src[0]);
+                    if (!ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, ab_trace_layer)) {
+                        ab_dump_tensor(0, -1, "l_out",
+                                       find_layer_output(0, ab_trace_layer));
+                    }
+                    ab_l47_entry_dumped = true;
+                    printf("[AB_L47_ENTRY] layer=%d tokens=%" PRId64
+                           " sg=%zu norm=%s input=%s status=CAPTURED\n",
+                           ab_trace_layer, ab_full_tokens(), i,
+                           node->name,
+                           node->src[0] != nullptr ?
+                               node->src[0]->name : "(null)");
+                    break;
+                }
+            }
+        }
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
@@ -13162,6 +13398,80 @@ auto prefill_norm_sg_has_prework =
             wait_all_prefill_reduces(nullptr);
         }
         return compute_status;
+    }
+
+
+    // Both A (C2P) and B (legacy split) are sampled at precisely the same
+    // pre-reduction point.  Never sample post-fold PC partials: C2P modifies
+    // that buffer in place during the second PC->Phone send.
+    if (ab_trace_requested && compute_status == GGML_STATUS_SUCCESS &&
+            ab_full_tokens() >= ab_min_tokens) {
+        if (is_prefill_norm_sg &&
+                prefill_norm_layer == ab_trace_layer) {
+            if (prefill_norm_chunk == 0) {
+                ab_dump_tensor(
+                    0, -1, "ffn_inp",
+                    find_recent_ffn_inp(0, communication_sg,
+                                        ab_trace_layer));
+            }
+            ggml_cgraph * g =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[communication_sg].cgraph_main;
+            if (g != nullptr && g->n_nodes > 0) {
+                ab_dump_tensor(
+                    0, prefill_norm_chunk, "ffn_norm",
+                    g->nodes[g->n_nodes - 1]);
+            }
+        }
+        if (is_prefill_down_sg &&
+                prefill_down_layer == ab_trace_layer) {
+            for (size_t side = 0; side < 2; ++side) {
+                ggml_cgraph * g =
+                    backend_ctx->backend_configs[side]
+                        .cgraphs[communication_sg].cgraph_main;
+                if (g == nullptr || g->n_nodes == 0) {
+                    continue;
+                }
+                ab_dump_tensor(
+                    side, prefill_down_chunk, "partial",
+                    g->nodes[g->n_nodes - 1]);
+
+                const std::string suffix =
+                    "-" + std::to_string(ab_trace_layer);
+                const std::string c2p_topk =
+                    "c2p_prefill_route_topk_chunk_" +
+                    std::to_string(prefill_down_chunk) + suffix;
+                const std::string c2p_weights =
+                    "c2p_prefill_route_weights_chunk_" +
+                    std::to_string(prefill_down_chunk) + suffix;
+                const std::string logits =
+                    "ffn_moe_logits" + suffix;
+                const std::string topk =
+                    "ffn_moe_topk" + suffix;
+                const std::string weights =
+                    "ffn_moe_weights_norm" + suffix;
+                ggml_tensor * t_logits =
+                    ab_find_sg_named(side, communication_sg, logits.c_str());
+                ggml_tensor * t_topk =
+                    ab_find_sg_named(side, communication_sg, c2p_topk.c_str());
+                ggml_tensor * t_weights =
+                    ab_find_sg_named(side, communication_sg, c2p_weights.c_str());
+                if (t_topk == nullptr) {
+                    t_topk = ab_find_sg_named(
+                        side, communication_sg, topk.c_str());
+                }
+                if (t_weights == nullptr) {
+                    t_weights = ab_find_sg_named(
+                        side, communication_sg, weights.c_str());
+                }
+                ab_dump_tensor(
+                    side, prefill_down_chunk, "router_logits", t_logits);
+                ab_dump_tensor(
+                    side, prefill_down_chunk, "router_topk", t_topk);
+                ab_dump_tensor(
+                    side, prefill_down_chunk, "router_weights", t_weights);
+            }
+        }
     }
 
     // Complete deferred TP input traces only for sources that are produced by
