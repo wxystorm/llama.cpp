@@ -142,8 +142,20 @@ llama_hybrid_cycle_pc_region_cache::llama_hybrid_cycle_pc_region_cache(
         size_t max_graphs)
     : impl_(std::make_unique<impl>(max_graphs)) {}
 
-llama_hybrid_cycle_pc_region_cache::~llama_hybrid_cycle_pc_region_cache() =
-    default;
+llama_hybrid_cycle_pc_region_cache::~llama_hybrid_cycle_pc_region_cache() {
+    if (impl_ && llama_hybrid_cycle_verbose()) {
+        std::printf(
+            "[CYCLE_PC_CUDA_REGION_CACHE_SUM] hits=%llu builds=%llu "
+            "evictions=%llu allocator_grows=%llu galloc_mib=%.3f "
+            "max_graphs=%zu status=PASS\n",
+            (unsigned long long) impl_->hit_count,
+            (unsigned long long) impl_->build_count,
+            (unsigned long long) impl_->eviction_count,
+            (unsigned long long) impl_->allocator_grow_count,
+            double(impl_->allocator_size()) / (1024.0 * 1024.0),
+            impl_->max_graphs);
+    }
+}
 
 uint64_t llama_hybrid_cycle_pc_region_cache::hits() const {
     return impl_ ? impl_->hit_count : 0;
