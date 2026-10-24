@@ -81,7 +81,7 @@ static bool cycle_core_evaluate_with_kv(
         hidden <= 0 || n_tokens < 1 || n_tokens > 512 ||
         position_base < 0 || position_base > 512 - n_tokens ||
         chunk_tokens < 1 || chunk_tokens > 64 ||
-        max_inflight < 1 || max_inflight > 2 ||
+        max_inflight < 0 ||
         n_tokens > std::numeric_limits<int>::max() - chunk_tokens + 1 ||
         token_embeddings.size() != size_t(n_tokens) * size_t(hidden)) {
         reason = "UNSUPPORTED_PREFILL_SHAPE_MODEL_OR_BACKENDS";
@@ -114,12 +114,18 @@ static bool cycle_core_evaluate_with_kv(
         }
     }
     const int n_chunks = (n_tokens + chunk_tokens - 1) / chunk_tokens;
+    // Zero is the production default: admit every dependency-ready Chunk.
+    // Each (physical layer, Chunk) owns separate buffers until the real
+    // consumer handoff, rather than blocking on a global/window credit.
     if (max_inflight > n_chunks) max_inflight = n_chunks;
+    const bool dependency_only_admission = max_inflight == 0;
     if (n_tokens > 1) {
         std::printf(
             "[CYCLE_PREFILL_RING] tokens=%d chunk_tokens=%d chunks=%d "
-            "window=%d outer_batches=1 status=BEGIN\n",
-            n_tokens, chunk_tokens, n_chunks, max_inflight);
+            "admission=%s window=%d outer_batches=1 status=BEGIN\n",
+            n_tokens, chunk_tokens, n_chunks,
+            dependency_only_admission ? "DEPENDENCY_ONLY" : "LEGACY_BOUNDED",
+            max_inflight);
     }
     bool ok = true;
     {
@@ -228,7 +234,11 @@ static bool cycle_core_evaluate_with_kv(
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
                         rc.max_inflight = max_inflight;
-                        rc.credit_until_handoff = true;
+                        // Phone/CUDA output slots remain owned by the
+                        // individual Chunk until actual downstream
+                        // consumption; no additional credit gate is needed.
+                        rc.credit_until_handoff =
+                            !dependency_only_admission;
                         rc.pc_cpu_reduce_priority = true;
                         rc.ordered_c2p_reduce = true;
                         rc.phone_main_priority = true;
@@ -972,10 +982,11 @@ static bool cycle_core_evaluate_with_kv(
             if (ok) {
                 if (llama_hybrid_cycle_verbose()) std::printf(
                     "[CYCLE_CORE_FORWARD] layers=48 tokens=%d chunks=%d "
-                    "window=%d input=REAL_TOKEN_EMBEDDING "
+                    "window=%d admission=%s input=REAL_TOKEN_EMBEDDING "
                     "phone=REAL_GPU rpc=REAL_BIDIRECTIONAL "
                     "pc_reduce=EXCLUSIVE status=BEGIN\n",
-                    n_tokens, n_chunks, max_inflight);
+                    n_tokens, n_chunks, max_inflight,
+                    dependency_only_admission ? "DEPENDENCY_ONLY" : "LEGACY_BOUNDED");
                 const auto fifo_start = std::chrono::steady_clock::now();
                 ok = runtime.run(stages,
                     collect_queue_profile ? &queue_profile : nullptr,
@@ -984,9 +995,10 @@ static bool cycle_core_evaluate_with_kv(
                     const auto fifo_done = std::chrono::steady_clock::now();
                     std::printf(
                         "[CYCLE_CORE_FIFO_WALL] tokens=%d chunks=%d "
-                        "window=%d wall_ms=%.3f scope=PC_STEADY "
+                        "window=%d admission=%s wall_ms=%.3f scope=PC_STEADY "
                         "status=%s\n",
                         n_tokens, n_chunks, max_inflight,
+                        dependency_only_admission ? "DEPENDENCY_ONLY" : "LEGACY_BOUNDED",
                         std::chrono::duration<double, std::milli>(
                             fifo_done - fifo_start).count(),
                         ok ? "PASS" : "FAIL");
@@ -1163,7 +1175,7 @@ bool llama_hybrid_cycle_session::prepare(
         !ggml_backend_is_rpc(phone) ||
         max_total_tokens < 1 || max_total_tokens > 512 ||
         chunk_tokens < 1 || chunk_tokens > 64 ||
-        max_inflight < 1 || max_inflight > 2 ||
+        max_inflight < 0 ||
         !pc_cuda) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
         return false;
@@ -1203,10 +1215,11 @@ bool llama_hybrid_cycle_session::prepare(
     poisoned_ = false;
     if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
-        "layers=48 window=%d attention_graph_cache_slots=%zu "
+        "layers=48 window=%d admission=%s attention_graph_cache_slots=%zu "
         "scratch_pool=1 phone_gpu=REAL pc_full=CUDA_ONLY "
         "cuda_resident_slots=%d cuda_budget_mib=%.2f status=PASS\n",
         (long long) capacity_, max_inflight_,
+        max_inflight_ == 0 ? "DEPENDENCY_ONLY" : "LEGACY_BOUNDED",
         config.attention_graph_cache_max_graphs,
         resources_->cuda_mirror_layers(),
         double(cuda_weight_budget_bytes_) / (1024.0 * 1024.0));
@@ -1322,6 +1335,6 @@ void llama_hybrid_cycle_session::reset() {
     capacity_ = 0;
     wire_epoch_ = 0;
     chunk_tokens_ = 64;
-    max_inflight_ = 2;
+    max_inflight_ = 0;
     poisoned_ = false;
 }
