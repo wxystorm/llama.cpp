@@ -858,7 +858,7 @@ static void test_chunk_trace_observational() {
             assert(task.stage == llama_hybrid_cycle_stage::FULL_LAYER);
             ++executed;
             return true;
-        }, 1, true, nullptr, false, false, false, &timeline);
+        }, 1, true, nullptr, false, false, false, false, &timeline);
     assert(ok && executed.load() == 4);
     size_t samples = 0;
     for (const auto & queue : timeline.by_queue) {
@@ -872,6 +872,34 @@ static void test_chunk_trace_observational() {
         }
     }
     assert(samples == 4);
+}
+
+// Region V1 executes all expensive CUDA work at the first Full layer.
+// Once that task completes, the same Chunk's logical continuation must drain
+// before a newer Chunk starts another Region graph.
+static void test_pc_cuda_region_continuation_priority() {
+    llama_hybrid_cycle_layout layout;
+    layout.kinds = {
+        llama_hybrid_cycle_layer_kind::PC_CPU,
+        llama_hybrid_cycle_layer_kind::PC_CPU
+    };
+    layout.pc_cuda_full = true;
+    llama_hybrid_cycle_task_ring ring(
+        layout, 2, 2, true, false, false, false, true);
+    ring.start();
+
+    auto c0_start = take(
+        ring, llama_hybrid_cycle_queue::PC_CUDA,
+        llama_hybrid_cycle_stage::FULL_LAYER, 0, 0);
+    ring.complete(c0_start);
+
+    // FIFO alone would return L0 C1 here. Region continuation priority must
+    // instead expose L1 C0 so downstream work for the completed Region can
+    // advance immediately.
+    auto c0_cont = take(
+        ring, llama_hybrid_cycle_queue::PC_CUDA,
+        llama_hybrid_cycle_stage::FULL_LAYER, 1, 0);
+    ring.complete(c0_cont);
 }
 
 // A ready C2P Reduce must start the older Chunk's Phone MAIN ahead of
@@ -1647,6 +1675,7 @@ int main() {
     test_cycle_runtime_physical_8_and_48();
     test_v5_ready_c2p_reduce_beats_next_region_prepare();
     test_chunk_trace_observational();
+    test_pc_cuda_region_continuation_priority();
     test_v5_pc_phone_proxy_main_priority();
     test_v5_phone_main_priority();
     test_v5_phone_rx_first();
