@@ -358,8 +358,11 @@ llama_context::llama_context(
         cparams.n_ctx = requested_ctx;
         cparams.n_ctx_seq = cparams.n_ctx;
         cparams.n_seq_max = 1;
+        // One native FIFO invocation may carry up to eight 16-token
+        // chunks. This halves prompt fill/drain boundaries versus the old
+        // 64-token adapter cap while preserving chunk size and window=2.
         cparams.n_batch = std::max<uint32_t>(
-            1, std::min<uint32_t>(params.n_batch, 64));
+            1, std::min<uint32_t>(params.n_batch, 128));
         cparams.n_ubatch = std::min<uint32_t>(
             cparams.n_batch,
             params.n_ubatch ? params.n_ubatch : cparams.n_batch);
@@ -4654,7 +4657,7 @@ int llama_context::decode_cycle(const llama_batch & batch) {
     return -2;
 #else
     if (!cycle_session || !cycle_session->usable() ||
-        batch.n_tokens < 1 || batch.n_tokens > 64 ||
+        batch.n_tokens < 1 || batch.n_tokens > 128 ||
         (!batch.token && !batch.embd)) {
         LLAMA_LOG_ERROR(
             "[CYCLE_STANDARD] stage=INPUT status=FAIL "
