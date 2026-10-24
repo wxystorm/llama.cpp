@@ -16417,6 +16417,16 @@ auto prefill_norm_sg_has_prework =
     }
 
     if (compute_status != GGML_STATUS_SUCCESS) {
+        if (region_window2) {
+            drain_region_window(
+                pending_region_c2p,
+                "C2P",
+                "ERROR_DRAIN");
+            drain_region_window(
+                pending_region_p2c,
+                "P2C",
+                "ERROR_DRAIN");
+        }
         if (has_pending_prefill_reduce()) {
             wait_all_prefill_reduces(nullptr);
         }
@@ -16765,6 +16775,25 @@ auto prefill_norm_sg_has_prework =
             return route_status;
         }
         pending_phone_prefill_route_lane_task[lane] = 0;
+    }
+
+    if (region_window2) {
+        const ggml_status c2p_window_status =
+            drain_region_window(
+                pending_region_c2p,
+                "C2P",
+                "GRAPH_DRAIN");
+        if (c2p_window_status != GGML_STATUS_SUCCESS) {
+            return c2p_window_status;
+        }
+        const ggml_status p2c_window_status =
+            drain_region_window(
+                pending_region_p2c,
+                "P2C",
+                "GRAPH_DRAIN");
+        if (p2c_window_status != GGML_STATUS_SUCCESS) {
+            return p2c_window_status;
+        }
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
