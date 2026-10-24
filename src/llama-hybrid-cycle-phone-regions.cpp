@@ -39,13 +39,13 @@ bool llama_hybrid_cycle_phone_regions::prepare(
     // Chunk is at most 64 tokens so READY fits the 2-MiB data-plane payload.
     if (tokens <= 0 || tokens > 512 ||
         chunk_tokens <= 0 || chunk_tokens > 64 ||
-        max_inflight <= 0 || max_inflight > tokens ||
+        max_inflight < 0 || max_inflight > tokens ||
         1 + (tokens - 1) / chunk_tokens > 999) {
-        reason = "INVALID_PHONE_TOKEN_OR_CREDIT_WINDOW";
+        reason = "INVALID_PHONE_TOKENS_OR_ADMISSION";
         return false;
     }
     const int chunks = int(1 + (tokens - 1) / chunk_tokens);
-    if (max_inflight > chunks) {
+    if (max_inflight != 0 && max_inflight > chunks) {
         reason = "MAX_INFLIGHT_EXCEEDS_CHUNKS";
         return false;
     }
