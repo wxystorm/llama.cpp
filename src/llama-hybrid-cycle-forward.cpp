@@ -312,18 +312,24 @@ static bool cycle_core_evaluate_with_kv(
                                     &ggml_backend_rpc_cycle_register_graph;
                                 const std::vector<float> empty;
                                 double attn_ms = 0.0;
-                                const bool prepared =
-                                    llama_hybrid_cycle_execute_attention_pre(
-                                        phone, model->layers[size_t(layer)],
-                                        model->hparams, empty, hidden,
-                                        st.tokens, model->hparams.n_expert_used,
-                                        model->hparams.n_expert,
-                                        st.ready, attn_ms, nullptr,
-                                        resource->kv.get(), st.start, 1,
-                                        predecessor, true, nullptr, nullptr,
-                                        resource->scratch_pool.get(),
-                                        resource->graph_cache.get(), {},
-                                        true, arpc);
+                                bool prepared = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        resource->attention_state_mutex);
+                                    prepared =
+                                        llama_hybrid_cycle_execute_attention_pre(
+                                            phone, model->layers[size_t(layer)],
+                                            model->hparams, empty, hidden,
+                                            st.tokens,
+                                            model->hparams.n_expert_used,
+                                            model->hparams.n_expert,
+                                            st.ready, attn_ms, nullptr,
+                                            resource->kv.get(), st.start, 1,
+                                            predecessor, true, nullptr, nullptr,
+                                            resource->scratch_pool.get(),
+                                            resource->graph_cache.get(), {},
+                                            true, arpc);
+                                }
                                 return prepared &&
                                     st.ready.prepared_attention_graph_uid != 0 &&
                                     st.ready.prepared_attention_input != nullptr &&
@@ -948,7 +954,11 @@ static bool cycle_core_evaluate_with_kv(
                                             if (valid) {
                                                 r->kv->committed_tokens =
                                                     state.start + state.tokens;
-                                                state.ready.release_phone_graph();
+                                                {
+                                                    std::lock_guard<std::mutex> lock(
+                                                        r->attention_state_mutex);
+                                                    state.ready.release_phone_graph();
+                                                }
                                                 auto previous =
                                                     session.retire_phone_output_after_handoff(
                                                         l - 1, l, c);
