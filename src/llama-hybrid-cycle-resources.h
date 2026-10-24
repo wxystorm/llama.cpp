@@ -53,6 +53,10 @@ struct llama_hybrid_cycle_physical_layer_resources {
     // miss, never permission to execute this Full layer on CPU.
     std::unique_ptr<llama_hybrid_cycle_cuda_full_weights> cuda_weights;
     uint64_t cuda_residency_stamp = 0;
+    // Changes only when this physical layer receives a newly prepared CUDA
+    // mirror. Cached graphs use this generation to reject stale weight
+    // pointers after an LRU slot has been moved/reprepared elsewhere.
+    uint64_t cuda_residency_generation = 0;
     std::unique_ptr<llama_hybrid_cycle_physical_kv_cache> kv;
     std::unique_ptr<cycle_real_attention_graph_cache> graph_cache;
     std::unique_ptr<cycle_real_attention_scratch_pool> scratch_pool;
@@ -104,6 +108,7 @@ private:
 
     mutable std::mutex cuda_residency_mutex_;
     uint64_t cuda_residency_clock_ = 0;
+    uint64_t cuda_residency_generation_clock_ = 0;
     uint64_t cuda_residency_loads_ = 0;
     uint64_t cuda_residency_evictions_ = 0;
     size_t cuda_mirror_bytes_planned_ = 0;
