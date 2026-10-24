@@ -331,19 +331,12 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         return false;
     }
     const int64_t kv_tokens = token_start + tokens;
-    std::vector<uint64_t> weight_generations;
-    weight_generations.reserve(region.size());
-    for (const auto * resource : region) {
-        if (!resource || resource->cuda_residency_generation == 0) {
-            reason = "PC_REGION_RESIDENCY_GENERATION";
-            return false;
-        }
-        weight_generations.push_back(resource->cuda_residency_generation);
-    }
-
-    auto * entry = cache_impl->lookup(
-        first_layer, layer_count, tokens, kv_tokens, weight_generations);
+    auto * entry = cache_impl->lookup(layer_count, tokens, kv_tokens);
     const bool cache_hit = entry != nullptr;
+    if (cache_hit && !cache_impl->bind_entry(*entry, region)) {
+        reason = "PC_REGION_CACHE_REBIND";
+        return false;
+    }
     const auto graph_build_begin = std::chrono::steady_clock::now();
 
     ggml_context * ctx = entry ? entry->ctx : nullptr;
