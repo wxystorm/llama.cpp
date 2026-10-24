@@ -34,7 +34,8 @@ LLAMA_API bool llama_hybrid_cycle_execute_pc_full_layer(
     int physical_layer, int64_t token_start, int64_t tokens,
     const std::vector<float> & input,
     std::vector<float> & output,
-    llama_hybrid_cycle_pc_full_timing * timing = nullptr);
+    llama_hybrid_cycle_pc_full_timing * timing = nullptr,
+    const std::function<bool()> & input_consumed = {});
 
 // Bind real PC Full stages by ABSOLUTE model layer number. The other
 // Tensor/Phone stages are intentionally left for their own real executors;
@@ -138,7 +139,8 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                     !llama_hybrid_cycle_execute_pc_full_layer(
                         model, *resident, pc_cpu, l,
                         chunk.start, chunk.tokens, input,
-                        chunk.host_output)) {
+                        chunk.host_output, nullptr,
+                        task.input_consumed)) {
                     return false;
                 }
                 // Diagnostic capture is executed only on this PC Full's
