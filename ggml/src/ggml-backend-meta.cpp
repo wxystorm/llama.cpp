@@ -7482,6 +7482,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (c2p_router_handoff) {
             handled = true;
 
+            if (c2p_route_chunk >= 0 &&
+                    c2p_prefill_route_ready.count({
+                        c2p_route_layer, c2p_route_chunk,
+                    }) != 0) {
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_ROUTE] layer=%d chunk=%d sg=%zu "
+                        "trigger=ROUTE_BOUNDARY action=SKIP_ALREADY_READY "
+                        "status=OK\n",
+                        c2p_route_layer,
+                        c2p_route_chunk,
+                        i);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
             char topk_name[96];
             char weights_name[96];
             if (c2p_route_chunk >= 0) {
@@ -13545,6 +13561,7 @@ auto prefill_norm_sg_has_prework =
         int c2p_exec_layer = -1;
         int c2p_exec_chunk = -1;
         bool c2p_exec_route = false;
+        bool c2p_exec_prefill_boundary = false;
         if (n_backends == 2) {
             ggml_cgraph * pc_graph =
                 backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
@@ -13563,6 +13580,22 @@ auto prefill_norm_sg_has_prework =
                         c2p_exec_route = true;
                         break;
                     }
+                }
+
+                if (c2p_exec_route &&
+                        c2p_exec_chunk >= 0 &&
+                        pc_graph->n_nodes > 0) {
+                    int terminal_chunk = -1;
+                    int terminal_layer = -1;
+                    ggml_tensor * terminal =
+                        pc_graph->nodes[pc_graph->n_nodes - 1];
+                    c2p_exec_prefill_boundary =
+                        ggml_backend_meta_parse_c2p_route_weights(
+                            terminal->name,
+                            terminal_chunk,
+                            terminal_layer) &&
+                        terminal_chunk == c2p_exec_chunk &&
+                        terminal_layer == c2p_exec_layer;
                 }
             }
         }
@@ -13610,11 +13643,9 @@ auto prefill_norm_sg_has_prework =
             GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
             GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
             GGML_ASSERT(
-                ggml_nbytes(src_topk) ==
-                ggml_nbytes(dst_topk));
+                ggml_are_same_layout(src_topk, dst_topk));
             GGML_ASSERT(
-                ggml_nbytes(src_weights) ==
-                ggml_nbytes(dst_weights));
+                ggml_are_same_layout(src_weights, dst_weights));
 
             const size_t route_slot =
                 c2p_exec_chunk >= 0 ?
@@ -13713,25 +13744,37 @@ auto prefill_norm_sg_has_prework =
                         "router_weights", dst_weights);
                 }
 
+                if (c2p_exec_prefill_boundary) {
+                    c2p_prefill_route_ready.insert({
+                        c2p_exec_layer, c2p_exec_chunk,
+                    });
+                }
+
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_ROUTE] layer=%d chunk=%d "
                         "direction=PC_TO_PHONE "
                         "topk_bytes=%zu weights_bytes=%zu "
                         "topk_ms=%.3f weights_ms=%.3f "
-                        "owner=PC trigger=GENERIC status=OK\n",
+                        "owner=PC trigger=%s status=%s\n",
                         c2p_exec_layer,
                         c2p_exec_chunk,
                         ggml_nbytes(src_topk),
                         ggml_nbytes(src_weights),
                         topk_us / 1000.0,
-                        weights_us / 1000.0);
+                        weights_us / 1000.0,
+                        c2p_exec_prefill_boundary ?
+                            "ROUTE_EXEC" : "GENERIC",
+                        c2p_exec_prefill_boundary ?
+                            "READY" : "OK");
                 }
 
                 restore_c2p_route_bindings(c2p_bindings);
 
-                compute_workers.start(1, i);
-                phone_status = compute_workers.wait(1);
+                if (!c2p_exec_prefill_boundary) {
+                    compute_workers.start(1, i);
+                    phone_status = compute_workers.wait(1);
+                }
             } else {
                 restore_c2p_route_bindings(c2p_bindings);
             }
