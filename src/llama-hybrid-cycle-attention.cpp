@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-attention.h"
+#include "llama-hybrid-cycle-log.h"
 #include "llama-model.h"
 #include "llama-hparams.h"
 #include "ggml-alloc.h"
@@ -296,7 +297,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
     auto * attn = ggml_cont_2d(ctx,
         ggml_permute(ctx, kqv, 0, 2, 1, 3), attention_width, tokens);
 
-    std::printf(
+    if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_PHONE_ATTN_SHAPE] hidden=%lld head_dim=%lld "
         "heads=%lld kv_heads=%lld attn_width=%lld wo_out=%lld "
         "query_tokens=%lld kv_tokens=%lld status=PASS\n",
@@ -423,7 +424,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
         release_compute_buffer();
         return false;
     }
-    std::printf("[CYCLE_PHONE_KV] query_tokens=%lld kv_tokens=%lld "
+    if (llama_hybrid_cycle_verbose()) std::printf("[CYCLE_PHONE_KV] query_tokens=%lld kv_tokens=%lld "
                 "position_start=%lld position_end=%lld "
                 "masked_future=%lld mask_type=F16 scope=%s "
                 "status=PASS\n",
@@ -472,7 +473,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
             release_compute_buffer();
             return false;
         }
-        std::printf(
+        if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_PHONE_LOCAL_HANDOFF] backend=%s "
             "bytes=%zu source=PHONE_GPU_PREVIOUS_LAYER "
             "destination=PHONE_GPU_ATTENTION "
@@ -497,7 +498,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
         ggml_graph_set_uid(graph, deferred_graph_uid);
         graph_submitted = rpc_ops.register_graph != nullptr &&
             rpc_ops.register_graph(backend, graph);
-        std::printf(
+        if (!graph_submitted || llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_PHONE_V2] side=PC event=REGISTER_NEXT_ATTN "
             "uid=%" PRIu64 " tokens=%lld prefix=%lld status=%s\n",
             deferred_graph_uid, (long long)tokens,
@@ -544,7 +545,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
         ggml_backend_synchronize(backend);
         if (kv_cache != nullptr) {
             kv_cache->committed_tokens = kv_tokens;
-            std::printf(
+            if (llama_hybrid_cycle_verbose()) std::printf(
                 "[CYCLE_PHONE_KV_PERSISTENT] chunk=%d "
                 "position_start=%lld committed=%lld "
                 "total=%lld owner=%s status=OK\n",
@@ -591,7 +592,7 @@ bool llama_hybrid_cycle_execute_attention_pre(
     }
     elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - begin).count();
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_PHONE_ATTN_PRE] backend=%s "
         "positions=[%lld,%lld] tokens=%lld kv_tokens=%lld "
         "heads=%lld kv_heads=%lld graph_nodes=%d "
