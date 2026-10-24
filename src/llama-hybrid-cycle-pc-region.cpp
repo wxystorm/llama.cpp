@@ -304,6 +304,13 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
                      " detail=" + residency_reason;
             return false;
         }
+        const auto & lw = model.layers[size_t(layer)];
+        if (lw.wqkv || lw.wq_b || lw.wk_b || lw.wv_b ||
+            lw.wo_b || lw.wq_s || lw.wk_s || lw.wv_s || lw.wo_s) {
+            reason = "PC_REGION_UNSUPPORTED_LAYER layer=" +
+                     std::to_string(layer);
+            return false;
+        }
         const auto * resource = resources.layer(layer);
         if (!resource || !resource->attn_backend || !resource->cuda_weights ||
             !resource->kv || !resource->kv->keys || !resource->kv->values ||
