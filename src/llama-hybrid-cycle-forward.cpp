@@ -1374,16 +1374,21 @@ static bool cycle_core_evaluate_with_kv(
             llama_hybrid_cycle_fifo_profile queue_profile;
             if (ok && !stages.validate(reason)) ok = false;
             if (ok) {
+                start_phone_region_prepare_worker();
                 if (llama_hybrid_cycle_verbose()) std::printf(
                     "[CYCLE_CORE_FORWARD] layers=48 tokens=%d chunks=%d "
                     "window=%d input=REAL_TOKEN_EMBEDDING "
                     "phone=REAL_GPU rpc=REAL_BIDIRECTIONAL "
-                    "pc_reduce=EXCLUSIVE status=BEGIN\n",
+                    "pc_reduce=EXCLUSIVE region_prepare=ASYNC "
+                    "status=BEGIN\n",
                     n_tokens, n_chunks, max_inflight);
                 const auto fifo_start = std::chrono::steady_clock::now();
                 ok = runtime.run(stages,
                     collect_queue_profile ? &queue_profile : nullptr,
                     collect_queue_profile ? &timeline : nullptr);
+                // No registered graph preparation may outlive the physical
+                // Session/slot buffers captured by this invocation.
+                stop_phone_region_prepare_worker();
                 if (collect_queue_profile) {
                     const auto fifo_done = std::chrono::steady_clock::now();
                     std::printf(
