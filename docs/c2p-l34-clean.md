@@ -355,3 +355,37 @@ The next step, after correctness passes, is to feed the post-C2P Phone
 continuation (L35-L45 -> L46 Attention/Router -> L46 Phone FFN -> P2C send)
 through PHONE_MAIN and the mirrored PC continuation through PC_MAIN, then
 delay incoming-shard joins to introduce a two-credit Prefill window.
+
+
+### Directional MAIN coverage V2
+
+With `LLAMA_HYBRID_REGION_PRIORITY_QUEUES=1`, the high-priority MAIN
+executor now also covers the already-proven synchronous Prefill continuation:
+
+```text
+PC_MAIN:
+  PC full-region Prefill work
+  C2P outgoing FFN/fold
+  P2C final reduce
+  PC continuation after P2C
+
+PHONE_MAIN:
+  C2P final reduce
+  Phone full-region Prefill work
+  P2C Attention/Router path
+  P2C outgoing FFN/fold
+```
+
+The reducer-side waiting shards remain low-priority only:
+
+```text
+PHONE_C2P_FFN
+PC_P2C_FFN
+```
+
+This stage intentionally preserves every existing join. It does not yet
+introduce a multi-chunk credit window. The purpose is to establish the
+correct priority topology before incoming-FFN waits are deferred.
+
+Reduce remains on the existing GPU backend in this version. CPU Reduce can be
+A/B tested later after the queue/window topology is correct.
