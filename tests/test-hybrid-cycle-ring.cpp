@@ -1490,6 +1490,11 @@ static void test_cycle_phone_regions_independent_ledgers() {
     assert(whole_prompt_regions.prepare(layout, 358, 64, 2, reason));
     assert(whole_prompt_regions.region_count() == 6);
     assert(whole_prompt_regions.n_chunks() == 6);
+    // Production admits all dependency-ready Chunks with window=0.
+    llama_hybrid_cycle_phone_regions unbounded_regions;
+    assert(unbounded_regions.prepare(layout, 358, 64, 0, reason));
+    assert(unbounded_regions.region_count() == 6);
+    assert(unbounded_regions.n_chunks() == 6);
     for (int i = 0; i < whole_prompt_regions.region_count(); ++i) {
         const auto * ledger = whole_prompt_regions.by_index(i);
         assert(ledger && ledger->n_chunks == 6 &&
@@ -1574,7 +1579,54 @@ static void test_cycle_phone_regions_independent_ledgers() {
     assert(reason == "MAX_INFLIGHT_EXCEEDS_CHUNKS");
 }
 
+// Dependency-only admission: a six-Chunk Prompt must enter the Ring
+// immediately, not block behind a two-Chunk phone/buffer credit window.
+// The actual per-(layer,chunk) buffers and device handoff ACKs are owned by
+// the executor, while the Ring preserves causal per-layer KV entry order.
+static void test_unbounded_chunk_admission() {
+    const auto layout = llama_hybrid_build_cycle_layout(4, 1, 1);
+    constexpr int chunks = 6;
+    llama_hybrid_cycle_task_ring ring(
+        layout, chunks, 0, false, false, true, true);
+    ring.start();
+    // All six initial FULL tasks are admitted before any computation.
+    assert(ring.pending(llama_hybrid_cycle_queue::PC_CPU) == chunks);
+    std::array<int, 4> next_entry {};
+    constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
+        llama_hybrid_cycle_queue::PC_CPU,
+        llama_hybrid_cycle_queue::PHONE_GPU,
+        llama_hybrid_cycle_queue::PC_CUDA,
+        llama_hybrid_cycle_queue::PC_TO_PHONE,
+        llama_hybrid_cycle_queue::PHONE_TO_PC,
+    };
+    int completed = 0;
+    while (!ring.finished() && completed < 1000) {
+        bool progressed = false;
+        for (const auto queue : queues) {
+            llama_hybrid_cycle_task task;
+            if (!ring.try_pop(queue, task)) continue;
+            if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER ||
+                task.stage == llama_hybrid_cycle_stage::ATTN_PRE) {
+                assert(task.chunk == next_entry[size_t(task.layer)]);
+                ++next_entry[size_t(task.layer)];
+            }
+            ring.complete(task);
+            ++completed;
+            progressed = true;
+        }
+        assert(progressed);
+    }
+    assert(ring.finished());
+    assert(ring.output_count() == 4 * chunks);
+    for (int count : next_entry) assert(count == chunks);
+    std::printf(
+        "[CYCLE_UNBOUNDED_ADMISSION] chunks=%d "
+        "completed_stages=%d kv_order=PASS status=PASS\\n",
+        chunks, completed);
+}
+
 int main() {
+    test_unbounded_chunk_admission();
     test_cycle_phone_regions_independent_ledgers();
     test_cycle_48_cuda_budget_selection();
     test_cycle_48_selective_cuda_full_layers();
