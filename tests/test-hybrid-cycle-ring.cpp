@@ -1621,7 +1621,7 @@ static void test_unbounded_chunk_admission() {
     for (int count : next_entry) assert(count == chunks);
     std::printf(
         "[CYCLE_UNBOUNDED_ADMISSION] chunks=%d "
-        "completed_stages=%d kv_order=PASS status=PASS\\n",
+        "completed_stages=%d kv_order=PASS status=PASS\n",
         chunks, completed);
 }
 
