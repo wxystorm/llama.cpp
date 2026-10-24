@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-phone-full.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 
@@ -108,7 +109,7 @@ bool llama_hybrid_cycle_execute_phone_full(
     ready.release_phone_graph();
     const double wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
-    std::printf(
+    if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_PHONE_FULL] layer=%d "
         "position_start=%lld tokens=%lld kv_committed=%lld "
         "attn_ms=%.3f wall_ms=%.3f "
