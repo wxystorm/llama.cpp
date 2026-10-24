@@ -11505,43 +11505,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     bool ab_l47_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        // Save the exact Phone input immediately before the next full layer.
-        // This verifies that the C2P l_out buffer is the activation consumed
-        // by L47 rather than merely a correctly reduced, unused copy.
-        if (ab_trace_requested && !ab_l47_entry_dumped &&
-                ab_full_tokens() >= ab_min_tokens) {
-            ggml_cgraph * phone_g =
-                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
-            if (phone_g != nullptr) {
-                const std::string norm_name =
-                    "norm-" + std::to_string(ab_trace_layer + 1);
-                for (int k = 0; k < phone_g->n_nodes; ++k) {
-                    ggml_tensor * node = phone_g->nodes[k];
-                    if (node == nullptr ||
-                            std::strcmp(node->name,
-                                        norm_name.c_str()) != 0 ||
-                            !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                        continue;
-                    }
-                    ab_dump_tensor(1, -1, "l_out",
-                                   find_layer_output(1, ab_trace_layer));
-                    ab_dump_tensor(1, -1, "l47_input", node->src[0]);
-                    if (!ggml_backend_meta_tensor_c2p_layer(
-                            backend_ctx, ab_trace_layer)) {
-                        ab_dump_tensor(0, -1, "l_out",
-                                       find_layer_output(0, ab_trace_layer));
-                    }
-                    ab_l47_entry_dumped = true;
-                    printf("[AB_L47_ENTRY] layer=%d tokens=%" PRId64
-                           " sg=%zu norm=%s input=%s status=CAPTURED\n",
-                           ab_trace_layer, ab_full_tokens(), i,
-                           node->name,
-                           node->src[0] != nullptr ?
-                               node->src[0]->name : "(null)");
-                    break;
-                }
-            }
-        }
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
@@ -11897,6 +11860,46 @@ auto prefill_norm_sg_has_prework =
 
     const int next_layer = is_prefill_down_sg ? prefill_down_layer : prefill_norm_layer;
     const int next_chunk = is_prefill_down_sg ? prefill_down_chunk : prefill_norm_chunk;
+        // Capture after the ordinary scheduler has waited for any pending
+        // prefill return/handoff. Before that barrier the B/legacy Phone
+        // activation could still contain the previous run's values.
+        // Save the exact Phone input immediately before the next full layer.
+        // This verifies that the C2P l_out buffer is the activation consumed
+        // by L47 rather than merely a correctly reduced, unused copy.
+        if (ab_trace_requested && !ab_l47_entry_dumped &&
+                ab_full_tokens() >= ab_min_tokens) {
+            ggml_cgraph * phone_g =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            if (phone_g != nullptr) {
+                const std::string norm_name =
+                    "norm-" + std::to_string(ab_trace_layer + 1);
+                for (int k = 0; k < phone_g->n_nodes; ++k) {
+                    ggml_tensor * node = phone_g->nodes[k];
+                    if (node == nullptr ||
+                            std::strcmp(node->name,
+                                        norm_name.c_str()) != 0 ||
+                            !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                        continue;
+                    }
+                    ab_dump_tensor(1, -1, "l_out",
+                                   find_layer_output(1, ab_trace_layer));
+                    ab_dump_tensor(1, -1, "l47_input", node->src[0]);
+                    if (!ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, ab_trace_layer)) {
+                        ab_dump_tensor(0, -1, "l_out",
+                                       find_layer_output(0, ab_trace_layer));
+                    }
+                    ab_l47_entry_dumped = true;
+                    printf("[AB_L47_ENTRY] layer=%d tokens=%" PRId64
+                           " sg=%zu norm=%s input=%s status=CAPTURED\n",
+                           ab_trace_layer, ab_full_tokens(), i,
+                           node->name,
+                           node->src[0] != nullptr ?
+                               node->src[0]->name : "(null)");
+                    break;
+                }
+            }
+        }
     const bool trace_prefill_chunk = pipeline_debug && (is_prefill_down_sg || is_prefill_norm_sg);
     const int64_t next_begin_us = ggml_time_us();
     if (trace_prefill_chunk) {
