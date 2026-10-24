@@ -9513,6 +9513,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const size_t chunk_offset = down_chunk_offset(
                     0, true, prefill_down_layer_0, prefill_down_chunk_0);
 
+                // At this boundary both FFN shard outputs are live and are the
+                // exact tensors consumed by the C2P reduction. Capture them
+                // here instead of reading a remote graph tail after the graph
+                // allocator may have recycled its storage.
+                if (ab_trace_requested &&
+                        prefill_down_layer_0 == ab_trace_layer &&
+                        ab_full_tokens() >= ab_min_tokens) {
+                    ab_dump_tensor(
+                        0, prefill_down_chunk_0,
+                        "partial", node_dst);
+                    ab_dump_tensor(
+                        1, prefill_down_chunk_0,
+                        "partial", node_src);
+                }
+
                 // PC: fold the residual into the local FFN partial in-place.
                 ggml_tensor * residual_chunk = get_node_aux(node_dst);
                 residual_chunk->view_src = pc_residual;
@@ -12658,6 +12673,98 @@ auto prefill_norm_sg_has_prework =
 
             compute_status = phone_status;
         } else {
+            const bool c2p_prefill_exec =
+                n_backends == 2 &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, prefill_down_layer);
+
+            std::vector<c2p_route_binding_backup> c2p_bindings;
+            ggml_tensor * c2p_src_topk = nullptr;
+            ggml_tensor * c2p_dst_topk = nullptr;
+            ggml_tensor * c2p_src_weights = nullptr;
+            ggml_tensor * c2p_dst_weights = nullptr;
+            ggml_cgraph * c2p_pc_graph = nullptr;
+            uint64_t c2p_saved_pc_graph_uid = 0;
+
+            if (c2p_prefill_exec) {
+                char topk_name[96];
+                char weights_name[96];
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "c2p_prefill_route_topk_chunk_%d-%d",
+                    prefill_down_chunk, prefill_down_layer);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "c2p_prefill_route_weights_chunk_%d-%d",
+                    prefill_down_chunk, prefill_down_layer);
+
+                c2p_src_topk =
+                    find_sg_named_tensor(0, i, topk_name);
+                c2p_dst_topk =
+                    find_sg_named_tensor(1, i, topk_name);
+                c2p_src_weights =
+                    find_sg_named_tensor(0, i, weights_name);
+                c2p_dst_weights =
+                    find_sg_named_tensor(1, i, weights_name);
+
+                GGML_ASSERT(c2p_src_topk != nullptr);
+                GGML_ASSERT(c2p_dst_topk != nullptr);
+                GGML_ASSERT(c2p_src_weights != nullptr);
+                GGML_ASSERT(c2p_dst_weights != nullptr);
+                GGML_ASSERT(c2p_src_topk->type == GGML_TYPE_I32);
+                GGML_ASSERT(c2p_dst_topk->type == GGML_TYPE_I32);
+                GGML_ASSERT(c2p_src_weights->type == GGML_TYPE_F32);
+                GGML_ASSERT(c2p_dst_weights->type == GGML_TYPE_F32);
+                GGML_ASSERT(
+                    ggml_are_same_layout(
+                        c2p_src_topk, c2p_dst_topk));
+                GGML_ASSERT(
+                    ggml_are_same_layout(
+                        c2p_src_weights, c2p_dst_weights));
+
+                const size_t route_slot =
+                    static_cast<size_t>(
+                        std::max(0, prefill_down_chunk));
+                auto & c2p_slots =
+                    backend_ctx->backend_configs[0].
+                        c2p_route_stage_bufs;
+                if (c2p_slots.size() <= route_slot) {
+                    c2p_slots.resize(route_slot + 1);
+                }
+
+                bind_c2p_route_storage(
+                    c2p_src_topk,
+                    c2p_slots[route_slot][0],
+                    c2p_bindings);
+                bind_c2p_route_storage(
+                    c2p_src_weights,
+                    c2p_slots[route_slot][1],
+                    c2p_bindings);
+
+                // Rebinding graph tensors changes their backing addresses.
+                // Force the local backend to rebuild/rebind this graph instead
+                // of reusing a cached graph prepared for the old arena.
+                c2p_pc_graph =
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[i].cgraph_main;
+                if (c2p_pc_graph != nullptr) {
+                    c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
+                    c2p_pc_graph->uid = 0;
+                }
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                        "topk_bytes=%zu weights_bytes=%zu "
+                        "trigger=PREFILL_DOWN status=READY\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        ggml_nbytes(c2p_src_topk),
+                        ggml_nbytes(c2p_src_weights));
+                }
+            }
+
             compute_workers.start(0, i);
 
             if (has_async_prefill_input) {
@@ -12672,6 +12779,10 @@ auto prefill_norm_sg_has_prework =
                 pending_prefill_input_chunk = -1;
                 if (input_status != GGML_STATUS_SUCCESS) {
                     compute_workers.wait(0);
+                    if (c2p_pc_graph != nullptr) {
+                        c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
+                    }
+                    restore_c2p_route_bindings(c2p_bindings);
                     if (has_pending_prefill_reduce()) {
                         wait_all_prefill_reduces(nullptr);
                     }
@@ -12690,60 +12801,41 @@ auto prefill_norm_sg_has_prework =
                        prefill_down_chunk, chunk_submit_begin_us);
             }
 
-            const bool c2p_prefill_exec =
-                n_backends == 2 &&
-                ggml_backend_meta_tensor_c2p_layer(
-                    backend_ctx, prefill_down_layer);
-
             ggml_status pc_status = GGML_STATUS_SUCCESS;
             ggml_status phone_status = GGML_STATUS_SUCCESS;
 
             if (c2p_prefill_exec) {
-                // C2P Router is PC-owned.  The Phone expert graph consumes the
-                // PC-produced TopK/weights, so it must not start concurrently
-                // with the PC graph.  Correctness-first ordering:
+                // Correctness-first C2P order:
                 //
-                //   PC graph -> route copy PC->Phone -> Phone graph
+                //   pin PC Router outputs
+                //   -> PC graph
+                //   -> copy exact Router TopK/weights PC->Phone
+                //   -> Phone expert graph
                 //
-                // Once validated this can be split at the Router boundary and
-                // overlapped without changing ownership.
+                // The pin is required because the PC graph itself consumes the
+                // Router outputs and would otherwise be free to recycle their
+                // arena storage before Meta performs the cross-device copy.
                 pc_status = compute_workers.wait(0);
+                if (c2p_pc_graph != nullptr) {
+                    c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
+                }
+
                 if (pc_status == GGML_STATUS_SUCCESS) {
-                    char topk_name[96];
-                    char weights_name[96];
-                    std::snprintf(
-                        topk_name, sizeof(topk_name),
-                        "c2p_prefill_route_topk_chunk_%d-%d",
-                        prefill_down_chunk, prefill_down_layer);
-                    std::snprintf(
-                        weights_name, sizeof(weights_name),
-                        "c2p_prefill_route_weights_chunk_%d-%d",
-                        prefill_down_chunk, prefill_down_layer);
-
-                    ggml_tensor * src_topk =
-                        find_exact_named_tensor(0, topk_name);
-                    ggml_tensor * dst_topk =
-                        find_exact_named_tensor(1, topk_name);
-                    ggml_tensor * src_weights =
-                        find_exact_named_tensor(0, weights_name);
-                    ggml_tensor * dst_weights =
-                        find_exact_named_tensor(1, weights_name);
-
-                    GGML_ASSERT(src_topk != nullptr);
-                    GGML_ASSERT(dst_topk != nullptr);
-                    GGML_ASSERT(src_weights != nullptr);
-                    GGML_ASSERT(dst_weights != nullptr);
-                    GGML_ASSERT(
-                        ggml_nbytes(src_topk) ==
-                        ggml_nbytes(dst_topk));
-                    GGML_ASSERT(
-                        ggml_nbytes(src_weights) ==
-                        ggml_nbytes(dst_weights));
-
                     auto & pc_cfg =
                         backend_ctx->backend_configs[0];
                     auto & phone_cfg =
                         backend_ctx->backend_configs[1];
+
+                    if (ab_trace_requested &&
+                            prefill_down_layer == ab_trace_layer &&
+                            ab_full_tokens() >= ab_min_tokens) {
+                        ab_dump_tensor(
+                            0, prefill_down_chunk,
+                            "router_topk", c2p_src_topk);
+                        ab_dump_tensor(
+                            0, prefill_down_chunk,
+                            "router_weights", c2p_src_weights);
+                    }
 
                     ggml_backend_synchronize(pc_cfg.backend);
 
@@ -12751,29 +12843,40 @@ auto prefill_norm_sg_has_prework =
                     ggml_backend_tensor_copy_async(
                         pc_cfg.backend,
                         phone_cfg.backend,
-                        src_topk,
-                        dst_topk);
+                        c2p_src_topk,
+                        c2p_dst_topk);
                     ggml_backend_synchronize(phone_cfg.backend);
                     const int64_t topk_us =
                         ggml_time_us() - topk_begin_us;
                     record_copy_wait(topk_us);
                     record_meta_copy(
-                        i, 0, 1, src_topk, topk_us);
+                        i, 0, 1, c2p_src_topk, topk_us);
                     record_direct_copy();
 
                     const int64_t weights_begin_us = ggml_time_us();
                     ggml_backend_tensor_copy_async(
                         pc_cfg.backend,
                         phone_cfg.backend,
-                        src_weights,
-                        dst_weights);
+                        c2p_src_weights,
+                        c2p_dst_weights);
                     ggml_backend_synchronize(phone_cfg.backend);
                     const int64_t weights_us =
                         ggml_time_us() - weights_begin_us;
                     record_copy_wait(weights_us);
                     record_meta_copy(
-                        i, 0, 1, src_weights, weights_us);
+                        i, 0, 1, c2p_src_weights, weights_us);
                     record_direct_copy();
+
+                    if (ab_trace_requested &&
+                            prefill_down_layer == ab_trace_layer &&
+                            ab_full_tokens() >= ab_min_tokens) {
+                        ab_dump_tensor(
+                            1, prefill_down_chunk,
+                            "router_topk", c2p_dst_topk);
+                        ab_dump_tensor(
+                            1, prefill_down_chunk,
+                            "router_weights", c2p_dst_weights);
+                    }
 
                     if (pipeline_debug) {
                         printf(
@@ -12784,14 +12887,18 @@ auto prefill_norm_sg_has_prework =
                             "owner=PC trigger=PREFILL_DOWN status=OK\n",
                             prefill_down_layer,
                             prefill_down_chunk,
-                            ggml_nbytes(src_topk),
-                            ggml_nbytes(src_weights),
+                            ggml_nbytes(c2p_src_topk),
+                            ggml_nbytes(c2p_src_weights),
                             topk_us / 1000.0,
                             weights_us / 1000.0);
                     }
 
+                    restore_c2p_route_bindings(c2p_bindings);
+
                     compute_workers.start(1, i);
                     phone_status = compute_workers.wait(1);
+                } else {
+                    restore_c2p_route_bindings(c2p_bindings);
                 }
             } else {
                 compute_workers.start(1, i);
@@ -13620,7 +13727,9 @@ auto prefill_norm_sg_has_prework =
             }
         }
         if (is_prefill_down_sg &&
-                prefill_down_layer == ab_trace_layer) {
+                prefill_down_layer == ab_trace_layer &&
+                !ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, prefill_down_layer)) {
             for (size_t side = 0; side < 2; ++side) {
                 ggml_cgraph * g =
                     backend_ctx->backend_configs[side]
