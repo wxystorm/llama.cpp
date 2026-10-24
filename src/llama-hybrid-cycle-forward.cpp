@@ -230,6 +230,7 @@ static bool cycle_core_evaluate_with_kv(
                         std::atomic<int> phone_region_prepared {0};
                         std::atomic<int> phone_region_armed {0};
                         std::atomic<int> phone_region_stage_acks {0};
+                        std::atomic<uint64_t> phone_region_prepare_wait_us {0};
 
                         // Protocol 31 production path. Prepare one future
                         // Phone Full stage without submitting it: Attention
@@ -480,6 +481,135 @@ static bool cycle_core_evaluate_with_kv(
                                 }
                                 return armed;
                             };
+
+                        // Registration is control-plane work, not a
+                        // compute stage. Keep it off both PC_CPU and
+                        // PHONE_GPU critical paths with one tiny host worker.
+                        // C2P ATTN_PRE enqueues; C2P REDUCE only waits if the
+                        // overlapped preparation has not completed yet.
+                        std::mutex phone_region_prepare_mutex;
+                        std::condition_variable phone_region_prepare_cv;
+                        std::deque<std::pair<int, int>>
+                            phone_region_prepare_jobs;
+                        std::vector<int> phone_region_prepare_status(
+                            size_t(phone_regions.region_count() * n_chunks), 0);
+                        bool phone_region_prepare_stop = false;
+                        std::thread phone_region_prepare_worker;
+
+                        const auto phone_region_prepare_key =
+                            [&](int region_index, int chunk) -> size_t {
+                                return size_t(region_index * n_chunks + chunk);
+                            };
+
+                        const auto enqueue_phone_region_prepare =
+                            [&](llama_hybrid_cycle_phone_region_progress & pregion,
+                                int chunk) -> bool {
+                                if (chunk < 0 || chunk >= n_chunks ||
+                                    pregion.location.cycle_index < 0 ||
+                                    pregion.location.cycle_index >=
+                                        phone_regions.region_count()) {
+                                    return false;
+                                }
+                                const size_t key = phone_region_prepare_key(
+                                    pregion.location.cycle_index, chunk);
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        phone_region_prepare_mutex);
+                                    if (phone_region_prepare_status[key] < 0) {
+                                        return false;
+                                    }
+                                    if (phone_region_prepare_status[key] != 0) {
+                                        return true;
+                                    }
+                                    phone_region_prepare_status[key] = 1;
+                                    phone_region_prepare_jobs.emplace_back(
+                                        pregion.location.cycle_index, chunk);
+                                }
+                                phone_region_prepare_cv.notify_one();
+                                return true;
+                            };
+
+                        const auto wait_phone_region_prepare =
+                            [&](llama_hybrid_cycle_phone_region_progress & pregion,
+                                int chunk) -> bool {
+                                if (chunk < 0 || chunk >= n_chunks ||
+                                    pregion.location.cycle_index < 0 ||
+                                    pregion.location.cycle_index >=
+                                        phone_regions.region_count()) {
+                                    return false;
+                                }
+                                const size_t key = phone_region_prepare_key(
+                                    pregion.location.cycle_index, chunk);
+                                const auto begin =
+                                    std::chrono::steady_clock::now();
+                                std::unique_lock<std::mutex> lock(
+                                    phone_region_prepare_mutex);
+                                const bool signaled =
+                                    phone_region_prepare_cv.wait_for(
+                                        lock, std::chrono::seconds(30), [&] {
+                                            return
+                                                phone_region_prepare_status[key] == 2 ||
+                                                phone_region_prepare_status[key] < 0;
+                                        });
+                                const uint64_t wait_us = uint64_t(
+                                    std::chrono::duration_cast<
+                                        std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() -
+                                        begin).count());
+                                phone_region_prepare_wait_us.fetch_add(
+                                    wait_us, std::memory_order_relaxed);
+                                return signaled &&
+                                    phone_region_prepare_status[key] == 2;
+                            };
+
+                        const auto start_phone_region_prepare_worker = [&]() {
+                            phone_region_prepare_worker = std::thread([&] {
+                                for (;;) {
+                                    std::pair<int, int> job {-1, -1};
+                                    {
+                                        std::unique_lock<std::mutex> lock(
+                                            phone_region_prepare_mutex);
+                                        phone_region_prepare_cv.wait(lock, [&] {
+                                            return phone_region_prepare_stop ||
+                                                !phone_region_prepare_jobs.empty();
+                                        });
+                                        if (phone_region_prepare_stop &&
+                                            phone_region_prepare_jobs.empty()) {
+                                            break;
+                                        }
+                                        job = phone_region_prepare_jobs.front();
+                                        phone_region_prepare_jobs.pop_front();
+                                    }
+                                    auto * pregion =
+                                        phone_regions.by_index(job.first);
+                                    const bool prepared = pregion &&
+                                        prepare_phone_region(
+                                            *pregion, job.second);
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                            phone_region_prepare_mutex);
+                                        const size_t key =
+                                            phone_region_prepare_key(
+                                                job.first, job.second);
+                                        phone_region_prepare_status[key] =
+                                            prepared ? 2 : -1;
+                                    }
+                                    phone_region_prepare_cv.notify_all();
+                                }
+                            });
+                        };
+
+                        const auto stop_phone_region_prepare_worker = [&]() {
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    phone_region_prepare_mutex);
+                                phone_region_prepare_stop = true;
+                            }
+                            phone_region_prepare_cv.notify_all();
+                            if (phone_region_prepare_worker.joinable()) {
+                                phone_region_prepare_worker.join();
+                            }
+                        };
 
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
