@@ -213,7 +213,7 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
     };
 
     if (!cpu || !phone || config.kv_tokens <= 0 ||
-        config.kv_tokens > 512 || config.max_inflight <= 0 ||
+        config.kv_tokens > 512 || config.max_inflight < 0 ||
         !llama_hybrid_cycle_runtime_validate_model(model, layout, reason)) {
         if (reason.empty()) reason = "INVALID_BACKENDS_OR_CONTEXT";
         return false;
