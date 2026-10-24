@@ -24,6 +24,7 @@ struct llama_hybrid_cycle_runtime_config {
     bool pc_cpu_reduce_priority = false;
     bool ordered_c2p_reduce = false;
     bool phone_main_priority = false;
+    bool pc_cuda_chunk_priority = false;
 };
 
 // Absolute layer identifiers for one repeated PC -> Phone -> PC region.
