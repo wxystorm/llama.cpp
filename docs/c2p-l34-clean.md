@@ -298,3 +298,60 @@ For the first V2 hardware run keep the self-check enabled. The required
 correctness gates remain `REGION_C2P_NUMERIC`, `REGION_P2C_NUMERIC`,
 their Decode variants, wire parity, and normal generated text. Only after those
 pass should the self-check and Top-5 diagnostics be disabled for throughput A/B.
+
+
+## Directional priority queues V1
+
+The directional pair is intentionally asymmetric on each device even though
+C2P and P2C are mirrors of each other.
+
+Physical weight roles remain:
+
+- C2P L34: Attention/Router execution is PC-owned; MoE expert weights are
+  split with backend 0 = PC and backend 1 = Phone; final reduce is Phone-owned.
+- P2C L46: Attention/Router execution is Phone-owned; MoE expert weights use
+  the same backend 0 = PC / backend 1 = Phone split convention; final reduce
+  is PC-owned.
+- Small control weights such as FFN norm/router weights may remain mirrored.
+  Compute ownership, not storage duplication, selects the C2P/P2C control side.
+
+Enable the first role-queue implementation with:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_PRIORITY_QUEUES = "1"
+```
+
+The logical queues are:
+
+```text
+PC_MAIN        (high): outgoing C2P work
+PC_P2C_FFN     (low):  incoming/reducer-side P2C FFN shard
+
+PHONE_MAIN     (high): outgoing P2C work
+PHONE_C2P_FFN  (low):  incoming/reducer-side C2P FFN shard
+```
+
+This distinction is important. Phone L46 FFN belongs to PHONE_MAIN: Phone
+does not reduce P2C and therefore should compute its L46 partial and send it
+to PC without waiting for the PC reduce. Symmetrically, PC L34 FFN belongs to
+PC_MAIN.
+
+V1 only establishes the mirrored priority executors at the already-proven
+Prefill FFN overlap points. It does not change Decode, does not move reduce to
+CPU, and does not yet relax the current dependency/join window. MAIN is chosen
+before a queued incoming-FFN shard, but an already submitted GPU graph is not
+preempted.
+
+Expected debug markers:
+
+```text
+[REGION_EXEC_QUEUE] side=PC    queue=MAIN    priority=HIGH direction=C2P role=OUTGOING_FFN
+[REGION_EXEC_QUEUE] side=PHONE queue=C2P_FFN priority=LOW  direction=C2P role=INCOMING_FFN
+[REGION_EXEC_QUEUE] side=PHONE queue=MAIN    priority=HIGH direction=P2C role=OUTGOING_FFN
+[REGION_EXEC_QUEUE] side=PC    queue=P2C_FFN priority=LOW  direction=P2C role=INCOMING_FFN
+```
+
+The next step, after correctness passes, is to feed the post-C2P Phone
+continuation (L35-L45 -> L46 Attention/Router -> L46 Phone FFN -> P2C send)
+through PHONE_MAIN and the mirrored PC continuation through PC_MAIN, then
+delay incoming-shard joins to introduce a two-credit Prefill window.
