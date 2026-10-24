@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-hybrid-cycle-p2c-ffn.h"
+#include "llama-hybrid-cycle-physical.h"
 #include "llama-hybrid-cycle-wire.h"
 #include "llama-hybrid-cycle-runtime.h"
 
@@ -251,7 +252,11 @@ public:
         const int producer_layer = consumer_layer - 1;
         if (!llama_hybrid_cycle_full_layer_on_cuda(
                 config_.layout, producer_layer) ||
+            !llama_hybrid_cycle_full_layer_on_cuda(
+                config_.layout, consumer_layer) ||
             config_.layout.kinds[static_cast<size_t>(producer_layer)] !=
+                llama_hybrid_cycle_layer_kind::PC_CPU ||
+            config_.layout.kinds[static_cast<size_t>(consumer_layer)] !=
                 llama_hybrid_cycle_layer_kind::PC_CPU) {
             return nullptr;
         }
@@ -269,7 +274,11 @@ public:
         if (!contains_layer(producer_layer) ||
             !contains_layer(successor_layer) ||
             int64_t(successor_layer) != int64_t(producer_layer) + 1 ||
-            chunk < 0 || chunk >= n_chunks_) {
+            chunk < 0 || chunk >= n_chunks_ ||
+            !llama_hybrid_cycle_full_layer_on_cuda(
+                config_.layout, producer_layer) ||
+            !llama_hybrid_cycle_full_layer_on_cuda(
+                config_.layout, successor_layer)) {
             return {};
         }
         return std::move(at(producer_layer, chunk).cuda_output);
