@@ -1149,14 +1149,13 @@ bool llama_hybrid_cycle_session::prepare(
     config.kv_tokens = max_total_tokens;
     config.max_inflight = max_inflight;
     config.cuda_weight_budget_bytes = cuda_weight_budget_bytes;
-    // In monotonically growing decode the (query_tokens, kv_tokens) shape
-    // never repeats. For >128-token sessions keep the bounded, reusable GPU
-    // Scratch Pool but do not retain 16 * 48 host-only graph metadata blobs
-    // whose old KV prefix can never be reached again. Small sessions keep
-    // their existing V5 graph-cache behavior unchanged.
+    // Production Cycle uses a monotonic physical KV prefix. The Attention
+    // cache key contains (query_tokens, kv_tokens), so a Prompt/Decode session
+    // does not revisit old shapes. Keep the cache OWNER object for existing
+    // resource contracts, but retain zero stale graphs; Scratch and FFN slots
+    // are the reusable GPU memory mechanisms.
     config.attention_graph_cache = true;
-    config.attention_graph_cache_max_graphs =
-        max_total_tokens <= 128 ? 16 : 0;
+    config.attention_graph_cache_max_graphs = 0;
     if (!pool->prepare(model, layout, cpu, phone, pc_cuda,
                        config, reason)) return false;
     model_ = &model;
