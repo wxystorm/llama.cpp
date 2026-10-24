@@ -38,6 +38,11 @@ bool llama_hybrid_cycle_execute_pc_full_layer(
     const int64_t hidden = model.hparams.n_embd;
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
+    if (hidden <= 0 || topk <= 0 || topk > experts ||
+        uint64_t(hidden) > std::numeric_limits<size_t>::max() /
+                           uint64_t(tokens)) {
+        return false;
+    }
     const size_t activation_elements = size_t(hidden) * size_t(tokens);
     const bool input_ok = device_input ?
         (device_input->type == GGML_TYPE_F32 &&
@@ -47,10 +52,7 @@ bool llama_hybrid_cycle_execute_pc_full_layer(
          device_input->ne[1] == tokens &&
          ggml_nelements(device_input) == hidden * tokens) :
         input.size() == activation_elements;
-    if (hidden <= 0 || topk <= 0 || topk > experts ||
-        uint64_t(hidden) > std::numeric_limits<size_t>::max() /
-                           uint64_t(tokens) ||
-        !input_ok) {
+    if (!input_ok) {
         return false;
     }
 
