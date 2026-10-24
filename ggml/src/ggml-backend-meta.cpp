@@ -3857,6 +3857,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
+                int directional_down_chunk = -1;
+                int directional_down_layer = -1;
+                const bool is_directional_down_boundary =
+                    n_backends == 2 &&
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        node->name,
+                        directional_down_chunk,
+                        directional_down_layer) &&
+                    (ggml_backend_meta_tensor_c2p_layer(
+                         backend_ctx, directional_down_layer) ||
+                     ggml_backend_meta_tensor_p2c_layer(
+                         backend_ctx, directional_down_layer));
+
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -3876,12 +3889,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
+                    is_directional_down_boundary ||
                     is_phone_primary_l_out;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                // Directional C2P/P2C down is a host-visible
+                // communication boundary.  Never let the generic MoE
+                // delayed-reduce scan absorb Phone-region nodes past it.
+                const int i_delayed =
+                    is_directional_down_boundary ?
+                        i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
