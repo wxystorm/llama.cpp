@@ -13078,6 +13078,25 @@ bool ggml_backend_meta_set_tensor_c2p_layer_mask(
     if (n_layers > 0) {
         backend_ctx->tensor_c2p_layer_mask.assign(mask, mask + n_layers);
     }
+
+    if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+        size_t selected = 0;
+        int first = -1;
+        int last = -1;
+        for (size_t il = 0; il < n_layers; ++il) {
+            if (mask[il] == 0) {
+                continue;
+            }
+            if (first < 0) {
+                first = int(il);
+            }
+            last = int(il) + 1;
+            ++selected;
+        }
+        printf(
+            "[META_C2P_POLICY_MASK] layers=%zu selected=%zu first=%d last=%d\n",
+            n_layers, selected, first, last);
+    }
     return true;
 }
 
