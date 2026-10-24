@@ -16,7 +16,9 @@ struct llama_model;
 // A budget is an upper bound, never a request to allocate all PC layers on
 // CUDA. Zero is the safe default: PC full layers execute on the CPU. A
 // nonempty input layout.pc_cuda_layers is treated as a REQUIRED selection
-// and is rejected if it exceeds the budget.
+// and is rejected if it exceeds the budget. Without an explicit bitmap,
+// automatic selection spreads the affordable mirrors across the whole
+// repeated Cycle pipeline instead of consuming a physical-layer prefix.
 LLAMA_API bool llama_hybrid_cycle_select_cuda_full_layers(
     const llama_hybrid_cycle_layout & layout,
     const std::vector<size_t> & estimated_mirror_bytes,
