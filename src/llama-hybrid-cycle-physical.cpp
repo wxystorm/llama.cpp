@@ -101,15 +101,16 @@ bool llama_hybrid_cycle_cuda_full_weights::prepare(ggml_backend_t cuda, ggml_bac
         }
         size_t upload_bytes = 0;
         for (size_t i = 0; i < COUNT; ++i) {
-            // One-time CPU -> CUDA copy; never re-upload model weights per
-            // Chunk. Only final full-layer output is read back to the host.
+            // CPU -> CUDA residency fill. A bounded LRU may later evict and
+            // reload this physical layer; while resident, all Chunk tasks
+            // borrow the same immutable mirror.
             ggml_backend_tensor_copy(physical[i], tensors[i]);
             upload_bytes += ggml_nbytes(physical[i]);
         }
         ggml_backend_synchronize(cuda);
         if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_PC_CUDA_WEIGHT] layer=%d weights=%zu upload_mib=%.3f "
-            "owner=PC_CUDA lifetime=PERIOD status=READY\n",
+            "owner=PC_CUDA lifetime=LRU_RESIDENT status=READY\n",
             layer_index, size_t(COUNT),
             double(upload_bytes) / (1024.0 * 1024.0));
         return true;
