@@ -702,85 +702,40 @@ static bool cycle_core_evaluate_with_kv(
                                             return false;
                                         }
                                         if (real_phone_full) {
-                                            const auto * predecessor =
-                                                session.phone_predecessor_output(l, c);
+                                            // Protocol 31 production path:
+                                            // C2P Reduce already registered both Full
+                                            // layers on the Phone FIFO. This callback
+                                            // is only the causal ACK / ownership
+                                            // boundary for the global Ring.
                                             const auto * r = resources.layer(l);
                                             auto * bank = phone_slot_banks.by_index(
                                                 region.location.cycle_index);
-                                            valid = predecessor && r && bank;
-                                            std::unique_ptr<
-                                                llama_hybrid_cycle_phone_ffn_slot> full_slot;
-                                            if (valid) {
-                                                // The sole PHONE_GPU FIFO worker owns
-                                                // every idle Full slot in this region.
-                                                auto & idle =
-                                                    bank->full_idle_by_layer[size_t(l)];
-                                                for (auto it = idle.begin();
-                                                     it != idle.end(); ++it) {
-                                                    if (*it && (*it)->is_full_layer &&
-                                                        (*it)->prepared_tokens ==
-                                                            state.tokens &&
-                                                        (*it)->fused_full_graph &&
-                                                        (*it)->registered_full_graph_uid != 0) {
-                                                        full_slot = std::move(*it);
-                                                        idle.erase(it);
-                                                        ++phone_full_slot_reuse;
-                                                        break;
-                                                    }
-                                                }
-                                                if (!full_slot) {
-                                                    full_slot = std::make_unique<
-                                                        llama_hybrid_cycle_phone_ffn_slot>();
-                                                }
-                                                // Bind Protocol 28 once; prepare() keeps
-                                                // these hooks across slot release/rebuild.
-                                                full_slot->rpc_ops.register_graph =
-                                                    &ggml_backend_rpc_cycle_register_graph;
-                                                full_slot->rpc_ops.run_full =
-                                                    &ggml_backend_rpc_cycle_run_phone_full;
-                                                std::function<void(
-                                                    const ggml_tensor *,
-                                                    const ggml_tensor *,
-                                                    const ggml_tensor *)> stage_probe;
-                                                if (trace_stages &&
-                                                    false) {
-                                                    stage_probe = [&](const ggml_tensor * residual,
-                                                                      const ggml_tensor * norm,
-                                                                      const ggml_tensor * ffn) {
-                                                        trace_stage_gpu(
-                                                            l, c, state.start,
-                                                            state.tokens, residual,
-                                                            "PHONE_GPU_FULL", "ATTN_RESIDUAL");
-                                                        trace_stage_gpu(
-                                                            l, c, state.start,
-                                                            state.tokens, norm,
-                                                            "PHONE_GPU_FULL", "FFN_NORM");
-                                                        trace_stage_gpu(
-                                                            l, c, state.start,
-                                                            state.tokens, ffn,
-                                                            "PHONE_GPU_FULL", "FFN_OUTPUT");
-                                                    };
-                                                }
-                                                valid = llama_hybrid_cycle_execute_phone_full(
-                                                    *model, *r, phone, l, c,
+                                            const bool first =
+                                                l == region.location.phone_begin;
+                                            const bool last =
+                                                l == region.location.phone_end - 1;
+                                            const bool prefix_ok = r && r->kv &&
+                                                r->kv->committed_tokens ==
+                                                    state.start;
+                                            valid = bank && prefix_ok &&
+                                                (first || last) &&
+                                                state.phone_output &&
+                                                state.phone_output->is_full_layer &&
+                                                state.phone_output->fused_full_graph &&
+                                                state.phone_output->
+                                                    registered_full_graph_uid != 0 &&
+                                                state.ready.
+                                                    prepared_attention_graph_uid != 0 &&
+                                                state.ready.
+                                                    prepared_attention_input != nullptr &&
+                                                ggml_backend_rpc_cycle_wait_phone_region_stage(
+                                                    phone, l, c,
                                                     state.wire.seq,
-                                                    state.start, state.tokens,
-                                                    predecessor, state.ready,
-                                                    *full_slot, stage_probe);
-                                            }
+                                                    state.wire.graph_id);
                                             if (valid) {
-                                                state.phone_output = std::move(full_slot);
-                                                if (trace_parity) {
-                                                    trace_gpu(
-                                                        l, c, state.start,
-                                                        state.tokens,
-                                                        state.phone_output->output,
-                                                        "PHONE_GPU_FULL");
-                                                }
-                                                // The previous physical GPU l_out was
-                                                // read by this Attention and the backend
-                                                // synchronized. This is the ONLY safe
-                                                // ownership transfer point for the slot.
+                                                r->kv->committed_tokens =
+                                                    state.start + state.tokens;
+                                                state.ready.release_phone_graph();
                                                 auto previous =
                                                     session.retire_phone_output_after_handoff(
                                                         l - 1, l, c);
@@ -799,9 +754,44 @@ static bool cycle_core_evaluate_with_kv(
                                                                 std::move(previous));
                                                         ++phone_full_device_handoffs;
                                                     }
+                                                    ++phone_region_stage_acks;
+                                                    ++region.ordered_full_handoffs;
+                                                    if (first) {
+                                                        ++region.first_phone_completed;
+                                                    } else {
+                                                        ++region.last_phone_completed;
+                                                    }
+                                                    ++real_phone_full_calls;
                                                 }
                                             }
-                                            if (valid) ++real_phone_full_calls;
+                                            if (!valid) {
+                                                std::fprintf(stderr,
+                                                    "[CYCLE_PHONE_REGION_PROD] "
+                                                    "event=FULL_ACK layer=%d "
+                                                    "chunk=%d prefix=%lld "
+                                                    "prepared_attn=%llu "
+                                                    "prepared_ffn=%llu "
+                                                    "status=FAIL\n",
+                                                    l, c,
+                                                    (long long)(r && r->kv ?
+                                                        r->kv->committed_tokens : -1),
+                                                    (unsigned long long)
+                                                        state.ready.
+                                                            prepared_attention_graph_uid,
+                                                    (unsigned long long)
+                                                        (state.phone_output ?
+                                                            state.phone_output->
+                                                                registered_full_graph_uid : 0));
+                                            } else if (llama_hybrid_cycle_verbose()) {
+                                                std::printf(
+                                                    "[CYCLE_PHONE_REGION_PROD] "
+                                                    "event=FULL_ACK layer=%d "
+                                                    "chunk=%d committed_kv=%lld "
+                                                    "status=PASS\n",
+                                                    l, c,
+                                                    (long long)r->kv->
+                                                        committed_tokens);
+                                            }
                                         } else {
                                             const auto & prior = mock_at(l - 1, c);
                                             valid = cycle_pc_ring_finite(
