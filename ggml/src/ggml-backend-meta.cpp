@@ -2307,6 +2307,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_compute_workers;
+struct ggml_backend_meta_priority_compute_worker;
 struct ggml_backend_meta_transfer_worker;
 
 struct ggml_backend_meta_context;
@@ -2391,6 +2392,11 @@ struct ggml_backend_meta_context {
     int64_t                          tensor_profile_wave_span_end_us   = 0;
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
+    // Directional Region Prefill role executors. MAIN work and reducer-side
+    // incoming FFN shards share one worker per device, so queued MAIN work
+    // always wins over queued shard work. A running shard is not preempted.
+    ggml_backend_meta_priority_compute_worker * region_pc_exec_worker = nullptr;
+    ggml_backend_meta_priority_compute_worker * region_phone_exec_worker = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
@@ -2571,6 +2577,114 @@ struct ggml_backend_meta_compute_workers {
     void reset_timings() {
         std::fill(backend_time_us.begin(), backend_time_us.end(), 0);
         std::fill(backend_call_count.begin(), backend_call_count.end(), 0);
+    }
+};
+
+// Directional Region role scheduler.
+//
+// The two Tensor boundaries are mirrors, but the reducer-side FFN is different:
+//   PC:    MAIN owns outgoing C2P work; P2C_FFN is the incoming waiting shard.
+//   Phone: MAIN owns outgoing P2C work; C2P_FFN is the incoming waiting shard.
+//
+// MAIN is selected before SHARD whenever both are queued. This deliberately
+// does not try to preempt a graph that has already been submitted to the GPU.
+struct ggml_backend_meta_priority_compute_worker {
+    struct task {
+        uint64_t id = 0;
+        bool main = true;
+        ggml_cgraph * graph = nullptr;
+    };
+
+    ggml_backend_t backend = nullptr;
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    std::deque<task> main_tasks;
+    std::deque<task> shard_tasks;
+    std::map<uint64_t, ggml_status> results;
+    uint64_t submitted = 0;
+    bool stop = false;
+
+    explicit ggml_backend_meta_priority_compute_worker(
+            ggml_backend_t backend) :
+        backend(backend),
+        worker([this]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (true) {
+                task_cv.wait(lock, [&]() {
+                    return stop ||
+                        !main_tasks.empty() ||
+                        !shard_tasks.empty();
+                });
+                if (stop &&
+                        main_tasks.empty() &&
+                        shard_tasks.empty()) {
+                    return;
+                }
+
+                task current;
+                if (!main_tasks.empty()) {
+                    current = main_tasks.front();
+                    main_tasks.pop_front();
+                } else {
+                    current = shard_tasks.front();
+                    shard_tasks.pop_front();
+                }
+
+                lock.unlock();
+                // Match ggml_backend_meta_compute_workers semantics: completion
+                // here means the backend accepted/submitted the graph. Device
+                // ordering/fences remain owned by the existing Region path.
+                const ggml_status status =
+                    ggml_backend_graph_compute_async(
+                        backend, current.graph);
+                lock.lock();
+
+                results[current.id] = status;
+                done_cv.notify_all();
+            }
+        }) {}
+
+    ~ggml_backend_meta_priority_compute_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_all();
+        worker.join();
+    }
+
+    uint64_t enqueue(
+            ggml_cgraph * graph,
+            bool main) {
+        GGML_ASSERT(graph != nullptr);
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint64_t id = ++submitted;
+        task item { id, main, graph };
+        if (main) {
+            main_tasks.push_back(item);
+        } else {
+            shard_tasks.push_back(item);
+        }
+        task_cv.notify_one();
+        return id;
+    }
+
+    ggml_status wait(uint64_t id) {
+        GGML_ASSERT(id != 0);
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&]() {
+            return results.find(id) != results.end();
+        });
+        const ggml_status status = results[id];
+        results.erase(id);
+        return status;
+    }
+
+    bool is_completed(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return results.find(id) != results.end();
     }
 };
 
@@ -2964,6 +3078,8 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
+    delete region_pc_exec_worker;
+    delete region_phone_exec_worker;
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
@@ -3923,6 +4039,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_async_partial =
         region_async_partial_env != nullptr &&
         std::atoi(region_async_partial_env) != 0;
+    const char * region_priority_queues_env =
+        std::getenv("LLAMA_HYBRID_REGION_PRIORITY_QUEUES");
+    const bool region_priority_queues =
+        region_priority_queues_env != nullptr &&
+        std::atoi(region_priority_queues_env) != 0;
+
+    auto get_region_exec_worker =
+        [&](size_t backend_index)
+            -> ggml_backend_meta_priority_compute_worker * {
+            GGML_ASSERT(
+                backend_index <
+                backend_ctx->backend_configs.size());
+            GGML_ASSERT(backend_index < 2);
+            ggml_backend_meta_priority_compute_worker ** slot =
+                backend_index == 0 ?
+                    &backend_ctx->region_pc_exec_worker :
+                    &backend_ctx->region_phone_exec_worker;
+            if (*slot == nullptr) {
+                *slot =
+                    new ggml_backend_meta_priority_compute_worker(
+                        backend_ctx->backend_configs[
+                            backend_index].backend);
+            }
+            return *slot;
+        };
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -4130,6 +4271,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int chunk = -1;
         uint64_t route_task = 0;
         ggml_backend_meta_transfer_worker * route_worker = nullptr;
+        uint64_t phone_main_task = 0;
     };
     region_p2c_early_ffn_state region_p2c_early_ffn;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
@@ -13130,11 +13272,41 @@ auto prefill_norm_sg_has_prework =
                 0, 0,
                 route.stage_weights, route.dst_weights);
 
-            compute_workers.start(0, i);
-            pc_status = compute_workers.wait(0);
+            if (region_priority_queues) {
+                const uint64_t pc_p2c_ffn_task =
+                    get_region_exec_worker(0)->enqueue(
+                        backend_ctx->backend_configs[0]
+                            .cgraphs[i].cgraph_main,
+                        false);
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_EXEC_QUEUE] side=PC "
+                        "queue=P2C_FFN priority=LOW "
+                        "direction=P2C role=INCOMING_FFN "
+                        "layer=%d chunk=%d task=%" PRIu64
+                        " status=ENQUEUED\n",
+                        region_p2c_early_ffn.layer,
+                        region_p2c_early_ffn.chunk,
+                        pc_p2c_ffn_task);
+                }
+                pc_status =
+                    get_region_exec_worker(0)->wait(
+                        pc_p2c_ffn_task);
+            } else {
+                compute_workers.start(0, i);
+                pc_status = compute_workers.wait(0);
+            }
         }
 
-        phone_status = compute_workers.wait(1);
+        if (region_priority_queues) {
+            GGML_ASSERT(
+                region_p2c_early_ffn.phone_main_task != 0);
+            phone_status =
+                get_region_exec_worker(1)->wait(
+                    region_p2c_early_ffn.phone_main_task);
+        } else {
+            phone_status = compute_workers.wait(1);
+        }
 
         if (route.lane <
                 pending_phone_prefill_route_lane_task.size() &&
@@ -13818,6 +13990,7 @@ auto prefill_norm_sg_has_prework =
             bool c2p_parallel_ready = false;
             ggml_cgraph * c2p_pc_suffix_graph = nullptr;
             bool c2p_pc_ffn_started_early = false;
+            uint64_t c2p_pc_main_task = 0;
             std::vector<uint8_t> c2p_route_topk_host;
             std::vector<uint8_t> c2p_route_weights_host;
 
@@ -14033,8 +14206,26 @@ auto prefill_norm_sg_has_prework =
                                 c2p_pc_graph->n_nodes,
                                 i,
                                 0x4352505355464649ULL);
-                        compute_workers.start_graph(
-                            0, c2p_pc_suffix_graph);
+                        if (region_priority_queues) {
+                            c2p_pc_main_task =
+                                get_region_exec_worker(0)->enqueue(
+                                    c2p_pc_suffix_graph,
+                                    true);
+                            if (pipeline_debug) {
+                                printf(
+                                    "[REGION_EXEC_QUEUE] side=PC "
+                                    "queue=MAIN priority=HIGH "
+                                    "direction=C2P role=OUTGOING_FFN "
+                                    "layer=%d chunk=%d task=%" PRIu64
+                                    " status=ENQUEUED\n",
+                                    prefill_down_layer,
+                                    prefill_down_chunk,
+                                    c2p_pc_main_task);
+                            }
+                        } else {
+                            compute_workers.start_graph(
+                                0, c2p_pc_suffix_graph);
+                        }
                         c2p_pc_ffn_started_early = true;
                     }
 
@@ -14130,15 +14321,59 @@ auto prefill_norm_sg_has_prework =
 
                         const int64_t parallel_begin_us =
                             ggml_time_us();
-                        if (!c2p_pc_ffn_started_early) {
-                            compute_workers.start_graph(
-                                0, c2p_pc_suffix_graph);
+                        uint64_t phone_c2p_ffn_task = 0;
+                        if (region_priority_queues) {
+                            if (!c2p_pc_ffn_started_early) {
+                                c2p_pc_main_task =
+                                    get_region_exec_worker(0)->enqueue(
+                                        c2p_pc_suffix_graph,
+                                        true);
+                                if (pipeline_debug) {
+                                    printf(
+                                        "[REGION_EXEC_QUEUE] side=PC "
+                                        "queue=MAIN priority=HIGH "
+                                        "direction=C2P role=OUTGOING_FFN "
+                                        "layer=%d chunk=%d task=%" PRIu64
+                                        " status=ENQUEUED\n",
+                                        prefill_down_layer,
+                                        prefill_down_chunk,
+                                        c2p_pc_main_task);
+                                }
+                            }
+                            phone_c2p_ffn_task =
+                                get_region_exec_worker(1)->enqueue(
+                                    backend_ctx->backend_configs[1]
+                                        .cgraphs[i].cgraph_main,
+                                    false);
+                            if (pipeline_debug) {
+                                printf(
+                                    "[REGION_EXEC_QUEUE] side=PHONE "
+                                    "queue=C2P_FFN priority=LOW "
+                                    "direction=C2P role=INCOMING_FFN "
+                                    "layer=%d chunk=%d task=%" PRIu64
+                                    " status=ENQUEUED\n",
+                                    prefill_down_layer,
+                                    prefill_down_chunk,
+                                    phone_c2p_ffn_task);
+                            }
+                        } else {
+                            if (!c2p_pc_ffn_started_early) {
+                                compute_workers.start_graph(
+                                    0, c2p_pc_suffix_graph);
+                            }
+                            compute_workers.start(1, i);
                         }
-                        compute_workers.start(1, i);
 
                         const ggml_status pc_ffn_status =
-                            compute_workers.wait(0);
-                        phone_status = compute_workers.wait(1);
+                            region_priority_queues ?
+                                get_region_exec_worker(0)->wait(
+                                    c2p_pc_main_task) :
+                                compute_workers.wait(0);
+                        phone_status =
+                            region_priority_queues ?
+                                get_region_exec_worker(1)->wait(
+                                    phone_c2p_ffn_task) :
+                                compute_workers.wait(1);
                         pc_status = pc_ffn_status;
 
                         if (pipeline_debug) {
@@ -14168,9 +14403,31 @@ auto prefill_norm_sg_has_prework =
                     } else {
                         restore_c2p_route_bindings(
                             c2p_bindings);
-                        compute_workers.start(1, i);
-                        phone_status =
-                            compute_workers.wait(1);
+                        if (region_priority_queues) {
+                            const uint64_t phone_c2p_ffn_task =
+                                get_region_exec_worker(1)->enqueue(
+                                    backend_ctx->backend_configs[1]
+                                        .cgraphs[i].cgraph_main,
+                                    false);
+                            if (pipeline_debug) {
+                                printf(
+                                    "[REGION_EXEC_QUEUE] side=PHONE "
+                                    "queue=C2P_FFN priority=LOW "
+                                    "direction=C2P role=INCOMING_FFN "
+                                    "layer=%d chunk=%d task=%" PRIu64
+                                    " status=ENQUEUED_SERIAL\n",
+                                    prefill_down_layer,
+                                    prefill_down_chunk,
+                                    phone_c2p_ffn_task);
+                            }
+                            phone_status =
+                                get_region_exec_worker(1)->wait(
+                                    phone_c2p_ffn_task);
+                        } else {
+                            compute_workers.start(1, i);
+                            phone_status =
+                                compute_workers.wait(1);
+                        }
                     }
                 } else {
                     restore_c2p_route_bindings(c2p_bindings);
@@ -14761,7 +15018,27 @@ auto prefill_norm_sg_has_prework =
                 GGML_ASSERT(route_it->second.worker != nullptr);
                 GGML_ASSERT(route_it->second.task != 0);
 
-                compute_workers.start(1, i + 1);
+                uint64_t phone_main_task = 0;
+                if (region_priority_queues) {
+                    phone_main_task =
+                        get_region_exec_worker(1)->enqueue(
+                            backend_ctx->backend_configs[1]
+                                .cgraphs[i + 1].cgraph_main,
+                            true);
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_EXEC_QUEUE] side=PHONE "
+                            "queue=MAIN priority=HIGH "
+                            "direction=P2C role=OUTGOING_FFN "
+                            "layer=%d chunk=%d task=%" PRIu64
+                            " status=ENQUEUED_EARLY\n",
+                            direct_route_layer,
+                            direct_route_chunk,
+                            phone_main_task);
+                    }
+                } else {
+                    compute_workers.start(1, i + 1);
+                }
 
                 region_p2c_early_ffn.active = true;
                 region_p2c_early_ffn.route_sg = i;
@@ -14774,6 +15051,8 @@ auto prefill_norm_sg_has_prework =
                     route_it->second.task;
                 region_p2c_early_ffn.route_worker =
                     route_it->second.worker;
+                region_p2c_early_ffn.phone_main_task =
+                    phone_main_task;
 
                 if (pipeline_debug) {
                     printf(
