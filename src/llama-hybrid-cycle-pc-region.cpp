@@ -116,13 +116,23 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
         return true;
     }
 
-    graph_entry * lookup(
-            int layer_count, int64_t tokens, int64_t kv_tokens) {
+    graph_entry * lookup_compatible(
+            int layer_count, int64_t tokens, int64_t kv_tokens,
+            const std::vector<
+                const llama_hybrid_cycle_physical_layer_resources *> & region) {
         for (auto & entry : entries) {
             if (!entry ||
                 entry->layer_count != layer_count ||
                 entry->tokens != tokens ||
                 entry->kv_tokens != kv_tokens) {
+                continue;
+            }
+            // Shape alone is not enough for Q4_K_M. Different physical
+            // layers may carry a different quantization/stride signature.
+            // Treat an incompatible template as a cache miss instead of
+            // poisoning the whole FIFO.
+            if (!bind_entry(*entry, region)) {
+                ++incompatible_count;
                 continue;
             }
             entry->last_use = ++clock;
@@ -191,6 +201,7 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
     uint64_t hit_count = 0;
     uint64_t build_count = 0;
     uint64_t eviction_count = 0;
+    uint64_t incompatible_count = 0;
     uint64_t allocator_grow_count = 0;
 };
 
@@ -338,12 +349,9 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         return false;
     }
     const int64_t kv_tokens = token_start + tokens;
-    auto * entry = cache_impl->lookup(layer_count, tokens, kv_tokens);
+    auto * entry = cache_impl->lookup_compatible(
+        layer_count, tokens, kv_tokens, region);
     const bool cache_hit = entry != nullptr;
-    if (cache_hit && !cache_impl->bind_entry(*entry, region)) {
-        reason = "PC_REGION_CACHE_REBIND";
-        return false;
-    }
     const auto graph_build_begin = std::chrono::steady_clock::now();
 
     ggml_context * ctx = entry ? entry->ctx : nullptr;
