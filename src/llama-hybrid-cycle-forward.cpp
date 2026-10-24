@@ -1037,6 +1037,8 @@ static bool cycle_core_evaluate_with_kv(
                 reason = "REAL_PHYSICAL_KV_INCOMPLETE";
                 ok = false;
             }
+            const uint64_t expected_cuda_handoffs =
+                pc_trace ? 0 : uint64_t(18 * n_chunks);
             const bool expected_stages =
                 real_c2p_attn.load() == 6*n_chunks &&
                 real_c2p_ffn.load() == 6*n_chunks &&
@@ -1057,7 +1059,7 @@ static bool cycle_core_evaluate_with_kv(
                 real_p2c_partial_ack.load() == 6*n_chunks &&
                 p2c_device_handoffs.load() == 6*n_chunks &&
                 session.cuda_device_handoffs() ==
-                    uint64_t(18 * n_chunks);
+                    expected_cuda_handoffs;
             if (ok && !expected_stages) {
                 reason = "REAL_PHYSICAL_STAGES_INCOMPLETE";
                 ok = false;
@@ -1068,7 +1070,8 @@ static bool cycle_core_evaluate_with_kv(
                     "expected=%d region_tail_host_readbacks=%d "
                     "status=%s\n",
                     (unsigned long long) session.cuda_device_handoffs(),
-                    18 * n_chunks, 6 * n_chunks,
+                    int(expected_cuda_handoffs),
+                    pc_trace ? 24 * n_chunks : 6 * n_chunks,
                     ok ? "PASS" : "FAIL");
                 std::printf(
                     "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
