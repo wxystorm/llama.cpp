@@ -103,8 +103,8 @@ public:
             bool pc_cpu_reduce_priority = false,
             bool ordered_c2p_reduce = false,
             bool phone_main_priority = false,
-            bool pc_cuda_chunk_priority = false,
-            bool trace_entry_gate = false)
+            bool trace_entry_gate = false,
+            bool pc_cuda_chunk_priority = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
           credit_until_handoff_(credit_until_handoff),
