@@ -101,6 +101,41 @@ static void test_one_cycle() {
     expect_empty(ring, llama_hybrid_cycle_queue::PHONE_TO_PC);
 }
 
+// A FULL_LAYER may release its predecessor credit as soon as Attention has
+// fenced the last input read. Its own output is still unpublished until the
+// task completes. Completion must not release the same predecessor twice.
+static void test_full_input_consumed_credit_release() {
+    auto layout = llama_hybrid_build_cycle_layout(8, 4, 2);
+    layout.pc_cuda_full = true;
+    llama_hybrid_cycle_task_ring ring(layout, 3, 2, true);
+    ring.start();
+
+    auto l0c0 = take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                     llama_hybrid_cycle_stage::FULL_LAYER, 0, 0);
+    auto l0c1 = take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                     llama_hybrid_cycle_stage::FULL_LAYER, 0, 1);
+    ring.complete(l0c0);
+    ring.complete(l0c1);
+
+    auto l1c0 = take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                     llama_hybrid_cycle_stage::FULL_LAYER, 1, 0);
+    assert(ring.mark_full_input_consumed(1, 0));
+    assert(!ring.mark_full_input_consumed(1, 0));
+
+    // L0 C2 was blocked by window=2. It is admitted immediately after L1 C0
+    // consumes L0 C0, even though L1 C0 itself has not completed yet.
+    auto l1c1 = take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                     llama_hybrid_cycle_stage::FULL_LAYER, 1, 1);
+    auto l0c2 = take(ring, llama_hybrid_cycle_queue::PC_CUDA,
+                     llama_hybrid_cycle_stage::FULL_LAYER, 0, 2);
+    assert(l1c1.layer == 1 && l1c1.chunk == 1);
+    assert(l0c2.layer == 0 && l0c2.chunk == 2);
+
+    // This exercises the completion fallback guard: no credit underflow and
+    // no second predecessor release after the early handoff.
+    ring.complete(l1c0);
+}
+
 // Out-of-order predecessor completions must never enqueue later-layer
 // Attention for C2 before C0 and C1: layer-local KV causality is preserved.
 static void test_causal_entry_order() {
@@ -1134,6 +1169,11 @@ static void test_cycle_runtime_physical_8_and_48() {
                                            task.chunk)].load() == 1);
                 }
             }
+            if (task.stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+                task.layer > 0) {
+                assert(task.input_consumed);
+                assert(task.input_consumed());
+            }
             if (task.stage == llama_hybrid_cycle_stage::SEND_ACTIVATION ||
                 task.stage == llama_hybrid_cycle_stage::SEND_PARTIAL) {
                 if (kind == llama_hybrid_cycle_layer_kind::TENSOR_C2P) {
@@ -1575,6 +1615,7 @@ static void test_cycle_phone_regions_independent_ledgers() {
 }
 
 int main() {
+    test_full_input_consumed_credit_release();
     test_cycle_phone_regions_independent_ledgers();
     test_cycle_48_cuda_budget_selection();
     test_cycle_48_selective_cuda_full_layers();
