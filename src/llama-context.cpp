@@ -358,11 +358,11 @@ llama_context::llama_context(
         cparams.n_ctx = requested_ctx;
         cparams.n_ctx_seq = cparams.n_ctx;
         cparams.n_seq_max = 1;
-        // One native FIFO invocation may carry up to eight 16-token
-        // chunks. This halves prompt fill/drain boundaries versus the old
-        // 64-token adapter cap while preserving chunk size and window=2.
+        // Cycle owns Prefill chunking internally. Keep the public batch large
+        // enough for the complete physical context so llama_decode() does not
+        // create a second, redundant batching layer above the global FIFO.
         cparams.n_batch = std::max<uint32_t>(
-            1, std::min<uint32_t>(params.n_batch, 128));
+            1, std::min<uint32_t>(params.n_batch, requested_ctx));
         cparams.n_ubatch = std::min<uint32_t>(
             cparams.n_batch,
             params.n_ubatch ? params.n_ubatch : cparams.n_batch);
@@ -380,7 +380,7 @@ llama_context::llama_context(
         const int64_t capacity = cparams.n_ctx;
         std::string reason;
         auto native = std::make_unique<llama_hybrid_cycle_session>();
-        if (!native->prepare(model, pc, phone, capacity, reason, 16, 2,
+        if (!native->prepare(model, pc, phone, capacity, reason, 64, 2,
                              cycle_cuda_backend, cycle_cuda_budget_bytes)) {
             throw std::runtime_error(
                 "Cycle standard physical KV prepare failed: " + reason);
@@ -4657,7 +4657,8 @@ int llama_context::decode_cycle(const llama_batch & batch) {
     return -2;
 #else
     if (!cycle_session || !cycle_session->usable() ||
-        batch.n_tokens < 1 || batch.n_tokens > 128 ||
+        batch.n_tokens < 1 ||
+        uint32_t(batch.n_tokens) > cparams.n_ctx ||
         (!batch.token && !batch.embd)) {
         LLAMA_LOG_ERROR(
             "[CYCLE_STANDARD] stage=INPUT status=FAIL "
