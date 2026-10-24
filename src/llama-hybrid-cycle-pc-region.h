@@ -4,6 +4,7 @@
 #include "llama-hybrid-cycle-execution-session.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
