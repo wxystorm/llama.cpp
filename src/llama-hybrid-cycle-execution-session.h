@@ -106,6 +106,9 @@ struct llama_hybrid_cycle_chunk_state {
     std::atomic<bool> host_output_published {false};
     inference_cycle_message recv_ready;
     inference_cycle_message recv_partial;
+    // Adjacent PC CUDA Full layers exchange l_out through this independent
+    // activation owner. It contains no graph or model-weight references.
+    std::unique_ptr<llama_hybrid_cycle_cuda_activation_slot> cuda_output;
     std::unique_ptr<PhoneSlot> phone_output;
     // Patch 33: each pre-registered L7 FFN owns its own buffer slot.
     // A single shared P2C FFN slot would be unsafe with window=2 while
@@ -233,6 +236,43 @@ public:
         }
         output = prior.host_output;
         return true;
+    }
+
+    // Adjacent PC CUDA Full layers keep l_out on-device. The activation slot
+    // is independent of the producer's FFN graph/weight mirror and remains
+    // owned until the successor Attention fences its input copy.
+    const ggml_tensor * cuda_predecessor_output(
+            int consumer_layer, int chunk) const {
+        if (!contains_layer(consumer_layer) ||
+            consumer_layer == first_layer() ||
+            chunk < 0 || chunk >= n_chunks_) {
+            return nullptr;
+        }
+        const int producer_layer = consumer_layer - 1;
+        if (!llama_hybrid_cycle_full_layer_on_cuda(
+                config_.layout, producer_layer) ||
+            config_.layout.kinds[static_cast<size_t>(producer_layer)] !=
+                llama_hybrid_cycle_layer_kind::PC_CPU) {
+            return nullptr;
+        }
+        const auto & prior = at(producer_layer, chunk);
+        const auto & consumer = at(consumer_layer, chunk);
+        if (prior.start != consumer.start || prior.tokens != consumer.tokens) {
+            return nullptr;
+        }
+        return prior.cuda_output ? prior.cuda_output->tensor : nullptr;
+    }
+
+    std::unique_ptr<llama_hybrid_cycle_cuda_activation_slot>
+    retire_cuda_output_after_handoff(
+            int producer_layer, int successor_layer, int chunk) {
+        if (!contains_layer(producer_layer) ||
+            !contains_layer(successor_layer) ||
+            int64_t(successor_layer) != int64_t(producer_layer) + 1 ||
+            chunk < 0 || chunk >= n_chunks_) {
+            return {};
+        }
+        return std::move(at(producer_layer, chunk).cuda_output);
     }
 
     // This is the separate PHONE-GPU-local path (C2P -> Phone Full ->
