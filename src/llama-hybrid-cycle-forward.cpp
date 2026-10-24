@@ -660,10 +660,15 @@ static bool cycle_core_evaluate_with_kv(
                                                         }
                                                     }
                                                 }
-                                                // With REAL Phone Full, L4's GPU slot
-                                                // remains owned by THIS chunk until
-                                                // L5's Attention finishes consuming it.
-                                                // Never recycle on C2P Reduce ACK.
+                                                // Protocol 31: after the correct C2P
+                                                // Reduce/FINISH boundary, register and arm
+                                                // BOTH following Phone Full layers. The
+                                                // C2P output stays device-owned until the
+                                                // L5 completion ACK proves its input copy
+                                                // and compute have finished.
+                                                if (valid && real_phone_full) {
+                                                    valid = arm_phone_region(region, c);
+                                                }
                                                 if (valid) {
                                                     ++phone_c2p_reduce;
                                                     if (llama_hybrid_cycle_verbose()) std::printf(
@@ -674,7 +679,7 @@ static bool cycle_core_evaluate_with_kv(
                                                         l, c,
                                                         (unsigned long long)wire.seq,
                                                         real_phone_full ?
-                                                            "GPU_DEVICE_OWNED_UNTIL_L5" :
+                                                            "PHONE_REGION_PROTOCOL31" :
                                                             "DIAGNOSTIC_READBACK");
                                                 }
                                             } else if (valid) {
