@@ -825,9 +825,13 @@ static bool cycle_core_evaluate_with_kv(
                                                             std::move(previous));
                                                         ++c2p_device_handoffs;
                                                     } else {
-                                                        bank->full_idle_by_layer[
-                                                            size_t(l - 1)].push_back(
-                                                                std::move(previous));
+                                                        {
+                                                            std::lock_guard<std::mutex> lock(
+                                                                bank->full_mutex);
+                                                            bank->full_idle_by_layer[
+                                                                size_t(l - 1)].push_back(
+                                                                    std::move(previous));
+                                                        }
                                                         ++phone_full_device_handoffs;
                                                     }
                                                     ++phone_region_stage_acks;
@@ -922,9 +926,13 @@ static bool cycle_core_evaluate_with_kv(
                                                             l - 1, l, c);
                                                     valid = old_slot != nullptr;
                                                     if (valid) {
-                                                        bank->full_idle_by_layer[
-                                                            size_t(l - 1)].push_back(
-                                                                std::move(old_slot));
+                                                        {
+                                                            std::lock_guard<std::mutex> lock(
+                                                                bank->full_mutex);
+                                                            bank->full_idle_by_layer[
+                                                                size_t(l - 1)].push_back(
+                                                                    std::move(old_slot));
+                                                        }
                                                         ++p2c_device_handoffs;
                                                         ++real_p2c_attn;
                                                     }
@@ -1163,9 +1171,13 @@ static bool cycle_core_evaluate_with_kv(
                                                             l - 1, l, c);
                                                     valid = bank && old_slot;
                                                     if (valid) {
-                                                        bank->full_idle_by_layer[
-                                                            size_t(l - 1)].push_back(
-                                                                std::move(old_slot));
+                                                        {
+                                                            std::lock_guard<std::mutex> lock(
+                                                                bank->full_mutex);
+                                                            bank->full_idle_by_layer[
+                                                                size_t(l - 1)].push_back(
+                                                                    std::move(old_slot));
+                                                        }
                                                         ++phone_full_p2c_readbacks;
                                                     }
                                                 }
