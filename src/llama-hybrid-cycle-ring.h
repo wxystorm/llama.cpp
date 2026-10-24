@@ -169,18 +169,36 @@ public:
         }
         if (pc_cuda_chunk_priority_ &&
             queue == llama_hybrid_cycle_queue::PC_CUDA) {
-            // Region V1 computes all CUDA Full layers at the first physical
-            // layer. The remaining same-Chunk FULL_LAYER tasks are dependency
-            // continuations only. Drain the oldest Chunk's continuation chain
-            // before starting a newer Region so its L3 output reaches C2P
-            // immediately instead of sitting behind another expensive graph.
+            // Region V1 computes all expensive CUDA work at the first PC Full
+            // layer of each cycle. Only the later PC Full layers in that SAME
+            // cycle are dependency continuations. Prefer those lightweight
+            // continuations, but keep FIFO order between distinct Region
+            // starts so Chunk C0 cannot monopolize later cycles.
+            bool picked_continuation = false;
+            int best_chunk = 0;
+            int best_layer = 0;
             for (auto it = ready.begin(); it != ready.end(); ++it) {
-                if (it->stage == llama_hybrid_cycle_stage::FULL_LAYER &&
-                    (selected == ready.end() ||
-                     it->chunk < selected->chunk ||
-                     (it->chunk == selected->chunk &&
-                      it->layer > selected->layer))) {
+                const bool in_repeated_region =
+                    layout_.cycle_size > 0 &&
+                    it->layer >= 0 &&
+                    it->layer < layout_.tail_begin;
+                const int offset = in_repeated_region ?
+                    it->layer % layout_.cycle_size : 0;
+                const bool continuation =
+                    it->stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+                    in_repeated_region &&
+                    offset > 0 && offset < layout_.x &&
+                    layout_.kinds[size_t(it->layer)] ==
+                        llama_hybrid_cycle_layer_kind::PC_CPU;
+                if (continuation &&
+                    (!picked_continuation ||
+                     it->chunk < best_chunk ||
+                     (it->chunk == best_chunk &&
+                      it->layer > best_layer))) {
                     selected = it;
+                    picked_continuation = true;
+                    best_chunk = it->chunk;
+                    best_layer = it->layer;
                 }
             }
         }
