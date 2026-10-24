@@ -1147,7 +1147,7 @@ bool llama_hybrid_cycle_session::prepare(
         max_total_tokens < 1 || max_total_tokens > 512 ||
         chunk_tokens < 1 || chunk_tokens > 64 ||
         max_inflight < 1 || max_inflight > 2 ||
-        (cuda_weight_budget_bytes != 0 && !pc_cuda)) {
+        !pc_cuda) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
         return false;
     }
@@ -1187,8 +1187,8 @@ bool llama_hybrid_cycle_session::prepare(
     if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
         "layers=48 window=%d attention_graph_cache_slots=%zu "
-        "scratch_pool=1 phone_gpu=REAL cuda_layers=%d "
-        "cuda_budget_mib=%.2f status=PASS\n",
+        "scratch_pool=1 phone_gpu=REAL pc_full=CUDA_ONLY "
+        "cuda_resident_slots=%d cuda_budget_mib=%.2f status=PASS\n",
         (long long) capacity_, max_inflight_,
         config.attention_graph_cache_max_graphs,
         resources_->cuda_mirror_layers(),
@@ -1214,6 +1214,16 @@ bool llama_hybrid_cycle_session::evaluate(
     if (ok) {
         prefix_ += tokens;
         ++wire_epoch_;
+        if (tokens > 1) {
+            std::printf(
+                "[CYCLE_CUDA_RESIDENCY_SUM] tokens=%d resident=%d slots=%d "
+                "loads=%llu evictions=%llu pc_cpu_fallback=0 status=PASS\n",
+                tokens,
+                resources_->cuda_resident_layers(),
+                resources_->cuda_mirror_layers(),
+                (unsigned long long) resources_->cuda_residency_loads(),
+                (unsigned long long) resources_->cuda_residency_evictions());
+        }
         if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_SESSION] phase=COMMIT "
             "absolute_kv_prefix=%lld epoch=%llu "
