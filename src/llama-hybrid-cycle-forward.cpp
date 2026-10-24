@@ -128,7 +128,7 @@ static bool cycle_core_evaluate_with_kv(
         std::printf(
             "[CYCLE_PC_CUDA_MODE] phase=BEGIN mode=%s "
             "region_layers=%d status=ACTIVE\n",
-            pc_cuda_region ? "REGION_V1" : "DEVICE_LOCAL_FALLBACK",
+            pc_cuda_region ? "REGION_V2_CACHE" : "DEVICE_LOCAL_FALLBACK",
             pc_cuda_region ? loaded_layout.x : 1);
     }
     bool ok = true;
@@ -1091,7 +1091,7 @@ static bool cycle_core_evaluate_with_kv(
                     "expected_region_calls=%d legacy_device_handoffs=%llu "
                     "expected_legacy_handoffs=%llu host_readbacks=%d "
                     "status=%s\n",
-                    pc_cuda_region ? "REGION_V1" : "DEVICE_LOCAL_FALLBACK",
+                    pc_cuda_region ? "REGION_V2_CACHE" : "DEVICE_LOCAL_FALLBACK",
                     pc_cuda_region_calls.load(), expected_region_calls,
                     (unsigned long long) session.cuda_device_handoffs(),
                     (unsigned long long) expected_legacy_cuda_handoffs,
