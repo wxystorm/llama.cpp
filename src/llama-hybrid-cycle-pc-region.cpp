@@ -709,7 +709,8 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
         const std::vector<float> & initial_hidden,
         int64_t hidden,
         std::string & reason,
-        std::atomic<int> * region_calls) {
+        std::atomic<int> * region_calls,
+        llama_hybrid_cycle_pc_region_cache_stats * cache_stats) {
     reason.clear();
     const auto & layout = resources.execution_layout();
     const auto & session_layout = session.config().layout;
@@ -753,7 +754,7 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
         const bool start_bound = stages.bind(
             begin, llama_hybrid_cycle_stage::FULL_LAYER,
             [begin, end, hidden, &model, &resources, &session,
-             &initial_hidden, region_calls, region_cache](
+             &initial_hidden, region_calls, cache_stats, region_cache](
                 const llama_hybrid_cycle_task & task) -> bool {
                 if (task.layer != begin ||
                     task.stage != llama_hybrid_cycle_stage::FULL_LAYER ||
@@ -824,6 +825,15 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
                 }
                 if (region_calls) {
                     region_calls->fetch_add(1, std::memory_order_relaxed);
+                }
+                if (cache_stats) {
+                    cache_stats->hits = region_cache->hits();
+                    cache_stats->builds = region_cache->builds();
+                    cache_stats->evictions = region_cache->evictions();
+                    cache_stats->allocator_grows =
+                        region_cache->allocator_grows();
+                    cache_stats->allocator_bytes =
+                        region_cache->allocator_bytes();
                 }
                 if (llama_hybrid_cycle_verbose()) {
                     std::printf(
