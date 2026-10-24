@@ -42,7 +42,7 @@ struct LLAMA_API llama_hybrid_cycle_cuda_full_weights {
 // Per-PHYSICAL-layer KV allocation. Lifetime is deliberately independent of
 // transient Chunk scratch or graph replay objects. The physical causal K/V
 // allocation supports up to 512 positions; the per-invocation chunk window
-// remains <=64 tokens and <=16 tokens per physical Chunk.
+// may span the full <=512-token Prompt with <=64 tokens per physical Chunk.
 struct LLAMA_API llama_hybrid_cycle_physical_kv_cache {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
