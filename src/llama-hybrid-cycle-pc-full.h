@@ -3,6 +3,7 @@
 #include "llama-hybrid-cycle-resources.h"
 #include "llama-hybrid-cycle-execution-session.h"
 #include "llama-hybrid-cycle-ffn-shard.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include <cstdint>
 #include <cstdio>
