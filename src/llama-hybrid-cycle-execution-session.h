@@ -167,6 +167,9 @@ public:
     int first_layer() const { return config_.physical_layer_begin; }
     int layer_count() const { return config_.physical_layer_count; }
     int chunks_per_layer() const { return n_chunks_; }
+    uint64_t cuda_device_handoffs() const {
+        return cuda_device_handoffs_.load(std::memory_order_relaxed);
+    }
     const llama_hybrid_cycle_execution_session_config & config() const {
         return config_;
     }
@@ -281,7 +284,11 @@ public:
                 config_.layout, successor_layer)) {
             return {};
         }
-        return std::move(at(producer_layer, chunk).cuda_output);
+        auto result = std::move(at(producer_layer, chunk).cuda_output);
+        if (result) {
+            cuda_device_handoffs_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return result;
     }
 
     // This is the separate PHONE-GPU-local path (C2P -> Phone Full ->
@@ -375,6 +382,7 @@ private:
 
     llama_hybrid_cycle_execution_session_config config_;
     int n_chunks_ = 0;
+    std::atomic<uint64_t> cuda_device_handoffs_ {0};
     storage_type states_;
     std::vector<llama_hybrid_cycle_physical_kv_cache *> kv_borrowed_;
 };
