@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-p2c-real.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 
@@ -73,7 +74,7 @@ bool llama_hybrid_cycle_execute_p2c_phone_attention(
         ready.phone_graph.topk_ids && ready.phone_graph.topk_weights &&
         ready.phone_compute_buffer;
     if (computed && !ok) ready.release_phone_graph();
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_P2C_ATTN] layer=%d position_start=%lld "
         "tokens=%lld kv_committed=%lld attn_ms=%.3f "
         "input=PHONE_GPU_PREVIOUS_L_OUT ready=PHONE_TO_PC_STAGED "
@@ -119,7 +120,7 @@ bool llama_hybrid_cycle_execute_p2c_pc_ffn(
     const bool ok = computed &&
         partial.size() == size_t(tokens) * size_t(hidden) &&
         all_finite(partial);
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_P2C_PC_FFN] layer=%d tokens=%lld elements=%zu "
         "status=%s\n", physical_layer, (long long) tokens, partial.size(),
         ok ? "PASS" : "FAIL");
