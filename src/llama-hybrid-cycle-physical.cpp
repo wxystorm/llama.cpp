@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-physical.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 
@@ -106,7 +107,7 @@ bool llama_hybrid_cycle_cuda_full_weights::prepare(ggml_backend_t cuda, ggml_bac
             upload_bytes += ggml_nbytes(physical[i]);
         }
         ggml_backend_synchronize(cuda);
-        std::printf(
+        if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_PC_CUDA_WEIGHT] layer=%d weights=%zu upload_mib=%.3f "
             "owner=PC_CUDA lifetime=PERIOD status=READY\n",
             layer_index, size_t(COUNT),
@@ -179,7 +180,7 @@ bool llama_hybrid_cycle_physical_kv_cache::init(ggml_backend_t backend,
             release();
             return false;
         }
-        std::printf(
+        if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_PHONE_KV_PERSISTENT] total_tokens=%lld head_dim=%lld "
             "kv_heads=%lld cache_bytes=%zu residency=%s "
             "status=READY\n",
