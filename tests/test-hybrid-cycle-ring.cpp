@@ -881,7 +881,7 @@ static void test_pc_cuda_region_continuation_priority() {
     auto layout = llama_hybrid_build_cycle_layout(5, 2, 1);
     layout.pc_cuda_full = true;
     llama_hybrid_cycle_task_ring ring(
-        layout, 2, 2, true, false, false, false, true);
+        layout, 2, 2, true, false, false, false, false, true);
     ring.start();
 
     auto c0_start = take(
