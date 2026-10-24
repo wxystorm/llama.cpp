@@ -396,13 +396,15 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         }
         current = x;
 
+    const size_t region_layer_count =
+        static_cast<size_t>(layer_count);
     std::vector<std::array<ggml_tensor *,
         llama_hybrid_cycle_cuda_full_weights::COUNT>> template_weight_aliases(
-            size_t(layer_count));
+            region_layer_count);
     std::vector<ggml_tensor *> template_kv_key_aliases(
-        size_t(layer_count), nullptr);
+        region_layer_count, nullptr);
     std::vector<ggml_tensor *> template_kv_value_aliases(
-        size_t(layer_count), nullptr);
+        region_layer_count, nullptr);
 
     const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
         int(hp.n_ctx_orig_yarn) : int(hp.n_ctx_train);
