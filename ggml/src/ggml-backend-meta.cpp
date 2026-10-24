@@ -8063,7 +8063,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 return GGML_STATUS_SUCCESS;
             }
-            if (!pc_needed_next && !phone_owner_exit) {
+
+            // A C2P FFN boundary is not an ordinary Phone-only subgraph even
+            // when its terminal node is the only active node.  The PC shard
+            // has already executed earlier in the subgraph and the boundary
+            // must continue into the explicit PC->Phone fold/copy/reduce path.
+            // In particular the final prefill chunk and single-token decode
+            // often have no following PC compute, which previously caused
+            // META_KEEP_PHONE to steal the boundary before C2P reduction.
+            if (!c2p_prefill_down_boundary &&
+                    !c2p_decode_single_boundary &&
+                    !pc_needed_next &&
+                    !phone_owner_exit) {
                 handled = true;
                 if (pipeline_debug) {
                     printf("[META_KEEP_PHONE] sg=%zu tensor=%s bytes=%zu next_pc_compute=0\n",
