@@ -34,6 +34,7 @@ struct llama_hybrid_cycle_pc_region_cache_stats {
     uint64_t hits = 0;
     uint64_t builds = 0;
     uint64_t evictions = 0;
+    uint64_t incompatible = 0;
     uint64_t allocator_grows = 0;
     size_t allocator_bytes = 0;
 };
@@ -67,6 +68,7 @@ public:
     uint64_t hits() const;
     uint64_t builds() const;
     uint64_t evictions() const;
+    uint64_t incompatible() const;
     uint64_t allocator_grows() const;
     size_t allocator_bytes() const;
 
