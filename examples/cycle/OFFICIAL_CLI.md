@@ -303,3 +303,82 @@ is enabled. Hardware performance comparisons should leave detailed verbose
 stage traces off to avoid log I/O overhead. `status=FAIL` from computational,
 transport and ownership validation is still printed independently of
 verbose mode.
+
+## First performance pass: steady prefill vs decode and real queue bottlenecks
+
+**Correctness is a prerequisite.** First keep the proven CPU+Phone GPU
+allocation with `LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB=0`. Next use the
+optional 1536-MiB PC CUDA mirror budget, **with the same input tokens**.
+The CUDA plan is automatically limited to the available VRAM after the
+existing safety reserve; record the selected `cuda_mirror_layers` count
+rather than assuming a specific number.
+
+Run from Windows PowerShell, with the Phone RPC server already running:
+
+```powershell
+$env:LLAMA_HYBRID_CYCLE_PC_LAYERS = "4"
+$env:LLAMA_HYBRID_CYCLE_PHONE_LAYERS = "2"
+$env:LLAMA_HYBRID_CYCLE_STANDARD_DECODE = "1"
+$env:LLAMA_HYBRID_CYCLE_QUEUE_PROFILE = "1"
+Remove-Item Env:LLAMA_HYBRID_CYCLE_VERBOSE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_CYCLE_STAGE_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_CYCLE_TOKEN_TRACE -ErrorAction SilentlyContinue
+
+# Use the EXACT same real prompt and CLI args for both runs.
+$prompt = ("Explain CPU and mobile GPU scheduling in distributed inference. " * 12).Trim()
+$exe = ".\build-cycle-test\bin\Debug\llama-cli.exe"
+$model = "E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf"
+$base = @("-m", $model, "--rpc", "10.39.52.114:50053",
+          "--split-mode", "tensor", "-c", "512", "-n", "32",
+          "-t", "8", "--temp", "0", "--seed", "1234",
+          "--no-mmap", "--no-display-prompt", "-p", $prompt)
+
+$env:LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB = "0"
+& $exe @base 2>&1 | Tee-Object .\cycle-perf-cpu-phone.log
+
+$env:LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB = "1536"
+& $exe @base 2>&1 | Tee-Object .\cycle-perf-cuda-phone.log
+```
+
+The **official** end-to-end `prompt eval time`, `eval time`, and
+`[CYCLE_PERF]` are the throughput evidence. Read the following optional
+instrumentation only to explain the end-to-end time:
+
+- `[CYCLE_CORE_FIFO_WALL]`: one FIFO invocation on the PC monotonic
+  clock, from before worker start to after all worker joins
+- `[CYCLE_CORE_QUEUE]`: per-worker task count, callback sum, ready-queue
+  wait and worker idle time
+- `[CYCLE_CORE_STAGE]`: per-(queue, stage) callback/queue/credit gate
+  aggregate, with maxima; useful for comparing FULL_LAYER, ATTN_PRE,
+  two independent SENDs, two FFNs and REDUCE
+- `[CYCLE_CORE_SLOW_TASK]`: five largest individual callback spans, with
+  physical layer and chunk, for locating a pathological layer or graph
+- `[CYCLE_CORE_RPC_DRAIN]`: TX completion wait **after** FIFO workers join
+
+These are measured on the PC. Phone `PHONE_GPU` callback time can
+include remote RPC wait, GPU sync, graph creation and Buffer Ownership
+handoff. Do not describe them as kernel-only milliseconds; per-queue
+elapsed time overlaps and must not be summed to estimate prompt/eval time.
+Entry-gate time represents causal order or available Chunk-credit delay,
+not necessarily a stalled device. A large GPU queue callback is a
+**candidate bottleneck**, not an established kernel bottleneck.
+
+On the **Phone server** only, set `GGML_CYCLE_GPU_STAGE_TIMING=1` before
+launching `rpc-server` to emit
+`[CYCLE_GPU_SERVER] phase_hint=... gpu_compute_ms=...` for actual backend
+graph execution. The phase is inferred from graph node count, so treat
+`phase_hint` as a **hint**, not a guaranteed op type. It is a separate
+Phone-side clock: do not subtract Phone-server absolute timestamps from
+PC steady-clock timestamps. It does not account for all RPC queuing or
+CPU-side graph setup. Disable verbose diagnostics during the final
+throughput measurement.
+
+Use at least two runs per configuration after the first warm/cold-load
+trial. Compare matching prompt Token counts and matching evaluated decode
+Token counts, not simply `-n` when EOG ends generation early. Keep
+`--temp 0` to reduce sampling variance; optional
+`LLAMA_HYBRID_CYCLE_TOKEN_TRACE=1` verifies the first divergent generated
+Token when enabling CUDA. Avoid comparing raw and chat-template prompts:
+they are different Token sequences. The direct CLI currently reports its
+official statistics at the end of each completed generation and does not
+yet expose live, multi-run server-benchmark APIs.
