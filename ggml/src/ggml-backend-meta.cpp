@@ -2349,6 +2349,13 @@ struct ggml_backend_meta_context {
         // earlier partial before the layer-tail ADD.
         std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
 
+        // Directional Region partial-return staging. Each backend owns one
+        // immutable slot per return lane. V1 validates the async handoff with
+        // lane 0 only; a later window=2 step can use both lanes without
+        // changing tensor ownership or the final reduce protocol.
+        std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
+            region_partial_stage_bufs;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
@@ -3859,6 +3866,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         tensor->buffer = buf_ptr.get();
         tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
     };
+    auto set_region_partial_stage_data =
+        [&](ggml_tensor * tensor, const size_t j, const size_t lane) {
+            GGML_ASSERT(
+                lane < ggml_backend_meta_context::PREFILL_RETURN_LANES);
+            auto & bcj = backend_ctx->backend_configs[j];
+            auto & buf_ptr = bcj.region_partial_stage_bufs[lane];
+            if (!buf_ptr ||
+                    ggml_backend_buffer_get_size(buf_ptr.get()) <
+                        backend_ctx->max_tmp_size) {
+                buf_ptr.reset(
+                    ggml_backend_alloc_buffer(
+                        bcj.backend, backend_ctx->max_tmp_size));
+            }
+            tensor->buffer = buf_ptr.get();
+            tensor->data = ggml_backend_buffer_get_base(buf_ptr.get());
+        };
     // FIXME usage_counts
     auto get_cgraph_aux = [&]() -> ggml_cgraph * {
         GGML_ASSERT(iga < backend_ctx->cgraphs_aux.size());
@@ -3895,6 +3918,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_route_overlap =
         region_route_overlap_env != nullptr &&
         std::atoi(region_route_overlap_env) != 0;
+    const char * region_async_partial_env =
+        std::getenv("LLAMA_HYBRID_REGION_ASYNC_PARTIAL");
+    const bool region_async_partial =
+        region_async_partial_env != nullptr &&
+        std::atoi(region_async_partial_env) != 0;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -9803,7 +9831,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             ggml_tensor * pc_tmp =
                 get_node_aux(pc_partial);
-            set_tmp_data(pc_tmp, j_dst, 0);
+            if (region_async_partial) {
+                set_region_partial_stage_data(pc_tmp, j_dst, 0);
+            } else {
+                set_tmp_data(pc_tmp, j_dst, 0);
+            }
 
             ggml_tensor * pc_out_chunk =
                 get_node_aux(pc_partial);
@@ -9872,13 +9904,117 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const int64_t phone_fold_us =
                 ggml_time_us() - phone_fold_begin_us;
 
-            const int64_t copy_begin_us = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                phone_cfg.backend, pc_cfg.backend,
-                phone_partial, pc_tmp);
-            ggml_backend_synchronize(pc_cfg.backend);
-            const int64_t copy_us =
-                ggml_time_us() - copy_begin_us;
+            int64_t partial_stage_us = 0;
+            int64_t partial_join_wait_us = 0;
+            int64_t copy_us = 0;
+            ggml_tensor * partial_wire_src = phone_partial;
+
+            if (region_async_partial) {
+                constexpr size_t partial_lane = 0;
+
+                ggml_tensor * phone_stage =
+                    get_node_aux(phone_partial);
+                set_region_partial_stage_data(
+                    phone_stage, j_src, partial_lane);
+
+                const int64_t stage_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    phone_cfg.backend, phone_cfg.backend,
+                    phone_partial, phone_stage);
+                ggml_backend_synchronize(phone_cfg.backend);
+                partial_stage_us =
+                    ggml_time_us() - stage_begin_us;
+                partial_wire_src = phone_stage;
+
+                auto & worker_slot =
+                    backend_ctx->prefill_return_workers[partial_lane];
+                if (worker_slot == nullptr) {
+                    worker_slot =
+                        new ggml_backend_meta_transfer_worker();
+                }
+                auto * return_worker = worker_slot;
+                auto wire_us =
+                    std::make_shared<int64_t>(0);
+
+                const int layer = prefill_down_layer_0;
+                const int chunk = prefill_down_chunk_0;
+                const size_t bytes = ggml_nbytes(phone_stage);
+                const bool debug = pipeline_debug;
+
+                const uint64_t return_task =
+                    return_worker->enqueue(
+                        [phone_backend = phone_cfg.backend,
+                         pc_backend = pc_cfg.backend,
+                         phone_stage,
+                         pc_tmp,
+                         wire_us,
+                         layer,
+                         chunk,
+                         bytes,
+                         debug]
+                        (uint64_t task_id) -> ggml_status {
+                            const int64_t wire_begin_us =
+                                ggml_time_us();
+                            ggml_backend_tensor_copy_async(
+                                phone_backend, pc_backend,
+                                phone_stage, pc_tmp);
+                            ggml_backend_synchronize(pc_backend);
+                            *wire_us =
+                                ggml_time_us() - wire_begin_us;
+
+                            if (debug) {
+                                printf(
+                                    "[REGION_RETURN_TX] "
+                                    "direction=P2C layer=%d chunk=%d "
+                                    "lane=0 task=%" PRIu64 " bytes=%zu "
+                                    "wire_ms=%.3f status=DONE\n",
+                                    layer, chunk, task_id, bytes,
+                                    *wire_us / 1000.0);
+                            }
+                            return GGML_STATUS_SUCCESS;
+                        });
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_RETURN_STAGE] "
+                        "direction=P2C layer=%d chunk=%d lane=0 "
+                        "bytes=%zu stage_ms=%.3f status=READY\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        ggml_nbytes(phone_stage),
+                        partial_stage_us / 1000.0);
+                }
+
+                const int64_t join_begin_us = ggml_time_us();
+                const ggml_status return_status =
+                    return_worker->wait(return_task);
+                partial_join_wait_us =
+                    ggml_time_us() - join_begin_us;
+                if (return_status != GGML_STATUS_SUCCESS) {
+                    return return_status;
+                }
+                copy_us = *wire_us;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_RETURN_JOIN] "
+                        "direction=P2C layer=%d chunk=%d lane=0 "
+                        "task=%" PRIu64 " wait_ms=%.3f "
+                        "window=1 status=OK\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        return_task,
+                        partial_join_wait_us / 1000.0);
+                }
+            } else {
+                const int64_t copy_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    phone_cfg.backend, pc_cfg.backend,
+                    phone_partial, pc_tmp);
+                ggml_backend_synchronize(pc_cfg.backend);
+                copy_us = ggml_time_us() - copy_begin_us;
+            }
+
             record_copy_wait(copy_us);
             record_meta_copy(
                 i, j_src, j_dst, phone_partial, copy_us);
@@ -9890,7 +10026,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 prefill_down_chunk_0,
                 "PHONE_PARTIAL_PLUS_RESIDUAL",
                 j_src, j_dst,
-                phone_partial, pc_tmp);
+                partial_wire_src, pc_tmp);
 
             const int64_t pc_reduce_begin_us =
                 ggml_time_us();
@@ -9953,15 +10089,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 printf(
                     "[REGION_P2C_PREFILL] layer=%d chunk=%d "
                     "last=%d bytes=%zu phone_fold_ms=%.3f "
-                    "copy_ms=%.3f pc_reduce_ms=%.3f "
+                    "stage_ms=%.3f copy_ms=%.3f join_wait_ms=%.3f "
+                    "pc_reduce_ms=%.3f async_partial=%d "
                     "owner=PC status=OK\n",
                     prefill_down_layer_0,
                     prefill_down_chunk_0,
                     last_chunk ? 1 : 0,
                     ggml_nbytes(phone_partial),
                     phone_fold_us / 1000.0,
+                    partial_stage_us / 1000.0,
                     copy_us / 1000.0,
-                    pc_reduce_us / 1000.0);
+                    partial_join_wait_us / 1000.0,
+                    pc_reduce_us / 1000.0,
+                    region_async_partial ? 1 : 0);
             }
 
             return GGML_STATUS_SUCCESS;
@@ -10275,7 +10415,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 // Phone staging for the second PC->Phone transfer.
                 ggml_tensor * phone_tmp = get_node_aux(node_src);
-                set_tmp_data(phone_tmp, j_src, 0);
+                if (region_async_partial) {
+                    set_region_partial_stage_data(phone_tmp, j_src, 0);
+                } else {
+                    set_tmp_data(phone_tmp, j_src, 0);
+                }
 
                 // Phone: write the completed chunk directly into l_out.
                 ggml_tensor * phone_out_chunk = get_node_aux(node_src);
@@ -10389,24 +10533,128 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t pc_fold_us =
                     ggml_time_us() - pc_fold_begin_us;
 
-                const int64_t copy_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    bcj_dst.backend,
-                    bcj_src.backend,
-                    node_dst,
-                    phone_tmp);
-                ggml_backend_synchronize(bcj_src.backend);
-                const int64_t copy_us =
-                    ggml_time_us() - copy_begin_us;
+                int64_t partial_stage_us = 0;
+                int64_t partial_join_wait_us = 0;
+                int64_t copy_us = 0;
+                ggml_tensor * partial_wire_src = node_dst;
+
+                if (region_async_partial) {
+                    constexpr size_t partial_lane = 0;
+
+                    ggml_tensor * pc_stage =
+                        get_node_aux(node_dst);
+                    set_region_partial_stage_data(
+                        pc_stage, j_dst, partial_lane);
+
+                    const int64_t stage_begin_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend, bcj_dst.backend,
+                        node_dst, pc_stage);
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    partial_stage_us =
+                        ggml_time_us() - stage_begin_us;
+                    partial_wire_src = pc_stage;
+
+                    auto & worker_slot =
+                        backend_ctx->prefill_return_workers[partial_lane];
+                    if (worker_slot == nullptr) {
+                        worker_slot =
+                            new ggml_backend_meta_transfer_worker();
+                    }
+                    auto * return_worker = worker_slot;
+                    auto wire_us =
+                        std::make_shared<int64_t>(0);
+
+                    const int layer = prefill_down_layer_0;
+                    const int chunk = prefill_down_chunk_0;
+                    const size_t bytes = ggml_nbytes(pc_stage);
+                    const bool debug = pipeline_debug;
+
+                    const uint64_t return_task =
+                        return_worker->enqueue(
+                            [pc_backend = bcj_dst.backend,
+                             phone_backend = bcj_src.backend,
+                             pc_stage,
+                             phone_tmp,
+                             wire_us,
+                             layer,
+                             chunk,
+                             bytes,
+                             debug]
+                            (uint64_t task_id) -> ggml_status {
+                                const int64_t wire_begin_us =
+                                    ggml_time_us();
+                                ggml_backend_tensor_copy_async(
+                                    pc_backend, phone_backend,
+                                    pc_stage, phone_tmp);
+                                ggml_backend_synchronize(phone_backend);
+                                *wire_us =
+                                    ggml_time_us() - wire_begin_us;
+
+                                if (debug) {
+                                    printf(
+                                        "[REGION_RETURN_TX] "
+                                        "direction=C2P layer=%d chunk=%d "
+                                        "lane=0 task=%" PRIu64 " bytes=%zu "
+                                        "wire_ms=%.3f status=DONE\n",
+                                        layer, chunk, task_id, bytes,
+                                        *wire_us / 1000.0);
+                                }
+                                return GGML_STATUS_SUCCESS;
+                            });
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_RETURN_STAGE] "
+                            "direction=C2P layer=%d chunk=%d lane=0 "
+                            "bytes=%zu stage_ms=%.3f status=READY\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            ggml_nbytes(pc_stage),
+                            partial_stage_us / 1000.0);
+                    }
+
+                    const int64_t join_begin_us = ggml_time_us();
+                    const ggml_status return_status =
+                        return_worker->wait(return_task);
+                    partial_join_wait_us =
+                        ggml_time_us() - join_begin_us;
+                    if (return_status != GGML_STATUS_SUCCESS) {
+                        return return_status;
+                    }
+                    copy_us = *wire_us;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_RETURN_JOIN] "
+                            "direction=C2P layer=%d chunk=%d lane=0 "
+                            "task=%" PRIu64 " wait_ms=%.3f "
+                            "window=1 status=OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            return_task,
+                            partial_join_wait_us / 1000.0);
+                    }
+                } else {
+                    const int64_t copy_begin_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend,
+                        bcj_src.backend,
+                        node_dst,
+                        phone_tmp);
+                    ggml_backend_synchronize(bcj_src.backend);
+                    copy_us = ggml_time_us() - copy_begin_us;
+                }
+
                 record_copy_wait(copy_us);
                 record_meta_copy(
                     i, j_dst, j_src, node_dst, copy_us);
                 record_direct_copy();
 
-                directional_wire_parity("C2P", 
+                directional_wire_parity("C2P",
                     prefill_down_layer_0, prefill_down_chunk_0,
                     "PC_PARTIAL_PLUS_RESIDUAL", j_dst, j_src,
-                    node_dst, phone_tmp);
+                    partial_wire_src, phone_tmp);
 
                 const int64_t phone_reduce_begin_us = ggml_time_us();
                 status = ggml_backend_graph_compute_async(
@@ -10498,15 +10746,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
-                        "bytes=%zu pc_fold_ms=%.3f copy_ms=%.3f "
-                        "phone_reduce_ms=%.3f owner=PHONE status=OK\n",
+                        "bytes=%zu pc_fold_ms=%.3f stage_ms=%.3f "
+                        "copy_ms=%.3f join_wait_ms=%.3f "
+                        "phone_reduce_ms=%.3f async_partial=%d "
+                        "owner=PHONE status=OK\n",
                         prefill_down_layer_0,
                         prefill_down_chunk_0,
                         last_chunk ? 1 : 0,
                         ggml_nbytes(node_dst),
                         pc_fold_us / 1000.0,
+                        partial_stage_us / 1000.0,
                         copy_us / 1000.0,
-                        phone_reduce_us / 1000.0);
+                        partial_join_wait_us / 1000.0,
+                        phone_reduce_us / 1000.0,
+                        region_async_partial ? 1 : 0);
                 }
 
                 return GGML_STATUS_SUCCESS;
