@@ -125,6 +125,11 @@ static bool cycle_core_evaluate_with_kv(
             "[CYCLE_PREFILL_RING] tokens=%d chunk_tokens=%d chunks=%d "
             "window=%d outer_batches=1 status=BEGIN\n",
             n_tokens, chunk_tokens, n_chunks, max_inflight);
+        std::printf(
+            "[CYCLE_PC_CUDA_MODE] phase=BEGIN mode=%s "
+            "region_layers=%d status=ACTIVE\n",
+            pc_cuda_region ? "REGION_V1" : "DEVICE_LOCAL_FALLBACK",
+            pc_cuda_region ? loaded_layout.x : 1);
     }
     bool ok = true;
     {
