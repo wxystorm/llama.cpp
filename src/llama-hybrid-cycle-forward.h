@@ -96,6 +96,8 @@ private:
     const llama_model * model_ = nullptr;
     ggml_backend_t cpu_ = nullptr;
     ggml_backend_t phone_ = nullptr;
+    ggml_backend_t cuda_ = nullptr;
+    size_t cuda_weight_budget_bytes_ = 0;
     std::unique_ptr<llama_hybrid_cycle_physical_resource_pool> resources_;
     int64_t prefix_ = 0;
     int64_t capacity_ = 0;
