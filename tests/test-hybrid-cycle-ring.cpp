@@ -858,7 +858,7 @@ static void test_chunk_trace_observational() {
             assert(task.stage == llama_hybrid_cycle_stage::FULL_LAYER);
             ++executed;
             return true;
-        }, 1, true, nullptr, false, false, false, false, &timeline);
+        }, 1, true, nullptr, false, false, false, &timeline);
     assert(ok && executed.load() == 4);
     size_t samples = 0;
     for (const auto & queue : timeline.by_queue) {
