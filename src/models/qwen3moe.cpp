@@ -420,11 +420,28 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     NULL, LLM_NORM_RMS, c2p_layer);
             cb(c2p_ffn_norm, "ffn_norm", c2p_layer);
 
-            std::vector<ggml_tensor *> c2p_down_chunks;
-            c2p_down_chunks.reserve(chunk_sizes.size());
+            // Stable C2P output backing.  This producer intentionally has no
+            // dependency on the C2P FFN chunks: Meta disables the DUP before
+            // the first continuation consumer and writes each reduced chunk
+            // directly into this tensor on Phone.
+            ggml_tensor * c2p_l_out =
+                ggml_dup(ctx0, c2p_ffn_inp);
+            cb(c2p_l_out, "l_out", c2p_layer);
+
+            std::vector<ggml_tensor *> p2c_down_chunks;
+            std::vector<ggml_tensor *> p2c_residual_chunks;
+            p2c_down_chunks.reserve(chunk_sizes.size());
+            p2c_residual_chunks.reserve(chunk_sizes.size());
+
+            // Chunk-major Phone continuation.  For each chunk, L35..L45 are
+            // fully Phone-local and L46 Attention/Router stays on Phone before
+            // the P2C split FFN boundary.
             for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
                 const int64_t count = chunk_sizes[ci];
-                ggml_tensor * norm_chunk =
+
+                // Seed exactly one C2P FFN chunk, then immediately continue
+                // that same chunk through the Phone-owned region.
+                ggml_tensor * c2p_norm_chunk =
                     ggml_view_2d(
                         ctx0,
                         c2p_ffn_norm,
@@ -432,14 +449,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         count,
                         c2p_ffn_norm->nb[1],
                         chunk_begin[ci] * c2p_ffn_norm->nb[1]);
-                const std::string norm_name =
+                const std::string c2p_norm_name =
                     "prefill_ffn_norm_chunk_" +
                     std::to_string(ci);
-                cb(norm_chunk, norm_name.c_str(), c2p_layer);
+                cb(
+                    c2p_norm_chunk,
+                    c2p_norm_name.c_str(),
+                    c2p_layer);
 
-                llm_graph_moe_routing routing =
+                llm_graph_moe_routing c2p_routing =
                     build_moe_routing(
-                        norm_chunk,
+                        c2p_norm_chunk,
                         model.layers[c2p_layer].ffn_gate_inp,
                         nullptr, nullptr,
                         n_expert, n_expert_used,
@@ -447,24 +467,24 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         hparams.expert_weights_scale,
                         LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                         c2p_layer);
-                const std::string topk_name =
+                const std::string c2p_topk_name =
                     "c2p_prefill_route_topk_chunk_" +
                     std::to_string(ci);
-                const std::string weights_name =
+                const std::string c2p_weights_name =
                     "c2p_prefill_route_weights_chunk_" +
                     std::to_string(ci);
                 cb(
-                    routing.selected_experts,
-                    topk_name.c_str(),
+                    c2p_routing.selected_experts,
+                    c2p_topk_name.c_str(),
                     c2p_layer);
                 cb(
-                    routing.weights,
-                    weights_name.c_str(),
+                    c2p_routing.weights,
+                    c2p_weights_name.c_str(),
                     c2p_layer);
 
-                ggml_tensor * down =
+                ggml_tensor * c2p_down =
                     build_moe_ffn(
-                        norm_chunk,
+                        c2p_norm_chunk,
                         model.layers[c2p_layer].ffn_gate_inp,
                         model.layers[c2p_layer].ffn_up_exps,
                         model.layers[c2p_layer].ffn_gate_exps,
@@ -479,45 +499,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         model.layers[c2p_layer].ffn_up_exps_s,
                         model.layers[c2p_layer].ffn_gate_exps_s,
                         model.layers[c2p_layer].ffn_down_exps_s,
-                        routing.selected_experts,
+                        c2p_routing.selected_experts,
                         1,
                         nullptr,
-                        routing.weights);
-                const std::string down_name =
+                        c2p_routing.weights);
+                const std::string c2p_down_name =
                     "prefill_ffn_down_chunk_" +
                     std::to_string(ci);
-                cb(down, down_name.c_str(), c2p_layer);
-                ggml_build_forward_expand(gf, down);
-                c2p_down_chunks.push_back(down);
-            }
-
-            // Create the full logical L34 output only as stable storage.  The
-            // directional Meta reducer disables this producer and writes each
-            // completed chunk directly into this backing on Phone.
-            ggml_tensor * c2p_concat = c2p_down_chunks[0];
-            for (size_t ci = 1; ci < c2p_down_chunks.size(); ++ci) {
-                c2p_concat =
-                    ggml_concat(
-                        ctx0,
-                        c2p_concat,
-                        c2p_down_chunks[ci],
-                        1);
-            }
-            ggml_tensor * c2p_l_out =
-                ggml_add(ctx0, c2p_concat, c2p_ffn_inp);
-            cb(c2p_l_out, "l_out", c2p_layer);
-            ggml_build_forward_expand(gf, c2p_l_out);
-
-            std::vector<ggml_tensor *> p2c_down_chunks;
-            std::vector<ggml_tensor *> p2c_residual_chunks;
-            p2c_down_chunks.reserve(chunk_sizes.size());
-            p2c_residual_chunks.reserve(chunk_sizes.size());
-
-            // Chunk-major Phone continuation.  For each chunk, L35..L45 are
-            // fully Phone-local and L46 Attention/Router stays on Phone before
-            // the P2C split FFN boundary.
-            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
-                const int64_t count = chunk_sizes[ci];
+                cb(
+                    c2p_down,
+                    c2p_down_name.c_str(),
+                    c2p_layer);
+                ggml_build_forward_expand(gf, c2p_down);
 
                 ggml_tensor * chunk_hidden =
                     ggml_view_2d(
