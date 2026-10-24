@@ -35,6 +35,13 @@ static bool cli_cycle_verbose() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// Opt-in exact Token ID trace for comparing Cycle against a CPU reference.
+// This does not alter sampling, scheduler activity or model output.
+static bool cli_cycle_token_trace() {
+    const char * value = std::getenv("LLAMA_HYBRID_CYCLE_TOKEN_TRACE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static bool cli_cycle_eval(
         llama_context * ctx,
         const std::vector<llama_token> & tokens,
@@ -285,6 +292,13 @@ int cli_cycle_run(common_params & params) {
                              "[CYCLE_CHAT_TEMPLATE] formatted_prompt_end\n",
                      model_prompt.c_str());
     }
+    if (cli_cycle_token_trace()) {
+        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+            std::fprintf(stderr,
+                "[CYCLE_TOKEN_TRACE] phase=PROMPT index=%zu id=%d\n",
+                i, int(prompt_tokens[i]));
+        }
+    }
     if (prompt_tokens.empty() ||
         prompt_tokens.size() > size_t(llama_n_ctx(ctx))) {
         std::fprintf(stderr,
@@ -367,6 +381,11 @@ int cli_cycle_run(common_params & params) {
         // This is the standard external sampler (temp/seed/top-k/top-p/
         // penalties), not the hard-coded argmax used by Cycle smoke tests.
         const llama_token token = common_sampler_sample(sampler, ctx, -1);
+        if (cli_cycle_token_trace()) {
+            std::fprintf(stderr,
+                "[CYCLE_TOKEN_TRACE] phase=GENERATE index=%zu id=%d eog=%d\n",
+                i, int(token), int(llama_vocab_is_eog(vocab, token)));
+        }
         common_sampler_accept(sampler, token, /* is_generated */ true);
         if (llama_vocab_is_eog(vocab, token)) {
             std::fprintf(stderr,
