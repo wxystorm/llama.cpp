@@ -7,6 +7,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -18,11 +19,13 @@
 
 struct llama_hybrid_cycle_pc_region_cache::impl {
     struct graph_entry {
-        int first_layer = -1;
         int layer_count = 0;
         int64_t tokens = 0;
         int64_t kv_tokens = 0;
-        std::vector<uint64_t> weight_generations;
+        std::vector<std::array<ggml_tensor *,
+            llama_hybrid_cycle_cuda_full_weights::COUNT>> weight_aliases;
+        std::vector<ggml_tensor *> kv_key_aliases;
+        std::vector<ggml_tensor *> kv_value_aliases;
         ggml_context * ctx = nullptr;
         ggml_cgraph * graph = nullptr;
         ggml_tensor * input = nullptr;
@@ -63,23 +66,64 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
         return allocator != nullptr;
     }
 
+    static bool bind_alias(
+            ggml_tensor * alias, const ggml_tensor * physical) {
+        if (!alias || !physical || !physical->buffer || !physical->data ||
+            alias->type != physical->type) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (alias->ne[d] != physical->ne[d] ||
+                alias->nb[d] != physical->nb[d]) {
+                return false;
+            }
+        }
+        alias->buffer = physical->buffer;
+        alias->data = physical->data;
+        alias->extra = physical->extra;
+        return true;
+    }
+
+    bool bind_entry(
+            graph_entry & entry,
+            const std::vector<
+                const llama_hybrid_cycle_physical_layer_resources *> & region) {
+        if (entry.weight_aliases.size() != region.size() ||
+            entry.kv_key_aliases.size() != region.size() ||
+            entry.kv_value_aliases.size() != region.size()) {
+            return false;
+        }
+        for (size_t offset = 0; offset < region.size(); ++offset) {
+            const auto * resource = region[offset];
+            if (!resource || !resource->cuda_weights || !resource->kv) {
+                return false;
+            }
+            for (size_t i = 0;
+                 i < llama_hybrid_cycle_cuda_full_weights::COUNT; ++i) {
+                if (!bind_alias(
+                        entry.weight_aliases[offset][i],
+                        resource->cuda_weights->tensors[i])) {
+                    return false;
+                }
+            }
+            if (!bind_alias(
+                    entry.kv_key_aliases[offset], resource->kv->keys) ||
+                !bind_alias(
+                    entry.kv_value_aliases[offset], resource->kv->values)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     graph_entry * lookup(
-            int first_layer, int layer_count,
-            int64_t tokens, int64_t kv_tokens,
-            const std::vector<uint64_t> & generations) {
-        for (size_t i = 0; i < entries.size(); ++i) {
-            auto & entry = entries[i];
+            int layer_count, int64_t tokens, int64_t kv_tokens) {
+        for (auto & entry : entries) {
             if (!entry ||
-                entry->first_layer != first_layer ||
                 entry->layer_count != layer_count ||
                 entry->tokens != tokens ||
                 entry->kv_tokens != kv_tokens) {
                 continue;
-            }
-            if (entry->weight_generations != generations) {
-                entries.erase(entries.begin() + i);
-                ++eviction_count;
-                return nullptr;
             }
             entry->last_use = ++clock;
             ++hit_count;
