@@ -1480,7 +1480,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 tmp.resize(target_tokens);
             }
 
-            LLAMA_LOG_INFO(
+            COM_INF(
                 "[HYBRID_PREFILL_WARMUP] tokens=%zu requested=%d "
                 "n_batch=%d status=BEGIN\n",
                 tmp.size(),
@@ -1508,7 +1508,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_perf_context_reset(lctx);
 
         if (hybrid_prefill_warmup) {
-            LLAMA_LOG_INFO(
+            COM_INF(
                 "[HYBRID_PREFILL_WARMUP] tokens=%zu wall_ms=%.3f "
                 "action=CLEAR_MEMORY_SYNC_RESET_PERF status=END\n",
                 tmp.size(),
