@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <map>
@@ -69,7 +70,9 @@ public:
     LLAMA_API bool prepare(const llama_model & model, ggml_backend_t cpu,
                  ggml_backend_t phone_rpc_gpu, int64_t max_total_tokens,
                  std::string & reason,
-                 int chunk_tokens = 16, int max_inflight = 2);
+                 int chunk_tokens = 16, int max_inflight = 2,
+                 ggml_backend_t pc_cuda = nullptr,
+                 size_t cuda_weight_budget_bytes = 0);
 
     // After prompt evaluation, call with ONE next-token embedding.
     // Every successful call commits the absolute physical KV prefix.
