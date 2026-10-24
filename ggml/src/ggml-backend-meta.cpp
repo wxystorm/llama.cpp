@@ -11523,15 +11523,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_reduce_graph->nodes[0] = phone_out_chunk;
                 phone_reduce_graph->n_nodes = 1;
 
-                if (last_chunk) {
+                const bool disable_c2p_output_producer =
+                    last_chunk ||
+                    (region_chunk_continuation &&
+                     prefill_down_chunk_0 == 0);
+                if (disable_c2p_output_producer) {
                     ggml_tensor * disabled_phone_l_out =
                         disable_layer_output_producers(
                             1, i + 1, prefill_down_layer_0);
                     GGML_ASSERT(disabled_phone_l_out == phone_l_out);
 
-                    // PC l_out is not an owner in C2P.  Suppress the legacy
-                    // concat/add producer so the completed activation remains
-                    // Phone-local for the following Phone Region.
+                    // PC l_out is not an owner in C2P.  In continuation mode
+                    // disable the stable backing producer before chunk 0 can
+                    // enter L35; subsequent chunks are filled by their own
+                    // Phone Reduce before the matching consumer is admitted.
                     ggml_tensor * disabled_pc_l_out =
                         disable_layer_output_producers(
                             0, i + 1, prefill_down_layer_0);
