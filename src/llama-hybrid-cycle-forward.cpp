@@ -956,7 +956,8 @@ static bool cycle_core_evaluate_with_kv(
                 ok = runtime.run(stages,
                     collect_queue_profile ? &queue_profile : nullptr,
                     collect_queue_profile ? &timeline : nullptr);
-                if (collect_queue_profile) for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
+                if (collect_queue_profile) {
+                    for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
                     const auto & v = queue_profile.queues[q];
                     std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
                                 "execute_ms=%.3f max_execute_ms=%.3f "
@@ -969,6 +970,7 @@ static bool cycle_core_evaluate_with_kv(
                                 v.max_execute_ms, v.queue_wait_ms,
                                 v.max_queue_wait_ms, v.idle_wait_ms,
                                 (unsigned long long) v.idle_wakes);
+                    }
                 }
             }
             if (ok) {
