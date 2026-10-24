@@ -1060,6 +1060,7 @@ static void test_cycle_execution_session_8_and_48() {
         auto cuda_slot =
             session.retire_cuda_output_after_handoff(0, 1, 1);
         assert(cuda_slot);
+        assert(session.cuda_device_handoffs() == 1);
         assert(!cuda0.cuda_output);
         assert(!session.retire_cuda_output_after_handoff(0, 1, 1));
 
