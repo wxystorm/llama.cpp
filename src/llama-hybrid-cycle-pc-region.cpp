@@ -447,3 +447,180 @@ bool llama_hybrid_cycle_execute_pc_full_region(
     cleanup();
     return true;
 }
+
+
+bool llama_hybrid_cycle_bind_pc_region_stages(
+        llama_hybrid_cycle_stage_dispatcher & stages,
+        const llama_model & model,
+        llama_hybrid_cycle_physical_resource_pool & resources,
+        llama_hybrid_cycle_execution_session<> & session,
+        const std::vector<float> & initial_hidden,
+        int64_t hidden,
+        std::string & reason,
+        std::atomic<int> * region_calls) {
+    reason.clear();
+    const auto & layout = resources.execution_layout();
+    const auto & session_layout = session.config().layout;
+    if (!layout.enabled() ||
+        layout.kinds != session_layout.kinds ||
+        layout.pc_cuda_layers != session_layout.pc_cuda_layers ||
+        layout.pc_cuda_full != session_layout.pc_cuda_full ||
+        layout.x <= 1 || layout.cycle_size <= layout.x ||
+        layout.cycles <= 0 ||
+        layout.tail_begin != int(layout.kinds.size()) ||
+        hidden <= 0 ||
+        resources.prepared_layers() != int(layout.kinds.size())) {
+        reason = "PC_REGION_BIND_LAYOUT";
+        return false;
+    }
+
+    for (int cycle = 0; cycle < layout.cycles; ++cycle) {
+        const int begin = cycle * layout.cycle_size;
+        const int end = begin + layout.x;
+        if (begin < session.first_layer() ||
+            end > session.first_layer() + session.layer_count()) {
+            reason = "PC_REGION_BIND_SESSION_RANGE";
+            return false;
+        }
+        for (int l = begin; l < end; ++l) {
+            if (layout.kinds[size_t(l)] !=
+                    llama_hybrid_cycle_layer_kind::PC_CPU ||
+                !llama_hybrid_cycle_full_layer_on_cuda(layout, l)) {
+                reason = "PC_REGION_BIND_NON_CUDA_FULL layer=" +
+                         std::to_string(l);
+                return false;
+            }
+        }
+
+        const bool start_bound = stages.bind(
+            begin, llama_hybrid_cycle_stage::FULL_LAYER,
+            [begin, end, hidden, &model, &resources, &session,
+             &initial_hidden, region_calls](
+                const llama_hybrid_cycle_task & task) -> bool {
+                if (task.layer != begin ||
+                    task.stage != llama_hybrid_cycle_stage::FULL_LAYER ||
+                    task.chunk < 0 ||
+                    task.chunk >= session.chunks_per_layer()) {
+                    return false;
+                }
+
+                auto & start_state = session.at(begin, task.chunk);
+                auto & tail_state = session.at(end - 1, task.chunk);
+                std::vector<float> input;
+                if (begin == session.first_layer()) {
+                    const int64_t relative_start =
+                        start_state.start -
+                        session.config().token_position_base;
+                    if (relative_start < 0 ||
+                        uint64_t(relative_start) >
+                            std::numeric_limits<size_t>::max() /
+                                uint64_t(hidden) ||
+                        uint64_t(start_state.tokens) >
+                            std::numeric_limits<size_t>::max() /
+                                uint64_t(hidden)) {
+                        return false;
+                    }
+                    const size_t offset =
+                        size_t(relative_start) * size_t(hidden);
+                    const size_t count =
+                        size_t(start_state.tokens) * size_t(hidden);
+                    if (offset > initial_hidden.size() ||
+                        count > initial_hidden.size() - offset) {
+                        return false;
+                    }
+                    input.assign(
+                        initial_hidden.begin() + offset,
+                        initial_hidden.begin() + offset + count);
+                } else if (!session.copy_predecessor_host_input(
+                               begin, task.chunk, hidden, input)) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PC_CUDA_REGION] layers=[%d,%d) chunk=%d "
+                        "reason=PREDECESSOR_HOST status=FAIL\n",
+                        begin, end, task.chunk);
+                    return false;
+                }
+
+                std::string execute_reason;
+                llama_hybrid_cycle_pc_region_timing timing;
+                const bool ok = llama_hybrid_cycle_execute_pc_full_region(
+                    model, resources, begin, end - begin,
+                    start_state.start, start_state.tokens,
+                    input, tail_state.host_output, execute_reason,
+                    task.input_consumed, &timing);
+                if (!ok) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PC_CUDA_REGION] layers=[%d,%d) chunk=%d "
+                        "reason=%s status=FAIL\n",
+                        begin, end, task.chunk, execute_reason.c_str());
+                    return false;
+                }
+                if (!session.publish_host_output(
+                        end - 1, task.chunk, hidden)) {
+                    std::fprintf(stderr,
+                        "[CYCLE_PC_CUDA_REGION] layers=[%d,%d) chunk=%d "
+                        "reason=TAIL_PUBLISH status=FAIL\n",
+                        begin, end, task.chunk);
+                    return false;
+                }
+                if (region_calls) {
+                    region_calls->fetch_add(1, std::memory_order_relaxed);
+                }
+                if (llama_hybrid_cycle_verbose()) {
+                    std::printf(
+                        "[CYCLE_PC_CUDA_REGION_PROFILE] layers=[%d,%d) "
+                        "chunk=%d graph_build_ms=%.3f alloc_ms=%.3f "
+                        "input_ms=%.3f compute_ms=%.3f readback_ms=%.3f "
+                        "nodes=%d status=PASS\n",
+                        begin, end, task.chunk,
+                        timing.graph_build_ms, timing.alloc_ms,
+                        timing.input_ms, timing.compute_ms,
+                        timing.readback_ms, timing.graph_nodes);
+                }
+                return true;
+            });
+        if (!start_bound) {
+            reason = "PC_REGION_BIND_START layer=" + std::to_string(begin);
+            return false;
+        }
+
+        for (int l = begin + 1; l < end; ++l) {
+            const bool bound = stages.bind(
+                l, llama_hybrid_cycle_stage::FULL_LAYER,
+                [l, end, &session](
+                    const llama_hybrid_cycle_task & task) -> bool {
+                    if (task.layer != l ||
+                        task.stage != llama_hybrid_cycle_stage::FULL_LAYER ||
+                        task.chunk < 0 ||
+                        task.chunk >= session.chunks_per_layer()) {
+                        return false;
+                    }
+                    // Region compute already consumed every internal edge.
+                    // These tasks only advance the original physical-layer
+                    // dependency graph and release its bounded credits.
+                    if (task.input_consumed &&
+                        !task.input_consumed()) {
+                        return false;
+                    }
+                    if (l == end - 1) {
+                        const auto & tail =
+                            session.at(end - 1, task.chunk);
+                        if (!tail.host_output_published.load(
+                                std::memory_order_acquire)) {
+                            std::fprintf(stderr,
+                                "[CYCLE_PC_CUDA_REGION_CONT] layer=%d "
+                                "chunk=%d reason=TAIL_NOT_PUBLISHED "
+                                "status=FAIL\n",
+                                l, task.chunk);
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            if (!bound) {
+                reason = "PC_REGION_BIND_CONT layer=" + std::to_string(l);
+                return false;
+            }
+        }
+    }
+    return true;
+}
