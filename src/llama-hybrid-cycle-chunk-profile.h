@@ -233,7 +233,7 @@ inline void llama_hybrid_cycle_print_stage_summary(
                 "callback_sum_ms=%.3f callback_max_ms=%.3f "
                 "queue_wait_sum_ms=%.3f queue_wait_max_ms=%.3f "
                 "entry_gate_sum_ms=%.3f entry_gate_max_ms=%.3f "
-                "clock=PC_STEADY scope=HOST_CALLBACK\\n",
+                "clock=PC_STEADY scope=HOST_CALLBACK\n",
                 llama_hybrid_cycle_queue_name(
                     static_cast<llama_hybrid_cycle_queue>(q)),
                 llama_hybrid_cycle_stage_name(
@@ -253,7 +253,7 @@ inline void llama_hybrid_cycle_print_stage_summary(
         std::printf(
             "[CYCLE_CORE_SLOW_TASK] rank=%zu layer=%d chunk=%d "
             "queue=%s stage=%s callback_ms=%.3f "
-            "device_kernel_ms=NOT_MEASURED\\n",
+            "device_kernel_ms=NOT_MEASURED\n",
             i + 1, e.task.layer, e.task.chunk,
             llama_hybrid_cycle_queue_name(e.task.queue),
             llama_hybrid_cycle_stage_name(e.task.stage),
