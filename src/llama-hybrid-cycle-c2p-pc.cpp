@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-c2p-pc.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 
@@ -69,7 +70,7 @@ bool llama_hybrid_cycle_execute_c2p_pc_attention(
         ready.routing.size() == size_t(tokens) * size_t(topk) &&
         all_finite(ready.residual) && all_finite(ready.norm) &&
         all_finite(ready.routing);
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_C2P_PC] layer=%d stage=ATTN_PRE "
         "position_start=%lld tokens=%lld kv_committed=%lld "
         "attn_ms=%.3f status=%s\n",
@@ -116,7 +117,7 @@ bool llama_hybrid_cycle_execute_c2p_pc_ffn_source(
     const bool ok = calculated &&
         partial.size() == size_t(tokens) * size_t(hidden) &&
         all_finite(partial);
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_REAL_C2P_PC] layer=%d stage=FFN_SOURCE "
         "tokens=%lld elements=%zu status=%s\n",
         physical_layer, (long long)tokens, partial.size(),
