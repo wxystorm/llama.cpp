@@ -141,6 +141,74 @@ def stage_sort(key):
     )
 
 
+
+def concatenated_stage(files, tokens, side, stage, dtype):
+    """Reconstruct token-major logical data, independent of chunk boundaries."""
+    chunks = [
+        (int(k[1]), k)
+        for k in files
+        if k[0] == tokens and k[1] != "full"
+        and k[2] == side and k[3] == stage and k[4] == dtype
+    ]
+    if not chunks:
+        return None
+    chunks.sort()
+    if [c for c, _ in chunks] != list(range(len(chunks))):
+        print(f"WARNING: {side} {stage} has noncontiguous chunk ids")
+        return None
+    result = array("f" if dtype == "f32" else "i")
+    for _, key in chunks:
+        result.extend(read_values(files[key], dtype))
+    return result
+
+
+def make_full_parity(a_files, b_files, tokens, atol, rtol):
+    """Stage parity over all tokens (preferred when A/B chunking differs)."""
+    errors = []
+    print()
+    print("=== Full-token parity (independent of chunk partition) ===")
+    for stage, dtype in (
+        ("ffn_norm", "f32"),
+        ("router_logits", "f32"),
+        ("router_topk", "i32"),
+        ("router_weights", "f32"),
+        ("partial", "f32"),
+    ):
+        for side in ("pc", "phone"):
+            a = concatenated_stage(a_files, tokens, side, stage, dtype)
+            b = concatenated_stage(b_files, tokens, side, stage, dtype)
+            if a is None or b is None:
+                continue
+            key = (tokens, "full", side, stage, dtype)
+            stats = compare(a, b, dtype, atol, rtol)
+            display(key, stats, label="  ")
+            if stats["status"] != "PASS":
+                errors.append((key, stats))
+
+    pc_a = concatenated_stage(a_files, tokens, "pc", "partial", "f32")
+    ph_a = concatenated_stage(a_files, tokens, "phone", "partial", "f32")
+    pc_b = concatenated_stage(b_files, tokens, "pc", "partial", "f32")
+    ph_b = concatenated_stage(b_files, tokens, "phone", "partial", "f32")
+    if all(x is not None for x in (pc_a, ph_a, pc_b, ph_b)):
+        if len(pc_a) == len(ph_a) == len(pc_b) == len(ph_b):
+            result_a = [float(x) + float(y) for x, y in zip(pc_a, ph_a)]
+            result_b = [float(x) + float(y) for x, y in zip(pc_b, ph_b)]
+            key = (tokens, "full", "sum", "ffn_combined", "f32")
+            stats = compare(result_a, result_b, "f32", atol, rtol)
+            display(key, stats, label="  ")
+            if stats["status"] != "PASS":
+                errors.append((key, stats))
+        else:
+            print(
+                "  full FFN_COMBINED SHAPE "
+                f"A={len(pc_a)}/{len(ph_a)} "
+                f"B={len(pc_b)}/{len(ph_b)}"
+            )
+    else:
+        print("  full FFN_COMBINED SKIP: missing PC/Phone partials")
+    return errors
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("a", type=Path, help="A: new C2P dump directory")
@@ -174,15 +242,35 @@ def main():
     if not common:
         raise SystemExit("No matching stage keys found.")
 
+    # Chunk sizes may differ even for the same prompt. For example A may
+    # use 120/119/119 while B uses 128/128/102. In that case a direct
+    # chunk0-to-chunk0 comparison has different tokens on both sides.
+    def chunk_shape(files):
+        return tuple(
+            (int(k[1]), len(read_values(files[k], "f32")))
+            for k in sorted(files, key=stage_sort)
+            if k[1] != "full" and k[2] == "pc"
+            and k[3] == "partial" and k[4] == "f32"
+        )
+    shape_a = chunk_shape(a_files)
+    shape_b = chunk_shape(b_files)
+    same_chunks = shape_a == shape_b
+
     print(
         f"A={args.a} ({len(a_files)} dumps) "
         f"B={args.b} ({len(b_files)} dumps) tokens={tokens}"
     )
     print(f"float tolerance atol={args.atol:g} rtol={args.rtol:g}")
     print("Exact matches required for I32 TopK; F32 compares logical elements.")
+    print(f"A partial chunks={shape_a}")
+    print(f"B partial chunks={shape_b}")
+    if not same_chunks:
+        print("CHUNK_LAYOUT_DIFF: skip per-chunk parity, use full-token parity.")
     print()
     failures = []
     for key in common:
+        if key[1] != "full" and not same_chunks:
+            continue
         dtype = key[-1]
         result = compare(
             read_values(a_files[key], dtype),
@@ -205,8 +293,14 @@ def main():
     # Compare the combined MoE FFN output too: the legacy split may
     # rotate which physical expert channels belong to which backend.
     # Different PC/Phone partials alone do not imply an incorrect sum.
+    failures.extend(
+        make_full_parity(
+            a_files, b_files, tokens, args.atol, args.rtol
+        )
+    )
+
     print()
-    print("FFN combined partial parity (PC + Phone):")
+    print("FFN combined partial parity (PC + Phone, aligned chunks only):")
     for chunk in sorted(
         {k[1] for k in common if k[3] == "partial" and k[1] != "full"},
         key=int,
@@ -215,6 +309,8 @@ def main():
             side: (tokens, chunk, side, "partial", "f32")
             for side in ("pc", "phone")
         }
+        if not same_chunks:
+            continue
         if any(k not in a_files or k not in b_files for k in keys.values()):
             print(f"chunk={chunk} SKIP incomplete partials")
             continue
@@ -237,7 +333,7 @@ def main():
     if failures:
         key, result = failures[0]
         print(
-            "FIRST DIFFERENCE (stage order): "
+            "FIRST RECORDED DIFFERENCE (read stage results above): "
             f"chunk={key[1]} side={key[2]} stage={key[3]} "
             f"status={result['status']}"
         )
