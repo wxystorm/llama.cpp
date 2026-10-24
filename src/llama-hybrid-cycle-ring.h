@@ -47,7 +47,7 @@ struct llama_hybrid_cycle_task {
     // scheduling order, dependencies or buffer ownership.
     std::chrono::steady_clock::time_point queued_at {};
     // Nonzero for an opt-in per-layer entry trace. This captures the time
-    // the predecessor made this Chunk ready, BEFORE credits/order allow enqueue.
+    // the predecessor made this Chunk ready, BEFORE ordered admission.
     std::chrono::steady_clock::time_point entry_ready_at {};
 };
 
@@ -99,17 +99,17 @@ public:
             bool phone_main_priority = false,
             bool trace_entry_gate = false)
         : layout_(layout), n_chunks_(n_chunks),
-          max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
+          max_inflight_(max_inflight),
           credit_until_handoff_(credit_until_handoff),
           pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
           ordered_c2p_reduce_(ordered_c2p_reduce),
           phone_main_priority_(phone_main_priority),
           trace_entry_gate_(trace_entry_gate) {
         if (!layout_.enabled() || !llama_hybrid_cycle_cuda_layers_valid(layout_) ||
-            n_chunks_ <= 0 || max_inflight_ <= 0 ||
+            n_chunks_ <= 0 || max_inflight_ < 0 ||
             max_inflight_ > n_chunks_) {
             throw std::invalid_argument(
-                "cycle task ring requires positive chunks and valid in-flight window");
+                "cycle task ring requires positive chunks and a valid admission policy");
         }
         entry_ready_.assign(layout_.kinds.size(), std::vector<uint8_t>(n_chunks_, 0));
         next_chunk_.assign(layout_.kinds.size(), 0);
@@ -384,17 +384,19 @@ private:
             entry_ready_times_[size_t(layer)][size_t(chunk)] =
                 std::chrono::steady_clock::now();
         }
-        drain_entry_window(layer);
+        drain_ready_entries(layer);
     }
 
-    // Apply bounded credits separately at every layer. A late chunk cannot
-    // jump ahead of an earlier KV position and may not allocate a new Phone
-    // Attention graph until one earlier chunk's final Reduce has freed its
-    // entry credit. Default (max_inflight == n_chunks) is legacy behavior.
-    void drain_entry_window(int layer) {
+    // Production max_inflight=0: NO artificial per-layer Chunk window.
+    // Once a predecessor publishes the Chunk, enqueue it in causal Chunk
+    // order immediately. Per-(layer,chunk) output/FFN slots, scratch leases
+    // and device ACKs provide the actual buffer lifetime guarantees.
+    // A positive max_inflight remains available for legacy bounded tests.
+    void drain_ready_entries(int layer) {
         while (next_chunk_[layer] < n_chunks_ &&
                entry_ready_[layer][next_chunk_[layer]] != 0 &&
-               layer_inflight_[layer] < max_inflight_) {
+               (max_inflight_ == 0 ||
+                layer_inflight_[layer] < max_inflight_)) {
             const int ready_chunk = next_chunk_[layer]++;
             ++layer_inflight_[layer];
             const auto stage = is_tensor(layout_.kinds[layer]) ?
@@ -412,7 +414,7 @@ private:
             throw std::logic_error("cycle layer credit underflow");
         }
         --layer_inflight_[layer];
-        drain_entry_window(layer);
+        drain_ready_entries(layer);
     }
 
     void finish_layer(int layer, int chunk) {
@@ -420,7 +422,7 @@ private:
         // For the full multi-layer period, output buffers remain owned
         // by this layer until the successor's FULL_LAYER or ATTN_PRE
         // actually consumes the tensor. Otherwise Reduce could allow
-        // unbounded pending Phone GPU outputs despite max_inflight=2.
+        // unsafe reuse of an output still borrowed by a downstream consumer.
         // On a single-layer diagnostic or the final layer, the normal
         // immediate credit release is still correct.
         if (!credit_until_handoff_ ||
@@ -432,7 +434,7 @@ private:
 
     llama_hybrid_cycle_layout layout_;
     int n_chunks_ = 0;
-    int max_inflight_ = 0;
+    int max_inflight_ = 0;  // 0 = unlimited ready-Chunk admission
     bool credit_until_handoff_ = false;
     bool pc_cpu_reduce_priority_ = false;
     bool ordered_c2p_reduce_ = false;
