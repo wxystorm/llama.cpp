@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -953,10 +954,21 @@ static bool cycle_core_evaluate_with_kv(
                     "phone=REAL_GPU rpc=REAL_BIDIRECTIONAL "
                     "pc_reduce=EXCLUSIVE status=BEGIN\n",
                     n_tokens, n_chunks, max_inflight);
+                const auto fifo_start = std::chrono::steady_clock::now();
                 ok = runtime.run(stages,
                     collect_queue_profile ? &queue_profile : nullptr,
                     collect_queue_profile ? &timeline : nullptr);
                 if (collect_queue_profile) {
+                    const auto fifo_done = std::chrono::steady_clock::now();
+                    std::printf(
+                        "[CYCLE_CORE_FIFO_WALL] tokens=%d chunks=%d "
+                        "window=%d wall_ms=%.3f scope=PC_STEADY "
+                        "status=%s\\n",
+                        n_tokens, n_chunks, max_inflight,
+                        std::chrono::duration<double, std::milli>(
+                            fifo_done - fifo_start).count(),
+                        ok ? "PASS" : "FAIL");
+                    llama_hybrid_cycle_print_stage_summary(timeline);
                     for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
                     const auto & v = queue_profile.queues[q];
                     std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
@@ -974,7 +986,16 @@ static bool cycle_core_evaluate_with_kv(
                 }
             }
             if (ok) {
+                const auto drain_begin = std::chrono::steady_clock::now();
                 ok = ggml_backend_rpc_cycle_wait_tx_idle(phone, 30000);
+                if (collect_queue_profile) {
+                    const double drain_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - drain_begin).count();
+                    std::printf(
+                        "[CYCLE_CORE_RPC_DRAIN] tokens=%d wait_ms=%.3f "
+                        "scope=HOST_AFTER_FIFO status=%s\\n",
+                        n_tokens, drain_ms, ok ? "PASS" : "FAIL");
+                }
                 if (!ok) reason = "REAL_RPC_TX_NOT_DRAINED";
             }
             if (!ok) ggml_backend_synchronize(phone);
