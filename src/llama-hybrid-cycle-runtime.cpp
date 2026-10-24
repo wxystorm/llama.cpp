@@ -37,8 +37,8 @@ static bool llama_hybrid_cycle_run_fifo_impl(
     llama_hybrid_cycle_task_ring ring(
         layout, n_chunks, max_inflight, credit_until_handoff,
         pc_cpu_reduce_priority, ordered_c2p_reduce,
-        phone_main_priority, pc_cuda_chunk_priority,
-        chunk_timeline != nullptr);
+        phone_main_priority, chunk_timeline != nullptr,
+        pc_cuda_chunk_priority);
     ring.start();
 
     constexpr std::array<llama_hybrid_cycle_queue, 5> queues {
