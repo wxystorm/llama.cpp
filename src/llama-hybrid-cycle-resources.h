@@ -29,7 +29,7 @@ LLAMA_API bool llama_hybrid_cycle_select_cuda_full_layers(
 
 struct llama_hybrid_cycle_resource_config {
     int64_t kv_tokens = 64;             // Physical KV supports <=512 tokens.
-    int max_inflight = 2;               // Graph/Scratch credit slots per layer.
+    int max_inflight = 0;               // 0 = on-demand scratch slots; no fixed ceiling.
     size_t cuda_weight_budget_bytes = 0; // Effective residency-cache cap; GPU Full is mandatory.
     size_t cuda_safety_reserve_bytes = 512ULL * 1024 * 1024;
     bool attention_graph_cache = true;
