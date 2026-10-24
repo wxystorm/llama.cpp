@@ -2,6 +2,7 @@
 #include "cli-context.h"
 #include "cli-ui.h"
 
+#include "chat.h"
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
@@ -132,7 +133,7 @@ int cli_cycle_run(common_params & params) {
         std::fprintf(stderr,
             "[CYCLE_OFFICIAL_CLI] status=FAIL "
             "reason=UNSUPPORTED_SERVER_MULTISEQ_MULTIMODAL_ADAPTER_OR_INTERACTIVE "
-            "supported=RAW_SINGLE_PROMPT\n");
+            "supported=SINGLE_TURN_CHAT_OR_RAW_PROMPT\n");
         return 2;
     }
     if (cli_context::interrupted().load()) {
@@ -208,8 +209,80 @@ int cli_cycle_run(common_params & params) {
         return 1;
     }
 
+    // AUTO follows the model's GGUF chat template, just like the official
+    // completion CLI. Explicit --no-conversation remains byte-for-byte raw
+    // input for numerical/parity regression. Neither mode enables a server,
+    // multi-turn history, KV shifting or a new executor.
+    const bool template_available =
+        !params.chat_template.empty() ||
+        llama_model_chat_template(init->model(), nullptr) != nullptr;
+    const bool template_enabled = params.enable_chat_template &&
+        params.conversation_mode != COMMON_CONVERSATION_MODE_DISABLED;
+    const bool use_chat_template = template_enabled &&
+        (template_available ||
+         params.conversation_mode == COMMON_CONVERSATION_MODE_ENABLED);
+    if (params.conversation_mode == COMMON_CONVERSATION_MODE_ENABLED &&
+        !params.enable_chat_template) {
+        std::fprintf(stderr,
+            "[CYCLE_OFFICIAL_CLI] status=FAIL reason=CHAT_TEMPLATE_DISABLED_BY_INPUT_PREFIX\n");
+        return 2;
+    }
+    if (use_chat_template && !template_available) {
+        std::fprintf(stderr,
+            "[CYCLE_OFFICIAL_CLI] status=FAIL reason=CHAT_TEMPLATE_NOT_AVAILABLE\n");
+        return 2;
+    }
+
+    std::string model_prompt = prompt;
+    if (use_chat_template) {
+        try {
+            auto templates = common_chat_templates_init(
+                init->model(), params.chat_template);
+            common_chat_templates_inputs inputs;
+            inputs.use_jinja = params.use_jinja;
+            inputs.add_generation_prompt = true;
+            inputs.chat_template_kwargs = params.default_template_kwargs;
+            if (!params.system_prompt.empty()) {
+                common_chat_msg system_message;
+                system_message.role = "system";
+                system_message.content = params.system_prompt;
+                inputs.messages.push_back(std::move(system_message));
+            }
+            common_chat_msg user_message;
+            user_message.role = "user";
+            user_message.content = prompt;
+            inputs.messages.push_back(std::move(user_message));
+            model_prompt = common_chat_templates_apply(
+                templates.get(), inputs).prompt;
+            if (model_prompt.empty()) {
+                std::fprintf(stderr,
+                    "[CYCLE_OFFICIAL_CLI] status=FAIL reason=CHAT_TEMPLATE_EMPTY_PROMPT\n");
+                return 2;
+            }
+        } catch (const std::exception & ex) {
+            std::fprintf(stderr,
+                "[CYCLE_OFFICIAL_CLI] status=FAIL reason=CHAT_TEMPLATE_APPLY detail=%s\n",
+                ex.what());
+            return 2;
+        }
+    }
+    // The template contains literal <|im_start|>/<|im_end|> or equivalent
+    // model-defined control tokens. Tokenize those as special IDs; treating
+    // them as ordinary text changes the logits at the assistant boundary.
     const auto prompt_tokens = common_tokenize(
-        vocab, prompt, /* add_special */ true, params.parse_special);
+        vocab, model_prompt, /* add_special */ true,
+        use_chat_template ? true : params.parse_special);
+    std::fprintf(stderr,
+        "[CYCLE_OFFICIAL_CLI] phase=PROMPT_FORMAT mode=%s user_bytes=%zu "
+        "model_bytes=%zu tokens=%zu special=%d status=PASS\n",
+        use_chat_template ? "MODEL_CHAT_TEMPLATE" : "RAW_COMPLETION",
+        prompt.size(), model_prompt.size(), prompt_tokens.size(),
+        int(use_chat_template || params.parse_special));
+    if (cli_cycle_verbose() && use_chat_template) {
+        std::fprintf(stderr, "[CYCLE_CHAT_TEMPLATE] formatted_prompt_begin\n%s\n"
+                             "[CYCLE_CHAT_TEMPLATE] formatted_prompt_end\n",
+                     model_prompt.c_str());
+    }
     if (prompt_tokens.empty() ||
         prompt_tokens.size() > size_t(llama_n_ctx(ctx))) {
         std::fprintf(stderr,
@@ -276,6 +349,8 @@ int cli_cycle_run(common_params & params) {
     }
 
     if (params.display_prompt) {
+        // Display only user-visible input. Never echo the rendered template's
+        // assistant prefix or special control tokens into the output stream.
         std::fwrite(prompt.data(), 1, prompt.size(), stdout);
         std::fflush(stdout);
     }
