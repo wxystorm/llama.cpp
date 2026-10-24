@@ -6915,6 +6915,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "ne=[%" PRId64 ",%" PRId64 "]\n",
                         prefill_norm_layer, prefill_norm_chunk,
                         src->name, src->ne[0], src->ne[1]);
+                    if (ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, prefill_norm_layer)) {
+                        printf(
+                            "[REGION_C2P_READY] layer=%d chunk=%d bytes=%zu "
+                            "direction=PC_TO_PHONE payload=FFN_NORM status=OK\n",
+                            prefill_norm_layer,
+                            prefill_norm_chunk,
+                            ggml_nbytes(src));
+                    }
                 }
                 return GGML_STATUS_SUCCESS;
             }
@@ -8320,6 +8329,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t copy_us = ggml_time_us() - copy_start_us;
                 record_copy_wait(copy_us);
                 record_meta_copy(i, active_backend, j_dst, nodes[active_backend], copy_us);
+
+                if (pipeline_debug &&
+                        is_prefill_norm_input &&
+                        active_backend == 0 &&
+                        j_dst == 1 &&
+                        ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, prefill_norm_layer)) {
+                    printf(
+                        "[REGION_C2P_READY] layer=%d chunk=%d bytes=%zu "
+                        "direction=PC_TO_PHONE payload=FFN_NORM "
+                        "path=GENERIC status=OK\n",
+                        prefill_norm_layer,
+                        prefill_norm_chunk,
+                        ggml_nbytes(nodes[active_backend]));
+                }
 
                 if (pc_full_ffn_to_phone && pipeline_debug) {
                     printf(
