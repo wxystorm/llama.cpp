@@ -59,5 +59,5 @@ LLAMA_API bool llama_hybrid_cycle_run_fifo(
         bool pc_cpu_reduce_priority = false,
         bool ordered_c2p_reduce = false,
         bool phone_main_priority = false,
-        bool pc_cuda_chunk_priority = false,
-        llama_hybrid_cycle_chunk_timeline * chunk_timeline = nullptr);
+        llama_hybrid_cycle_chunk_timeline * chunk_timeline = nullptr,
+        bool pc_cuda_chunk_priority = false);
