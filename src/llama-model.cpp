@@ -998,6 +998,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         force_to_device(0);
     }
 
+    // Compare the actual physical MoE FFN weight allocation for A/C2P
+    // and B/legacy tensor split.  Identical nominal R does not necessarily
+    // imply identical shards when the legacy planner uses split rotation.
+    if (const char * ab_layer_env =
+            std::getenv("GGML_META_AB_TRACE_LAYER")) {
+        if (ud->n_devices == 2 && is_ffn_split_tensor &&
+                tc.il == std::atoi(ab_layer_env)) {
+            int64_t pc_size = 0;
+            int64_t phone_size = 0;
+            for (size_t is = 0; is < split_state.n_segments; ++is) {
+                pc_size += split_state.ne[is*2] * split_state.nr[is];
+                phone_size += split_state.ne[is*2 + 1] *
+                              split_state.nr[is];
+            }
+            LLAMA_LOG_ERROR(
+                "[AB_WEIGHT_SPLIT] layer=%d tensor=%s mode=%d "
+                "axis=%d rotation=%zu applied_rotation=%zu "
+                "segments=%zu pc_units=%lld phone_units=%lld "
+                "layer_pc_ratio=%.6f\n",
+                tc.il, tensor_name.c_str(), (int) mode,
+                split_state.axis, tc.rotation, split_rotation,
+                split_state.n_segments,
+                (long long) pc_size, (long long) phone_size,
+                (double) ud->model->hybrid_tensor_pc_ratio(tc.il));
+        }
+    }
+
     if (tensor_name.rfind("blk.0.", 0) == 0 &&
             (is_attention_tensor ||
              std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
