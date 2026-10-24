@@ -13,10 +13,11 @@ struct llama_model;
 // transfer is allowed here. Caller keeps the producer slot alive through
 // completion, then may retire it to its OWN physical region's idle bank.
 //
-// The caller owns READY and the output FFN slot. This function may reuse a
-// shape-compatible FFN slot, but MUST NOT move/free the output before the
-// successor Attention (or an explicit diagnostic bridge) consumes its l_out.
-// The full layer commits its physical KV in strict Chunk order.
+// The caller owns READY and the output FFN slot. Production Full uses a
+// registered server-side fused FFN+residual replay (RPC patch >=28); there is
+// no legacy client FFN + separate Reduce fallback. A shape-compatible
+// registered slot may be reused, but its output must remain alive until the
+// successor Attention consumes l_out. KV commits remain strict Chunk order.
 LLAMA_API bool llama_hybrid_cycle_execute_phone_full(
     const llama_model & model,
     const llama_hybrid_cycle_physical_layer_resources & resource,
