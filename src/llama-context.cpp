@@ -3603,7 +3603,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // Execution follows the model policy, not merely the planner flag.
     // A PHONE-primary plan may intentionally run with legacy TENSOR_SPLIT
     // semantics for correctness A/B testing.
+    // Legacy Phone-primary staged execution assumes one contiguous Tensor
+    // interval. Directional Region Boundary V1 uses sparse P2C boundaries and
+    // must not enable that interval-wide shortcut; per-layer model ownership
+    // plus the Meta masks remain authoritative.
     const bool tensor_phone_primary_exec =
+        !directional_region_policy &&
         tensor_phone_first_layer >= 0 &&
         tensor_phone_last_layer > tensor_phone_first_layer;
 
