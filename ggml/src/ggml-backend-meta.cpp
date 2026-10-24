@@ -2642,12 +2642,15 @@ struct ggml_backend_meta_priority_compute_worker {
                 // submit a graph to the backend directly from this new thread.
                 // It only chooses MAIN vs SHARD; the canonical compute worker
                 // performs the actual backend submission.
-                GGML_ASSERT(submitter != nullptr);
-                GGML_ASSERT(backend_index < submitter->n_backends);
-                submitter->start_graph(
-                    backend_index, current.graph);
+                GGML_ASSERT(this->submitter != nullptr);
+                GGML_ASSERT(
+                    this->backend_index <
+                    this->submitter->n_backends);
+                this->submitter->start_graph(
+                    this->backend_index, current.graph);
                 const ggml_status status =
-                    submitter->wait(backend_index);
+                    this->submitter->wait(
+                        this->backend_index);
                 lock.lock();
 
                 results[current.id] = status;
