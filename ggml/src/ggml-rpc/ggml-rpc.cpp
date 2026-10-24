@@ -21,6 +21,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <map>
 #include <set>
 #include <tuple>
@@ -8195,7 +8196,7 @@ public:
         const auto key = cycle_key(
             msg.layer, msg.chunk, msg.seq, msg.graph_id, msg.kind);
         size_t staged_frames = 0;
-        {
+        try {
             std::lock_guard<std::mutex> lock(cycle_rx_mutex);
             // Store each validated C2P frame by its exact
             // (layer, chunk, seq, graph, kind) identity until the GPU
@@ -8207,6 +8208,12 @@ public:
                 return false;
             }
             staged_frames = cycle_rx_frames.size();
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_ERROR(
+                "[CYCLE_C2P_RX] side=phone layer=%d chunk=%d "
+                "status=FAIL reason=HOST_MEMORY_EXHAUSTED\n",
+                header.layer, header.chunk);
+            return false;
         }
         cycle_rx_cv.notify_all();
         GGML_LOG_INFO(
