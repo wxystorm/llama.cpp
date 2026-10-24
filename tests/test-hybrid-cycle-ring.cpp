@@ -1066,6 +1066,24 @@ static void test_cycle_execution_session_8_and_48() {
     assert(llama_hybrid_cycle_session_wire_seq(0, 0, 0) == 1001);
     assert(llama_hybrid_cycle_session_wire_seq(1, 47, 3) == 148004);
     assert(llama_hybrid_cycle_session_wire_seq(0, 99, 0) == 0);
+
+    // Production Prefill: the full 358-token Prompt is one execution session,
+    // internally split into five 64-token Chunks plus one 38-token tail.
+    llama_hybrid_cycle_execution_session_config whole;
+    whole.layout = llama_hybrid_build_cycle_layout(48, 4, 2);
+    whole.physical_layer_count = 48;
+    whole.tokens = 358;
+    whole.chunk_tokens = 64;
+    whole.wire_epoch = 0;
+    llama_hybrid_cycle_execution_session<> whole_session(whole);
+    assert(whole_session.chunks_per_layer() == 6);
+    for (int c = 0; c < 5; ++c) {
+        assert(whole_session.at(0, c).start == int64_t(c * 64));
+        assert(whole_session.at(0, c).tokens == 64);
+    }
+    assert(whole_session.at(0, 5).start == 320);
+    assert(whole_session.at(0, 5).tokens == 38);
+    assert(whole_session.at(47, 5).wire.seq == 48006);
 }
 
 // Verify the compiled libllama Cycle runtime across both the original
@@ -1439,8 +1457,9 @@ static void test_cycle_48_cuda_budget_selection() {
         layout, estimates, 350, selected, bytes, reason));
     assert(bytes == 300);
     assert(std::count(selected.begin(), selected.end(), uint8_t(1)) == 3);
-    assert(selected[0] && selected[1] && selected[2] &&
-           !selected[3] && !selected[4] && !selected[8]);
+    // Implicit placement is balanced across the six physical periods.
+    assert(selected[8] && selected[24] && selected[40] &&
+           !selected[0] && !selected[1] && !selected[2]);
 
     // A Planner's explicit physical-layer selection is a hard contract:
     // it must not be silently weakened on memory shortfall.
@@ -1467,6 +1486,17 @@ static void test_cycle_phone_regions_independent_ledgers() {
     const auto layout = llama_hybrid_build_cycle_layout(48, 4, 2);
     llama_hybrid_cycle_phone_regions regions;
     std::string reason;
+    llama_hybrid_cycle_phone_regions whole_prompt_regions;
+    assert(whole_prompt_regions.prepare(layout, 358, 64, 2, reason));
+    assert(whole_prompt_regions.region_count() == 6);
+    assert(whole_prompt_regions.n_chunks() == 6);
+    for (int i = 0; i < whole_prompt_regions.region_count(); ++i) {
+        const auto * ledger = whole_prompt_regions.by_index(i);
+        assert(ledger && ledger->n_chunks == 6 &&
+               ledger->c2p_ready_chunks.size() == 6);
+    }
+
+    // Keep the original 16-token V5 ledger case as a regression.
     assert(regions.prepare(layout, 64, 16, 2, reason));
     assert(regions.region_count() == 6);
     assert(regions.n_chunks() == 4);
