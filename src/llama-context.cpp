@@ -3550,10 +3550,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
     int tensor_phone_first_layer = -1;
     int tensor_phone_last_layer = -1;
-    int directional_c2p_layer = -1;
-    int directional_p2c_layer = -1;
-    int directional_c2p_count = 0;
-    int directional_p2c_count = 0;
     std::vector<uint8_t> tensor_phone_layer_mask(
         size_t(hparams.n_layer()), uint8_t(0));
     std::vector<uint8_t> tensor_c2p_layer_mask(
@@ -3572,17 +3568,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             llama_hybrid_layer_mode_directional_tensor(mode);
         if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
             tensor_c2p_layer_mask[size_t(il)] = 1;
-            ++directional_c2p_count;
-            if (directional_c2p_layer < 0) {
-                directional_c2p_layer = il;
-            }
         }
         if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
             tensor_p2c_layer_mask[size_t(il)] = 1;
-            ++directional_p2c_count;
-            if (directional_p2c_layer < 0) {
-                directional_p2c_layer = il;
-            }
         }
         if (!llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) {
             continue;
@@ -3619,86 +3607,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
-
-    // Directional Region chunk continuation.
-    //
-    // Keep the entire C2P -> Phone-local -> P2C interval in one graph so the
-    // Qwen3-MoE builder can express Layer x Chunk dependencies without
-    // materializing Phone-owned hidden states through the host.  The prefix
-    // and tail stages remain PC-owned; their stage handoffs are therefore
-    // local to the laptop side.
-    const char * region_chunk_cont_env =
-        std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
-    const bool region_chunk_cont_requested =
-        region_chunk_cont_env != nullptr &&
-        std::atoi(region_chunk_cont_env) != 0;
-    std::vector<llama_hybrid_runtime_stage> region_chunk_cont_stages;
-    bool region_chunk_cont_plan_eligible = false;
-    if (region_chunk_cont_requested &&
-            has_runtime_plan &&
-            runtime_plan.tensor_chunk_tokens > 0 &&
-            model.arch == LLM_ARCH_QWEN3MOE &&
-            directional_region_policy &&
-            directional_c2p_count == 1 &&
-            directional_p2c_count == 1 &&
-            directional_c2p_layer >= 0 &&
-            directional_p2c_layer > directional_c2p_layer + 1 &&
-            directional_p2c_layer < (int) hparams.n_layer() - 1 &&
-            n_tokens_all > 1) {
-        const int macro_tokens = (int) n_tokens_all;
-        if (directional_c2p_layer > 0) {
-            region_chunk_cont_stages.push_back({
-                llama_hybrid_runtime_stage_kind::CPU,
-                0,
-                directional_c2p_layer,
-                macro_tokens,
-                0,
-                false,
-            });
-        }
-        region_chunk_cont_stages.push_back({
-            llama_hybrid_runtime_stage_kind::TENSOR,
-            directional_c2p_layer,
-            directional_p2c_layer + 1,
-            macro_tokens,
-            has_runtime_plan ? runtime_plan.tensor_chunk_tokens : 0,
-            false,
-        });
-        if (directional_p2c_layer + 1 < (int) hparams.n_layer()) {
-            region_chunk_cont_stages.push_back({
-                llama_hybrid_runtime_stage_kind::CPU,
-                directional_p2c_layer + 1,
-                (int) hparams.n_layer(),
-                macro_tokens,
-                0,
-                false,
-            });
-        }
-        region_chunk_cont_plan_eligible =
-            region_chunk_cont_stages.size() >= 2;
-
-        LLAMA_LOG_ERROR(
-            "[REGION_CONT_STAGE_PLAN] enabled=%d tokens=%u "
-            "c2p=%d phone=[%d,%d) p2c=%d stages=%zu macro=%d status=%s\n",
-            region_chunk_cont_plan_eligible ? 1 : 0,
-            n_tokens_all,
-            directional_c2p_layer,
-            directional_c2p_layer + 1,
-            directional_p2c_layer,
-            directional_p2c_layer,
-            region_chunk_cont_stages.size(),
-            macro_tokens,
-            region_chunk_cont_plan_eligible ? "READY" : "DISABLED");
-    } else if (region_chunk_cont_requested && n_tokens_all > 1) {
-        LLAMA_LOG_WARN(
-            "[REGION_CONT_STAGE_PLAN] enabled=0 tokens=%u c2p_count=%d "
-            "p2c_count=%d c2p=%d p2c=%d status=UNSUPPORTED_POLICY\n",
-            n_tokens_all,
-            directional_c2p_count,
-            directional_p2c_count,
-            directional_c2p_layer,
-            directional_p2c_layer);
-    }
 
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
@@ -3962,18 +3870,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool stage_serial_runtime_enabled =
         stage_serial_plan_eligible && !generalized_stage_queue_runtime_enabled && n_tokens_all > 1;
     uint32_t runtime_ubatch = cparams.n_ubatch;
-    if (region_chunk_cont_plan_eligible) {
-        // The Region stage must see the complete prompt so it can build the
-        // C2P chunk fan-out followed by chunk-major Phone continuation.
-        runtime_ubatch =
-            std::min<uint32_t>(cparams.n_ubatch, n_tokens_all);
-        LLAMA_LOG_DEBUG(
-            "[REGION_CONT_RUNTIME] batch=%u ubatch=%u stages=%zu "
-            "mode=FULL_PROMPT_STAGE\n",
-            n_tokens_all,
-            runtime_ubatch,
-            region_chunk_cont_stages.size());
-    } else if (stage_queue_plan_eligible) {
+    if (stage_queue_plan_eligible) {
         const uint32_t xg = std::min<uint32_t>(cparams.n_ubatch, runtime_plan.gpu_chunk_tokens);
         const uint32_t n_macros = (n_tokens_all + xg - 1) / xg;
 
@@ -4845,23 +4742,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        const bool region_chunk_cont_candidate =
-            region_chunk_cont_plan_eligible &&
-            cparams.causal_attn &&
-            ubatch.n_tokens > 1 &&
-            ubatch.token != nullptr &&
-            ubatch.embd == nullptr &&
-            ubatch.n_pos == 1 &&
-            (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
-            ubatch.n_seqs_unq == 1 &&
-            !cparams.embeddings &&
-            !cparams.embeddings_nextn &&
-            cparams.cb_eval == nullptr &&
-            std::none_of(
-                cparams.embeddings_layer_inp.begin(),
-                cparams.embeddings_layer_inp.end(),
-                [](bool enabled) { return enabled; });
-
         bool stage_serial_candidate =
             stage_serial_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 && ubatch.token != nullptr &&
             ubatch.embd == nullptr && ubatch.n_pos == 1 && !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
@@ -4896,41 +4776,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const llm_graph_result * res          = nullptr;
         bool                     pipe_success = false;
 
-        if (region_chunk_cont_plan_eligible &&
-                !region_chunk_cont_candidate) {
-            LLAMA_LOG_WARN(
-                "[REGION_CONT_RUNTIME] ub=%d status=FALLBACK "
-                "reason=UNSUPPORTED_UBATCH tokens=%u\n",
-                ubatch_id,
-                ubatch.n_tokens);
-        }
-
-        if (region_chunk_cont_candidate) {
-            LLAMA_LOG_DEBUG(
-                "[REGION_CONT_RUNTIME] ub=%d status=BEGIN tokens=%u "
-                "stages=%zu\n",
-                ubatch_id,
-                ubatch.n_tokens,
-                region_chunk_cont_stages.size());
-
-            res = process_ubatch_staged(
-                ubatch,
-                ctx_type_to_graph_type(cparams.ctx_type),
-                mctx.get(),
-                sched.get(),
-                gf_res_prev.get(),
-                region_chunk_cont_stages,
-                ubatch_id,
-                status);
-            sched_use = sched.get();
-            res_use   = gf_res_prev.get();
-
-            LLAMA_LOG_DEBUG(
-                "[REGION_CONT_RUNTIME] ub=%d status=%s tokens=%u\n",
-                ubatch_id,
-                status == GGML_STATUS_SUCCESS ? "END" : "FAIL",
-                ubatch.n_tokens);
-        } else if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
+        if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
             LLAMA_LOG_WARN(
                 "[HYBRID_PIPE] ub=%d generalized stage queue unsupported for this ubatch; using full graph\n",
                 ubatch_id);
