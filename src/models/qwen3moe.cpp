@@ -291,6 +291,463 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
+    const char * region_chunk_cont_env =
+        std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
+    bool directional_region_chunk_cont =
+        region_chunk_cont_env != nullptr &&
+        std::atoi(region_chunk_cont_env) != 0 &&
+        stage_graph &&
+        n_tokens > 1 &&
+        planned_chunk_tokens > 0 &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        loras->empty() &&
+        model.hybrid_layer_mode(layer_begin) ==
+            llama_hybrid_layer_mode::TENSOR_C2P &&
+        model.hybrid_layer_mode(layer_end - 1) ==
+            llama_hybrid_layer_mode::TENSOR_P2C;
+
+    for (int il = layer_begin + 1;
+            directional_region_chunk_cont && il < layer_end - 1;
+            ++il) {
+        directional_region_chunk_cont =
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::PHONE_ONLY &&
+            cvec->tensor_for(il) == nullptr;
+    }
+
+    if (directional_region_chunk_cont) {
+        const std::vector<int> chunk_sizes =
+            llama_hybrid_runtime_tensor_chunks(
+                (int) n_tokens, planned_chunk_tokens);
+        directional_region_chunk_cont =
+            chunk_sizes.size() > 1;
+
+        if (directional_region_chunk_cont) {
+            std::string layout;
+            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
+                if (!layout.empty()) {
+                    layout += ",";
+                }
+                layout += std::to_string(chunk_sizes[ci]);
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_CONT_GRAPH] enabled=1 layers=[%d,%d) "
+                "c2p=%d phone=[%d,%d) p2c=%d tokens=%" PRId64
+                " XT=%d chunks=%s mode=BOUNDARY_SEED_THEN_CHUNK_MAJOR\n",
+                layer_begin,
+                layer_end,
+                layer_begin,
+                layer_begin + 1,
+                layer_end - 1,
+                layer_end - 1,
+                n_tokens,
+                planned_chunk_tokens,
+                layout.c_str());
+
+            std::vector<int64_t> chunk_begin(
+                chunk_sizes.size(), 0);
+            int64_t token_cursor = 0;
+            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
+                chunk_begin[ci] = token_cursor;
+                token_cursor += chunk_sizes[ci];
+            }
+            GGML_ASSERT(token_cursor == n_tokens);
+
+            // Boundary seed: L34 Attention/Router stays coarse on PC, then
+            // expose all C2P FFN chunks.  Meta can place the Phone shard on
+            // PHONE_C2P_FFN and retire each chunk independently into the
+            // stable Phone l_out backing.
+            const int c2p_layer = layer_begin;
+            ggml_tensor * c2p_inp = inpL;
+            ggml_tensor * c2p_attn_norm =
+                build_norm(
+                    c2p_inp,
+                    model.layers[c2p_layer].attn_norm,
+                    NULL, LLM_NORM_RMS, c2p_layer);
+            cb(c2p_attn_norm, "attn_norm", c2p_layer);
+
+            auto [c2p_q, c2p_k, c2p_v] =
+                build_qkv(
+                    model.layers[c2p_layer],
+                    c2p_attn_norm,
+                    n_embd_head, n_head, n_head_kv,
+                    c2p_layer);
+            c2p_q = build_norm(
+                c2p_q,
+                model.layers[c2p_layer].attn_q_norm,
+                NULL, LLM_NORM_RMS, c2p_layer);
+            cb(c2p_q, "Qcur_normed", c2p_layer);
+            c2p_k = build_norm(
+                c2p_k,
+                model.layers[c2p_layer].attn_k_norm,
+                NULL, LLM_NORM_RMS, c2p_layer);
+            cb(c2p_k, "Kcur_normed", c2p_layer);
+
+            c2p_q = ggml_rope_ext(
+                ctx0, c2p_q, inp_pos, nullptr,
+                n_rot, rope_type, n_ctx_orig,
+                freq_base, freq_scale,
+                ext_factor, attn_factor,
+                beta_fast, beta_slow);
+            c2p_k = ggml_rope_ext(
+                ctx0, c2p_k, inp_pos, nullptr,
+                n_rot, rope_type, n_ctx_orig,
+                freq_base, freq_scale,
+                ext_factor, attn_factor,
+                beta_fast, beta_slow);
+            cb(c2p_q, "Qcur", c2p_layer);
+            cb(c2p_k, "Kcur", c2p_layer);
+            cb(c2p_v, "Vcur", c2p_layer);
+
+            ggml_tensor * c2p_attn =
+                build_attn(
+                    inp_attn,
+                    model.layers[c2p_layer].wo,
+                    model.layers[c2p_layer].wo_b,
+                    model.layers[c2p_layer].wo_s,
+                    c2p_q, c2p_k, c2p_v,
+                    nullptr, nullptr, nullptr,
+                    1.0f / sqrtf(float(n_embd_head)),
+                    c2p_layer);
+            ggml_tensor * c2p_ffn_inp =
+                ggml_add(ctx0, c2p_attn, c2p_inp);
+            cb(c2p_ffn_inp, "ffn_inp", c2p_layer);
+
+            ggml_tensor * c2p_ffn_norm =
+                build_norm(
+                    c2p_ffn_inp,
+                    model.layers[c2p_layer].ffn_norm,
+                    NULL, LLM_NORM_RMS, c2p_layer);
+            cb(c2p_ffn_norm, "ffn_norm", c2p_layer);
+
+            std::vector<ggml_tensor *> c2p_down_chunks;
+            c2p_down_chunks.reserve(chunk_sizes.size());
+            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
+                const int64_t count = chunk_sizes[ci];
+                ggml_tensor * norm_chunk =
+                    ggml_view_2d(
+                        ctx0,
+                        c2p_ffn_norm,
+                        c2p_ffn_norm->ne[0],
+                        count,
+                        c2p_ffn_norm->nb[1],
+                        chunk_begin[ci] * c2p_ffn_norm->nb[1]);
+                const std::string norm_name =
+                    "prefill_ffn_norm_chunk_" +
+                    std::to_string(ci);
+                cb(norm_chunk, norm_name.c_str(), c2p_layer);
+
+                llm_graph_moe_routing routing =
+                    build_moe_routing(
+                        norm_chunk,
+                        model.layers[c2p_layer].ffn_gate_inp,
+                        nullptr, nullptr,
+                        n_expert, n_expert_used,
+                        true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        c2p_layer);
+                const std::string topk_name =
+                    "c2p_prefill_route_topk_chunk_" +
+                    std::to_string(ci);
+                const std::string weights_name =
+                    "c2p_prefill_route_weights_chunk_" +
+                    std::to_string(ci);
+                cb(
+                    routing.selected_experts,
+                    topk_name.c_str(),
+                    c2p_layer);
+                cb(
+                    routing.weights,
+                    weights_name.c_str(),
+                    c2p_layer);
+
+                ggml_tensor * down =
+                    build_moe_ffn(
+                        norm_chunk,
+                        model.layers[c2p_layer].ffn_gate_inp,
+                        model.layers[c2p_layer].ffn_up_exps,
+                        model.layers[c2p_layer].ffn_gate_exps,
+                        model.layers[c2p_layer].ffn_down_exps,
+                        nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        c2p_layer,
+                        nullptr, nullptr,
+                        model.layers[c2p_layer].ffn_up_exps_s,
+                        model.layers[c2p_layer].ffn_gate_exps_s,
+                        model.layers[c2p_layer].ffn_down_exps_s,
+                        routing.selected_experts,
+                        1,
+                        nullptr,
+                        routing.weights);
+                const std::string down_name =
+                    "prefill_ffn_down_chunk_" +
+                    std::to_string(ci);
+                cb(down, down_name.c_str(), c2p_layer);
+                ggml_build_forward_expand(gf, down);
+                c2p_down_chunks.push_back(down);
+            }
+
+            // Create the full logical L34 output only as stable storage.  The
+            // directional Meta reducer disables this producer and writes each
+            // completed chunk directly into this backing on Phone.
+            ggml_tensor * c2p_concat = c2p_down_chunks[0];
+            for (size_t ci = 1; ci < c2p_down_chunks.size(); ++ci) {
+                c2p_concat =
+                    ggml_concat(
+                        ctx0,
+                        c2p_concat,
+                        c2p_down_chunks[ci],
+                        1);
+            }
+            ggml_tensor * c2p_l_out =
+                ggml_add(ctx0, c2p_concat, c2p_ffn_inp);
+            cb(c2p_l_out, "l_out", c2p_layer);
+            ggml_build_forward_expand(gf, c2p_l_out);
+
+            std::vector<ggml_tensor *> p2c_down_chunks;
+            std::vector<ggml_tensor *> p2c_residual_chunks;
+            p2c_down_chunks.reserve(chunk_sizes.size());
+            p2c_residual_chunks.reserve(chunk_sizes.size());
+
+            // Chunk-major Phone continuation.  For each chunk, L35..L45 are
+            // fully Phone-local and L46 Attention/Router stays on Phone before
+            // the P2C split FFN boundary.
+            for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
+                const int64_t count = chunk_sizes[ci];
+
+                ggml_tensor * chunk_hidden =
+                    ggml_view_2d(
+                        ctx0,
+                        c2p_l_out,
+                        c2p_l_out->ne[0],
+                        count,
+                        c2p_l_out->nb[1],
+                        chunk_begin[ci] * c2p_l_out->nb[1]);
+                const std::string entry_name =
+                    "region_cont_entry_chunk_" +
+                    std::to_string(ci);
+                cb(
+                    chunk_hidden,
+                    entry_name.c_str(),
+                    c2p_layer + 1);
+
+                for (int il = c2p_layer + 1;
+                        il < layer_end;
+                        ++il) {
+                    const llama_hybrid_layer_mode mode =
+                        model.hybrid_layer_mode(il);
+                    const bool p2c =
+                        mode ==
+                            llama_hybrid_layer_mode::TENSOR_P2C;
+                    GGML_ASSERT(
+                        p2c ||
+                        mode ==
+                            llama_hybrid_layer_mode::PHONE_ONLY);
+
+                    ggml_tensor * attn_norm =
+                        build_norm(
+                            chunk_hidden,
+                            model.layers[il].attn_norm,
+                            NULL, LLM_NORM_RMS, il);
+                    const std::string attn_norm_name =
+                        "region_cont_attn_norm_chunk_" +
+                        std::to_string(ci);
+                    cb(attn_norm, attn_norm_name.c_str(), il);
+
+                    auto [Qcur, Kcur, Vcur] =
+                        build_qkv(
+                            model.layers[il],
+                            attn_norm,
+                            n_embd_head, n_head, n_head_kv,
+                            il);
+                    Qcur = build_norm(
+                        Qcur,
+                        model.layers[il].attn_q_norm,
+                        NULL, LLM_NORM_RMS, il);
+                    cb(Qcur, "Qcur_normed", il);
+                    Kcur = build_norm(
+                        Kcur,
+                        model.layers[il].attn_k_norm,
+                        NULL, LLM_NORM_RMS, il);
+                    cb(Kcur, "Kcur_normed", il);
+
+                    ggml_tensor * pos_chunk =
+                        ggml_view_1d(
+                            ctx0,
+                            inp_pos,
+                            count,
+                            chunk_begin[ci] * inp_pos->nb[0]);
+                    Qcur = ggml_rope_ext(
+                        ctx0, Qcur, pos_chunk, nullptr,
+                        n_rot, rope_type, n_ctx_orig,
+                        freq_base, freq_scale,
+                        ext_factor, attn_factor,
+                        beta_fast, beta_slow);
+                    Kcur = ggml_rope_ext(
+                        ctx0, Kcur, pos_chunk, nullptr,
+                        n_rot, rope_type, n_ctx_orig,
+                        freq_base, freq_scale,
+                        ext_factor, attn_factor,
+                        beta_fast, beta_slow);
+                    cb(Qcur, "Qcur", il);
+                    cb(Kcur, "Kcur", il);
+                    cb(Vcur, "Vcur", il);
+
+                    auto * attn_chunk =
+                        build_attn_inp_kv_range(
+                            (uint32_t) chunk_begin[ci],
+                            (uint32_t) count);
+                    ggml_tensor * attn =
+                        build_attn(
+                            attn_chunk,
+                            model.layers[il].wo,
+                            model.layers[il].wo_b,
+                            model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur,
+                            nullptr, nullptr, nullptr,
+                            1.0f / sqrtf(float(n_embd_head)),
+                            il);
+                    const std::string attn_name =
+                        "prefill_wave_attn_out_group_" +
+                        std::to_string(ci) + "_1";
+                    cb(attn, attn_name.c_str(), il);
+
+                    ggml_tensor * ffn_inp =
+                        ggml_add(ctx0, attn, chunk_hidden);
+                    const std::string ffn_inp_name =
+                        "prefill_wave_ffn_inp_chunk_" +
+                        std::to_string(ci);
+                    cb(ffn_inp, ffn_inp_name.c_str(), il);
+
+                    ggml_tensor * ffn_norm =
+                        build_norm(
+                            ffn_inp,
+                            model.layers[il].ffn_norm,
+                            NULL, LLM_NORM_RMS, il);
+                    const std::string norm_name =
+                        "prefill_ffn_norm_chunk_" +
+                        std::to_string(ci);
+                    cb(ffn_norm, norm_name.c_str(), il);
+
+                    llm_graph_moe_routing routing;
+                    if (p2c) {
+                        routing =
+                            build_moe_routing(
+                                ffn_norm,
+                                model.layers[il].ffn_gate_inp,
+                                nullptr, nullptr,
+                                n_expert, n_expert_used,
+                                true,
+                                hparams.expert_weights_scale,
+                                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                                il);
+                        const std::string topk_name =
+                            "phone_prefill_route_topk_chunk_" +
+                            std::to_string(ci);
+                        const std::string weights_name =
+                            "phone_prefill_route_weights_chunk_" +
+                            std::to_string(ci);
+                        cb(
+                            routing.selected_experts,
+                            topk_name.c_str(),
+                            il);
+                        cb(
+                            routing.weights,
+                            weights_name.c_str(),
+                            il);
+                    }
+
+                    ggml_tensor * down =
+                        build_moe_ffn(
+                            ffn_norm,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_up_exps,
+                            model.layers[il].ffn_gate_exps,
+                            model.layers[il].ffn_down_exps,
+                            nullptr,
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, true,
+                            hparams.expert_weights_scale,
+                            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                            il,
+                            nullptr, nullptr,
+                            model.layers[il].ffn_up_exps_s,
+                            model.layers[il].ffn_gate_exps_s,
+                            model.layers[il].ffn_down_exps_s,
+                            routing.selected_experts,
+                            1,
+                            nullptr,
+                            routing.weights);
+
+                    if (p2c) {
+                        const std::string down_name =
+                            "prefill_ffn_down_chunk_" +
+                            std::to_string(ci);
+                        cb(down, down_name.c_str(), il);
+                        ggml_build_forward_expand(gf, down);
+                        p2c_down_chunks.push_back(down);
+                        p2c_residual_chunks.push_back(ffn_inp);
+                        break;
+                    }
+
+                    const std::string local_down_name =
+                        "region_phone_ffn_down_chunk_" +
+                        std::to_string(ci);
+                    cb(down, local_down_name.c_str(), il);
+
+                    ggml_tensor * l_out =
+                        ggml_add(ctx0, down, ffn_inp);
+                    const std::string l_out_name =
+                        "prefill_wave_l_out_chunk_" +
+                        std::to_string(ci);
+                    cb(l_out, l_out_name.c_str(), il);
+                    ggml_build_forward_expand(gf, l_out);
+                    chunk_hidden = l_out;
+                }
+            }
+
+            GGML_ASSERT(
+                p2c_down_chunks.size() ==
+                chunk_sizes.size());
+            GGML_ASSERT(
+                p2c_residual_chunks.size() ==
+                chunk_sizes.size());
+
+            // Logical L46 output is again stable destination storage.  P2C
+            // Meta disables this producer and commits the reduced chunks into
+            // the PC backing; the following PC stage consumes that completed
+            // activation.
+            ggml_tensor * p2c_down = p2c_down_chunks[0];
+            ggml_tensor * p2c_residual =
+                p2c_residual_chunks[0];
+            for (size_t ci = 1; ci < p2c_down_chunks.size(); ++ci) {
+                p2c_down =
+                    ggml_concat(
+                        ctx0,
+                        p2c_down,
+                        p2c_down_chunks[ci],
+                        1);
+                p2c_residual =
+                    ggml_concat(
+                        ctx0,
+                        p2c_residual,
+                        p2c_residual_chunks[ci],
+                        1);
+            }
+            cur = ggml_add(ctx0, p2c_down, p2c_residual);
+            cb(cur, "l_out", layer_end - 1);
+            ggml_build_forward_expand(gf, cur);
+
+            res->t_stage_output = cur;
+            ggml_set_output(cur);
+            return;
+        }
+    }
+
     if (moe_stage_wavefront) {
         std::vector<int64_t> chunk_begin(
             wave_chunk_sizes.size(), 0);
