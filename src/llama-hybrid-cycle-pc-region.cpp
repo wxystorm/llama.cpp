@@ -46,7 +46,7 @@ bool llama_hybrid_cycle_execute_pc_full_region(
     const auto & hp = model.hparams;
     if (hp.f_norm_rms_eps <= 0.0f ||
         hp.rope_type != LLAMA_ROPE_TYPE_NEOX ||
-        (hp.rope_scaling_type_train != LLAMA_ROPE_TYPE_NONE &&
+        (hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_NONE &&
          hp.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_LINEAR) ||
         std::fabs(hp.rope_freq_scale_train - 1.0f) > 1.0e-6f ||
         hp.yarn_ext_factor > 0.0f ||
