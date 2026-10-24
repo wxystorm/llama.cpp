@@ -956,6 +956,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         force_to_device(0);
     }
 
+    if (std::getenv("GGML_META_REGION_C2P_SELF_CHECK") != nullptr &&
+            mode == llama_hybrid_layer_mode::TENSOR_C2P &&
+            (is_attention_tensor || is_ffn_split_tensor)) {
+        int64_t pc_units = 0;
+        int64_t phone_units = 0;
+        for (size_t is = 0; is < split_state.n_segments; ++is) {
+            pc_units += split_state.ne[is*ud->n_devices + 0] *
+                        split_state.nr[is];
+            if (ud->n_devices > 1) {
+                phone_units += split_state.ne[is*ud->n_devices + 1] *
+                               split_state.nr[is];
+            }
+        }
+        const bool ok =
+            is_attention_tensor ?
+                (pc_units > 0 && phone_units == 0) :
+                (pc_units > 0 && phone_units > 0);
+        LLAMA_LOG_ERROR(
+            "[REGION_C2P_WEIGHT_PLACEMENT] layer=%u tensor=%s class=%s "
+            "pc_units=%lld phone_units=%lld axis=%d status=%s\n",
+            tc.il, tensor_name.c_str(),
+            is_attention_tensor ? "ATTENTION" : "FFN",
+            (long long) pc_units, (long long) phone_units,
+            split_state.axis, ok ? "PASS" : "FAIL");
+    }
+
     // Compare the actual physical MoE FFN weight allocation for A/C2P
     // and B/legacy tensor split.  Identical nominal R does not necessarily
     // imply identical shards when the legacy planner uses split rotation.

@@ -5028,6 +5028,127 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                sum, std::sqrt(l2), max_abs, hash, file.c_str());
     };
 
+    const bool c2p_self_check =
+        std::getenv("GGML_META_REGION_C2P_SELF_CHECK") != nullptr;
+
+    auto c2p_wire_parity = [&](
+            int layer, int chunk, const char * stage,
+            size_t src_backend, size_t dst_backend,
+            ggml_tensor * src, ggml_tensor * dst) -> bool {
+        if (!c2p_self_check) {
+            return true;
+        }
+        if (src == nullptr || dst == nullptr ||
+                src_backend >= n_backends || dst_backend >= n_backends ||
+                (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_I32) ||
+                src->type != dst->type ||
+                ggml_nelements(src) != ggml_nelements(dst)) {
+            printf(
+                "[REGION_C2P_WIRE_PARITY] layer=%d chunk=%d stage=%s "
+                "status=UNSUPPORTED\n",
+                layer, chunk, stage != nullptr ? stage : "(null)");
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (src->ne[d] != dst->ne[d]) {
+                printf(
+                    "[REGION_C2P_WIRE_PARITY] layer=%d chunk=%d stage=%s "
+                    "dim=%d src=%" PRId64 " dst=%" PRId64 " status=SHAPE_FAIL\n",
+                    layer, chunk, stage, d, src->ne[d], dst->ne[d]);
+                return false;
+            }
+        }
+
+        auto read_logical = [&](size_t backend, ggml_tensor * t,
+                                std::vector<uint8_t> & packed) -> bool {
+            const size_t physical = ggml_nbytes(t);
+            const size_t count = (size_t) ggml_nelements(t);
+            constexpr size_t elem = sizeof(uint32_t);
+            if (physical == 0 || count == 0) {
+                packed.clear();
+                return true;
+            }
+            std::vector<uint8_t> raw(physical);
+            auto & cfg = backend_ctx->backend_configs[backend];
+            ggml_backend_synchronize(cfg.backend);
+            ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+            packed.resize(count * elem);
+            size_t pos = 0;
+            for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const size_t offs =
+                                (size_t) i0 * t->nb[0] +
+                                (size_t) i1 * t->nb[1] +
+                                (size_t) i2 * t->nb[2] +
+                                (size_t) i3 * t->nb[3];
+                            if (offs + elem > raw.size()) {
+                                return false;
+                            }
+                            std::memcpy(
+                                packed.data() + pos * elem,
+                                raw.data() + offs, elem);
+                            ++pos;
+                        }
+                    }
+                }
+            }
+            return pos == count;
+        };
+
+        std::vector<uint8_t> a;
+        std::vector<uint8_t> b;
+        if (!read_logical(src_backend, src, a) ||
+                !read_logical(dst_backend, dst, b) ||
+                a.size() != b.size()) {
+            printf(
+                "[REGION_C2P_WIRE_PARITY] layer=%d chunk=%d stage=%s "
+                "status=READ_FAIL\n",
+                layer, chunk, stage);
+            return false;
+        }
+
+        const size_t n = (size_t) ggml_nelements(src);
+        size_t mismatch = 0;
+        size_t worst = 0;
+        double max_abs = 0.0;
+        double rms_acc = 0.0;
+        for (size_t q = 0; q < n; ++q) {
+            uint32_t av = 0;
+            uint32_t bv = 0;
+            std::memcpy(&av, a.data() + q * sizeof(uint32_t), sizeof(uint32_t));
+            std::memcpy(&bv, b.data() + q * sizeof(uint32_t), sizeof(uint32_t));
+            if (av != bv) {
+                ++mismatch;
+            }
+            if (src->type == GGML_TYPE_F32) {
+                float af = 0.0f;
+                float bf = 0.0f;
+                std::memcpy(&af, &av, sizeof(float));
+                std::memcpy(&bf, &bv, sizeof(float));
+                const double d = std::abs((double) af - (double) bf);
+                rms_acc += d * d;
+                if (d > max_abs) {
+                    max_abs = d;
+                    worst = q;
+                }
+            } else if (av != bv && mismatch == 1) {
+                worst = q;
+            }
+        }
+        const double rms = n > 0 ? std::sqrt(rms_acc / (double) n) : 0.0;
+        printf(
+            "[REGION_C2P_WIRE_PARITY] layer=%d chunk=%d stage=%s "
+            "type=%s n=%zu mismatch=%zu max_abs=%.9g rms=%.9g "
+            "worst=%zu status=%s\n",
+            layer, chunk, stage,
+            src->type == GGML_TYPE_F32 ? "F32" : "I32",
+            n, mismatch, max_abs, rms, worst,
+            mismatch == 0 ? "PASS" : "FAIL");
+        return mismatch == 0;
+    };
+
     auto ab_find_sg_named =
         [&](size_t backend, size_t sg,
             const char * exact_name) -> ggml_tensor * {
@@ -9007,6 +9128,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 record_copy_wait(copy_us);
                 record_meta_copy(i, active_backend, j_dst, nodes[active_backend], copy_us);
 
+                if (c2p_self_check &&
+                        n_backends == 2 &&
+                        active_backend == 0 && j_dst == 1) {
+                    int self_layer = subgraph_tensor_c2p_layer(i);
+                    if (self_layer < 0 && i + 1 < backend_ctx->n_subgraphs) {
+                        self_layer = subgraph_tensor_c2p_layer(i + 1);
+                    }
+                    if (self_layer >= 0 &&
+                            ggml_backend_meta_tensor_c2p_layer(
+                                backend_ctx, self_layer)) {
+                        int self_chunk = -1;
+                        const char * self_stage = "READY_GENERIC";
+                        if (is_prefill_norm_input) {
+                            self_chunk = prefill_norm_chunk;
+                            self_stage = "FFN_NORM";
+                        } else if (decode_pc_to_phone_ffn_norm) {
+                            self_stage = "FFN_NORM";
+                        }
+                        c2p_wire_parity(
+                            self_layer, self_chunk, self_stage,
+                            active_backend, j_dst,
+                            nodes[active_backend], nodes[j_dst]);
+                    }
+                }
+
                 if (pipeline_debug &&
                         is_prefill_norm_input &&
                         active_backend == 0 &&
@@ -9198,6 +9344,30 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_reduce_graph->nodes[0] = phone_out;
             phone_reduce_graph->n_nodes = 1;
 
+            std::vector<float> c2p_decode_pc_partial;
+            std::vector<float> c2p_decode_phone_partial;
+            std::vector<float> c2p_decode_residual;
+            if (c2p_self_check &&
+                    node_dst->type == GGML_TYPE_F32 &&
+                    node_src->type == GGML_TYPE_F32 &&
+                    pc_residual->type == GGML_TYPE_F32) {
+                ggml_backend_synchronize(bcj_dst.backend);
+                ggml_backend_synchronize(bcj_src.backend);
+                const size_t n = (size_t) ggml_nelements(node_dst);
+                c2p_decode_pc_partial.resize(n);
+                c2p_decode_phone_partial.resize(n);
+                c2p_decode_residual.resize(n);
+                ggml_backend_tensor_get(
+                    node_dst, c2p_decode_pc_partial.data(),
+                    0, n * sizeof(float));
+                ggml_backend_tensor_get(
+                    node_src, c2p_decode_phone_partial.data(),
+                    0, n * sizeof(float));
+                ggml_backend_tensor_get(
+                    pc_residual, c2p_decode_residual.data(),
+                    0, n * sizeof(float));
+            }
+
             ggml_tensor * disabled_phone_l_out =
                 disable_layer_output_producers(
                     1, i + 1, decode_single_layer_0);
@@ -9228,12 +9398,53 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             record_meta_copy(i, j_dst, j_src, node_dst, copy_us);
             record_direct_copy();
 
+            c2p_wire_parity(
+                decode_single_layer_0, -1,
+                "PC_PARTIAL_PLUS_RESIDUAL", j_dst, j_src,
+                node_dst, phone_tmp);
+
             status = ggml_backend_graph_compute_async(
                 bcj_src.backend, phone_reduce_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
             ggml_backend_synchronize(bcj_src.backend);
+
+            if (c2p_self_check &&
+                    !c2p_decode_pc_partial.empty() &&
+                    phone_out->type == GGML_TYPE_F32) {
+                const size_t n = c2p_decode_pc_partial.size();
+                std::vector<float> actual(n);
+                ggml_backend_tensor_get(
+                    phone_out, actual.data(), 0, n * sizeof(float));
+                double diff2 = 0.0;
+                double max_abs = 0.0;
+                size_t worst = 0;
+                for (size_t q = 0; q < n; ++q) {
+                    const double expected =
+                        (double) c2p_decode_pc_partial[q] +
+                        (double) c2p_decode_phone_partial[q] +
+                        (double) c2p_decode_residual[q];
+                    const double d = (double) actual[q] - expected;
+                    diff2 += d * d;
+                    if (std::abs(d) > max_abs) {
+                        max_abs = std::abs(d);
+                        worst = q;
+                    }
+                }
+                const double rms =
+                    n > 0 ? std::sqrt(diff2 / (double) n) : 0.0;
+                printf(
+                    "[REGION_C2P_DECODE_NUMERIC] layer=%d n=%zu "
+                    "max_abs=%.9g rms=%.9g worst=%zu "
+                    "actual=%.9f expected=%.9f status=%s\n",
+                    decode_single_layer_0, n, max_abs, rms, worst,
+                    actual[worst],
+                    (double) c2p_decode_pc_partial[worst] +
+                    (double) c2p_decode_phone_partial[worst] +
+                    (double) c2p_decode_residual[worst],
+                    max_abs <= 1e-4 ? "PASS" : "FAIL");
+            }
 
             if (pipeline_debug) {
                 printf(
@@ -9589,6 +9800,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 const bool c2p_numeric_trace =
+                    c2p_self_check ||
                     std::getenv("GGML_META_REGION_C2P_NUMERIC_TRACE") != nullptr;
                 std::vector<float> c2p_pc_partial;
                 std::vector<float> c2p_phone_partial;
@@ -9680,6 +9892,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 record_meta_copy(
                     i, j_dst, j_src, node_dst, copy_us);
                 record_direct_copy();
+
+                c2p_wire_parity(
+                    prefill_down_layer_0, prefill_down_chunk_0,
+                    "PC_PARTIAL_PLUS_RESIDUAL", j_dst, j_src,
+                    node_dst, phone_tmp);
 
                 const int64_t phone_reduce_begin_us = ggml_time_us();
                 status = ggml_backend_graph_compute_async(
@@ -12842,6 +13059,15 @@ auto prefill_norm_sg_has_prework =
                         i, 0, 1, c2p_src_weights, weights_us);
                     record_direct_copy();
 
+                    c2p_wire_parity(
+                        prefill_down_layer, prefill_down_chunk,
+                        "ROUTER_TOPK", 0, 1,
+                        c2p_src_topk, c2p_dst_topk);
+                    c2p_wire_parity(
+                        prefill_down_layer, prefill_down_chunk,
+                        "ROUTER_WEIGHTS", 0, 1,
+                        c2p_src_weights, c2p_dst_weights);
+
                     if (ab_trace_requested &&
                             prefill_down_layer == ab_trace_layer &&
                             ab_full_tokens() >= ab_min_tokens) {
@@ -13601,6 +13827,15 @@ auto prefill_norm_sg_has_prework =
                 record_meta_copy(
                     i, 0, 1, src_weights, weights_us);
                 record_direct_copy();
+
+                c2p_wire_parity(
+                    c2p_exec_layer, c2p_exec_chunk,
+                    "ROUTER_TOPK", 0, 1,
+                    src_topk, dst_topk);
+                c2p_wire_parity(
+                    c2p_exec_layer, c2p_exec_chunk,
+                    "ROUTER_WEIGHTS", 0, 1,
+                    src_weights, dst_weights);
 
                 // Verify the exact tensors the Phone FFN is about to consume,
                 // before the Phone graph can recycle their storage.

@@ -109,3 +109,29 @@ Interpret the first mismatch in order:
 
 Do not begin FFN overlap/windowing work until the first token-divergence point is
 understood.
+
+
+## Direct L34 self-check (no dump files)
+
+Set only:
+
+```powershell
+$env:GGML_META_REGION_C2P_SELF_CHECK = "1"
+$env:GGML_META_PIPELINE_DEBUG = "1"
+```
+
+No `GGML_META_AB_DUMP_DIR` is required. One C2P run prints:
+
+- `REGION_C2P_WEIGHT_PLACEMENT`: Attention must be PC-only; MoE FFN expert weights must exist on both PC and Phone.
+- `REGION_C2P_WIRE_PARITY stage=FFN_NORM/READY_GENERIC`: first large PC->Phone handoff.
+- `REGION_C2P_WIRE_PARITY stage=ROUTER_TOPK`: exact I32 route parity.
+- `REGION_C2P_WIRE_PARITY stage=ROUTER_WEIGHTS`: exact F32 route-weight parity.
+- `REGION_C2P_WIRE_PARITY stage=PC_PARTIAL_PLUS_RESIDUAL`: second large PC->Phone handoff.
+- `REGION_C2P_NUMERIC`: Prefill reduction check.
+- `REGION_C2P_DECODE_NUMERIC`: per-token Decode reduction check.
+
+The wire checks compare logical tensor elements in memory after the destination
+backend is synchronized; they strip view strides/padding, so a PASS is stronger
+than comparing physical RPC byte counts. If all wire/reduce checks pass but
+generation is still wrong, the next suspect is the mathematical producer before
+the handoff (Attention/FFN Norm/Router/FFN), not serialization.
