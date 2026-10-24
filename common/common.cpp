@@ -1470,7 +1470,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 1,
                 std::min<size_t>(
                     (size_t) hybrid_prefill_warmup_tokens,
-                    (size_t) params.n_batch));
+                    (size_t) std::max<int32_t>(1, params.n_batch)));
             const std::vector<llama_token> seed = tmp;
             tmp.reserve(target_tokens);
             while (tmp.size() < target_tokens) {
@@ -1482,7 +1482,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
             LLAMA_LOG_INFO(
                 "[HYBRID_PREFILL_WARMUP] tokens=%zu requested=%d "
-                "n_batch=%u status=BEGIN\n",
+                "n_batch=%d status=BEGIN\n",
                 tmp.size(),
                 hybrid_prefill_warmup_tokens,
                 params.n_batch);
