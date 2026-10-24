@@ -640,6 +640,14 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // Physical devices SELECTED at weight-load time for the fixed Cycle.
+    // LLAMA_SPLIT_MODE_TENSOR stores one Meta device in "devices"; Meta
+    // wraps these two concrete devices, so they must not be rediscovered
+    // by scanning ggml_backend_dev_count() in llama_context.
+    // Non-Cycle models leave both handles null.
+    ggml_backend_dev_t hybrid_cycle_cpu_dev   = nullptr;
+    ggml_backend_dev_t hybrid_cycle_phone_dev = nullptr;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 

@@ -148,12 +148,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     ggml_backend_dev_backend_reg(params.devices[1]) : nullptr;
                 if (n_devs != 2 ||
                     ggml_backend_dev_type(params.devices[0]) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    ggml_backend_dev_type(params.devices[1]) != GGML_BACKEND_DEVICE_TYPE_GPU ||
                     reg == nullptr ||
                     std::strcmp(ggml_backend_reg_name(reg), "RPC") != 0) {
                     LLAMA_LOG_ERROR("%s: fixed cycle requires --device CPU,<Phone-GPU-RPC> "
                                    "in that exact order (Meta cannot include CUDA/NPU)\n", __func__);
                     return false;
                 }
+                // Preserve the exact physical device handles passed to the
+                // Meta weight splitter. Their lifetimes are owned by the
+                // backend registries, not by the caller's params.devices array.
+                model->hybrid_cycle_cpu_dev   = params.devices[0];
+                model->hybrid_cycle_phone_dev = params.devices[1];
+                LLAMA_LOG_INFO(
+                    "[CYCLE_MODEL_PHYSICAL] origin=EXPLICIT_DEVICE_LIST "
+                    "cpu=%s phone=%s status=BOUND\n",
+                    ggml_backend_dev_name(model->hybrid_cycle_cpu_dev),
+                    ggml_backend_dev_name(model->hybrid_cycle_phone_dev));
             }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
@@ -209,13 +220,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            if (llama_hybrid_cycle_requested() &&
-                (devs.size() != 2 ||
-                 ggml_backend_dev_type(devs[0]) != GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                LLAMA_LOG_ERROR("%s: fixed cycle needs exactly PC CPU + one Phone GPU RPC. "
-                               "If multiple RPC devices exist, explicitly select CPU and "
-                               "the Phone GPU RPC only; do not include NPU or CUDA.\n", __func__);
-                return false;
+            if (llama_hybrid_cycle_requested()) {
+                auto * rpc_dev = devs.size() == 2 ? devs[1] : nullptr;
+                auto * rpc_reg = rpc_dev ?
+                    ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+                if (devs.size() != 2 ||
+                    ggml_backend_dev_type(devs[0]) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    ggml_backend_dev_type(rpc_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                    rpc_reg == nullptr ||
+                    std::strcmp(ggml_backend_reg_name(rpc_reg), "RPC") != 0) {
+                    LLAMA_LOG_ERROR("%s: fixed cycle needs exactly PC CPU + one Phone GPU RPC. "
+                                   "If multiple RPC devices exist, explicitly select CPU and "
+                                   "the Phone GPU RPC only; do not include NPU or CUDA.\n", __func__);
+                    return false;
+                }
+                model->hybrid_cycle_cpu_dev   = devs[0];
+                model->hybrid_cycle_phone_dev = devs[1];
+                LLAMA_LOG_INFO(
+                    "[CYCLE_MODEL_PHYSICAL] origin=AUTO_DEVICE_SELECTION "
+                    "cpu=%s phone=%s status=BOUND\n",
+                    ggml_backend_dev_name(model->hybrid_cycle_cpu_dev),
+                    ggml_backend_dev_name(model->hybrid_cycle_phone_dev));
             }
 
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());

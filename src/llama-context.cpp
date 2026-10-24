@@ -270,27 +270,34 @@ llama_context::llama_context(
                 "one sequence, external sampler, no embeddings/pooling");
         }
 
-        auto * cpu_dev =
-            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        ggml_backend_dev_t phone_dev = nullptr;
-        int phone_count = 0;
-        // Explicitly require exactly ONE registered Phone RPC GPU. With
-        // multiple RPC GPUs, fail instead of binding a different model's
-        // physical weights or routing READY/PARTIAL to the wrong endpoint.
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            auto * dev = ggml_backend_dev_get(i);
-            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (dev && reg &&
-                std::strcmp(ggml_backend_reg_name(reg), "RPC") == 0 &&
-                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                phone_dev = dev;
-                ++phone_count;
-            }
-        }
-        if (!cpu_dev || phone_count != 1) {
+        // LLAMA_SPLIT_MODE_TENSOR records a single META device in
+        // model.devices. The physical RPC GPU can also be dynamically
+        // registered through --rpc and need not appear in the global device
+        // registry. Reuse the EXACT physical devices selected when the model
+        // allocated its split weights; never guess from global enumeration.
+        auto * cpu_dev   = model.hybrid_cycle_cpu_dev;
+        auto * phone_dev = model.hybrid_cycle_phone_dev;
+        auto * rpc_reg   = phone_dev ?
+            ggml_backend_dev_backend_reg(phone_dev) : nullptr;
+        if (!cpu_dev || !phone_dev ||
+            model.devices.size() != 1 || !model.devices[0].is_meta ||
+            model.get_split_state_ud.n_devices != 2 ||
+            ggml_backend_dev_type(cpu_dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+            ggml_backend_dev_type(phone_dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+            !rpc_reg ||
+            std::strcmp(ggml_backend_reg_name(rpc_reg), "RPC") != 0) {
             throw std::runtime_error(
-                "Cycle standard decode needs CPU plus exactly one RPC GPU");
+                "Cycle standard decode cannot resolve the CPU and RPC GPU "
+                "bound during fixed-Cycle model weight loading");
         }
+        LLAMA_LOG_INFO(
+            "[CYCLE_STANDARD_DEVICE_BIND] source=MODEL_PHYSICAL "
+            "cpu=%s phone=%s meta_devices=%zu physical_devices=%zu "
+            "status=PASS\n",
+            ggml_backend_dev_name(cpu_dev),
+            ggml_backend_dev_name(phone_dev),
+            model.devices.size(),
+            model.get_split_state_ud.n_devices);
         ggml_backend_t pc = ggml_backend_dev_init(cpu_dev, nullptr);
         if (!pc) {
             throw std::runtime_error("Cycle standard CPU backend init failed");
