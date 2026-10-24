@@ -7458,20 +7458,49 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     pc_route_layer == prefill_norm_layer &&
                     phone_route_layer == prefill_norm_layer;
                 if (matching_route) {
+                    ggml_cgraph * pc_down_graph =
+                        backend_ctx->backend_configs[0].
+                            cgraphs[i + 2].cgraph_main;
+                    ggml_cgraph * phone_down_graph =
+                        backend_ctx->backend_configs[1].
+                            cgraphs[i + 2].cgraph_main;
+
+                    // The terminal C2P prefill-down node is Phone-owned.
+                    // Its PC counterpart legitimately has COMPUTE cleared,
+                    // although earlier PC nodes in the same FFN graph run.
+                    // get_prefill_down_boundary_node(0, ...) requires
+                    // COMPUTE and therefore incorrectly rejects this
+                    // Norm -> Router -> FFN topology.
                     pc_next_down =
-                        get_prefill_down_boundary_node(0, i + 2);
+                        pc_down_graph != nullptr &&
+                                pc_down_graph->n_nodes > 0 ?
+                            pc_down_graph->nodes[
+                                pc_down_graph->n_nodes - 1] : nullptr;
                     phone_next_down =
-                        get_prefill_down_boundary_node(1, i + 2);
-                    next_chunk = -1;
-                    next_layer = -1;
+                        phone_down_graph != nullptr &&
+                                phone_down_graph->n_nodes > 0 ?
+                            phone_down_graph->nodes[
+                                phone_down_graph->n_nodes - 1] : nullptr;
+
+                    int pc_down_chunk = -1;
+                    int pc_down_layer = -1;
+                    int phone_down_chunk = -1;
+                    int phone_down_layer = -1;
                     c2p_norm_router_between =
                         pc_next_down != nullptr &&
                         phone_next_down != nullptr &&
                         ggml_backend_meta_parse_prefill_down_chunk(
                             pc_next_down->name,
-                            next_chunk, next_layer) &&
-                        next_chunk == prefill_norm_chunk &&
-                        next_layer == prefill_norm_layer;
+                            pc_down_chunk, pc_down_layer) &&
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            phone_next_down->name,
+                            phone_down_chunk, phone_down_layer) &&
+                        pc_down_chunk == prefill_norm_chunk &&
+                        phone_down_chunk == prefill_norm_chunk &&
+                        pc_down_layer == prefill_norm_layer &&
+                        phone_down_layer == prefill_norm_layer &&
+                        (phone_next_down->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) != 0;
                     direct_prefill_down = c2p_norm_router_between;
                 }
                 if (pipeline_debug) {
