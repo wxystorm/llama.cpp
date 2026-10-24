@@ -3254,8 +3254,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const char * name = cgraph->nodes[i]->name;
                 if (std::sscanf(name, "l_out-%d%n", &layer, &parsed) != 1 ||
                         name[parsed] != '\0' ||
-                        layer < backend_ctx->tensor_phone_first_layer ||
-                        layer >= backend_ctx->tensor_phone_last_layer) {
+                        !ggml_backend_meta_tensor_phone_primary_layer(
+                            backend_ctx, layer)) {
                     continue;
                 }
 
@@ -7691,10 +7691,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 &phone_v2_l_out_parsed_1) == 1 &&
             nodes[1]->name[phone_v2_l_out_parsed_1] == '\0' &&
             phone_v2_l_out_layer_0 == phone_v2_l_out_layer_1 &&
-            phone_v2_l_out_layer_0 >=
-                backend_ctx->tensor_phone_first_layer &&
-            phone_v2_l_out_layer_0 <
-                backend_ctx->tensor_phone_last_layer;
+            ggml_backend_meta_tensor_phone_primary_layer(
+                backend_ctx, phone_v2_l_out_layer_0);
 
         if (phone_v2_l_out_boundary) {
             // Both backends already hold the same complete FFN result after
@@ -9524,11 +9522,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     if (current_layer == trace_layer &&
                             current_chunk == 0) {
                         const bool phone_primary_owner =
-                            backend_ctx->tensor_phone_first_layer >= 0 &&
-                            trace_layer >=
-                                backend_ctx->tensor_phone_first_layer &&
-                            trace_layer <
-                                backend_ctx->tensor_phone_last_layer;
+                            ggml_backend_meta_tensor_phone_primary_layer(
+                                backend_ctx, trace_layer);
                         const size_t owner =
                             phone_primary_owner ? 1 : 0;
                         auto & owner_cfg =
