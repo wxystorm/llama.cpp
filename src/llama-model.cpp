@@ -373,6 +373,29 @@ static int llama_hybrid_gpu_pc_layers() {
     return std::max(0, std::atoi(value));
 }
 
+// Cycle Tensor layers remain PC-CPU <-> Phone-GPU split layers. The old
+// 50/50 intermediate-channel split overfeeds the slower Phone FFN shard.
+// Current production measurements put equal-sized Phone shards at roughly
+// 2x the PC CPU shard time, so 2/3 PC + 1/3 Phone is the balanced default.
+// Keep one explicit knob for hardware A/B without involving X/Y placement.
+static float llama_hybrid_cycle_tensor_pc_ratio() {
+    constexpr float fallback = 2.0f / 3.0f;
+    const char * value = std::getenv("LLAMA_HYBRID_CYCLE_TENSOR_PC_RATIO");
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    char * tail = nullptr;
+    const double parsed = std::strtod(value, &tail);
+    if (!tail || *tail != '\0' || !std::isfinite(parsed) ||
+        parsed <= 0.0 || parsed >= 1.0) {
+        LLAMA_LOG_WARN(
+            "[HYBRID_CYCLE_TENSOR_RATIO] value=%s status=INVALID "
+            "fallback=%.6f\n", value, double(fallback));
+        return fallback;
+    }
+    return float(parsed);
+}
+
 static ggml_backend_dev_t llama_hybrid_cuda_device() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1498,6 +1521,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_cycle_layout cycle_layout;
         const bool cycle_requested = llama_hybrid_cycle_layout_from_env(n_layer, cycle_layout);
+        const float cycle_tensor_pc_ratio =
+            cycle_requested ? llama_hybrid_cycle_tensor_pc_ratio() : 0.0f;
         llama_hybrid_plan runtime_plan;
         const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
         const bool force_phone_primary =
@@ -1530,7 +1555,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         if (has_runtime_plan || cycle_requested) {
             pimpl->tensor_split_owned.assign(llama_max_devices(), 0.0f);
-            const float ratio = cycle_requested ? 0.5f : runtime_plan.tensor_pc_ratio;
+            const float ratio = cycle_requested ?
+                cycle_tensor_pc_ratio : runtime_plan.tensor_pc_ratio;
             pimpl->tensor_split_owned[0] = ratio;
             pimpl->tensor_split_owned[1] = 1.0f - ratio;
             this->params.tensor_split = pimpl->tensor_split_owned.data();
@@ -1567,11 +1593,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             LLAMA_LOG_INFO("[HYBRID_CYCLE_LAYOUT] x=%d y=%d period=%d cycles=%d tail=[%d,%d) status=PLACEMENT_ONLY\n",
                 cycle_layout.x, cycle_layout.y, cycle_layout.cycle_size, cycle_layout.cycles,
                 cycle_layout.tail_begin, n_layer);
+            LLAMA_LOG_INFO(
+                "[HYBRID_CYCLE_TENSOR_RATIO] pc=%.6f phone=%.6f "
+                "source=%s status=ACTIVE\n",
+                double(cycle_tensor_pc_ratio),
+                double(1.0f - cycle_tensor_pc_ratio),
+                std::getenv("LLAMA_HYBRID_CYCLE_TENSOR_PC_RATIO") ?
+                    "environment" : "balanced_default");
         }
 
         hybrid_tensor_pc_ratios.assign(
             n_layer,
-            cycle_requested ? 0.5f :
+            cycle_requested ? cycle_tensor_pc_ratio :
             has_runtime_plan ? runtime_plan.tensor_pc_ratio : 0.0f);
         if (!cycle_requested && has_runtime_plan &&
             runtime_plan.tensor_phone_primary &&
