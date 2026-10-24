@@ -72,33 +72,99 @@ bool llama_hybrid_cycle_select_cuda_full_layers(
     }
     selected.assign(layout.kinds.size(), 0);
     const bool explicit_selection = !layout.pc_cuda_layers.empty();
-    for (size_t i = 0; i < layout.kinds.size(); ++i) {
-        const bool pc = layout.kinds[i] == llama_hybrid_cycle_layer_kind::PC_CPU;
-        if (!pc) continue;
-        const bool requested = !explicit_selection || layout.pc_cuda_layers[i] == 1;
-        if (!requested) continue;
-        const size_t bytes = estimates[i];
-        if (!bytes) {
-            if (explicit_selection) {
-                reason = "CUDA_ESTIMATE_UNAVAILABLE layer=" + std::to_string(i);
+
+    // An explicit bitmap is a hard placement contract. Preserve its exact
+    // semantics: every requested PC Full layer must have a valid estimate
+    // and the whole selection must fit the CUDA mirror budget.
+    if (explicit_selection) {
+        for (size_t i = 0; i < layout.kinds.size(); ++i) {
+            if (layout.kinds[i] != llama_hybrid_cycle_layer_kind::PC_CPU ||
+                layout.pc_cuda_layers[i] == 0) {
+                continue;
+            }
+            const size_t bytes = estimates[i];
+            if (!bytes) {
+                reason = "CUDA_ESTIMATE_UNAVAILABLE layer=" +
+                         std::to_string(i);
                 selected.clear();
                 selected_bytes = 0;
                 return false;
             }
-            continue;
-        }
-        if (bytes > budget - selected_bytes) {
-            if (explicit_selection) {
+            if (bytes > budget - selected_bytes) {
                 reason = "CUDA_MIRROR_BUDGET_EXCEEDED layer=" +
                          std::to_string(i);
                 selected.clear();
                 selected_bytes = 0;
                 return false;
             }
-            continue; // CPU fallback for this physical layer.
+            selected[i] = 1;
+            selected_bytes += bytes;
         }
-        selected[i] = 1;
-        selected_bytes += bytes;
+        return true;
+    }
+
+    // Automatic placement must not spend the entire budget on the first
+    // physical period. Build the PC Full candidate list in model order,
+    // determine how many mirrors the budget can support, then choose that
+    // many layers from evenly spaced strata across the whole 48-layer
+    // pipeline. With the X4/Y2 production layout this gives, for example:
+    //   3 mirrors -> physical layers 8,24,40
+    //   6 mirrors -> one PC Full layer in each of the six periods.
+    //
+    // Estimates are almost equal for Qwen3-MoE, but the cheapest-first pass
+    // below is only used to derive an upper bound on mirror COUNT. If the
+    // evenly distributed set is more expensive, reduce the count until the
+    // actual selected bytes fit. This never exceeds the requested budget.
+    std::vector<size_t> candidates;
+    std::vector<size_t> costs;
+    candidates.reserve(layout.kinds.size());
+    costs.reserve(layout.kinds.size());
+    for (size_t i = 0; i < layout.kinds.size(); ++i) {
+        if (layout.kinds[i] != llama_hybrid_cycle_layer_kind::PC_CPU ||
+            estimates[i] == 0) {
+            continue;
+        }
+        candidates.push_back(i);
+        costs.push_back(estimates[i]);
+    }
+    if (candidates.empty() || budget == 0) {
+        return true;
+    }
+
+    std::sort(costs.begin(), costs.end());
+    size_t affordable = 0;
+    size_t cheapest_bytes = 0;
+    for (const size_t bytes : costs) {
+        if (bytes > budget - cheapest_bytes) break;
+        cheapest_bytes += bytes;
+        ++affordable;
+    }
+
+    for (size_t count = affordable; count > 0; --count) {
+        std::vector<size_t> trial;
+        trial.reserve(count);
+        size_t trial_bytes = 0;
+        bool fits = true;
+        const size_t n = candidates.size();
+        for (size_t k = 0; k < count; ++k) {
+            const size_t candidate_index =
+                ((2 * k + 1) * n) / (2 * count);
+            const size_t layer =
+                candidates[std::min(candidate_index, n - 1)];
+            const size_t bytes = estimates[layer];
+            if (bytes > budget - trial_bytes) {
+                fits = false;
+                break;
+            }
+            trial.push_back(layer);
+            trial_bytes += bytes;
+        }
+        if (!fits) continue;
+        for (const size_t layer : trial) {
+            selected[layer] = 1;
+        }
+        selected_bytes = trial_bytes;
+        return true;
     }
     return true;
 }
@@ -179,6 +245,20 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
             layout, estimated, budget, selected, selected_bytes, reason)) {
         return fail(reason);
     }
+    std::string selected_layers;
+    for (size_t i = 0; i < selected.size(); ++i) {
+        if (!selected[i]) continue;
+        if (!selected_layers.empty()) selected_layers += ",";
+        selected_layers += std::to_string(i);
+    }
+    std::printf(
+        "[CYCLE_CUDA_SELECTION] policy=%s selected=%zu layers=%s "
+        "planned_mib=%.2f budget_mib=%.2f status=READY\n",
+        layout.pc_cuda_layers.empty() ? "BALANCED_STRATA" : "EXPLICIT",
+        size_t(std::count(selected.begin(), selected.end(), uint8_t(1))),
+        selected_layers.empty() ? "none" : selected_layers.c_str(),
+        double(selected_bytes) / (1024.0 * 1024.0),
+        double(budget) / (1024.0 * 1024.0));
     layout_ = layout;
     // The explicit bitmap OVERRIDES legacy pc_cuda_full=true. Unmirrored
     // PC layers always route to PC_CPU, including on full 48-layer runs.
