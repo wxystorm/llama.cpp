@@ -2964,6 +2964,46 @@ ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC));
 }
 
+static ggml_backend_rpc_set_tensor_async_return_lane_t
+ggml_backend_meta_get_set_tensor_async_return_lane(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_set_tensor_async_return_lane_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_LANE_PROC));
+}
+
+static ggml_backend_rpc_get_tensor_return_lane_t
+ggml_backend_meta_get_tensor_return_lane(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_get_tensor_return_lane_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_GET_TENSOR_RETURN_LANE_PROC));
+}
+
 static ggml_backend_rpc_phone_ffn_mark_ready_t
 ggml_backend_meta_get_phone_ffn_mark_ready(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -4088,10 +4128,51 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         std::max(1, std::min(
             region_window_requested,
             (int) ggml_backend_meta_context::PREFILL_RETURN_LANES));
+    const ggml_backend_rpc_set_tensor_async_return_lane_t
+        region_return_set_lane =
+            n_backends > 1 ?
+                ggml_backend_meta_get_set_tensor_async_return_lane(
+                    backend_ctx->backend_configs[1].backend) :
+                nullptr;
+    const ggml_backend_rpc_get_tensor_return_lane_t
+        region_return_get_lane =
+            n_backends > 1 ?
+                ggml_backend_meta_get_tensor_return_lane(
+                    backend_ctx->backend_configs[1].backend) :
+                nullptr;
+    const bool region_return_lane_capable =
+        region_return_set_lane != nullptr &&
+        region_return_get_lane != nullptr &&
+        region_return_set_lane(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            0) &&
+        region_return_set_lane(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            1) &&
+        region_return_get_lane(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            0) &&
+        region_return_get_lane(
+            backend_ctx->backend_configs[1].backend,
+            nullptr,
+            nullptr,
+            0,
+            1);
+
     const bool region_window2 =
         region_window_requested >= 2 &&
         region_priority_queues &&
-        region_async_partial;
+        region_async_partial &&
+        region_return_lane_capable;
 
     auto get_region_exec_worker =
         [&](size_t backend_index)
@@ -5720,12 +5801,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     if (pipeline_debug && region_window_requested >= 2) {
         printf(
             "[REGION_WINDOW_CONFIG] requested=%d active=%d "
-            "credits=%zu async_partial=%d priority_queues=%d\n",
+            "credits=%zu async_partial=%d priority_queues=%d "
+            "return_lane_rpc=%d\n",
             region_window_requested,
             region_window2 ? 1 : 0,
             ggml_backend_meta_context::PREFILL_RETURN_LANES,
             region_async_partial ? 1 : 0,
-            region_priority_queues ? 1 : 0);
+            region_priority_queues ? 1 : 0,
+            region_return_lane_capable ? 1 : 0);
     }
 
     auto ab_find_sg_named =
