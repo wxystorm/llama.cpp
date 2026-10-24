@@ -874,14 +874,16 @@ static bool cycle_core_evaluate_with_kv(
                                                         }
                                                     }
                                                 }
-                                                // Protocol 31: after the correct C2P
-                                                // Reduce/FINISH boundary, register and arm
-                                                // BOTH following Phone Full layers. The
-                                                // C2P output stays device-owned until the
-                                                // L5 completion ACK proves its input copy
-                                                // and compute have finished.
+                                                // Protocol 31: graph preparation
+                                                // was queued at C2P ATTN_PRE and overlaps
+                                                // both FFN branches + transport. REDUCE
+                                                // may wait only for any residual prepare
+                                                // tail, then sends one short ARM RPC.
                                                 if (valid && real_phone_full) {
-                                                    valid = arm_phone_region(region, c);
+                                                    valid =
+                                                        wait_phone_region_prepare(
+                                                            region, c) &&
+                                                        arm_phone_region(region, c);
                                                 }
                                                 if (valid) {
                                                     ++phone_c2p_reduce;
