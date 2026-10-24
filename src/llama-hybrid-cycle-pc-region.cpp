@@ -84,7 +84,7 @@ bool llama_hybrid_cycle_execute_pc_full_region(
         }
         const auto * resource = resources.layer(layer);
         if (!resource || !resource->attn_backend || !resource->cuda_weights ||
-            !resource->kv ||
+            !resource->kv || !resource->kv->keys || !resource->kv->values ||
             resource->physical_layer != layer ||
             resource->kv->committed_tokens != token_start ||
             token_start + tokens > resource->kv->max_tokens) {
@@ -284,6 +284,10 @@ bool llama_hybrid_cycle_execute_pc_full_region(
         auto * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
         auto * kqv = ggml_mul_mat(ctx, vt, probs);
         const int64_t attention_width = wq->ne[1];
+        if (ggml_nelements(kqv) != attention_width * tokens) {
+            return fail("PC_REGION_ATTN_WIDTH layer=" +
+                        std::to_string(layer_index));
+        }
         auto * attn = ggml_cont_2d(
             ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3),
             attention_width, tokens);
