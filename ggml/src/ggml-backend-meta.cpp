@@ -6687,6 +6687,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
+        // C2P prefill completes l_out chunk-by-chunk directly on Phone and
+        // disables both legacy l_out producers on the terminal chunk.  The
+        // resulting l_out bridge subgraph is therefore intentionally inactive;
+        // do not feed it into the generic all-reduce fallback.
+        if (n_backends == 2 && active_count == 0) {
+            int c2p_l_out_layer_0 = -1;
+            int c2p_l_out_layer_1 = -1;
+            int parsed_0 = 0;
+            int parsed_1 = 0;
+            const bool c2p_l_out_bridge =
+                std::sscanf(
+                    nodes[0]->name, "l_out-%d%n",
+                    &c2p_l_out_layer_0, &parsed_0) == 1 &&
+                nodes[0]->name[parsed_0] == '\0' &&
+                std::sscanf(
+                    nodes[1]->name, "l_out-%d%n",
+                    &c2p_l_out_layer_1, &parsed_1) == 1 &&
+                nodes[1]->name[parsed_1] == '\0' &&
+                c2p_l_out_layer_0 == c2p_l_out_layer_1 &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, c2p_l_out_layer_0);
+            if (c2p_l_out_bridge) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_L_OUT] layer=%d sg=%zu "
+                        "action=KEEP_PHONE_MANUAL_OUTPUT status=OK\n",
+                        c2p_l_out_layer_0, i);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
         auto deferred_prefill_it =
             deferred_phone_prefill_return_sgs.find(i);
         if (deferred_prefill_it !=
