@@ -54,6 +54,11 @@ struct llama_hybrid_cycle_physical_layer_resources {
     std::unique_ptr<llama_hybrid_cycle_cuda_full_weights> cuda_weights;
     uint64_t cuda_residency_stamp = 0;
     std::unique_ptr<llama_hybrid_cycle_physical_kv_cache> kv;
+    // Deferred Phone-region registration may acquire/rebind Attention
+    // scratch on a host control worker while the PHONE_GPU ACK path returns
+    // the previous Chunk's lease. Protect only these host-side pool/cache
+    // metadata mutations; GPU execution itself is never held under this lock.
+    std::mutex attention_state_mutex;
     std::unique_ptr<cycle_real_attention_graph_cache> graph_cache;
     std::unique_ptr<cycle_real_attention_scratch_pool> scratch_pool;
 };
