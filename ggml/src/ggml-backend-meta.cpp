@@ -10652,9 +10652,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ((size_t) prefill_down_chunk_0 %
                      ggml_backend_meta_context::PREFILL_RETURN_LANES) :
                     0;
+            // Full-graph Region P2C carries the residual as a
+            // chunk-local tensor named prefill_wave_ffn_inp_chunk_C-L.
+            // Legacy layouts expose one full-layer ffn_inp-L instead.  Prefer
+            // the exact chunk-local residual and fall back to the old lookup.
+            char p2c_residual_name[96];
+            std::snprintf(
+                p2c_residual_name,
+                sizeof(p2c_residual_name),
+                "prefill_wave_ffn_inp_chunk_%d-%d",
+                prefill_down_chunk_0,
+                prefill_down_layer_0);
             ggml_tensor * phone_residual =
-                find_recent_ffn_inp(
-                    1, i, prefill_down_layer_0);
+                find_exact_named_tensor(
+                    1, p2c_residual_name);
+            const bool p2c_chunk_local_residual =
+                phone_residual != nullptr;
+            if (phone_residual == nullptr) {
+                phone_residual =
+                    find_recent_ffn_inp(
+                        1, i, prefill_down_layer_0);
+            }
+
             ggml_tensor * pc_l_out =
                 find_layer_output(
                     0, prefill_down_layer_0);
@@ -10666,15 +10685,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     1, true,
                     prefill_down_layer_0,
                     prefill_down_chunk_0);
+            const size_t residual_offset =
+                p2c_chunk_local_residual ?
+                    0 : chunk_offset;
 
             ggml_tensor * residual_chunk =
                 get_node_aux(phone_partial);
             residual_chunk->view_src = phone_residual;
-            residual_chunk->view_offs = chunk_offset;
+            residual_chunk->view_offs = residual_offset;
             ggml_backend_view_init(residual_chunk);
             GGML_ASSERT(
-                chunk_offset + ggml_nbytes(residual_chunk) <=
+                residual_offset + ggml_nbytes(residual_chunk) <=
                 ggml_nbytes(phone_residual));
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_P2C_RESIDUAL] layer=%d chunk=%d "
+                    "tensor=%s source=%s residual_offs=%zu "
+                    "chunk_offs=%zu bytes=%zu status=OK\n",
+                    prefill_down_layer_0,
+                    prefill_down_chunk_0,
+                    phone_residual->name,
+                    p2c_chunk_local_residual ?
+                        "CHUNK_LOCAL" : "FULL_LAYER",
+                    residual_offset,
+                    chunk_offset,
+                    ggml_nbytes(residual_chunk));
+            }
 
             ggml_tensor * phone_fold =
                 get_node_aux(phone_partial);
