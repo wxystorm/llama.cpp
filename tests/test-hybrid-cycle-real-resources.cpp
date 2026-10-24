@@ -71,21 +71,18 @@ int main(int argc, char ** argv) {
             "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL reason=NO_CPU_DEVICE\n");
         return 1;
     }
-    ggml_backend_dev_t cuda_dev = nullptr;
-    if (budget_mib > 0) {
+    ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0");
+    if (!cuda_dev) {
+        ggml_backend_load_all();
         cuda_dev = ggml_backend_dev_by_name("CUDA0");
-        if (!cuda_dev) {
-            ggml_backend_load_all();
-            cuda_dev = ggml_backend_dev_by_name("CUDA0");
-        }
-        if (!cuda_dev ||
-            ggml_backend_dev_type(cuda_dev) !=
-                GGML_BACKEND_DEVICE_TYPE_GPU) {
-            std::fprintf(stderr,
-                "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
-                "reason=CUDA_BUDGET_REQUIRES_CUDA0\n");
-            return 1;
-        }
+    }
+    if (!cuda_dev ||
+        ggml_backend_dev_type(cuda_dev) !=
+            GGML_BACKEND_DEVICE_TYPE_GPU) {
+        std::fprintf(stderr,
+            "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+            "reason=PC_FULL_REQUIRES_CUDA0\n");
+        return 1;
     }
     const auto rpc_reg = ggml_backend_rpc_add_server(argv[2]);
     if (!rpc_reg || ggml_backend_reg_dev_count(rpc_reg) != 1) {
@@ -141,7 +138,7 @@ int main(int argc, char ** argv) {
     const auto phone = ggml_backend_dev_init(phone_dev, nullptr);
     const auto cuda = cuda_dev ?
         ggml_backend_dev_init(cuda_dev, nullptr) : nullptr;
-    if (!cpu || !phone || (budget_mib > 0 && !cuda)) {
+    if (!cpu || !phone || !cuda) {
         std::fprintf(stderr,
             "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
             "reason=BACKEND_INITIALIZATION\n");
@@ -175,38 +172,65 @@ int main(int argc, char ** argv) {
                 resource_pool.prepared_layers() == n_layers;
             for (int l = 0; l < n_layers && ok; ++l) {
                 const auto * item = resource_pool.layer(l);
-                const bool mirrored =
-                    selected.pc_cuda_layers[size_t(l)] != 0;
+                const auto kind = selected.kinds[size_t(l)];
+                const bool pc_full =
+                    kind == llama_hybrid_cycle_layer_kind::PC_CPU;
+                const bool phone_owned =
+                    kind == llama_hybrid_cycle_layer_kind::PHONE_GPU ||
+                    kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+                const bool cuda_tail =
+                    kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL;
+                const auto expected_backend = phone_owned ? phone :
+                    (pc_full || cuda_tail ? cuda : cpu);
                 ok = item && item->physical_layer == l &&
                     item->kv && item->kv->buffer &&
                     item->kv->keys && item->kv->values &&
                     item->kv->max_tokens == int64_t(kv_tokens) &&
                     item->kv->committed_tokens == 0 &&
                     item->graph_cache && item->scratch_pool &&
-                    (item->cuda_weights != nullptr) == mirrored &&
-                    item->attn_backend ==
-                        (selected.kinds[size_t(l)] ==
-                            llama_hybrid_cycle_layer_kind::PHONE_GPU ||
-                         selected.kinds[size_t(l)] ==
-                            llama_hybrid_cycle_layer_kind::TENSOR_P2C ?
-                         phone :
-                         mirrored ? cuda : cpu);
+                    item->attn_backend == expected_backend &&
+                    (!pc_full || selected.pc_cuda_layers[size_t(l)] != 0) &&
+                    item->cuda_weights == nullptr;
                 if (ok) {
                     std::printf(
                         "[CYCLE_FULL_RESOURCE_LAYER] physical=%d kind=%s "
                         "attn=%s kv_tokens=%" PRId64
-                        " cuda_weight_mirror=%d graph_cache=1 scratch_pool=1 "
+                        " cuda_weight_resident=0 graph_cache=1 scratch_pool=1 "
                         "status=READY\n",
                         l,
-                        llama_hybrid_cycle_kind_name(
-                            selected.kinds[size_t(l)]),
+                        llama_hybrid_cycle_kind_name(kind),
                         ggml_backend_name(item->attn_backend),
-                        item->kv->max_tokens, mirrored ? 1 : 0);
+                        item->kv->max_tokens);
                 } else {
                     std::fprintf(stderr,
                         "[CYCLE_FULL_RESOURCE_LAYER] physical=%d "
                         "status=FAIL reason=RESOURCE_OR_BACKEND_MISMATCH\n",
                         l);
+                }
+            }
+            if (ok) {
+                // Lazy residency: PC Full is already routed to CUDA before
+                // any mirror is loaded. Fault one layer in explicitly.
+                int first_pc_full = -1;
+                for (int l = 0; l < n_layers; ++l) {
+                    if (selected.kinds[size_t(l)] ==
+                        llama_hybrid_cycle_layer_kind::PC_CPU) {
+                        first_pc_full = l;
+                        break;
+                    }
+                }
+                std::string residency_error;
+                ok = first_pc_full >= 0 &&
+                    resource_pool.ensure_pc_full_cuda_resident(
+                        first_pc_full, residency_error) &&
+                    resource_pool.layer(first_pc_full)->cuda_weights != nullptr &&
+                    resource_pool.cuda_resident_layers() == 1 &&
+                    resource_pool.cuda_residency_loads() == 1;
+                if (!ok) {
+                    std::fprintf(stderr,
+                        "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
+                        "reason=CUDA_RESIDENCY detail=%s\n",
+                        residency_error.c_str());
                 }
             }
             if (ok) {
