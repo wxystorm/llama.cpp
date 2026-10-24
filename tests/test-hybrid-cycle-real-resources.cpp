@@ -53,10 +53,10 @@ int main(int argc, char ** argv) {
     }
     uint64_t kv_tokens = 64, budget_mib = 0;
     if ((argc >= 4 &&
-         !cycle_resource_parse_uint(argv[3], 128, kv_tokens)) ||
+         !cycle_resource_parse_uint(argv[3], 512, kv_tokens)) ||
         (argc >= 5 &&
          !cycle_resource_parse_uint(argv[4], 16384, budget_mib)) ||
-        kv_tokens == 0 || kv_tokens > 128) {
+        kv_tokens == 0 || kv_tokens > 512) {
         std::fprintf(stderr,
             "[CYCLE_FULL_RESOURCE_PROBE] status=FAIL "
             "reason=BAD_KV_TOKENS_OR_CUDA_BUDGET\n");
@@ -215,7 +215,7 @@ int main(int argc, char ** argv) {
                 // absolute-layer K/V, graph metadata and scratch owner.
                 // No RPC graph is executed by this resource-only probe.
                 llama_hybrid_cycle_phone_regions phone_regions;
-                const int chunk_size = 16;
+                const int chunk_size = 64;
                 const int chunks = int((kv_tokens + chunk_size - 1) /
                                        chunk_size);
                 const int inflight = std::min(2, chunks);
@@ -255,7 +255,7 @@ int main(int argc, char ** argv) {
                 desc.layout = selected;
                 desc.physical_layer_count = n_layers;
                 desc.tokens = int64_t(kv_tokens);
-                desc.chunk_tokens = 16;
+                desc.chunk_tokens = 64;
                 llama_hybrid_cycle_execution_session<> session(desc);
                 for (int l = 0; l < n_layers && ok; ++l) {
                     ok = session.borrow_kv(
