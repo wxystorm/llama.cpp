@@ -115,6 +115,12 @@ static bool cycle_core_evaluate_with_kv(
     }
     const int n_chunks = (n_tokens + chunk_tokens - 1) / chunk_tokens;
     if (max_inflight > n_chunks) max_inflight = n_chunks;
+    if (n_tokens > 1) {
+        std::printf(
+            "[CYCLE_PREFILL_RING] tokens=%d chunk_tokens=%d chunks=%d "
+            "window=%d outer_batches=1 status=BEGIN\n",
+            n_tokens, chunk_tokens, n_chunks, max_inflight);
+    }
     bool ok = true;
     {
         const auto & layout = resources.execution_layout();
