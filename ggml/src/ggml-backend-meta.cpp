@@ -10609,6 +10609,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                              pc_tmp,
                              pc_reduce_graph,
                              reducer_exec,
+                             region_return_get_lane,
                              metrics,
                              layer,
                              chunk,
@@ -10618,11 +10619,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             (uint64_t task_id) -> ggml_status {
                                 const int64_t wire_begin_us =
                                     ggml_time_us();
-                                ggml_backend_tensor_copy_async(
-                                    phone_backend,
-                                    pc_backend,
-                                    phone_stage,
-                                    pc_tmp);
+                                std::vector<uint8_t> payload(bytes);
+                                const bool received =
+                                    region_return_get_lane(
+                                        phone_backend,
+                                        phone_stage,
+                                        payload.data(),
+                                        payload.size(),
+                                        partial_lane);
+                                if (!received) {
+                                    return GGML_STATUS_FAILED;
+                                }
+                                ggml_backend_tensor_set(
+                                    pc_tmp,
+                                    payload.data(),
+                                    0,
+                                    payload.size());
                                 ggml_backend_synchronize(pc_backend);
                                 metrics->wire_us =
                                     ggml_time_us() - wire_begin_us;
@@ -10634,6 +10646,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                         "chunk=%d lane=%zu "
                                         "task=%" PRIu64
                                         " bytes=%zu wire_ms=%.3f "
+                                        "transport=RETURN_LANE "
                                         "status=DONE\n",
                                         layer,
                                         chunk,
@@ -11482,6 +11495,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                  phone_tmp,
                                  phone_reduce_graph,
                                  reducer_exec,
+                                 region_return_set_lane,
                                  metrics,
                                  layer,
                                  chunk,
@@ -11491,13 +11505,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 (uint64_t task_id) -> ggml_status {
                                     const int64_t wire_begin_us =
                                         ggml_time_us();
-                                    ggml_backend_tensor_copy_async(
-                                        pc_backend,
-                                        phone_backend,
+                                    std::vector<uint8_t> payload(bytes);
+                                    ggml_backend_tensor_get(
                                         pc_stage,
-                                        phone_tmp);
-                                    ggml_backend_synchronize(
-                                        phone_backend);
+                                        payload.data(),
+                                        0,
+                                        payload.size());
+                                    const bool sent =
+                                        region_return_set_lane(
+                                            phone_backend,
+                                            phone_tmp,
+                                            payload.data(),
+                                            payload.size(),
+                                            partial_lane);
+                                    if (!sent) {
+                                        return GGML_STATUS_FAILED;
+                                    }
                                     metrics->wire_us =
                                         ggml_time_us() - wire_begin_us;
 
@@ -11508,6 +11531,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                             "chunk=%d lane=%zu "
                                             "task=%" PRIu64
                                             " bytes=%zu wire_ms=%.3f "
+                                            "transport=RETURN_LANE "
                                             "status=DONE\n",
                                             layer,
                                             chunk,
