@@ -3,6 +3,7 @@
 #include "log.h"
 
 #include "cli-context.h"
+#include "cli-cycle.h"
 
 #include <signal.h>
 
@@ -54,6 +55,15 @@ int llama_cli(int argc, char ** argv) {
     };
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
+
+    // The normal llama-cli launches a local llama-server. That server's
+    // multi-slot KV manager is not compatible with the fixed Cycle physical
+    // 48-layer cache yet. Explicit Cycle opt-in uses a direct, PUBLIC
+    // llama_decode/llama_get_logits completion path instead. Non-Cycle CLI
+    // behavior remains byte-for-byte unchanged below this dispatch.
+    if (cli_cycle_requested()) {
+        return cli_cycle_run(params);
+    }
 
     cli_context ctx_cli(params);
 

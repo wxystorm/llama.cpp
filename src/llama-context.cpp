@@ -4634,6 +4634,16 @@ int llama_context::decode_cycle(const llama_batch & batch) {
         }
     }
 
+    // Normal llama_context installs CPU threadpools later in its scheduler
+    // initialization, which the physical Cycle intentionally bypasses.
+    // Apply the official -t / -tb flags directly to the one PC CPU backend
+    // before launching the global 48-layer FIFO for this invocation.
+    const int cpu_threads = n > 1 ?
+        cparams.n_threads_batch : cparams.n_threads;
+    if (backend_cpu && cpu_threads > 0) {
+        ggml_backend_cpu_set_n_threads(backend_cpu, cpu_threads);
+    }
+
     cycle_logits_storage.clear();
     logits = {nullptr, 0};
     n_outputs = 0;

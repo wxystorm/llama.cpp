@@ -1,4 +1,13 @@
-# Native physical Cycle prefill
+# Physical Cycle integration
+
+**Official `llama-cli` entrypoint:** see
+[OFFICIAL_CLI.md](OFFICIAL_CLI.md). Explicitly enabling
+`LLAMA_HYBRID_CYCLE_STANDARD_DECODE=1` routes the official executable
+through the public Context API and real five-queue Cycle, without
+starting its normal HTTP server. This is currently single-prompt
+completion, not full interactive server chat.
+
+## Earlier native prefill runner
 
 `llama-cycle-prefill` is the first **non-test** host entry point for the
 real 48-layer Qwen3-30B-A3B Cycle. It links the reusable physical executor in

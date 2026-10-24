@@ -3,6 +3,7 @@
 set(TARGET llama-cli-impl)
 
 add_library(${TARGET} cli.cpp
+                      cli-cycle.cpp
                       cli-client.cpp
                       cli-context.cpp)
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
