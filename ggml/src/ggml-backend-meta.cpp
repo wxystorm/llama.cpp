@@ -4077,6 +4077,38 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
             return *slot;
         };
+
+    auto run_region_main_graph =
+        [&](size_t backend_index,
+            ggml_cgraph * graph,
+            const char * direction,
+            const char * role,
+            int layer,
+            int chunk) -> ggml_status {
+            GGML_ASSERT(region_priority_queues);
+            GGML_ASSERT(graph != nullptr);
+
+            const uint64_t task =
+                get_region_exec_worker(backend_index)->enqueue(
+                    graph, true);
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_EXEC_QUEUE] side=%s "
+                    "queue=MAIN priority=HIGH "
+                    "direction=%s role=%s "
+                    "layer=%d chunk=%d task=%" PRIu64
+                    " status=ENQUEUED\n",
+                    backend_index == 0 ? "PC" : "PHONE",
+                    direction != nullptr ? direction : "LOCAL",
+                    role != nullptr ? role : "MAIN",
+                    layer,
+                    chunk,
+                    task);
+            }
+
+            return get_region_exec_worker(backend_index)->wait(task);
+        };
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -10050,8 +10082,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_time_us();
             ggml_backend_synchronize(phone_cfg.backend);
             ggml_status status =
-                ggml_backend_graph_compute_async(
-                    phone_cfg.backend, phone_fold_graph);
+                region_priority_queues ?
+                    run_region_main_graph(
+                        1,
+                        phone_fold_graph,
+                        "P2C",
+                        "OUTGOING_FOLD",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0) :
+                    ggml_backend_graph_compute_async(
+                        phone_cfg.backend, phone_fold_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -10185,8 +10225,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             const int64_t pc_reduce_begin_us =
                 ggml_time_us();
-            status = ggml_backend_graph_compute_async(
-                pc_cfg.backend, pc_reduce_graph);
+            status =
+                region_priority_queues ?
+                    run_region_main_graph(
+                        0,
+                        pc_reduce_graph,
+                        "P2C",
+                        "REDUCE",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0) :
+                    ggml_backend_graph_compute_async(
+                        pc_cfg.backend, pc_reduce_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -10679,8 +10728,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t pc_fold_begin_us = ggml_time_us();
                 ggml_backend_synchronize(bcj_dst.backend);
                 ggml_status status =
-                    ggml_backend_graph_compute_async(
-                        bcj_dst.backend, pc_fold_graph);
+                    region_priority_queues ?
+                        run_region_main_graph(
+                            0,
+                            pc_fold_graph,
+                            "C2P",
+                            "OUTGOING_FOLD",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0) :
+                        ggml_backend_graph_compute_async(
+                            bcj_dst.backend, pc_fold_graph);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -10812,8 +10869,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     partial_wire_src, phone_tmp);
 
                 const int64_t phone_reduce_begin_us = ggml_time_us();
-                status = ggml_backend_graph_compute_async(
-                    bcj_src.backend, phone_reduce_graph);
+                status =
+                    region_priority_queues ?
+                        run_region_main_graph(
+                            1,
+                            phone_reduce_graph,
+                            "C2P",
+                            "REDUCE",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0) :
+                        ggml_backend_graph_compute_async(
+                            bcj_src.backend, phone_reduce_graph);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -14540,8 +14606,22 @@ auto prefill_norm_sg_has_prework =
 
     } else if (subgraph_is_prefill_pc_only(i)) {
 
-        compute_workers.start(0, i);
-        compute_status = compute_workers.wait(0);
+        if (region_priority_queues) {
+            ggml_cgraph * pc_main_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            compute_status =
+                run_region_main_graph(
+                    0,
+                    pc_main_graph,
+                    "LOCAL",
+                    "FULL_REGION",
+                    subgraph_layer(i),
+                    -1);
+        } else {
+            compute_workers.start(0, i);
+            compute_status = compute_workers.wait(0);
+        }
 
         if (pipeline_debug) {
             ggml_cgraph * graph =
@@ -14957,8 +15037,32 @@ auto prefill_norm_sg_has_prework =
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
         }
-        compute_workers.start_graph(1, phone_graph);
-        compute_status = compute_workers.wait(1);
+        if (region_priority_queues) {
+            const int main_layer =
+                direct_route_layer >= 0 ?
+                    direct_route_layer :
+                    (phone_block_fused ?
+                        first_fused_layer :
+                        subgraph_layer(i));
+            const char * main_role =
+                region_p2c_producer_route ?
+                    "P2C_ROUTE" :
+                    (phone_block_fused ?
+                        "FULL_REGION_FUSED" :
+                        "FULL_REGION");
+            compute_status =
+                run_region_main_graph(
+                    1,
+                    phone_graph,
+                    region_p2c_producer_route ?
+                        "P2C" : "LOCAL",
+                    main_role,
+                    main_layer,
+                    direct_route_chunk);
+        } else {
+            compute_workers.start_graph(1, phone_graph);
+            compute_status = compute_workers.wait(1);
+        }
 
         if (direct_route_bound) {
             if (direct_route_rebound) {
