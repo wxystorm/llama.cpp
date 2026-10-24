@@ -3870,6 +3870,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                      ggml_backend_meta_tensor_p2c_layer(
                          backend_ctx, directional_down_layer));
 
+                if (is_directional_down_boundary &&
+                        std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                    printf(
+                        "[REGION_CONT_SPLIT] node=%d layer=%d chunk=%d "
+                        "tensor=%s reason=DIRECTIONAL_DOWN status=HARD\n",
+                        i,
+                        directional_down_layer,
+                        directional_down_chunk,
+                        node->name);
+                }
+
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -13978,6 +13989,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 int layer = -1;
                 if (ggml_backend_meta_parse_prefill_norm_chunk(name, chunk, layer) ||
                     ggml_backend_meta_parse_prefill_down_chunk(name, chunk, layer) ||
+                    std::sscanf(name, "region_phone_attn_out_chunk_%*d-%d", &layer) == 1 ||
+                    std::sscanf(name, "region_phone_ffn_inp_chunk_%*d-%d", &layer) == 1 ||
+                    std::sscanf(name, "region_phone_ffn_norm_chunk_%*d-%d", &layer) == 1 ||
+                    std::sscanf(name, "region_phone_ffn_down_chunk_%*d-%d", &layer) == 1 ||
+                    std::sscanf(name, "region_phone_l_out_chunk_%*d-%d", &layer) == 1 ||
+                    std::sscanf(name, "region_p2c_attn_out_chunk_%*d-%d", &layer) == 1 ||
                     std::sscanf(name, "attn_out-%d", &layer) == 1 ||
                     std::sscanf(name, "ffn_inp-%d", &layer) == 1 ||
                     std::sscanf(name, "l_out-%d", &layer) == 1) {
