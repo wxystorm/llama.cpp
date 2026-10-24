@@ -3,6 +3,7 @@
 
 #include "llama-model.h"
 #include "llama-hybrid-cycle-pc-region.h"
+#include "llama-hybrid-cycle-pc-full.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-full.h"
 #include "llama-hybrid-cycle-p2c-real.h"
@@ -115,6 +116,10 @@ static bool cycle_core_evaluate_with_kv(
     }
     const int n_chunks = (n_tokens + chunk_tokens - 1) / chunk_tokens;
     if (max_inflight > n_chunks) max_inflight = n_chunks;
+    const char * cuda_region_env =
+        std::getenv("LLAMA_HYBRID_CYCLE_CUDA_REGION");
+    const bool pc_cuda_region =
+        cuda_region_env == nullptr || std::atoi(cuda_region_env) != 0;
     if (n_tokens > 1) {
         std::printf(
             "[CYCLE_PREFILL_RING] tokens=%d chunk_tokens=%d chunks=%d "
@@ -231,18 +236,25 @@ static bool cycle_core_evaluate_with_kv(
                         rc.pc_cpu_reduce_priority = true;
                         rc.ordered_c2p_reduce = true;
                         rc.phone_main_priority = true;
-                        rc.pc_cuda_chunk_priority = true;
+                        rc.pc_cuda_chunk_priority = pc_cuda_region;
                         llama_hybrid_cycle_runtime runtime(rc);
                         llama_hybrid_cycle_stage_dispatcher stages(layout);
-                        if (ok && !llama_hybrid_cycle_bind_pc_region_stages(
-                                stages, *model, resources, session,
-                                initial_hidden, hidden, reason,
-                                &pc_cuda_region_calls)) {
-                            std::fprintf(stderr,
-                                "[CYCLE_REAL_PC_RING] status=FAIL "
-                                "reason=BIND_REAL_PC detail=%s\n",
-                                reason.c_str());
-                            ok = false;
+                        if (ok) {
+                            const bool pc_bound = pc_cuda_region ?
+                                llama_hybrid_cycle_bind_pc_region_stages(
+                                    stages, *model, resources, session,
+                                    initial_hidden, hidden, reason,
+                                    &pc_cuda_region_calls) :
+                                llama_hybrid_cycle_bind_pc_full_stages(
+                                    stages, *model, resources, cpu, session,
+                                    initial_hidden, hidden, reason);
+                            if (!pc_bound) {
+                                std::fprintf(stderr,
+                                    "[CYCLE_REAL_PC_RING] status=FAIL "
+                                    "reason=BIND_REAL_PC detail=%s\n",
+                                    reason.c_str());
+                                ok = false;
+                            }
                         }
 
                         if (ok && !phone_regions.bind_phone_stages(
@@ -1038,6 +1050,10 @@ static bool cycle_core_evaluate_with_kv(
                 reason = "REAL_PHYSICAL_KV_INCOMPLETE";
                 ok = false;
             }
+            const uint64_t expected_legacy_cuda_handoffs =
+                pc_cuda_region ? 0 : uint64_t(18 * n_chunks);
+            const int expected_region_calls =
+                pc_cuda_region ? 6 * n_chunks : 0;
             const bool expected_stages =
                 real_c2p_attn.load() == 6*n_chunks &&
                 real_c2p_ffn.load() == 6*n_chunks &&
@@ -1057,20 +1073,25 @@ static bool cycle_core_evaluate_with_kv(
                 real_p2c_reduce.load() == 6*n_chunks &&
                 real_p2c_partial_ack.load() == 6*n_chunks &&
                 p2c_device_handoffs.load() == 6*n_chunks &&
-                pc_cuda_region_calls.load() == 6*n_chunks &&
-                session.cuda_device_handoffs() == 0;
+                pc_cuda_region_calls.load() == expected_region_calls &&
+                session.cuda_device_handoffs() ==
+                    expected_legacy_cuda_handoffs;
             if (ok && !expected_stages) {
                 reason = "REAL_PHYSICAL_STAGES_INCOMPLETE";
                 ok = false;
             }
             if (n_tokens > 1) {
                 std::printf(
-                    "[CYCLE_PC_CUDA_REGION_SUM] calls=%d expected=%d "
-                    "legacy_device_handoffs=%llu "
-                    "region_tail_host_readbacks=%d status=%s\n",
-                    pc_cuda_region_calls.load(), 6 * n_chunks,
+                    "[CYCLE_PC_CUDA_MODE] mode=%s region_calls=%d "
+                    "expected_region_calls=%d legacy_device_handoffs=%llu "
+                    "expected_legacy_handoffs=%llu host_readbacks=%d "
+                    "status=%s\n",
+                    pc_cuda_region ? "REGION_V1" : "DEVICE_LOCAL_FALLBACK",
+                    pc_cuda_region_calls.load(), expected_region_calls,
                     (unsigned long long) session.cuda_device_handoffs(),
-                    6 * n_chunks, ok ? "PASS" : "FAIL");
+                    (unsigned long long) expected_legacy_cuda_handoffs,
+                    pc_cuda_region ? 6 * n_chunks : 24 * n_chunks,
+                    ok ? "PASS" : "FAIL");
                 std::printf(
                     "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
                     "fused_ffn_add=1 calls=%d slot_reuse=%d "
