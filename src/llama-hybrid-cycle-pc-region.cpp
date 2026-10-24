@@ -168,7 +168,6 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         const llama_model & model,
         llama_hybrid_cycle_physical_resource_pool & resources,
         llama_hybrid_cycle_pc_region_cache & cache,
-        llama_hybrid_cycle_physical_resource_pool & resources,
         int first_layer,
         int layer_count,
         int64_t token_start,
