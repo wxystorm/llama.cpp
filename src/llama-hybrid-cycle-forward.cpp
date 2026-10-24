@@ -16,15 +16,18 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -256,16 +259,22 @@ static bool cycle_core_evaluate_with_kv(
                                 }
 
                                 std::unique_ptr<llama_hybrid_cycle_phone_ffn_slot> slot;
-                                auto & idle = bank->full_idle_by_layer[size_t(layer)];
-                                for (auto it = idle.begin(); it != idle.end(); ++it) {
-                                    if (*it && (*it)->is_full_layer &&
-                                        (*it)->prepared_tokens == st.tokens &&
-                                        (*it)->fused_full_graph &&
-                                        (*it)->registered_full_graph_uid != 0) {
-                                        slot = std::move(*it);
-                                        idle.erase(it);
-                                        ++phone_full_slot_reuse;
-                                        break;
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        bank->full_mutex);
+                                    auto & idle =
+                                        bank->full_idle_by_layer[size_t(layer)];
+                                    for (auto it = idle.begin();
+                                         it != idle.end(); ++it) {
+                                        if (*it && (*it)->is_full_layer &&
+                                            (*it)->prepared_tokens == st.tokens &&
+                                            (*it)->fused_full_graph &&
+                                            (*it)->registered_full_graph_uid != 0) {
+                                            slot = std::move(*it);
+                                            idle.erase(it);
+                                            ++phone_full_slot_reuse;
+                                            break;
+                                        }
                                     }
                                 }
                                 if (!slot) {
