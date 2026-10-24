@@ -398,7 +398,8 @@ private:
                (max_inflight_ == 0 ||
                 layer_inflight_[layer] < max_inflight_)) {
             const int ready_chunk = next_chunk_[layer]++;
-            ++layer_inflight_[layer];
+            // No credit counter or admission ceiling in production mode.
+            if (max_inflight_ != 0) ++layer_inflight_[layer];
             const auto stage = is_tensor(layout_.kinds[layer]) ?
                 llama_hybrid_cycle_stage::ATTN_PRE :
                 llama_hybrid_cycle_stage::FULL_LAYER;
@@ -410,6 +411,7 @@ private:
     }
 
     void release_layer_credit(int layer) {
+        if (max_inflight_ == 0) return;
         if (layer_inflight_[layer] <= 0) {
             throw std::logic_error("cycle layer credit underflow");
         }
@@ -425,8 +427,9 @@ private:
         // unsafe reuse of an output still borrowed by a downstream consumer.
         // On a single-layer diagnostic or the final layer, the normal
         // immediate credit release is still correct.
-        if (!credit_until_handoff_ ||
-            layer + 1 == int(layout_.kinds.size())) {
+        if (max_inflight_ != 0 &&
+            (!credit_until_handoff_ ||
+             layer + 1 == int(layout_.kinds.size()))) {
             release_layer_credit(layer);
         }
         mark_entry_ready(layer + 1, chunk);
