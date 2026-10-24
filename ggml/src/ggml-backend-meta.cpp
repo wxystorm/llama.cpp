@@ -3108,6 +3108,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // Keep the proven correctness-first C2P path as the default while the
+    // separated Router/FFN execution is being validated.  This switch only
+    // changes the graph boundary; all C2P mathematics and Reduce ownership
+    // remain unchanged.
+    const char * c2p_parallel_env =
+        std::getenv("LLAMA_HYBRID_REGION_C2P_PARALLEL");
+    const bool c2p_parallel_prefill =
+        c2p_parallel_env != nullptr &&
+        std::atoi(c2p_parallel_env) != 0;
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
     const int64_t meta_rebuild_begin_us = needs_rebuild ? ggml_time_us() : 0;
@@ -3673,8 +3683,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 int c2p_route_chunk = -1;
                 int c2p_route_layer = -1;
                 const bool is_c2p_route_boundary =
+                    c2p_parallel_prefill &&
                     ggml_backend_meta_parse_c2p_route_weights(
                         node->name, c2p_route_chunk, c2p_route_layer) &&
+                    c2p_route_chunk >= 0 &&
                     ggml_backend_meta_tensor_c2p_layer(
                         backend_ctx, c2p_route_layer);
 
@@ -3895,6 +3907,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    if (pipeline_debug && needs_rebuild &&
+            !backend_ctx->tensor_c2p_layer_mask.empty()) {
+        printf(
+            "[REGION_C2P_PARALLEL_CONFIG] enabled=%d "
+            "source=LLAMA_HYBRID_REGION_C2P_PARALLEL\n",
+            c2p_parallel_prefill ? 1 : 0);
+    }
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
