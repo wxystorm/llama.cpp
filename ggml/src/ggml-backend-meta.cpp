@@ -4056,6 +4056,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_priority_queues =
         region_priority_queues_env != nullptr &&
         std::atoi(region_priority_queues_env) != 0;
+    const char * region_window_env =
+        std::getenv("LLAMA_HYBRID_REGION_WINDOW");
+    int region_window_requested =
+        region_window_env != nullptr ?
+            std::atoi(region_window_env) : 1;
+    region_window_requested =
+        std::max(1, std::min(
+            region_window_requested,
+            (int) ggml_backend_meta_context::PREFILL_RETURN_LANES));
+    const bool region_window2 =
+        region_window_requested >= 2 &&
+        region_priority_queues &&
+        region_async_partial;
 
     auto get_region_exec_worker =
         [&](size_t backend_index)
@@ -5398,6 +5411,299 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             mismatch == 0 ? "PASS" : "FAIL");
         return mismatch == 0;
     };
+
+    struct region_window_metrics {
+        int64_t wire_us = 0;
+        int64_t reduce_us = 0;
+    };
+
+    struct region_window_pending {
+        bool active = false;
+        int layer = -1;
+        int chunk = -1;
+        size_t sg = SIZE_MAX;
+        size_t lane = 0;
+        size_t src_backend = 0;
+        size_t dst_backend = 0;
+        uint64_t task = 0;
+        ggml_backend_meta_transfer_worker * worker = nullptr;
+        ggml_tensor * wire_src = nullptr;
+        ggml_tensor * wire_dst = nullptr;
+        ggml_tensor * out_chunk = nullptr;
+        size_t bytes = 0;
+        int64_t fold_us = 0;
+        int64_t stage_us = 0;
+        bool boundary_last = false;
+        bool numeric_check = false;
+        std::shared_ptr<region_window_metrics> metrics;
+        std::shared_ptr<std::vector<float>> before_a;
+        std::shared_ptr<std::vector<float>> before_b;
+        std::shared_ptr<std::vector<float>> before_residual;
+    };
+
+    std::array<
+        region_window_pending,
+        ggml_backend_meta_context::PREFILL_RETURN_LANES>
+        pending_region_c2p {};
+    std::array<
+        region_window_pending,
+        ggml_backend_meta_context::PREFILL_RETURN_LANES>
+        pending_region_p2c {};
+
+    auto region_active_credits =
+        [&](const auto & pending) -> size_t {
+            size_t n = 0;
+            for (const auto & p : pending) {
+                n += p.active ? 1 : 0;
+            }
+            return n;
+        };
+
+    auto region_has_later_boundary_chunk =
+        [&](size_t current_sg, int layer, int chunk) -> bool {
+            for (size_t sg = current_sg + 1;
+                    sg < backend_ctx->n_subgraphs; ++sg) {
+                for (size_t backend = 0;
+                        backend < std::min<size_t>(n_backends, 2);
+                        ++backend) {
+                    ggml_cgraph * graph =
+                        backend_ctx->backend_configs[backend]
+                            .cgraphs[sg].cgraph_main;
+                    if (graph == nullptr) {
+                        continue;
+                    }
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        int later_chunk = -1;
+                        int later_layer = -1;
+                        if (ggml_backend_meta_parse_prefill_down_chunk(
+                                graph->nodes[k]->name,
+                                later_chunk,
+                                later_layer) &&
+                                later_layer == layer &&
+                                later_chunk > chunk) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+    auto wait_region_window_lane =
+        [&](auto & pending,
+            const char * direction,
+            size_t lane,
+            const char * reason) -> ggml_status {
+            GGML_ASSERT(
+                lane <
+                ggml_backend_meta_context::PREFILL_RETURN_LANES);
+            auto & p = pending[lane];
+            if (!p.active) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            GGML_ASSERT(p.worker != nullptr);
+            GGML_ASSERT(p.task != 0);
+            GGML_ASSERT(p.metrics != nullptr);
+
+            const int64_t join_begin_us = ggml_time_us();
+            const ggml_status status =
+                p.worker->wait(p.task);
+            const int64_t join_wait_us =
+                ggml_time_us() - join_begin_us;
+
+            if (status == GGML_STATUS_SUCCESS) {
+                record_copy_wait(p.metrics->wire_us);
+                record_meta_copy(
+                    p.sg,
+                    p.src_backend,
+                    p.dst_backend,
+                    p.wire_src,
+                    p.metrics->wire_us);
+                record_direct_copy();
+                directional_wire_parity(
+                    direction,
+                    p.layer,
+                    p.chunk,
+                    std::strcmp(direction, "C2P") == 0 ?
+                        "PC_PARTIAL_PLUS_RESIDUAL" :
+                        "PHONE_PARTIAL_PLUS_RESIDUAL",
+                    p.src_backend,
+                    p.dst_backend,
+                    p.wire_src,
+                    p.wire_dst);
+                record_reduce_add(
+                    p.fold_us + p.metrics->reduce_us,
+                    true);
+
+                if (p.numeric_check &&
+                        p.before_a != nullptr &&
+                        p.before_b != nullptr &&
+                        p.before_residual != nullptr &&
+                        !p.before_a->empty() &&
+                        p.out_chunk != nullptr) {
+                    const size_t n = p.before_a->size();
+                    std::vector<float> actual(n);
+                    ggml_backend_tensor_get(
+                        p.out_chunk,
+                        actual.data(),
+                        0,
+                        n * sizeof(float));
+
+                    double diff2 = 0.0;
+                    double actual_l2 = 0.0;
+                    double expected_l2 = 0.0;
+                    double dot = 0.0;
+                    double max_abs = 0.0;
+                    size_t worst = 0;
+                    for (size_t q = 0; q < n; ++q) {
+                        const double expected =
+                            (double) (*p.before_a)[q] +
+                            (double) (*p.before_b)[q] +
+                            (double) (*p.before_residual)[q];
+                        const double got = actual[q];
+                        const double d = got - expected;
+                        diff2 += d * d;
+                        actual_l2 += got * got;
+                        expected_l2 += expected * expected;
+                        dot += got * expected;
+                        if (std::abs(d) > max_abs) {
+                            max_abs = std::abs(d);
+                            worst = q;
+                        }
+                    }
+                    const double rms =
+                        n > 0 ?
+                            std::sqrt(diff2 / (double) n) : 0.0;
+                    const double cosine =
+                        actual_l2 > 0.0 && expected_l2 > 0.0 ?
+                            dot / std::sqrt(
+                                actual_l2 * expected_l2) : 0.0;
+                    printf(
+                        "[REGION_%s_NUMERIC] layer=%d chunk=%d "
+                        "n=%zu max_abs=%.9g rms=%.9g "
+                        "cosine=%.12f worst=%zu "
+                        "actual=%.9f expected=%.9f status=%s\n",
+                        direction,
+                        p.layer,
+                        p.chunk,
+                        n,
+                        max_abs,
+                        rms,
+                        cosine,
+                        worst,
+                        actual[worst],
+                        (double) (*p.before_a)[worst] +
+                            (double) (*p.before_b)[worst] +
+                            (double) (*p.before_residual)[worst],
+                        max_abs <= 1e-4 ? "PASS" : "FAIL");
+                }
+
+                if (pipeline_debug) {
+                    if (std::strcmp(direction, "C2P") == 0) {
+                        printf(
+                            "[REGION_C2P_PREFILL] layer=%d chunk=%d "
+                            "last=%d bytes=%zu pc_fold_ms=%.3f "
+                            "stage_ms=%.3f copy_ms=%.3f "
+                            "join_wait_ms=%.3f phone_reduce_ms=%.3f "
+                            "async_partial=1 window=2 "
+                            "owner=PHONE status=OK\n",
+                            p.layer,
+                            p.chunk,
+                            p.boundary_last ? 1 : 0,
+                            p.bytes,
+                            p.fold_us / 1000.0,
+                            p.stage_us / 1000.0,
+                            p.metrics->wire_us / 1000.0,
+                            join_wait_us / 1000.0,
+                            p.metrics->reduce_us / 1000.0);
+                    } else {
+                        printf(
+                            "[REGION_P2C_PREFILL] layer=%d chunk=%d "
+                            "last=%d bytes=%zu phone_fold_ms=%.3f "
+                            "stage_ms=%.3f copy_ms=%.3f "
+                            "join_wait_ms=%.3f pc_reduce_ms=%.3f "
+                            "async_partial=1 window=2 "
+                            "owner=PC status=OK\n",
+                            p.layer,
+                            p.chunk,
+                            p.boundary_last ? 1 : 0,
+                            p.bytes,
+                            p.fold_us / 1000.0,
+                            p.stage_us / 1000.0,
+                            p.metrics->wire_us / 1000.0,
+                            join_wait_us / 1000.0,
+                            p.metrics->reduce_us / 1000.0);
+                    }
+                }
+            }
+
+            const int layer = p.layer;
+            const int chunk = p.chunk;
+            const uint64_t task = p.task;
+            p = region_window_pending {};
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_RETURN_JOIN] direction=%s "
+                    "layer=%d chunk=%d lane=%zu task=%" PRIu64
+                    " wait_ms=%.3f window=2 reason=%s status=%s\n",
+                    direction,
+                    layer,
+                    chunk,
+                    lane,
+                    task,
+                    join_wait_us / 1000.0,
+                    reason != nullptr ? reason : "DEPENDENCY",
+                    status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
+                printf(
+                    "[REGION_CREDIT] direction=%s event=RELEASE "
+                    "layer=%d chunk=%d lane=%zu inflight=%zu/2 "
+                    "reason=%s\n",
+                    direction,
+                    layer,
+                    chunk,
+                    lane,
+                    region_active_credits(pending),
+                    reason != nullptr ? reason : "DEPENDENCY");
+            }
+
+            return status;
+        };
+
+    auto drain_region_window =
+        [&](auto & pending,
+            const char * direction,
+            const char * reason) -> ggml_status {
+            ggml_status result = GGML_STATUS_SUCCESS;
+            for (size_t lane = 0;
+                    lane <
+                        ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                    ++lane) {
+                const ggml_status status =
+                    wait_region_window_lane(
+                        pending,
+                        direction,
+                        lane,
+                        reason);
+                if (result == GGML_STATUS_SUCCESS &&
+                        status != GGML_STATUS_SUCCESS) {
+                    result = status;
+                }
+            }
+            return result;
+        };
+
+    if (pipeline_debug && region_window_requested >= 2) {
+        printf(
+            "[REGION_WINDOW_CONFIG] requested=%d active=%d "
+            "credits=%zu async_partial=%d priority_queues=%d\n",
+            region_window_requested,
+            region_window2 ? 1 : 0,
+            ggml_backend_meta_context::PREFILL_RETURN_LANES,
+            region_async_partial ? 1 : 0,
+            region_priority_queues ? 1 : 0);
+    }
 
     auto ab_find_sg_named =
         [&](size_t backend, size_t sg,
