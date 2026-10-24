@@ -73,7 +73,7 @@ static bool cycle_core_evaluate_with_kv(
         llama_model_n_layer(model) != 48 ||
         hidden <= 0 || n_tokens < 1 || n_tokens > 512 ||
         position_base < 0 || position_base > 512 - n_tokens ||
-        chunk_tokens < 1 || chunk_tokens > 128 ||
+        chunk_tokens < 1 || chunk_tokens > 64 ||
         max_inflight < 1 || max_inflight > 2 ||
         n_tokens > std::numeric_limits<int>::max() - chunk_tokens + 1 ||
         token_embeddings.size() != size_t(n_tokens) * size_t(hidden)) {
@@ -1131,7 +1131,7 @@ bool llama_hybrid_cycle_session::prepare(
         llama_model_n_layer(&model) != 48 ||
         !ggml_backend_is_rpc(phone) ||
         max_total_tokens < 1 || max_total_tokens > 512 ||
-        chunk_tokens < 1 || chunk_tokens > 128 ||
+        chunk_tokens < 1 || chunk_tokens > 64 ||
         max_inflight < 1 || max_inflight > 2 ||
         (cuda_weight_budget_bytes != 0 && !pc_cuda)) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
