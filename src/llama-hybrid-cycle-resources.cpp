@@ -175,17 +175,25 @@ llama_hybrid_cycle_physical_resource_pool::
 }
 
 void llama_hybrid_cycle_physical_resource_pool::clear() {
-    // Keep KV/model/Backend storage alive while the cached graph metadata
-    // and Scratch pools release their borrowed tensor references.
+    std::lock_guard<std::mutex> lock(cuda_residency_mutex_);
+    // Keep KV/model/Backend storage alive while cached graph metadata,
+    // Scratch pools and any resident CUDA weight mirrors are released.
     for (auto & resource : layers_) {
         if (!resource) continue;
         resource->graph_cache.reset();
         resource->scratch_pool.reset();
         resource->kv.reset();
         resource->cuda_weights.reset();
+        resource->cuda_residency_stamp = 0;
     }
     layers_.clear();
     layout_ = {};
+    model_ = nullptr;
+    cpu_ = nullptr;
+    cuda_ = nullptr;
+    cuda_residency_clock_ = 0;
+    cuda_residency_loads_ = 0;
+    cuda_residency_evictions_ = 0;
     cuda_mirror_bytes_planned_ = 0;
     cuda_mirror_layers_ = 0;
 }
@@ -209,74 +217,96 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
         if (reason.empty()) reason = "INVALID_BACKENDS_OR_CONTEXT";
         return false;
     }
-    if (config.cuda_weight_budget_bytes && !cuda) {
-        reason = "CUDA_BUDGET_WITHOUT_BACKEND";
-        return false;
+    if (!cuda) {
+        return fail("PC_FULL_CUDA_BACKEND_REQUIRED");
     }
 
-    size_t budget = config.cuda_weight_budget_bytes;
-    size_t free_gpu = 0, total_gpu = 0;
-    if (cuda && budget) {
-        auto * dev = ggml_backend_get_device(cuda);
-        if (!dev || ggml_backend_dev_type(dev) !=
+    auto * cuda_dev = ggml_backend_get_device(cuda);
+    if (!cuda_dev || ggml_backend_dev_type(cuda_dev) !=
                         GGML_BACKEND_DEVICE_TYPE_GPU) {
-            return fail("CUDA_BACKEND_DEVICE_INVALID");
-        }
-        ggml_backend_dev_memory(dev, &free_gpu, &total_gpu);
-        budget = free_gpu > config.cuda_safety_reserve_bytes ?
-            std::min(budget, free_gpu - config.cuda_safety_reserve_bytes) : 0;
+        return fail("CUDA_BACKEND_DEVICE_INVALID");
     }
+
+    size_t free_gpu = 0, total_gpu = 0;
+    ggml_backend_dev_memory(cuda_dev, &free_gpu, &total_gpu);
+    const size_t usable_gpu =
+        free_gpu > config.cuda_safety_reserve_bytes ?
+        free_gpu - config.cuda_safety_reserve_bytes : 0;
+    const size_t requested_budget = config.cuda_weight_budget_bytes ?
+        config.cuda_weight_budget_bytes : free_gpu;
+    const size_t budget = std::min(requested_budget, usable_gpu);
+
+    // Every ordinary PC Full layer is a CUDA task. The budget sizes only the
+    // number of simultaneously resident full-weight mirrors; it no longer
+    // selects CPU fallback layers.
     std::vector<size_t> estimated(layout.kinds.size(), 0);
-    if (budget || !layout.pc_cuda_layers.empty()) {
-        for (size_t i = 0; i < layout.kinds.size(); ++i) {
-            if (layout.kinds[i] != llama_hybrid_cycle_layer_kind::PC_CPU ||
-                (!layout.pc_cuda_layers.empty() &&
-                 layout.pc_cuda_layers[i] == 0)) continue;
-            if (!cycle_cuda_mirror_estimate(
-                    model.layers[i], cpu, cuda, estimated[i])) {
-                return fail("CUDA_WEIGHT_ESTIMATE_FAILED layer=" +
-                            std::to_string(i));
-            }
+    size_t pc_full_layers = 0;
+    size_t max_layer_estimate = 0;
+    for (size_t i = 0; i < layout.kinds.size(); ++i) {
+        if (layout.kinds[i] != llama_hybrid_cycle_layer_kind::PC_CPU) continue;
+        ++pc_full_layers;
+        if (!cycle_cuda_mirror_estimate(
+                model.layers[i], cpu, cuda, estimated[i])) {
+            return fail("CUDA_WEIGHT_ESTIMATE_FAILED layer=" +
+                        std::to_string(i));
+        }
+        max_layer_estimate = std::max(max_layer_estimate, estimated[i]);
+    }
+    if (pc_full_layers == 0 || max_layer_estimate == 0) {
+        return fail("PC_FULL_CUDA_RESIDENCY_ESTIMATE_EMPTY");
+    }
+
+    const size_t resident_capacity = std::min(
+        pc_full_layers, budget / max_layer_estimate);
+    if (resident_capacity == 0) {
+        return fail(
+            "PC_FULL_CUDA_RESIDENCY_BUDGET_TOO_SMALL required_one_mib=" +
+            std::to_string(max_layer_estimate / (1024 * 1024)) +
+            " budget_mib=" + std::to_string(budget / (1024 * 1024)));
+    }
+
+    layout_ = layout;
+    layout_.pc_cuda_layers.assign(layout_.kinds.size(), 0);
+    for (size_t i = 0; i < layout_.kinds.size(); ++i) {
+        if (layout_.kinds[i] == llama_hybrid_cycle_layer_kind::PC_CPU) {
+            layout_.pc_cuda_layers[i] = 1;
         }
     }
-    std::vector<uint8_t> selected;
-    size_t selected_bytes = 0;
-    if (!llama_hybrid_cycle_select_cuda_full_layers(
-            layout, estimated, budget, selected, selected_bytes, reason)) {
-        return fail(reason);
-    }
-    std::string selected_layers;
-    for (size_t i = 0; i < selected.size(); ++i) {
-        if (!selected[i]) continue;
-        if (!selected_layers.empty()) selected_layers += ",";
-        selected_layers += std::to_string(i);
-    }
+
+    model_ = &model;
+    cpu_ = cpu;
+    cuda_ = cuda;
+    cuda_mirror_layers_ = int(resident_capacity);
+    cuda_mirror_bytes_planned_ = resident_capacity * max_layer_estimate;
+
     std::printf(
-        "[CYCLE_CUDA_SELECTION] policy=%s selected=%zu layers=%s "
-        "planned_mib=%.2f budget_mib=%.2f status=READY\n",
-        layout.pc_cuda_layers.empty() ? "BALANCED_STRATA" : "EXPLICIT",
-        size_t(std::count(selected.begin(), selected.end(), uint8_t(1))),
-        selected_layers.empty() ? "none" : selected_layers.c_str(),
-        double(selected_bytes) / (1024.0 * 1024.0),
-        double(budget) / (1024.0 * 1024.0));
-    layout_ = layout;
-    // The explicit bitmap OVERRIDES legacy pc_cuda_full=true. Unmirrored
-    // PC layers always route to PC_CPU, including on full 48-layer runs.
-    layout_.pc_cuda_layers = std::move(selected);
-    cuda_mirror_bytes_planned_ = selected_bytes;
+        "[CYCLE_CUDA_RESIDENCY_PLAN] policy=GPU_FULL_LRU "
+        "pc_full_layers=%zu resident_slots=%zu pc_cpu_fallback=0 "
+        "slot_estimate_mib=%.2f planned_mib=%.2f budget_mib=%.2f "
+        "cuda_free_mib=%.2f status=READY\n",
+        pc_full_layers, resident_capacity,
+        double(max_layer_estimate) / (1024.0 * 1024.0),
+        double(cuda_mirror_bytes_planned_) / (1024.0 * 1024.0),
+        double(budget) / (1024.0 * 1024.0),
+        double(free_gpu) / (1024.0 * 1024.0));
+
     const size_t n_layers = layout_.kinds.size();
     layers_.reserve(n_layers);
     for (size_t i = 0; i < n_layers; ++i) {
         auto layer = std::make_unique<llama_hybrid_cycle_physical_layer_resources>();
         layer->physical_layer = int(i);
         layer->kind = layout_.kinds[i];
-        const bool mirrored = llama_hybrid_cycle_full_layer_on_cuda(
-            layout_, int(i));
-        const bool phone_layer = layer->kind == llama_hybrid_cycle_layer_kind::PHONE_GPU ||
-                                  layer->kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
-        const bool cuda_tail = layer->kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL;
+        const bool pc_full =
+            layer->kind == llama_hybrid_cycle_layer_kind::PC_CPU;
+        const bool phone_layer =
+            layer->kind == llama_hybrid_cycle_layer_kind::PHONE_GPU ||
+            layer->kind == llama_hybrid_cycle_layer_kind::TENSOR_P2C;
+        const bool cuda_tail =
+            layer->kind == llama_hybrid_cycle_layer_kind::PC_CUDA_TAIL;
+        // Tensor C2P remains CPU by design. Ordinary PC Full is always CUDA;
+        // its weights are populated lazily by the residency cache.
         layer->attn_backend = phone_layer ? phone :
-            (mirrored || cuda_tail ? cuda : cpu);
+            (pc_full || cuda_tail ? cuda : cpu);
         if (!layer->attn_backend) {
             return fail("PHYSICAL_BACKEND_MISSING layer=" + std::to_string(i));
         }
@@ -284,20 +314,10 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
         // construction in reverse dependency order.
         layers_.push_back(std::move(layer));
         auto & resource = *layers_.back();
-        if (mirrored && resource.kind == llama_hybrid_cycle_layer_kind::PC_CPU) {
-            resource.cuda_weights =
-                std::make_unique<llama_hybrid_cycle_cuda_full_weights>();
-            if (!resource.cuda_weights->prepare(
-                    cuda, cpu, model.layers[i], int(i))) {
-                return fail("CUDA_WEIGHT_MIRROR_ALLOCATION_FAILED layer=" +
-                            std::to_string(i));
-            }
-            ++cuda_mirror_layers_;
-        }
         resource.kv = std::make_unique<llama_hybrid_cycle_physical_kv_cache>();
         if (!resource.kv->init(
                 resource.attn_backend, model.layers[i], config.kv_tokens,
-                phone_layer ? 1 : 0, resource.cuda_weights.get())) {
+                phone_layer ? 1 : 0, nullptr)) {
             return fail("PHYSICAL_KV_ALLOC_FAILED layer=" +
                         std::to_string(i));
         }
@@ -316,15 +336,12 @@ bool llama_hybrid_cycle_physical_resource_pool::prepare(
     }
     std::printf(
         "[CYCLE_FULL_RESOURCE_PLAN] layers=%zu kv_tokens=%" PRId64
-        " max_inflight=%d cuda_mirror_layers=%d pc_cpu_fallback=%zu"
-        " cuda_estimated_mib=%.2f cuda_cap_mib=%.2f"
-        " cuda_free_mib=%.2f graph_cache=%d scratch_pool=%d"
-        " status=READY_ONLY\n",
+        " max_inflight=%d pc_full_backend=CUDA pc_cpu_fallback=0"
+        " cuda_resident_slots=%d cuda_residency_planned_mib=%.2f"
+        " cuda_cap_mib=%.2f cuda_free_mib=%.2f"
+        " graph_cache=%d scratch_pool=%d status=READY_ONLY\n",
         n_layers, config.kv_tokens, config.max_inflight,
         cuda_mirror_layers_,
-        size_t(std::count(layout_.kinds.begin(), layout_.kinds.end(),
-              llama_hybrid_cycle_layer_kind::PC_CPU)) -
-              size_t(cuda_mirror_layers_),
         double(cuda_mirror_bytes_planned_) / (1024.0 * 1024.0),
         double(budget) / (1024.0 * 1024.0),
         double(free_gpu) / (1024.0 * 1024.0),
@@ -343,6 +360,103 @@ llama_hybrid_cycle_physical_resource_pool::layer(int physical_layer) const {
     if (physical_layer < 0 ||
         static_cast<size_t>(physical_layer) >= layers_.size()) return nullptr;
     return layers_[static_cast<size_t>(physical_layer)].get();
+}
+
+bool llama_hybrid_cycle_physical_resource_pool::ensure_pc_full_cuda_resident(
+        int physical_layer, std::string & reason) {
+    std::lock_guard<std::mutex> lock(cuda_residency_mutex_);
+    reason.clear();
+    if (!model_ || !cpu_ || !cuda_ || cuda_mirror_layers_ <= 0 ||
+        physical_layer < 0 ||
+        static_cast<size_t>(physical_layer) >= layers_.size()) {
+        reason = "CUDA_RESIDENCY_NOT_PREPARED";
+        return false;
+    }
+    auto & target = layers_[static_cast<size_t>(physical_layer)];
+    if (!target || target->kind != llama_hybrid_cycle_layer_kind::PC_CPU ||
+        target->attn_backend != cuda_) {
+        reason = "CUDA_RESIDENCY_TARGET_NOT_PC_FULL";
+        return false;
+    }
+
+    const uint64_t stamp = ++cuda_residency_clock_;
+    if (target->cuda_weights) {
+        target->cuda_residency_stamp = stamp;
+        return true;
+    }
+
+    int resident = 0;
+    int victim_layer = -1;
+    uint64_t victim_stamp = std::numeric_limits<uint64_t>::max();
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        const auto & item = layers_[i];
+        if (!item || !item->cuda_weights) continue;
+        ++resident;
+        if (item->cuda_residency_stamp < victim_stamp) {
+            victim_stamp = item->cuda_residency_stamp;
+            victim_layer = int(i);
+        }
+    }
+
+    std::unique_ptr<llama_hybrid_cycle_cuda_full_weights> slot;
+    if (resident >= cuda_mirror_layers_) {
+        if (victim_layer < 0) {
+            reason = "CUDA_RESIDENCY_EVICTION_TARGET_MISSING";
+            return false;
+        }
+        auto & victim = layers_[static_cast<size_t>(victim_layer)];
+        slot = std::move(victim->cuda_weights);
+        victim->cuda_residency_stamp = 0;
+        ++cuda_residency_evictions_;
+        if (llama_hybrid_cycle_verbose()) {
+            std::printf(
+                "[CYCLE_CUDA_RESIDENCY] event=EVICT layer=%d for_layer=%d "
+                "resident_slots=%d status=OK\n",
+                victim_layer, physical_layer, cuda_mirror_layers_);
+        }
+    } else {
+        slot = std::make_unique<llama_hybrid_cycle_cuda_full_weights>();
+    }
+
+    if (!slot || !slot->prepare(
+            cuda_, cpu_, model_->layers[static_cast<size_t>(physical_layer)],
+            physical_layer)) {
+        reason = "CUDA_RESIDENCY_LOAD_FAILED layer=" +
+                 std::to_string(physical_layer);
+        return false;
+    }
+    target->cuda_weights = std::move(slot);
+    target->cuda_residency_stamp = stamp;
+    ++cuda_residency_loads_;
+    if (llama_hybrid_cycle_verbose()) {
+        std::printf(
+            "[CYCLE_CUDA_RESIDENCY] event=LOAD layer=%d load_index=%llu "
+            "evictions=%llu resident_slots=%d status=OK\n",
+            physical_layer,
+            (unsigned long long) cuda_residency_loads_,
+            (unsigned long long) cuda_residency_evictions_,
+            cuda_mirror_layers_);
+    }
+    return true;
+}
+
+int llama_hybrid_cycle_physical_resource_pool::cuda_resident_layers() const {
+    std::lock_guard<std::mutex> lock(cuda_residency_mutex_);
+    int count = 0;
+    for (const auto & item : layers_) {
+        if (item && item->cuda_weights) ++count;
+    }
+    return count;
+}
+
+uint64_t llama_hybrid_cycle_physical_resource_pool::cuda_residency_loads() const {
+    std::lock_guard<std::mutex> lock(cuda_residency_mutex_);
+    return cuda_residency_loads_;
+}
+
+uint64_t llama_hybrid_cycle_physical_resource_pool::cuda_residency_evictions() const {
+    std::lock_guard<std::mutex> lock(cuda_residency_mutex_);
+    return cuda_residency_evictions_;
 }
 
 size_t llama_hybrid_cycle_physical_resource_pool::
