@@ -15,7 +15,8 @@ bool llama_hybrid_cycle_execute_pc_full_layer(
         int physical_layer, int64_t token_start, int64_t tokens,
         const std::vector<float> & input,
         std::vector<float> & output,
-        llama_hybrid_cycle_pc_full_timing * timing) {
+        llama_hybrid_cycle_pc_full_timing * timing,
+        const std::function<bool()> & input_consumed) {
     output.clear();
     (void) pc_cpu; // Tensor layers still use CPU; ordinary Full never does.
     if (!resource.attn_backend || !resource.kv || !resource.cuda_weights ||
@@ -70,6 +71,16 @@ bool llama_hybrid_cycle_execute_pc_full_layer(
             std::chrono::steady_clock::now() - attn_begin).count();
     }
     if (!attention_ok) {
+        return false;
+    }
+    // execute_attention_pre() fences the backend before returning on this
+    // non-deferred CUDA path. The predecessor input can therefore be reused
+    // while this layer continues through FFN + residual + readback.
+    if (input_consumed && !input_consumed()) {
+        std::fprintf(stderr,
+            "[CYCLE_PC_FULL_HANDOFF] layer=%d reason=INPUT_CONSUMED_NOTIFY "
+            "status=FAIL\n", physical_layer);
+        ready.release_phone_graph();
         return false;
     }
 
