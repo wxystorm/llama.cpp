@@ -11,7 +11,8 @@ bool llama_hybrid_cycle_execute_phone_full(
         const llama_model & model,
         const llama_hybrid_cycle_physical_layer_resources & resource,
         ggml_backend_t phone,
-        int physical_layer, int64_t position_start, int64_t tokens,
+        int physical_layer, int chunk, uint64_t seq,
+        int64_t position_start, int64_t tokens,
         const ggml_tensor * device_input,
         llama_hybrid_cycle_attention_ready & ready,
         llama_hybrid_cycle_phone_ffn_slot & output_slot,
@@ -21,7 +22,7 @@ bool llama_hybrid_cycle_execute_phone_full(
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
     const bool inputs_valid =
-        phone && physical_layer >= 0 &&
+        phone && physical_layer >= 0 && chunk >= 0 && seq != 0 &&
         size_t(physical_layer) < model.layers.size() &&
         resource.physical_layer == physical_layer &&
         resource.kind == llama_hybrid_cycle_layer_kind::PHONE_GPU &&
@@ -38,7 +39,8 @@ bool llama_hybrid_cycle_execute_phone_full(
         (!output_slot.prepared_tokens ||
          (output_slot.is_full_layer &&
           output_slot.prepared_tokens == tokens &&
-          output_slot.output && !output_slot.fused_full_graph));
+          output_slot.output && output_slot.fused_full_graph &&
+          output_slot.registered_full_graph_uid != 0));
     if (!inputs_valid) {
         std::fprintf(stderr,
             "[CYCLE_REAL_PHONE_FULL] layer=%d start=%lld tokens=%lld "
@@ -58,7 +60,11 @@ bool llama_hybrid_cycle_execute_phone_full(
         };
         if (!shard.available() ||
             !output_slot.prepare(phone, shard, hidden, tokens,
-                                 topk, experts, true, false)) {
+                                 topk, experts,
+                                 true,  // full_layer
+                                 true,  // fuse FFN + residual ADD
+                                 true,  // registered RPC replay
+                                 true)) { // Phone Full local replay
             std::fprintf(stderr,
                 "[CYCLE_REAL_PHONE_FULL] layer=%d "
                 "status=FAIL reason=FULL_FFN_SLOT_PREPARE\n",
@@ -84,15 +90,18 @@ bool llama_hybrid_cycle_execute_phone_full(
         ready.phone_graph.residual && ready.phone_graph.ffn_norm &&
         ready.phone_graph.topk_ids && ready.phone_graph.topk_weights;
     if (attention_done) {
-        // This consumes READY on Phone GPU, and computes the exact native
-        // Qwen3-MoE FFN shard. The separate REDUCE adds the residual.
-        ok = output_slot.execute_full_local(ready) &&
-             output_slot.execute_reduce(phone);
+        // Protocol 28: READY remains entirely on Phone. The server copies the
+        // four READY tensors into the persistent registered Full slot and
+        // replays one fused FFN + residual graph. The ACK is the l_out device
+        // ownership boundary: no separate client FFN submit, Reduce submit,
+        // or fence is required on the success path.
+        ok = output_slot.execute_full_server(
+            phone, ready, physical_layer, chunk, seq);
     } else {
         ok = false;
     }
     if (!ok) {
-        // Failure must never recycle scratch while Phone may be using it.
+        // Failed remote work may still reference READY scratch.
         ggml_backend_synchronize(phone);
     }
     if (ok && stage_probe) {
@@ -113,7 +122,7 @@ bool llama_hybrid_cycle_execute_phone_full(
         "[CYCLE_REAL_PHONE_FULL] layer=%d "
         "position_start=%lld tokens=%lld kv_committed=%lld "
         "attn_ms=%.3f wall_ms=%.3f "
-        "input=PHONE_DEVICE_L_OUT ffn=REAL_GPU reduce=REAL_GPU "
+        "input=PHONE_DEVICE_L_OUT ffn=REGISTERED_REPLAY reduce=FUSED_ADD "
         "status=%s\n",
         physical_layer, (long long)position_start, (long long)tokens,
         (long long)resource.kv->committed_tokens, attn_ms, wall_ms,
