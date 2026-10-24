@@ -6770,6 +6770,40 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
+        int c2p_prefill_down_chunk_0 = -1;
+        int c2p_prefill_down_layer_0 = -1;
+        int c2p_prefill_down_chunk_1 = -1;
+        int c2p_prefill_down_layer_1 = -1;
+        const bool c2p_prefill_down_boundary =
+            n_backends == 2 &&
+            ggml_backend_meta_parse_prefill_down_chunk(
+                nodes[0]->name,
+                c2p_prefill_down_chunk_0,
+                c2p_prefill_down_layer_0) &&
+            ggml_backend_meta_parse_prefill_down_chunk(
+                nodes[1]->name,
+                c2p_prefill_down_chunk_1,
+                c2p_prefill_down_layer_1) &&
+            c2p_prefill_down_chunk_0 == c2p_prefill_down_chunk_1 &&
+            c2p_prefill_down_layer_0 == c2p_prefill_down_layer_1 &&
+            ggml_backend_meta_tensor_c2p_layer(
+                backend_ctx, c2p_prefill_down_layer_0);
+
+        if (pipeline_debug && c2p_prefill_down_boundary) {
+            printf(
+                "[REGION_C2P_BOUNDARY] sg=%zu layer=%d chunk=%d "
+                "active=%zu pc_compute=%d phone_compute=%d "
+                "pc=%s phone=%s status=DETECTED\n",
+                i,
+                c2p_prefill_down_layer_0,
+                c2p_prefill_down_chunk_0,
+                active_count,
+                !!(nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE),
+                !!(nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE),
+                nodes[0]->name,
+                nodes[1]->name);
+        }
+
         auto deferred_prefill_it =
             deferred_phone_prefill_return_sgs.find(i);
         if (deferred_prefill_it !=
@@ -7847,6 +7881,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         const bool c2p_tensor_sg =
             active_count == 1 &&
             active_backend == 1 &&
+            !c2p_prefill_down_boundary &&
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
@@ -8004,7 +8039,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
-        if (active_count == 1) {
+        if (active_count == 1 && !c2p_prefill_down_boundary) {
             handled = true;
             auto & bcj_src = backend_ctx->backend_configs[active_backend];
             const bool defer_to_terminal_l_out =
@@ -8542,7 +8577,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int prefill_down_layer_1 = -1;
         const bool is_prefill_down_chunk =
             n_backends == 2 &&
-            active_count == 2 &&
+            (active_count == 2 || c2p_prefill_down_boundary) &&
             ggml_backend_meta_parse_prefill_down_chunk(
                 nodes[0]->name, prefill_down_chunk_0, prefill_down_layer_0) &&
             ggml_backend_meta_parse_prefill_down_chunk(
