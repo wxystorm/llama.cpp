@@ -12872,13 +12872,13 @@ auto prefill_norm_sg_has_prework =
                 n_backends == 2 &&
                 ggml_backend_meta_tensor_c2p_layer(
                     backend_ctx, prefill_down_layer);
-            const bool c2p_route_ready =
+            const bool c2p_prefill_handoff_ready =
                 c2p_prefill_exec &&
                 c2p_route_ready.erase({
                     prefill_down_layer, prefill_down_chunk,
                 }) != 0;
 
-            if (c2p_route_ready && !has_async_prefill_input) {
+            if (c2p_prefill_handoff_ready && !has_async_prefill_input) {
                 // The Router-only boundary lies between norm and FFN. If
                 // the original norm handoff was skipped, Phone FFN would
                 // read an uninitialized activation. Report an explicit
@@ -12899,7 +12899,7 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_graph = nullptr;
             uint64_t c2p_saved_pc_graph_uid = 0;
 
-            if (c2p_prefill_exec && !c2p_route_ready) {
+            if (c2p_prefill_exec && !c2p_prefill_handoff_ready) {
                 char topk_name[96];
                 char weights_name[96];
                 std::snprintf(
@@ -12978,7 +12978,7 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (pipeline_debug && c2p_route_ready) {
+            if (pipeline_debug && c2p_prefill_handoff_ready) {
                 printf(
                     "[REGION_C2P_FFN_START] layer=%d chunk=%d sg=%zu "
                     "phase=PC_BEGIN norm=STAGED route=READY\n",
@@ -13024,7 +13024,7 @@ auto prefill_norm_sg_has_prework =
             ggml_status pc_status = GGML_STATUS_SUCCESS;
             ggml_status phone_status = GGML_STATUS_SUCCESS;
 
-            if (c2p_prefill_exec && c2p_route_ready) {
+            if (c2p_prefill_exec && c2p_prefill_handoff_ready) {
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_FFN_START] layer=%d chunk=%d sg=%zu "
