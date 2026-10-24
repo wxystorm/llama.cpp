@@ -71,7 +71,7 @@ static bool cycle_core_evaluate_with_kv(
     if (!cpu || !phone || !ggml_backend_is_rpc(phone) ||
         model->arch != LLM_ARCH_QWEN3MOE ||
         llama_model_n_layer(model) != 48 ||
-        hidden <= 0 || n_tokens < 1 || n_tokens > 64 ||
+        hidden <= 0 || n_tokens < 1 || n_tokens > 128 ||
         position_base < 0 || position_base > 512 - n_tokens ||
         chunk_tokens < 1 || chunk_tokens > 16 ||
         max_inflight < 1 || max_inflight > 2 ||
@@ -1189,7 +1189,7 @@ bool llama_hybrid_cycle_session::evaluate(
         llama_hybrid_cycle_forward_metrics * metrics) {
     hidden.clear();
     reason.clear();
-    if (!usable() || tokens < 1 || tokens > 64 ||
+    if (!usable() || tokens < 1 || tokens > 128 ||
         int64_t(tokens) > capacity_ - prefix_) {
         reason = "SESSION_NOT_READY_OR_KV_CAPACITY";
         return false;
