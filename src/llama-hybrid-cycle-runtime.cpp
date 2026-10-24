@@ -28,8 +28,8 @@ bool llama_hybrid_cycle_run_fifo(
         bool pc_cpu_reduce_priority,
         bool ordered_c2p_reduce,
         bool phone_main_priority,
-        bool pc_cuda_chunk_priority,
-        llama_hybrid_cycle_chunk_timeline * chunk_timeline) {
+        llama_hybrid_cycle_chunk_timeline * chunk_timeline,
+        bool pc_cuda_chunk_priority) {
     if (!execute || !layout.enabled() || n_chunks <= 0 ||
         max_inflight < 0 || max_inflight > n_chunks) {
         return false;
@@ -438,8 +438,8 @@ bool llama_hybrid_cycle_runtime::run(
         config_.layout, config_.n_chunks, execute, config_.max_inflight,
         config_.credit_until_handoff, profile,
         config_.pc_cpu_reduce_priority, config_.ordered_c2p_reduce,
-        config_.phone_main_priority, config_.pc_cuda_chunk_priority,
-        timeline);
+        config_.phone_main_priority, timeline,
+        config_.pc_cuda_chunk_priority);
 }
 
 bool llama_hybrid_cycle_runtime::run(
