@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-forward.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 #include "llama-hybrid-cycle-pc-full.h"
@@ -469,7 +470,7 @@ static bool cycle_core_evaluate_with_kv(
                                                 // Never recycle on C2P Reduce ACK.
                                                 if (valid) {
                                                     ++phone_c2p_reduce;
-                                                    std::printf(
+                                                    if (llama_hybrid_cycle_verbose()) std::printf(
                                                         "[CYCLE_REAL_C2P_PHONE] layer=%d "
                                                         "chunk=%d seq=%llu "
                                                         "compute=REAL_GPU reduce=REAL_GPU "
@@ -836,7 +837,7 @@ static bool cycle_core_evaluate_with_kv(
                                                 if (valid) {
                                                     ++p2c_completed[size_t(
                                                         region.location.cycle_index)];
-                                                    std::printf(
+                                                    if (llama_hybrid_cycle_verbose()) std::printf(
                                                         "[CYCLE_REAL_P2C] layer=%d "
                                                         "chunk=%d seq=%llu "
                                                         "attn=PHONE_GPU "
@@ -941,18 +942,21 @@ static bool cycle_core_evaluate_with_kv(
                             ok = false;
                         }
 
+            const bool collect_queue_profile = llama_hybrid_cycle_queue_profile_enabled();
             llama_hybrid_cycle_chunk_timeline timeline;
             llama_hybrid_cycle_fifo_profile queue_profile;
             if (ok && !stages.validate(reason)) ok = false;
             if (ok) {
-                std::printf(
+                if (llama_hybrid_cycle_verbose()) std::printf(
                     "[CYCLE_CORE_FORWARD] layers=48 tokens=%d chunks=%d "
                     "window=%d input=REAL_TOKEN_EMBEDDING "
                     "phone=REAL_GPU rpc=REAL_BIDIRECTIONAL "
                     "pc_reduce=EXCLUSIVE status=BEGIN\n",
                     n_tokens, n_chunks, max_inflight);
-                ok = runtime.run(stages, &queue_profile, &timeline);
-                for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
+                ok = runtime.run(stages,
+                    collect_queue_profile ? &queue_profile : nullptr,
+                    collect_queue_profile ? &timeline : nullptr);
+                if (collect_queue_profile) for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
                     const auto & v = queue_profile.queues[q];
                     std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
                                 "execute_ms=%.3f max_execute_ms=%.3f "
@@ -1056,7 +1060,7 @@ static bool cycle_core_evaluate_with_kv(
         final_hidden.clear();
         if (reason.empty()) reason = "REAL_FIFO_OR_DEPENDENCY_FAILED";
     }
-    std::printf(
+    if (!ok || llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_CORE_FORWARD] tokens=%d chunks=%d hidden=%zu "
         "physical_layers=48 full_forward=%s "
         "numeric_reference=NOT_RUN logits=NOT_RUN status=%s "
@@ -1144,7 +1148,7 @@ bool llama_hybrid_cycle_session::prepare(
     prefix_ = 0;
     wire_epoch_ = 0;
     poisoned_ = false;
-    std::printf(
+    if (llama_hybrid_cycle_verbose()) std::printf(
         "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
         "layers=48 window=%d attention_graph_cache_slots=%zu "
         "scratch_pool=1 phone_gpu=REAL cuda_layers=%d "
@@ -1174,7 +1178,7 @@ bool llama_hybrid_cycle_session::evaluate(
     if (ok) {
         prefix_ += tokens;
         ++wire_epoch_;
-        std::printf(
+        if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_SESSION] phase=COMMIT "
             "absolute_kv_prefix=%lld epoch=%llu "
             "appended_tokens=%d status=PASS\n",
