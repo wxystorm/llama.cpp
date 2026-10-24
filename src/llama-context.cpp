@@ -3635,6 +3635,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     std::vector<llama_hybrid_runtime_stage> region_chunk_cont_stages;
     bool region_chunk_cont_plan_eligible = false;
     if (region_chunk_cont_requested &&
+            has_runtime_plan &&
+            runtime_plan.tensor_chunk_tokens > 0 &&
+            model.arch == LLM_ARCH_QWEN3MOE &&
             directional_region_policy &&
             directional_c2p_count == 1 &&
             directional_p2c_count == 1 &&
