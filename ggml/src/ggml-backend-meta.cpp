@@ -9060,6 +9060,73 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     GGML_ASSERT(disabled_pc_l_out != nullptr);
                 }
 
+                const bool c2p_numeric_trace =
+                    std::getenv("GGML_META_REGION_C2P_NUMERIC_TRACE") != nullptr;
+                std::vector<float> c2p_pc_partial;
+                std::vector<float> c2p_phone_partial;
+                std::vector<float> c2p_residual;
+                if (c2p_numeric_trace &&
+                        node_dst->type == GGML_TYPE_F32 &&
+                        node_src->type == GGML_TYPE_F32 &&
+                        residual_chunk->type == GGML_TYPE_F32) {
+                    ggml_backend_synchronize(bcj_dst.backend);
+                    ggml_backend_synchronize(bcj_src.backend);
+
+                    const size_t n = ggml_nelements(node_dst);
+                    c2p_pc_partial.resize(n);
+                    c2p_phone_partial.resize(n);
+                    c2p_residual.resize(n);
+
+                    ggml_backend_tensor_get(
+                        node_dst,
+                        c2p_pc_partial.data(),
+                        0,
+                        n * sizeof(float));
+                    ggml_backend_tensor_get(
+                        node_src,
+                        c2p_phone_partial.data(),
+                        0,
+                        n * sizeof(float));
+                    ggml_backend_tensor_get(
+                        residual_chunk,
+                        c2p_residual.data(),
+                        0,
+                        n * sizeof(float));
+
+                    auto trace_component = [&](const char * name,
+                                               const std::vector<float> & values) {
+                        double sum = 0.0;
+                        double l2 = 0.0;
+                        double max_abs = 0.0;
+                        size_t nonzero = 0;
+                        for (float x : values) {
+                            sum += x;
+                            l2 += (double) x * x;
+                            max_abs = std::max(max_abs, std::abs((double) x));
+                            nonzero += x != 0.0f ? 1 : 0;
+                        }
+                        printf(
+                            "[REGION_C2P_NUMERIC_INPUT] layer=%d chunk=%d "
+                            "part=%s n=%zu nonzero=%zu sum=%.9f l2=%.9f "
+                            "max=%.9f v0=%.9f v1=%.9f v2=%.9f v3=%.9f\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            name,
+                            values.size(),
+                            nonzero,
+                            sum,
+                            std::sqrt(l2),
+                            max_abs,
+                            values.size() > 0 ? values[0] : 0.0f,
+                            values.size() > 1 ? values[1] : 0.0f,
+                            values.size() > 2 ? values[2] : 0.0f,
+                            values.size() > 3 ? values[3] : 0.0f);
+                    };
+                    trace_component("PC_PARTIAL", c2p_pc_partial);
+                    trace_component("PHONE_PARTIAL", c2p_phone_partial);
+                    trace_component("RESIDUAL", c2p_residual);
+                }
+
                 const int64_t pc_fold_begin_us = ggml_time_us();
                 ggml_backend_synchronize(bcj_dst.backend);
                 ggml_status status =
@@ -9098,6 +9165,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 reduce_add_us += pc_fold_us + phone_reduce_us;
                 ++reduce_to_primary_count;
+
+                if (c2p_numeric_trace &&
+                        !c2p_pc_partial.empty() &&
+                        phone_out_chunk->type == GGML_TYPE_F32) {
+                    const size_t n = c2p_pc_partial.size();
+                    std::vector<float> actual(n);
+                    ggml_backend_tensor_get(
+                        phone_out_chunk,
+                        actual.data(),
+                        0,
+                        n * sizeof(float));
+
+                    double diff_l2 = 0.0;
+                    double actual_l2 = 0.0;
+                    double expected_l2 = 0.0;
+                    double dot = 0.0;
+                    double max_abs_diff = 0.0;
+                    size_t worst = 0;
+                    for (size_t q = 0; q < n; ++q) {
+                        const double expected =
+                            (double) c2p_pc_partial[q] +
+                            (double) c2p_phone_partial[q] +
+                            (double) c2p_residual[q];
+                        const double got = actual[q];
+                        const double d = got - expected;
+                        diff_l2 += d * d;
+                        actual_l2 += got * got;
+                        expected_l2 += expected * expected;
+                        dot += got * expected;
+                        if (std::abs(d) > max_abs_diff) {
+                            max_abs_diff = std::abs(d);
+                            worst = q;
+                        }
+                    }
+                    const double rms =
+                        n > 0 ? std::sqrt(diff_l2 / (double) n) : 0.0;
+                    const double cosine =
+                        actual_l2 > 0.0 && expected_l2 > 0.0 ?
+                            dot / std::sqrt(actual_l2 * expected_l2) : 0.0;
+                    const double worst_expected =
+                        (double) c2p_pc_partial[worst] +
+                        (double) c2p_phone_partial[worst] +
+                        (double) c2p_residual[worst];
+
+                    printf(
+                        "[REGION_C2P_NUMERIC] layer=%d chunk=%d n=%zu "
+                        "max_abs=%.9g rms=%.9g cosine=%.12f worst=%zu "
+                        "actual=%.9f expected=%.9f status=%s\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        n,
+                        max_abs_diff,
+                        rms,
+                        cosine,
+                        worst,
+                        actual[worst],
+                        worst_expected,
+                        max_abs_diff <= 1e-4 ? "PASS" : "FAIL");
+                }
 
                 if (pipeline_debug) {
                     printf(
