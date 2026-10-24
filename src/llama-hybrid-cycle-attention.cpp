@@ -162,7 +162,9 @@ bool llama_hybrid_cycle_execute_attention_pre(
             "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld "
             "committed=%lld mode=%s\n",
             (long long)kv_token_start,
-            (long long)(kv_cache ? kv_cache->committed_tokens : -1),
+            (long long)(kv_cache ?
+                (defer_registered_replay ? -2 :
+                 kv_cache->committed_tokens) : -1),
             defer_registered_replay ? "REGISTER" : "EXECUTE");
         return false;
     }
