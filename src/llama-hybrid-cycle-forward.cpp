@@ -71,9 +71,9 @@ static bool cycle_core_evaluate_with_kv(
     if (!cpu || !phone || !ggml_backend_is_rpc(phone) ||
         model->arch != LLM_ARCH_QWEN3MOE ||
         llama_model_n_layer(model) != 48 ||
-        hidden <= 0 || n_tokens < 1 || n_tokens > 128 ||
+        hidden <= 0 || n_tokens < 1 || n_tokens > 512 ||
         position_base < 0 || position_base > 512 - n_tokens ||
-        chunk_tokens < 1 || chunk_tokens > 16 ||
+        chunk_tokens < 1 || chunk_tokens > 128 ||
         max_inflight < 1 || max_inflight > 2 ||
         n_tokens > std::numeric_limits<int>::max() - chunk_tokens + 1 ||
         token_embeddings.size() != size_t(n_tokens) * size_t(hidden)) {
@@ -127,7 +127,7 @@ static bool cycle_core_evaluate_with_kv(
         if (ok) {
             ok = cycle_core_env_default("GGML_INFERENCE_TRANSPORT_SLOTS","2") &&
                  cycle_core_env_default(
-                     "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB","1") &&
+                     "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB","2") &&
                  open && open(phone);
             if (!ok) reason = "REAL_RPC_TRANSPORT_OPEN";
         }
@@ -1131,7 +1131,7 @@ bool llama_hybrid_cycle_session::prepare(
         llama_model_n_layer(&model) != 48 ||
         !ggml_backend_is_rpc(phone) ||
         max_total_tokens < 1 || max_total_tokens > 512 ||
-        chunk_tokens < 1 || chunk_tokens > 16 ||
+        chunk_tokens < 1 || chunk_tokens > 128 ||
         max_inflight < 1 || max_inflight > 2 ||
         (cuda_weight_budget_bytes != 0 && !pc_cuda)) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
@@ -1189,7 +1189,7 @@ bool llama_hybrid_cycle_session::evaluate(
         llama_hybrid_cycle_forward_metrics * metrics) {
     hidden.clear();
     reason.clear();
-    if (!usable() || tokens < 1 || tokens > 128 ||
+    if (!usable() || tokens < 1 || tokens > 512 ||
         int64_t(tokens) > capacity_ - prefix_) {
         reason = "SESSION_NOT_READY_OR_KV_CAPACITY";
         return false;
@@ -1281,7 +1281,7 @@ void llama_hybrid_cycle_session::reset() {
     prefix_ = 0;
     capacity_ = 0;
     wire_epoch_ = 0;
-    chunk_tokens_ = 16;
+    chunk_tokens_ = 64;
     max_inflight_ = 2;
     poisoned_ = false;
 }
