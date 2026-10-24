@@ -177,3 +177,86 @@ inline void llama_hybrid_cycle_print_chunk_timeline(
         c2p>=0 && p2c>=0 && complete==chunks ? "OK" : "PARTIAL");
     std::fflush(stdout);
 }
+
+// Compact aggregate for the official Cycle CLI. The full per-task trace is
+// retained only when profiling is explicitly enabled; normal generation
+// performs none of this work. A stage duration is a PC-side callback wall
+// interval and can include RPC, GPU synchronization, Graph preparation and
+// host copies. Stage sums overlap across queues and are NOT on the critical
+// path by themselves.
+inline void llama_hybrid_cycle_print_stage_summary(
+        const llama_hybrid_cycle_chunk_timeline & timeline) {
+    constexpr size_t queues = static_cast<size_t>(llama_hybrid_cycle_queue::COUNT);
+    constexpr size_t stages = static_cast<size_t>(llama_hybrid_cycle_stage::REDUCE) + 1;
+    struct stage_totals {
+        size_t tasks = 0;
+        double callback_sum_ms = 0;
+        double callback_max_ms = 0;
+        double queue_wait_sum_ms = 0;
+        double queue_wait_max_ms = 0;
+        double entry_gate_sum_ms = 0;
+        double entry_gate_max_ms = 0;
+    };
+    std::array<std::array<stage_totals, stages>, queues> totals {};
+    std::vector<const llama_hybrid_cycle_task_interval *> ordered;
+    for (size_t q = 0; q < queues; ++q) {
+        for (const auto & event : timeline.by_queue[q]) {
+            const size_t st = static_cast<size_t>(event.task.stage);
+            if (st >= stages) continue;
+            auto & t = totals[q][st];
+            const double callback_ms = std::max(0.0,
+                llama_hybrid_cycle_trace_ms(event.start, event.finish));
+            const double wait_ms = event.task.queued_at.time_since_epoch().count() ?
+                std::max(0.0, llama_hybrid_cycle_trace_ms(
+                    event.task.queued_at, event.start)) : 0.0;
+            const double gate_ms =
+                event.task.entry_ready_at.time_since_epoch().count() &&
+                event.task.queued_at.time_since_epoch().count() ?
+                std::max(0.0, llama_hybrid_cycle_trace_ms(
+                    event.task.entry_ready_at, event.task.queued_at)) : 0.0;
+            ++t.tasks;
+            t.callback_sum_ms += callback_ms;
+            t.callback_max_ms = std::max(t.callback_max_ms, callback_ms);
+            t.queue_wait_sum_ms += wait_ms;
+            t.queue_wait_max_ms = std::max(t.queue_wait_max_ms, wait_ms);
+            t.entry_gate_sum_ms += gate_ms;
+            t.entry_gate_max_ms = std::max(t.entry_gate_max_ms, gate_ms);
+            ordered.push_back(&event);
+        }
+    }
+    for (size_t q = 0; q < queues; ++q) {
+        for (size_t st = 0; st < stages; ++st) {
+            const auto & t = totals[q][st];
+            if (!t.tasks) continue;
+            std::printf(
+                "[CYCLE_CORE_STAGE] queue=%s stage=%s tasks=%zu "
+                "callback_sum_ms=%.3f callback_max_ms=%.3f "
+                "queue_wait_sum_ms=%.3f queue_wait_max_ms=%.3f "
+                "entry_gate_sum_ms=%.3f entry_gate_max_ms=%.3f "
+                "clock=PC_STEADY scope=HOST_CALLBACK\\n",
+                llama_hybrid_cycle_queue_name(
+                    static_cast<llama_hybrid_cycle_queue>(q)),
+                llama_hybrid_cycle_stage_name(
+                    static_cast<llama_hybrid_cycle_stage>(st)),
+                t.tasks, t.callback_sum_ms, t.callback_max_ms,
+                t.queue_wait_sum_ms, t.queue_wait_max_ms,
+                t.entry_gate_sum_ms, t.entry_gate_max_ms);
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(),
+        [](const auto * a, const auto * b) {
+            return llama_hybrid_cycle_trace_ms(a->start,a->finish) >
+                   llama_hybrid_cycle_trace_ms(b->start,b->finish);
+        });
+    for (size_t i = 0; i < std::min(size_t(5), ordered.size()); ++i) {
+        const auto & e = *ordered[i];
+        std::printf(
+            "[CYCLE_CORE_SLOW_TASK] rank=%zu layer=%d chunk=%d "
+            "queue=%s stage=%s callback_ms=%.3f "
+            "device_kernel_ms=NOT_MEASURED\\n",
+            i + 1, e.task.layer, e.task.chunk,
+            llama_hybrid_cycle_queue_name(e.task.queue),
+            llama_hybrid_cycle_stage_name(e.task.stage),
+            llama_hybrid_cycle_trace_ms(e.start,e.finish));
+    }
+}
