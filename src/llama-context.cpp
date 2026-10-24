@@ -373,7 +373,7 @@ llama_context::llama_context(
         cparams.n_seq_max = 1;
         // Cycle owns the only Prefill batching layer. Public batch/ubatch
         // capacity equals the physical context; internal scheduling uses
-        // 64-token Chunks and window=2.
+        // 64-token Chunks; every dependency-ready Chunk is queued immediately.
         cparams.n_batch = requested_ctx;
         cparams.n_ubatch = requested_ctx;
         cparams.n_outputs_max = 1;
@@ -390,7 +390,7 @@ llama_context::llama_context(
         const int64_t capacity = cparams.n_ctx;
         std::string reason;
         auto native = std::make_unique<llama_hybrid_cycle_session>();
-        if (!native->prepare(model, pc, phone, capacity, reason, 64, 2,
+        if (!native->prepare(model, pc, phone, capacity, reason, 64, 0,
                              cycle_cuda_backend, cycle_cuda_budget_bytes)) {
             throw std::runtime_error(
                 "Cycle standard physical KV prepare failed: " + reason);
@@ -4629,7 +4629,7 @@ bool llama_context::reset_cycle() {
     std::string reason;
     const bool ok = cycle_session->prepare(
         model, backend_cpu, backends[1].get(),
-        cparams.n_ctx, reason, 16, 2,
+        cparams.n_ctx, reason, 16, 0,
         backends.size() == 3 ? backends[2].get() : nullptr,
         cycle_cuda_weight_budget_bytes);
     cycle_logits_storage.clear();
