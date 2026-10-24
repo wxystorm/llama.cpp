@@ -11873,6 +11873,40 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                     pending_region_c2p));
                         }
 
+                        if (region_chunk_continuation) {
+                            // The full-graph Region is depth-first by chunk:
+                            // L35(C) is the immediate consumer of this C2P
+                            // output.  Join exactly this credit before leaving
+                            // the directional down subgraph.  P2C remains
+                            // windowed/asynchronous and can overlap later PC
+                            // work; C2P cannot expose l_out(C) before Reduce(C)
+                            // has completed.
+                            const int64_t cont_join_begin_us =
+                                ggml_time_us();
+                            status =
+                                wait_region_window_lane(
+                                    pending_region_c2p,
+                                    "C2P",
+                                    partial_lane,
+                                    "PHONE_CONTINUATION");
+                            const int64_t cont_join_us =
+                                ggml_time_us() -
+                                cont_join_begin_us;
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
+                            }
+                            if (pipeline_debug) {
+                                printf(
+                                    "[REGION_CONT_JOIN] direction=C2P "
+                                    "layer=%d chunk=%d lane=%zu "
+                                    "wait_ms=%.3f status=OK\n",
+                                    layer,
+                                    chunk,
+                                    partial_lane,
+                                    cont_join_us / 1000.0);
+                            }
+                        }
+
                         if (region_boundary_last &&
                                 !region_chunk_continuation) {
                             status =
