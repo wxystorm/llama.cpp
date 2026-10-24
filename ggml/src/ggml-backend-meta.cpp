@@ -14562,28 +14562,6 @@ auto prefill_norm_sg_has_prework =
                 pc_status != GGML_STATUS_SUCCESS ?
                     pc_status : phone_status;
         } else {
-            const bool p2c_parallel_ffn =
-                region_parallel_ffn &&
-                ((is_single_decode_moe_out &&
-                  ggml_backend_meta_tensor_p2c_layer(
-                      backend_ctx, decode_single_layer_0)) ||
-                 (is_prefill_down_chunk &&
-                  ggml_backend_meta_tensor_p2c_layer(
-                      backend_ctx, prefill_down_layer_0)));
-            if (pipeline_debug && p2c_parallel_ffn) {
-                const int layer =
-                    is_single_decode_moe_out ?
-                        decode_single_layer_0 :
-                        prefill_down_layer_0;
-                const int chunk =
-                    is_single_decode_moe_out ?
-                        -1 : prefill_down_chunk_0;
-                printf(
-                    "[REGION_P2C_FFN_PARALLEL] "
-                    "layer=%d chunk=%d mode=GENERIC_DUAL_WORKER "
-                    "status=SUBMIT\n",
-                    layer, chunk);
-            }
             compute_status = compute_workers.compute(i);
         }
     }

@@ -230,16 +230,14 @@ The serial C2P implementation remains the fallback when the switch is unset or
 when the Router split point cannot be identified.
 
 P2C already reaches its FFN boundary through the generic dual-worker path, so
-phase 1 does not rewrite its compute graph. With the switch enabled it emits
-`REGION_P2C_FFN_PARALLEL` to confirm that both device graphs are submitted by
-the generic dual-worker execution path.
+phase 1 does not rewrite its compute graph. No extra P2C marker is added here;
+the existing P2C correctness/timing logs remain the source of truth.
 
-Expected debug markers:
+Expected new debug markers:
 
 ```text
 [REGION_C2P_FFN_PARALLEL] phase=PREFILL ...
 [REGION_C2P_FFN_PARALLEL] phase=DECODE ...
-[REGION_P2C_FFN_PARALLEL] ... mode=GENERIC_DUAL_WORKER ...
 ```
 
 For the first hardware run, keep the correctness diagnostics enabled and verify
