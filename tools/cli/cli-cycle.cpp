@@ -46,7 +46,7 @@ static bool cli_cycle_eval(
         llama_context * ctx,
         const std::vector<llama_token> & tokens,
         size_t start, size_t count, bool want_last_logits) {
-    if (!ctx || count < 1 || count > 64 ||
+    if (!ctx || count < 1 || count > 128 ||
         start + count > tokens.size()) {
         return false;
     }
@@ -193,7 +193,7 @@ int cli_cycle_run(common_params & params) {
     params.no_extra_bufts = true;
     params.sampling.backend_sampling = false;
     params.n_ctx = params.n_ctx == 0 ? 128 : params.n_ctx;
-    params.n_batch = std::min(params.n_batch, 64);
+    params.n_batch = std::min(params.n_batch, 128);
     params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
 
     llama_backend_init();
@@ -321,7 +321,7 @@ int cli_cycle_run(common_params & params) {
         return 2;
     }
 
-    // Prompt timing must include a final one-token chunk, e.g. 64+1.
+    // Prompt timing must include a final tail chunk, e.g. 128+1.
     if (!llama_cycle_context_set_prompt_phase(ctx, true)) {
         std::fprintf(stderr,
             "[CYCLE_OFFICIAL_CLI] status=FAIL "
@@ -340,7 +340,7 @@ int cli_cycle_run(common_params & params) {
             return 130;
         }
         const size_t len = std::min<size_t>(
-            64, prompt_tokens.size() - off);
+            128, prompt_tokens.size() - off);
         if (!cli_cycle_eval(ctx, prompt_tokens, off, len,
                             off + len == prompt_tokens.size())) {
             return 1;
