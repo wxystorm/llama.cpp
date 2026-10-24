@@ -193,8 +193,10 @@ int cli_cycle_run(common_params & params) {
     params.no_extra_bufts = true;
     params.sampling.backend_sampling = false;
     params.n_ctx = params.n_ctx == 0 ? 128 : params.n_ctx;
-    params.n_batch = std::min(params.n_batch, params.n_ctx);
-    params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
+    // Cycle has exactly one outer Prompt append. -b/-ub do not create an
+    // additional batching layer; the executor owns its 64-token Chunks.
+    params.n_batch = params.n_ctx;
+    params.n_ubatch = params.n_ctx;
 
     llama_backend_init();
     std::fprintf(stderr,
