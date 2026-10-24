@@ -942,6 +942,7 @@ static bool cycle_core_evaluate_with_kv(
                         }
 
             llama_hybrid_cycle_chunk_timeline timeline;
+            llama_hybrid_cycle_fifo_profile queue_profile;
             if (ok && !stages.validate(reason)) ok = false;
             if (ok) {
                 std::printf(
@@ -950,7 +951,21 @@ static bool cycle_core_evaluate_with_kv(
                     "phone=REAL_GPU rpc=REAL_BIDIRECTIONAL "
                     "pc_reduce=EXCLUSIVE status=BEGIN\n",
                     n_tokens, n_chunks, max_inflight);
-                ok = runtime.run(stages, nullptr, &timeline);
+                ok = runtime.run(stages, &queue_profile, &timeline);
+                for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
+                    const auto & v = queue_profile.queues[q];
+                    std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
+                                "execute_ms=%.3f max_execute_ms=%.3f "
+                                "queue_wait_ms=%.3f max_queue_wait_ms=%.3f "
+                                "idle_wait_ms=%.3f idle_wakes=%llu "
+                                "scope=HOST_CALLBACK status=MEASURED\n",
+                                llama_hybrid_cycle_queue_name(
+                                    static_cast<llama_hybrid_cycle_queue>(q)),
+                                (unsigned long long) v.tasks, v.execute_ms,
+                                v.max_execute_ms, v.queue_wait_ms,
+                                v.max_queue_wait_ms, v.idle_wait_ms,
+                                (unsigned long long) v.idle_wakes);
+                }
             }
             if (ok) {
                 ok = ggml_backend_rpc_cycle_wait_tx_idle(phone, 30000);
@@ -1080,7 +1095,8 @@ llama_hybrid_cycle_session::~llama_hybrid_cycle_session() {
 bool llama_hybrid_cycle_session::prepare(
         const llama_model & model, ggml_backend_t cpu,
         ggml_backend_t phone, int64_t max_total_tokens,
-        std::string & reason, int chunk_tokens, int max_inflight) {
+        std::string & reason, int chunk_tokens, int max_inflight,
+        ggml_backend_t pc_cuda, size_t cuda_weight_budget_bytes) {
     reset();
     reason.clear();
     if (!cpu || !phone ||
@@ -1089,7 +1105,8 @@ bool llama_hybrid_cycle_session::prepare(
         !ggml_backend_is_rpc(phone) ||
         max_total_tokens < 1 || max_total_tokens > 512 ||
         chunk_tokens < 1 || chunk_tokens > 16 ||
-        max_inflight < 1 || max_inflight > 2) {
+        max_inflight < 1 || max_inflight > 2 ||
+        (cuda_weight_budget_bytes != 0 && !pc_cuda)) {
         reason = "INVALID_CYCLE_SESSION_CONFIG";
         return false;
     }
@@ -1104,7 +1121,7 @@ bool llama_hybrid_cycle_session::prepare(
     llama_hybrid_cycle_resource_config config;
     config.kv_tokens = max_total_tokens;
     config.max_inflight = max_inflight;
-    config.cuda_weight_budget_bytes = 0;
+    config.cuda_weight_budget_bytes = cuda_weight_budget_bytes;
     // In monotonically growing decode the (query_tokens, kv_tokens) shape
     // never repeats. For >128-token sessions keep the bounded, reusable GPU
     // Scratch Pool but do not retain 16 * 48 host-only graph metadata blobs
@@ -1113,11 +1130,13 @@ bool llama_hybrid_cycle_session::prepare(
     config.attention_graph_cache = true;
     config.attention_graph_cache_max_graphs =
         max_total_tokens <= 128 ? 16 : 0;
-    if (!pool->prepare(model, layout, cpu, phone, nullptr,
+    if (!pool->prepare(model, layout, cpu, phone, pc_cuda,
                        config, reason)) return false;
     model_ = &model;
     cpu_ = cpu;
     phone_ = phone;
+    cuda_ = pc_cuda;
+    cuda_weight_budget_bytes_ = cuda_weight_budget_bytes;
     capacity_ = max_total_tokens;
     chunk_tokens_ = chunk_tokens;
     max_inflight_ = max_inflight;
@@ -1128,9 +1147,12 @@ bool llama_hybrid_cycle_session::prepare(
     std::printf(
         "[CYCLE_SESSION] phase=PREPARE physical_kv_capacity=%lld "
         "layers=48 window=%d attention_graph_cache_slots=%zu "
-        "scratch_pool=1 phone_gpu=REAL status=PASS\n",
+        "scratch_pool=1 phone_gpu=REAL cuda_layers=%d "
+        "cuda_budget_mib=%.2f status=PASS\n",
         (long long) capacity_, max_inflight_,
-        config.attention_graph_cache_max_graphs);
+        config.attention_graph_cache_max_graphs,
+        resources_->cuda_mirror_layers(),
+        double(cuda_weight_budget_bytes_) / (1024.0 * 1024.0));
     return true;
 }
 
