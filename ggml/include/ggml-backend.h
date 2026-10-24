@@ -512,6 +512,11 @@ extern "C" {
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer);
+    // Sparse layer policy for Region Boundary V1. A non-zero mask entry means
+    // the Tensor boundary's Attention/control owner is Phone (P2C).
+    // Passing nullptr with n_layers == 0 clears the sparse policy.
+    GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layer_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
