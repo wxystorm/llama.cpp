@@ -3,6 +3,7 @@
 
 #include "llama-model.h"
 #include "llama-hybrid-cycle-pc-full.h"
+#include "llama-hybrid-cycle-pc-region.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-full.h"
 #include "llama-hybrid-cycle-p2c-real.h"
@@ -224,6 +225,7 @@ static bool cycle_core_evaluate_with_kv(
                         std::atomic<int> real_p2c_partial_ack {0};
                         std::atomic<int> p2c_device_handoffs {0};
                         std::atomic<int> p2c_slot_reuse {0};
+                        std::atomic<int> pc_cuda_region_calls {0};
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -232,11 +234,13 @@ static bool cycle_core_evaluate_with_kv(
                         rc.pc_cpu_reduce_priority = true;
                         rc.ordered_c2p_reduce = true;
                         rc.phone_main_priority = true;
+                        rc.pc_cuda_chunk_priority = true;
                         llama_hybrid_cycle_runtime runtime(rc);
                         llama_hybrid_cycle_stage_dispatcher stages(layout);
-                        if (ok && !llama_hybrid_cycle_bind_pc_full_stages(
-                                stages, *model, resources, cpu, session,
-                                initial_hidden, hidden, reason, pc_trace)) {
+                        if (ok && !llama_hybrid_cycle_bind_pc_region_stages(
+                                stages, *model, resources, session,
+                                initial_hidden, hidden, reason,
+                                &pc_cuda_region_calls)) {
                             std::fprintf(stderr,
                                 "[CYCLE_REAL_PC_RING] status=FAIL "
                                 "reason=BIND_REAL_PC detail=%s\n",
