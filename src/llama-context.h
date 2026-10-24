@@ -429,6 +429,7 @@ private:
     std::vector<float> cycle_logits_storage;
     bool cycle_perf_phase_explicit = false;
     bool cycle_perf_is_prompt = false;
+    size_t cycle_cuda_weight_budget_bytes = 0;
 
     llama_cparams cparams;
 
