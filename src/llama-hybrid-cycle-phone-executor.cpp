@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-phone-executor.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "../ggml/src/ggml-backend-impl.h" // GPU local tensor-to-tensor copy
 
@@ -149,7 +150,7 @@ bool llama_hybrid_cycle_phone_ffn_slot::prepare(
         gpu_alloc_ms = std::chrono::duration<double, std::milli>(
             alloc_end - build_end).count();
         prepared_tokens = tokens;
-        std::printf(
+        if (llama_hybrid_cycle_verbose()) std::printf(
             "[CYCLE_GPU_PREPARE] phase=PHONE_FFN graph_build_ms=%.3f "
             "gpu_alloc_ms=%.3f source=PC_CLIENT status=OK\n",
             graph_build_ms, gpu_alloc_ms);
@@ -282,7 +283,7 @@ bool llama_hybrid_cycle_phone_ffn_slot::execute_ffn() {
         const bool ok = executor.execute_device_ready();
         ffn_graph_submit_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();
-        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_FFN "
+        if (!ok || llama_hybrid_cycle_verbose()) std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_FFN "
                     "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
                     "status=%s\n",
                     ffn_graph_submit_ms, ok ? "OK" : "FAIL");
@@ -319,7 +320,7 @@ bool llama_hybrid_cycle_phone_ffn_slot::execute_reduce(ggml_backend_t phone) {
                 done - graph_done).count();
         reduce_graph_submit_ms = reduce_graph_call_ms +
             reduce_backend_sync_ms;
-        std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE mode=%s "
+        if (!ok || llama_hybrid_cycle_verbose()) std::printf("[CYCLE_GPU_SUBMIT] phase=PHONE_REDUCE mode=%s "
                     "graph_submit_ms=%.3f gpu_compute_ms=SERVER_ONLY "
                     "status=%s\n",
                     is_full_layer ? "PHONE_FULL" : "TENSOR_C2P",
