@@ -309,6 +309,35 @@ llama_context::llama_context(
             throw std::runtime_error("Cycle standard Phone backend init failed");
         }
         backends.emplace_back(phone);
+        size_t cycle_cuda_budget_bytes = 0;
+        if (const char * value = std::getenv("LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB")) {
+            char * tail = nullptr;
+            const unsigned long long mib = std::strtoull(value, &tail, 10);
+            constexpr unsigned long long scale = 1024ULL * 1024ULL;
+            if (!*value || value[0] == '-' || !tail || *tail ||
+                mib > std::numeric_limits<size_t>::max() / scale) {
+                throw std::runtime_error("invalid LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB");
+            }
+            cycle_cuda_budget_bytes = size_t(mib * scale);
+        }
+        ggml_backend_t cycle_cuda_backend = nullptr;
+        if (cycle_cuda_budget_bytes) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (!dev || !reg ||
+                    ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                    std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) continue;
+                cycle_cuda_backend = ggml_backend_dev_init(dev, nullptr);
+                if (cycle_cuda_backend) {
+                    backends.emplace_back(cycle_cuda_backend);
+                    break;
+                }
+            }
+            if (!cycle_cuda_backend)
+                throw std::runtime_error("Cycle CUDA budget requested but CUDA backend unavailable");
+        }
+        cycle_cuda_weight_budget_bytes = cycle_cuda_budget_bytes;
 
         // Unlike the ordinary constructor's long initialization route,
         // this early-return Cycle path must value-initialize every
@@ -347,7 +376,8 @@ llama_context::llama_context(
         const int64_t capacity = cparams.n_ctx;
         std::string reason;
         auto native = std::make_unique<llama_hybrid_cycle_session>();
-        if (!native->prepare(model, pc, phone, capacity, reason, 16, 2)) {
+        if (!native->prepare(model, pc, phone, capacity, reason, 16, 2,
+                             cycle_cuda_backend, cycle_cuda_budget_bytes)) {
             throw std::runtime_error(
                 "Cycle standard physical KV prepare failed: " + reason);
         }
@@ -4577,7 +4607,7 @@ bool llama_context::reset_cycle() {
     return false;
 #else
     if (!cycle_session || !cycle_session->usable() ||
-        backends.size() != 2 || !backend_cpu) {
+        (backends.size() != 2 && backends.size() != 3) || !backend_cpu) {
         // A failed physical FIFO may have committed KV on only a subset
         // of devices. Never reset/reuse a poisoned context over that state.
         return false;
@@ -4585,7 +4615,9 @@ bool llama_context::reset_cycle() {
     std::string reason;
     const bool ok = cycle_session->prepare(
         model, backend_cpu, backends[1].get(),
-        cparams.n_ctx, reason, 16, 2);
+        cparams.n_ctx, reason, 16, 2,
+        backends.size() == 3 ? backends[2].get() : nullptr,
+        cycle_cuda_weight_budget_bytes);
     cycle_logits_storage.clear();
     logits = {nullptr, 0};
     output_ids.clear();
