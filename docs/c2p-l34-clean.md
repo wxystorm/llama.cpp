@@ -389,3 +389,78 @@ correct priority topology before incoming-FFN waits are deferred.
 
 Reduce remains on the existing GPU backend in this version. CPU Reduce can be
 A/B tested later after the queue/window topology is correct.
+
+
+### Directional boundary window=2 V1
+
+Enable the first two-credit Region boundary window with:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_WINDOW = "2"
+```
+
+It requires the already-proven switches:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_PRIORITY_QUEUES = "1"
+$env:LLAMA_HYBRID_REGION_ASYNC_PARTIAL = "1"
+```
+
+V1 gives each directional boundary two independent credits:
+
+```text
+lane = chunk % 2
+```
+
+Each credit pins both pieces required by the final reducer:
+
+- the outgoing remote partial in a private per-lane staging buffer;
+- the reducer-side local FFN partial in a separate private per-lane staging
+  buffer, so the next chunk cannot overwrite it through graph-arena reuse.
+
+The asynchronous task for each credit performs:
+
+```text
+PARTIAL transfer
+  -> destination visible
+  -> enqueue final Reduce on MAIN/HIGH
+  -> Reduce complete
+  -> credit may retire
+```
+
+Therefore C2P can overlap:
+
+```text
+chunk0: PC->Phone PARTIAL / Phone MAIN Reduce
+chunk1: C2P Router + PC FFN + PHONE_C2P_FFN
+```
+
+and P2C mirrors it:
+
+```text
+chunk0: Phone->PC PARTIAL / PC MAIN Reduce
+chunk1: P2C Router + Phone FFN + PC_P2C_FFN
+```
+
+A credit is released only after final Reduce has completed. Lane reuse waits for
+the previous owner of that lane, and the final boundary chunk drains both
+credits before downstream ownership is consumed.
+
+Expected markers:
+
+```text
+[REGION_WINDOW_CONFIG] requested=2 active=1 credits=2
+[REGION_CREDIT] direction=C2P event=ACQUIRE ... inflight=1/2
+[REGION_CREDIT] direction=C2P event=ACQUIRE ... inflight=2/2
+[REGION_RETURN_TX] direction=C2P ... lane=0/1
+[REGION_EXEC_QUEUE] ... queue=MAIN ... role=REDUCE ... ENQUEUED_ASYNC
+[REGION_CREDIT] direction=C2P event=RELEASE ... reason=LANE_REUSE/BOUNDARY_DRAIN
+```
+
+P2C has the same mirrored markers.
+
+This V1 pipelines the directional boundaries themselves. The current graph
+still finishes all L34 chunks before entering the full Phone L35-L45 graph.
+The later full Region pipeline step will chunk the local full-region graph so
+that an earlier chunk can already advance through L35-L46 while the next
+chunk is still in the incoming C2P FFN queue.
