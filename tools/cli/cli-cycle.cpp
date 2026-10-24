@@ -26,6 +26,12 @@ bool cli_cycle_requested() {
     return value && std::strcmp(value, "1") == 0;
 }
 
+// The CLI uses stderr for operational status and stdout for generated text.
+static bool cli_cycle_verbose() {
+    const char * value = std::getenv("LLAMA_HYBRID_CYCLE_VERBOSE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static bool cli_cycle_eval(
         llama_context * ctx,
         const std::vector<llama_token> & tokens,
@@ -47,7 +53,7 @@ static bool cli_cycle_eval(
     }
     const int code = llama_decode(ctx, batch);
     llama_batch_free(batch);
-    std::fprintf(stderr,
+    if (code != 0 || cli_cycle_verbose()) std::fprintf(stderr,
         "[CYCLE_OFFICIAL_CLI] stage=PUBLIC_DECODE "
         "position=%zu tokens=%zu final_logits=%d code=%d status=%s\n",
         start, count, int(want_last_logits), code,
@@ -317,7 +323,7 @@ int cli_cycle_run(common_params & params) {
                 prompt_tokens.size() + i, rc);
             return 1;
         }
-        std::fprintf(stderr,
+        if (cli_cycle_verbose()) std::fprintf(stderr,
             "[CYCLE_OFFICIAL_CLI] stage=INCREMENTAL_DECODE "
             "position=%zu tokens=1 status=PASS\n",
             prompt_tokens.size() + i);
