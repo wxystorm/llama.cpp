@@ -446,6 +446,37 @@ static int llama_hybrid_region_boundary_env_int(
 
 static std::vector<llama_hybrid_layer_mode>
 llama_build_region_boundary_v1_policy(int n_layer) {
+    const bool c2p_only =
+        llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_REGION_C2P_ONLY", 0) != 0;
+    if (c2p_only) {
+        const int default_layer = std::max(0, n_layer - 2);
+        const int c2p_layer = llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_REGION_C2P_LAYER", default_layer);
+        if (c2p_layer < 0 || c2p_layer >= n_layer - 1) {
+            throw std::runtime_error(
+                "invalid C2P-only layer: require 0 <= layer < n_layer-1");
+        }
+
+        std::vector<llama_hybrid_layer_mode> policy(
+            n_layer, llama_hybrid_layer_mode::PC_ONLY);
+        policy[c2p_layer] = llama_hybrid_layer_mode::TENSOR_C2P;
+        std::fill(
+            policy.begin() + c2p_layer + 1,
+            policy.end(),
+            llama_hybrid_layer_mode::PHONE_ONLY);
+
+        LLAMA_LOG_ERROR(
+            "[REGION_BOUNDARY_V1] mode=C2P_ONLY c2p_layer=%d "
+            "pc=[0,%d) phone=[%d,%d) layers=%d status=POLICY_READY\n",
+            c2p_layer,
+            c2p_layer,
+            c2p_layer + 1,
+            n_layer,
+            n_layer);
+        return policy;
+    }
+
     const int cycle_size = llama_hybrid_region_boundary_env_int(
         "LLAMA_HYBRID_REGION_CYCLE_SIZE", 8);
     const int c2p_offset = llama_hybrid_region_boundary_env_int(
