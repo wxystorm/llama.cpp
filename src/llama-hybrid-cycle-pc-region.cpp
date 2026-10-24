@@ -6,6 +6,7 @@
 
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -709,6 +710,12 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
         return false;
     }
 
+    // One allocator/cache is shared by all six PC CUDA Regions in this
+    // invocation. The PC_CUDA queue has a single worker, so no cache lock is
+    // required and the gallocr workspace can be rebound safely per graph.
+    auto region_cache =
+        std::make_shared<llama_hybrid_cycle_pc_region_cache>(2);
+
     for (int cycle = 0; cycle < layout.cycles; ++cycle) {
         const int begin = cycle * layout.cycle_size;
         const int end = begin + layout.x;
@@ -730,7 +737,7 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
         const bool start_bound = stages.bind(
             begin, llama_hybrid_cycle_stage::FULL_LAYER,
             [begin, end, hidden, &model, &resources, &session,
-             &initial_hidden, region_calls](
+             &initial_hidden, region_calls, region_cache](
                 const llama_hybrid_cycle_task & task) -> bool {
                 if (task.layer != begin ||
                     task.stage != llama_hybrid_cycle_stage::FULL_LAYER ||
@@ -777,11 +784,13 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
 
                 std::string execute_reason;
                 llama_hybrid_cycle_pc_region_timing timing;
-                const bool ok = llama_hybrid_cycle_execute_pc_full_region(
-                    model, resources, begin, end - begin,
-                    start_state.start, start_state.tokens,
-                    input, tail_state.host_output, execute_reason,
-                    task.input_consumed, &timing);
+                const bool ok =
+                    llama_hybrid_cycle_execute_pc_full_region_cached(
+                        model, resources, *region_cache,
+                        begin, end - begin,
+                        start_state.start, start_state.tokens,
+                        input, tail_state.host_output, execute_reason,
+                        task.input_consumed, &timing);
                 if (!ok) {
                     std::fprintf(stderr,
                         "[CYCLE_PC_CUDA_REGION] layers=[%d,%d) chunk=%d "
@@ -803,13 +812,22 @@ bool llama_hybrid_cycle_bind_pc_region_stages(
                 if (llama_hybrid_cycle_verbose()) {
                     std::printf(
                         "[CYCLE_PC_CUDA_REGION_PROFILE] layers=[%d,%d) "
-                        "chunk=%d graph_build_ms=%.3f alloc_ms=%.3f "
-                        "input_ms=%.3f compute_ms=%.3f readback_ms=%.3f "
-                        "nodes=%d status=PASS\n",
+                        "chunk=%d cache=%s graph_build_ms=%.3f "
+                        "alloc_ms=%.3f input_ms=%.3f compute_ms=%.3f "
+                        "readback_ms=%.3f nodes=%d galloc_mib=%.3f "
+                        "cache_hits=%llu cache_builds=%llu "
+                        "cache_evictions=%llu allocator_grows=%llu "
+                        "status=PASS\n",
                         begin, end, task.chunk,
+                        timing.cache_hit ? "HIT" : "MISS",
                         timing.graph_build_ms, timing.alloc_ms,
                         timing.input_ms, timing.compute_ms,
-                        timing.readback_ms, timing.graph_nodes);
+                        timing.readback_ms, timing.graph_nodes,
+                        double(timing.allocator_bytes) / (1024.0 * 1024.0),
+                        (unsigned long long) region_cache->hits(),
+                        (unsigned long long) region_cache->builds(),
+                        (unsigned long long) region_cache->evictions(),
+                        (unsigned long long) region_cache->allocator_grows());
                 }
                 return true;
             });
