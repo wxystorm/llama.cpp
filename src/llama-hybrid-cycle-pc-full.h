@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -98,10 +99,20 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
             reason = "PC_FULL_UNPREPARED_LAYER layer=" + std::to_string(l);
             return false;
         }
+        const bool cuda_predecessor =
+            device_local && l > 0 &&
+            layout.kinds[size_t(l - 1)] ==
+                llama_hybrid_cycle_layer_kind::PC_CPU &&
+            llama_hybrid_cycle_full_layer_on_cuda(layout, l - 1);
+        const bool cuda_successor =
+            device_local && l + 1 < int(layout.kinds.size()) &&
+            layout.kinds[size_t(l + 1)] ==
+                llama_hybrid_cycle_layer_kind::PC_CPU &&
+            llama_hybrid_cycle_full_layer_on_cuda(layout, l + 1);
         const bool bound = stages.bind(l, llama_hybrid_cycle_stage::FULL_LAYER,
             [l, hidden, pc_cpu, &resources, &session, &model,
-             &initial_hidden, trace_output, device_local,
-             cuda_idle_by_layer](
+             &initial_hidden, trace_output, cuda_predecessor,
+             cuda_successor, cuda_idle_by_layer](
                 const llama_hybrid_cycle_task & task) {
                 if (task.layer != l || task.chunk < 0 ||
                     task.chunk >= session.chunks_per_layer() ||
@@ -110,16 +121,6 @@ bool llama_hybrid_cycle_bind_pc_full_stages(
                 }
                 auto & chunk = session.at(l, task.chunk);
                 std::vector<float> input;
-                const bool cuda_predecessor =
-                    device_local && l > 0 &&
-                    layout.kinds[size_t(l - 1)] ==
-                        llama_hybrid_cycle_layer_kind::PC_CPU &&
-                    llama_hybrid_cycle_full_layer_on_cuda(layout, l - 1);
-                const bool cuda_successor =
-                    device_local && l + 1 < int(layout.kinds.size()) &&
-                    layout.kinds[size_t(l + 1)] ==
-                        llama_hybrid_cycle_layer_kind::PC_CPU &&
-                    llama_hybrid_cycle_full_layer_on_cuda(layout, l + 1);
                 const ggml_tensor * device_input = nullptr;
                 if (cuda_predecessor) {
                     device_input =
