@@ -293,36 +293,92 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     const char * region_chunk_cont_env =
         std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
-    bool directional_region_chunk_cont =
+    const bool region_chunk_cont_requested =
         region_chunk_cont_env != nullptr &&
-        std::atoi(region_chunk_cont_env) != 0 &&
-        stage_graph &&
+        std::atoi(region_chunk_cont_env) != 0;
+
+    int region_c2p_layer = -1;
+    int region_p2c_layer = -1;
+    int region_c2p_count = 0;
+    int region_p2c_count = 0;
+    bool directional_region_chunk_cont =
+        region_chunk_cont_requested &&
+        !stage_graph &&
         n_tokens > 1 &&
+        ubatch.n_pos == 1 &&
+        ubatch.n_seqs_unq == 1 &&
+        (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
         planned_chunk_tokens > 0 &&
         model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-        loras->empty() &&
-        model.hybrid_layer_mode(layer_begin) ==
-            llama_hybrid_layer_mode::TENSOR_C2P &&
-        model.hybrid_layer_mode(layer_end - 1) ==
-            llama_hybrid_layer_mode::TENSOR_P2C;
-
-    for (int il = layer_begin + 1;
-            directional_region_chunk_cont && il < layer_end - 1;
-            ++il) {
-        directional_region_chunk_cont =
-            model.hybrid_layer_mode(il) ==
-                llama_hybrid_layer_mode::PHONE_ONLY &&
-            cvec->tensor_for(il) == nullptr;
-    }
+        loras->empty();
 
     if (directional_region_chunk_cont) {
-        const std::vector<int> chunk_sizes =
-            llama_hybrid_runtime_tensor_chunks(
-                (int) n_tokens, planned_chunk_tokens);
+        for (int il = 0; il < n_layer; ++il) {
+            const llama_hybrid_layer_mode mode =
+                model.hybrid_layer_mode(il);
+            if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+                ++region_c2p_count;
+                region_c2p_layer = il;
+            } else if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+                ++region_p2c_count;
+                region_p2c_layer = il;
+            }
+        }
+
         directional_region_chunk_cont =
-            chunk_sizes.size() > 1;
+            region_c2p_count == 1 &&
+            region_p2c_count == 1 &&
+            region_c2p_layer >= 0 &&
+            region_p2c_layer > region_c2p_layer + 1 &&
+            region_p2c_layer < n_layer - 1;
+
+        for (int il = region_c2p_layer + 1;
+                directional_region_chunk_cont &&
+                il < region_p2c_layer;
+                ++il) {
+            directional_region_chunk_cont =
+                model.hybrid_layer_mode(il) ==
+                    llama_hybrid_layer_mode::PHONE_ONLY &&
+                cvec->tensor_for(il) == nullptr;
+        }
 
         if (directional_region_chunk_cont) {
+            directional_region_chunk_cont =
+                cvec->tensor_for(region_c2p_layer) == nullptr &&
+                cvec->tensor_for(region_p2c_layer) == nullptr &&
+                llama_hybrid_runtime_tensor_chunks(
+                    (int) n_tokens,
+                    planned_chunk_tokens).size() > 1;
+        }
+    }
+
+    if (region_chunk_cont_requested && n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[REGION_CONT_FULL_GRAPH_CAP] enabled=%d tokens=%" PRId64
+            " c2p=%d p2c=%d c2p_count=%d p2c_count=%d "
+            "stage_graph=%d XT=%d status=%s\n",
+            directional_region_chunk_cont ? 1 : 0,
+            n_tokens,
+            region_c2p_layer,
+            region_p2c_layer,
+            region_c2p_count,
+            region_p2c_count,
+            stage_graph ? 1 : 0,
+            planned_chunk_tokens,
+            directional_region_chunk_cont ? "READY" : "DISABLED");
+    }
+
+    auto build_directional_region =
+        [&](ggml_tensor * region_inp) -> ggml_tensor * {
+            GGML_ASSERT(directional_region_chunk_cont);
+            const int c2p_layer = region_c2p_layer;
+            const int p2c_layer = region_p2c_layer;
+            const std::vector<int> chunk_sizes =
+                llama_hybrid_runtime_tensor_chunks(
+                    (int) n_tokens,
+                    planned_chunk_tokens);
+            GGML_ASSERT(chunk_sizes.size() > 1);
+
             std::string layout;
             for (size_t ci = 0; ci < chunk_sizes.size(); ++ci) {
                 if (!layout.empty()) {
@@ -334,12 +390,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 "[REGION_CONT_GRAPH] enabled=1 layers=[%d,%d) "
                 "c2p=%d phone=[%d,%d) p2c=%d tokens=%" PRId64
                 " XT=%d chunks=%s mode=BOUNDARY_SEED_THEN_CHUNK_MAJOR\n",
-                layer_begin,
+                c2p_layer,
                 layer_end,
-                layer_begin,
-                layer_begin + 1,
-                layer_end - 1,
-                layer_end - 1,
+                c2p_layer,
+                c2p_layer + 1,
+                p2c_layer,
+                p2c_layer,
                 n_tokens,
                 planned_chunk_tokens,
                 layout.c_str());
@@ -357,8 +413,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // expose all C2P FFN chunks.  Meta can place the Phone shard on
             // PHONE_C2P_FFN and retire each chunk independently into the
             // stable Phone l_out backing.
-            const int c2p_layer = layer_begin;
-            ggml_tensor * c2p_inp = inpL;
+            ggml_tensor * c2p_inp = region_inp;
             ggml_tensor * c2p_attn_norm =
                 build_norm(
                     c2p_inp,
@@ -529,7 +584,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     c2p_layer + 1);
 
                 for (int il = c2p_layer + 1;
-                        il < layer_end;
+                        il <= p2c_layer;
                         ++il) {
                     const llama_hybrid_layer_mode mode =
                         model.hybrid_layer_mode(il);
@@ -732,14 +787,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         1);
             }
             cur = ggml_add(ctx0, p2c_down, p2c_residual);
-            cb(cur, "l_out", layer_end - 1);
+            cb(cur, "l_out", p2c_layer);
             ggml_build_forward_expand(gf, cur);
 
-            res->t_stage_output = cur;
-            ggml_set_output(cur);
-            return;
-        }
-    }
+            return cur;
+        
+            GGML_ABORT("directional Region builder did not return output");
+        };
 
     if (moe_stage_wavefront) {
         std::vector<int64_t> chunk_begin(
@@ -1113,6 +1167,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     for (int il = layer_begin; il < layer_end; ++il) {
+        if (directional_region_chunk_cont &&
+                il == region_c2p_layer) {
+            res->t_layer_inp[il] = inpL;
+            cur = build_directional_region(inpL);
+            inpL = cur;
+            il = region_p2c_layer;
+            continue;
+        }
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
