@@ -7142,6 +7142,133 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             // a synchronous PC->Phone copy before the next phone computation.
         }
 
+        int c2p_route_chunk = -1;
+        int c2p_route_layer = -1;
+        bool c2p_route_boundary = false;
+        if (n_backends == 2) {
+            c2p_route_boundary =
+                ggml_backend_meta_parse_c2p_route_weights(
+                    nodes[0]->name,
+                    c2p_route_chunk,
+                    c2p_route_layer);
+            if (!c2p_route_boundary) {
+                c2p_route_boundary =
+                    ggml_backend_meta_parse_c2p_route_weights(
+                        nodes[1]->name,
+                        c2p_route_chunk,
+                        c2p_route_layer);
+            }
+        }
+
+        const bool c2p_router_handoff =
+            c2p_route_boundary &&
+            ggml_backend_meta_tensor_c2p_layer(
+                backend_ctx, c2p_route_layer);
+
+        if (c2p_router_handoff) {
+            handled = true;
+
+            char topk_name[96];
+            char weights_name[96];
+            if (c2p_route_chunk >= 0) {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "c2p_prefill_route_topk_chunk_%d-%d",
+                    c2p_route_chunk, c2p_route_layer);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "c2p_prefill_route_weights_chunk_%d-%d",
+                    c2p_route_chunk, c2p_route_layer);
+            } else {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "c2p_moe_route_topk-%d",
+                    c2p_route_layer);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "c2p_moe_route_weights-%d",
+                    c2p_route_layer);
+            }
+
+            ggml_tensor * src_topk =
+                find_exact_named_tensor(0, topk_name);
+            ggml_tensor * dst_topk =
+                find_exact_named_tensor(1, topk_name);
+            ggml_tensor * src_weights =
+                find_exact_named_tensor(0, weights_name);
+            ggml_tensor * dst_weights =
+                find_exact_named_tensor(1, weights_name);
+
+            GGML_ASSERT(src_topk != nullptr);
+            GGML_ASSERT(dst_topk != nullptr);
+            GGML_ASSERT(src_weights != nullptr);
+            GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(
+                ggml_nbytes(src_topk) ==
+                ggml_nbytes(dst_topk));
+            GGML_ASSERT(
+                ggml_nbytes(src_weights) ==
+                ggml_nbytes(dst_weights));
+
+            auto & pc_cfg =
+                backend_ctx->backend_configs[0];
+            auto & phone_cfg =
+                backend_ctx->backend_configs[1];
+
+            // Correctness-first C2P route handoff:
+            // the PC-owned Router must be complete before Phone expert
+            // dispatch consumes TopK/weights.  Keep this ordered/synchronous
+            // for now; later it can be coalesced with READY staging.
+            ggml_backend_synchronize(pc_cfg.backend);
+
+            const int64_t topk_copy_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend,
+                phone_cfg.backend,
+                src_topk,
+                dst_topk);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t topk_copy_us =
+                ggml_time_us() - topk_copy_begin_us;
+            record_copy_wait(topk_copy_us);
+            record_meta_copy(
+                i, 0, 1, src_topk, topk_copy_us);
+            record_direct_copy();
+
+            const int64_t weights_copy_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend,
+                phone_cfg.backend,
+                src_weights,
+                dst_weights);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t weights_copy_us =
+                ggml_time_us() - weights_copy_begin_us;
+            record_copy_wait(weights_copy_us);
+            record_meta_copy(
+                i, 0, 1, src_weights, weights_copy_us);
+            record_direct_copy();
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_ROUTE] layer=%d chunk=%d "
+                    "direction=PC_TO_PHONE "
+                    "topk_bytes=%zu weights_bytes=%zu "
+                    "topk_ms=%.3f weights_ms=%.3f "
+                    "owner=PC status=OK\n",
+                    c2p_route_layer,
+                    c2p_route_chunk,
+                    ggml_nbytes(src_topk),
+                    ggml_nbytes(src_weights),
+                    topk_copy_us / 1000.0,
+                    weights_copy_us / 1000.0);
+            }
+
+            return GGML_STATUS_SUCCESS;
+        }
+
         int phone_route_chunk = -1;
         int phone_route_layer = -1;
         bool phone_route_boundary = false;
