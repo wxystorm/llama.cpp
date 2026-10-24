@@ -110,12 +110,14 @@ has not yet been compiled or hardware-verified.
 ## Exact present limitations
 
 Only the 48-layer Qwen3-30B-A3B fixed `X=4,Y=2` layout, one sequence,
-one single-turn **model Chat Template or raw completion** prompt, <=128 tokens per `llama_decode` invocation,
-<=512 total physical KV, and only final-token Logits are supported.
+one single-turn **model Chat Template or raw completion** prompt, <=512 total physical KV,
+and only final-token Logits are supported. Cycle Prefill uses one public
+`llama_decode` append for the complete Prompt and performs its own 64-token
+Layer×Chunk scheduling internally.
 
-The direct CLI evaluates the prompt in <=128-token batches and generates
-up to the requested `-n`, provided `prompt_tokens + n_predict - 1 <=
-n_ctx <= 512`. If the request exceeds capacity it **fails explicitly**;
+The direct CLI evaluates the complete Prompt as one global FIFO ring and
+generates up to the requested `-n`, provided `prompt_tokens + n_predict - 1 <=
+n_ctx <= 512`. There is no second 64/128-token outer Prompt batching loop. If the request exceeds capacity it **fails explicitly**;
 it does not silently shift, truncate, replay or edit physical KV.
 
 `--server-base`, multiple sequences, server-slot state, multimodal input,
@@ -166,12 +168,10 @@ KV prefix. This validates historical K/V and causal masks beyond the old
 A normal EOS token may end generation early; the long Prompt must itself
 cross 128. After 256 succeeds, retry the same Prompt with `-c 512`.
 
-For `n_ctx > 128`, old Attention Graph metadata caching is disabled for
-monotonically increasing KV shapes (which cannot repeat within the same
-session); the existing Attention Scratch Pool, Phone FFN cache and data-plane
-Buffer Ownership remain active. This avoids retaining 16 large, never-reused
-host graph metadata allocations per physical layer. No change is made to
-128-token session reuse behavior.
+Retained Attention Graph metadata caching is disabled for the production
+session because its `(query_tokens, kv_tokens)` shapes advance monotonically
+and do not repeat. The Attention Scratch Pool, Phone FFN shape-slot reuse and
+data-plane Buffer Ownership remain active.
 
 ## Official Prompt / Eval performance and UI
 
