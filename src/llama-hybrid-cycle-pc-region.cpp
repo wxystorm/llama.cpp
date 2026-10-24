@@ -60,6 +60,12 @@ bool llama_hybrid_cycle_execute_pc_full_region(
     // Pin the whole contiguous Region in the bounded LRU before building any
     // graph. The PC_CUDA queue has one worker, so no other residency fault can
     // evict these mirrors until this Region call returns.
+    if (resources.cuda_mirror_layers() < layer_count) {
+        reason = "PC_REGION_RESIDENCY_CAPACITY required=" +
+                 std::to_string(layer_count) + " available=" +
+                 std::to_string(resources.cuda_mirror_layers());
+        return false;
+    }
     std::vector<const llama_hybrid_cycle_physical_layer_resources *> region;
     region.reserve(size_t(layer_count));
     ggml_backend_t cuda = nullptr;
