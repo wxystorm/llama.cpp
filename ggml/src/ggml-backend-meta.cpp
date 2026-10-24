@@ -5066,6 +5066,51 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return false;
         };
 
+    // Prefill-only detector used at a Phone full-region exit.  A P2C
+    // boundary starts with Phone-owned Attention, so the preceding full
+    // activation must stay Phone-local; the P2C Router/READY path will send
+    // exactly the data the PC shard needs.  Keep this detector deliberately
+    // narrower than the generic Tensor-layer helpers so Decode semantics are
+    // unchanged.
+    auto subgraph_prefill_p2c_layer =
+        [&](size_t sg, int & layer) -> bool {
+            layer = -1;
+            if (sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            for (size_t backend = 0; backend < n_backends; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    int chunk = -1;
+                    int parsed_layer = -1;
+                    const bool prefill =
+                        ggml_backend_meta_parse_prefill_norm_chunk(
+                            graph->nodes[k]->name,
+                            chunk,
+                            parsed_layer) ||
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            graph->nodes[k]->name,
+                            chunk,
+                            parsed_layer);
+                    if (prefill &&
+                            ggml_backend_meta_tensor_p2c_layer(
+                                backend_ctx, parsed_layer)) {
+                        layer = parsed_layer;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        };
+
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_is_tensor_phone_primary(layer)) {
             return false;
@@ -9476,6 +9521,44 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf("[META_KEEP_PHONE] sg=%zu tensor=%s bytes=%zu next_pc_compute=0\n",
                            i, nodes[1]->name, ggml_nbytes(nodes[1]));
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
+            // Region directional pair:
+            //
+            //   ... L45 Phone Full -> L46 P2C (Phone Attention)
+            //
+            // force_phone_block_exit marks L45 as a generic Phone-owner exit,
+            // but the next P2C layer still starts on Phone.  Falling through
+            // to the generic active-backend mirror copies the complete L45
+            // activation Phone->PC even though PC never consumes it.  Besides
+            // wasting a full-H transfer, that blocking RPC copy sits directly
+            // on the Prefill critical path.  Keep ownership on Phone and let
+            // the explicit P2C READY/Router handoff provide only the tensors
+            // needed by the PC FFN shard.
+            int next_p2c_prefill_layer = -1;
+            const bool keep_phone_for_p2c_prefill =
+                !c2p_prefill_down_boundary &&
+                !c2p_decode_single_boundary &&
+                phone_owner_exit &&
+                i + 1 < backend_ctx->n_subgraphs &&
+                subgraph_prefill_p2c_layer(
+                    i + 1, next_p2c_prefill_layer) &&
+                layer_attention_phone_owned(
+                    next_p2c_prefill_layer);
+            if (keep_phone_for_p2c_prefill) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_KEEP_PHONE_EXIT] sg=%zu layer=%d "
+                        "next_layer=%d tensor=%s "
+                        "reason=NEXT_P2C_PHONE_ATTN status=OK\n",
+                        i,
+                        force_phone_block_layer,
+                        next_p2c_prefill_layer,
+                        nodes[1] != nullptr ?
+                            nodes[1]->name : "(null)");
                 }
                 return GGML_STATUS_SUCCESS;
             }
