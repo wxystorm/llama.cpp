@@ -151,12 +151,12 @@ bool llama_hybrid_cycle_execute_attention_pre(
          kv_cache->head_dim != head_dim ||
          kv_cache->kv_heads != n_kv_heads ||
          kv_tokens > kv_cache->max_tokens ||
-         // Registering a future Chunk must not wait for the prior
-         // Attention completion ACK; only live execution requires the
-         // exact committed prefix. Admission order is checked by V2.
-         (defer_registered_replay ?
-             kv_cache->committed_tokens > kv_token_start :
-             kv_cache->committed_tokens != kv_token_start))) {
+         // Deferred registration does not read the mutable host
+         // committed-prefix counter. Protocol admission + the global Ring
+         // enforce execution order; only live execution requires an exact
+         // prefix match. This also keeps async registration race-free.
+         (!defer_registered_replay &&
+          kv_cache->committed_tokens != kv_token_start))) {
         std::fprintf(stderr,
             "[CYCLE_PHONE_KV_PERSISTENT] status=FAIL "
             "reason=BAD_PREFIX_OR_OUT_OF_ORDER start=%lld "
