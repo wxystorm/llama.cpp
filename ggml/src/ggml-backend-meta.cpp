@@ -2595,7 +2595,8 @@ struct ggml_backend_meta_priority_compute_worker {
         ggml_cgraph * graph = nullptr;
     };
 
-    ggml_backend_t backend = nullptr;
+    ggml_backend_meta_compute_workers * submitter = nullptr;
+    size_t backend_index = SIZE_MAX;
     std::thread worker;
     std::mutex mutex;
     std::condition_variable task_cv;
@@ -2607,8 +2608,10 @@ struct ggml_backend_meta_priority_compute_worker {
     bool stop = false;
 
     explicit ggml_backend_meta_priority_compute_worker(
-            ggml_backend_t backend) :
-        backend(backend),
+            ggml_backend_meta_compute_workers * submitter,
+            size_t backend_index) :
+        submitter(submitter),
+        backend_index(backend_index),
         worker([this]() {
             std::unique_lock<std::mutex> lock(mutex);
             while (true) {
@@ -2633,12 +2636,18 @@ struct ggml_backend_meta_priority_compute_worker {
                 }
 
                 lock.unlock();
-                // Match ggml_backend_meta_compute_workers semantics: completion
-                // here means the backend accepted/submitted the graph. Device
-                // ordering/fences remain owned by the existing Region path.
+                // Preserve the original per-backend submission thread.  RPC,
+                // CUDA and OpenCL paths may carry thread-local connection /
+                // stream ordering state, so the priority scheduler must never
+                // submit a graph to the backend directly from this new thread.
+                // It only chooses MAIN vs SHARD; the canonical compute worker
+                // performs the actual backend submission.
+                GGML_ASSERT(submitter != nullptr);
+                GGML_ASSERT(backend_index < submitter->n_backends);
+                submitter->start_graph(
+                    backend_index, current.graph);
                 const ggml_status status =
-                    ggml_backend_graph_compute_async(
-                        this->backend, current.graph);
+                    submitter->wait(backend_index);
                 lock.lock();
 
                 results[current.id] = status;
@@ -4057,10 +4066,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     &backend_ctx->region_pc_exec_worker :
                     &backend_ctx->region_phone_exec_worker;
             if (*slot == nullptr) {
+                GGML_ASSERT(backend_ctx->compute_workers != nullptr);
                 *slot =
                     new ggml_backend_meta_priority_compute_worker(
-                        backend_ctx->backend_configs[
-                            backend_index].backend);
+                        backend_ctx->compute_workers,
+                        backend_index);
             }
             return *slot;
         };
