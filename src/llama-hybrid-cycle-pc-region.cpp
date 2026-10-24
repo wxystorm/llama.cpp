@@ -389,6 +389,14 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         }
         current = x;
 
+    std::vector<std::array<ggml_tensor *,
+        llama_hybrid_cycle_cuda_full_weights::COUNT>> template_weight_aliases(
+            size_t(layer_count));
+    std::vector<ggml_tensor *> template_kv_key_aliases(
+        size_t(layer_count), nullptr);
+    std::vector<ggml_tensor *> template_kv_value_aliases(
+        size_t(layer_count), nullptr);
+
     const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
         int(hp.n_ctx_orig_yarn) : int(hp.n_ctx_train);
     const float rope_base = hp.rope_freq_base_train > 0 ?
@@ -407,32 +415,61 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
 
         const auto * resource = region[size_t(offset)];
         const auto & cw = *resource->cuda_weights;
-        ggml_tensor * w_attn_norm =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::ATTN_NORM];
-        ggml_tensor * wq =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::WQ];
-        ggml_tensor * wk =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::WK];
-        ggml_tensor * wv =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::WV];
-        ggml_tensor * wo =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::WO];
-        ggml_tensor * wq_norm =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::Q_NORM];
-        ggml_tensor * wk_norm =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::K_NORM];
-        ggml_tensor * w_ffn_norm =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::FFN_NORM];
-        ggml_tensor * w_router =
-            cw.tensors[llama_hybrid_cycle_cuda_full_weights::ROUTER];
-        const auto shard = cw.full_ffn_shard();
-
-        if (!w_attn_norm || !wq || !wk || !wv || !wo ||
-            !wq_norm || !wk_norm || !w_ffn_norm || !w_router ||
-            !shard.available()) {
-            return fail("PC_REGION_WEIGHT_MISSING layer=" +
+        auto & aliases = template_weight_aliases[size_t(offset)];
+        for (size_t i = 0;
+             i < llama_hybrid_cycle_cuda_full_weights::COUNT; ++i) {
+            const ggml_tensor * physical = cw.tensors[i];
+            if (!physical || !physical->buffer || !physical->data) {
+                return fail("PC_REGION_WEIGHT_MISSING layer=" +
+                            std::to_string(layer_index));
+            }
+            aliases[i] = ggml_dup_tensor(
+                ctx, const_cast<ggml_tensor *>(physical));
+            if (!aliases[i] ||
+                !cache_impl->bind_alias(aliases[i], physical)) {
+                return fail("PC_REGION_WEIGHT_ALIAS layer=" +
+                            std::to_string(layer_index));
+            }
+        }
+        template_kv_key_aliases[size_t(offset)] =
+            ggml_dup_tensor(ctx, resource->kv->keys);
+        template_kv_value_aliases[size_t(offset)] =
+            ggml_dup_tensor(ctx, resource->kv->values);
+        if (!template_kv_key_aliases[size_t(offset)] ||
+            !template_kv_value_aliases[size_t(offset)] ||
+            !cache_impl->bind_alias(
+                template_kv_key_aliases[size_t(offset)],
+                resource->kv->keys) ||
+            !cache_impl->bind_alias(
+                template_kv_value_aliases[size_t(offset)],
+                resource->kv->values)) {
+            return fail("PC_REGION_KV_ALIAS layer=" +
                         std::to_string(layer_index));
         }
+
+        ggml_tensor * w_attn_norm =
+            aliases[llama_hybrid_cycle_cuda_full_weights::ATTN_NORM];
+        ggml_tensor * wq =
+            aliases[llama_hybrid_cycle_cuda_full_weights::WQ];
+        ggml_tensor * wk =
+            aliases[llama_hybrid_cycle_cuda_full_weights::WK];
+        ggml_tensor * wv =
+            aliases[llama_hybrid_cycle_cuda_full_weights::WV];
+        ggml_tensor * wo =
+            aliases[llama_hybrid_cycle_cuda_full_weights::WO];
+        ggml_tensor * wq_norm =
+            aliases[llama_hybrid_cycle_cuda_full_weights::Q_NORM];
+        ggml_tensor * wk_norm =
+            aliases[llama_hybrid_cycle_cuda_full_weights::K_NORM];
+        ggml_tensor * w_ffn_norm =
+            aliases[llama_hybrid_cycle_cuda_full_weights::FFN_NORM];
+        ggml_tensor * w_router =
+            aliases[llama_hybrid_cycle_cuda_full_weights::ROUTER];
+        const llama_hybrid_cycle_ffn_shard_weights shard {
+            aliases[llama_hybrid_cycle_cuda_full_weights::FFN_UP],
+            aliases[llama_hybrid_cycle_cuda_full_weights::FFN_GATE],
+            aliases[llama_hybrid_cycle_cuda_full_weights::FFN_DOWN]
+        };
 
         const int64_t head_dim = wq_norm->ne[0];
         if (head_dim <= 0 || wk_norm->ne[0] != head_dim ||
