@@ -358,14 +358,11 @@ llama_context::llama_context(
         cparams.n_ctx = requested_ctx;
         cparams.n_ctx_seq = cparams.n_ctx;
         cparams.n_seq_max = 1;
-        // Cycle owns Prefill chunking internally. Keep the public batch large
-        // enough for the complete physical context so llama_decode() does not
-        // create a second, redundant batching layer above the global FIFO.
-        cparams.n_batch = std::max<uint32_t>(
-            1, std::min<uint32_t>(params.n_batch, requested_ctx));
-        cparams.n_ubatch = std::min<uint32_t>(
-            cparams.n_batch,
-            params.n_ubatch ? params.n_ubatch : cparams.n_batch);
+        // Cycle owns the only Prefill batching layer. Public batch/ubatch
+        // capacity equals the physical context; internal scheduling uses
+        // 64-token Chunks and window=2.
+        cparams.n_batch = requested_ctx;
+        cparams.n_ubatch = requested_ctx;
         cparams.n_outputs_max = 1;
         cparams.n_threads = params.n_threads;
         cparams.n_threads_batch = params.n_threads_batch;
