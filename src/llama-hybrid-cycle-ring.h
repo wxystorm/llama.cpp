@@ -103,6 +103,7 @@ public:
             bool pc_cpu_reduce_priority = false,
             bool ordered_c2p_reduce = false,
             bool phone_main_priority = false,
+            bool pc_cuda_chunk_priority = false,
             bool trace_entry_gate = false)
         : layout_(layout), n_chunks_(n_chunks),
           max_inflight_(max_inflight == 0 ? n_chunks : max_inflight),
@@ -110,6 +111,7 @@ public:
           pc_cpu_reduce_priority_(pc_cpu_reduce_priority),
           ordered_c2p_reduce_(ordered_c2p_reduce),
           phone_main_priority_(phone_main_priority),
+          pc_cuda_chunk_priority_(pc_cuda_chunk_priority),
           trace_entry_gate_(trace_entry_gate) {
         if (!layout_.enabled() || !llama_hybrid_cycle_cuda_layers_valid(layout_) ||
             n_chunks_ <= 0 || max_inflight_ <= 0 ||
@@ -162,6 +164,23 @@ public:
                         llama_hybrid_cycle_layer_kind::TENSOR_P2C) {
                     selected = it;
                     break;
+                }
+            }
+        }
+        if (pc_cuda_chunk_priority_ &&
+            queue == llama_hybrid_cycle_queue::PC_CUDA) {
+            // Region V1 computes all CUDA Full layers at the first physical
+            // layer. The remaining same-Chunk FULL_LAYER tasks are dependency
+            // continuations only. Drain the oldest Chunk's continuation chain
+            // before starting a newer Region so its L3 output reaches C2P
+            // immediately instead of sitting behind another expensive graph.
+            for (auto it = ready.begin(); it != ready.end(); ++it) {
+                if (it->stage == llama_hybrid_cycle_stage::FULL_LAYER &&
+                    (selected == ready.end() ||
+                     it->chunk < selected->chunk ||
+                     (it->chunk == selected->chunk &&
+                      it->layer > selected->layer))) {
+                    selected = it;
                 }
             }
         }
@@ -470,6 +489,7 @@ private:
     bool pc_cpu_reduce_priority_ = false;
     bool ordered_c2p_reduce_ = false;
     bool phone_main_priority_ = false;
+    bool pc_cuda_chunk_priority_ = false;
     bool trace_entry_gate_ = false;
     bool started_ = false;
     size_t layer_outputs_done_ = 0;
