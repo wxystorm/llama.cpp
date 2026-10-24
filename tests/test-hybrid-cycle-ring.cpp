@@ -993,6 +993,7 @@ static void test_cycle_execution_session_8_and_48() {
     for (const int layers : {8, 48}) {
         llama_hybrid_cycle_execution_session_config cfg;
         cfg.layout = llama_hybrid_build_cycle_layout(layers, 4, 2);
+        cfg.layout.pc_cuda_full = true;
         cfg.physical_layer_begin = 0;
         cfg.physical_layer_count = layers;
         cfg.tokens = 64;
@@ -1047,6 +1048,20 @@ static void test_cycle_execution_session_8_and_48() {
         assert(!session.copy_predecessor_host_input(5, 0, 2, received));
         assert(!session.phone_predecessor_output(1, 0)); // PC -> PC.
         assert(!session.phone_predecessor_output(5, 0)); // Not yet ready.
+
+        // PC CUDA activation ownership mirrors the Phone handoff contract:
+        // completion alone does not retire a producer slot; only the adjacent
+        // CUDA Full successor may move it after its Attention input fence.
+        auto & cuda0 = session.at(0, 1);
+        cuda0.cuda_output =
+            std::make_unique<llama_hybrid_cycle_cuda_activation_slot>();
+        assert(!session.retire_cuda_output_after_handoff(0, 2, 1));
+        assert(cuda0.cuda_output);
+        auto cuda_slot =
+            session.retire_cuda_output_after_handoff(0, 1, 1);
+        assert(cuda_slot);
+        assert(!cuda0.cuda_output);
+        assert(!session.retire_cuda_output_after_handoff(0, 1, 1));
 
         if (layers == 48) {
             // Exact P2C/PC CUDA handoff at the first Cycle boundary:
