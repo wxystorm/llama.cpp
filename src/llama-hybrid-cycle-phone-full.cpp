@@ -17,7 +17,8 @@ bool llama_hybrid_cycle_execute_phone_full(
         llama_hybrid_cycle_attention_ready & ready,
         llama_hybrid_cycle_phone_ffn_slot & output_slot,
         const std::function<void(const ggml_tensor *, const ggml_tensor *,
-                                 const ggml_tensor *)> & stage_probe) {
+                                 const ggml_tensor *)> & stage_probe,
+        const std::function<bool()> & input_consumed) {
     const int64_t hidden = model.hparams.n_embd;
     const int64_t topk = model.hparams.n_expert_used;
     const int64_t experts = model.hparams.n_expert;
@@ -89,7 +90,14 @@ bool llama_hybrid_cycle_execute_phone_full(
         resource.kv->committed_tokens == position_start + tokens &&
         ready.phone_graph.residual && ready.phone_graph.ffn_norm &&
         ready.phone_graph.topk_ids && ready.phone_graph.topk_weights;
-    if (attention_done) {
+    if (attention_done && input_consumed && !input_consumed()) {
+        std::fprintf(stderr,
+            "[CYCLE_REAL_PHONE_FULL] layer=%d chunk=%d "
+            "status=FAIL reason=INPUT_CONSUMED_NOTIFY\n",
+            physical_layer, chunk);
+        ok = false;
+    }
+    if (attention_done && ok) {
         // Protocol 28: READY remains entirely on Phone. The server copies the
         // four READY tensors into the persistent registered Full slot and
         // replays one fused FFN + residual graph. The ACK is the l_out device
