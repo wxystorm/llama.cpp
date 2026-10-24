@@ -1438,6 +1438,7 @@ static bool cycle_core_evaluate_with_kv(
                 phone_c2p_ffn.load() == 6*n_chunks &&
                 phone_c2p_partial.load() == 6*n_chunks &&
                 phone_c2p_reduce.load() == 6*n_chunks &&
+                phone_region_prepared.load() == 6*n_chunks &&
                 phone_region_armed.load() == 6*n_chunks &&
                 phone_region_stage_acks.load() == 12*n_chunks &&
                 real_phone_full_calls.load() == 12*n_chunks &&
@@ -1459,13 +1460,17 @@ static bool cycle_core_evaluate_with_kv(
             if (n_tokens > 1) {
                 std::printf(
                     "[CYCLE_PHONE_REGION_MODE] protocol=31 "
-                    "mode=SERVER_FIFO_TWO_FULL fused_ffn_add=1 "
-                    "regions=%d stage_acks=%d calls=%d slot_reuse=%d "
+                    "mode=SERVER_FIFO_TWO_FULL prepare=ASYNC "
+                    "fused_ffn_add=1 prepared=%d regions=%d stage_acks=%d "
+                    "calls=%d slot_reuse=%d prepare_wait_ms=%.3f "
                     "legacy_pc_full_submit=0 p2c=PC_DRIVEN status=%s\n",
+                    phone_region_prepared.load(),
                     phone_region_armed.load(),
                     phone_region_stage_acks.load(),
                     real_phone_full_calls.load(),
                     phone_full_slot_reuse.load(),
+                    double(phone_region_prepare_wait_us.load(
+                        std::memory_order_relaxed)) / 1000.0,
                     ok ? "PASS" : "FAIL");
             }
             if (ok) {
