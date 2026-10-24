@@ -963,25 +963,25 @@ static bool cycle_core_evaluate_with_kv(
                     std::printf(
                         "[CYCLE_CORE_FIFO_WALL] tokens=%d chunks=%d "
                         "window=%d wall_ms=%.3f scope=PC_STEADY "
-                        "status=%s\\n",
+                        "status=%s\n",
                         n_tokens, n_chunks, max_inflight,
                         std::chrono::duration<double, std::milli>(
                             fifo_done - fifo_start).count(),
                         ok ? "PASS" : "FAIL");
                     llama_hybrid_cycle_print_stage_summary(timeline);
                     for (size_t q = 0; q < queue_profile.queues.size(); ++q) {
-                    const auto & v = queue_profile.queues[q];
-                    std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
-                                "execute_ms=%.3f max_execute_ms=%.3f "
-                                "queue_wait_ms=%.3f max_queue_wait_ms=%.3f "
-                                "idle_wait_ms=%.3f idle_wakes=%llu "
-                                "scope=HOST_CALLBACK status=MEASURED\n",
-                                llama_hybrid_cycle_queue_name(
-                                    static_cast<llama_hybrid_cycle_queue>(q)),
-                                (unsigned long long) v.tasks, v.execute_ms,
-                                v.max_execute_ms, v.queue_wait_ms,
-                                v.max_queue_wait_ms, v.idle_wait_ms,
-                                (unsigned long long) v.idle_wakes);
+                        const auto & v = queue_profile.queues[q];
+                        std::printf("[CYCLE_CORE_QUEUE] queue=%s tasks=%llu "
+                                    "execute_ms=%.3f max_execute_ms=%.3f "
+                                    "queue_wait_ms=%.3f max_queue_wait_ms=%.3f "
+                                    "idle_wait_ms=%.3f idle_wakes=%llu "
+                                    "scope=HOST_CALLBACK status=MEASURED\n",
+                                    llama_hybrid_cycle_queue_name(
+                                        static_cast<llama_hybrid_cycle_queue>(q)),
+                                    (unsigned long long) v.tasks, v.execute_ms,
+                                    v.max_execute_ms, v.queue_wait_ms,
+                                    v.max_queue_wait_ms, v.idle_wait_ms,
+                                    (unsigned long long) v.idle_wakes);
                     }
                 }
             }
@@ -993,7 +993,7 @@ static bool cycle_core_evaluate_with_kv(
                         std::chrono::steady_clock::now() - drain_begin).count();
                     std::printf(
                         "[CYCLE_CORE_RPC_DRAIN] tokens=%d wait_ms=%.3f "
-                        "scope=HOST_AFTER_FIFO status=%s\\n",
+                        "scope=HOST_AFTER_FIFO status=%s\n",
                         n_tokens, drain_ms, ok ? "PASS" : "FAIL");
                 }
                 if (!ok) reason = "REAL_RPC_TX_NOT_DRAINED";
