@@ -38,6 +38,22 @@ struct llama_hybrid_cycle_pc_region_cache_stats {
     size_t allocator_bytes = 0;
 };
 
+class llama_hybrid_cycle_pc_region_cache;
+
+LLAMA_API bool llama_hybrid_cycle_execute_pc_full_region_cached(
+    const llama_model & model,
+    llama_hybrid_cycle_physical_resource_pool & resources,
+    llama_hybrid_cycle_pc_region_cache & cache,
+    int first_layer,
+    int layer_count,
+    int64_t token_start,
+    int64_t tokens,
+    const std::vector<float> & input,
+    std::vector<float> & output,
+    std::string & reason,
+    const std::function<bool()> & input_consumed = {},
+    llama_hybrid_cycle_pc_region_timing * timing = nullptr);
+
 class LLAMA_API llama_hybrid_cycle_pc_region_cache {
 public:
     explicit llama_hybrid_cycle_pc_region_cache(size_t max_graphs = 2);
@@ -67,20 +83,6 @@ private:
         std::string &, const std::function<bool()> &,
         llama_hybrid_cycle_pc_region_timing *);
 };
-
-LLAMA_API bool llama_hybrid_cycle_execute_pc_full_region_cached(
-    const llama_model & model,
-    llama_hybrid_cycle_physical_resource_pool & resources,
-    llama_hybrid_cycle_pc_region_cache & cache,
-    int first_layer,
-    int layer_count,
-    int64_t token_start,
-    int64_t tokens,
-    const std::vector<float> & input,
-    std::vector<float> & output,
-    std::string & reason,
-    const std::function<bool()> & input_consumed = {},
-    llama_hybrid_cycle_pc_region_timing * timing = nullptr);
 
 LLAMA_API bool llama_hybrid_cycle_execute_pc_full_region(
     const llama_model & model,
