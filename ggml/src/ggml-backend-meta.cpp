@@ -2387,7 +2387,7 @@ struct ggml_backend_meta_context {
     uint64_t                    next_phone_prefill_route_seq = 1;
     uint64_t                    next_phone_prefill_ffn_seq = 1;
 
-    struct region_p2c_prefill_state {
+    struct region_prefill_boundary_state {
         bool active = false;
         bool complete = false;
         int layer = -1;
@@ -2399,7 +2399,8 @@ struct ggml_backend_meta_context {
     // compute calls by the scheduler. Keep P2C output assembly state here,
     // not on the per-call stack.
     size_t                      region_prefill_hidden_bytes = 0;
-    region_p2c_prefill_state    region_p2c_prefill {};
+    region_prefill_boundary_state region_c2p_prefill {};
+    region_prefill_boundary_state region_p2c_prefill {};
 
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
@@ -11346,6 +11347,56 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_fold_us + pc_reduce_us;
             ++reduce_to_primary_count;
 
+            if (region_chunk_continuation &&
+                    region_output_complete &&
+                    pc_l_out != nullptr &&
+                    backend_ctx->region_p2c_prefill.active) {
+                ggml_tensor * staged_l_out =
+                    get_node_aux(pc_l_out);
+                bind_region_boundary_output_full(
+                    staged_l_out,
+                    j_dst,
+                    full_output_bytes);
+
+                const int64_t commit_begin_us =
+                    ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    pc_cfg.backend,
+                    pc_cfg.backend,
+                    staged_l_out,
+                    pc_l_out);
+                ggml_backend_synchronize(pc_cfg.backend);
+                const int64_t commit_us =
+                    ggml_time_us() - commit_begin_us;
+
+                if (c2p_self_check &&
+                        staged_l_out->type == GGML_TYPE_F32 &&
+                        pc_l_out->type == GGML_TYPE_F32) {
+                    directional_wire_parity(
+                        "P2C",
+                        prefill_down_layer_0,
+                        -1,
+                        "BOUNDARY_OUTPUT_COMMIT",
+                        j_dst,
+                        j_dst,
+                        staged_l_out,
+                        pc_l_out);
+                }
+
+                backend_ctx->region_p2c_prefill.active = false;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_BOUNDARY_OUTPUT_COMMIT] "
+                        "direction=P2C layer=%d bytes=%zu "
+                        "commit_ms=%.3f source=CURRENT_GRAPH "
+                        "owner=PC status=OK\n",
+                        prefill_down_layer_0,
+                        full_output_bytes,
+                        commit_us / 1000.0);
+                }
+            }
+
             if (c2p_self_check && !pc_before.empty()) {
                 const size_t n = pc_before.size();
                 std::vector<float> actual(n);
@@ -11690,9 +11741,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     if (prefill_down_chunk_0 == 0) {
                         backend_ctx->region_prefill_hidden_bytes =
                             full_hidden_bytes;
+                        backend_ctx->region_c2p_prefill =
+                            ggml_backend_meta_context::
+                                region_prefill_boundary_state {};
                         backend_ctx->region_p2c_prefill =
                             ggml_backend_meta_context::
-                                region_p2c_prefill_state {};
+                                region_prefill_boundary_state {};
                         if (pipeline_debug) {
                             printf(
                                 "[REGION_CONT_OUTPUT_STATE] "
@@ -11708,8 +11762,69 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     }
                 }
 
-                const size_t chunk_offset = down_chunk_offset(
-                    0, true, prefill_down_layer_0, prefill_down_chunk_0);
+                size_t chunk_offset = 0;
+                bool c2p_output_complete = false;
+                if (region_chunk_continuation) {
+                    auto & output_state =
+                        backend_ctx->region_c2p_prefill;
+                    if (!output_state.active) {
+                        GGML_ASSERT(prefill_down_chunk_0 == 0);
+                        output_state.active = true;
+                        output_state.complete = false;
+                        output_state.layer = prefill_down_layer_0;
+                        output_state.next_chunk = 0;
+                        output_state.full_bytes =
+                            ggml_nbytes(phone_l_out);
+                        output_state.bytes_reserved = 0;
+                    }
+
+                    GGML_ASSERT(
+                        output_state.layer ==
+                        prefill_down_layer_0);
+                    GGML_ASSERT(
+                        output_state.full_bytes ==
+                        ggml_nbytes(phone_l_out));
+                    GGML_ASSERT(
+                        output_state.next_chunk ==
+                        prefill_down_chunk_0);
+
+                    chunk_offset =
+                        output_state.bytes_reserved;
+                    output_state.bytes_reserved +=
+                        ggml_nbytes(node_dst);
+                    ++output_state.next_chunk;
+                    GGML_ASSERT(
+                        output_state.bytes_reserved <=
+                        output_state.full_bytes);
+                    output_state.complete =
+                        output_state.bytes_reserved ==
+                        output_state.full_bytes;
+                    c2p_output_complete =
+                        output_state.complete;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_C2P_OUTPUT_STATE] "
+                            "layer=%d chunk=%d offset=%zu "
+                            "chunk_bytes=%zu reserved=%zu/%zu "
+                            "complete=%d status=OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            chunk_offset,
+                            ggml_nbytes(node_dst),
+                            output_state.bytes_reserved,
+                            output_state.full_bytes,
+                            output_state.complete ? 1 : 0);
+                    }
+                } else {
+                    chunk_offset =
+                        down_chunk_offset(
+                            0, true,
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0);
+                    c2p_output_complete =
+                        last_chunk;
+                }
 
                 // At this boundary both FFN shard outputs are live and are the
                 // exact tensors consumed by the C2P reduction. Capture them
@@ -12374,7 +12489,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         max_abs_diff <= 1e-4 ? "PASS" : "FAIL");
                 }
 
-                if (last_chunk &&
+                if (c2p_output_complete &&
                         ab_trace_requested &&
                         prefill_down_layer_0 == ab_trace_layer &&
                         ab_full_tokens() >= ab_min_tokens) {
@@ -12398,7 +12513,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "owner=PHONE status=OK\n",
                         prefill_down_layer_0,
                         prefill_down_chunk_0,
-                        last_chunk ? 1 : 0,
+                        c2p_output_complete ? 1 : 0,
                         ggml_nbytes(node_dst),
                         pc_fold_us / 1000.0,
                         partial_stage_us / 1000.0,
