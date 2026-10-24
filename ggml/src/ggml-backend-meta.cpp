@@ -11098,7 +11098,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     pending.fold_us = phone_fold_us;
                     pending.stage_us = partial_stage_us;
                     pending.boundary_last =
-                        region_boundary_last;
+                        region_output_complete;
                     pending.numeric_check =
                         c2p_self_check &&
                         !pc_before.empty();
@@ -12185,7 +12185,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         pending.fold_us = pc_fold_us;
                         pending.stage_us = partial_stage_us;
                         pending.boundary_last =
-                            region_boundary_last;
+                            c2p_output_complete;
                         pending.numeric_check =
                             c2p_numeric_trace &&
                             !c2p_pc_partial.empty();
