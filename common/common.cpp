@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -1426,6 +1427,21 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
+        const char * hybrid_prefill_warmup_env =
+            std::getenv("LLAMA_HYBRID_PREFILL_WARMUP");
+        const bool hybrid_prefill_warmup =
+            hybrid_prefill_warmup_env != nullptr &&
+            std::atoi(hybrid_prefill_warmup_env) != 0;
+
+        int hybrid_prefill_warmup_tokens = 128;
+        if (const char * tokens_env =
+                std::getenv("LLAMA_HYBRID_PREFILL_WARMUP_TOKENS")) {
+            const int requested = std::atoi(tokens_env);
+            if (requested > 0) {
+                hybrid_prefill_warmup_tokens = requested;
+            }
+        }
+
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
@@ -1443,6 +1459,38 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(0);
         }
 
+        // Reuse the existing warmup pass. When explicitly enabled for hybrid
+        // inference, only enlarge its dummy decoder batch so CUDA/OpenCL/RPC
+        // and Meta see a representative prefill graph. No extra cache, pass,
+        // or scheduler state is introduced here.
+        if (hybrid_prefill_warmup &&
+                llama_model_has_decoder(model) &&
+                !llama_model_has_encoder(model)) {
+            const size_t target_tokens = std::max<size_t>(
+                1,
+                std::min<size_t>(
+                    (size_t) hybrid_prefill_warmup_tokens,
+                    (size_t) params.n_batch));
+            const std::vector<llama_token> seed = tmp;
+            tmp.reserve(target_tokens);
+            while (tmp.size() < target_tokens) {
+                tmp.push_back(seed[(tmp.size() - seed.size()) % seed.size()]);
+            }
+            if (tmp.size() > target_tokens) {
+                tmp.resize(target_tokens);
+            }
+
+            LLAMA_LOG_INFO(
+                "[HYBRID_PREFILL_WARMUP] tokens=%zu requested=%d "
+                "n_batch=%u status=BEGIN\n",
+                tmp.size(),
+                hybrid_prefill_warmup_tokens,
+                params.n_batch);
+        }
+
+        const int64_t warmup_start_us =
+            hybrid_prefill_warmup ? ggml_time_us() : 0;
+
         if (llama_model_has_encoder(model)) {
             llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
@@ -1458,6 +1506,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+
+        if (hybrid_prefill_warmup) {
+            LLAMA_LOG_INFO(
+                "[HYBRID_PREFILL_WARMUP] tokens=%zu wall_ms=%.3f "
+                "action=CLEAR_MEMORY_SYNC_RESET_PERF status=END\n",
+                tmp.size(),
+                (ggml_time_us() - warmup_start_us) / 1000.0);
+        }
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
