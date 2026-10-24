@@ -46,9 +46,9 @@ LLAMA_API bool llama_hybrid_cycle_execute_pc_full_layer(
 // callers must bind them before running/validating the full FIFO.
 //
 // The model, resources, backends, session and initial embedding are BORROWED
-// and must remain alive until all five FIFO workers have joined. A producer
-// publishes its host output before returning, allowing the next physical
-// layer's SAME Chunk to proceed without a period-level barrier.
+// and must remain alive until all five FIFO workers have joined. Adjacent CUDA
+// Full layers publish a weight-independent device activation slot; only the
+// final Full layer before a Tensor boundary materializes Host output.
 template <class PhoneSlot, class P2cSlot>
 bool llama_hybrid_cycle_bind_pc_full_stages(
     llama_hybrid_cycle_stage_dispatcher & stages,
