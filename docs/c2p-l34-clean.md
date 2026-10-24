@@ -494,53 +494,63 @@ Phone-owner exits retain the legacy handoff behavior.
 
 ## Directional Region Chunk Continuation
 
-The next Region step is now isolated behind:
+The continuation path is isolated behind:
 
 ```text
 LLAMA_HYBRID_REGION_CHUNK_CONTINUATION=1
 ```
 
-It is Prefill-only and currently gated to Qwen3-MoE directional-pair policies with
-exactly one C2P and one P2C boundary.
+It is Prefill-only and currently gated to Qwen3-MoE directional-pair
+policies with exactly one C2P and one P2C boundary.
 
-For the current L34/L46 policy, the staged graph is:
+Unlike the earlier staged prototype, this implementation keeps one normal
+full Qwen3 graph. There is no `process_ubatch_staged()` handoff and no host
+hidden buffer between the PC prefix, Phone Region, and PC tail.
 
-```text
-PC prefix       directional Region stage                  PC tail
-L0-L33          [L34 C2P, L35-L45 Phone, L46 P2C]        L47
-```
-
-The Region graph is depth-first by Tensor chunk:
+For the current L34/L46 policy the single graph is:
 
 ```text
-L34 FFN(C0) -> C2P Reduce(C0) -> L35(C0) -> ... -> L46(C0)
-L34 FFN(C1) -> C2P Reduce(C1) -> L35(C1) -> ... -> L46(C1)
-L34 FFN(C2) -> C2P Reduce(C2) -> L35(C2) -> ... -> L46(C2)
+L0 ... L33
+      |
+      v
+L34 C2P
+      |
+      +--> chunk0 -> L35 -> ... -> L45 -> L46 P2C
+      +--> chunk1 -> L35 -> ... -> L45 -> L46 P2C
+      +--> chunk2 -> L35 -> ... -> L45 -> L46 P2C
+                                      |
+                                      v
+                                     L47
+                                      |
+                                      v
+                                    logits
 ```
+
+The ordinary Qwen3 layer loop builds L0-L33. When it reaches the C2P layer,
+it calls the directional Region builder, which emits the chunk-major
+L34-L46 sub-DAG and returns `l_out-46`. The same ordinary loop then resumes
+at L47.
 
 C2P final output uses one stable Phone-side `l_out-34` backing. The ordinary
 producer is disabled before chunk 0 continuation. Each C2P Reduce writes only
-its chunk into that backing, and `Attention(L35,C)` is admitted only after
-the exact `Reduce(L34,C)` credit has completed.
+its chunk into that backing. With `LLAMA_HYBRID_REGION_WINDOW=2`,
+`Attention(L35,C)` waits only for the exact `Reduce(L34,C)` credit; the old
+boundary-wide C2P drain is suppressed. Graph-end drain remains a safety net.
 
-With `LLAMA_HYBRID_REGION_WINDOW=2`, the old C2P boundary-wide drain is
-suppressed in continuation mode. Graph-end drain remains as a safety net.
+The existing P2C stable boundary-output commit remains unchanged, so the PC
+tail sees the completed `l_out-46` before L47 executes.
 
 Expected diagnostic markers:
 
 ```text
-[REGION_CONT_STAGE_PLAN] ... status=READY
-[REGION_CONT_RUNTIME] ... status=BEGIN
+[REGION_CONT_FULL_GRAPH_CAP] ... status=READY
 [REGION_CONT_GRAPH] ... mode=BOUNDARY_SEED_THEN_CHUNK_MAJOR
 [REGION_CONT_DEP] direction=C2P producer=34/C consumer=35/C ... status=OK
-```
-
-The existing P2C stable boundary-output commit remains unchanged:
-
-```text
 [REGION_BOUNDARY_OUTPUT_COMMIT] direction=P2C layer=46 ... status=OK
 ```
 
-This step removes the full-Region layer barrier from the graph dataflow. It
-does not yet make an already-running low-priority C2P FFN shard preemptible;
-the priority worker remains non-preemptive by design.
+This removes the staged host round-trip and the full-Region layer barrier
+from the graph dataflow. The priority worker is still non-preemptive: a
+low-priority C2P FFN that is already running is not interrupted by newly
+ready MAIN work.
+
