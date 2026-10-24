@@ -242,3 +242,59 @@ Expected new debug markers:
 
 For the first hardware run, keep the correctness diagnostics enabled and verify
 C2P/P2C wire/numeric checks and generated text before measuring clean throughput.
+
+
+## Region route overlap V2
+
+After `LLAMA_HYBRID_REGION_PARALLEL_FFN=1` has passed correctness, enable:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_ROUTE_OVERLAP = "1"
+```
+
+V2 keeps the directional owners and final partial/reduce protocol unchanged.
+
+### C2P
+
+After the PC Router prefix completes, TopK/weights are snapshotted to host.
+The PC FFN suffix is submitted immediately, then the host snapshot is pushed
+PC->Phone while the PC FFN is running. Phone FFN starts after those route
+control tensors arrive.
+
+Expected marker:
+
+```text
+[REGION_C2P_FFN_PARALLEL] phase=PREFILL ... route_overlap=1 ...
+[REGION_C2P_FFN_PARALLEL] phase=DECODE  ... route_overlap=1 ...
+```
+
+### P2C Prefill
+
+The existing RPC immutable Router snapshot mailbox is prearmed before the Phone
+Router producer graph. After the Router graph completes, the server captures
+hidden + TopK + weights into an immutable snapshot. The next Phone FFN graph is
+submitted immediately while the dedicated route worker transfers that snapshot
+Phone->PC. Once the route transfer finishes, the PC staging tensors are copied
+into the normal PC FFN inputs and the PC FFN starts. Both FFN workers are joined
+before the existing Phone-partial+residual -> PC final-reduce path.
+
+Expected markers:
+
+```text
+[REGION_P2C_ROUTE_OVERLAP] phase=PHONE_FFN_EARLY ... status=SUBMITTED
+[REGION_P2C_ROUTE_OVERLAP] phase=HANDOFF ... status=IN_FLIGHT
+[REGION_P2C_FFN_PARALLEL] phase=PREFILL ... status=OK
+```
+
+If the endpoint does not support the immutable route mailbox, V2 logs:
+
+```text
+[REGION_P2C_ROUTE_OVERLAP] phase=PREARM ... status=FALLBACK_SYNC
+```
+
+and retains the proven synchronous P2C handoff.
+
+For the first V2 hardware run keep the self-check enabled. The required
+correctness gates remain `REGION_C2P_NUMERIC`, `REGION_P2C_NUMERIC`,
+their Decode variants, wire parity, and normal generated text. Only after those
+pass should the self-check and Top-5 diagnostics be disabled for throughput A/B.

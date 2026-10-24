@@ -3890,6 +3890,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_parallel_ffn =
         region_parallel_ffn_env != nullptr &&
         std::atoi(region_parallel_ffn_env) != 0;
+    const char * region_route_overlap_env =
+        std::getenv("LLAMA_HYBRID_REGION_ROUTE_OVERLAP");
+    const bool region_route_overlap =
+        region_route_overlap_env != nullptr &&
+        std::atoi(region_route_overlap_env) != 0;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -4088,6 +4093,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::map<std::pair<int, int>, phone_prefill_route_task>
         pending_phone_prefill_routes;
+
+    struct region_p2c_early_ffn_state {
+        bool active = false;
+        size_t route_sg = SIZE_MAX;
+        size_t ffn_sg = SIZE_MAX;
+        int layer = -1;
+        int chunk = -1;
+        uint64_t route_task = 0;
+        ggml_backend_meta_transfer_worker * route_worker = nullptr;
+    };
+    region_p2c_early_ffn_state region_p2c_early_ffn;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
 
@@ -5940,17 +5956,25 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // publishes READY. The consumer never reads a live producer tensor.
     auto prearm_phone_prefill_route =
         [&](size_t sg, int layer, int chunk) -> bool {
-            if (!phone_prefill_producer_route ||
-                    !phone_prefill_chunk_pipeline ||
+            const bool region_p2c_overlap =
+                region_route_overlap &&
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, layer);
+            if ((!phone_prefill_producer_route &&
+                 !region_p2c_overlap) ||
+                    (!phone_prefill_chunk_pipeline &&
+                     !region_p2c_overlap) ||
                     phone_primary_strict_route ||
                     chunk < 0 ||
                     n_backends != 2 ||
-                    std::getenv(
+                    (!region_p2c_overlap &&
+                     std::getenv(
                         "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") ==
-                        nullptr ||
-                    std::getenv(
+                        nullptr) ||
+                    (!region_p2c_overlap &&
+                     std::getenv(
                         "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") ==
-                        nullptr) {
+                        nullptr)) {
                 return false;
             }
 
@@ -7815,7 +7839,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const auto producer_route_it =
                 pending_phone_prefill_routes.find(
                     { phone_route_layer, phone_route_chunk });
-            if (phone_prefill_producer_route &&
+            const bool region_p2c_mailbox =
+                region_route_overlap &&
+                p2c_directional &&
+                phone_route_chunk >= 0 &&
+                region_p2c_early_ffn.active &&
+                region_p2c_early_ffn.route_sg == i &&
+                region_p2c_early_ffn.layer ==
+                    phone_route_layer &&
+                region_p2c_early_ffn.chunk ==
+                    phone_route_chunk;
+            if ((phone_prefill_producer_route ||
+                 region_p2c_mailbox) &&
                     producer_route_it !=
                         pending_phone_prefill_routes.end() &&
                     producer_route_it->second.producer_seq != 0) {
@@ -7836,9 +7871,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 // Soft dual-return policy: lane 0 stays fully eager.  Lane 1
                 // is released as soon as the final route for this layer has
                 // been posted, not when the route transfer or FFN completes.
-                open_phone_prefill_lane1_return_gate(
-                    phone_route_layer,
-                    phone_route_chunk);
+                if (!region_p2c_mailbox) {
+                    open_phone_prefill_lane1_return_gate(
+                        phone_route_layer,
+                        phone_route_chunk);
+                } else if (pipeline_debug) {
+                    printf(
+                        "[REGION_P2C_ROUTE_OVERLAP] "
+                        "phase=HANDOFF layer=%d chunk=%d "
+                        "route_task=%" PRIu64 " phone_ffn_sg=%zu "
+                        "status=IN_FLIGHT\n",
+                        phone_route_layer,
+                        phone_route_chunk,
+                        producer_route_it->second.task,
+                        region_p2c_early_ffn.ffn_sg);
+                }
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -12751,7 +12798,129 @@ auto prefill_norm_sg_has_prework =
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
-    if (is_prefill_down_sg) {
+    const bool region_p2c_join =
+        region_p2c_early_ffn.active &&
+        region_p2c_early_ffn.ffn_sg == i;
+
+    if (region_p2c_join) {
+        GGML_ASSERT(is_prefill_down_sg);
+        GGML_ASSERT(
+            prefill_down_layer ==
+            region_p2c_early_ffn.layer);
+        GGML_ASSERT(
+            prefill_down_chunk ==
+            region_p2c_early_ffn.chunk);
+        GGML_ASSERT(
+            region_p2c_early_ffn.route_worker != nullptr);
+        GGML_ASSERT(
+            region_p2c_early_ffn.route_task != 0);
+
+        const int64_t route_wait_begin_us =
+            ggml_time_us();
+        const ggml_status route_status =
+            region_p2c_early_ffn.route_worker->wait(
+                region_p2c_early_ffn.route_task);
+        const int64_t route_wait_us =
+            ggml_time_us() - route_wait_begin_us;
+
+        ggml_status pc_status = route_status;
+        ggml_status phone_status = GGML_STATUS_SUCCESS;
+        int64_t pc_stage_us = 0;
+
+        auto route_it =
+            pending_phone_prefill_routes.find(
+                { region_p2c_early_ffn.layer,
+                  region_p2c_early_ffn.chunk });
+        GGML_ASSERT(
+            route_it != pending_phone_prefill_routes.end());
+        const phone_prefill_route_task route =
+            route_it->second;
+
+        if (route_status == GGML_STATUS_SUCCESS) {
+            auto & pc_cfg =
+                backend_ctx->backend_configs[0];
+
+            const int64_t stage_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, pc_cfg.backend,
+                route.stage_hidden, route.dst_hidden);
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, pc_cfg.backend,
+                route.stage_topk, route.dst_topk);
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, pc_cfg.backend,
+                route.stage_weights, route.dst_weights);
+            ggml_backend_synchronize(pc_cfg.backend);
+            pc_stage_us =
+                ggml_time_us() - stage_begin_us;
+
+            directional_wire_parity(
+                "P2C",
+                region_p2c_early_ffn.layer,
+                region_p2c_early_ffn.chunk,
+                "FFN_NORM",
+                0, 0,
+                route.stage_hidden, route.dst_hidden);
+            directional_wire_parity(
+                "P2C",
+                region_p2c_early_ffn.layer,
+                region_p2c_early_ffn.chunk,
+                "ROUTER_TOPK",
+                0, 0,
+                route.stage_topk, route.dst_topk);
+            directional_wire_parity(
+                "P2C",
+                region_p2c_early_ffn.layer,
+                region_p2c_early_ffn.chunk,
+                "ROUTER_WEIGHTS",
+                0, 0,
+                route.stage_weights, route.dst_weights);
+
+            compute_workers.start(0, i);
+            pc_status = compute_workers.wait(0);
+        }
+
+        phone_status = compute_workers.wait(1);
+
+        if (route.lane <
+                pending_phone_prefill_route_lane_task.size() &&
+                pending_phone_prefill_route_lane_task[
+                    route.lane] == route.task) {
+            pending_phone_prefill_route_lane_task[
+                route.lane] = 0;
+        }
+        phone_prefill_route_producer_seq.erase(
+            { region_p2c_early_ffn.layer,
+              region_p2c_early_ffn.chunk });
+        pending_phone_prefill_routes.erase(
+            { region_p2c_early_ffn.layer,
+              region_p2c_early_ffn.chunk });
+
+        if (pipeline_debug) {
+            printf(
+                "[REGION_P2C_FFN_PARALLEL] "
+                "phase=PREFILL layer=%d chunk=%d "
+                "route_wait_ms=%.3f pc_stage_ms=%.3f "
+                "pc_status=%d phone_status=%d status=%s\n",
+                region_p2c_early_ffn.layer,
+                region_p2c_early_ffn.chunk,
+                route_wait_us / 1000.0,
+                pc_stage_us / 1000.0,
+                (int) pc_status,
+                (int) phone_status,
+                (pc_status == GGML_STATUS_SUCCESS &&
+                 phone_status == GGML_STATUS_SUCCESS) ?
+                    "OK" : "FAIL");
+        }
+
+        region_p2c_early_ffn =
+            region_p2c_early_ffn_state {};
+
+        compute_status =
+            pc_status != GGML_STATUS_SUCCESS ?
+                pc_status : phone_status;
+    } else if (is_prefill_down_sg) {
         const bool has_async_prefill_input =
             pending_prefill_input_task != 0;
 
@@ -13394,6 +13563,10 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_prefix_graph = nullptr;
             int c2p_pc_route_stop = -1;
             bool c2p_parallel_ready = false;
+            ggml_cgraph * c2p_pc_suffix_graph = nullptr;
+            bool c2p_pc_ffn_started_early = false;
+            std::vector<uint8_t> c2p_route_topk_host;
+            std::vector<uint8_t> c2p_route_weights_host;
 
             if (c2p_prefill_exec) {
                 char topk_name[96];
@@ -13583,13 +13756,50 @@ auto prefill_norm_sg_has_prework =
 
                     ggml_backend_synchronize(pc_cfg.backend);
 
+                    if (region_route_overlap &&
+                            c2p_parallel_ready) {
+                        c2p_route_topk_host.resize(
+                            ggml_nbytes(c2p_src_topk));
+                        c2p_route_weights_host.resize(
+                            ggml_nbytes(c2p_src_weights));
+                        ggml_backend_tensor_get(
+                            c2p_src_topk,
+                            c2p_route_topk_host.data(),
+                            0,
+                            c2p_route_topk_host.size());
+                        ggml_backend_tensor_get(
+                            c2p_src_weights,
+                            c2p_route_weights_host.data(),
+                            0,
+                            c2p_route_weights_host.size());
+
+                        c2p_pc_suffix_graph =
+                            build_region_graph_slice(
+                                c2p_pc_graph,
+                                c2p_pc_route_stop,
+                                c2p_pc_graph->n_nodes,
+                                i,
+                                0x4352505355464649ULL);
+                        compute_workers.start_graph(
+                            0, c2p_pc_suffix_graph);
+                        c2p_pc_ffn_started_early = true;
+                    }
+
                     const int64_t topk_begin_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        pc_cfg.backend,
-                        phone_cfg.backend,
-                        c2p_src_topk,
-                        c2p_dst_topk);
-                    ggml_backend_synchronize(phone_cfg.backend);
+                    if (c2p_pc_ffn_started_early) {
+                        ggml_backend_tensor_set(
+                            c2p_dst_topk,
+                            c2p_route_topk_host.data(),
+                            0,
+                            c2p_route_topk_host.size());
+                    } else {
+                        ggml_backend_tensor_copy_async(
+                            pc_cfg.backend,
+                            phone_cfg.backend,
+                            c2p_src_topk,
+                            c2p_dst_topk);
+                        ggml_backend_synchronize(phone_cfg.backend);
+                    }
                     const int64_t topk_us =
                         ggml_time_us() - topk_begin_us;
                     record_copy_wait(topk_us);
@@ -13598,12 +13808,20 @@ auto prefill_norm_sg_has_prework =
                     record_direct_copy();
 
                     const int64_t weights_begin_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        pc_cfg.backend,
-                        phone_cfg.backend,
-                        c2p_src_weights,
-                        c2p_dst_weights);
-                    ggml_backend_synchronize(phone_cfg.backend);
+                    if (c2p_pc_ffn_started_early) {
+                        ggml_backend_tensor_set(
+                            c2p_dst_weights,
+                            c2p_route_weights_host.data(),
+                            0,
+                            c2p_route_weights_host.size());
+                    } else {
+                        ggml_backend_tensor_copy_async(
+                            pc_cfg.backend,
+                            phone_cfg.backend,
+                            c2p_src_weights,
+                            c2p_dst_weights);
+                        ggml_backend_synchronize(phone_cfg.backend);
+                    }
                     const int64_t weights_us =
                         ggml_time_us() - weights_begin_us;
                     record_copy_wait(weights_us);
@@ -13647,18 +13865,22 @@ auto prefill_norm_sg_has_prework =
                     }
 
                     if (c2p_parallel_ready) {
-                        ggml_cgraph * c2p_pc_suffix_graph =
-                            build_region_graph_slice(
-                                c2p_pc_graph,
-                                c2p_pc_route_stop,
-                                c2p_pc_graph->n_nodes,
-                                i,
-                                0x4352505355464649ULL);
+                        if (c2p_pc_suffix_graph == nullptr) {
+                            c2p_pc_suffix_graph =
+                                build_region_graph_slice(
+                                    c2p_pc_graph,
+                                    c2p_pc_route_stop,
+                                    c2p_pc_graph->n_nodes,
+                                    i,
+                                    0x4352505355464649ULL);
+                        }
 
                         const int64_t parallel_begin_us =
                             ggml_time_us();
-                        compute_workers.start_graph(
-                            0, c2p_pc_suffix_graph);
+                        if (!c2p_pc_ffn_started_early) {
+                            compute_workers.start_graph(
+                                0, c2p_pc_suffix_graph);
+                        }
                         compute_workers.start(1, i);
 
                         const ggml_status pc_ffn_status =
@@ -13671,7 +13893,8 @@ auto prefill_norm_sg_has_prework =
                                 "[REGION_C2P_FFN_PARALLEL] "
                                 "phase=PREFILL layer=%d chunk=%d "
                                 "router_nodes=%d pc_ffn_nodes=%d "
-                                "phone_nodes=%d submit_wait_ms=%.3f "
+                                "phone_nodes=%d route_overlap=%d "
+                                "submit_wait_ms=%.3f "
                                 "pc_status=%d phone_status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
@@ -13680,6 +13903,7 @@ auto prefill_norm_sg_has_prework =
                                     c2p_pc_route_stop,
                                 backend_ctx->backend_configs[1]
                                     .cgraphs[i].cgraph_main->n_nodes,
+                                c2p_pc_ffn_started_early ? 1 : 0,
                                 (ggml_time_us() - parallel_begin_us) /
                                     1000.0,
                                 (int) pc_ffn_status,
@@ -13896,6 +14120,10 @@ auto prefill_norm_sg_has_prework =
         ggml_cgraph * c2p_decode_prefix_graph = nullptr;
         int c2p_decode_route_stop = -1;
         bool c2p_decode_parallel_ready = false;
+        ggml_cgraph * c2p_decode_suffix_graph = nullptr;
+        bool c2p_decode_pc_ffn_started_early = false;
+        std::vector<uint8_t> c2p_decode_topk_host;
+        std::vector<uint8_t> c2p_decode_weights_host;
         if (region_parallel_ffn &&
                 c2p_decode_pc_graph != nullptr) {
             const int topk_index =
@@ -13953,21 +14181,67 @@ auto prefill_norm_sg_has_prework =
             auto & phone_cfg = backend_ctx->backend_configs[1];
 
             ggml_backend_synchronize(pc_cfg.backend);
+
+            if (region_route_overlap &&
+                    c2p_decode_parallel_ready) {
+                c2p_decode_topk_host.resize(
+                    ggml_nbytes(src_topk));
+                c2p_decode_weights_host.resize(
+                    ggml_nbytes(src_weights));
+                ggml_backend_tensor_get(
+                    src_topk,
+                    c2p_decode_topk_host.data(),
+                    0,
+                    c2p_decode_topk_host.size());
+                ggml_backend_tensor_get(
+                    src_weights,
+                    c2p_decode_weights_host.data(),
+                    0,
+                    c2p_decode_weights_host.size());
+
+                c2p_decode_suffix_graph =
+                    build_region_graph_slice(
+                        c2p_decode_pc_graph,
+                        c2p_decode_route_stop,
+                        c2p_decode_pc_graph->n_nodes,
+                        i,
+                        0x4352445355464649ULL);
+                compute_workers.start_graph(
+                    0, c2p_decode_suffix_graph);
+                c2p_decode_pc_ffn_started_early = true;
+            }
+
             const int64_t topk_begin_us = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend, phone_cfg.backend,
-                src_topk, dst_topk);
-            ggml_backend_synchronize(phone_cfg.backend);
+            if (c2p_decode_pc_ffn_started_early) {
+                ggml_backend_tensor_set(
+                    dst_topk,
+                    c2p_decode_topk_host.data(),
+                    0,
+                    c2p_decode_topk_host.size());
+            } else {
+                ggml_backend_tensor_copy_async(
+                    pc_cfg.backend, phone_cfg.backend,
+                    src_topk, dst_topk);
+                ggml_backend_synchronize(phone_cfg.backend);
+            }
             const int64_t topk_us = ggml_time_us() - topk_begin_us;
             record_copy_wait(topk_us);
             record_meta_copy(i, 0, 1, src_topk, topk_us);
             record_direct_copy();
 
             const int64_t weights_begin_us = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend, phone_cfg.backend,
-                src_weights, dst_weights);
-            ggml_backend_synchronize(phone_cfg.backend);
+            if (c2p_decode_pc_ffn_started_early) {
+                ggml_backend_tensor_set(
+                    dst_weights,
+                    c2p_decode_weights_host.data(),
+                    0,
+                    c2p_decode_weights_host.size());
+            } else {
+                ggml_backend_tensor_copy_async(
+                    pc_cfg.backend, phone_cfg.backend,
+                    src_weights, dst_weights);
+                ggml_backend_synchronize(phone_cfg.backend);
+            }
             const int64_t weights_us = ggml_time_us() - weights_begin_us;
             record_copy_wait(weights_us);
             record_meta_copy(i, 0, 1, src_weights, weights_us);
@@ -13988,18 +14262,22 @@ auto prefill_norm_sg_has_prework =
             }
 
             if (c2p_decode_parallel_ready) {
-                ggml_cgraph * c2p_decode_suffix_graph =
-                    build_region_graph_slice(
-                        c2p_decode_pc_graph,
-                        c2p_decode_route_stop,
-                        c2p_decode_pc_graph->n_nodes,
-                        i,
-                        0x4352445355464649ULL);
+                if (c2p_decode_suffix_graph == nullptr) {
+                    c2p_decode_suffix_graph =
+                        build_region_graph_slice(
+                            c2p_decode_pc_graph,
+                            c2p_decode_route_stop,
+                            c2p_decode_pc_graph->n_nodes,
+                            i,
+                            0x4352445355464649ULL);
+                }
 
                 const int64_t parallel_begin_us =
                     ggml_time_us();
-                compute_workers.start_graph(
-                    0, c2p_decode_suffix_graph);
+                if (!c2p_decode_pc_ffn_started_early) {
+                    compute_workers.start_graph(
+                        0, c2p_decode_suffix_graph);
+                }
                 compute_workers.start(1, i);
 
                 const ggml_status pc_ffn_status =
@@ -14013,7 +14291,8 @@ auto prefill_norm_sg_has_prework =
                         "[REGION_C2P_FFN_PARALLEL] "
                         "phase=DECODE layer=%d chunk=-1 "
                         "router_nodes=%d pc_ffn_nodes=%d "
-                        "phone_nodes=%d submit_wait_ms=%.3f "
+                        "phone_nodes=%d route_overlap=%d "
+                        "submit_wait_ms=%.3f "
                         "pc_status=%d phone_status=%d\n",
                         c2p_decode_ffn_layer,
                         c2p_decode_route_stop,
@@ -14021,6 +14300,7 @@ auto prefill_norm_sg_has_prework =
                             c2p_decode_route_stop,
                         backend_ctx->backend_configs[1]
                             .cgraphs[i].cgraph_main->n_nodes,
+                        c2p_decode_pc_ffn_started_early ? 1 : 0,
                         (ggml_time_us() - parallel_begin_us) /
                             1000.0,
                         (int) pc_ffn_status,
@@ -14069,6 +14349,7 @@ auto prefill_norm_sg_has_prework =
         int direct_route_layer = -1;
         bool direct_route_bound = false;
         bool direct_route_rebound = false;
+        bool region_p2c_producer_route = false;
         uint64_t saved_phone_graph_uid = 0;
         if (!phone_block_fused &&
                 phone_graph != nullptr &&
@@ -14082,7 +14363,36 @@ auto prefill_norm_sg_has_prework =
             // immediately after this graph completes.  It must therefore
             // detect the boundary without rebinding those tensors into the
             // legacy deferred-Phone-FFN staging storage.
-            if (phone_prefill_producer_route) {
+            if (region_route_overlap &&
+                    direct_route_chunk >= 0 &&
+                    ggml_backend_meta_tensor_p2c_layer(
+                        backend_ctx, direct_route_layer) &&
+                    i + 1 < backend_ctx->n_subgraphs) {
+                ggml_tensor * pc_next =
+                    get_prefill_down_boundary_node(0, i + 1);
+                ggml_tensor * phone_next =
+                    get_prefill_down_boundary_node(1, i + 1);
+                int pc_chunk = -1;
+                int pc_layer = -1;
+                int phone_chunk = -1;
+                int phone_layer = -1;
+                region_p2c_producer_route =
+                    pc_next != nullptr &&
+                    phone_next != nullptr &&
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        pc_next->name, pc_chunk, pc_layer) &&
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        phone_next->name, phone_chunk, phone_layer) &&
+                    pc_chunk == direct_route_chunk &&
+                    phone_chunk == direct_route_chunk &&
+                    pc_layer == direct_route_layer &&
+                    phone_layer == direct_route_layer &&
+                    (pc_next->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    (phone_next->flags & GGML_TENSOR_FLAG_COMPUTE);
+            }
+
+            if (phone_prefill_producer_route ||
+                    region_p2c_producer_route) {
                 direct_route_bound = true;
             } else if (bind_phone_prefill_route_outputs_direct(
                     direct_route_layer,
@@ -14101,6 +14411,22 @@ auto prefill_norm_sg_has_prework =
                     i,
                     direct_route_layer,
                     direct_route_chunk);
+        }
+        if (region_p2c_producer_route &&
+                !producer_route_prearmed) {
+            // Snapshot mailbox support is optional. If the RPC endpoint cannot
+            // prearm an immutable route snapshot, fall back to the proven
+            // synchronous P2C handoff and do not start the next Phone FFN early.
+            region_p2c_producer_route = false;
+            direct_route_bound = false;
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_P2C_ROUTE_OVERLAP] "
+                    "phase=PREARM layer=%d chunk=%d "
+                    "status=FALLBACK_SYNC\n",
+                    direct_route_layer,
+                    direct_route_chunk);
+            }
         }
 
         const int64_t phone_submit_begin_us = ggml_time_us();
@@ -14165,6 +14491,50 @@ auto prefill_norm_sg_has_prework =
                 published = mark_ready(phone_backend, seq);
             }
             GGML_ASSERT(published);
+
+            if (region_p2c_producer_route &&
+                    producer_route_prearmed &&
+                    compute_status == GGML_STATUS_SUCCESS) {
+                GGML_ASSERT(!region_p2c_early_ffn.active);
+                GGML_ASSERT(i + 1 < backend_ctx->n_subgraphs);
+
+                const auto route_it =
+                    pending_phone_prefill_routes.find(
+                        { direct_route_layer,
+                          direct_route_chunk });
+                GGML_ASSERT(
+                    route_it !=
+                    pending_phone_prefill_routes.end());
+                GGML_ASSERT(route_it->second.worker != nullptr);
+                GGML_ASSERT(route_it->second.task != 0);
+
+                compute_workers.start(1, i + 1);
+
+                region_p2c_early_ffn.active = true;
+                region_p2c_early_ffn.route_sg = i;
+                region_p2c_early_ffn.ffn_sg = i + 1;
+                region_p2c_early_ffn.layer =
+                    direct_route_layer;
+                region_p2c_early_ffn.chunk =
+                    direct_route_chunk;
+                region_p2c_early_ffn.route_task =
+                    route_it->second.task;
+                region_p2c_early_ffn.route_worker =
+                    route_it->second.worker;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_P2C_ROUTE_OVERLAP] "
+                        "phase=PHONE_FFN_EARLY layer=%d chunk=%d "
+                        "route_sg=%zu ffn_sg=%zu route_task=%" PRIu64
+                        " status=SUBMITTED\n",
+                        direct_route_layer,
+                        direct_route_chunk,
+                        i,
+                        i + 1,
+                        route_it->second.task);
+                }
+            }
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
