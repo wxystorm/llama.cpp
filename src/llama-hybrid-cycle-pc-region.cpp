@@ -531,14 +531,44 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
                     std::to_string(unsupported));
     }
 
+        auto built =
+            std::make_unique<llama_hybrid_cycle_pc_region_cache::impl::graph_entry>();
+        built->first_layer = first_layer;
+        built->layer_count = layer_count;
+        built->tokens = tokens;
+        built->kv_tokens = kv_tokens;
+        built->weight_generations = weight_generations;
+        built->ctx = ctx;
+        built->graph = graph;
+        built->input = x;
+        built->positions = positions;
+        built->causal_mask = causal_mask;
+        built->output = current;
+        built->graph_nodes = ggml_graph_n_nodes(graph);
+        entry = cache_impl->insert(std::move(built));
+        if (!entry) {
+            return fail("PC_REGION_CACHE_INSERT");
+        }
+        local_ctx_owned = false;
+    }
+
+    if (!entry || !entry->ctx || !entry->graph || !entry->input ||
+        !entry->positions || !entry->causal_mask || !entry->output) {
+        return fail("PC_REGION_CACHE_ENTRY");
+    }
+    ctx = entry->ctx;
+    graph = entry->graph;
+    x = entry->input;
+    positions = entry->positions;
+    causal_mask = entry->causal_mask;
+    current = entry->output;
+
     const auto graph_build_done = std::chrono::steady_clock::now();
     const auto alloc_begin = graph_build_done;
-    compute_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
-        ctx, ggml_backend_get_default_buffer_type(cuda));
-    const auto alloc_done = std::chrono::steady_clock::now();
-    if (!compute_buffer) {
-        return fail("PC_REGION_COMPUTE_BUFFER");
+    if (!cache_impl->allocate_graph(graph)) {
+        return fail("PC_REGION_GALLOC_GRAPH");
     }
+    const auto alloc_done = std::chrono::steady_clock::now();
 
     std::vector<int32_t> position_data(size_t(tokens), 0);
     std::vector<ggml_fp16_t> mask_data(size_t(tokens * kv_tokens));
@@ -631,8 +661,26 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
             output.size() * sizeof(float));
     }
 
-    cleanup();
     return true;
+}
+
+bool llama_hybrid_cycle_execute_pc_full_region(
+        const llama_model & model,
+        llama_hybrid_cycle_physical_resource_pool & resources,
+        int first_layer,
+        int layer_count,
+        int64_t token_start,
+        int64_t tokens,
+        const std::vector<float> & input,
+        std::vector<float> & output,
+        std::string & reason,
+        const std::function<bool()> & input_consumed,
+        llama_hybrid_cycle_pc_region_timing * timing) {
+    llama_hybrid_cycle_pc_region_cache one_call_cache(1);
+    return llama_hybrid_cycle_execute_pc_full_region_cached(
+        model, resources, one_call_cache,
+        first_layer, layer_count, token_start, tokens,
+        input, output, reason, input_consumed, timing);
 }
 
 
