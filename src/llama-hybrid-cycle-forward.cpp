@@ -224,6 +224,7 @@ static bool cycle_core_evaluate_with_kv(
                         std::atomic<int> real_p2c_partial_ack {0};
                         std::atomic<int> p2c_device_handoffs {0};
                         std::atomic<int> p2c_slot_reuse {0};
+                        std::atomic<int> phone_region_prepared {0};
                         std::atomic<int> phone_region_armed {0};
                         std::atomic<int> phone_region_stage_acks {0};
 
@@ -323,7 +324,7 @@ static bool cycle_core_evaluate_with_kv(
                                     st.phone_output->registered_full_graph_uid != 0;
                             };
 
-                        const auto arm_phone_region =
+                        const auto prepare_phone_region =
                             [&](llama_hybrid_cycle_phone_region_progress & pregion,
                                 int chunk) -> bool {
                                 if (chunk < 0 || chunk >= n_chunks ||
@@ -345,6 +346,72 @@ static bool cycle_core_evaluate_with_kv(
                                     !prepare_phone_region_full(
                                         pregion, l6, chunk,
                                         s5.phone_output->output)) {
+                                    return false;
+                                }
+                                pregion.first_phone_registered_tokens =
+                                    std::max<int64_t>(
+                                        pregion.first_phone_registered_tokens,
+                                        s5.start + s5.tokens);
+                                pregion.next_attention_registered_tokens =
+                                    std::max<int64_t>(
+                                        pregion.next_attention_registered_tokens,
+                                        s6.start + s6.tokens);
+                                ++phone_region_prepared;
+                                if (llama_hybrid_cycle_verbose()) {
+                                    std::printf(
+                                        "[CYCLE_PHONE_REGION_PROD] "
+                                        "event=PREPARE chunk=%d layers=%d,%d "
+                                        "l5_attn_uid=%llu l5_ffn_uid=%llu "
+                                        "l6_attn_uid=%llu l6_ffn_uid=%llu "
+                                        "status=PASS\n",
+                                        chunk, l5, l6,
+                                        (unsigned long long)
+                                            s5.ready.prepared_attention_graph_uid,
+                                        (unsigned long long)
+                                            s5.phone_output->
+                                                registered_full_graph_uid,
+                                        (unsigned long long)
+                                            s6.ready.prepared_attention_graph_uid,
+                                        (unsigned long long)
+                                            s6.phone_output->
+                                                registered_full_graph_uid);
+                                }
+                                return true;
+                            };
+
+                        const auto arm_phone_region =
+                            [&](llama_hybrid_cycle_phone_region_progress & pregion,
+                                int chunk) -> bool {
+                                if (chunk < 0 || chunk >= n_chunks ||
+                                    pregion.location.phone_end -
+                                        pregion.location.phone_begin != 2) {
+                                    return false;
+                                }
+                                const int l5 = pregion.location.phone_begin;
+                                const int l6 = l5 + 1;
+                                auto & c2p = session.at(
+                                    pregion.location.c2p_layer, chunk);
+                                auto & s5 = session.at(l5, chunk);
+                                auto & s6 = session.at(l6, chunk);
+                                // PREPARE must have completed earlier in the
+                                // C2P ATTN_PRE callback. REDUCE is allowed to
+                                // do only descriptor validation + one ARM RPC.
+                                const bool prepared =
+                                    c2p.phone_output &&
+                                    c2p.phone_output->output &&
+                                    s5.phone_output &&
+                                    s6.phone_output &&
+                                    s5.ready.prepared_attention_graph_uid != 0 &&
+                                    s6.ready.prepared_attention_graph_uid != 0 &&
+                                    s5.ready.prepared_attention_input != nullptr &&
+                                    s6.ready.prepared_attention_input != nullptr &&
+                                    s5.phone_output->registered_full_graph_uid != 0 &&
+                                    s6.phone_output->registered_full_graph_uid != 0;
+                                if (!prepared) {
+                                    std::fprintf(stderr,
+                                        "[CYCLE_PHONE_REGION_PROD] "
+                                        "event=ARM chunk=%d status=FAIL "
+                                        "reason=NOT_PREPARED\n", chunk);
                                     return false;
                                 }
 
@@ -379,27 +446,27 @@ static bool cycle_core_evaluate_with_kv(
                                     dst.ffn_inputs[3] =
                                         st.phone_output->inputs.topk_weights;
                                 }
+                                const auto arm_begin =
+                                    std::chrono::steady_clock::now();
                                 const bool armed =
                                     ggml_backend_rpc_cycle_arm_phone_region(
                                         phone, plan);
+                                const double arm_ms =
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        arm_begin).count();
                                 if (armed) {
                                     ++pregion.region_armed;
                                     ++phone_region_armed;
-                                    pregion.first_phone_registered_tokens =
-                                        std::max<int64_t>(
-                                            pregion.first_phone_registered_tokens,
-                                            s5.start + s5.tokens);
-                                    pregion.next_attention_registered_tokens =
-                                        std::max<int64_t>(
-                                            pregion.next_attention_registered_tokens,
-                                            s6.start + s6.tokens);
                                     if (llama_hybrid_cycle_verbose()) {
                                         std::printf(
                                             "[CYCLE_PHONE_REGION_PROD] "
                                             "event=ARM chunk=%d layers=%d,%d "
-                                            "seq=%llu status=PASS\n",
+                                            "seq=%llu arm_rpc_ms=%.3f "
+                                            "status=PASS\n",
                                             chunk, l5, l6,
-                                            (unsigned long long)s5.wire.seq);
+                                            (unsigned long long)s5.wire.seq,
+                                            arm_ms);
                                     }
                                 }
                                 return armed;
