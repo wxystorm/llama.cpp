@@ -113,6 +113,10 @@ public:
         std::mutex c2p_mutex;
         std::vector<phone_ptr> c2p_idle;
         size_t c2p_live_slots = 0;
+        // Region preparation now runs on a small host control worker while
+        // PHONE_GPU callbacks retire completed Full slots. Protect the idle
+        // Full pool independently from C2P slot ownership.
+        std::mutex full_mutex;
         // Indexed by ABSOLUTE physical model layer, not local L5/L6.
         std::vector<std::vector<phone_ptr>> full_idle_by_layer;
         std::vector<p2c_ptr> p2c_idle;
