@@ -669,15 +669,21 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             1.0f / sqrtf(float(n_embd_head)),
                             il);
                     const std::string attn_name =
-                        "prefill_wave_attn_out_group_" +
-                        std::to_string(ci) + "_1";
+                        p2c ?
+                            ("region_p2c_attn_out_chunk_" +
+                             std::to_string(ci)) :
+                            ("region_phone_attn_out_chunk_" +
+                             std::to_string(ci));
                     cb(attn, attn_name.c_str(), il);
 
                     ggml_tensor * ffn_inp =
                         ggml_add(ctx0, attn, chunk_hidden);
                     const std::string ffn_inp_name =
-                        "prefill_wave_ffn_inp_chunk_" +
-                        std::to_string(ci);
+                        p2c ?
+                            ("prefill_wave_ffn_inp_chunk_" +
+                             std::to_string(ci)) :
+                            ("region_phone_ffn_inp_chunk_" +
+                             std::to_string(ci));
                     cb(ffn_inp, ffn_inp_name.c_str(), il);
 
                     ggml_tensor * ffn_norm =
@@ -686,8 +692,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             model.layers[il].ffn_norm,
                             NULL, LLM_NORM_RMS, il);
                     const std::string norm_name =
-                        "prefill_ffn_norm_chunk_" +
-                        std::to_string(ci);
+                        p2c ?
+                            ("prefill_ffn_norm_chunk_" +
+                             std::to_string(ci)) :
+                            ("region_phone_ffn_norm_chunk_" +
+                             std::to_string(ci));
                     cb(ffn_norm, norm_name.c_str(), il);
 
                     llm_graph_moe_routing routing;
@@ -759,7 +768,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ggml_tensor * l_out =
                         ggml_add(ctx0, down, ffn_inp);
                     const std::string l_out_name =
-                        "prefill_wave_l_out_chunk_" +
+                        "region_phone_l_out_chunk_" +
                         std::to_string(ci);
                     cb(l_out, l_out_name.c_str(), il);
                     ggml_build_forward_expand(gf, l_out);
