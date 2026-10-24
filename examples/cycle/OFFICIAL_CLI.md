@@ -194,8 +194,8 @@ and 48-layer Cycle pattern do not change. For reproducibility, compare the
 `cuda_estimated_mib`, and `pc_cpu_fallback`. A nonzero budget with no
 registered CUDA backend fails instead of silently changing the experiment.
 
-The official forward now also prints one `[CYCLE_CORE_QUEUE]` per logical
-worker after each FIFO invocation: task count, callback execution total/maximum,
+When `LLAMA_HYBRID_CYCLE_QUEUE_PROFILE=1` is set, the official forward
+prints one `[CYCLE_CORE_QUEUE]` per logical worker after each FIFO invocation: task count, callback execution total/maximum,
 queue wait total/maximum, and idle time. These are **PC host-side observations**:
 they overlap across queues and must never be summed to produce end-to-end time.
 A Phone GPU callback may include network and remote synchronization; it is
@@ -208,3 +208,35 @@ baseline first, followed by a small nonzero budget that fits one or two mirrored
 PC Full layers. Do not start with a budget intended for all 24 PC Full layers.
 Confirm that all 48 KV prefixes, READY/PARTIAL ACKs and final logits continue
 to complete and compare prompt/eval timings under the same input.
+
+
+## Quiet generated text and opt-in diagnostics
+
+Successful per-layer/per-Chunk Cycle tracing is now **off by default** so the
+official CLI's sampled tokens on `stdout` are readable. The regular completion
+status, resource-plan summary, standard Prompt/Eval statistics, error messages
+and correctness/parity failures remain available. Cycle's direct
+`std::printf` diagnostics were never controlled by the upstream `-lv`
+argument; `-lv` only configures the normal logging system.
+
+```powershell
+# Quiet generation and correctness regression (default).
+Remove-Item Env:LLAMA_HYBRID_CYCLE_VERBOSE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_CYCLE_QUEUE_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_HYBRID_CYCLE_STAGE_PROFILE -ErrorAction SilentlyContinue
+
+# When investigating a wrong result, turn on all successful stage traces:
+$env:LLAMA_HYBRID_CYCLE_VERBOSE = "1"
+# When measuring bottlenecks, request real five-worker host-side queue metrics:
+$env:LLAMA_HYBRID_CYCLE_QUEUE_PROFILE = "1"
+# Optional existing Attention/FFN stage timing; unset to disable.
+$env:LLAMA_HYBRID_CYCLE_STAGE_PROFILE = "1"
+```
+
+Unlike verbose logs, these options only change observation/printing; they do
+not change KV ownership, worker scheduling, attention graphs, precision or
+sampler output. The queue timeline is not collected unless queue profiling
+is enabled. Hardware performance comparisons should leave detailed verbose
+stage traces off to avoid log I/O overhead. `status=FAIL` from computational,
+transport and ownership validation is still printed independently of
+verbose mode.
