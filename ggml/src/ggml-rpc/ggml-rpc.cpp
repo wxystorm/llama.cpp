@@ -3132,11 +3132,12 @@ static bool ggml_backend_rpc_set_tensor_async_return_wait(
     return status;
 }
 
-static bool ggml_backend_rpc_set_tensor_async_return(
+static bool ggml_backend_rpc_set_tensor_async_return_lane(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
         const void * data,
-        size_t data_size) {
+        size_t data_size,
+        size_t return_lane) {
     if (backend_dst == nullptr || !ggml_backend_is_rpc(backend_dst)) {
         return false;
     }
@@ -3159,7 +3160,7 @@ static bool ggml_backend_rpc_set_tensor_async_return(
 
     // Null destination/data is a cheap capability query used by Meta.
     if (dst == nullptr && data == nullptr && data_size == 0) {
-        return true;
+        return return_lane < RPC_RETURN_TRANSFER_LANES;
     }
     if (dst == nullptr || data == nullptr ||
             dst->buffer == nullptr ||
@@ -3177,13 +3178,17 @@ static bool ggml_backend_rpc_set_tensor_async_return(
         return false;
     }
 
+    if (return_lane >= RPC_RETURN_TRANSFER_LANES) {
+        return false;
+    }
+
     auto & return_sock =
-        rpc_dev_ctx->return_transfer_socks[0];
+        rpc_dev_ctx->return_transfer_socks[return_lane];
     if (return_sock == nullptr) {
         return_sock =
             get_return_transfer_socket(
                 rpc_ctx->endpoint,
-                0);
+                return_lane);
     }
     auto sock = return_sock;
     RPC_STATUS_ASSERT(sock != nullptr);
@@ -3238,6 +3243,85 @@ static bool ggml_backend_rpc_set_tensor_async_return(
     }
 
     return status;
+}
+
+static bool ggml_backend_rpc_set_tensor_async_return(
+        ggml_backend_t backend_dst,
+        ggml_tensor * dst,
+        const void * data,
+        size_t data_size) {
+    return ggml_backend_rpc_set_tensor_async_return_lane(
+        backend_dst,
+        dst,
+        data,
+        data_size,
+        0);
+}
+
+static bool ggml_backend_rpc_get_tensor_return_lane(
+        ggml_backend_t backend_src,
+        const ggml_tensor * src,
+        void * data,
+        size_t data_size,
+        size_t return_lane) {
+    if (backend_src == nullptr ||
+            !ggml_backend_is_rpc(backend_src)) {
+        return false;
+    }
+
+    if (src == nullptr && data == nullptr && data_size == 0) {
+        return return_lane < RPC_RETURN_TRANSFER_LANES;
+    }
+
+    if (src == nullptr || data == nullptr ||
+            src->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(src->buffer) ||
+            data_size != ggml_nbytes(src) ||
+            return_lane >= RPC_RETURN_TRANSFER_LANES) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(
+            backend_src->context);
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_src)->context);
+    auto * src_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            src->buffer->context);
+
+    if (rpc_ctx == nullptr ||
+            rpc_dev_ctx == nullptr ||
+            src_buffer_ctx == nullptr ||
+            src_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            src_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    auto & return_sock =
+        rpc_dev_ctx->return_transfer_socks[return_lane];
+    if (return_sock == nullptr) {
+        return_sock =
+            get_return_transfer_socket(
+                rpc_ctx->endpoint,
+                return_lane);
+    }
+    auto sock = return_sock;
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    rpc_msg_get_tensor_req request {};
+    request.tensor = serialize_tensor(src);
+    request.offset = 0;
+    request.size = data_size;
+
+    return send_rpc_cmd(
+        sock,
+        RPC_CMD_GET_TENSOR,
+        &request,
+        sizeof(request),
+        data,
+        data_size);
 }
 
 static int rpc_find_graph_node(
@@ -7591,6 +7675,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_set_tensor_async_return);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_LANE_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_set_tensor_async_return_lane);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_TENSOR_RETURN_LANE_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_get_tensor_return_lane);
     }
     if (std::strcmp(
             name,
