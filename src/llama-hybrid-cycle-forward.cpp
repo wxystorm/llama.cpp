@@ -1055,12 +1055,21 @@ static bool cycle_core_evaluate_with_kv(
                 real_p2c_partial_rx.load() == 6*n_chunks &&
                 real_p2c_reduce.load() == 6*n_chunks &&
                 real_p2c_partial_ack.load() == 6*n_chunks &&
-                p2c_device_handoffs.load() == 6*n_chunks;
+                p2c_device_handoffs.load() == 6*n_chunks &&
+                session.cuda_device_handoffs() ==
+                    uint64_t(18 * n_chunks);
             if (ok && !expected_stages) {
                 reason = "REAL_PHYSICAL_STAGES_INCOMPLETE";
                 ok = false;
             }
             if (n_tokens > 1) {
+                std::printf(
+                    "[CYCLE_PC_CUDA_LOCAL] internal_edges=%llu "
+                    "expected=%d region_tail_host_readbacks=%d "
+                    "status=%s\n",
+                    (unsigned long long) session.cuda_device_handoffs(),
+                    18 * n_chunks, 6 * n_chunks,
+                    ok ? "PASS" : "FAIL");
                 std::printf(
                     "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
                     "fused_ffn_add=1 calls=%d slot_reuse=%d "
