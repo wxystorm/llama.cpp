@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -49,6 +50,11 @@ struct llama_hybrid_cycle_task {
     // Nonzero for an opt-in per-layer entry trace. This captures the time
     // the predecessor made this Chunk ready, BEFORE credits/order allow enqueue.
     std::chrono::steady_clock::time_point entry_ready_at {};
+    // FULL_LAYER only. The runtime installs this callback after dequeue.
+    // A real executor calls it exactly once after the predecessor input is no
+    // longer referenced by device work. This releases only the predecessor's
+    // admission credit; task completion still publishes this layer's output.
+    std::function<bool()> input_consumed;
 };
 
 inline const char * llama_hybrid_cycle_stage_name(llama_hybrid_cycle_stage stage) {
@@ -115,6 +121,8 @@ public:
         next_chunk_.assign(layout_.kinds.size(), 0);
         layer_inflight_.assign(layout_.kinds.size(), 0);
         tensor_ready_.assign(layout_.kinds.size(), std::vector<tensor_join_state>(n_chunks_));
+        full_input_consumed_.assign(
+            layout_.kinds.size(), std::vector<uint8_t>(n_chunks_, 0));
         next_c2p_reduce_chunk_.assign(layout_.kinds.size(), 0);
         if (trace_entry_gate_) {
             entry_ready_times_.assign(layout_.kinds.size(),
@@ -213,10 +221,13 @@ public:
             if (task.stage != llama_hybrid_cycle_stage::FULL_LAYER) {
                 throw std::logic_error("unexpected non-Tensor stage");
             }
-            // This full layer has now consumed the previous layer's
-            // output. Only NOW can the previous owner's GPU/CPU buffer
-            // credit be reused to start another Chunk.
-            if (credit_until_handoff_ && task.layer > 0) {
+            // Preferred path: the real FULL_LAYER executor already released
+            // the predecessor credit at its exact INPUT_CONSUMED boundary.
+            // Keep completion-time release as a compatibility fallback for
+            // mock/legacy handlers that do not emit that notification.
+            if (credit_until_handoff_ && task.layer > 0 &&
+                full_input_consumed_[size_t(task.layer)][size_t(task.chunk)] == 0) {
+                full_input_consumed_[size_t(task.layer)][size_t(task.chunk)] = 1;
                 release_layer_credit(task.layer - 1);
             }
             finish_layer(task.layer, task.chunk);
@@ -288,6 +299,29 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         const size_t i = static_cast<size_t>(queue);
         return i < queues_.size() ? queues_[i].size() : 0;
+    }
+
+    // Called by the runtime-installed FULL_LAYER task callback while the task
+    // is still running. The executor must have fenced the last read of the
+    // predecessor input before calling this method.
+    bool mark_full_input_consumed(int layer, int chunk) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!credit_until_handoff_ || layer <= 0 ||
+            layer >= int(layout_.kinds.size()) ||
+            chunk < 0 || chunk >= n_chunks_ ||
+            is_tensor(layout_.kinds[size_t(layer)]) ||
+            full_input_consumed_[size_t(layer)][size_t(chunk)] != 0) {
+            return false;
+        }
+        const task_id key {
+            layer, chunk, llama_hybrid_cycle_stage::FULL_LAYER
+        };
+        if (running_.find(key) == running_.end()) {
+            return false;
+        }
+        full_input_consumed_[size_t(layer)][size_t(chunk)] = 1;
+        release_layer_credit(layer - 1);
+        return true;
     }
 
 private:
@@ -451,4 +485,5 @@ private:
     std::vector<int> layer_inflight_;
     std::vector<int> next_c2p_reduce_chunk_;
     std::vector<std::vector<tensor_join_state>> tensor_ready_;
+    std::vector<std::vector<uint8_t>> full_input_consumed_;
 };
