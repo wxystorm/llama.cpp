@@ -2,7 +2,6 @@
 #include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
-#include "llama-hybrid-cycle-pc-full.h"
 #include "llama-hybrid-cycle-pc-region.h"
 #include "llama-hybrid-cycle-c2p-pc.h"
 #include "llama-hybrid-cycle-phone-full.h"
@@ -181,8 +180,6 @@ static bool cycle_core_evaluate_with_kv(
                 const std::vector<float> &,const char *,const char *) {};
             const auto trace_stage_gpu = [](int,int,int64_t,int64_t,
                 const ggml_tensor *,const char *,const char *) {};
-            std::function<void(int,int,int64_t,int64_t,
-                               const std::vector<float> &)> pc_trace;
             const std::vector<float> & initial_hidden = token_embeddings;
                         // Mock Phone device activations live until all FIFO
                         // workers join. Exactly one producing stage writes
