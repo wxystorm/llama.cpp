@@ -233,6 +233,8 @@ static bool cycle_core_evaluate_with_kv(
                         std::atomic<int> p2c_device_handoffs {0};
                         std::atomic<int> p2c_slot_reuse {0};
                         std::atomic<int> pc_cuda_region_calls {0};
+                        llama_hybrid_cycle_pc_region_cache_stats
+                            pc_cuda_region_cache_stats;
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
@@ -249,7 +251,8 @@ static bool cycle_core_evaluate_with_kv(
                                 llama_hybrid_cycle_bind_pc_region_stages(
                                     stages, *model, resources, session,
                                     initial_hidden, hidden, reason,
-                                    &pc_cuda_region_calls) :
+                                    &pc_cuda_region_calls,
+                                    &pc_cuda_region_cache_stats) :
                                 llama_hybrid_cycle_bind_pc_full_stages(
                                     stages, *model, resources, cpu, session,
                                     initial_hidden, hidden, reason);
@@ -1090,12 +1093,19 @@ static bool cycle_core_evaluate_with_kv(
                     "[CYCLE_PC_CUDA_MODE] mode=%s region_calls=%d "
                     "expected_region_calls=%d legacy_device_handoffs=%llu "
                     "expected_legacy_handoffs=%llu host_readbacks=%d "
-                    "status=%s\n",
+                    "cache_hits=%llu cache_builds=%llu cache_evictions=%llu "
+                    "allocator_grows=%llu galloc_mib=%.3f status=%s\n",
                     pc_cuda_region ? "REGION_V2_CACHE" : "DEVICE_LOCAL_FALLBACK",
                     pc_cuda_region_calls.load(), expected_region_calls,
                     (unsigned long long) session.cuda_device_handoffs(),
                     (unsigned long long) expected_legacy_cuda_handoffs,
                     6 * n_chunks,
+                    (unsigned long long) pc_cuda_region_cache_stats.hits,
+                    (unsigned long long) pc_cuda_region_cache_stats.builds,
+                    (unsigned long long) pc_cuda_region_cache_stats.evictions,
+                    (unsigned long long) pc_cuda_region_cache_stats.allocator_grows,
+                    double(pc_cuda_region_cache_stats.allocator_bytes) /
+                        (1024.0 * 1024.0),
                     ok ? "PASS" : "FAIL");
                 std::printf(
                     "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
