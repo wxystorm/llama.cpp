@@ -8,17 +8,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 struct llama_model;
 
-// A budget is an upper bound, never a request to allocate all PC layers on
-// CUDA. Zero is the safe default: PC full layers execute on the CPU. A
-// nonempty input layout.pc_cuda_layers is treated as a REQUIRED selection
-// and is rejected if it exceeds the budget. Without an explicit bitmap,
-// automatic selection spreads the affordable mirrors across the whole
-// repeated Cycle pipeline instead of consuming a physical-layer prefix.
+// Legacy pure selector retained for policy/unit tests. Production Cycle no
+// longer uses the selected bitmap as a CPU-vs-CUDA execution decision:
+// every ordinary PC Full layer executes on CUDA. The budget instead sizes a
+// bounded CUDA full-weight residency cache; misses synchronously replace one
+// resident mirror on the single PC_CUDA FIFO worker.
 LLAMA_API bool llama_hybrid_cycle_select_cuda_full_layers(
     const llama_hybrid_cycle_layout & layout,
     const std::vector<size_t> & estimated_mirror_bytes,
@@ -30,7 +30,7 @@ LLAMA_API bool llama_hybrid_cycle_select_cuda_full_layers(
 struct llama_hybrid_cycle_resource_config {
     int64_t kv_tokens = 64;             // Physical KV supports <=512 tokens.
     int max_inflight = 2;               // Graph/Scratch credit slots per layer.
-    size_t cuda_weight_budget_bytes = 0; // 0 -> CPU fallback, never mirror all.
+    size_t cuda_weight_budget_bytes = 0; // Effective residency-cache cap; GPU Full is mandatory.
     size_t cuda_safety_reserve_bytes = 512ULL * 1024 * 1024;
     bool attention_graph_cache = true;
     bool attention_scratch_pool = true;
@@ -48,7 +48,11 @@ struct llama_hybrid_cycle_physical_layer_resources {
     llama_hybrid_cycle_layer_kind kind =
         llama_hybrid_cycle_layer_kind::PC_CPU;
     ggml_backend_t attn_backend = nullptr;
+    // Lazy resident mirror for ordinary PC Full. Ownership moves between
+    // physical layers under the pool residency mutex; nullptr means a cache
+    // miss, never permission to execute this Full layer on CPU.
     std::unique_ptr<llama_hybrid_cycle_cuda_full_weights> cuda_weights;
+    uint64_t cuda_residency_stamp = 0;
     std::unique_ptr<llama_hybrid_cycle_physical_kv_cache> kv;
     std::unique_ptr<cycle_real_attention_graph_cache> graph_cache;
     std::unique_ptr<cycle_real_attention_scratch_pool> scratch_pool;
@@ -75,14 +79,33 @@ public:
     LLAMA_API const llama_hybrid_cycle_layout & execution_layout() const;
     LLAMA_API const llama_hybrid_cycle_physical_layer_resources * layer(
         int physical_layer) const;
+
+    // Ensure one ordinary PC Full layer has CUDA weights resident before its
+    // PC_CUDA task executes. There is deliberately no CPU fallback.
+    LLAMA_API bool ensure_pc_full_cuda_resident(
+        int physical_layer, std::string & reason);
+
     LLAMA_API size_t cuda_mirror_bytes_planned() const;
+    // Number of full-layer mirrors that may be resident simultaneously.
     LLAMA_API int cuda_mirror_layers() const;
+    LLAMA_API int cuda_resident_layers() const;
+    LLAMA_API uint64_t cuda_residency_loads() const;
+    LLAMA_API uint64_t cuda_residency_evictions() const;
     LLAMA_API int prepared_layers() const;
 
 private:
     llama_hybrid_cycle_layout layout_;
     std::vector<std::unique_ptr<llama_hybrid_cycle_physical_layer_resources>>
         layers_;
+
+    const llama_model * model_ = nullptr;
+    ggml_backend_t cpu_ = nullptr;
+    ggml_backend_t cuda_ = nullptr;
+
+    mutable std::mutex cuda_residency_mutex_;
+    uint64_t cuda_residency_clock_ = 0;
+    uint64_t cuda_residency_loads_ = 0;
+    uint64_t cuda_residency_evictions_ = 0;
     size_t cuda_mirror_bytes_planned_ = 0;
     int cuda_mirror_layers_ = 0;
 };
