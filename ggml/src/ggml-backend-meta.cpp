@@ -4225,6 +4225,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         region_priority_queues &&
         region_async_partial &&
         region_return_lane_capable;
+    const char * region_chunk_cont_env =
+        std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
+    const bool region_chunk_continuation =
+        region_chunk_cont_env != nullptr &&
+        std::atoi(region_chunk_cont_env) != 0;
 
     auto get_region_exec_worker =
         [&](size_t backend_index)
@@ -5893,6 +5898,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
             return result;
+        };
+
+    auto wait_region_window_dependency =
+        [&](auto & pending,
+            const char * direction,
+            int layer,
+            int chunk,
+            const char * reason,
+            bool & waited) -> ggml_status {
+            waited = false;
+            for (size_t lane = 0;
+                    lane <
+                        ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                    ++lane) {
+                if (!pending[lane].active ||
+                        pending[lane].layer != layer ||
+                        pending[lane].chunk != chunk) {
+                    continue;
+                }
+                waited = true;
+                return wait_region_window_lane(
+                    pending,
+                    direction,
+                    lane,
+                    reason);
+            }
+            return GGML_STATUS_SUCCESS;
         };
 
     if (pipeline_debug && region_window_requested >= 2) {
@@ -11817,7 +11849,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                     pending_region_c2p));
                         }
 
-                        if (region_boundary_last) {
+                        if (region_boundary_last &&
+                                !region_chunk_continuation) {
                             status =
                                 drain_region_window(
                                     pending_region_c2p,
@@ -14141,6 +14174,52 @@ auto prefill_norm_sg_has_prework =
 
         const bool continues_prefill_layer =
             norm_can_overlap || down_can_overlap || is_prefill_wave_attn_sg;
+
+        // In Region continuation mode L35(C) consumes the C2P reducer's
+        // stable Phone-owned L34(C).  Wait only for that exact credit; leave
+        // the other C2P chunks in flight so PHONE_C2P_FFN can overlap MAIN.
+        if (region_chunk_continuation &&
+                region_window2 &&
+                is_prefill_wave_attn_sg &&
+                prefill_wave_attn_layer > 0 &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx,
+                    prefill_wave_attn_layer - 1)) {
+            for (int dep_chunk = prefill_wave_attn_chunk;
+                    dep_chunk <
+                        prefill_wave_attn_chunk +
+                            prefill_wave_attn_chunk_count;
+                    ++dep_chunk) {
+                bool waited = false;
+                const int64_t wait_begin_us = ggml_time_us();
+                const ggml_status dep_status =
+                    wait_region_window_dependency(
+                        pending_region_c2p,
+                        "C2P",
+                        prefill_wave_attn_layer - 1,
+                        dep_chunk,
+                        "PHONE_CONTINUATION",
+                        waited);
+                const int64_t wait_us =
+                    ggml_time_us() - wait_begin_us;
+                if (dep_status != GGML_STATUS_SUCCESS) {
+                    return dep_status;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_CONT_DEP] direction=C2P "
+                        "producer=%d/%d consumer=%d/%d "
+                        "waited=%d wait_ms=%.3f status=OK\n",
+                        prefill_wave_attn_layer - 1,
+                        dep_chunk,
+                        prefill_wave_attn_layer,
+                        dep_chunk,
+                        waited ? 1 : 0,
+                        wait_us / 1000.0);
+                }
+            }
+        }
+
         if (return_wavefront_graph &&
                 (is_prefill_wave_attn_sg || is_prefill_norm_sg || is_prefill_down_sg)) {
             if (is_prefill_wave_attn_sg) {
