@@ -722,6 +722,14 @@ static bool cycle_core_evaluate_with_kv(
                                                 }
                                                 if (valid) {
                                                     state.phone_output = std::move(slot);
+                                                    // As soon as the future C2P l_out
+                                                    // tensor exists, queue L5/L6 graph
+                                                    // preparation. The worker registers
+                                                    // deferred graphs while C2P FFN,
+                                                    // transport and Reduce continue.
+                                                    valid =
+                                                        enqueue_phone_region_prepare(
+                                                            region, c);
                                                 }
                                                 if (!valid) {
                                                     std::fprintf(stderr,
