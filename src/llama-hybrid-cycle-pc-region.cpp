@@ -256,55 +256,76 @@ bool llama_hybrid_cycle_execute_pc_full_region_cached(
         return false;
     }
 
-    const auto graph_build_begin = std::chrono::steady_clock::now();
-    ggml_init_params params {};
-    params.mem_size = 64ULL * 1024 * 1024;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) {
-        reason = "PC_REGION_CONTEXT_ALLOC";
+    auto * cache_impl = cache.impl_.get();
+    if (!cache_impl || !cache_impl->ensure_backend(cuda)) {
+        reason = "PC_REGION_CACHE_BACKEND";
         return false;
     }
-    ggml_backend_buffer_t compute_buffer = nullptr;
-    const auto cleanup = [&] {
-        if (compute_buffer) {
-            ggml_backend_buffer_free(compute_buffer);
-            compute_buffer = nullptr;
+    const int64_t kv_tokens = token_start + tokens;
+    std::vector<uint64_t> weight_generations;
+    weight_generations.reserve(region.size());
+    for (const auto * resource : region) {
+        if (!resource || resource->cuda_residency_generation == 0) {
+            reason = "PC_REGION_RESIDENCY_GENERATION";
+            return false;
         }
-        if (ctx) {
-            ggml_free(ctx);
-            ctx = nullptr;
-        }
-    };
+        weight_generations.push_back(resource->cuda_residency_generation);
+    }
+
+    auto * entry = cache_impl->lookup(
+        first_layer, layer_count, tokens, kv_tokens, weight_generations);
+    const bool cache_hit = entry != nullptr;
+    const auto graph_build_begin = std::chrono::steady_clock::now();
+
+    ggml_context * ctx = entry ? entry->ctx : nullptr;
+    ggml_cgraph * graph = entry ? entry->graph : nullptr;
+    ggml_tensor * x = entry ? entry->input : nullptr;
+    ggml_tensor * positions = entry ? entry->positions : nullptr;
+    ggml_tensor * causal_mask = entry ? entry->causal_mask : nullptr;
+    ggml_tensor * current = entry ? entry->output : nullptr;
+    bool local_ctx_owned = false;
+
     const auto fail = [&](const std::string & why) {
         reason = why;
-        cleanup();
+        if (local_ctx_owned && ctx) {
+            ggml_free(ctx);
+        }
         output.clear();
         return false;
     };
 
-    const int64_t kv_tokens = token_start + tokens;
-    ggml_tensor * x = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, hidden, tokens);
-    ggml_tensor * positions = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_I32, tokens);
-    ggml_tensor * causal_mask = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F16, kv_tokens, tokens);
-    if (!x || !positions || !causal_mask) {
-        return fail("PC_REGION_INPUT_TENSORS");
-    }
-    ggml_set_input(x);
-    ggml_set_input(positions);
-    ggml_set_input(causal_mask);
-    ggml_set_name(x, "cycle_pc_region_input");
-    ggml_set_name(positions, "cycle_pc_region_positions");
-    ggml_set_name(causal_mask, "cycle_pc_region_causal_mask");
+    if (!cache_hit) {
+        ggml_init_params params {};
+        params.mem_size = 64ULL * 1024 * 1024;
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        local_ctx_owned = ctx != nullptr;
+        if (!ctx) {
+            reason = "PC_REGION_CONTEXT_ALLOC";
+            return false;
+        }
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
-    if (!graph) {
-        return fail("PC_REGION_GRAPH_ALLOC");
-    }
-    ggml_tensor * current = x;
+        x = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, hidden, tokens);
+        positions = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, tokens);
+        causal_mask = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F16, kv_tokens, tokens);
+        if (!x || !positions || !causal_mask) {
+            return fail("PC_REGION_INPUT_TENSORS");
+        }
+        ggml_set_input(x);
+        ggml_set_input(positions);
+        ggml_set_input(causal_mask);
+        ggml_set_name(x, "cycle_pc_region_input");
+        ggml_set_name(positions, "cycle_pc_region_positions");
+        ggml_set_name(causal_mask, "cycle_pc_region_causal_mask");
+
+        graph = ggml_new_graph_custom(ctx, 4096, false);
+        if (!graph) {
+            return fail("PC_REGION_GRAPH_ALLOC");
+        }
+        current = x;
 
     const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
         int(hp.n_ctx_orig_yarn) : int(hp.n_ctx_train);
