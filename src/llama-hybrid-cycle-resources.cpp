@@ -186,7 +186,6 @@ void llama_hybrid_cycle_physical_resource_pool::clear() {
         resource->kv.reset();
         resource->cuda_weights.reset();
         resource->cuda_residency_stamp = 0;
-        resource->cuda_residency_generation = 0;
     }
     layers_.clear();
     layout_ = {};
@@ -194,7 +193,6 @@ void llama_hybrid_cycle_physical_resource_pool::clear() {
     cpu_ = nullptr;
     cuda_ = nullptr;
     cuda_residency_clock_ = 0;
-    cuda_residency_generation_clock_ = 0;
     cuda_residency_loads_ = 0;
     cuda_residency_evictions_ = 0;
     cuda_mirror_bytes_planned_ = 0;
@@ -410,7 +408,6 @@ bool llama_hybrid_cycle_physical_resource_pool::ensure_pc_full_cuda_resident(
         auto & victim = layers_[static_cast<size_t>(victim_layer)];
         slot = std::move(victim->cuda_weights);
         victim->cuda_residency_stamp = 0;
-        victim->cuda_residency_generation = 0;
         ++cuda_residency_evictions_;
         if (llama_hybrid_cycle_verbose()) {
             std::printf(
@@ -431,8 +428,6 @@ bool llama_hybrid_cycle_physical_resource_pool::ensure_pc_full_cuda_resident(
     }
     target->cuda_weights = std::move(slot);
     target->cuda_residency_stamp = stamp;
-    target->cuda_residency_generation =
-        ++cuda_residency_generation_clock_;
     ++cuda_residency_loads_;
     if (llama_hybrid_cycle_verbose()) {
         std::printf(
