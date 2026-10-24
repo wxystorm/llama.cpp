@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <limits>
 #include <vector>
 
 // Cache ONLY a physical backend scratch buffer, NOT ggml_context,
@@ -51,7 +52,10 @@ struct cycle_real_attention_scratch_pool {
     void configure(ggml_backend_t backend, int inflight) {
         clear();
         buft = ggml_backend_get_default_buffer_type(backend);
-        max_slots = size_t(inflight);
+        // A zero admission window means grow the scratch pool on demand.
+        // Recycle only after the consumer fence; no arbitrary two-slot cap.
+        max_slots = inflight == 0 ?
+            std::numeric_limits<size_t>::max() : size_t(inflight);
     }
 
     size_t slots() const { return idle.size() + active.size(); }
