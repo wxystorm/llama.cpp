@@ -34,10 +34,11 @@ bool llama_hybrid_cycle_phone_regions::prepare(
         reason = "INVALID_FULL_PHYSICAL_PERIOD_LAYOUT";
         return false;
     }
-    // 'tokens' is this invocation's count (<=128 for native Forward),
-    // not the absolute K/V capacity (now <=512). The wire ID encoding
-    // reserves three decimal digits per Chunk.
-    if (tokens <= 0 || tokens > 128 || chunk_tokens <= 0 ||
+    // 'tokens' is the complete Prefill invocation (up to the physical
+    // 512-token context). Cycle owns the only batching layer; each internal
+    // Chunk is at most 64 tokens so READY fits the 2-MiB data-plane payload.
+    if (tokens <= 0 || tokens > 512 ||
+        chunk_tokens <= 0 || chunk_tokens > 64 ||
         max_inflight <= 0 || max_inflight > tokens ||
         1 + (tokens - 1) / chunk_tokens > 999) {
         reason = "INVALID_PHONE_TOKEN_OR_CREDIT_WINDOW";
