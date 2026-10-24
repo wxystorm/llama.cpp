@@ -982,6 +982,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.axis, ok ? "PASS" : "FAIL");
     }
 
+    if (directional_tensor &&
+            is_ffn_split_tensor &&
+            ud->n_devices == 2) {
+        int64_t pc_units = 0;
+        int64_t phone_units = 0;
+        for (size_t is = 0; is < split_state.n_segments; ++is) {
+            pc_units += split_state.ne[is*ud->n_devices + 0] *
+                        split_state.nr[is];
+            phone_units += split_state.ne[is*ud->n_devices + 1] *
+                           split_state.nr[is];
+        }
+        const float requested_ratio =
+            ud->model->hybrid_tensor_pc_ratio(tc.il);
+        if (requested_ratio > 0.0f && requested_ratio < 1.0f &&
+                (pc_units == 0 || phone_units == 0)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_C2P_EMPTY_FFN_SHARD] layer=%u tensor=%s "
+                "requested_pc_ratio=%.9f pc_units=%lld phone_units=%lld "
+                "action=ABORT\n",
+                tc.il, tensor_name.c_str(), (double) requested_ratio,
+                (long long) pc_units, (long long) phone_units);
+            throw std::runtime_error(
+                "directional Tensor FFN split collapsed to an empty shard");
+        }
+    }
+
     // Compare the actual physical MoE FFN weight allocation for A/C2P
     // and B/legacy tensor split.  Identical nominal R does not necessarily
     // imply identical shards when the legacy planner uses split rotation.
@@ -1640,7 +1666,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                         llama_hybrid_layer_mode::TENSOR_C2P) {
                     hybrid_tensor_pc_ratios[il] = pc_ratio;
                     LLAMA_LOG_ERROR(
-                        "[REGION_C2P_FFN_RATIO] layer=%d pc=%.6f phone=%.6f "
+                        "[REGION_C2P_FFN_RATIO] layer=%d pc=%.9f phone=%.9f "
                         "status=POLICY_READY\n",
                         il, (double) pc_ratio, (double) (1.0f - pc_ratio));
                 }

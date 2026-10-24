@@ -5727,9 +5727,15 @@ int64_t llama_hybrid_ffn_shard_size(int64_t n_ff, ggml_type down_type, float pc_
     // round-down policy.
     double raw_pc_size = n_ff * (double) pc_ratio;
     const double nearest = std::round(raw_pc_size);
+    // Environment ratios are commonly written with six decimals
+    // (for example 0.333333).  That textual rounding can be a few float ULPs
+    // away from an exact representable shard boundary: 768 * 0.333333 is
+    // slightly below 256.  Give the integer-boundary snap enough room for
+    // both float representation and six-decimal configuration text, while
+    // remaining far below half an element.
     const double integer_tol =
         std::max(1e-6,
-                 2.0 * std::numeric_limits<float>::epsilon() *
+                 8.0 * std::numeric_limits<float>::epsilon() *
                      (double) n_ff);
     if (std::fabs(raw_pc_size - nearest) <= integer_tol) {
         raw_pc_size = nearest;
