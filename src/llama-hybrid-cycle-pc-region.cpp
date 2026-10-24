@@ -66,8 +66,8 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
         return allocator != nullptr;
     }
 
-    static bool bind_alias(
-            ggml_tensor * alias, const ggml_tensor * physical) {
+    static bool alias_compatible(
+            const ggml_tensor * alias, const ggml_tensor * physical) {
         if (!alias || !physical || !physical->buffer || !physical->data ||
             alias->type != physical->type) {
             return false;
@@ -78,9 +78,22 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
                 return false;
             }
         }
+        return true;
+    }
+
+    static void bind_alias_unchecked(
+            ggml_tensor * alias, const ggml_tensor * physical) {
         alias->buffer = physical->buffer;
         alias->data = physical->data;
         alias->extra = physical->extra;
+    }
+
+    static bool bind_alias(
+            ggml_tensor * alias, const ggml_tensor * physical) {
+        if (!alias_compatible(alias, physical)) {
+            return false;
+        }
+        bind_alias_unchecked(alias, physical);
         return true;
     }
 
@@ -93,6 +106,9 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
             entry.kv_value_aliases.size() != region.size()) {
             return false;
         }
+
+        // Phase 1: pure compatibility check. Do not mutate a cached template
+        // unless every borrowed tensor in the current physical Region matches.
         for (size_t offset = 0; offset < region.size(); ++offset) {
             const auto * resource = region[offset];
             if (!resource || !resource->cuda_weights || !resource->kv) {
@@ -100,18 +116,34 @@ struct llama_hybrid_cycle_pc_region_cache::impl {
             }
             for (size_t i = 0;
                  i < llama_hybrid_cycle_cuda_full_weights::COUNT; ++i) {
-                if (!bind_alias(
+                if (!alias_compatible(
                         entry.weight_aliases[offset][i],
                         resource->cuda_weights->tensors[i])) {
                     return false;
                 }
             }
-            if (!bind_alias(
+            if (!alias_compatible(
                     entry.kv_key_aliases[offset], resource->kv->keys) ||
-                !bind_alias(
+                !alias_compatible(
                     entry.kv_value_aliases[offset], resource->kv->values)) {
                 return false;
             }
+        }
+
+        // Phase 2: all tensors are compatible, now rebind atomically from the
+        // cache's point of view.
+        for (size_t offset = 0; offset < region.size(); ++offset) {
+            const auto * resource = region[offset];
+            for (size_t i = 0;
+                 i < llama_hybrid_cycle_cuda_full_weights::COUNT; ++i) {
+                bind_alias_unchecked(
+                    entry.weight_aliases[offset][i],
+                    resource->cuda_weights->tensors[i]);
+            }
+            bind_alias_unchecked(
+                entry.kv_key_aliases[offset], resource->kv->keys);
+            bind_alias_unchecked(
+                entry.kv_value_aliases[offset], resource->kv->values);
         }
         return true;
     }
