@@ -105,16 +105,15 @@ bool llama_hybrid_cycle_execute_phone_full(
         ggml_backend_synchronize(phone);
     }
     if (ok && stage_probe) {
-        // Explicit numerical trace only. All FFN and Reduce GPU work is
-        // synchronized by execute_reduce(); the original READY/scratch and
-        // FFN compute buffer are still alive here. Nothing enters the
-        // normal scheduling path, and no graph output owner is changed.
+        // Explicit numerical trace only. Protocol-28 RUN returns only after
+        // fused FFN+ADD is device-complete, so READY/scratch and the registered
+        // slot are still valid here without another client fence.
         stage_probe(ready.phone_graph.residual,
                     ready.phone_graph.ffn_norm,
                     output_slot.inputs.ffn_output);
     }
-    // FFN is complete (or backend has been synchronized on failure). No
-    // consumer still needs this layer's Attention scratch/Graph lease.
+    // Fused Full is complete (or the failure path fenced). No consumer still
+    // needs this layer's Attention scratch/Graph lease.
     ready.release_phone_graph();
     const double wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
