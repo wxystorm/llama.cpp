@@ -1,4 +1,5 @@
 #include "llama-hybrid-cycle-resources.h"
+#include "llama-hybrid-cycle-log.h"
 
 #include "llama-model.h"
 
