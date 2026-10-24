@@ -1090,7 +1090,7 @@ static bool cycle_core_evaluate_with_kv(
                     pc_cuda_region_calls.load(), expected_region_calls,
                     (unsigned long long) session.cuda_device_handoffs(),
                     (unsigned long long) expected_legacy_cuda_handoffs,
-                    pc_cuda_region ? 6 * n_chunks : 24 * n_chunks,
+                    6 * n_chunks,
                     ok ? "PASS" : "FAIL");
                 std::printf(
                     "[CYCLE_PHONE_FULL_MODE] mode=REGISTERED_REPLAY "
