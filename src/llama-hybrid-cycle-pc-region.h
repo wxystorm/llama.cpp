@@ -1,7 +1,9 @@
 #pragma once
 
 #include "llama-hybrid-cycle-resources.h"
+#include "llama-hybrid-cycle-execution-session.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -34,3 +36,13 @@ LLAMA_API bool llama_hybrid_cycle_execute_pc_full_region(
     std::string & reason,
     const std::function<bool()> & input_consumed = {},
     llama_hybrid_cycle_pc_region_timing * timing = nullptr);
+
+LLAMA_API bool llama_hybrid_cycle_bind_pc_region_stages(
+    llama_hybrid_cycle_stage_dispatcher & stages,
+    const llama_model & model,
+    llama_hybrid_cycle_physical_resource_pool & resources,
+    llama_hybrid_cycle_execution_session<> & session,
+    const std::vector<float> & initial_hidden,
+    int64_t hidden,
+    std::string & reason,
+    std::atomic<int> * region_calls = nullptr);
