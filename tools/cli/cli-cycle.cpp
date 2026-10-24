@@ -250,6 +250,7 @@ int cli_cycle_run(common_params & params) {
             common_chat_templates_inputs inputs;
             inputs.use_jinja = params.use_jinja;
             inputs.add_generation_prompt = true;
+            inputs.enable_thinking = params.enable_reasoning != 0;
             inputs.chat_template_kwargs = params.default_template_kwargs;
             if (!params.system_prompt.empty()) {
                 common_chat_msg system_message;
