@@ -224,6 +224,187 @@ static bool cycle_core_evaluate_with_kv(
                         std::atomic<int> real_p2c_partial_ack {0};
                         std::atomic<int> p2c_device_handoffs {0};
                         std::atomic<int> p2c_slot_reuse {0};
+                        std::atomic<int> phone_region_armed {0};
+                        std::atomic<int> phone_region_stage_acks {0};
+
+                        // Protocol 31 production path. Prepare one future
+                        // Phone Full stage without submitting it: Attention
+                        // and fused FFN+ADD are registered on the RPC server,
+                        // while the predecessor l_out remains device-owned.
+                        // The C2P Reduce boundary later arms BOTH L5/L6 with
+                        // one descriptor RPC; their Ring callbacks only ACK.
+                        const auto prepare_phone_region_full =
+                            [&](llama_hybrid_cycle_phone_region_progress & pregion,
+                                int layer, int chunk,
+                                const ggml_tensor * predecessor) -> bool {
+                                if (!predecessor || layer < pregion.location.phone_begin ||
+                                    layer >= pregion.location.phone_end ||
+                                    chunk < 0 || chunk >= n_chunks) {
+                                    return false;
+                                }
+                                auto * resource = resources.layer(layer);
+                                auto * bank = phone_slot_banks.by_index(
+                                    pregion.location.cycle_index);
+                                if (!resource || !resource->kv || !bank ||
+                                    resource->attn_backend != phone) {
+                                    return false;
+                                }
+                                auto & st = session.at(layer, chunk);
+                                if (resource->kv->committed_tokens > st.start) {
+                                    return false;
+                                }
+
+                                std::unique_ptr<llama_hybrid_cycle_phone_ffn_slot> slot;
+                                auto & idle = bank->full_idle_by_layer[size_t(layer)];
+                                for (auto it = idle.begin(); it != idle.end(); ++it) {
+                                    if (*it && (*it)->is_full_layer &&
+                                        (*it)->prepared_tokens == st.tokens &&
+                                        (*it)->fused_full_graph &&
+                                        (*it)->registered_full_graph_uid != 0) {
+                                        slot = std::move(*it);
+                                        idle.erase(it);
+                                        ++phone_full_slot_reuse;
+                                        break;
+                                    }
+                                }
+                                if (!slot) {
+                                    const auto & lw = model->layers[size_t(layer)];
+                                    const llama_hybrid_cycle_ffn_shard_weights shard {
+                                        llama_hybrid_cycle_resolve_physical_weight(
+                                            lw.ffn_up_exps, phone, 1),
+                                        llama_hybrid_cycle_resolve_physical_weight(
+                                            lw.ffn_gate_exps, phone, 1),
+                                        llama_hybrid_cycle_resolve_physical_weight(
+                                            lw.ffn_down_exps, phone, 1),
+                                    };
+                                    slot = std::make_unique<
+                                        llama_hybrid_cycle_phone_ffn_slot>();
+                                    slot->rpc_ops.register_graph =
+                                        &ggml_backend_rpc_cycle_register_graph;
+                                    slot->rpc_ops.run_full =
+                                        &ggml_backend_rpc_cycle_run_phone_full;
+                                    if (!shard.available() ||
+                                        !slot->prepare(
+                                            phone, shard, hidden, st.tokens,
+                                            model->hparams.n_expert_used,
+                                            model->hparams.n_expert,
+                                            true, true, true, true)) {
+                                        return false;
+                                    }
+                                }
+                                slot->rpc_ops.register_graph =
+                                    &ggml_backend_rpc_cycle_register_graph;
+                                slot->rpc_ops.run_full =
+                                    &ggml_backend_rpc_cycle_run_phone_full;
+                                st.phone_output = std::move(slot);
+
+                                llama_hybrid_cycle_attention_rpc_ops arpc {};
+                                arpc.is_rpc = ggml_backend_is_rpc(phone);
+                                arpc.register_graph =
+                                    &ggml_backend_rpc_cycle_register_graph;
+                                const std::vector<float> empty;
+                                double attn_ms = 0.0;
+                                const bool prepared =
+                                    llama_hybrid_cycle_execute_attention_pre(
+                                        phone, model->layers[size_t(layer)],
+                                        model->hparams, empty, hidden,
+                                        st.tokens, model->hparams.n_expert_used,
+                                        model->hparams.n_expert,
+                                        st.ready, attn_ms, nullptr,
+                                        resource->kv.get(), st.start, 1,
+                                        predecessor, true, nullptr, nullptr,
+                                        resource->scratch_pool.get(),
+                                        resource->graph_cache.get(), {},
+                                        true, arpc);
+                                return prepared &&
+                                    st.ready.prepared_attention_graph_uid != 0 &&
+                                    st.ready.prepared_attention_input != nullptr &&
+                                    st.phone_output &&
+                                    st.phone_output->registered_full_graph_uid != 0;
+                            };
+
+                        const auto arm_phone_region =
+                            [&](llama_hybrid_cycle_phone_region_progress & pregion,
+                                int chunk) -> bool {
+                                if (chunk < 0 || chunk >= n_chunks ||
+                                    pregion.location.phone_end -
+                                        pregion.location.phone_begin != 2) {
+                                    return false;
+                                }
+                                const int l5 = pregion.location.phone_begin;
+                                const int l6 = l5 + 1;
+                                auto & c2p = session.at(
+                                    pregion.location.c2p_layer, chunk);
+                                auto & s5 = session.at(l5, chunk);
+                                auto & s6 = session.at(l6, chunk);
+                                if (!c2p.phone_output ||
+                                    !c2p.phone_output->output ||
+                                    !prepare_phone_region_full(
+                                        pregion, l5, chunk,
+                                        c2p.phone_output->output) ||
+                                    !prepare_phone_region_full(
+                                        pregion, l6, chunk,
+                                        s5.phone_output->output)) {
+                                    return false;
+                                }
+
+                                ggml_rpc_cycle_phone_region_stage plan[2] {};
+                                for (int k = 0; k < 2; ++k) {
+                                    const int layer = l5 + k;
+                                    auto & st = session.at(layer, chunk);
+                                    auto & dst = plan[k];
+                                    dst.layer = layer;
+                                    dst.chunk = chunk;
+                                    dst.seq = st.wire.seq;
+                                    dst.graph_id = st.wire.graph_id;
+                                    dst.attention_graph_uid =
+                                        st.ready.prepared_attention_graph_uid;
+                                    dst.ffn_graph_uid =
+                                        st.phone_output->registered_full_graph_uid;
+                                    dst.input_source = k == 0 ?
+                                        c2p.phone_output->output :
+                                        s5.phone_output->output;
+                                    dst.attention_input =
+                                        st.ready.prepared_attention_input;
+                                    const auto & ready = st.ready.phone_graph;
+                                    dst.attention_outputs[0] = ready.residual;
+                                    dst.attention_outputs[1] = ready.ffn_norm;
+                                    dst.attention_outputs[2] = ready.topk_ids;
+                                    dst.attention_outputs[3] = ready.topk_weights;
+                                    dst.ffn_inputs[0] = st.phone_output->residual;
+                                    dst.ffn_inputs[1] =
+                                        st.phone_output->inputs.norm;
+                                    dst.ffn_inputs[2] =
+                                        st.phone_output->inputs.topk_ids;
+                                    dst.ffn_inputs[3] =
+                                        st.phone_output->inputs.topk_weights;
+                                }
+                                const bool armed =
+                                    ggml_backend_rpc_cycle_arm_phone_region(
+                                        phone, plan);
+                                if (armed) {
+                                    ++pregion.region_armed;
+                                    ++phone_region_armed;
+                                    pregion.first_phone_registered_tokens =
+                                        std::max<int64_t>(
+                                            pregion.first_phone_registered_tokens,
+                                            s5.start + s5.tokens);
+                                    pregion.next_attention_registered_tokens =
+                                        std::max<int64_t>(
+                                            pregion.next_attention_registered_tokens,
+                                            s6.start + s6.tokens);
+                                    if (llama_hybrid_cycle_verbose()) {
+                                        std::printf(
+                                            "[CYCLE_PHONE_REGION_PROD] "
+                                            "event=ARM chunk=%d layers=%d,%d "
+                                            "seq=%llu status=PASS\n",
+                                            chunk, l5, l6,
+                                            (unsigned long long)s5.wire.seq);
+                                    }
+                                }
+                                return armed;
+                            };
+
                         llama_hybrid_cycle_runtime_config rc;
                         rc.layout = layout;
                         rc.n_chunks = n_chunks;
