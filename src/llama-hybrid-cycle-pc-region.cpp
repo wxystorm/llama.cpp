@@ -147,8 +147,10 @@ bool llama_hybrid_cycle_execute_pc_full_region(
     ggml_set_name(positions, "cycle_pc_region_positions");
     ggml_set_name(causal_mask, "cycle_pc_region_causal_mask");
 
-    std::vector<ggml_tensor *> ordered_kv_writes;
-    ordered_kv_writes.reserve(size_t(layer_count) * 2);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
+    if (!graph) {
+        return fail("PC_REGION_GRAPH_ALLOC");
+    }
     ggml_tensor * current = x;
 
     const int ctx_orig = hp.n_ctx_orig_yarn > 0 ?
@@ -260,8 +262,6 @@ bool llama_hybrid_cycle_execute_pc_full_region(
             size_t(token_start) * resource->kv->values->nb[2]);
         auto * kv_k_write = ggml_cpy(ctx, k, dst_k);
         auto * kv_v_write = ggml_cpy(ctx, v, dst_v);
-        ordered_kv_writes.push_back(kv_k_write);
-        ordered_kv_writes.push_back(kv_v_write);
 
         k = ggml_view_3d(
             ctx, resource->kv->keys,
@@ -322,16 +322,19 @@ bool llama_hybrid_cycle_execute_pc_full_region(
         }
         current = ggml_cont(ctx, ggml_add(ctx, residual, ffn.ffn_output));
         ggml_set_name(current, "cycle_pc_region_l_out");
+
+        // Preserve the exact single-layer causal contract inside the fused
+        // graph: commit this layer's NEW K/V before any prefix read that
+        // contributes to its l_out, then make that l_out the dependency root
+        // for the next physical layer.
+        ggml_build_forward_expand(graph, kv_k_write);
+        ggml_build_forward_expand(graph, kv_v_write);
+        ggml_build_forward_expand(graph, current);
     }
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
-    if (!graph || !current) {
-        return fail("PC_REGION_GRAPH_ALLOC");
+    if (!current) {
+        return fail("PC_REGION_GRAPH_OUTPUT");
     }
-    for (auto * write : ordered_kv_writes) {
-        ggml_build_forward_expand(graph, write);
-    }
-    ggml_build_forward_expand(graph, current);
 
     int unsupported = 0;
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
