@@ -8194,6 +8194,7 @@ public:
         }
         const auto key = cycle_key(
             msg.layer, msg.chunk, msg.seq, msg.graph_id, msg.kind);
+        size_t staged_frames = 0;
         {
             std::lock_guard<std::mutex> lock(cycle_rx_mutex);
             // Store each validated C2P frame by its exact
@@ -8205,14 +8206,16 @@ public:
                 !cycle_rx_frames.emplace(key, std::move(msg)).second) {
                 return false;
             }
+            staged_frames = cycle_rx_frames.size();
         }
         cycle_rx_cv.notify_all();
         GGML_LOG_INFO(
             "[CYCLE_C2P_RX] side=phone layer=%d chunk=%d seq=%" PRIu64
-            " kind=%s bytes=%zu state=HOST_READY\n",
+            " kind=%s bytes=%zu staged_frames=%zu "
+            "state=HOST_READY\n",
             header.layer, header.chunk, header.seq,
             header.stage == INFERENCE_STAGE_CYCLE_READY ? "READY" : "PARTIAL",
-            size);
+            size, staged_frames);
         return true;
     }
     void fail_cycle_inbound() {
