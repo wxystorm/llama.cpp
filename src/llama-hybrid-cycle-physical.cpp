@@ -42,6 +42,80 @@ ggml_tensor * llama_hybrid_cycle_resolve_physical_weight(
     return ggml_backend_meta_get_static_weight_shard(weight, source_device);
 }
 
+void llama_hybrid_cycle_cuda_activation_slot::release() {
+    if (buffer) {
+        ggml_backend_buffer_free(buffer);
+        buffer = nullptr;
+    }
+    if (ctx) {
+        ggml_free(ctx);
+        ctx = nullptr;
+    }
+    tensor = nullptr;
+    backend = nullptr;
+    hidden = 0;
+    tokens = 0;
+}
+
+bool llama_hybrid_cycle_cuda_activation_slot::matches(
+        ggml_backend_t target, int64_t h, int64_t t) const {
+    return target && backend == target && ctx && buffer && tensor &&
+        h > 0 && t > 0 && hidden == h && tokens == t &&
+        tensor->type == GGML_TYPE_F32 && tensor->buffer != nullptr &&
+        tensor->ne[0] == h && tensor->ne[1] == t &&
+        ggml_is_contiguous(tensor);
+}
+
+bool llama_hybrid_cycle_cuda_activation_slot::prepare(
+        ggml_backend_t target, int64_t h, int64_t t) {
+    if (matches(target, h, t)) {
+        return true;
+    }
+    release();
+    if (!target || h <= 0 || t <= 0) {
+        return false;
+    }
+    ggml_init_params params {};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, t);
+    if (!tensor) {
+        release();
+        return false;
+    }
+    ggml_set_name(tensor, "cycle_pc_cuda_activation");
+    buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx, ggml_backend_get_default_buffer_type(target));
+    if (!buffer) {
+        release();
+        return false;
+    }
+    backend = target;
+    hidden = h;
+    tokens = t;
+    return true;
+}
+
+bool llama_hybrid_cycle_cuda_activation_slot::store(
+        const ggml_tensor * source) {
+    if (!source || !matches(backend, hidden, tokens) ||
+        source->type != GGML_TYPE_F32 || source->buffer == nullptr ||
+        !ggml_is_contiguous(source) ||
+        source->ne[0] != hidden || source->ne[1] != tokens ||
+        ggml_nelements(source) != hidden * tokens ||
+        !ggml_backend_buffer_copy_tensor(source, tensor)) {
+        return false;
+    }
+    // The producer FFN graph may be destroyed immediately after this copy.
+    // Fence the D2D transfer here so this slot is the sole remaining owner.
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
 void llama_hybrid_cycle_cuda_full_weights::release() {
         if (buffer) {
             ggml_backend_buffer_free(buffer);
