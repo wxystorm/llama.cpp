@@ -1096,7 +1096,8 @@ static bool cycle_core_evaluate_with_kv(
                 for (int l = 0; l < 48 && ok; ++l) {
                     for (int c = 0; c < n_chunks && ok; ++c) {
                         const auto & st = session.at(l,c);
-                        if (st.phone_output ||
+                        if (st.cuda_output ||
+                            st.phone_output ||
                             st.ready.phone_compute_buffer ||
                             st.p2c_main_ffn) {
                             reason = "REAL_DEVICE_SLOT_NOT_RETIRED";
