@@ -6804,6 +6804,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 nodes[1]->name);
         }
 
+        int c2p_decode_layer_0 = -1;
+        int c2p_decode_layer_1 = -1;
+        int c2p_decode_parsed_0 = 0;
+        int c2p_decode_parsed_1 = 0;
+        const bool c2p_decode_single_boundary =
+            n_backends == 2 &&
+            nodes[0]->ne[1] == 1 &&
+            nodes[1]->ne[1] == 1 &&
+            std::sscanf(
+                nodes[0]->name, "ffn_moe_out-%d%n",
+                &c2p_decode_layer_0,
+                &c2p_decode_parsed_0) == 1 &&
+            nodes[0]->name[c2p_decode_parsed_0] == '\0' &&
+            std::sscanf(
+                nodes[1]->name, "ffn_moe_out-%d%n",
+                &c2p_decode_layer_1,
+                &c2p_decode_parsed_1) == 1 &&
+            nodes[1]->name[c2p_decode_parsed_1] == '\0' &&
+            c2p_decode_layer_0 == c2p_decode_layer_1 &&
+            ggml_backend_meta_tensor_c2p_layer(
+                backend_ctx, c2p_decode_layer_0);
+
+        if (pipeline_debug && c2p_decode_single_boundary) {
+            printf(
+                "[REGION_C2P_DECODE_BOUNDARY] sg=%zu layer=%d "
+                "active=%zu pc_compute=%d phone_compute=%d status=DETECTED\n",
+                i,
+                c2p_decode_layer_0,
+                active_count,
+                !!(nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE),
+                !!(nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE));
+        }
+
         auto deferred_prefill_it =
             deferred_phone_prefill_return_sgs.find(i);
         if (deferred_prefill_it !=
@@ -7882,6 +7915,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             active_count == 1 &&
             active_backend == 1 &&
             !c2p_prefill_down_boundary &&
+            !c2p_decode_single_boundary &&
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
@@ -8039,7 +8073,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
-        if (active_count == 1 && !c2p_prefill_down_boundary) {
+        if (active_count == 1 &&
+                !c2p_prefill_down_boundary &&
+                !c2p_decode_single_boundary) {
             handled = true;
             auto & bcj_src = backend_ctx->backend_configs[active_backend];
             const bool defer_to_terminal_l_out =
@@ -8556,7 +8592,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int decode_single_parsed_1 = 0;
         const bool is_single_decode_moe_out =
             n_backends == 2 &&
-            active_count == 2 &&
+            (active_count == 2 || c2p_decode_single_boundary) &&
             nodes[0]->ne[1] == 1 &&
             nodes[1]->ne[1] == 1 &&
             std::sscanf(
@@ -8584,6 +8620,107 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 nodes[1]->name, prefill_down_chunk_1, prefill_down_layer_1) &&
             prefill_down_chunk_0 == prefill_down_chunk_1 &&
             prefill_down_layer_0 == prefill_down_layer_1;
+
+        if (is_single_decode_moe_out &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, decode_single_layer_0)) {
+            handled = true;
+
+            constexpr size_t j_src = 1; // Phone FFN partial
+            constexpr size_t j_dst = 0; // PC FFN partial + residual
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+
+            ggml_tensor * node_src = nodes[j_src];
+            ggml_tensor * node_dst = nodes[j_dst];
+            ggml_tensor * pc_residual =
+                find_recent_ffn_inp(0, i, decode_single_layer_0);
+            ggml_tensor * phone_l_out =
+                find_layer_output(1, decode_single_layer_0);
+
+            GGML_ASSERT(pc_residual != nullptr);
+            GGML_ASSERT(phone_l_out != nullptr);
+            GGML_ASSERT(ggml_nbytes(node_src) == ggml_nbytes(node_dst));
+            GGML_ASSERT(ggml_nbytes(node_dst) == ggml_nbytes(pc_residual));
+            GGML_ASSERT(ggml_nbytes(phone_l_out) == ggml_nbytes(node_src));
+
+            ggml_tensor * pc_fold = get_node_aux(node_dst);
+            pc_fold->view_src =
+                node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+            pc_fold->view_offs = node_dst->view_offs;
+            pc_fold->op = GGML_OP_ADD;
+            pc_fold->src[0] = node_dst;
+            pc_fold->src[1] = pc_residual;
+            pc_fold->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(pc_fold);
+
+            ggml_cgraph * pc_fold_graph = get_cgraph_aux();
+            pc_fold_graph->nodes[0] = pc_fold;
+            pc_fold_graph->n_nodes = 1;
+
+            ggml_tensor * phone_tmp = get_node_aux(node_src);
+            set_tmp_data(phone_tmp, j_src, 0);
+
+            ggml_tensor * phone_out = get_node_aux(node_src);
+            phone_out->view_src = phone_l_out;
+            phone_out->view_offs = 0;
+            phone_out->op = GGML_OP_ADD;
+            phone_out->src[0] = node_src;
+            phone_out->src[1] = phone_tmp;
+            phone_out->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(phone_out);
+
+            ggml_cgraph * phone_reduce_graph = get_cgraph_aux();
+            phone_reduce_graph->nodes[0] = phone_out;
+            phone_reduce_graph->n_nodes = 1;
+
+            ggml_tensor * disabled_phone_l_out =
+                disable_layer_output_producers(
+                    1, i + 1, decode_single_layer_0);
+            GGML_ASSERT(disabled_phone_l_out == phone_l_out);
+            ggml_tensor * disabled_pc_l_out =
+                disable_layer_output_producers(
+                    0, i + 1, decode_single_layer_0);
+            GGML_ASSERT(disabled_pc_l_out != nullptr);
+
+            ggml_backend_synchronize(bcj_dst.backend);
+            ggml_status status =
+                ggml_backend_graph_compute_async(
+                    bcj_dst.backend, pc_fold_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            ggml_backend_synchronize(bcj_dst.backend);
+
+            const int64_t copy_begin_us = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                bcj_dst.backend,
+                bcj_src.backend,
+                node_dst,
+                phone_tmp);
+            ggml_backend_synchronize(bcj_src.backend);
+            const int64_t copy_us = ggml_time_us() - copy_begin_us;
+            record_copy_wait(copy_us);
+            record_meta_copy(i, j_dst, j_src, node_dst, copy_us);
+            record_direct_copy();
+
+            status = ggml_backend_graph_compute_async(
+                bcj_src.backend, phone_reduce_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            ggml_backend_synchronize(bcj_src.backend);
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_DECODE] layer=%d bytes=%zu copy_ms=%.3f "
+                    "direction=PC_TO_PHONE owner=PHONE status=OK\n",
+                    decode_single_layer_0,
+                    ggml_nbytes(node_dst),
+                    copy_us / 1000.0);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
 
         const int phone_primary_decode_layer =
             is_ffn_down_chunk ? decode_layer_0 :
