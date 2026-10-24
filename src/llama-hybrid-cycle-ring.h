@@ -313,9 +313,8 @@ public:
             full_input_consumed_[size_t(layer)][size_t(chunk)] != 0) {
             return false;
         }
-        const task_id key {
-            layer, chunk, llama_hybrid_cycle_stage::FULL_LAYER
-        };
+        const auto key = std::make_tuple(
+            layer, chunk, llama_hybrid_cycle_stage::FULL_LAYER);
         if (running_.find(key) == running_.end()) {
             return false;
         }
