@@ -8645,6 +8645,155 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
+            // Region Boundary V1 C2P prefill:
+            //
+            //   READY:   PC ffn_norm -> Phone  (existing norm handoff)
+            //   PARTIAL: PC (ffn_partial + residual) -> Phone
+            //   REDUCE:  Phone ffn_partial + received PC value -> Phone l_out
+            //
+            // This keeps both large transfers in the PC->Phone direction and
+            // preserves the old ~2H payload shape.  For the first correctness
+            // version the operations below are deliberately ordered/synchronous;
+            // overlap/windowing can be added later without changing ownership.
+            const bool c2p_prefill =
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, prefill_down_layer_0);
+            if (c2p_prefill) {
+                GGML_ASSERT(prefill_layer_hands_off_to_phone(
+                    i, prefill_down_layer_0));
+
+                const bool last_chunk =
+                    prefill_is_last_down_chunk(i, prefill_down_layer_0);
+                ggml_tensor * pc_residual =
+                    find_recent_ffn_inp(0, i, prefill_down_layer_0);
+                ggml_tensor * phone_l_out =
+                    find_layer_output(1, prefill_down_layer_0);
+
+                GGML_ASSERT(pc_residual != nullptr);
+                GGML_ASSERT(phone_l_out != nullptr);
+                GGML_ASSERT(
+                    ggml_nbytes(pc_residual) ==
+                    ggml_nbytes(phone_l_out));
+
+                const size_t chunk_offset = down_chunk_offset(
+                    0, true, prefill_down_layer_0, prefill_down_chunk_0);
+
+                // PC: fold the residual into the local FFN partial in-place.
+                ggml_tensor * residual_chunk = get_node_aux(node_dst);
+                residual_chunk->view_src = pc_residual;
+                residual_chunk->view_offs = chunk_offset;
+                ggml_backend_view_init(residual_chunk);
+                GGML_ASSERT(
+                    chunk_offset + ggml_nbytes(residual_chunk) <=
+                    ggml_nbytes(pc_residual));
+
+                ggml_tensor * pc_fold = get_node_aux(node_dst);
+                pc_fold->view_src =
+                    node_dst->view_src == nullptr ?
+                        node_dst : node_dst->view_src;
+                pc_fold->view_offs = node_dst->view_offs;
+                pc_fold->op = GGML_OP_ADD;
+                pc_fold->src[0] = node_dst;
+                pc_fold->src[1] = residual_chunk;
+                pc_fold->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(pc_fold);
+
+                ggml_cgraph * pc_fold_graph = get_cgraph_aux();
+                pc_fold_graph->nodes[0] = pc_fold;
+                pc_fold_graph->n_nodes = 1;
+
+                // Phone staging for the second PC->Phone transfer.
+                ggml_tensor * phone_tmp = get_node_aux(node_src);
+                set_tmp_data(phone_tmp, j_src, 0);
+
+                // Phone: write the completed chunk directly into l_out.
+                ggml_tensor * phone_out_chunk = get_node_aux(node_src);
+                phone_out_chunk->view_src = phone_l_out;
+                phone_out_chunk->view_offs = chunk_offset;
+                phone_out_chunk->op = GGML_OP_ADD;
+                phone_out_chunk->src[0] = node_src;
+                phone_out_chunk->src[1] = phone_tmp;
+                phone_out_chunk->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(phone_out_chunk);
+                GGML_ASSERT(
+                    chunk_offset + ggml_nbytes(phone_out_chunk) <=
+                    ggml_nbytes(phone_l_out));
+
+                ggml_cgraph * phone_reduce_graph = get_cgraph_aux();
+                phone_reduce_graph->nodes[0] = phone_out_chunk;
+                phone_reduce_graph->n_nodes = 1;
+
+                if (last_chunk) {
+                    ggml_tensor * disabled_phone_l_out =
+                        disable_layer_output_producers(
+                            1, i + 1, prefill_down_layer_0);
+                    GGML_ASSERT(disabled_phone_l_out == phone_l_out);
+
+                    // PC l_out is not an owner in C2P.  Suppress the legacy
+                    // concat/add producer so the completed activation remains
+                    // Phone-local for the following Phone Region.
+                    ggml_tensor * disabled_pc_l_out =
+                        disable_layer_output_producers(
+                            0, i + 1, prefill_down_layer_0);
+                    GGML_ASSERT(disabled_pc_l_out != nullptr);
+                }
+
+                const int64_t pc_fold_begin_us = ggml_time_us();
+                ggml_backend_synchronize(bcj_dst.backend);
+                ggml_status status =
+                    ggml_backend_graph_compute_async(
+                        bcj_dst.backend, pc_fold_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                ggml_backend_synchronize(bcj_dst.backend);
+                const int64_t pc_fold_us =
+                    ggml_time_us() - pc_fold_begin_us;
+
+                const int64_t copy_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_dst.backend,
+                    bcj_src.backend,
+                    node_dst,
+                    phone_tmp);
+                ggml_backend_synchronize(bcj_src.backend);
+                const int64_t copy_us =
+                    ggml_time_us() - copy_begin_us;
+                record_copy_wait(copy_us);
+                record_meta_copy(
+                    i, j_dst, j_src, node_dst, copy_us);
+                record_direct_copy();
+
+                const int64_t phone_reduce_begin_us = ggml_time_us();
+                status = ggml_backend_graph_compute_async(
+                    bcj_src.backend, phone_reduce_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                ggml_backend_synchronize(bcj_src.backend);
+                const int64_t phone_reduce_us =
+                    ggml_time_us() - phone_reduce_begin_us;
+
+                reduce_add_us += pc_fold_us + phone_reduce_us;
+                ++reduce_to_primary_count;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
+                        "bytes=%zu pc_fold_ms=%.3f copy_ms=%.3f "
+                        "phone_reduce_ms=%.3f owner=PHONE status=OK\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        last_chunk ? 1 : 0,
+                        ggml_nbytes(node_dst),
+                        pc_fold_us / 1000.0,
+                        copy_us / 1000.0,
+                        phone_reduce_us / 1000.0);
+                }
+
+                return GGML_STATUS_SUCCESS;
+            }
+
             ggml_tensor * node_tmp = get_node_aux(node_dst);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
