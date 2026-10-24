@@ -430,6 +430,63 @@ static bool llama_hybrid_force_phone_primary_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool llama_hybrid_region_boundary_v1_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_REGION_BOUNDARY_V1");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+static int llama_hybrid_region_boundary_env_int(
+        const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return std::atoi(value);
+}
+
+static std::vector<llama_hybrid_layer_mode>
+llama_build_region_boundary_v1_policy(int n_layer) {
+    const int cycle_size = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_CYCLE_SIZE", 8);
+    const int c2p_offset = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_C2P_OFFSET", 4);
+    const int p2c_offset = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_P2C_OFFSET", 7);
+
+    if (cycle_size < 4 ||
+        c2p_offset < 1 ||
+        p2c_offset <= c2p_offset + 1 ||
+        p2c_offset >= cycle_size) {
+        throw std::runtime_error(
+            "invalid Region Boundary V1 cycle: require "
+            "0 < C2P < P2C-1 < cycle_size");
+    }
+
+    std::vector<llama_hybrid_layer_mode> policy(
+        n_layer, llama_hybrid_layer_mode::PC_ONLY);
+
+    for (int il = 0; il < n_layer; ++il) {
+        const int offset = il % cycle_size;
+        if (offset < c2p_offset) {
+            policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+        } else if (offset == c2p_offset) {
+            policy[il] = llama_hybrid_layer_mode::TENSOR_C2P;
+        } else if (offset < p2c_offset) {
+            policy[il] = llama_hybrid_layer_mode::PHONE_ONLY;
+        } else if (offset == p2c_offset) {
+            policy[il] = llama_hybrid_layer_mode::TENSOR_P2C;
+        } else {
+            policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+        }
+    }
+
+    LLAMA_LOG_ERROR(
+        "[REGION_BOUNDARY_V1] cycle=%d C2P_offset=%d P2C_offset=%d "
+        "layers=%d status=POLICY_READY\n",
+        cycle_size, c2p_offset, p2c_offset, n_layer);
+    return policy;
+}
+
 static std::vector<llama_hybrid_layer_mode> llama_build_hybrid_plan_policy(
         int n_layer, int pc_layers, int tensor_layers, int phone_layers,
         bool tensor_phone_primary) {
@@ -793,7 +850,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         ud->model->hybrid_layer_mode(tc.il) :
         llama_hybrid_layer_mode::TENSOR_SPLIT;
     const bool tensor_phone_primary =
-        mode == llama_hybrid_layer_mode::TENSOR_PHONE_PRIMARY;
+        llama_hybrid_layer_mode_tensor_attention_on_phone(mode);
+    const bool directional_tensor =
+        llama_hybrid_layer_mode_directional_tensor(mode);
 
     // In Phone-primary Tensor mode, R is a physical PC share.  FFN shards must
     // therefore keep backend 0 == PC and backend 1 == Phone on every layer.
@@ -801,7 +860,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // these two heterogeneous roles changes the meaning of R and can collapse
     // the smaller shard after quantized alignment.
     const size_t split_rotation =
-        tensor_phone_primary && is_ffn_split_tensor && ud->n_devices == 2 ?
+        (tensor_phone_primary || directional_tensor) &&
+                is_ffn_split_tensor && ud->n_devices == 2 ?
             0 : tc.rotation;
 
     split_state.axis = tc.axis;
@@ -830,7 +890,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 float split_ratio = tensor_split_scan.back() == 0.0f ?
                     (float) (j + 1) / ud->n_devices : tensor_split_scan[j] / tensor_split_scan.back();
 
-                if (tensor_phone_primary &&
+                if ((tensor_phone_primary || directional_tensor) &&
                     is_ffn_split_tensor &&
                     ud->n_devices == 2 &&
                     j == 0) {
@@ -875,13 +935,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool force_primary =
         (is_attention_tensor &&
          mode != llama_hybrid_layer_mode::PHONE_ONLY &&
-         !tensor_phone_primary) ||
+         !llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) ||
         (is_ffn_split_tensor && mode == llama_hybrid_layer_mode::PC_ONLY) ||
         is_output_tensor;
     const bool force_phone =
         (mode == llama_hybrid_layer_mode::PHONE_ONLY &&
          (is_attention_tensor || is_ffn_split_tensor)) ||
-        (tensor_phone_primary && is_attention_tensor);
+        (llama_hybrid_layer_mode_tensor_attention_on_phone(mode) &&
+         is_attention_tensor);
 
     auto force_to_device = [&](size_t device) {
         GGML_ASSERT(device < ud->n_devices);
@@ -1507,11 +1568,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
-        hybrid_layer_modes = has_runtime_plan ?
-            llama_build_hybrid_plan_policy(
-                n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
-                runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
-            llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout);
+        hybrid_layer_modes = llama_hybrid_region_boundary_v1_enabled() ?
+            llama_build_region_boundary_v1_policy(n_layer) :
+            (has_runtime_plan ?
+                llama_build_hybrid_plan_policy(
+                    n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
+                    runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
+                llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout));
 
         hybrid_tensor_pc_ratios.assign(
             n_layer,
