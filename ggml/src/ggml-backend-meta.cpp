@@ -2272,6 +2272,8 @@ struct ggml_backend_meta_transfer_worker;
 struct ggml_backend_meta_context;
 static bool ggml_backend_meta_tensor_phone_primary_layer(
     const ggml_backend_meta_context * backend_ctx, int layer);
+static bool ggml_backend_meta_tensor_c2p_layer(
+    const ggml_backend_meta_context * backend_ctx, int layer);
 
 struct ggml_backend_meta_context {
     static constexpr size_t PREFILL_RETURN_LANES = 2;
@@ -2324,6 +2326,7 @@ struct ggml_backend_meta_context {
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
     std::vector<uint8_t>        tensor_phone_layer_mask;
+    std::vector<uint8_t>        tensor_c2p_layer_mask;
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
@@ -12705,6 +12708,14 @@ static bool ggml_backend_meta_tensor_phone_primary_layer(
            layer < backend_ctx->tensor_phone_last_layer;
 }
 
+static bool ggml_backend_meta_tensor_c2p_layer(
+        const ggml_backend_meta_context * backend_ctx, int layer) {
+    return backend_ctx != nullptr &&
+           layer >= 0 &&
+           size_t(layer) < backend_ctx->tensor_c2p_layer_mask.size() &&
+           backend_ctx->tensor_c2p_layer_mask[size_t(layer)] != 0;
+}
+
 bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer) {
     if (!ggml_backend_is_meta(backend)) {
@@ -12761,6 +12772,23 @@ bool ggml_backend_meta_set_tensor_phone_primary_layer_mask(
                 "[META_TP_POLICY_MASK] layers=%zu selected=%zu first=%d last=%d\n",
                 n_layers, count, first, last);
         }
+    }
+    return true;
+}
+
+bool ggml_backend_meta_set_tensor_c2p_layer_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    if ((mask == nullptr) != (n_layers == 0)) {
+        return false;
+    }
+    ggml_backend_meta_context * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    backend_ctx->tensor_c2p_layer_mask.clear();
+    if (n_layers > 0) {
+        backend_ctx->tensor_c2p_layer_mask.assign(mask, mask + n_layers);
     }
     return true;
 }
