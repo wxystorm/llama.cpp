@@ -38,12 +38,19 @@ static bool cycle_core_finite(const std::vector<float> & v, size_t expect) {
 // private helper name; the test program does not participate in this API.
 #define cycle_pc_ring_finite cycle_core_finite
 
-static bool cycle_core_env_default(const char * key, const char * value) {
-    if (std::getenv(key)) return true;
+static bool cycle_core_env_minimum(
+        const char * key, long minimum, const char * minimum_text) {
+    if (const char * current = std::getenv(key)) {
+        char * tail = nullptr;
+        const long value = std::strtol(current, &tail, 10);
+        if (tail && *tail == '\0' && value >= minimum) {
+            return true;
+        }
+    }
 #ifdef _WIN32
-    return _putenv_s(key, value) == 0;
+    return _putenv_s(key, minimum_text) == 0;
 #else
-    return setenv(key, value, 0) == 0;
+    return setenv(key, minimum_text, 1) == 0;
 #endif
 }
 
@@ -125,9 +132,10 @@ static bool cycle_core_evaluate_with_kv(
                     reg, GGML_BACKEND_RPC_INFERENCE_TRANSPORT_OPEN_PROC)) :
             nullptr;
         if (ok) {
-            ok = cycle_core_env_default("GGML_INFERENCE_TRANSPORT_SLOTS","2") &&
-                 cycle_core_env_default(
-                     "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB","2") &&
+            ok = cycle_core_env_minimum(
+                     "GGML_INFERENCE_TRANSPORT_SLOTS", 2, "2") &&
+                 cycle_core_env_minimum(
+                     "GGML_INFERENCE_TRANSPORT_MAX_PAYLOAD_MIB", 2, "2") &&
                  open && open(phone);
             if (!ok) reason = "REAL_RPC_TRANSPORT_OPEN";
         }
