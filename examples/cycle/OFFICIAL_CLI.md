@@ -171,3 +171,40 @@ A passing run reports:
 and then reaches the official purple Prompt/Generation summary, without
 the former scheduler assertion. The default Context's original
 Scheduler-based breakdown remains unchanged.
+
+
+## Experimental production CUDA and five-queue profiling
+
+The production Cycle Context now accepts an **opt-in CUDA mirror budget**.
+The unset or zero setting preserves the verified CPU + Phone GPU route.
+
+```powershell
+# Unset this for the existing tested CPU + Phone GPU baseline.
+$env:LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB = "1536"
+# Run the same official llama-cli command as above.
+```
+
+The selected PC GPU is the first registered **local CUDA backend** (not the
+Phone RPC GPU). The existing resource pool estimates weights for PC Full layers,
+reserves 512 MiB of reported free VRAM, and mirrors **only** layers that fit the
+requested budget. All unselected PC Full layers retain CPU execution. This is
+**not** an automatic Planner, and the model's CPU/Phone physical weight layout
+and 48-layer Cycle pattern do not change. For reproducibility, compare the
+`[CYCLE_FULL_RESOURCE_PLAN]` line and record `cuda_mirror_layers`,
+`cuda_estimated_mib`, and `pc_cpu_fallback`. A nonzero budget with no
+registered CUDA backend fails instead of silently changing the experiment.
+
+The official forward now also prints one `[CYCLE_CORE_QUEUE]` per logical
+worker after each FIFO invocation: task count, callback execution total/maximum,
+queue wait total/maximum, and idle time. These are **PC host-side observations**:
+they overlap across queues and must never be summed to produce end-to-end time.
+A Phone GPU callback may include network and remote synchronization; it is
+not a kernel-only device timer. The existing `llama_perf_context()` remains the
+source of official end-to-end Prompt/Eval elapsed time.
+
+**This optional CUDA path and new queue measurements require Windows and Phone
+real-device regression before being treated as verified.** Test the zero-budget
+baseline first, followed by a small nonzero budget that fits one or two mirrored
+PC Full layers. Do not start with a budget intended for all 24 PC Full layers.
+Confirm that all 48 KV prefixes, READY/PARTIAL ACKs and final logits continue
+to complete and compare prompt/eval timings under the same input.
