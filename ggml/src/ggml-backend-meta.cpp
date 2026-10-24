@@ -2356,6 +2356,11 @@ struct ggml_backend_meta_context {
         // changing tensor ownership or the final reduce protocol.
         std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
             region_partial_stage_bufs;
+        // Reducer-side local FFN partials also need private per-credit
+        // storage. Without this, the next chunk can reuse the graph arena
+        // while the previous chunk is still waiting for its remote partial.
+        std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
+            region_local_partial_stage_bufs;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
@@ -4009,6 +4014,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
             tensor->buffer = buf_ptr.get();
             tensor->data = ggml_backend_buffer_get_base(buf_ptr.get());
+        };
+    auto set_region_local_partial_stage_data =
+        [&](ggml_tensor * tensor, const size_t j, const size_t lane) {
+            GGML_ASSERT(
+                lane < ggml_backend_meta_context::PREFILL_RETURN_LANES);
+            auto & bcj = backend_ctx->backend_configs[j];
+            auto & buf_ptr =
+                bcj.region_local_partial_stage_bufs[lane];
+            if (!buf_ptr ||
+                    ggml_backend_buffer_get_size(buf_ptr.get()) <
+                        backend_ctx->max_tmp_size) {
+                buf_ptr.reset(
+                    ggml_backend_alloc_buffer(
+                        bcj.backend, backend_ctx->max_tmp_size));
+            }
+            tensor->buffer = buf_ptr.get();
+            tensor->data =
+                ggml_backend_buffer_get_base(buf_ptr.get());
         };
     // FIXME usage_counts
     auto get_cgraph_aux = [&]() -> ggml_cgraph * {
