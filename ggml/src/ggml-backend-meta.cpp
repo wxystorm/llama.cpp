@@ -7395,6 +7395,76 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     next_layer == prefill_norm_layer;
             }
 
+            // In C2P parallel prefill the PC Router is now a real
+            // subgraph between FFN_NORM and the two expert FFNs:
+            //
+            //   NORM -> ROUTER_WEIGHTS -> PREFILL_DOWN
+            //
+            // The original adjacency-only check would see the PC-owned
+            // Router as the next stage, conclude Phone does not need the
+            // normalized hidden, and silently skip the transfer.  Look
+            // through exactly this C2P Router boundary, retaining the
+            // original asynchronous norm transfer worker.
+            bool c2p_norm_router_between = false;
+            if (!direct_prefill_down &&
+                    i + 2 < backend_ctx->n_subgraphs &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, prefill_norm_layer)) {
+                ggml_cgraph * pc_route =
+                    backend_ctx->backend_configs[0].
+                        cgraphs[i + 1].cgraph_main;
+                ggml_cgraph * phone_route =
+                    backend_ctx->backend_configs[1].
+                        cgraphs[i + 1].cgraph_main;
+                int pc_route_chunk = -1;
+                int pc_route_layer = -1;
+                int phone_route_chunk = -1;
+                int phone_route_layer = -1;
+                const bool matching_route =
+                    pc_route != nullptr &&
+                    phone_route != nullptr &&
+                    pc_route->n_nodes > 0 &&
+                    phone_route->n_nodes > 0 &&
+                    ggml_backend_meta_parse_c2p_route_weights(
+                        pc_route->nodes[pc_route->n_nodes - 1]->name,
+                        pc_route_chunk, pc_route_layer) &&
+                    ggml_backend_meta_parse_c2p_route_weights(
+                        phone_route->nodes[phone_route->n_nodes - 1]->name,
+                        phone_route_chunk, phone_route_layer) &&
+                    pc_route_chunk == prefill_norm_chunk &&
+                    phone_route_chunk == prefill_norm_chunk &&
+                    pc_route_layer == prefill_norm_layer &&
+                    phone_route_layer == prefill_norm_layer;
+                if (matching_route) {
+                    pc_next_down =
+                        get_prefill_down_boundary_node(0, i + 2);
+                    phone_next_down =
+                        get_prefill_down_boundary_node(1, i + 2);
+                    next_chunk = -1;
+                    next_layer = -1;
+                    c2p_norm_router_between =
+                        pc_next_down != nullptr &&
+                        phone_next_down != nullptr &&
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            pc_next_down->name,
+                            next_chunk, next_layer) &&
+                        next_chunk == prefill_norm_chunk &&
+                        next_layer == prefill_norm_layer;
+                    direct_prefill_down = c2p_norm_router_between;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_NORM_ROUTE] layer=%d chunk=%d "
+                        "sg=%zu route_match=%d down_match=%d "
+                        "status=%s\n",
+                        prefill_norm_layer, prefill_norm_chunk, i,
+                        matching_route ? 1 : 0,
+                        c2p_norm_router_between ? 1 : 0,
+                        c2p_norm_router_between ?
+                            "READY" : "NO_MATCH");
+                }
+            }
+
             if (direct_prefill_down) {
                 GGML_ASSERT(pending_prefill_input_task == 0);
 
@@ -11677,6 +11747,27 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     bool ab_l47_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        if (pipeline_debug && !c2p_prefill_route_ready.empty() &&
+                n_backends == 2) {
+            ggml_cgraph * next_pc =
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            ggml_cgraph * next_phone =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            printf(
+                "[REGION_C2P_NEXT_SG] sg=%zu pc_nodes=%d "
+                "pc_last=%s phone_nodes=%d phone_last=%s "
+                "pending_norm=%" PRIu64 " route_ready=%zu\n",
+                i,
+                next_pc != nullptr ? next_pc->n_nodes : 0,
+                next_pc != nullptr && next_pc->n_nodes > 0 ?
+                    next_pc->nodes[next_pc->n_nodes - 1]->name : "none",
+                next_phone != nullptr ? next_phone->n_nodes : 0,
+                next_phone != nullptr && next_phone->n_nodes > 0 ?
+                    next_phone->nodes[next_phone->n_nodes - 1]->name : "none",
+                pending_prefill_input_task,
+                c2p_prefill_route_ready.size());
+            fflush(stdout);
+        }
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
@@ -12739,6 +12830,19 @@ auto prefill_norm_sg_has_prework =
                     prefill_down_layer, prefill_down_chunk,
                 }) != 0;
 
+            if (c2p_route_ready && !has_async_prefill_input) {
+                // The Router-only boundary lies between norm and FFN. If
+                // the original norm handoff was skipped, Phone FFN would
+                // read an uninitialized activation. Report an explicit
+                // dependency failure instead of dispatching unsafe work.
+                fprintf(
+                    stderr,
+                    "[REGION_C2P_FFN_INPUT] layer=%d chunk=%d sg=%zu "
+                    "route=READY norm=NOT_STAGED status=FAIL\n",
+                    prefill_down_layer, prefill_down_chunk, i);
+                return GGML_STATUS_FAILED;
+            }
+
             std::vector<c2p_route_binding_backup> c2p_bindings;
             ggml_tensor * c2p_src_topk = nullptr;
             ggml_tensor * c2p_dst_topk = nullptr;
@@ -12826,6 +12930,13 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
+            if (pipeline_debug && c2p_route_ready) {
+                printf(
+                    "[REGION_C2P_FFN_START] layer=%d chunk=%d sg=%zu "
+                    "phase=PC_BEGIN norm=STAGED route=READY\n",
+                    prefill_down_layer, prefill_down_chunk, i);
+                fflush(stdout);
+            }
             compute_workers.start(0, i);
 
             if (has_async_prefill_input) {
@@ -12866,6 +12977,13 @@ auto prefill_norm_sg_has_prework =
             ggml_status phone_status = GGML_STATUS_SUCCESS;
 
             if (c2p_prefill_exec && c2p_route_ready) {
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_FFN_START] layer=%d chunk=%d sg=%zu "
+                        "phase=PHONE_BEGIN norm=READY route=READY\n",
+                        prefill_down_layer, prefill_down_chunk, i);
+                    fflush(stdout);
+                }
                 // Router handoff already completed at the previous subgraph
                 // boundary. PC FFN was launched before the asynchronous
                 // FFN_NORM input wait above; Phone FFN can now start and both
@@ -13647,30 +13765,46 @@ auto prefill_norm_sg_has_prework =
             GGML_ASSERT(
                 ggml_are_same_layout(src_weights, dst_weights));
 
-            const size_t route_slot =
-                c2p_exec_chunk >= 0 ?
-                    static_cast<size_t>(c2p_exec_chunk) : 0;
-            auto & c2p_slots =
-                backend_ctx->backend_configs[0].
-                    c2p_route_stage_bufs;
-            if (c2p_slots.size() <= route_slot) {
-                c2p_slots.resize(route_slot + 1);
-            }
-
             std::vector<c2p_route_binding_backup> c2p_bindings;
-            bind_c2p_route_storage(
-                src_topk,
-                c2p_slots[route_slot][0],
-                c2p_bindings);
-            bind_c2p_route_storage(
-                src_weights,
-                c2p_slots[route_slot][1],
-                c2p_bindings);
+            if (!c2p_exec_prefill_boundary) {
+                // Legacy same-SG Router+FFN still requires pinning because
+                // the allocator may reuse Router storage during PC FFN.
+                const size_t route_slot =
+                    c2p_exec_chunk >= 0 ?
+                        static_cast<size_t>(c2p_exec_chunk) : 0;
+                auto & c2p_slots =
+                    backend_ctx->backend_configs[0].
+                        c2p_route_stage_bufs;
+                if (c2p_slots.size() <= route_slot) {
+                    c2p_slots.resize(route_slot + 1);
+                }
+                bind_c2p_route_storage(
+                    src_topk,
+                    c2p_slots[route_slot][0],
+                    c2p_bindings);
+                bind_c2p_route_storage(
+                    src_weights,
+                    c2p_slots[route_slot][1],
+                    c2p_bindings);
 
-            if (pipeline_debug) {
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                        "topk_bytes=%zu weights_bytes=%zu "
+                        "trigger=GENERIC status=READY\n",
+                        c2p_exec_layer, c2p_exec_chunk, i,
+                        ggml_nbytes(src_topk),
+                        ggml_nbytes(src_weights));
+                }
+            } else if (pipeline_debug) {
+                // The output is still needed by the PC FFN in the next SG,
+                // so it must stay at its scheduler-managed storage address.
+                // Copy to Phone before starting that consumer; do NOT
+                // temporarily rebind and then restore to stale arena bytes.
                 printf(
-                    "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
-                    "topk_bytes=%zu weights_bytes=%zu status=READY\n",
+                    "[REGION_C2P_ROUTE_STORAGE] layer=%d chunk=%d sg=%zu "
+                    "mode=GRAPH_LIVE_CROSS_SG topk_bytes=%zu "
+                    "weights_bytes=%zu status=READY\n",
                     c2p_exec_layer, c2p_exec_chunk, i,
                     ggml_nbytes(src_topk),
                     ggml_nbytes(src_weights));
