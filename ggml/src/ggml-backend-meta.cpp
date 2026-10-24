@@ -9131,11 +9131,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (c2p_self_check &&
                         n_backends == 2 &&
                         active_backend == 0 && j_dst == 1) {
-                    int self_layer = subgraph_tensor_c2p_layer(i);
-                    if (self_layer < 0 && i + 1 < backend_ctx->n_subgraphs) {
-                        self_layer = subgraph_tensor_c2p_layer(i + 1);
+                    int self_layer = -1;
+                    bool self_c2p =
+                        subgraph_tensor_c2p_layer(i, self_layer);
+                    if (!self_c2p &&
+                            i + 1 < backend_ctx->n_subgraphs) {
+                        self_c2p =
+                            subgraph_tensor_c2p_layer(
+                                i + 1, self_layer);
                     }
-                    if (self_layer >= 0 &&
+                    if (self_c2p && self_layer >= 0 &&
                             ggml_backend_meta_tensor_c2p_layer(
                                 backend_ctx, self_layer)) {
                         int self_chunk = -1;
