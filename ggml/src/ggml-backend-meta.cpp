@@ -2333,6 +2333,10 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
         std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES> prefill_reduce_bufs;
         std::vector<std::array<ggml_backend_buffer_ptr, 3>> prefill_route_stage_bufs;
+        // Private PC-side storage used by C2P Router handoff.  The Router
+        // outputs remain live after the PC FFN consumes them so Meta can copy
+        // the exact TopK/weights to Phone without graph-arena reuse.
+        std::vector<std::array<ggml_backend_buffer_ptr, 2>> c2p_route_stage_bufs;
         // Private Phone-side storage used by Router-first deferred FFN.
         // The full normalized hidden is produced directly into one layer-local
         // buffer, while top-k/weights use per-chunk buffers.
@@ -5545,6 +5549,103 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             phone_prefill_direct_bindings.erase(binding_it);
+        };
+
+    struct c2p_route_binding_backup {
+        ggml_tensor * tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+    };
+
+    auto find_sg_named_tensor =
+        [&](size_t backend, size_t sg,
+            const char * expected) -> ggml_tensor * {
+            if (backend >= n_backends ||
+                    sg >= backend_ctx->n_subgraphs ||
+                    expected == nullptr) {
+                return nullptr;
+            }
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[backend]
+                    .cgraphs[sg].cgraph_main;
+            if (graph == nullptr) {
+                return nullptr;
+            }
+            for (int k = graph->n_nodes - 1; k >= 0; --k) {
+                ggml_tensor * tensor = graph->nodes[k];
+                if (tensor != nullptr &&
+                        std::strcmp(tensor->name, expected) == 0) {
+                    return tensor;
+                }
+            }
+            for (int k = graph->n_leafs - 1; k >= 0; --k) {
+                ggml_tensor * tensor = graph->leafs[k];
+                if (tensor != nullptr &&
+                        std::strcmp(tensor->name, expected) == 0) {
+                    return tensor;
+                }
+            }
+            return nullptr;
+        };
+
+    auto bind_c2p_route_storage =
+        [&](ggml_tensor * tensor,
+            ggml_backend_buffer_ptr & buf,
+            std::vector<c2p_route_binding_backup> & backups) {
+            GGML_ASSERT(tensor != nullptr);
+
+            auto backup_once = [&](ggml_tensor * target) {
+                GGML_ASSERT(target != nullptr);
+                for (const auto & binding : backups) {
+                    if (binding.tensor == target) {
+                        return;
+                    }
+                }
+                backups.push_back({
+                    target,
+                    target->buffer,
+                    target->data,
+                });
+            };
+
+            ggml_tensor * storage =
+                tensor->view_src != nullptr ?
+                    tensor->view_src : tensor;
+            backup_once(storage);
+
+            const size_t need = ggml_nbytes(storage);
+            if (!buf ||
+                    ggml_backend_buffer_get_size(buf.get()) < need) {
+                buf.reset(
+                    ggml_backend_alloc_buffer(
+                        backend_ctx->backend_configs[0].backend,
+                        need));
+            }
+            GGML_ASSERT(buf != nullptr);
+
+            storage->buffer = buf.get();
+            storage->data = ggml_backend_buffer_get_base(buf.get());
+
+            if (tensor->view_src != nullptr) {
+                GGML_ASSERT(
+                    tensor->view_offs + ggml_nbytes(tensor) <=
+                    ggml_nbytes(storage));
+                backup_once(tensor);
+                tensor->buffer = storage->buffer;
+                tensor->data =
+                    static_cast<char *>(storage->data) +
+                    tensor->view_offs;
+            }
+        };
+
+    auto restore_c2p_route_bindings =
+        [&](std::vector<c2p_route_binding_backup> & backups) {
+            for (auto it = backups.rbegin();
+                 it != backups.rend(); ++it) {
+                it->tensor->buffer = it->buffer;
+                it->tensor->data = it->data;
+            }
+            backups.clear();
         };
 
     auto phone_prefill_direct_defer_eligible =
@@ -12835,9 +12936,62 @@ auto prefill_norm_sg_has_prework =
         // C2P decode is NOT a Phone-only FFN even though the terminal
         // ffn_moe_out node is Phone-active.  The shared Router is PC-owned,
         // followed by two expert shards and a Phone-owned final reduction.
-        // Execute PC graph first to materialize its TopK/weights and shard.
-        // Copy the routing outputs, then run the Phone expert graph.
+        //
+        // Router outputs are consumed by the PC FFN inside this same graph,
+        // but Meta also needs them after the graph returns for PC->Phone
+        // handoff. Pin them to private PC storage before execution so the
+        // graph allocator cannot recycle their arena memory into later FFN
+        // intermediates/partial output.
+        char topk_name[96];
+        char weights_name[96];
+        std::snprintf(
+            topk_name, sizeof(topk_name),
+            "c2p_moe_route_topk-%d", c2p_decode_ffn_layer);
+        std::snprintf(
+            weights_name, sizeof(weights_name),
+            "c2p_moe_route_weights-%d", c2p_decode_ffn_layer);
+
+        ggml_tensor * src_topk =
+            find_sg_named_tensor(0, i, topk_name);
+        ggml_tensor * dst_topk =
+            find_sg_named_tensor(1, i, topk_name);
+        ggml_tensor * src_weights =
+            find_sg_named_tensor(0, i, weights_name);
+        ggml_tensor * dst_weights =
+            find_sg_named_tensor(1, i, weights_name);
+
+        GGML_ASSERT(src_topk != nullptr);
+        GGML_ASSERT(dst_topk != nullptr);
+        GGML_ASSERT(src_weights != nullptr);
+        GGML_ASSERT(dst_weights != nullptr);
+        GGML_ASSERT(src_topk->type == GGML_TYPE_I32);
+        GGML_ASSERT(dst_topk->type == GGML_TYPE_I32);
+        GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(
+            ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
+        GGML_ASSERT(
+            ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
+
+        auto & c2p_slots =
+            backend_ctx->backend_configs[0].
+                c2p_route_stage_bufs;
+        if (c2p_slots.empty()) {
+            c2p_slots.resize(1);
+        }
+        std::vector<c2p_route_binding_backup> c2p_bindings;
+        bind_c2p_route_storage(
+            src_topk, c2p_slots[0][0], c2p_bindings);
+        bind_c2p_route_storage(
+            src_weights, c2p_slots[0][1], c2p_bindings);
+
         if (pipeline_debug) {
+            printf(
+                "[REGION_C2P_ROUTE_PIN] layer=%d chunk=-1 sg=%zu "
+                "topk_bytes=%zu weights_bytes=%zu status=READY\n",
+                c2p_decode_ffn_layer, i,
+                ggml_nbytes(src_topk),
+                ggml_nbytes(src_weights));
             printf(
                 "[REGION_C2P_DECODE_EXEC] layer=%d sg=%zu "
                 "phase=PC_BEGIN status=BEGIN\n",
@@ -12849,37 +13003,6 @@ auto prefill_norm_sg_has_prework =
         ggml_status c2p_phone_status = GGML_STATUS_SUCCESS;
 
         if (c2p_pc_status == GGML_STATUS_SUCCESS) {
-            char topk_name[96];
-            char weights_name[96];
-            std::snprintf(
-                topk_name, sizeof(topk_name),
-                "c2p_moe_route_topk-%d", c2p_decode_ffn_layer);
-            std::snprintf(
-                weights_name, sizeof(weights_name),
-                "c2p_moe_route_weights-%d", c2p_decode_ffn_layer);
-
-            ggml_tensor * src_topk =
-                find_exact_named_tensor(0, topk_name);
-            ggml_tensor * dst_topk =
-                find_exact_named_tensor(1, topk_name);
-            ggml_tensor * src_weights =
-                find_exact_named_tensor(0, weights_name);
-            ggml_tensor * dst_weights =
-                find_exact_named_tensor(1, weights_name);
-
-            GGML_ASSERT(src_topk != nullptr);
-            GGML_ASSERT(dst_topk != nullptr);
-            GGML_ASSERT(src_weights != nullptr);
-            GGML_ASSERT(dst_weights != nullptr);
-            GGML_ASSERT(src_topk->type == GGML_TYPE_I32);
-            GGML_ASSERT(dst_topk->type == GGML_TYPE_I32);
-            GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
-            GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
-            GGML_ASSERT(
-                ggml_nbytes(src_topk) == ggml_nbytes(dst_topk));
-            GGML_ASSERT(
-                ggml_nbytes(src_weights) == ggml_nbytes(dst_weights));
-
             auto & pc_cfg = backend_ctx->backend_configs[0];
             auto & phone_cfg = backend_ctx->backend_configs[1];
 
@@ -12918,6 +13041,8 @@ auto prefill_norm_sg_has_prework =
                     weights_us / 1000.0);
             }
 
+            restore_c2p_route_bindings(c2p_bindings);
+
             compute_workers.start(1, i);
             c2p_phone_status = compute_workers.wait(1);
             if (pipeline_debug) {
@@ -12926,6 +13051,8 @@ auto prefill_norm_sg_has_prework =
                     "phase=PHONE_END status=%d\n",
                     c2p_decode_ffn_layer, i, (int) c2p_phone_status);
             }
+        } else {
+            restore_c2p_route_bindings(c2p_bindings);
         }
 
         compute_status =
@@ -13261,58 +13388,107 @@ auto prefill_norm_sg_has_prework =
         }
 
         if (c2p_exec_route) {
+            char topk_name[96];
+            char weights_name[96];
+            if (c2p_exec_chunk >= 0) {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "c2p_prefill_route_topk_chunk_%d-%d",
+                    c2p_exec_chunk, c2p_exec_layer);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "c2p_prefill_route_weights_chunk_%d-%d",
+                    c2p_exec_chunk, c2p_exec_layer);
+            } else {
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "c2p_moe_route_topk-%d",
+                    c2p_exec_layer);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "c2p_moe_route_weights-%d",
+                    c2p_exec_layer);
+            }
+
+            // Use the exact tensors in this subgraph. The same logical name
+            // can appear elsewhere as a scheduler leaf/clone.
+            ggml_tensor * src_topk =
+                find_sg_named_tensor(0, i, topk_name);
+            ggml_tensor * dst_topk =
+                find_sg_named_tensor(1, i, topk_name);
+            ggml_tensor * src_weights =
+                find_sg_named_tensor(0, i, weights_name);
+            ggml_tensor * dst_weights =
+                find_sg_named_tensor(1, i, weights_name);
+
+            GGML_ASSERT(src_topk != nullptr);
+            GGML_ASSERT(dst_topk != nullptr);
+            GGML_ASSERT(src_weights != nullptr);
+            GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(src_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(dst_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(
+                ggml_nbytes(src_topk) ==
+                ggml_nbytes(dst_topk));
+            GGML_ASSERT(
+                ggml_nbytes(src_weights) ==
+                ggml_nbytes(dst_weights));
+
+            const size_t route_slot =
+                c2p_exec_chunk >= 0 ?
+                    static_cast<size_t>(c2p_exec_chunk) : 0;
+            auto & c2p_slots =
+                backend_ctx->backend_configs[0].
+                    c2p_route_stage_bufs;
+            if (c2p_slots.size() <= route_slot) {
+                c2p_slots.resize(route_slot + 1);
+            }
+
+            std::vector<c2p_route_binding_backup> c2p_bindings;
+            bind_c2p_route_storage(
+                src_topk,
+                c2p_slots[route_slot][0],
+                c2p_bindings);
+            bind_c2p_route_storage(
+                src_weights,
+                c2p_slots[route_slot][1],
+                c2p_bindings);
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                    "topk_bytes=%zu weights_bytes=%zu status=READY\n",
+                    c2p_exec_layer, c2p_exec_chunk, i,
+                    ggml_nbytes(src_topk),
+                    ggml_nbytes(src_weights));
+            }
+
             compute_workers.start(0, i);
             const ggml_status pc_status =
                 compute_workers.wait(0);
 
             ggml_status phone_status = GGML_STATUS_SUCCESS;
             if (pc_status == GGML_STATUS_SUCCESS) {
-                char topk_name[96];
-                char weights_name[96];
-                if (c2p_exec_chunk >= 0) {
-                    std::snprintf(
-                        topk_name, sizeof(topk_name),
-                        "c2p_prefill_route_topk_chunk_%d-%d",
-                        c2p_exec_chunk, c2p_exec_layer);
-                    std::snprintf(
-                        weights_name, sizeof(weights_name),
-                        "c2p_prefill_route_weights_chunk_%d-%d",
-                        c2p_exec_chunk, c2p_exec_layer);
-                } else {
-                    std::snprintf(
-                        topk_name, sizeof(topk_name),
-                        "c2p_moe_route_topk-%d",
-                        c2p_exec_layer);
-                    std::snprintf(
-                        weights_name, sizeof(weights_name),
-                        "c2p_moe_route_weights-%d",
-                        c2p_exec_layer);
-                }
-
-                ggml_tensor * src_topk =
-                    find_exact_named_tensor(0, topk_name);
-                ggml_tensor * dst_topk =
-                    find_exact_named_tensor(1, topk_name);
-                ggml_tensor * src_weights =
-                    find_exact_named_tensor(0, weights_name);
-                ggml_tensor * dst_weights =
-                    find_exact_named_tensor(1, weights_name);
-
-                GGML_ASSERT(src_topk != nullptr);
-                GGML_ASSERT(dst_topk != nullptr);
-                GGML_ASSERT(src_weights != nullptr);
-                GGML_ASSERT(dst_weights != nullptr);
-                GGML_ASSERT(
-                    ggml_nbytes(src_topk) ==
-                    ggml_nbytes(dst_topk));
-                GGML_ASSERT(
-                    ggml_nbytes(src_weights) ==
-                    ggml_nbytes(dst_weights));
-
                 auto & pc_cfg =
                     backend_ctx->backend_configs[0];
                 auto & phone_cfg =
                     backend_ctx->backend_configs[1];
+
+                // Capture producer values while they are still pinned. This
+                // is the meaningful Router A/B sample; post-FFN arena reads
+                // can observe recycled storage.
+                if (ab_trace_requested &&
+                        c2p_exec_layer == ab_trace_layer &&
+                        ab_full_tokens() >= ab_min_tokens) {
+                    ab_dump_tensor(
+                        0, c2p_exec_chunk,
+                        "router_topk", src_topk);
+                    ab_dump_tensor(
+                        0, c2p_exec_chunk,
+                        "router_weights", src_weights);
+                }
 
                 ggml_backend_synchronize(pc_cfg.backend);
 
@@ -13344,6 +13520,19 @@ auto prefill_norm_sg_has_prework =
                     i, 0, 1, src_weights, weights_us);
                 record_direct_copy();
 
+                // Verify the exact tensors the Phone FFN is about to consume,
+                // before the Phone graph can recycle their storage.
+                if (ab_trace_requested &&
+                        c2p_exec_layer == ab_trace_layer &&
+                        ab_full_tokens() >= ab_min_tokens) {
+                    ab_dump_tensor(
+                        1, c2p_exec_chunk,
+                        "router_topk", dst_topk);
+                    ab_dump_tensor(
+                        1, c2p_exec_chunk,
+                        "router_weights", dst_weights);
+                }
+
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_ROUTE] layer=%d chunk=%d "
@@ -13359,8 +13548,12 @@ auto prefill_norm_sg_has_prework =
                         weights_us / 1000.0);
                 }
 
+                restore_c2p_route_bindings(c2p_bindings);
+
                 compute_workers.start(1, i);
                 phone_status = compute_workers.wait(1);
+            } else {
+                restore_c2p_route_bindings(c2p_bindings);
             }
 
             compute_status =
@@ -13439,40 +13632,10 @@ auto prefill_norm_sg_has_prework =
                     side, prefill_down_chunk, "partial",
                     g->nodes[g->n_nodes - 1]);
 
-                const std::string suffix =
-                    "-" + std::to_string(ab_trace_layer);
-                const std::string c2p_topk =
-                    "c2p_prefill_route_topk_chunk_" +
-                    std::to_string(prefill_down_chunk) + suffix;
-                const std::string c2p_weights =
-                    "c2p_prefill_route_weights_chunk_" +
-                    std::to_string(prefill_down_chunk) + suffix;
-                const std::string logits =
-                    "ffn_moe_logits" + suffix;
-                const std::string topk =
-                    "ffn_moe_topk" + suffix;
-                const std::string weights =
-                    "ffn_moe_weights_norm" + suffix;
-                ggml_tensor * t_logits =
-                    ab_find_sg_named(side, communication_sg, logits.c_str());
-                ggml_tensor * t_topk =
-                    ab_find_sg_named(side, communication_sg, c2p_topk.c_str());
-                ggml_tensor * t_weights =
-                    ab_find_sg_named(side, communication_sg, c2p_weights.c_str());
-                if (t_topk == nullptr) {
-                    t_topk = ab_find_sg_named(
-                        side, communication_sg, topk.c_str());
-                }
-                if (t_weights == nullptr) {
-                    t_weights = ab_find_sg_named(
-                        side, communication_sg, weights.c_str());
-                }
-                ab_dump_tensor(
-                    side, prefill_down_chunk, "router_logits", t_logits);
-                ab_dump_tensor(
-                    side, prefill_down_chunk, "router_topk", t_topk);
-                ab_dump_tensor(
-                    side, prefill_down_chunk, "router_weights", t_weights);
+                // Router tensors are sampled at the C2P handoff itself.
+                // Reading them here is too late because graph-arena storage
+                // can already have been reused by FFN intermediates.
+
             }
         }
     }
