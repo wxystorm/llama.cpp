@@ -10303,6 +10303,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool last_chunk =
                 prefill_is_last_down_chunk(
                     i, prefill_down_layer_0);
+            const bool region_boundary_last =
+                !region_has_later_boundary_chunk(
+                    i,
+                    prefill_down_layer_0,
+                    prefill_down_chunk_0);
+            const size_t region_partial_lane =
+                region_window2 ?
+                    ((size_t) prefill_down_chunk_0 %
+                     ggml_backend_meta_context::PREFILL_RETURN_LANES) :
+                    0;
             ggml_tensor * phone_residual =
                 find_recent_ffn_inp(
                     1, i, prefill_down_layer_0);
@@ -10348,7 +10358,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * pc_tmp =
                 get_node_aux(pc_partial);
             if (region_async_partial) {
-                set_region_partial_stage_data(pc_tmp, j_dst, 0);
+                set_region_partial_stage_data(
+                    pc_tmp, j_dst, region_partial_lane);
             } else {
                 set_tmp_data(pc_tmp, j_dst, 0);
             }
@@ -10434,6 +10445,221 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * partial_wire_src = phone_partial;
 
             if (region_async_partial) {
+                if (region_window2) {
+                    const size_t partial_lane =
+                        region_partial_lane;
+
+                    status =
+                        wait_region_window_lane(
+                            pending_region_p2c,
+                            "P2C",
+                            partial_lane,
+                            "LANE_REUSE");
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+
+                    // Pin the reducer-side PC FFN result before another
+                    // chunk can reuse the graph arena.
+                    ggml_tensor * pc_local_stage =
+                        get_node_aux(pc_partial);
+                    set_region_local_partial_stage_data(
+                        pc_local_stage, j_dst, partial_lane);
+
+                    const int64_t local_stage_begin_us =
+                        ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        pc_cfg.backend,
+                        pc_cfg.backend,
+                        pc_partial,
+                        pc_local_stage);
+                    ggml_backend_synchronize(pc_cfg.backend);
+                    const int64_t local_stage_us =
+                        ggml_time_us() - local_stage_begin_us;
+
+                    // The eventual PC reduce consumes the pinned local
+                    // partial, not the reusable graph output.
+                    pc_out_chunk->src[0] = pc_local_stage;
+
+                    ggml_tensor * phone_stage =
+                        get_node_aux(phone_partial);
+                    set_region_partial_stage_data(
+                        phone_stage, j_src, partial_lane);
+
+                    const int64_t stage_begin_us =
+                        ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        phone_cfg.backend,
+                        phone_cfg.backend,
+                        phone_partial,
+                        phone_stage);
+                    ggml_backend_synchronize(phone_cfg.backend);
+                    partial_stage_us =
+                        local_stage_us +
+                        (ggml_time_us() - stage_begin_us);
+                    partial_wire_src = phone_stage;
+
+                    auto & worker_slot =
+                        backend_ctx->prefill_return_workers[
+                            partial_lane];
+                    if (worker_slot == nullptr) {
+                        worker_slot =
+                            new ggml_backend_meta_transfer_worker();
+                    }
+                    auto * return_worker = worker_slot;
+                    auto * reducer_exec =
+                        get_region_exec_worker(0);
+                    auto metrics =
+                        std::make_shared<region_window_metrics>();
+
+                    const int layer = prefill_down_layer_0;
+                    const int chunk = prefill_down_chunk_0;
+                    const size_t bytes =
+                        ggml_nbytes(phone_stage);
+                    const bool debug = pipeline_debug;
+
+                    const uint64_t return_task =
+                        return_worker->enqueue(
+                            [phone_backend = phone_cfg.backend,
+                             pc_backend = pc_cfg.backend,
+                             phone_stage,
+                             pc_tmp,
+                             pc_reduce_graph,
+                             reducer_exec,
+                             metrics,
+                             layer,
+                             chunk,
+                             partial_lane,
+                             bytes,
+                             debug]
+                            (uint64_t task_id) -> ggml_status {
+                                const int64_t wire_begin_us =
+                                    ggml_time_us();
+                                ggml_backend_tensor_copy_async(
+                                    phone_backend,
+                                    pc_backend,
+                                    phone_stage,
+                                    pc_tmp);
+                                ggml_backend_synchronize(pc_backend);
+                                metrics->wire_us =
+                                    ggml_time_us() - wire_begin_us;
+
+                                if (debug) {
+                                    printf(
+                                        "[REGION_RETURN_TX] "
+                                        "direction=P2C layer=%d "
+                                        "chunk=%d lane=%zu "
+                                        "task=%" PRIu64
+                                        " bytes=%zu wire_ms=%.3f "
+                                        "status=DONE\n",
+                                        layer,
+                                        chunk,
+                                        partial_lane,
+                                        task_id,
+                                        bytes,
+                                        metrics->wire_us / 1000.0);
+                                }
+
+                                const int64_t reduce_begin_us =
+                                    ggml_time_us();
+                                const uint64_t reduce_task =
+                                    reducer_exec->enqueue(
+                                        pc_reduce_graph,
+                                        true);
+                                if (debug) {
+                                    printf(
+                                        "[REGION_EXEC_QUEUE] side=PC "
+                                        "queue=MAIN priority=HIGH "
+                                        "direction=P2C role=REDUCE "
+                                        "layer=%d chunk=%d "
+                                        "task=%" PRIu64
+                                        " status=ENQUEUED_ASYNC\n",
+                                        layer,
+                                        chunk,
+                                        reduce_task);
+                                }
+                                const ggml_status reduce_status =
+                                    reducer_exec->wait(reduce_task);
+                                if (reduce_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return reduce_status;
+                                }
+                                ggml_backend_synchronize(pc_backend);
+                                metrics->reduce_us =
+                                    ggml_time_us() - reduce_begin_us;
+                                return GGML_STATUS_SUCCESS;
+                            });
+
+                    auto & pending =
+                        pending_region_p2c[partial_lane];
+                    GGML_ASSERT(!pending.active);
+                    pending.active = true;
+                    pending.layer = layer;
+                    pending.chunk = chunk;
+                    pending.sg = i;
+                    pending.lane = partial_lane;
+                    pending.src_backend = j_src;
+                    pending.dst_backend = j_dst;
+                    pending.task = return_task;
+                    pending.worker = return_worker;
+                    pending.wire_src = phone_stage;
+                    pending.wire_dst = pc_tmp;
+                    pending.out_chunk = pc_out_chunk;
+                    pending.bytes = bytes;
+                    pending.fold_us = phone_fold_us;
+                    pending.stage_us = partial_stage_us;
+                    pending.boundary_last =
+                        region_boundary_last;
+                    pending.numeric_check =
+                        c2p_self_check &&
+                        !pc_before.empty();
+                    pending.metrics = metrics;
+                    pending.before_a =
+                        std::make_shared<std::vector<float>>(
+                            std::move(pc_before));
+                    pending.before_b =
+                        std::make_shared<std::vector<float>>(
+                            std::move(phone_before));
+                    pending.before_residual =
+                        std::make_shared<std::vector<float>>(
+                            std::move(residual_before));
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_RETURN_STAGE] "
+                            "direction=P2C layer=%d chunk=%d "
+                            "lane=%zu bytes=%zu stage_ms=%.3f "
+                            "status=READY\n",
+                            layer,
+                            chunk,
+                            partial_lane,
+                            bytes,
+                            partial_stage_us / 1000.0);
+                        printf(
+                            "[REGION_CREDIT] direction=P2C "
+                            "event=ACQUIRE layer=%d chunk=%d "
+                            "lane=%zu inflight=%zu/2\n",
+                            layer,
+                            chunk,
+                            partial_lane,
+                            region_active_credits(
+                                pending_region_p2c));
+                    }
+
+                    if (region_boundary_last) {
+                        status =
+                            drain_region_window(
+                                pending_region_p2c,
+                                "P2C",
+                                "BOUNDARY_DRAIN");
+                        if (status != GGML_STATUS_SUCCESS) {
+                            return status;
+                        }
+                    }
+
+                    return GGML_STATUS_SUCCESS;
+                }
+
                 constexpr size_t partial_lane = 0;
 
                 ggml_tensor * phone_stage =
