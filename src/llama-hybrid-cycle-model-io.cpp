@@ -80,7 +80,7 @@ bool llama_hybrid_cycle_embed_tokens(
     const int64_t hidden = model.hparams.n_embd;
     const int64_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(&model));
     if (model.arch != LLM_ARCH_QWEN3MOE || hidden <= 0 ||
-        tokens.empty() || tokens.size() > 64 ||
+        tokens.empty() || tokens.size() > 512 ||
         size_t(hidden) > std::numeric_limits<size_t>::max()/tokens.size()) {
         reason = "EMBED_UNSUPPORTED_SHAPE";
         return false;
