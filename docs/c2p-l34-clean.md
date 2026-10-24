@@ -206,3 +206,41 @@ The `piece` field escapes newline/tab/quote/backslash so repeated or malformed
 generation can be inspected directly from the log. `raw_argmax=1` marks the
 highest raw logit, not necessarily the final sampled token when non-greedy
 sampling transforms logits.
+
+
+## Region FFN parallel phase 1
+
+The first performance step keeps the directional topology and both final owners
+unchanged. Enable it explicitly:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_PARALLEL_FFN = "1"
+```
+
+C2P previously executed one PC graph containing both Router and the PC FFN
+shard, copied Router TopK/weights, and only then launched the Phone FFN shard.
+With this switch the PC graph is split at the pinned Router outputs:
+
+1. execute the PC Router prefix;
+2. copy pinned TopK/weights PC->Phone;
+3. submit the PC FFN suffix and Phone FFN graph together;
+4. wait for both before the existing fold/copy/final-reduce path.
+
+The serial C2P implementation remains the fallback when the switch is unset or
+when the Router split point cannot be identified.
+
+P2C already reaches its FFN boundary through the generic dual-worker path, so
+phase 1 does not rewrite its compute graph. With the switch enabled it emits
+`REGION_P2C_FFN_PARALLEL` to confirm that both device graphs are submitted by
+the generic dual-worker execution path.
+
+Expected debug markers:
+
+```text
+[REGION_C2P_FFN_PARALLEL] phase=PREFILL ...
+[REGION_C2P_FFN_PARALLEL] phase=DECODE ...
+[REGION_P2C_FFN_PARALLEL] ... mode=GENERIC_DUAL_WORKER ...
+```
+
+For the first hardware run, keep the correctness diagnostics enabled and verify
+C2P/P2C wire/numeric checks and generated text before measuring clean throughput.

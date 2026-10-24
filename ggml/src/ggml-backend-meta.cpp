@@ -3885,6 +3885,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const char * region_parallel_ffn_env =
+        std::getenv("LLAMA_HYBRID_REGION_PARALLEL_FFN");
+    const bool region_parallel_ffn =
+        region_parallel_ffn_env != nullptr &&
+        std::atoi(region_parallel_ffn_env) != 0;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -12189,6 +12194,57 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return fused;
     };
 
+    auto build_region_graph_slice =
+        [&](ggml_cgraph * source, int node_begin, int node_end,
+            size_t scratch_slot, uint64_t salt) -> ggml_cgraph * {
+            GGML_ASSERT(source != nullptr);
+            GGML_ASSERT(node_begin >= 0);
+            GGML_ASSERT(node_begin < node_end);
+            GGML_ASSERT(node_end <= source->n_nodes);
+            GGML_ASSERT(scratch_slot < backend_ctx->cgraphs_phone_fused.size());
+
+            ggml_cgraph * slice =
+                backend_ctx->cgraphs_phone_fused[scratch_slot];
+            GGML_ASSERT(slice != nullptr);
+            GGML_ASSERT(node_end - node_begin <= slice->size);
+
+            slice->n_nodes = 0;
+            slice->n_leafs = 0;
+            ggml_hash_set_reset(&slice->visited_hash_set);
+            for (int k = node_begin; k < node_end; ++k) {
+                ggml_tensor * node = source->nodes[k];
+                slice->nodes[slice->n_nodes++] = node;
+                const size_t source_pos =
+                    ggml_hash_find(&source->visited_hash_set, node);
+                const size_t slice_pos =
+                    ggml_hash_insert(&slice->visited_hash_set, node);
+                slice->use_counts[slice_pos] =
+                    source->use_counts[source_pos];
+            }
+
+            uint64_t uid = source->uid;
+            uid ^= (uint64_t) (node_begin + 1) *
+                0x9e3779b97f4a7c15ULL;
+            uid ^= (uint64_t) (node_end + 1) *
+                0xbf58476d1ce4e5b9ULL;
+            uid ^= salt;
+            slice->uid = uid != 0 ? uid : 1;
+            return slice;
+        };
+
+    auto graph_node_index =
+        [](ggml_cgraph * graph, ggml_tensor * tensor) -> int {
+            if (graph == nullptr || tensor == nullptr) {
+                return -1;
+            }
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                if (graph->nodes[k] == tensor) {
+                    return k;
+                }
+            }
+            return -1;
+        };
+
     struct meta_layer_timing {
         int64_t compute_pc_us    = 0;
         int64_t compute_phone_us = 0;
@@ -13335,6 +13391,9 @@ auto prefill_norm_sg_has_prework =
             ggml_tensor * c2p_dst_weights = nullptr;
             ggml_cgraph * c2p_pc_graph = nullptr;
             uint64_t c2p_saved_pc_graph_uid = 0;
+            ggml_cgraph * c2p_pc_prefix_graph = nullptr;
+            int c2p_pc_route_stop = -1;
+            bool c2p_parallel_ready = false;
 
             if (c2p_prefill_exec) {
                 char topk_name[96];
@@ -13399,7 +13458,37 @@ auto prefill_norm_sg_has_prework =
                         .cgraphs[i].cgraph_main;
                 if (c2p_pc_graph != nullptr) {
                     c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
-                    c2p_pc_graph->uid = 0;
+
+                    if (region_parallel_ffn) {
+                        const int topk_index =
+                            graph_node_index(
+                                c2p_pc_graph, c2p_src_topk);
+                        const int weights_index =
+                            graph_node_index(
+                                c2p_pc_graph, c2p_src_weights);
+                        c2p_pc_route_stop =
+                            std::max(topk_index, weights_index) + 1;
+                        c2p_parallel_ready =
+                            topk_index >= 0 &&
+                            weights_index >= 0 &&
+                            c2p_pc_route_stop > 0 &&
+                            c2p_pc_route_stop < c2p_pc_graph->n_nodes;
+                        if (c2p_parallel_ready) {
+                            c2p_pc_prefix_graph =
+                                build_region_graph_slice(
+                                    c2p_pc_graph,
+                                    0,
+                                    c2p_pc_route_stop,
+                                    i,
+                                    0x4352505052454649ULL);
+                        }
+                    }
+
+                    if (!c2p_parallel_ready) {
+                        // Serial fallback keeps the old cache invalidation
+                        // because Router tensors were rebound to private storage.
+                        c2p_pc_graph->uid = 0;
+                    }
                 }
 
                 if (pipeline_debug) {
@@ -13415,7 +13504,12 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            compute_workers.start(0, i);
+            if (c2p_parallel_ready) {
+                compute_workers.start_graph(
+                    0, c2p_pc_prefix_graph);
+            } else {
+                compute_workers.start(0, i);
+            }
 
             if (has_async_prefill_input) {
                 GGML_ASSERT(backend_ctx->prefill_input_worker != nullptr);
@@ -13552,10 +13646,55 @@ auto prefill_norm_sg_has_prework =
                             weights_us / 1000.0);
                     }
 
-                    restore_c2p_route_bindings(c2p_bindings);
+                    if (c2p_parallel_ready) {
+                        ggml_cgraph * c2p_pc_suffix_graph =
+                            build_region_graph_slice(
+                                c2p_pc_graph,
+                                c2p_pc_route_stop,
+                                c2p_pc_graph->n_nodes,
+                                i,
+                                0x4352505355464649ULL);
 
-                    compute_workers.start(1, i);
-                    phone_status = compute_workers.wait(1);
+                        const int64_t parallel_begin_us =
+                            ggml_time_us();
+                        compute_workers.start_graph(
+                            0, c2p_pc_suffix_graph);
+                        compute_workers.start(1, i);
+
+                        const ggml_status pc_ffn_status =
+                            compute_workers.wait(0);
+                        phone_status = compute_workers.wait(1);
+                        pc_status = pc_ffn_status;
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[REGION_C2P_FFN_PARALLEL] "
+                                "phase=PREFILL layer=%d chunk=%d "
+                                "router_nodes=%d pc_ffn_nodes=%d "
+                                "phone_nodes=%d submit_wait_ms=%.3f "
+                                "pc_status=%d phone_status=%d\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                c2p_pc_route_stop,
+                                c2p_pc_graph->n_nodes -
+                                    c2p_pc_route_stop,
+                                backend_ctx->backend_configs[1]
+                                    .cgraphs[i].cgraph_main->n_nodes,
+                                (ggml_time_us() - parallel_begin_us) /
+                                    1000.0,
+                                (int) pc_ffn_status,
+                                (int) phone_status);
+                        }
+
+                        restore_c2p_route_bindings(
+                            c2p_bindings);
+                    } else {
+                        restore_c2p_route_bindings(
+                            c2p_bindings);
+                        compute_workers.start(1, i);
+                        phone_status =
+                            compute_workers.wait(1);
+                    }
                 } else {
                     restore_c2p_route_bindings(c2p_bindings);
                 }
@@ -13751,6 +13890,39 @@ auto prefill_norm_sg_has_prework =
         bind_c2p_route_storage(
             src_weights, c2p_slots[0][1], c2p_bindings);
 
+        ggml_cgraph * c2p_decode_pc_graph =
+            backend_ctx->backend_configs[0]
+                .cgraphs[i].cgraph_main;
+        ggml_cgraph * c2p_decode_prefix_graph = nullptr;
+        int c2p_decode_route_stop = -1;
+        bool c2p_decode_parallel_ready = false;
+        if (region_parallel_ffn &&
+                c2p_decode_pc_graph != nullptr) {
+            const int topk_index =
+                graph_node_index(
+                    c2p_decode_pc_graph, src_topk);
+            const int weights_index =
+                graph_node_index(
+                    c2p_decode_pc_graph, src_weights);
+            c2p_decode_route_stop =
+                std::max(topk_index, weights_index) + 1;
+            c2p_decode_parallel_ready =
+                topk_index >= 0 &&
+                weights_index >= 0 &&
+                c2p_decode_route_stop > 0 &&
+                c2p_decode_route_stop <
+                    c2p_decode_pc_graph->n_nodes;
+            if (c2p_decode_parallel_ready) {
+                c2p_decode_prefix_graph =
+                    build_region_graph_slice(
+                        c2p_decode_pc_graph,
+                        0,
+                        c2p_decode_route_stop,
+                        i,
+                        0x4352445052454649ULL);
+            }
+        }
+
         if (pipeline_debug) {
             printf(
                 "[REGION_C2P_ROUTE_PIN] layer=%d chunk=-1 sg=%zu "
@@ -13760,13 +13932,21 @@ auto prefill_norm_sg_has_prework =
                 ggml_nbytes(src_weights));
             printf(
                 "[REGION_C2P_DECODE_EXEC] layer=%d sg=%zu "
-                "phase=PC_BEGIN status=BEGIN\n",
-                c2p_decode_ffn_layer, i);
+                "phase=PC_BEGIN parallel=%d status=BEGIN\n",
+                c2p_decode_ffn_layer, i,
+                c2p_decode_parallel_ready ? 1 : 0);
         }
 
-        compute_workers.start(0, i);
-        const ggml_status c2p_pc_status = compute_workers.wait(0);
-        ggml_status c2p_phone_status = GGML_STATUS_SUCCESS;
+        if (c2p_decode_parallel_ready) {
+            compute_workers.start_graph(
+                0, c2p_decode_prefix_graph);
+        } else {
+            compute_workers.start(0, i);
+        }
+        ggml_status c2p_pc_status =
+            compute_workers.wait(0);
+        ggml_status c2p_phone_status =
+            GGML_STATUS_SUCCESS;
 
         if (c2p_pc_status == GGML_STATUS_SUCCESS) {
             auto & pc_cfg = backend_ctx->backend_configs[0];
@@ -13807,15 +13987,62 @@ auto prefill_norm_sg_has_prework =
                     weights_us / 1000.0);
             }
 
-            restore_c2p_route_bindings(c2p_bindings);
+            if (c2p_decode_parallel_ready) {
+                ggml_cgraph * c2p_decode_suffix_graph =
+                    build_region_graph_slice(
+                        c2p_decode_pc_graph,
+                        c2p_decode_route_stop,
+                        c2p_decode_pc_graph->n_nodes,
+                        i,
+                        0x4352445355464649ULL);
 
-            compute_workers.start(1, i);
-            c2p_phone_status = compute_workers.wait(1);
+                const int64_t parallel_begin_us =
+                    ggml_time_us();
+                compute_workers.start_graph(
+                    0, c2p_decode_suffix_graph);
+                compute_workers.start(1, i);
+
+                const ggml_status pc_ffn_status =
+                    compute_workers.wait(0);
+                c2p_phone_status =
+                    compute_workers.wait(1);
+                c2p_pc_status = pc_ffn_status;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_FFN_PARALLEL] "
+                        "phase=DECODE layer=%d chunk=-1 "
+                        "router_nodes=%d pc_ffn_nodes=%d "
+                        "phone_nodes=%d submit_wait_ms=%.3f "
+                        "pc_status=%d phone_status=%d\n",
+                        c2p_decode_ffn_layer,
+                        c2p_decode_route_stop,
+                        c2p_decode_pc_graph->n_nodes -
+                            c2p_decode_route_stop,
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[i].cgraph_main->n_nodes,
+                        (ggml_time_us() - parallel_begin_us) /
+                            1000.0,
+                        (int) pc_ffn_status,
+                        (int) c2p_phone_status);
+                }
+
+                restore_c2p_route_bindings(
+                    c2p_bindings);
+            } else {
+                restore_c2p_route_bindings(
+                    c2p_bindings);
+                compute_workers.start(1, i);
+                c2p_phone_status =
+                    compute_workers.wait(1);
+            }
             if (pipeline_debug) {
                 printf(
                     "[REGION_C2P_DECODE_EXEC] layer=%d sg=%zu "
-                    "phase=PHONE_END status=%d\n",
-                    c2p_decode_ffn_layer, i, (int) c2p_phone_status);
+                    "phase=PHONE_END parallel=%d status=%d\n",
+                    c2p_decode_ffn_layer, i,
+                    c2p_decode_parallel_ready ? 1 : 0,
+                    (int) c2p_phone_status);
             }
         } else {
             restore_c2p_route_bindings(c2p_bindings);
@@ -14335,6 +14562,28 @@ auto prefill_norm_sg_has_prework =
                 pc_status != GGML_STATUS_SUCCESS ?
                     pc_status : phone_status;
         } else {
+            const bool p2c_parallel_ffn =
+                region_parallel_ffn &&
+                ((is_single_decode_moe_out &&
+                  ggml_backend_meta_tensor_p2c_layer(
+                      backend_ctx, decode_single_layer_0)) ||
+                 (is_prefill_down_chunk &&
+                  ggml_backend_meta_tensor_p2c_layer(
+                      backend_ctx, prefill_down_layer_0)));
+            if (pipeline_debug && p2c_parallel_ffn) {
+                const int layer =
+                    is_single_decode_moe_out ?
+                        decode_single_layer_0 :
+                        prefill_down_layer_0;
+                const int chunk =
+                    is_single_decode_moe_out ?
+                        -1 : prefill_down_chunk_0;
+                printf(
+                    "[REGION_P2C_FFN_PARALLEL] "
+                    "layer=%d chunk=%d mode=GENERIC_DUAL_WORKER "
+                    "status=SUBMIT\n",
+                    layer, chunk);
+            }
             compute_status = compute_workers.compute(i);
         }
     }
