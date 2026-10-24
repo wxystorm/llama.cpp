@@ -14530,7 +14530,7 @@ struct rpc_cycle_p2c_fifo_v1 {
         std::lock_guard<std::mutex> lock(mutex);
         if (!enabled || stopping || plan.layer < 0 || plan.chunk < 0 || !plan.seq ||
             !plan.ffn_graph_uid || !plan.reduce_graph_uid ||
-            c2p_v5.count(k) || c2p_v5.size() >= 64) return false;
+            c2p_v5.count(k)) return false;
         if (plan.chunk == 0) {
             // The previous period must have consumed all its C2P ACKs.
             if (!c2p_v5.empty() || plan.seq <= v5_epoch_head_seq)
@@ -14712,14 +14712,14 @@ struct rpc_cycle_p2c_fifo_v1 {
 
     bool can_arm(const key & k) {
         std::lock_guard<std::mutex> lock(mutex);
-        return !stopping && pending.size() + completed.size() < 64 &&
-            !pending.count(k) && !completed.count(k);
+        // A unique job with valid resources may queue regardless of the
+        // number of earlier jobs awaiting GPU execution or completion ACKs.
+        return !stopping && !pending.count(k) && !completed.count(k);
     }
     bool enqueue(const key & k,
                  const rpc_msg_inference_cycle_p2c_arm_req & plan) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (!enabled || stopping || jobs.size() >= 32 ||
-            pending.size() + completed.size() >= 64 ||
+        if (!enabled || stopping ||
             pending.count(k) || completed.count(k)) return false;
         if (!worker.joinable()) {
             try {
@@ -14750,7 +14750,6 @@ struct rpc_cycle_p2c_fifo_v1 {
             const rpc_msg_inference_cycle_phone_full_pair_req * full_plan = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!enabled || stopping ||
-            jobs.size() >= 32 || pending.size() + completed.size() >= 64 ||
             pending.count(k) || completed.count(k)) return false;
         // NEXT_ATTENTION must be admitted in Chunk order, even if the
         // PC hasn't yet observed the preceding Chunk's completion. The
@@ -14827,8 +14826,7 @@ struct rpc_cycle_p2c_fifo_v1 {
         const key a {first.layer, first.chunk, first.seq, first.graph_id};
         const key b {second.layer, second.chunk, second.seq, second.graph_id};
         std::lock_guard<std::mutex> lock(mutex);
-        if (!enabled || stopping || jobs.size() >= 31 ||
-            pending.size() + completed.size() >= (p2c ? 61 : 62) ||
+        if (!enabled || stopping ||
             a == b || pending.count(a) || pending.count(b) ||
             completed.count(a) || completed.count(b)) return false;
         const bool first_chunk = first.chunk == 0;
