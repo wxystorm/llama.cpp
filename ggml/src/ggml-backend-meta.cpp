@@ -2269,6 +2269,10 @@ static ggml_guid_t ggml_backend_meta_guid() {
 struct ggml_backend_meta_compute_workers;
 struct ggml_backend_meta_transfer_worker;
 
+struct ggml_backend_meta_context;
+static bool ggml_backend_meta_tensor_phone_primary_layer(
+    const ggml_backend_meta_context * backend_ctx, int layer);
+
 struct ggml_backend_meta_context {
     static constexpr size_t PREFILL_RETURN_LANES = 2;
     static constexpr size_t PREFILL_ROUTE_LANES = 4;
@@ -2319,6 +2323,7 @@ struct ggml_backend_meta_context {
     uint64_t                    next_phone_prefill_ffn_seq = 1;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
+    std::vector<uint8_t>        tensor_phone_layer_mask;
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
@@ -3143,8 +3148,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     std::sscanf(node->name, "ffn_moe_logits-%d%n",
                                 &parsed_layer, &parsed_chars) == 1 &&
                     node->name[parsed_chars] == '\0' &&
-                    parsed_layer >= backend_ctx->tensor_phone_first_layer &&
-                    parsed_layer < backend_ctx->tensor_phone_last_layer;
+                    ggml_backend_meta_tensor_phone_primary_layer(
+                        backend_ctx, parsed_layer);
 
                 if (router_begin) {
                     in_phone_router = true;
@@ -3217,8 +3222,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            if (layer < backend_ctx->tensor_phone_first_layer ||
-                    layer >= backend_ctx->tensor_phone_last_layer) {
+            if (!ggml_backend_meta_tensor_phone_primary_layer(
+                    backend_ctx, layer)) {
                 continue;
             }
 
@@ -3315,8 +3320,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const bool phone_primary_norm =
                 n_backends == 2 &&
                 backend_ctx->tensor_phone_first_layer >= 0 &&
-                layer >= backend_ctx->tensor_phone_first_layer &&
-                layer < backend_ctx->tensor_phone_last_layer;
+                ggml_backend_meta_tensor_phone_primary_layer(
+                    backend_ctx, layer);
 
             if (phone_primary_norm) {
                 backend_ctx->backend_configs[0].nodes[i]->flags &=
@@ -3581,10 +3586,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         &phone_primary_l_out_layer,
                         &phone_primary_l_out_parsed) == 1 &&
                     node->name[phone_primary_l_out_parsed] == '\0' &&
-                    phone_primary_l_out_layer >=
-                        backend_ctx->tensor_phone_first_layer &&
-                    phone_primary_l_out_layer <
-                        backend_ctx->tensor_phone_last_layer;
+                    ggml_backend_meta_tensor_phone_primary_layer(
+                        backend_ctx, phone_primary_l_out_layer);
 
                 const bool new_subgraph =
                     i == last_meta_node ||
@@ -4351,9 +4354,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (n_backends != 2 || layer < 0) {
             return false;
         }
-        if (backend_ctx->tensor_phone_first_layer >= 0 &&
-            layer >= backend_ctx->tensor_phone_first_layer &&
-            layer < backend_ctx->tensor_phone_last_layer) {
+        if (ggml_backend_meta_tensor_phone_primary_layer(
+                backend_ctx, layer)) {
             return true;
         }
 
@@ -4406,9 +4408,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     std::map<int, bool> layer_tensor_phone_primary_cache;
     auto layer_is_tensor_phone_primary = [&](int layer) -> bool {
-        if (backend_ctx->tensor_phone_first_layer >= 0 &&
-            layer >= backend_ctx->tensor_phone_first_layer &&
-            layer < backend_ctx->tensor_phone_last_layer) {
+        if (ggml_backend_meta_tensor_phone_primary_layer(
+                backend_ctx, layer)) {
             return true;
         }
         if (n_backends != 2 || layer < 0 ||
@@ -12695,6 +12696,20 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     return backend_ctx->backend_configs[index].backend;
 }
 
+static bool ggml_backend_meta_tensor_phone_primary_layer(
+        const ggml_backend_meta_context * backend_ctx, int layer) {
+    if (backend_ctx == nullptr || layer < 0) {
+        return false;
+    }
+    if (!backend_ctx->tensor_phone_layer_mask.empty()) {
+        return size_t(layer) < backend_ctx->tensor_phone_layer_mask.size() &&
+               backend_ctx->tensor_phone_layer_mask[size_t(layer)] != 0;
+    }
+    return backend_ctx->tensor_phone_first_layer >= 0 &&
+           layer >= backend_ctx->tensor_phone_first_layer &&
+           layer < backend_ctx->tensor_phone_last_layer;
+}
+
 bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer) {
     if (!ggml_backend_is_meta(backend)) {
@@ -12710,6 +12725,48 @@ bool ggml_backend_meta_set_tensor_phone_primary_layers(
     }
     backend_ctx->tensor_phone_first_layer = first_layer;
     backend_ctx->tensor_phone_last_layer  = last_layer;
+    backend_ctx->tensor_phone_layer_mask.clear();
+    return true;
+}
+
+bool ggml_backend_meta_set_tensor_phone_primary_layer_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    if ((mask == nullptr) != (n_layers == 0)) {
+        return false;
+    }
+
+    ggml_backend_meta_context * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    backend_ctx->tensor_phone_first_layer = -1;
+    backend_ctx->tensor_phone_last_layer = -1;
+    backend_ctx->tensor_phone_layer_mask.clear();
+
+    if (n_layers > 0) {
+        backend_ctx->tensor_phone_layer_mask.assign(mask, mask + n_layers);
+        int first = -1;
+        int last = -1;
+        size_t count = 0;
+        for (size_t il = 0; il < n_layers; ++il) {
+            if (mask[il] == 0) {
+                continue;
+            }
+            if (first < 0) {
+                first = int(il);
+            }
+            last = int(il) + 1;
+            ++count;
+        }
+        backend_ctx->tensor_phone_first_layer = first;
+        backend_ctx->tensor_phone_last_layer = last;
+        if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+            printf(
+                "[META_TP_POLICY_MASK] layers=%zu selected=%zu first=%d last=%d\n",
+                n_layers, count, first, last);
+        }
+    }
     return true;
 }
 
