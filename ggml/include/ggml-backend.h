@@ -519,6 +519,8 @@ extern "C" {
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_set_tensor_c2p_layer_mask(
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
+    GGML_API bool ggml_backend_meta_set_tensor_p2c_layer_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 

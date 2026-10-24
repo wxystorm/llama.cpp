@@ -444,21 +444,53 @@ static int llama_hybrid_region_boundary_env_int(
     return std::atoi(value);
 }
 
-// Isolated first correctness pass: exactly one PC->Phone Tensor boundary.
+// Correctness-first directional Region: one C2P boundary, one Phone region,
+// one P2C boundary, then a PC suffix.  C2P-only remains available explicitly
+// as a rollback mode; it is no longer the default.
 static std::vector<llama_hybrid_layer_mode>
 llama_build_region_boundary_v1_policy(int n_layer) {
-    if (llama_hybrid_region_boundary_env_int(
-            "LLAMA_HYBRID_REGION_C2P_ONLY", 1) != 1) {
-        throw std::runtime_error(
-            "C2P L34 clean baseline supports only C2P_ONLY=1");
+    const bool c2p_only =
+        llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_REGION_C2P_ONLY", 0) != 0;
+
+    const int default_c2p =
+        n_layer == 48 ? 34 : std::max(1, (2 * n_layer) / 3);
+    const int c2p_layer = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_C2P_LAYER", default_c2p);
+
+    if (c2p_only) {
+        if (n_layer < 2 || c2p_layer < 0 || c2p_layer >= n_layer - 1) {
+            throw std::runtime_error(
+                "invalid C2P-only layer: require 0 <= layer < n_layer-1");
+        }
+
+        std::vector<llama_hybrid_layer_mode> policy(
+            n_layer, llama_hybrid_layer_mode::PC_ONLY);
+        policy[c2p_layer] = llama_hybrid_layer_mode::TENSOR_C2P;
+        std::fill(
+            policy.begin() + c2p_layer + 1,
+            policy.end(),
+            llama_hybrid_layer_mode::PHONE_ONLY);
+
+        LLAMA_LOG_ERROR(
+            "[REGION_BOUNDARY_V1] mode=C2P_ONLY c2p_layer=%d "
+            "pc=[0,%d) phone=[%d,%d) layers=%d status=POLICY_READY\n",
+            c2p_layer, c2p_layer, c2p_layer + 1, n_layer, n_layer);
+        return policy;
     }
 
-    const int default_layer = n_layer == 48 ? 34 : n_layer - 2;
-    const int c2p_layer = llama_hybrid_region_boundary_env_int(
-        "LLAMA_HYBRID_REGION_C2P_LAYER", default_layer);
-    if (n_layer < 2 || c2p_layer < 0 || c2p_layer >= n_layer - 1) {
+    const int default_p2c =
+        n_layer == 48 ? 46 : n_layer - 2;
+    const int p2c_layer = llama_hybrid_region_boundary_env_int(
+        "LLAMA_HYBRID_REGION_P2C_LAYER", default_p2c);
+
+    if (n_layer < 5 ||
+            c2p_layer < 0 ||
+            p2c_layer <= c2p_layer + 1 ||
+            p2c_layer >= n_layer - 1) {
         throw std::runtime_error(
-            "invalid C2P-only layer: require 0 <= layer < n_layer-1");
+            "invalid directional Region: require "
+            "0 <= C2P < P2C-1 and P2C < n_layer-1");
     }
 
     std::vector<llama_hybrid_layer_mode> policy(
@@ -466,13 +498,22 @@ llama_build_region_boundary_v1_policy(int n_layer) {
     policy[c2p_layer] = llama_hybrid_layer_mode::TENSOR_C2P;
     std::fill(
         policy.begin() + c2p_layer + 1,
-        policy.end(),
+        policy.begin() + p2c_layer,
         llama_hybrid_layer_mode::PHONE_ONLY);
+    policy[p2c_layer] = llama_hybrid_layer_mode::TENSOR_P2C;
 
     LLAMA_LOG_ERROR(
-        "[REGION_BOUNDARY_V1] mode=C2P_ONLY c2p_layer=%d "
-        "pc=[0,%d) phone=[%d,%d) layers=%d status=POLICY_READY\n",
-        c2p_layer, c2p_layer, c2p_layer + 1, n_layer, n_layer);
+        "[REGION_BOUNDARY_V1] mode=DIRECTIONAL_PAIR "
+        "pc0=[0,%d) c2p=%d phone=[%d,%d) p2c=%d pc1=[%d,%d) "
+        "layers=%d status=POLICY_READY\n",
+        c2p_layer,
+        c2p_layer,
+        c2p_layer + 1,
+        p2c_layer,
+        p2c_layer,
+        p2c_layer + 1,
+        n_layer,
+        n_layer);
     return policy;
 }
 
@@ -957,7 +998,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     }
 
     if (std::getenv("GGML_META_REGION_C2P_SELF_CHECK") != nullptr &&
-            mode == llama_hybrid_layer_mode::TENSOR_C2P &&
+            directional_tensor &&
             (is_attention_tensor || is_ffn_split_tensor)) {
         int64_t pc_units = 0;
         int64_t phone_units = 0;
@@ -969,13 +1010,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                                split_state.nr[is];
             }
         }
+
+        const bool c2p =
+            mode == llama_hybrid_layer_mode::TENSOR_C2P;
         const bool ok =
             is_attention_tensor ?
-                (pc_units > 0 && phone_units == 0) :
+                (c2p ?
+                    (pc_units > 0 && phone_units == 0) :
+                    (pc_units == 0 && phone_units > 0)) :
                 (pc_units > 0 && phone_units > 0);
         LLAMA_LOG_ERROR(
-            "[REGION_C2P_WEIGHT_PLACEMENT] layer=%u tensor=%s class=%s "
+            "[REGION_%s_WEIGHT_PLACEMENT] layer=%u tensor=%s class=%s "
             "pc_units=%lld phone_units=%lld axis=%d status=%s\n",
+            c2p ? "C2P" : "P2C",
             tc.il, tensor_name.c_str(),
             is_attention_tensor ? "ATTENTION" : "FFN",
             (long long) pc_units, (long long) phone_units,
@@ -998,7 +1045,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (requested_ratio > 0.0f && requested_ratio < 1.0f &&
                 (pc_units == 0 || phone_units == 0)) {
             LLAMA_LOG_ERROR(
-                "[REGION_C2P_EMPTY_FFN_SHARD] layer=%u tensor=%s "
+                "[REGION_DIRECTIONAL_EMPTY_FFN_SHARD] layer=%u tensor=%s "
                 "requested_pc_ratio=%.9f pc_units=%lld phone_units=%lld "
                 "action=ABORT\n",
                 tc.il, tensor_name.c_str(), (double) requested_ratio,
@@ -1649,27 +1696,48 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             has_runtime_plan ?
                 runtime_plan.tensor_pc_ratio :
                 0.0f);
-        // Keep L34's PC expert share deliberately small. Both backends must
-        // use the same physical FFN weight split; never rotate this C2P shard.
+        // Directional boundaries use a physical PC expert-width share.
+        // Keep the ratios explicit per direction; performance tuning can change
+        // them later without changing the ownership protocol.
         if (llama_hybrid_region_boundary_v1_enabled()) {
-            const char * raw = std::getenv("LLAMA_HYBRID_REGION_C2P_PC_RATIO");
-            const float pc_ratio =
-                raw != nullptr && raw[0] != '\0' ?
-                    std::strtof(raw, nullptr) : (1.0f / 3.0f);
-            if (!std::isfinite(pc_ratio) ||
-                    pc_ratio <= 0.0f || pc_ratio >= 1.0f) {
-                throw std::runtime_error(
-                    "LLAMA_HYBRID_REGION_C2P_PC_RATIO must be between 0 and 1");
-            }
-            for (int il = 0; il < n_layer; ++il) {
-                if (hybrid_layer_modes[il] ==
-                        llama_hybrid_layer_mode::TENSOR_C2P) {
-                    hybrid_tensor_pc_ratios[il] = pc_ratio;
-                    LLAMA_LOG_ERROR(
-                        "[REGION_C2P_FFN_RATIO] layer=%d pc=%.9f phone=%.9f "
-                        "status=POLICY_READY\n",
-                        il, (double) pc_ratio, (double) (1.0f - pc_ratio));
+            auto read_region_ratio = [&](const char * name, float fallback) {
+                const char * raw = std::getenv(name);
+                const float ratio =
+                    raw != nullptr && raw[0] != '\0' ?
+                        std::strtof(raw, nullptr) : fallback;
+                if (!std::isfinite(ratio) ||
+                        ratio <= 0.0f || ratio >= 1.0f) {
+                    throw std::runtime_error(
+                        std::string(name) + " must be between 0 and 1");
                 }
+                return ratio;
+            };
+
+            const float c2p_pc_ratio = read_region_ratio(
+                "LLAMA_HYBRID_REGION_C2P_PC_RATIO", 1.0f / 3.0f);
+            const float p2c_pc_ratio = read_region_ratio(
+                "LLAMA_HYBRID_REGION_P2C_PC_RATIO", 1.0f / 3.0f);
+
+            for (int il = 0; il < n_layer; ++il) {
+                const llama_hybrid_layer_mode mode =
+                    hybrid_layer_modes[il];
+                if (mode != llama_hybrid_layer_mode::TENSOR_C2P &&
+                        mode != llama_hybrid_layer_mode::TENSOR_P2C) {
+                    continue;
+                }
+
+                const bool c2p =
+                    mode == llama_hybrid_layer_mode::TENSOR_C2P;
+                const float pc_ratio =
+                    c2p ? c2p_pc_ratio : p2c_pc_ratio;
+                hybrid_tensor_pc_ratios[il] = pc_ratio;
+                LLAMA_LOG_ERROR(
+                    "[REGION_%s_FFN_RATIO] layer=%d "
+                    "pc=%.9f phone=%.9f status=POLICY_READY\n",
+                    c2p ? "C2P" : "P2C",
+                    il,
+                    (double) pc_ratio,
+                    (double) (1.0f - pc_ratio));
             }
         }
 

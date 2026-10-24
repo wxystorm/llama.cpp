@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -3553,6 +3554,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         size_t(hparams.n_layer()), uint8_t(0));
     std::vector<uint8_t> tensor_c2p_layer_mask(
         size_t(hparams.n_layer()), uint8_t(0));
+    std::vector<uint8_t> tensor_p2c_layer_mask(
+        size_t(hparams.n_layer()), uint8_t(0));
     bool directional_region_policy = false;
 
     // The model policy is the execution source of truth. Region Boundary V1
@@ -3565,6 +3568,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             llama_hybrid_layer_mode_directional_tensor(mode);
         if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
             tensor_c2p_layer_mask[size_t(il)] = 1;
+        }
+        if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+            tensor_p2c_layer_mask[size_t(il)] = 1;
         }
         if (!llama_hybrid_layer_mode_tensor_attention_on_phone(mode)) {
             continue;
@@ -3588,6 +3594,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 tensor_c2p_layer_mask.empty() ? nullptr :
                     tensor_c2p_layer_mask.data(),
                 tensor_c2p_layer_mask.size());
+            ggml_backend_meta_set_tensor_p2c_layer_mask(
+                backend,
+                tensor_p2c_layer_mask.empty() ? nullptr :
+                    tensor_p2c_layer_mask.data(),
+                tensor_p2c_layer_mask.size());
         } else {
             ggml_backend_meta_set_tensor_phone_primary_layers(
                 backend, tensor_phone_first_layer, tensor_phone_last_layer);
@@ -5059,6 +5070,86 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     logits_out,
                     0,
                     logits_copy_bytes);
+
+                const bool decode_top5_trace =
+                    ubatch.n_tokens == 1 &&
+                    (std::getenv("LLAMA_DECODE_TOP5_TRACE") != nullptr ||
+                     std::getenv("GGML_META_REGION_C2P_SELF_CHECK") != nullptr);
+                if (decode_top5_trace) {
+                    // Diagnostics only: make the async host copy visible before
+                    // inspecting scores. This intentionally adds a decode fence.
+                    ggml_backend_synchronize(backend_res);
+
+                    struct top_entry {
+                        float logit;
+                        llama_token token;
+                    };
+                    std::array<top_entry, 5> top;
+                    for (auto & entry : top) {
+                        entry.logit =
+                            -std::numeric_limits<float>::infinity();
+                        entry.token = LLAMA_TOKEN_NULL;
+                    }
+
+                    const float * row =
+                        logits_out +
+                        ((size_t) n_outputs - 1) * (size_t) n_vocab;
+                    for (llama_token tok = 0;
+                            tok < (llama_token) n_vocab; ++tok) {
+                        const float value = row[tok];
+                        if (!std::isfinite(value) ||
+                                value <= top.back().logit) {
+                            continue;
+                        }
+                        size_t pos = top.size() - 1;
+                        while (pos > 0 &&
+                                value > top[pos - 1].logit) {
+                            top[pos] = top[pos - 1];
+                            --pos;
+                        }
+                        top[pos] = { value, tok };
+                    }
+
+                    auto escape_piece = [](const std::string & piece) {
+                        std::string out;
+                        out.reserve(piece.size() + 8);
+                        for (unsigned char ch : piece) {
+                            switch (ch) {
+                                case '\n': out += "\\n"; break;
+                                case '\r': out += "\\r"; break;
+                                case '\t': out += "\\t"; break;
+                                case '\\': out += "\\\\"; break;
+                                case '"': out += "\\\""; break;
+                                default: out.push_back((char) ch); break;
+                            }
+                        }
+                        return out;
+                    };
+
+                    static thread_local uint64_t decode_top5_seq = 0;
+                    const uint64_t seq = decode_top5_seq++;
+                    printf(
+                        "========== DECODE TOP 5 decoded=%" PRIu64
+                        " ==========\n",
+                        seq);
+                    for (size_t rank = 0; rank < top.size(); ++rank) {
+                        const llama_token tok = top[rank].token;
+                        const std::string piece =
+                            tok == LLAMA_TOKEN_NULL ?
+                                std::string() :
+                                model.vocab.token_to_piece(tok);
+                        printf(
+                            "[DECODE_TOP5] decoded=%" PRIu64
+                            " rank=%zu token=%d logit=%.9f "
+                            "piece=\"%s\" raw_argmax=%d\n",
+                            seq,
+                            rank,
+                            (int) tok,
+                            top[rank].logit,
+                            escape_piece(piece).c_str(),
+                            rank == 0 ? 1 : 0);
+                    }
+                }
 
                 // The server samples the first generated token from the raw
                 // logits produced by the prompt graph.  Keep an explicit

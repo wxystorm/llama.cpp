@@ -135,3 +135,74 @@ backend is synchronized; they strip view strides/padding, so a PASS is stronger
 than comparing physical RPC byte counts. If all wire/reduce checks pass but
 generation is still wrong, the next suspect is the mathematical producer before
 the handoff (Attention/FFN Norm/Router/FFN), not serialization.
+
+
+## Directional pair: PC -> C2P -> Phone -> P2C -> PC
+
+The correctness-first topology is now a single directional pair. For the
+48-layer Qwen3 MoE model the defaults are:
+
+- PC full: L0-L33
+- C2P: L34
+- Phone full: L35-L45
+- P2C: L46
+- PC full: L47
+
+P2C mirrors C2P. Phone owns Attention, residual, FFN norm and Router. It sends
+normalized hidden + TopK/weights Phone-to-PC, both sides compute their FFN
+shards, then Phone folds `phone_partial + residual` and sends that one tensor
+Phone-to-PC. PC adds its local partial and owns the final P2C `l_out`.
+
+Use:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_BOUNDARY_V1 = "1"
+$env:LLAMA_HYBRID_REGION_C2P_ONLY = "0"
+$env:LLAMA_HYBRID_REGION_C2P_LAYER = "34"
+$env:LLAMA_HYBRID_REGION_P2C_LAYER = "46"
+
+$env:LLAMA_HYBRID_REGION_C2P_PC_RATIO = "0.333333"
+$env:LLAMA_HYBRID_REGION_P2C_PC_RATIO = "0.333333"
+
+$env:GGML_META_REGION_C2P_SELF_CHECK = "1"
+$env:GGML_META_PIPELINE_DEBUG = "1"
+$env:LLAMA_DECODE_TOP5_TRACE = "1"
+```
+
+Do not enable the legacy Phone-primary single-owner/one-way variables for this
+test. Directional C2P/P2C owns its reductions explicitly.
+
+Expected policy logs:
+
+```text
+[REGION_BOUNDARY_V1] mode=DIRECTIONAL_PAIR pc0=[0,34) c2p=34 phone=[35,46) p2c=46 pc1=[47,48)
+[META_C2P_POLICY_MASK] ... selected=1 first=34 last=35
+[META_P2C_POLICY_MASK] ... selected=1 first=46 last=47
+```
+
+P2C correctness logs should all PASS:
+
+```text
+[REGION_P2C_WEIGHT_PLACEMENT] ... class=ATTENTION pc_units=0 phone_units=...
+[REGION_P2C_WEIGHT_PLACEMENT] ... class=FFN pc_units=256 phone_units=512
+[REGION_P2C_WIRE_PARITY] ... stage=FFN_NORM ... status=PASS
+[REGION_P2C_WIRE_PARITY] ... stage=ROUTER_TOPK ... status=PASS
+[REGION_P2C_WIRE_PARITY] ... stage=ROUTER_WEIGHTS ... status=PASS
+[REGION_P2C_WIRE_PARITY] ... stage=PHONE_PARTIAL_PLUS_RESIDUAL ... status=PASS
+[REGION_P2C_NUMERIC] ... status=PASS
+[REGION_P2C_DECODE_NUMERIC] ... status=PASS
+```
+
+Decode diagnostics print the raw Top-5 logits and the actual vocabulary piece
+for each token id:
+
+```text
+[DECODE_TOP5] decoded=0 rank=0 token=... logit=... piece="..." raw_argmax=1
+[DECODE_TOP5] decoded=0 rank=1 token=... logit=... piece="..." raw_argmax=0
+...
+```
+
+The `piece` field escapes newline/tab/quote/backslash so repeated or malformed
+generation can be inspected directly from the log. `raw_argmax=1` marks the
+highest raw logit, not necessarily the final sampled token when non-greedy
+sampling transforms logits.
