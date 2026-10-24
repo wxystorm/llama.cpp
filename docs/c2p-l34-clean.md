@@ -490,3 +490,57 @@ reason=NEXT_P2C_PHONE_ATTN status=OK
 Expected effect: the full L45 `1->0` mirror disappears; the intentional L46
 P2C READY/PARTIAL transfers remain unchanged. Decode and non-directional
 Phone-owner exits retain the legacy handoff behavior.
+
+
+## Directional Region Chunk Continuation
+
+The next Region step is now isolated behind:
+
+```text
+LLAMA_HYBRID_REGION_CHUNK_CONTINUATION=1
+```
+
+It is Prefill-only and currently gated to Qwen3-MoE directional-pair policies with
+exactly one C2P and one P2C boundary.
+
+For the current L34/L46 policy, the staged graph is:
+
+```text
+PC prefix       directional Region stage                  PC tail
+L0-L33          [L34 C2P, L35-L45 Phone, L46 P2C]        L47
+```
+
+The Region graph is depth-first by Tensor chunk:
+
+```text
+L34 FFN(C0) -> C2P Reduce(C0) -> L35(C0) -> ... -> L46(C0)
+L34 FFN(C1) -> C2P Reduce(C1) -> L35(C1) -> ... -> L46(C1)
+L34 FFN(C2) -> C2P Reduce(C2) -> L35(C2) -> ... -> L46(C2)
+```
+
+C2P final output uses one stable Phone-side `l_out-34` backing. The ordinary
+producer is disabled before chunk 0 continuation. Each C2P Reduce writes only
+its chunk into that backing, and `Attention(L35,C)` is admitted only after
+the exact `Reduce(L34,C)` credit has completed.
+
+With `LLAMA_HYBRID_REGION_WINDOW=2`, the old C2P boundary-wide drain is
+suppressed in continuation mode. Graph-end drain remains as a safety net.
+
+Expected diagnostic markers:
+
+```text
+[REGION_CONT_STAGE_PLAN] ... status=READY
+[REGION_CONT_RUNTIME] ... status=BEGIN
+[REGION_CONT_GRAPH] ... mode=BOUNDARY_SEED_THEN_CHUNK_MAJOR
+[REGION_CONT_DEP] direction=C2P producer=34/C consumer=35/C ... status=OK
+```
+
+The existing P2C stable boundary-output commit remains unchanged:
+
+```text
+[REGION_BOUNDARY_OUTPUT_COMMIT] direction=P2C layer=46 ... status=OK
+```
+
+This step removes the full-Region layer barrier from the graph dataflow. It
+does not yet make an already-running low-priority C2P FFN shard preemptible;
+the priority worker remains non-preemptive by design.
