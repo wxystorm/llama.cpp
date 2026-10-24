@@ -1094,7 +1094,8 @@ static bool cycle_core_evaluate_with_kv(
                     "expected_region_calls=%d legacy_device_handoffs=%llu "
                     "expected_legacy_handoffs=%llu host_readbacks=%d "
                     "cache_hits=%llu cache_builds=%llu cache_evictions=%llu "
-                    "allocator_grows=%llu galloc_mib=%.3f status=%s\n",
+                    "cache_incompatible=%llu allocator_grows=%llu "
+                    "galloc_mib=%.3f status=%s\n",
                     pc_cuda_region ? "REGION_V2_CACHE" : "DEVICE_LOCAL_FALLBACK",
                     pc_cuda_region_calls.load(), expected_region_calls,
                     (unsigned long long) session.cuda_device_handoffs(),
@@ -1103,6 +1104,7 @@ static bool cycle_core_evaluate_with_kv(
                     (unsigned long long) pc_cuda_region_cache_stats.hits,
                     (unsigned long long) pc_cuda_region_cache_stats.builds,
                     (unsigned long long) pc_cuda_region_cache_stats.evictions,
+                    (unsigned long long) pc_cuda_region_cache_stats.incompatible,
                     (unsigned long long) pc_cuda_region_cache_stats.allocator_grows,
                     double(pc_cuda_region_cache_stats.allocator_bytes) /
                         (1024.0 * 1024.0),
