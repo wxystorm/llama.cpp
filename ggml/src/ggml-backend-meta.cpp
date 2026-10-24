@@ -4886,6 +4886,32 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     auto subgraph_is_phone_only = [&](size_t sg) -> bool {
         return subgraph_is_phone_owned(sg);
     };
+    auto subgraph_is_region_phone_continuation =
+        [&](size_t sg) -> bool {
+            if (!region_chunk_continuation ||
+                    n_backends != 2 ||
+                    sg >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+            for (size_t backend = 0; backend < n_backends; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    const char * name = graph->nodes[k]->name;
+                    if (std::strncmp(
+                            name, "region_phone_", 13) == 0 ||
+                        std::strncmp(
+                            name, "region_p2c_", 11) == 0) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
     std::map<int, bool> layer_phone_primary_cache;
     auto layer_attention_phone_owned = [&](int layer) -> bool {
         if (n_backends != 2 || layer < 0) {
@@ -9423,12 +9449,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
+        const bool region_phone_cont_sg =
+            active_count == 1 &&
+            active_backend == 1 &&
+            subgraph_is_region_phone_continuation(i);
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
             !c2p_tensor_sg &&
+            !region_phone_cont_sg &&
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
@@ -9552,6 +9584,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             const bool pc_needed_next =
                 i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
+
+            // Full-graph directional Region interior is explicitly
+            // Phone-owned.  Chunk-local tensors are not complete layer
+            // activations and must never enter the generic Phone->PC l_out
+            // handoff/copy path.  The only cross-device exit is the explicit
+            // P2C boundary machinery at L46.
+            if (region_phone_cont_sg &&
+                    !c2p_prefill_down_boundary &&
+                    !c2p_decode_single_boundary) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_PHONE_CONT_KEEP] sg=%zu tensor=%s "
+                        "bytes=%zu next_pc=%d next_phone=%d "
+                        "action=NO_HANDOFF status=OK\n",
+                        i,
+                        nodes[1] != nullptr ?
+                            nodes[1]->name : "(null)",
+                        nodes[1] != nullptr ?
+                            ggml_nbytes(nodes[1]) : 0,
+                        pc_needed_next ? 1 : 0,
+                        i + 1 < backend_ctx->n_subgraphs ?
+                            (int) subgraph_will_execute_phone(i + 1) : -1);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
             if (c2p_tensor_sg) {
                 handled = true;
                 if (pipeline_debug) {
@@ -13849,10 +13908,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
         int attn_layer = -1;
         int ffn_layer = -1;
+        const char * attn_name =
+            g0->nodes[g0->n_nodes - 1]->name;
+        const char * ffn_name =
+            g1->nodes[0]->name;
         const bool is_attn =
-            std::sscanf(g0->nodes[g0->n_nodes - 1]->name, "attn_out-%d", &attn_layer) == 1;
+            std::sscanf(
+                attn_name,
+                "attn_out-%d",
+                &attn_layer) == 1 ||
+            std::sscanf(
+                attn_name,
+                "region_phone_attn_out_chunk_%*d-%d",
+                &attn_layer) == 1;
         const bool is_ffn =
-            std::sscanf(g1->nodes[0]->name, "ffn_inp-%d", &ffn_layer) == 1;
+            std::sscanf(
+                ffn_name,
+                "ffn_inp-%d",
+                &ffn_layer) == 1 ||
+            std::sscanf(
+                ffn_name,
+                "region_phone_ffn_inp_chunk_%*d-%d",
+                &ffn_layer) == 1;
         if (!is_attn || !is_ffn || attn_layer != ffn_layer) {
             return false;
         }
