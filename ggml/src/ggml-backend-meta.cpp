@@ -3670,6 +3670,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
+                int c2p_route_chunk = -1;
+                int c2p_route_layer = -1;
+                const bool is_c2p_route_boundary =
+                    ggml_backend_meta_parse_c2p_route_weights(
+                        node->name, c2p_route_chunk, c2p_route_layer) &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, c2p_route_layer);
+
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -3689,12 +3697,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
+                    is_c2p_route_boundary ||
                     is_phone_primary_l_out;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                // C2P Router handoff must occur immediately after the
+                // route weights are produced.  Do not let the generic delayed
+                // split logic slide this boundary into the expert FFN.
+                const int i_delayed =
+                    is_c2p_route_boundary ? i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -7108,6 +7121,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         };
 
+    std::set<std::pair<int, int>> c2p_prefill_route_ready;
+
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
                                          int force_phone_block_layer) -> ggml_status {
@@ -7490,24 +7505,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             ggml_tensor * src_topk =
-                find_exact_named_tensor(0, topk_name);
+                find_sg_named_tensor(0, i, topk_name);
             ggml_tensor * dst_topk =
-                find_exact_named_tensor(1, topk_name);
+                find_sg_named_tensor(1, i, topk_name);
             ggml_tensor * src_weights =
-                find_exact_named_tensor(0, weights_name);
+                find_sg_named_tensor(0, i, weights_name);
             ggml_tensor * dst_weights =
-                find_exact_named_tensor(1, weights_name);
+                find_sg_named_tensor(1, i, weights_name);
 
             GGML_ASSERT(src_topk != nullptr);
             GGML_ASSERT(dst_topk != nullptr);
             GGML_ASSERT(src_weights != nullptr);
             GGML_ASSERT(dst_weights != nullptr);
+            GGML_ASSERT(src_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(dst_topk->type == GGML_TYPE_I32);
+            GGML_ASSERT(src_weights->type == GGML_TYPE_F32);
+            GGML_ASSERT(dst_weights->type == GGML_TYPE_F32);
             GGML_ASSERT(
-                ggml_nbytes(src_topk) ==
-                ggml_nbytes(dst_topk));
+                ggml_are_same_layout(src_topk, dst_topk));
             GGML_ASSERT(
-                ggml_nbytes(src_weights) ==
-                ggml_nbytes(dst_weights));
+                ggml_are_same_layout(src_weights, dst_weights));
 
             auto & pc_cfg =
                 backend_ctx->backend_configs[0];
@@ -7550,13 +7567,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 i, 0, 1, src_weights, weights_copy_us);
             record_direct_copy();
 
+            if (ab_trace_requested &&
+                    c2p_route_layer == ab_trace_layer &&
+                    ab_full_tokens() >= ab_min_tokens) {
+                ab_dump_tensor(
+                    0, c2p_route_chunk,
+                    "router_topk", src_topk);
+                ab_dump_tensor(
+                    0, c2p_route_chunk,
+                    "router_weights", src_weights);
+                ab_dump_tensor(
+                    1, c2p_route_chunk,
+                    "router_topk", dst_topk);
+                ab_dump_tensor(
+                    1, c2p_route_chunk,
+                    "router_weights", dst_weights);
+            }
+
+            if (c2p_route_chunk >= 0) {
+                c2p_prefill_route_ready.insert({
+                    c2p_route_layer, c2p_route_chunk,
+                });
+            }
+
             if (pipeline_debug) {
                 printf(
                     "[REGION_C2P_ROUTE] layer=%d chunk=%d "
                     "direction=PC_TO_PHONE "
                     "topk_bytes=%zu weights_bytes=%zu "
                     "topk_ms=%.3f weights_ms=%.3f "
-                    "owner=PC status=OK\n",
+                    "owner=PC trigger=ROUTE_BOUNDARY status=READY\n",
                     c2p_route_layer,
                     c2p_route_chunk,
                     ggml_nbytes(src_topk),
@@ -12677,6 +12717,11 @@ auto prefill_norm_sg_has_prework =
                 n_backends == 2 &&
                 ggml_backend_meta_tensor_c2p_layer(
                     backend_ctx, prefill_down_layer);
+            const bool c2p_route_ready =
+                c2p_prefill_exec &&
+                c2p_prefill_route_ready.erase({
+                    prefill_down_layer, prefill_down_chunk,
+                }) != 0;
 
             std::vector<c2p_route_binding_backup> c2p_bindings;
             ggml_tensor * c2p_src_topk = nullptr;
@@ -12686,7 +12731,7 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_graph = nullptr;
             uint64_t c2p_saved_pc_graph_uid = 0;
 
-            if (c2p_prefill_exec) {
+            if (c2p_prefill_exec && !c2p_route_ready) {
                 char topk_name[96];
                 char weights_name[96];
                 std::snprintf(
@@ -12804,7 +12849,35 @@ auto prefill_norm_sg_has_prework =
             ggml_status pc_status = GGML_STATUS_SUCCESS;
             ggml_status phone_status = GGML_STATUS_SUCCESS;
 
-            if (c2p_prefill_exec) {
+            if (c2p_prefill_exec && c2p_route_ready) {
+                // Router handoff already completed at the previous subgraph
+                // boundary. PC FFN was launched before the asynchronous
+                // FFN_NORM input wait above; Phone FFN can now start and both
+                // expert shards execute concurrently.
+                compute_workers.start(1, i);
+
+                const int64_t parallel_wait_begin_us = ggml_time_us();
+                pc_status = compute_workers.wait(0);
+                phone_status = compute_workers.wait(1);
+                const int64_t parallel_wait_us =
+                    ggml_time_us() - parallel_wait_begin_us;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_FFN_PARALLEL] layer=%d chunk=%d sg=%zu "
+                        "route=READY pc_status=%d phone_status=%d "
+                        "join_wait_ms=%.3f status=%s\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        (int) pc_status,
+                        (int) phone_status,
+                        parallel_wait_us / 1000.0,
+                        pc_status == GGML_STATUS_SUCCESS &&
+                                phone_status == GGML_STATUS_SUCCESS ?
+                            "OK" : "FAIL");
+                }
+            } else if (c2p_prefill_exec) {
                 // Correctness-first C2P order:
                 //
                 //   pin PC Router outputs
