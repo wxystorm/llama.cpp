@@ -16384,6 +16384,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         eligible; ++chunk) {
                     const auto & current =
                         region_pipe_chunks.at((int) chunk);
+                    add_pc_prefix_gap((int) chunk);
                     add_sg(current.norm_sg);
                     add_sg(current.down_sg);
                     add_region(current);
