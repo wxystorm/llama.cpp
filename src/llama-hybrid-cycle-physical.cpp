@@ -39,7 +39,10 @@ ggml_tensor * llama_hybrid_cycle_resolve_physical_weight(
         // Borrowed model tensor: it remains owned by the model until unload.
         return const_cast<ggml_tensor *>(weight);
     }
-    // Region-cycle CUDA mirror only borrows canonical PC CPU weights.\n    // Tensor/Phone Meta shards remain owned by the existing Meta path and are\n    // deliberately not resolved through this helper.\n    return nullptr;
+    // Region-cycle CUDA mirror only borrows canonical PC CPU weights.
+    // Tensor/Phone Meta shards remain owned by the existing Meta path and are
+    // deliberately not resolved through this helper.
+    return nullptr;
 }
 
 void llama_hybrid_cycle_cuda_activation_slot::release() {
