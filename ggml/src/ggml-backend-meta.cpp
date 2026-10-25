@@ -5882,6 +5882,32 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             backups.clear();
         };
 
+    struct region_c2p_pc_prework_state {
+        int layer = -1;
+        int chunk = -1;
+        size_t norm_sg = 0;
+        size_t down_sg = 0;
+        ggml_tensor * norm_stage = nullptr;
+        ggml_tensor * src_topk = nullptr;
+        ggml_tensor * src_weights = nullptr;
+        ggml_tensor * pc_partial = nullptr;
+        std::vector<c2p_route_binding_backup> bindings;
+        ggml_status status = GGML_STATUS_SUCCESS;
+        int64_t wall_us = 0;
+        bool ready = false;
+    };
+    std::map<std::pair<int, int>, region_c2p_pc_prework_state>
+        region_c2p_pc_prework;
+
+    auto find_region_c2p_pc_prework =
+        [&](int layer, int chunk) ->
+            region_c2p_pc_prework_state * {
+            auto it =
+                region_c2p_pc_prework.find({ layer, chunk });
+            return it == region_c2p_pc_prework.end() ?
+                nullptr : &it->second;
+        };
+
     auto phone_prefill_direct_defer_eligible =
         [&](int layer) {
             if (!phone_prefill_chunk_pipeline ||
