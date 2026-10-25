@@ -315,14 +315,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool phone_region_single_sequence =
         ubatch.n_seqs_unq == 1 &&
         (!ubatch.equal_seqs() || ubatch.n_seqs == 1);
-    if (phone_region_requested && !stage_graph &&
+    if (phone_region_requested &&
             n_tokens > 1 && ubatch.n_pos == 1 &&
             phone_region_single_sequence &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             planned_chunk_tokens > 0 && loras->empty() &&
             !moe_stage_wavefront) {
         bool spans_valid = true;
-        for (int il = 0; il < n_layer && spans_valid; ++il) {
+        for (int il = layer_begin;
+                il < layer_end && spans_valid; ++il) {
             if (model.hybrid_layer_mode(il) !=
                     llama_hybrid_layer_mode::TENSOR_C2P) {
                 continue;
@@ -330,7 +331,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
             const int first = il + 1;
             int p2c = first;
-            while (p2c < n_layer &&
+            while (p2c < layer_end &&
                     model.hybrid_layer_mode(p2c) ==
                         llama_hybrid_layer_mode::PHONE_ONLY) {
                 ++p2c;
@@ -339,7 +340,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // A schedulable Region needs at least one full Phone layer and a
             // closing P2C owner transition. Truncated suffixes are PC_ONLY by
             // policy and therefore never appear here.
-            if (p2c <= first || p2c >= n_layer ||
+            if (p2c <= first || p2c >= layer_end ||
                     model.hybrid_layer_mode(p2c) !=
                         llama_hybrid_layer_mode::TENSOR_P2C) {
                 spans_valid = false;
@@ -387,12 +388,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
             " stage=%d equal_seqs=%d n_seqs=%u n_seq_tokens=%u"
             " n_seqs_unq=%u n_pos=%u one_sequence=%d"
-            " tensor_mode=%d loras=%zu regions=%zu status=%s\n",
+            " tensor_mode=%d stage_range=[%d,%d) "
+            "loras=%zu regions=%zu status=%s\n",
             n_tokens, stage_graph ? 1 : 0,
             ubatch.equal_seqs() ? 1 : 0, ubatch.n_seqs,
             ubatch.n_seq_tokens, ubatch.n_seqs_unq,
             ubatch.n_pos, phone_region_single_sequence ? 1 : 0,
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 1 : 0,
+            layer_begin, layer_end,
             loras->size(), phone_region_spans.size(),
             !phone_region_spans.empty() ? "READY" : "SKIP");
         for (size_t ri = 0; ri < phone_region_spans.size(); ++ri) {
