@@ -59,6 +59,16 @@ def main() -> int:
         print("FAIL: expected continuation=1 in PHONE_REGION_PIPE_PLAN")
         return 1
 
+    event_mode = re.search(
+        r"\[PHONE_REGION_EVENT_PIPELINE\] active=1 window=2 "
+        r"pc_prework=NEXT_CHUNK completion_wait=ASYNC_EVENT "
+        r"phone_prework=DEFERRED_UNTIL_CONTINUATION status=READY",
+        block,
+    )
+    if event_mode is None:
+        print("FAIL: missing PHONE_REGION_EVENT_PIPELINE READY marker")
+        return 1
+
     attn_plans = list(re.finditer(
         r"\[PHONE_TENSOR_ATTN_CHUNK_PLAN\] layer=46 chunks=(\d+) "
         r"tokens=\d+ mode=P2C status=READY",
