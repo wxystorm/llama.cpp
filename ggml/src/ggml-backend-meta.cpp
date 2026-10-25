@@ -12572,8 +12572,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             // explicitly before overwriting a slot that previously belonged
             // to another chunk.
             int64_t reuse_wait_us = 0;
-            if (slot.owner_chunk >= 0 &&
-                    slot.owner_chunk != chunk) {
+            if (slot.owner_chunk >= 0) {
                 const int64_t wait_begin_us = ggml_time_us();
                 const ggml_backend_rpc_fence_t rpc_fence =
                     ggml_backend_meta_get_rpc_fence(phone_backend);
