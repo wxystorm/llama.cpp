@@ -12530,8 +12530,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         GGML_ASSERT(phone != nullptr);
                         for (int k = 0; k < phone->n_nodes; ++k) {
                             ggml_tensor * node = phone->nodes[k];
+                            const bool layout_only =
+                                node->op == GGML_OP_VIEW ||
+                                node->op == GGML_OP_RESHAPE ||
+                                node->op == GGML_OP_PERMUTE ||
+                                node->op == GGML_OP_TRANSPOSE;
                             if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-                                    ggml_is_view_op(node->op)) {
+                                    layout_only) {
                                 continue;
                             }
                             // Nodes without a materialized backing pointer
