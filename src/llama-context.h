@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_region_cuda_mirror;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -483,6 +484,12 @@ private:
 
     ggml_backend_t                backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Region-cycle PC Full execution is intentionally outside the ordinary
+    // scheduler: CPU owns canonical weights; this private CUDA backend owns
+    // only bounded LRU mirrors and PC Full KV/scratch.
+    ggml_backend_ptr region_cuda_backend;
+    std::unique_ptr<llama_region_cuda_mirror> region_cuda_mirror;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
