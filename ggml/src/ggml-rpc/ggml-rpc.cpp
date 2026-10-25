@@ -1593,6 +1593,8 @@ enum class rpc_socket_role {
     ROUTE_TRANSFER_3,
     RETURN_TRANSFER_0,
     RETURN_TRANSFER_1,
+    PHONE_C2P_READY,
+    PHONE_C2P_PARTIAL,
     COMPLETION_WAIT,
 };
 
@@ -1631,6 +1633,12 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::RETURN_TRANSFER_1:
             suffix = "_return_transfer_1";
+            break;
+        case rpc_socket_role::PHONE_C2P_READY:
+            suffix = "_phone_c2p_ready";
+            break;
+        case rpc_socket_role::PHONE_C2P_PARTIAL:
+            suffix = "_phone_c2p_partial";
             break;
         case rpc_socket_role::COMPLETION_WAIT:
             suffix = "_completion_wait";
@@ -1672,6 +1680,18 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return get_socket_role(endpoint, rpc_socket_role::COMPUTE);
+}
+
+static std::shared_ptr<socket_t> get_phone_c2p_ready_socket(
+        const std::string & endpoint) {
+    return get_socket_role(
+        endpoint, rpc_socket_role::PHONE_C2P_READY);
+}
+
+static std::shared_ptr<socket_t> get_phone_c2p_partial_socket(
+        const std::string & endpoint) {
+    return get_socket_role(
+        endpoint, rpc_socket_role::PHONE_C2P_PARTIAL);
 }
 
 static std::shared_ptr<socket_t> get_transfer_socket(const std::string & endpoint) {
