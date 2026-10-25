@@ -739,6 +739,12 @@ struct ggml_backend_rpc_buffer_context {
 // Phone MAIN client helpers are declared before the ordinary RPC helper
 // definitions below. Keep only narrow forward declarations here rather than
 // moving the feature into the low-level transport section.
+static std::shared_ptr<socket_t> get_socket(
+        const std::string & endpoint);
+static std::shared_ptr<socket_t> get_phone_c2p_ready_socket(
+        const std::string & endpoint);
+static std::shared_ptr<socket_t> get_phone_c2p_partial_socket(
+        const std::string & endpoint);
 static bool send_rpc_cmd(
         socket_ptr sock,
         enum rpc_cmd cmd,
@@ -1062,7 +1068,7 @@ static bool ggml_backend_rpc_phone_c2p_ready(
     GGML_ASSERT(cursor == input.size());
 
     rpc_msg_phone_c2p_ready_rsp response {};
-    auto sock = get_socket(rpc_ctx->endpoint);
+    auto sock = get_phone_c2p_ready_socket(rpc_ctx->endpoint);
     const int64_t begin_us = ggml_time_us();
     const bool ok =
         sock != nullptr &&
@@ -1150,7 +1156,7 @@ static bool ggml_backend_rpc_phone_c2p_partial(
     }
 
     rpc_msg_phone_c2p_partial_rsp response {};
-    auto sock = get_socket(rpc_ctx->endpoint);
+    auto sock = get_phone_c2p_partial_socket(rpc_ctx->endpoint);
     const int64_t begin_us = ggml_time_us();
     const bool ok =
         sock != nullptr &&
