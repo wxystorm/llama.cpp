@@ -16624,6 +16624,36 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         pipeline_stage = "P2C_CONTINUE";
                     }
                 }
+
+                // SGs immediately preceding a chunk's C2P_NORM are its
+                // chunk-major PC prefix. Label the actual execution, not just
+                // the planner insertion, so logs can prove that chunk N's
+                // L0-L33 work runs before L34-N while Phone MAIN handles older
+                // chunks independently.
+                if (pipeline_stage == nullptr &&
+                        !region_pipe_chunks.empty()) {
+                    const auto & first =
+                        region_pipe_chunks.at(0);
+                    if (i < first.norm_sg) {
+                        pipeline_chunk = 0;
+                        pipeline_stage = "PC_PREFIX";
+                    } else {
+                        for (size_t c = 1;
+                                c < region_pipe_chunks.size();
+                                ++c) {
+                            const auto & prev =
+                                region_pipe_chunks.at((int) c - 1);
+                            const auto & cur =
+                                region_pipe_chunks.at((int) c);
+                            if (i > prev.down_sg &&
+                                    i < cur.norm_sg) {
+                                pipeline_chunk = (int) c;
+                                pipeline_stage = "PC_PREFIX";
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             if (pipeline_debug && pipeline_stage != nullptr) {
                 printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
