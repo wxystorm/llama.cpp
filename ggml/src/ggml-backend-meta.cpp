@@ -2842,6 +2842,36 @@ static ggml_backend_rpc_set_tensor_graph_t ggml_backend_meta_get_set_tensor_grap
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_RPC_SET_TENSOR_GRAPH_PROC));
 }
 
+static ggml_backend_rpc_graph_register_t
+ggml_backend_meta_get_graph_register(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_graph_register_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_GRAPH_REGISTER_PROC));
+}
+
+static ggml_backend_rpc_phone_main_register_t
+ggml_backend_meta_get_phone_main_register(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_main_register_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_MAIN_REGISTER_PROC));
+}
+
 static ggml_backend_rpc_set_tensor_async_return_t
 ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -3970,6 +4000,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_pc_overlap_requested =
         region_pc_overlap_env != nullptr &&
         std::atoi(region_pc_overlap_env) != 0;
+    const char * phone_main_local_env =
+        std::getenv("GGML_META_PHONE_MAIN_LOCAL");
+    const bool phone_main_local_requested =
+        phone_main_local_env != nullptr &&
+        std::atoi(phone_main_local_env) != 0;
+    bool phone_main_local_active = false;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -13162,6 +13198,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         size_t begin_sg             = static_cast<size_t>(-1);
         size_t end_sg               = static_cast<size_t>(-1);
         size_t continuation_begin_sg = static_cast<size_t>(-1);
+        size_t continuation_route_sg = static_cast<size_t>(-1);
         size_t continuation_end_sg   = static_cast<size_t>(-1);
     };
     enum class region_pipe_schedule_kind {
