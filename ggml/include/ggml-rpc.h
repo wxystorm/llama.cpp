@@ -165,6 +165,7 @@ using ggml_backend_rpc_phone_region_local_submit_t = bool (*)(
         uint64_t ready_seq,
         uint32_t ready_lane,
         const struct ggml_cgraph * ffn_graph,
+        const struct ggml_cgraph * fold_graph,
         const ggml_tensor * partial,
         uint64_t partial_seq,
         uint32_t partial_slot);
