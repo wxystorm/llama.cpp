@@ -205,6 +205,30 @@ def main() -> int:
         print(f"FAIL: unmarked slot credit: {credits}")
         return 1
 
+    p2c_residuals = [
+        (int(m.group(1)), m.group(2), int(m.group(3)), int(m.group(4)))
+        for m in re.finditer(
+            r"\[REGION_P2C_RESIDUAL\] layer=46 chunk=(\d+) "
+            r"tensor=\S+ bytes=\d+ mode=(\w+) "
+            r"residual_offs=(\d+) output_offs=(\d+)",
+            block,
+        )
+    ]
+    expected_residuals = [
+        (c, "CHUNK_LOCAL", 0)
+        for c in range(n_chunks)
+    ]
+    observed_residuals = [
+        (c, mode, residual_offs)
+        for c, mode, residual_offs, _ in p2c_residuals
+    ]
+    if observed_residuals != expected_residuals:
+        print(
+            f"FAIL: L46 P2C residuals={p2c_residuals}; "
+            f"expected chunk-local residual_offs=0 for every chunk"
+        )
+        return 1
+
     continuation_credits = [
         (int(m.group(1)), int(m.group(2)))
         for m in re.finditer(
