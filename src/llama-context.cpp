@@ -50,6 +50,81 @@ static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_k
     return "UNKNOWN";
 }
 
+static std::vector<llama_hybrid_runtime_stage>
+llama_region_cycle_build_stages(
+        const llama_model & model,
+        int macro_tokens) {
+    std::vector<llama_hybrid_runtime_stage> stages;
+    const int n_layer = model.hparams.n_layer();
+    if (n_layer <= 0 || macro_tokens <= 0) {
+        return stages;
+    }
+
+    int il = 0;
+    while (il < n_layer) {
+        const llama_hybrid_layer_mode mode =
+            model.hybrid_layer_mode(il);
+
+        if (mode == llama_hybrid_layer_mode::PC_ONLY) {
+            const int begin = il;
+            while (il < n_layer &&
+                    model.hybrid_layer_mode(il) ==
+                        llama_hybrid_layer_mode::PC_ONLY) {
+                ++il;
+            }
+
+            // A non-divisible suffix still belongs to PC for correctness.
+            // If it is the final stage, use the ordinary CPU graph so it can
+            // also produce output_norm / LM-head logits. Complete PC blocks
+            // inside the cycle use the private CUDA LRU mirror.
+            const bool final_pc_suffix = il == n_layer;
+            stages.push_back({
+                final_pc_suffix ?
+                    llama_hybrid_runtime_stage_kind::CPU :
+                    llama_hybrid_runtime_stage_kind::GPU,
+                begin,
+                il,
+                macro_tokens,
+                std::min(macro_tokens, 128),
+                false,
+            });
+            continue;
+        }
+
+        if (mode !=
+                llama_hybrid_layer_mode::TENSOR_C2P) {
+            stages.clear();
+            return stages;
+        }
+
+        const int begin = il++;
+        int phone_layers = 0;
+        while (il < n_layer &&
+                model.hybrid_layer_mode(il) ==
+                    llama_hybrid_layer_mode::PHONE_ONLY) {
+            ++phone_layers;
+            ++il;
+        }
+        if (phone_layers <= 0 ||
+                il >= n_layer ||
+                model.hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::TENSOR_P2C) {
+            stages.clear();
+            return stages;
+        }
+        ++il; // include P2C
+        stages.push_back({
+            llama_hybrid_runtime_stage_kind::TENSOR,
+            begin,
+            il,
+            macro_tokens,
+            macro_tokens,
+            false,
+        });
+    }
+    return stages;
+}
+
 static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_action action) {
     switch (action) {
         case llama_hybrid_boundary_action::PASS:       return "PASS";
