@@ -6419,6 +6419,44 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return true;
         };
 
+    struct phone_main_local_chunk_state {
+        int chunk = -1;
+        size_t route_sg = SIZE_MAX;
+        size_t down_sg = SIZE_MAX;
+
+        uint64_t region_uid = 0;
+        uint64_t p2c_attention_uid = 0;
+        uint64_t p2c_ffn_uid = 0;
+        uint64_t trigger_reduce_uid = 0;
+
+        uint64_t ready_seq = 0;
+        uint32_t ready_lane = 0;
+        uint64_t partial_seq = 0;
+        uint32_t partial_slot = 0;
+
+        ggml_tensor * ready_hidden = nullptr;
+        ggml_tensor * ready_topk = nullptr;
+        ggml_tensor * ready_weights = nullptr;
+        ggml_tensor * phone_folded_partial = nullptr;
+
+        ggml_tensor * pc_partial = nullptr;
+        ggml_tensor * pc_partial_stage = nullptr;
+        ggml_tensor * pc_out_chunk = nullptr;
+        ggml_cgraph * pc_reduce_graph = nullptr;
+
+        std::shared_ptr<std::vector<uint8_t>> phone_partial_payload;
+        ggml_backend_meta_transfer_worker * partial_worker = nullptr;
+        uint64_t partial_task = 0;
+        uint64_t pc_ffn_task = 0;
+        ggml_backend_meta_transfer_worker * join_worker = nullptr;
+        uint64_t join_task = 0;
+
+        bool graphs_registered = false;
+        bool main_registered = false;
+    };
+    std::map<int, phone_main_local_chunk_state>
+        phone_main_local_chunks;
+
     struct tensor_expert_load_accum {
         uint64_t assignments = 0;
         int64_t read_us = 0;
