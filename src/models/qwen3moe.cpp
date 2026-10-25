@@ -203,7 +203,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     const int planned_chunk_tokens =
         llama_hybrid_runtime_prefill_chunk_tokens();
+    const char * pc_phone_exec_v1_env =
+        std::getenv("GGML_META_PC_PHONE_EXEC_V1");
+    const bool pc_phone_exec_v1_requested =
+        pc_phone_exec_v1_env != nullptr &&
+        std::atoi(pc_phone_exec_v1_env) != 0;
     const bool return_wavefront_requested =
+        pc_phone_exec_v1_requested ||
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
 
     bool moe_stage_wavefront =
@@ -274,7 +280,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         LLAMA_LOG_DEBUG(
             "[MOE_WAVEFRONT_ELIGIBILITY] enabled=%d tokens=%" PRId64
             " layers=[%d,%d) equal_seqs=%d n_seqs=%u n_seqs_unq=%u "
-            "XT=%d target=%d min_group=%d chunks=%zu groups=%zu\n",
+            "XT=%d target=%d min_group=%d chunks=%zu groups=%zu "
+            "source=%s\n",
             moe_stage_wavefront ? 1 : 0,
             n_tokens, layer_begin, layer_end,
             ubatch.equal_seqs() ? 1 : 0,
@@ -283,7 +290,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             qwen3moe_wave_attn_min_group_tokens(
                 wave_attn_target_tokens),
             wave_chunk_sizes.size(),
-            wave_attn_group_counts.size());
+            wave_attn_group_counts.size(),
+            pc_phone_exec_v1_requested ?
+                "PC_PHONE_EXEC_V1" :
+                "LEGACY_RETURN_WAVEFRONT");
     }
 
     llm_graph_input_attn_kv * inp_attn =

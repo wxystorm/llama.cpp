@@ -4625,7 +4625,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             "pc=COMPUTE_WORKER phone=DEDICATED_FIFO "
             "completion=PHONE_SEQ_READY "
             "reduce=RETURN_WORKER workers=%zu slots=%zu "
-            "dep=EXACT_LAYER_CHUNK directional=UNCHANGED\n",
+            "dep=WAVEFRONT_IF_ELIGIBLE_OR_EXACT_CHUNK "
+            "directional=UNCHANGED\n",
             ggml_backend_meta_context::PREFILL_RETURN_LANES,
             ggml_backend_meta_context::PREFILL_RETURN_SLOTS);
     }
@@ -15829,7 +15830,10 @@ auto prefill_norm_sg_has_prework =
             // full snapshot return completion. The snapshot client publishes
             // seq readiness as soon as the first payload byte arrives, which
             // can only happen after the server slot reached READY.
-            constexpr size_t phone_inflight_limit = 2;
+            const size_t phone_inflight_limit =
+                pc_phone_exec_v1 ?
+                    ggml_backend_meta_context::PREFILL_RETURN_SLOTS :
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES;
             GGML_ASSERT(return_wave_snapshot_ready_waiter != nullptr);
 
             if (return_wave_phone_credit_seqs.size() >= phone_inflight_limit) {
