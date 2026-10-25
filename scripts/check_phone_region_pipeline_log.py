@@ -137,12 +137,28 @@ def main() -> int:
         "PHONE_REGION_CONTINUATION_REJECT",
         "PHONE_REGION_CONTINUATION_DEPENDENCY",
         "CONTINUATION_FUTURE_REGION_INPUT",
+        "PHONE_TENSOR_ATTN_OWNER_REJECT",
         "PREFILL_INPUT_PARK",
         "Compute error",
     ):
         if bad in block:
             print(f"FAIL: found {bad}")
             return 1
+
+    kept_attn_chunks = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[TENSOR_PHONE_KEEP_OWNER\] sg=\d+ layer=46 "
+            r"node=phone_tensor_attn_chunk_(\d+)-46 .*?source=subgraph",
+            block,
+        )
+    ]
+    if kept_attn_chunks != list(range(n_chunks)):
+        print(
+            f"FAIL: chunked L46 Attention Phone-owner sequence="
+            f"{kept_attn_chunks}; expected 0..{n_chunks - 1}"
+        )
+        return 1
 
     prep = list(re.finditer(
         r"\[PHONE_REGION_POOL_PREP\] ready=(\d+) outputs=(\d+) "
