@@ -527,6 +527,7 @@ struct rpc_msg_phone_region_local_submit_req {
     uint64_t graph_sizes[4]; // Region, L46 Attention/Router, Phone FFN, residual fold
     rpc_msg_route_snapshot_ready_req ready;
     rpc_msg_snapshot_tensor_req partial;
+    uint64_t scratch_reuse_seq;
 };
 
 struct rpc_msg_phone_region_local_submit_rsp {
@@ -3134,7 +3135,8 @@ static bool ggml_backend_rpc_phone_region_local_submit(
         const ggml_cgraph * fold_graph,
         const ggml_tensor * partial,
         uint64_t partial_seq,
-        uint32_t partial_slot) {
+        uint32_t partial_slot,
+        uint64_t scratch_reuse_seq) {
     if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
         return false;
     }
@@ -3239,6 +3241,7 @@ static bool ggml_backend_rpc_phone_region_local_submit(
     request.partial.tensor = serialize_tensor(partial);
     request.partial.offset = 0;
     request.partial.size = ggml_nbytes(partial);
+    request.scratch_reuse_seq = scratch_reuse_seq;
 
     size_t input_size = sizeof(request);
     for (const auto & graph : graphs) {
@@ -3279,12 +3282,14 @@ static bool ggml_backend_rpc_phone_region_local_submit(
             "[PHONE_REGION_MAIN_SUBMIT] side=pc chunk=%d "
             "ready_seq=%" PRIu64 " ready_lane=%u "
             "partial_seq=%" PRIu64 " partial_slot=%u "
+            "reuse_seq=%" PRIu64 " "
             "submit_ms=%.3f accepted=%d\n",
             chunk,
             ready_seq,
             ready_lane,
             partial_seq,
             partial_slot,
+            scratch_reuse_seq,
             (ggml_time_us() - begin_us) / 1000.0,
             status && response.accepted ? 1 : 0);
         std::fflush(stderr);
@@ -3986,6 +3991,7 @@ struct rpc_phone_region_local_task {
     std::array<std::vector<uint8_t>, 3> graphs;
     rpc_msg_route_snapshot_ready_req ready {};
     rpc_msg_snapshot_tensor_req partial {};
+    uint64_t scratch_reuse_seq = 0;
 };
 
 class rpc_server {
@@ -5394,6 +5400,7 @@ bool rpc_server::phone_region_local_submit(
     task.chunk = request.chunk;
     task.ready = request.ready;
     task.partial = request.partial;
+    task.scratch_reuse_seq = request.scratch_reuse_seq;
 
     const uint8_t * src = input.data() + sizeof(request);
     for (size_t i = 0; i < task.graphs.size(); ++i) {
@@ -5492,6 +5499,15 @@ bool rpc_server::run_phone_region_local_task(
 
     if (!snapshot_tensor(task.partial)) {
         return false;
+    }
+
+    if (task.scratch_reuse_seq != 0) {
+        rpc_msg_phone_ffn_mark_ready_req reuse {};
+        reuse.device = task.partial.device;
+        reuse.seq = task.scratch_reuse_seq;
+        if (!phone_ffn_mark_ready(reuse)) {
+            return false;
+        }
     }
 
     if (RPC_DEBUG ||
