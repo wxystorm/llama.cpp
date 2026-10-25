@@ -84,7 +84,8 @@ def main() -> int:
             return 1
 
     prep = list(re.finditer(
-        r"\[PHONE_REGION_POOL_PREP\] ready=(\d+) outputs=(\d+).*?"
+        r"\[PHONE_REGION_POOL_PREP\] ready=(\d+) outputs=(\d+) "
+        r"(?:output_plans=(\d+) )?.*?"
         r"slot0_mib=([0-9.]+) slot1_mib=([0-9.]+).*?reason=([^\s]+)",
         text,
     ))
@@ -93,6 +94,9 @@ def main() -> int:
         return 1
     if int(prep[-1].group(2)) != n_chunks:
         print(f"FAIL: prewarmed outputs={prep[-1].group(2)}; expected {n_chunks}")
+        return 1
+    if prep[-1].group(3) is not None and int(prep[-1].group(3)) != n_chunks:
+        print(f"FAIL: output bind plans={prep[-1].group(3)}; expected {n_chunks}")
         return 1
 
     scratch = list(re.finditer(
