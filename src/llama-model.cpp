@@ -435,6 +435,11 @@ static bool llama_hybrid_region_boundary_v1_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool llama_hybrid_region_cycle_v1_enabled() {
+    const char * value = std::getenv("LLAMA_HYBRID_REGION_CYCLE_V1");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static int llama_hybrid_region_boundary_env_int(
         const char * name, int fallback) {
     const char * value = std::getenv(name);
@@ -442,6 +447,73 @@ static int llama_hybrid_region_boundary_env_int(
         return fallback;
     }
     return std::atoi(value);
+}
+
+// Repeating directional Region cycle:
+//
+//   PC_ONLY^x -> TENSOR_C2P -> PHONE_ONLY^y -> TENSOR_P2C
+//
+// The cycle is tiled from layer 0. Any suffix that cannot fit one complete
+// unit is intentionally left PC_ONLY so ownership always ends on PC and no
+// truncated cross-device boundary is created. Defaults x=1,y=1; x/y remain
+// environment-tunable for later load balancing.
+static std::vector<llama_hybrid_layer_mode>
+llama_build_region_cycle_v1_policy(int n_layer) {
+    const int pc_layers = std::max(
+        1, llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_CYCLE_PC_LAYERS", 1));
+    const int phone_layers = std::max(
+        1, llama_hybrid_region_boundary_env_int(
+            "LLAMA_HYBRID_CYCLE_PHONE_LAYERS", 1));
+    const int unit = pc_layers + 1 + phone_layers + 1;
+
+    if (n_layer < unit) {
+        LLAMA_LOG_ERROR(
+            "[REGION_CYCLE_V1] layers=%d unit=%d x=%d y=%d cycles=0 "
+            "remainder=%d policy=PC_ONLY status=POLICY_READY\n",
+            n_layer, unit, pc_layers, phone_layers, n_layer);
+        return std::vector<llama_hybrid_layer_mode>(
+            n_layer, llama_hybrid_layer_mode::PC_ONLY);
+    }
+
+    std::vector<llama_hybrid_layer_mode> policy(
+        n_layer, llama_hybrid_layer_mode::PC_ONLY);
+    int cursor = 0;
+    int cycles = 0;
+    while (cursor + unit <= n_layer) {
+        cursor += pc_layers;
+        const int c2p = cursor++;
+        policy[c2p] = llama_hybrid_layer_mode::TENSOR_C2P;
+
+        const int phone_begin = cursor;
+        const int phone_end = cursor + phone_layers;
+        std::fill(
+            policy.begin() + phone_begin,
+            policy.begin() + phone_end,
+            llama_hybrid_layer_mode::PHONE_ONLY);
+        cursor = phone_end;
+
+        const int p2c = cursor++;
+        policy[p2c] = llama_hybrid_layer_mode::TENSOR_P2C;
+
+        LLAMA_LOG_ERROR(
+            "[REGION_CYCLE_UNIT] cycle=%d pc=[%d,%d) c2p=%d "
+            "phone=[%d,%d) p2c=%d next=%d status=POLICY_READY\n",
+            cycles,
+            c2p - pc_layers, c2p,
+            c2p,
+            phone_begin, phone_end,
+            p2c, cursor);
+        ++cycles;
+    }
+
+    const int remainder = n_layer - cursor;
+    LLAMA_LOG_ERROR(
+        "[REGION_CYCLE_V1] layers=%d unit=%d x=%d y=%d cycles=%d "
+        "remainder=%d remainder_pc=[%d,%d) status=POLICY_READY\n",
+        n_layer, unit, pc_layers, phone_layers, cycles,
+        remainder, cursor, n_layer);
+    return policy;
 }
 
 // Correctness-first directional Region: one C2P boundary, one Phone region,
@@ -1683,13 +1755,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
-        hybrid_layer_modes = llama_hybrid_region_boundary_v1_enabled() ?
-            llama_build_region_boundary_v1_policy(n_layer) :
+        const bool region_cycle_v1 =
+            llama_hybrid_region_cycle_v1_enabled();
+        hybrid_layer_modes = region_cycle_v1 ?
+            llama_build_region_cycle_v1_policy(n_layer) :
+            (llama_hybrid_region_boundary_v1_enabled() ?
+                llama_build_region_boundary_v1_policy(n_layer) :
             (has_runtime_plan ?
                 llama_build_hybrid_plan_policy(
                     n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
                     runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
-                llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout));
+                llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout)));
 
         hybrid_tensor_pc_ratios.assign(
             n_layer,
@@ -1699,7 +1775,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         // Directional boundaries use a physical PC expert-width share.
         // Keep the ratios explicit per direction; performance tuning can change
         // them later without changing the ownership protocol.
-        if (llama_hybrid_region_boundary_v1_enabled()) {
+        if (llama_hybrid_region_boundary_v1_enabled() ||
+                region_cycle_v1) {
             auto read_region_ratio = [&](const char * name, float fallback) {
                 const char * raw = std::getenv(name);
                 const float ratio =
