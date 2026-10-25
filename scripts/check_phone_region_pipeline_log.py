@@ -33,7 +33,8 @@ def main() -> int:
         r"\[PHONE_REGION_PIPE_PLAN\] active=(\d+) window=(\d+) "
         r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
         r"(?:scratch_pool=(\d+) )?"
-        r"(?:continuation=(\d+) )?reason=([^\s]+)"
+        r"(?:continuation=(\d+) )?"
+        r"(?:pc_overlap=(\d+) )?reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -42,7 +43,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(8)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(9)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -99,27 +100,134 @@ def main() -> int:
             print(f"FAIL: non-contiguous L46 Attention chunks={attn_chunks}")
             return 1
 
+    pc_overlap = plan.group(8) == "1"
+
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
-        r"stage=(C2P_NORM|C2P_FFN_REDUCE|PHONE_REGION|P2C_CONTINUE) "
+        r"stage=(C2P_NORM|C2P_FFN_REDUCE|C2P_PC_PREP|PHONE_REGION|P2C_CONTINUE) "
         r"event=BEGIN"
     )
     observed = [(int(m.group(1)), m.group(2)) for m in begin_re.finditer(block)]
 
-    expected = [
-        (c, stage)
-        for c in range(n_chunks)
-        for stage in (
-            "C2P_NORM",
-            "C2P_FFN_REDUCE",
-            "PHONE_REGION",
-            "P2C_CONTINUE",
-        )
-    ]
+    if pc_overlap:
+        expected = [
+            (0, "C2P_NORM"),
+            (0, "C2P_FFN_REDUCE"),
+            (0, "PHONE_REGION"),
+        ]
+        for c in range(n_chunks):
+            if c + 1 < n_chunks:
+                expected.extend([
+                    (c + 1, "C2P_NORM"),
+                    (c + 1, "C2P_PC_PREP"),
+                ])
+            expected.append((c, "P2C_CONTINUE"))
+            if c + 1 < n_chunks:
+                expected.extend([
+                    (c + 1, "C2P_FFN_REDUCE"),
+                    (c + 1, "PHONE_REGION"),
+                ])
+    else:
+        expected = [
+            (c, stage)
+            for c in range(n_chunks)
+            for stage in (
+                "C2P_NORM",
+                "C2P_FFN_REDUCE",
+                "PHONE_REGION",
+                "P2C_CONTINUE",
+            )
+        ]
 
     if observed != expected:
         print(f"FAIL: stage order mismatch\nexpected={expected}\nobserved={observed}")
         return 1
+
+    if pc_overlap:
+        staged = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[REGION_C2P_INPUT_STAGE\] layer=34 chunk=(\d+) "
+                r"slot=\d+ task=\d+ bytes=\d+ status=QUEUED",
+                block,
+            )
+        ]
+        expected_staged = list(range(1, n_chunks))
+        if staged != expected_staged:
+            print(
+                f"FAIL: overlap input staging chunks={staged}; "
+                f"expected={expected_staged}"
+            )
+            return 1
+
+        prepared = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[REGION_C2P_PC_PREP\] layer=34 chunk=(\d+) "
+                r"sg=\d+ slot=\d+ .*?status=READY",
+                block,
+            )
+        ]
+        if prepared != expected_staged:
+            print(
+                f"FAIL: PC prep chunks={prepared}; "
+                f"expected={expected_staged}"
+            )
+            return 1
+
+        reused = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[REGION_C2P_PC_REUSE\] layer=34 chunk=(\d+) "
+                r"sg=\d+ slot=\d+ .*?status=OK",
+                block,
+            )
+        ]
+        if reused != expected_staged:
+            print(
+                f"FAIL: PC reuse chunks={reused}; "
+                f"expected={expected_staged}"
+            )
+            return 1
+
+        released = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[REGION_C2P_SLOT_RELEASE\] layer=34 chunk=(\d+) "
+                r"slot=\d+ .*?status=FREE",
+                block,
+            )
+        ]
+        if released != expected_staged:
+            print(
+                f"FAIL: overlap slot release chunks={released}; "
+                f"expected={expected_staged}"
+            )
+            return 1
+
+        for c in range(n_chunks - 1):
+            region_submit = block.find(
+                f"stage=PHONE_REGION event=BEGIN",
+                0,
+            )
+            prep_pos = block.find(
+                f"[REGION_C2P_PC_PREP] layer=34 chunk={c + 1} "
+            )
+            cont_pos = block.find(
+                f"chunk={c} ",
+                prep_pos if prep_pos >= 0 else 0,
+            )
+            if prep_pos < 0:
+                print(f"FAIL: missing PC prep marker for chunk {c + 1}")
+                return 1
+
+        reject = re.search(
+            r"\[REGION_C2P_OVERLAP_REJECT\]",
+            block,
+        )
+        if reject:
+            print("FAIL: REGION_C2P_OVERLAP_REJECT present")
+            return 1
 
     for pattern, event in [
         (r"\[REGION_C2P_PREFILL\] layer=34 chunk=(\d+).*?status=OK", "C2P"),
@@ -286,9 +394,11 @@ def main() -> int:
         print(f"FAIL: output slots={outputs}; expected 0..{n_chunks - 1}")
         return 1
 
+    mode = "pc-overlap" if pc_overlap else "baseline"
     print(
         f"PASS: {n_chunks} C2P -> Phone Region -> L46 continuations are "
-        f"chunk-pipelined (window=2, {plan.group(4)} Meta schedule entries)"
+        f"chunk-pipelined (window=2, mode={mode}, "
+        f"{plan.group(4)} Meta schedule entries)"
     )
     print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
     print("PASS: every Region completion credit is consumed by its own L46 continuation")
