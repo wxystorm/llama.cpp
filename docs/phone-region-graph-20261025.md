@@ -35,6 +35,38 @@ The new fusion validator therefore suppresses the redundant PC compute flag **on
 
 This is an ownership correction for the known Phone-only topology, **not proof of numerical parity**. Subsequent tests must check L45/L46 values and the final logits for divergence, and must verify that the Phone-only graph did not silently drop required CPU-side partial computations.
 
+## 358-token END_NOT_FOUND and scheduler input reuse (2026-10-25)
+
+After C2P chunk 0/1/2 succeeded, fusion failed with
+`[PHONE_REGION_GRAPH_REJECT] chunk=0 sg=7 reason=END_NOT_FOUND`.
+The Meta region scan could not see `phone_region_chunk_end_0-45`
+in its current outer scheduler graph split. This is **not** a phone GPU
+kernel failure and must not be bypassed by disregarding the end marker.
+
+The graph builder was inadvertently constructing
+`build_attn_inp_kv_range(token_begin, count)` **inside each of
+the eleven L35-L45 layers** for the same chunk, duplicating K/V
+indices and Attention masks. The ordinary graph reuses one attention
+input object across all layers. The outer ggml scheduler limits a split
+to `GGML_SCHED_MAX_SPLIT_INPUTS=30` cross-backend input tensors;
+those duplicated host inputs are a likely reason a scheduler boundary
+landed inside the region. We now create **one KV/attention input group
+and one position VIEW per chunk**, shared across all eleven layers.
+This also reduces input metadata and allocations without changing
+Attention computations or KV positions.
+
+Expected diagnostic `[PHONE_REGION_INPUT_REUSE]` occurs once for
+each chunk, followed by one `[PHONE_REGION_GRAPH]` /
+`[PHONE_REGION_GRAPH_DONE]` pair per chunk. If end is still absent,
+the rejection now prints `scan_last_sg`, `meta_sgs`, and `last_node`.
+Compare these with the outer scheduler's existing `SPLIT #` lines.
+If a backend boundary or another input limit remains, it must be fixed
+at the outer scheduler level: a region cannot safely fuse across two
+separate outer scheduler invocations.
+
+The 30-input threshold is confirmed from source, but its role in
+this specific run remains **a hypothesis until the next hardware log**.
+
 ## First hardware verification (REQUIRED; not yet run)
 
 1. Build and restart matching PC and Phone server binaries at the same branch commit. Compare protocol versions and hashes.
