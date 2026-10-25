@@ -13758,6 +13758,40 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     "POOL_SEQ_FENCE_UNAVAILABLE";
             }
 
+            if (prep_ok && region_local_main_requested) {
+                const ggml_backend_rpc_phone_region_local_submit_t
+                    local_submit =
+                        ggml_backend_meta_get_phone_region_local_submit(
+                            phone_cfg.backend);
+                const bool local_submit_ready =
+                    local_submit != nullptr &&
+                    phone_prefill_chunk_pipeline &&
+                    phone_prefill_producer_route &&
+                    local_submit(
+                        phone_cfg.backend,
+                        0,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        0,
+                        0,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        0,
+                        0,
+                        0);
+                if (!local_submit_ready) {
+                    prep_ok = false;
+                    region_pipe_reason =
+                        "LOCAL_MAIN_CAP_UNAVAILABLE";
+                } else {
+                    region_local_main_active = true;
+                }
+            }
+
             for (size_t c = 0;
                     c < region_pipe_chunks.size() && prep_ok; ++c) {
                 const auto & e = region_pipe_chunks.at((int) c);
@@ -14181,7 +14215,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
                "scratch_pool=%d continuation=%d pc_overlap=%d "
-               "reason=%s\n",
+               "local_main=%d reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
@@ -14190,6 +14224,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                region_pipeline_active ? 1 : 0,
                region_pipeline_active &&
                    region_pc_overlap_requested ? 1 : 0,
+               region_pipeline_active &&
+                   region_local_main_active ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             printf("[PHONE_REGION_LOCAL_CONTINUATION_PLAN] "
