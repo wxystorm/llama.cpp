@@ -27,6 +27,14 @@ The graph builder now **removes the full-batch CONT** and directly makes chunk v
 
 Next run should report `[PHONE_REGION_GRAPH_OWNERSHIP] chunk=0 ... pc_compute=0 status=SAFE` and `[PHONE_REGION_GRAPH_DONE] chunk=0 ... status=0`, followed by chunks 1 and 2. Continue to check output parity, KV ordering, and buffer lifetime before treating the fused graph as verified.
 
+## Fix for mirrored RMS_NORM PC flag (358-token run)
+
+After removing the unnecessary `CONT`, all three C2P chunks completed, but the fusion validator rejected `norm-35` (op `RMS_NORM`): both PC and Phone simple tensors had `COMPUTE` flags and each held the full 128-token output shape. The C2P output is committed on Phone, so executing this norm on a PC mirror is not valid.
+
+The new fusion validator therefore suppresses the redundant PC compute flag **only inside the explicitly delimited L35-L45 Phone Region chunk**, and only if Phone already has an active corresponding tensor and PC/Phone tensor sizes match. It still stops with `PC_REQUIRED_OR_SPLIT_SHAPE` when PC computation is necessary, the Phone node is inactive, or the shapes differ. Metadata-only views remain no-ops; shared host-view tensors are not modified. `[PHONE_REGION_GRAPH_OWNERSHIP]` now reports `pc_duplicate_disabled` and `pc_compute_required=0`.
+
+This is an ownership correction for the known Phone-only topology, **not proof of numerical parity**. Subsequent tests must check L45/L46 values and the final logits for divergence, and must verify that the Phone-only graph did not silently drop required CPU-side partial computations.
+
 ## First hardware verification (REQUIRED; not yet run)
 
 1. Build and restart matching PC and Phone server binaries at the same branch commit. Compare protocol versions and hashes.
