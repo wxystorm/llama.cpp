@@ -2308,6 +2308,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 
 struct ggml_backend_meta_compute_workers;
 struct ggml_backend_meta_transfer_worker;
+struct ggml_backend_meta_priority_worker;
 
 struct ggml_backend_meta_context;
 static bool ggml_backend_meta_tensor_phone_primary_layer(
@@ -2427,6 +2428,10 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
+    // Local-MAIN PC executor is intentionally separate from the legacy FIFO.
+    // It remains single-threaded for backend safety, but READY-triggered L46
+    // PC FFN can overtake speculative future C2P PC_PREP work.
+    ggml_backend_meta_priority_worker * phone_main_pc_worker = nullptr;
     // Serialize final P2C PC reduces on one backend-owning worker. Route and
     // snapshot receivers remain independent; only backend graph execution is
     // single-lane until the later priority executor replaces this bridge.
@@ -2691,6 +2696,121 @@ struct ggml_backend_meta_transfer_worker {
         std::unique_lock<std::mutex> lock(mutex);
         stage_cv.wait(lock, [&]() { return stage_ready >= id || completed >= id; });
         return status;
+    }
+};
+
+struct ggml_backend_meta_priority_worker {
+    enum class priority : uint8_t {
+        HIGH = 0,
+        LOW  = 1,
+    };
+
+    struct task {
+        uint64_t id = 0;
+        priority prio = priority::LOW;
+        std::function<ggml_status(uint64_t)> run;
+    };
+    struct completion {
+        bool done = false;
+        ggml_status status = GGML_STATUS_SUCCESS;
+    };
+
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    std::deque<task> high_tasks;
+    std::deque<task> low_tasks;
+    std::unordered_map<uint64_t, completion> completions;
+    uint64_t submitted = 0;
+    bool stop = false;
+
+    ggml_backend_meta_priority_worker() : worker([this]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            task_cv.wait(lock, [&]() {
+                return stop ||
+                       !high_tasks.empty() ||
+                       !low_tasks.empty();
+            });
+            if (stop &&
+                    high_tasks.empty() &&
+                    low_tasks.empty()) {
+                return;
+            }
+
+            task current;
+            if (!high_tasks.empty()) {
+                current = std::move(high_tasks.front());
+                high_tasks.pop_front();
+            } else {
+                current = std::move(low_tasks.front());
+                low_tasks.pop_front();
+            }
+
+            lock.unlock();
+            const ggml_status task_status =
+                current.run(current.id);
+            lock.lock();
+
+            auto it = completions.find(current.id);
+            GGML_ASSERT(it != completions.end());
+            it->second.done = true;
+            it->second.status = task_status;
+            done_cv.notify_all();
+        }
+    }) {}
+
+    ~ggml_backend_meta_priority_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_all();
+        worker.join();
+    }
+
+    uint64_t enqueue(
+            priority prio,
+            std::function<ggml_status(uint64_t)> run) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint64_t id = ++submitted;
+        completions.emplace(id, completion {});
+        task item { id, prio, std::move(run) };
+        if (prio == priority::HIGH) {
+            high_tasks.push_back(std::move(item));
+        } else {
+            low_tasks.push_back(std::move(item));
+        }
+        task_cv.notify_one();
+        return id;
+    }
+
+    ggml_status wait(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&]() {
+            const auto it = completions.find(id);
+            return it != completions.end() &&
+                   it->second.done;
+        });
+        return completions.at(id).status;
+    }
+
+    bool is_completed(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = completions.find(id);
+        return it != completions.end() &&
+               it->second.done;
+    }
+
+    size_t pending_high() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return high_tasks.size();
+    }
+
+    size_t pending_low() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return low_tasks.size();
     }
 };
 
@@ -3099,6 +3219,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
+    delete phone_main_pc_worker;
     delete phone_main_pc_reduce_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
