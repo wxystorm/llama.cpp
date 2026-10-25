@@ -849,6 +849,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 region_join = ggml_concat(ctx0, region_join,
                                           region_outputs[ci], 1);
             }
+            if (region_outputs.size() == 1) {
+                // Do not rename the only chunk's end tensor: Meta relies on
+                // phone_region_chunk_end_N-45 for the single-graph boundary.
+                // This VIEW is a separate zero-copy alias for L46's input.
+                region_join = ggml_view_2d(
+                    ctx0, region_join, region_join->ne[0],
+                    region_join->ne[1], region_join->nb[1], 0);
+            }
             cb(region_join, "l_out", phone_region_end - 1);
             inpL = region_join;
             il = phone_region_end - 1;
