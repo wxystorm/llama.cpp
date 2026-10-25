@@ -16231,6 +16231,35 @@ auto prefill_norm_sg_has_prework =
             backend_ctx->backend_configs[0];
         auto & phone_cfg =
             backend_ctx->backend_configs[1];
+
+        GGML_ASSERT(state.slot < 2);
+        auto & overlap_slot =
+            backend_ctx->region_c2p_overlap_slots[state.slot];
+        if (state.phone_bindings.empty()) {
+            bind_c2p_private_storage(
+                1,
+                dst_topk,
+                overlap_slot.phone_route_bufs[0],
+                state.phone_bindings);
+            bind_c2p_private_storage(
+                1,
+                dst_weights,
+                overlap_slot.phone_route_bufs[1],
+                state.phone_bindings);
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_PHONE_ROUTE_SLOT] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "topk_bytes=%zu weights_bytes=%zu "
+                    "owner=PHONE_PRIVATE status=BOUND\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    state.slot,
+                    ggml_nbytes(dst_topk),
+                    ggml_nbytes(dst_weights));
+            }
+        }
+
         ggml_backend_synchronize(pc_cfg.backend);
 
         const int64_t topk_begin_us =
