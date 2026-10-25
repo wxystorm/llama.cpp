@@ -1179,6 +1179,24 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cur = ggml_add(ctx0, down_join, residual_join);
             cur = build_cvec(cur, il);
             cb(cur, "l_out", il);
+
+            // This chunk-local P2C continuation bypasses the ordinary
+            // per-layer tail below. If P2C is the final transformer layer,
+            // preserve the same deferred output-row pruning used by the
+            // normal Phone-attention Tensor path. Without this, the full
+            // prefill batch reaches output_norm / LM head (e.g. 512 rows
+            // instead of the requested output rows), causing a very large
+            // final logits allocation during sched_reserve/runtime.
+            if (il == n_layer - 1 && inp_out_ids != nullptr) {
+                const int64_t full_rows = cur->ne[1];
+                cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+                LLAMA_LOG_ERROR(
+                    "[PHONE_TENSOR_FINAL_OUTPUT_ROWS] layer=%d "
+                    "full_rows=%" PRId64 " output_rows=%" PRId64
+                    " action=DEFERRED_GET_ROWS status=BUILT\n",
+                    il, full_rows, cur->ne[1]);
+            }
+
             inpL = cur;
             phone_region_outputs_for_tensor.clear();
             phone_region_attn_inputs_for_tensor.clear();
