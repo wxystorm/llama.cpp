@@ -972,14 +972,35 @@ static bool ggml_backend_rpc_phone_c2p_register(
 }
 
 static bool ggml_backend_rpc_phone_c2p_ready(
-        ggml_backend_t backend,
-        int32_t chunk) {
-    if (backend == nullptr || chunk < 0) {
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        int32_t chunk,
+        const ggml_tensor * src_hidden,
+        ggml_tensor * dst_hidden,
+        const ggml_tensor * src_topk,
+        ggml_tensor * dst_topk,
+        const ggml_tensor * src_weights,
+        ggml_tensor * dst_weights) {
+    if (backend_src == nullptr || backend_dst == nullptr ||
+            chunk < 0 ||
+            src_hidden == nullptr || dst_hidden == nullptr ||
+            src_topk == nullptr || dst_topk == nullptr ||
+            src_weights == nullptr || dst_weights == nullptr ||
+            !ggml_are_same_layout(src_hidden, dst_hidden) ||
+            !ggml_are_same_layout(src_topk, dst_topk) ||
+            !ggml_are_same_layout(src_weights, dst_weights) ||
+            dst_hidden->buffer == nullptr ||
+            dst_topk->buffer == nullptr ||
+            dst_weights->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(dst_hidden->buffer) ||
+            !ggml_backend_buffer_is_rpc(dst_topk->buffer) ||
+            !ggml_backend_buffer_is_rpc(dst_weights->buffer)) {
         return false;
     }
+
     auto * rpc_ctx =
         static_cast<ggml_backend_rpc_context *>(
-            backend->context);
+            backend_dst->context);
     if (rpc_ctx == nullptr) {
         return false;
     }
@@ -989,21 +1010,84 @@ static bool ggml_backend_rpc_phone_c2p_ready(
         return false;
     }
 
+    const ggml_tensor * srcs[3] = {
+        src_hidden, src_topk, src_weights,
+    };
+    ggml_tensor * dsts[3] = {
+        dst_hidden, dst_topk, dst_weights,
+    };
+
     rpc_msg_phone_c2p_ready_req request {};
     request.device = rpc_ctx->device;
     request.chunk = chunk;
-    rpc_msg_phone_c2p_ready_rsp response {};
 
+    size_t payload_size = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        request.tensors[i] =
+            serialize_tensor(dsts[i]);
+        request.sizes[i] =
+            ggml_nbytes(srcs[i]);
+        if (request.sizes[i] >
+                SIZE_MAX - payload_size) {
+            return false;
+        }
+        payload_size +=
+            static_cast<size_t>(
+                request.sizes[i]);
+    }
+    if (payload_size >
+            SIZE_MAX - sizeof(request)) {
+        return false;
+    }
+
+    ggml_backend_synchronize(backend_src);
+    std::vector<uint8_t> input(
+        sizeof(request) + payload_size);
+    memcpy(
+        input.data(),
+        &request,
+        sizeof(request));
+    size_t cursor = sizeof(request);
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t n =
+            static_cast<size_t>(
+                request.sizes[i]);
+        ggml_backend_tensor_get(
+            srcs[i],
+            input.data() + cursor,
+            0,
+            n);
+        cursor += n;
+    }
+    GGML_ASSERT(cursor == input.size());
+
+    rpc_msg_phone_c2p_ready_rsp response {};
     auto sock = get_socket(rpc_ctx->endpoint);
-    return sock != nullptr &&
+    const int64_t begin_us = ggml_time_us();
+    const bool ok =
+        sock != nullptr &&
         send_rpc_cmd(
             sock,
             RPC_CMD_PHONE_C2P_READY,
-            &request,
-            sizeof(request),
+            input.data(),
+            input.size(),
             &response,
             sizeof(response)) &&
         response.result != 0;
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_PHONE_RPC_STAGE] side=pc "
+            "stage=c2p_ready_local chunk=%d "
+            "bytes=%zu total_ms=%.3f status=%d\n",
+            chunk,
+            payload_size,
+            (ggml_time_us() - begin_us) / 1000.0,
+            ok ? 1 : 0);
+        std::fflush(stderr);
+    }
+    return ok;
 }
 
 static bool ggml_backend_rpc_phone_c2p_partial(
@@ -6815,7 +6899,53 @@ bool rpc_server::phone_c2p_register(
 }
 
 bool rpc_server::phone_c2p_ready(
-        const rpc_msg_phone_c2p_ready_req & request) {
+        const std::vector<uint8_t> & input) {
+    if (input.size() <
+            sizeof(rpc_msg_phone_c2p_ready_req)) {
+        return false;
+    }
+
+    rpc_msg_phone_c2p_ready_req request {};
+    memcpy(
+        &request,
+        input.data(),
+        sizeof(request));
+    if (request.device >= backends.size() ||
+            request.chunk < 0) {
+        return false;
+    }
+
+    size_t expected =
+        sizeof(request);
+    for (size_t i = 0; i < 3; ++i) {
+        if (request.sizes[i] == 0 ||
+                request.sizes[i] >
+                    SIZE_MAX - expected) {
+            return false;
+        }
+        expected +=
+            static_cast<size_t>(
+                request.sizes[i]);
+    }
+    if (expected != input.size()) {
+        return false;
+    }
+
+    size_t cursor = sizeof(request);
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t n =
+            static_cast<size_t>(
+                request.sizes[i]);
+        if (!set_tensor_direct(
+                request.tensors[i],
+                0,
+                input.data() + cursor,
+                n)) {
+            return false;
+        }
+        cursor += n;
+    }
+
     std::lock_guard<std::mutex> lock(phone_main_mutex);
     const auto key =
         std::make_pair(
@@ -6837,9 +6967,11 @@ bool rpc_server::phone_c2p_ready(
 
     GGML_LOG_INFO(
         "[PHONE_C2P_READY] chunk=%d device=%u "
-        "low_depth=%zu priority=C2P_FFN status=QUEUED\n",
+        "bytes=%zu low_depth=%zu "
+        "priority=C2P_FFN status=QUEUED\n",
         request.chunk,
         request.device,
+        expected - sizeof(request),
         phone_c2p_ffn_jobs.size());
     phone_main_cv.notify_one();
     return true;
@@ -8030,16 +8162,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_PHONE_C2P_READY: {
-                rpc_msg_phone_c2p_ready_req request {};
-                if (!recv_msg(
-                        sock,
-                        &request,
-                        sizeof(request))) {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
                     return;
                 }
                 rpc_msg_phone_c2p_ready_rsp response {};
                 response.result =
-                    server.phone_c2p_ready(request) ?
+                    server.phone_c2p_ready(input) ?
                         1 : 0;
                 if (!send_msg(
                         sock,
