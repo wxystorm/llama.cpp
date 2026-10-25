@@ -16649,6 +16649,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 prep_sg, prep_id);
                         });
 
+                const uint64_t prep_task =
+                    state_it->second.pc_prep_task;
                 if (pipeline_debug) {
                     printf(
                         "[PHONE_MAIN_PC_PREP_ENQUEUE] "
@@ -16659,9 +16661,42 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         prep_layer,
                         prep_chunk,
                         i,
-                        state_it->second.pc_prep_task,
+                        prep_task,
                         pc_priority_worker->pending_high(),
                         pc_priority_worker->pending_low());
+                }
+
+                // PC_PREP uses the Meta PC graph arena. Do not let the main
+                // scheduler submit another PC graph until this task has
+                // completed, or gallocr may reuse that arena concurrently.
+                // The Phone MAIN continues independently while this local
+                // PC task runs; higher-priority P2C work can overtake it.
+                const int64_t prep_wait_begin_us =
+                    ggml_time_us();
+                const ggml_status prep_status =
+                    pc_priority_worker->wait(prep_task);
+                if (prep_status != GGML_STATUS_SUCCESS) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d task=%" PRIu64
+                        " reason=PC_PREP_FAILED status=%d "
+                        "action=STOP\n",
+                        prep_chunk,
+                        prep_task,
+                        (int) prep_status);
+                    return prep_status;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_MAIN_PC_PREP_COMPLETE] "
+                        "layer=%d chunk=%d task=%" PRIu64
+                        " scheduler_wait_ms=%.3f "
+                        "status=READY\n",
+                        prep_layer,
+                        prep_chunk,
+                        prep_task,
+                        (ggml_time_us() -
+                            prep_wait_begin_us) / 1000.0);
                 }
             } else {
                 const int64_t prep_stage_begin_us =
