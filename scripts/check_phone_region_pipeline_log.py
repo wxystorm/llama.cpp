@@ -112,6 +112,33 @@ def main() -> int:
         print(f"FAIL: scratch slot order={slots}; expected={expected_slots}")
         return 1
 
+    credits = [
+        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        for m in re.finditer(
+            r"\[PHONE_REGION_SLOT_CREDIT\] chunk=(\d+) slot=(\d+) "
+            r"seq=\d+ marked=(\d+)",
+            block,
+        )
+    ]
+    expected_credit_chunks = max(0, n_chunks - 2)
+    if len(credits) != expected_credit_chunks:
+        print(f"FAIL: slot credits={credits}; expected {expected_credit_chunks}")
+        return 1
+    if any(marked != 1 for _, _, marked in credits):
+        print(f"FAIL: unmarked slot credit: {credits}")
+        return 1
+
+    seq_reuse = list(re.finditer(
+        r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?"
+        r"reuse_wait_ms=([0-9.]+) wait_mode=(\w+)",
+        block,
+    ))
+    for m in seq_reuse:
+        chunk = int(m.group(1))
+        if chunk >= 2 and m.group(4) != "SEQ":
+            print(f"FAIL: chunk {chunk} reused slot with wait_mode={m.group(4)}")
+            return 1
+
     outputs = [
         int(m.group(1))
         for m in re.finditer(
