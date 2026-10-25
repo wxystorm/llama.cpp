@@ -171,6 +171,29 @@ def main() -> int:
             )
             return 1
 
+        arena_paused = chunks_for(
+            r"\[PHONE_MAIN_PC_ARENA_PAUSE\] "
+            r"layer=34 chunk=(\d+) sg=\d+ "
+            r"reason=C2P_NORM_SNAPSHOT status=PAUSED"
+        )
+        input_snapshots = chunks_for(
+            r"\[PHONE_MAIN_C2P_INPUT_READY\] "
+            r"layer=34 chunk=(\d+) task=\d+ "
+            r"residual_snapshot=1 status=READY"
+        )
+        if arena_paused != expected_chunks:
+            print(
+                f"FAIL: PC arena pauses={arena_paused}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+        if input_snapshots != expected_chunks:
+            print(
+                f"FAIL: private C2P input/residual snapshots={input_snapshots}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+
         local_owned = [
             (int(m.group(1)), m.group(2))
             for m in re.finditer(
