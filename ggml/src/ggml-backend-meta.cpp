@@ -9828,9 +9828,32 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool last_chunk =
                 prefill_is_last_down_chunk(
                     i, prefill_down_layer_0);
+
+            // Chunk-local L46 Attention now produces a chunk-local residual:
+            //
+            //   phone_tensor_ffn_inp_chunk_N-46
+            //
+            // The legacy path instead exposes one full-batch ffn_inp-46.
+            // Prefer the exact chunk tensor when present. Its logical offset
+            // is zero; only the legacy full-batch tensor uses chunk_offset.
+            char chunk_residual_name[96];
+            std::snprintf(
+                chunk_residual_name,
+                sizeof(chunk_residual_name),
+                "phone_tensor_ffn_inp_chunk_%d-%d",
+                prefill_down_chunk_0,
+                prefill_down_layer_0);
             ggml_tensor * phone_residual =
-                find_recent_ffn_inp(
-                    1, i, prefill_down_layer_0);
+                find_exact_named_tensor(
+                    1, chunk_residual_name);
+            const bool chunk_local_residual =
+                phone_residual != nullptr;
+            if (phone_residual == nullptr) {
+                phone_residual =
+                    find_recent_ffn_inp(
+                        1, i, prefill_down_layer_0);
+            }
+
             ggml_tensor * pc_l_out =
                 find_layer_output(
                     0, prefill_down_layer_0);
@@ -9842,14 +9865,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     1, true,
                     prefill_down_layer_0,
                     prefill_down_chunk_0);
+            const size_t residual_offset =
+                chunk_local_residual ? 0 : chunk_offset;
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_P2C_RESIDUAL] layer=%d chunk=%d "
+                    "tensor=%s bytes=%zu mode=%s "
+                    "residual_offs=%zu output_offs=%zu\n",
+                    prefill_down_layer_0,
+                    prefill_down_chunk_0,
+                    phone_residual->name,
+                    ggml_nbytes(phone_residual),
+                    chunk_local_residual ?
+                        "CHUNK_LOCAL" : "FULL_BATCH_VIEW",
+                    residual_offset,
+                    chunk_offset);
+            }
 
             ggml_tensor * residual_chunk =
                 get_node_aux(phone_partial);
             residual_chunk->view_src = phone_residual;
-            residual_chunk->view_offs = chunk_offset;
+            residual_chunk->view_offs = residual_offset;
             ggml_backend_view_init(residual_chunk);
             GGML_ASSERT(
-                chunk_offset + ggml_nbytes(residual_chunk) <=
+                residual_offset + ggml_nbytes(residual_chunk) <=
                 ggml_nbytes(phone_residual));
 
             ggml_tensor * phone_fold =
