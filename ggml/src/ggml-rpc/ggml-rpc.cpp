@@ -266,6 +266,7 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_WAIT_READY_SEQ,
     RPC_CMD_PHONE_REGION_LOCAL_SUBMIT,
+    RPC_CMD_GET_PHONE_REGION_PARTIAL,
     RPC_CMD_COUNT,
 };
 
@@ -288,6 +289,7 @@ static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY 
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_WAIT_READY_SEQ == 33, "RPC_CMD_WAIT_READY_SEQ must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PHONE_REGION_LOCAL_SUBMIT == 34, "RPC_CMD_PHONE_REGION_LOCAL_SUBMIT must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GET_PHONE_REGION_PARTIAL == 35, "RPC_CMD_GET_PHONE_REGION_PARTIAL must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -1098,6 +1100,8 @@ enum class rpc_socket_role {
     ROUTE_TRANSFER_3,
     RETURN_TRANSFER_0,
     RETURN_TRANSFER_1,
+    PHONE_REGION_PARTIAL_0,
+    PHONE_REGION_PARTIAL_1,
     COMPLETION_WAIT,
 };
 
@@ -1136,6 +1140,12 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::RETURN_TRANSFER_1:
             suffix = "_return_transfer_1";
+            break;
+        case rpc_socket_role::PHONE_REGION_PARTIAL_0:
+            suffix = "_phone_region_partial_0";
+            break;
+        case rpc_socket_role::PHONE_REGION_PARTIAL_1:
+            suffix = "_phone_region_partial_1";
             break;
         case rpc_socket_role::COMPLETION_WAIT:
             suffix = "_completion_wait";
@@ -1214,6 +1224,17 @@ static std::shared_ptr<socket_t> get_return_transfer_socket(
         lane == 0 ?
             rpc_socket_role::RETURN_TRANSFER_0 :
             rpc_socket_role::RETURN_TRANSFER_1);
+}
+
+static std::shared_ptr<socket_t> get_phone_region_partial_socket(
+        const std::string & endpoint,
+        size_t lane) {
+    GGML_ASSERT(lane < 2);
+    return get_socket_role(
+        endpoint,
+        lane == 0 ?
+            rpc_socket_role::PHONE_REGION_PARTIAL_0 :
+            rpc_socket_role::PHONE_REGION_PARTIAL_1);
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -4001,10 +4022,13 @@ public:
         stored_graphs.resize(backends.size());
         snapshot_devices.reserve(backends.size());
         route_snapshot_devices.reserve(backends.size());
+        phone_region_partial_devices.reserve(backends.size());
         for (size_t i = 0; i < backends.size(); ++i) {
             snapshot_devices.emplace_back(std::make_unique<rpc_snapshot_device>());
             route_snapshot_devices.emplace_back(
                 std::make_unique<rpc_route_snapshot_device>());
+            phone_region_partial_devices.emplace_back(
+                std::make_unique<rpc_snapshot_device>());
         }
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
@@ -4057,6 +4081,11 @@ public:
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
     bool snapshot_tensor_direct(uint32_t device, uint32_t slot, uint64_t seq, ggml_tensor * tensor, uint64_t offset, uint64_t size);
     bool send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock);
+    bool phone_region_partial_publish(
+        const rpc_msg_snapshot_tensor_req & request);
+    bool send_phone_region_partial(
+        const rpc_msg_get_snapshot_req & request,
+        socket_ptr sock);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool init_zero_tensor(
         const rpc_msg_init_zero_tensor_req & request,
@@ -4138,6 +4167,8 @@ private:
     std::vector<std::unique_ptr<rpc_snapshot_device>> snapshot_devices;
     std::vector<std::unique_ptr<rpc_route_snapshot_device>>
         route_snapshot_devices;
+    std::vector<std::unique_ptr<rpc_snapshot_device>>
+        phone_region_partial_devices;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
