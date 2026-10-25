@@ -14905,10 +14905,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             // PARTIAL arrival independently set join bits; the second event
             // enqueues the PC Reduce.
             if (local_ok) {
-                if (backend_ctx->prefill_pc_worker ==
+                if (backend_ctx->phone_main_pc_worker ==
                         nullptr) {
-                    backend_ctx->prefill_pc_worker =
-                        new ggml_backend_meta_transfer_worker();
+                    backend_ctx->phone_main_pc_worker =
+                        new ggml_backend_meta_priority_worker();
                 }
                 if (backend_ctx->
                         phone_main_pc_reduce_worker ==
@@ -15051,9 +15051,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         state.pc_partial;
                     ggml_tensor * pc_local_stage =
                         state.pc_local_stage;
-                    ggml_backend_meta_transfer_worker *
+                    ggml_backend_meta_priority_worker *
                         pc_worker =
-                            backend_ctx->prefill_pc_worker;
+                            backend_ctx->phone_main_pc_worker;
 
                     phone_prefill_route_ready_hooks[
                         { 46, chunk }] =
@@ -15093,6 +15093,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                             const uint64_t pc_task =
                                 pc_worker->enqueue(
+                                    ggml_backend_meta_priority_worker::
+                                        priority::HIGH,
                                     [&, pc_backend,
                                      pc_ffn_graph,
                                      pc_partial,
@@ -15206,10 +15208,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 printf(
                                     "[PHONE_MAIN_PC_FFN_ENQUEUE] "
                                     "chunk=%d task=%" PRIu64
-                                    " source=READY_EVENT "
+                                    " source=READY_EVENT priority=HIGH "
+                                    "pending_high=%zu pending_low=%zu "
                                     "status=QUEUED\n",
                                     chunk,
-                                    pc_task);
+                                    pc_task,
+                                    pc_worker->pending_high(),
+                                    pc_worker->pending_low());
                             }
                             phone_main_pc_event_cv.notify_all();
                             return GGML_STATUS_SUCCESS;
@@ -15731,15 +15736,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         state_it->second.pc_prep_task != 0) {
                     return GGML_STATUS_FAILED;
                 }
-                if (backend_ctx->prefill_pc_worker ==
+                if (backend_ctx->phone_main_pc_worker ==
                         nullptr) {
-                    backend_ctx->prefill_pc_worker =
-                        new ggml_backend_meta_transfer_worker();
+                    return GGML_STATUS_FAILED;
                 }
                 const size_t prep_sg = i;
                 const int prep_id = prep_chunk;
+                ggml_backend_meta_priority_worker *
+                    pc_priority_worker =
+                        backend_ctx->phone_main_pc_worker;
                 state_it->second.pc_prep_task =
-                    backend_ctx->prefill_pc_worker->enqueue(
+                    pc_priority_worker->enqueue(
+                        ggml_backend_meta_priority_worker::
+                            priority::LOW,
                         [&, prep_sg, prep_id](
                             uint64_t) -> ggml_status {
                             return prepare_region_c2p_pc(
@@ -15750,11 +15759,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     printf(
                         "[PHONE_MAIN_PC_PREP_ENQUEUE] "
                         "layer=%d chunk=%d sg=%zu task=%" PRIu64
-                        " queue=PC_TENSOR status=QUEUED\n",
+                        " queue=PC_TENSOR priority=LOW "
+                        "pending_high=%zu pending_low=%zu "
+                        "status=QUEUED\n",
                         prep_layer,
                         prep_chunk,
                         i,
-                        state_it->second.pc_prep_task);
+                        state_it->second.pc_prep_task,
+                        pc_priority_worker->pending_high(),
+                        pc_priority_worker->pending_low());
                 }
             } else {
                 const int64_t prep_stage_begin_us =
@@ -16342,11 +16355,11 @@ auto prefill_norm_sg_has_prework =
             region_c2p_exec_it->second.pc_prep_task != 0 &&
             !region_c2p_exec_it->second.pc_prepared) {
         GGML_ASSERT(
-            backend_ctx->prefill_pc_worker != nullptr);
+            backend_ctx->phone_main_pc_worker != nullptr);
         const int64_t prep_wait_begin_us =
             ggml_time_us();
         const ggml_status prep_status =
-            backend_ctx->prefill_pc_worker->wait(
+            backend_ctx->phone_main_pc_worker->wait(
                 region_c2p_exec_it->second.pc_prep_task);
         if (prep_status != GGML_STATUS_SUCCESS) {
             return prep_status;
