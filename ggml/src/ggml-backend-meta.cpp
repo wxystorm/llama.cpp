@@ -17066,6 +17066,40 @@ auto prefill_norm_sg_has_prework =
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
         }
+
+        // A speculative PC C2P branch keeps Router outputs and the PC FFN
+        // partial rebound to private storage across the intervening L46
+        // continuation. Once the real C2P boundary has consumed those values
+        // and completed its Phone-owned reduction, restore the original graph
+        // descriptors so later executions see the stock allocator layout.
+        if (region_pipeline_active &&
+                is_prefill_down_sg &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, prefill_down_layer)) {
+            auto prework_it =
+                region_c2p_pc_prework.find(
+                    { prefill_down_layer,
+                      prefill_down_chunk });
+            if (prework_it !=
+                    region_c2p_pc_prework.end()) {
+                const size_t binding_count =
+                    prework_it->second.bindings.size();
+                restore_c2p_route_bindings(
+                    prework_it->second.bindings);
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_PC_PREWORK_RELEASE] "
+                        "layer=%d chunk=%d bindings=%zu "
+                        "status=RELEASED_AFTER_REDUCE\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        binding_count);
+                }
+                region_c2p_pc_prework.erase(
+                    prework_it);
+            }
+        }
+
         if (phone_block_fused) {
             i = communication_sg;
             if (!region_pipeline_active) {
@@ -17208,6 +17242,34 @@ auto prefill_norm_sg_has_prework =
                    std::strcmp(pipeline_stage, "PHONE_REGION") == 0 ?
                        "SUBMITTED" : "COMPLETED",
                    (ggml_time_us() - layer_wall_start_us) / 1000.0);
+        }
+
+        // The Phone Region graph is asynchronous at this point. Spend that
+        // producer time on the next chunk's PC-only C2P Router/expert shard.
+        // No Phone buffer is touched here; FFN_NORM/TopK/weights are sent only
+        // after the current L46 continuation has run, preserving Phone MAIN
+        // priority and avoiding the old PREFILL_INPUT_PARK corruption.
+        if (region_pipeline_active &&
+                pipeline_stage != nullptr &&
+                std::strcmp(
+                    pipeline_stage,
+                    "PHONE_REGION") == 0 &&
+                pipeline_chunk >= 0 &&
+                static_cast<size_t>(pipeline_chunk + 1) <
+                    region_pipe_chunks.size()) {
+            const ggml_status prework_status =
+                run_region_c2p_pc_prework(
+                    pipeline_chunk + 1);
+            if (prework_status != GGML_STATUS_SUCCESS) {
+                printf(
+                    "[REGION_C2P_PC_PREWORK_REJECT] "
+                    "source_chunk=%d target_chunk=%d "
+                    "status=%d action=STOP\n",
+                    pipeline_chunk,
+                    pipeline_chunk + 1,
+                    (int) prework_status);
+                return prework_status;
+            }
         }
     }
 
