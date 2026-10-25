@@ -34,7 +34,10 @@ def main() -> int:
         r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
         r"(?:scratch_pool=(\d+) )?"
         r"(?:continuation=(\d+) )?"
-        r"(?:pc_overlap=(\d+) )?reason=([^\s]+)"
+        r"(?:pc_overlap=(\d+) )?"
+        r"(?:phone_main_local=(\d+) )?"
+        r"(?:tail_join_sg=(\d+) )?"
+        r"reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -43,7 +46,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(9)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(11)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -101,6 +104,233 @@ def main() -> int:
             return 1
 
     pc_overlap = plan.group(8) == "1"
+    phone_main_local = plan.group(9) == "1"
+
+    if phone_main_local:
+        local_plan = list(re.finditer(
+            r"\[PHONE_MAIN_LOCAL_PLAN\] requested=1 active=1 "
+            r"chunks=(\d+) rpc_patch=15 reason=READY",
+            block,
+        ))
+        if not local_plan or int(local_plan[-1].group(1)) != n_chunks:
+            print(
+                "FAIL: missing/mismatched successful PHONE_MAIN_LOCAL_PLAN "
+                f"for {n_chunks} chunks"
+            )
+            return 1
+
+        expected_chunks = list(range(n_chunks))
+
+        def chunks_for(pattern: str) -> list[int]:
+            return [int(m.group(1)) for m in re.finditer(pattern, block)]
+
+        registered = chunks_for(
+            r"\[PHONE_MAIN_PLAN_REGISTERED\] "
+            r"chunk=(\d+) .*?status=READY"
+        )
+        if registered != expected_chunks:
+            print(
+                f"FAIL: Phone MAIN registrations={registered}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+
+        armed = chunks_for(
+            r"\[PHONE_MAIN_LOCAL_PREP\] "
+            r"chunk=(\d+) .*?status=ARMED"
+        )
+        if armed != expected_chunks:
+            print(
+                f"FAIL: Phone MAIN armed chunks={armed}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+
+        c2p_ready_send = chunks_for(
+            r"\[PHONE_C2P_READY_SEND\] "
+            r"layer=34 chunk=(\d+) .*?"
+            r"phone_compute_wait=0 priority=C2P_FFN "
+            r"status=QUEUED"
+        )
+        if c2p_ready_send != expected_chunks:
+            print(
+                f"FAIL: C2P READY sends={c2p_ready_send}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+
+        c2p_partial_send = chunks_for(
+            r"\[PHONE_C2P_PARTIAL_SEND\] "
+            r"layer=34 chunk=(\d+) .*?"
+            r"priority=LOW wait_phone=0 .*?status=READY"
+        )
+        if c2p_partial_send != expected_chunks:
+            print(
+                f"FAIL: C2P PARTIAL sends={c2p_partial_send}; "
+                f"expected={expected_chunks}"
+            )
+            return 1
+
+        local_owned = [
+            (int(m.group(1)), m.group(2))
+            for m in re.finditer(
+                r"\[PHONE_MAIN_LOCAL_OWNED\] "
+                r"chunk=(\d+) sg=\d+ "
+                r"stage=(PHONE_REGION|P2C_CONTINUE) "
+                r"pc_action=SKIP_PHONE_GRAPH "
+                r"wait_region=0 status=DELEGATED",
+                block,
+            )
+        ]
+        for chunk in expected_chunks:
+            stages = {
+                stage for c, stage in local_owned if c == chunk
+            }
+            if "PHONE_REGION" not in stages or "P2C_CONTINUE" not in stages:
+                print(
+                    f"FAIL: chunk {chunk} local-owned stages={sorted(stages)}; "
+                    "expected PHONE_REGION and P2C_CONTINUE"
+                )
+                return 1
+
+        pc_ffn_enqueued = chunks_for(
+            r"\[PHONE_MAIN_PC_FFN_ENQUEUE\] "
+            r"chunk=(\d+) .*?"
+            r"source=READY_EVENT priority=HIGH .*?"
+            r"status=QUEUED"
+        )
+        pc_ffn_done = chunks_for(
+            r"\[PHONE_MAIN_PC_FFN\] "
+            r"chunk=(\d+) .*?status=READY"
+        )
+        partial_rx = chunks_for(
+            r"\[PHONE_MAIN_PARTIAL_RX\] "
+            r"chunk=(\d+) .*?status=READY"
+        )
+        pc_reduce_enqueued = chunks_for(
+            r"\[PHONE_MAIN_PC_REDUCE_ENQUEUE\] "
+            r"chunk=(\d+) .*?"
+            r"reason=BOTH_READY priority=HIGH .*?"
+            r"status=QUEUED"
+        )
+        pc_join = chunks_for(
+            r"\[PHONE_MAIN_PC_JOIN\] "
+            r"chunk=(\d+) .*?status=0"
+        )
+        for name, found in (
+            ("PC FFN enqueue", pc_ffn_enqueued),
+            ("PC FFN done", pc_ffn_done),
+            ("P2C PARTIAL RX", partial_rx),
+            ("PC Reduce enqueue", pc_reduce_enqueued),
+            ("PC Reduce join", pc_join),
+        ):
+            if found != expected_chunks:
+                print(
+                    f"FAIL: {name} chunks={found}; "
+                    f"expected={expected_chunks}"
+                )
+                return 1
+
+        tail = list(re.finditer(
+            r"\[PHONE_MAIN_PC_TAIL_READY\] "
+            r"chunks=(\d+) wait_ms=[0-9.]+ "
+            r"boundary_sg=\d+ status=READY",
+            block,
+        ))
+        if not tail or int(tail[-1].group(1)) != n_chunks:
+            print("FAIL: missing successful PHONE_MAIN_PC_TAIL_READY")
+            return 1
+
+        for bad in (
+            "PHONE_REGION_CONTINUATION_WAIT",
+            "PHONE_REGION_CONTINUATION_REJECT",
+            "PHONE_MAIN_LOCAL_REJECT",
+            "REGION_C2P_OVERLAP_REJECT",
+            "Compute error",
+        ):
+            if bad in block:
+                print(f"FAIL: local-main log contains forbidden {bad}")
+                return 1
+
+        # Server-side markers may live in a separate Phone log. If this input
+        # contains any of them, require the complete LOW -> MAIN chain.
+        server_present = any(
+            tag in block for tag in (
+                "[PHONE_C2P_READY]",
+                "[PHONE_C2P_FFN_DONE]",
+                "[PHONE_C2P_PARTIAL_READY]",
+                "[PHONE_C2P_REDUCE_ADMIT]",
+                "[PHONE_MAIN_CHAIN]",
+            )
+        )
+        if server_present:
+            server_checks = (
+                ("Phone C2P READY", chunks_for(
+                    r"\[PHONE_C2P_READY\] "
+                    r"chunk=(\d+) .*?"
+                    r"priority=C2P_FFN status=QUEUED"
+                )),
+                ("Phone C2P FFN", chunks_for(
+                    r"\[PHONE_C2P_FFN_DONE\] "
+                    r"chunk=(\d+) .*?"
+                    r"priority=C2P_FFN status=READY"
+                )),
+                ("Phone C2P partial", chunks_for(
+                    r"\[PHONE_C2P_PARTIAL_READY\] "
+                    r"chunk=(\d+) .*?status=READY"
+                )),
+                ("Phone MAIN admit", chunks_for(
+                    r"\[PHONE_C2P_REDUCE_ADMIT\] "
+                    r"chunk=(\d+) .*?"
+                    r"reason=BOTH_READY priority=MAIN status=QUEUED"
+                )),
+                ("Phone consume credit", chunks_for(
+                    r"\[PHONE_C2P_CONSUME_READY\] "
+                    r"chunk=(\d+) .*?"
+                    r"phase=REDUCE_DONE status=READY"
+                )),
+                ("Phone MAIN chain", chunks_for(
+                    r"\[PHONE_MAIN_CHAIN\] "
+                    r"chunk=(\d+) .*?"
+                    r"execute_reduce=1 status=OK"
+                )),
+            )
+            for name, found in server_checks:
+                if found != expected_chunks:
+                    print(
+                        f"FAIL: {name} chunks={found}; "
+                        f"expected={expected_chunks}"
+                    )
+                    return 1
+
+        print(
+            f"PASS: local Phone MAIN runtime active for {n_chunks} chunks "
+            "(RPC 4.0.15)"
+        )
+        print(
+            "PASS: PC sends C2P READY/PARTIAL without waiting for Phone compute"
+        )
+        print(
+            "PASS: Phone Region/L46 are delegated locally; "
+            "no REGION_DONE/CONTINUATION wait is used"
+        )
+        print(
+            "PASS: P2C READY enqueues PC FFN HIGH, PARTIAL joins PC Reduce HIGH"
+        )
+        if server_present:
+            print(
+                "PASS: Phone C2P_FFN LOW -> BOTH_READY -> MAIN chain validated"
+            )
+        else:
+            print(
+                "NOTE: Phone server log not present; server-side LOW/MAIN "
+                "markers were not checked"
+            )
+        print(
+            "NOTE: tail wait is the real L47 data dependency, not a Phone "
+            "completion-control wait"
+        )
+        return 0
 
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
