@@ -4228,6 +4228,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::map<std::pair<int, int>, phone_prefill_route_task>
         pending_phone_prefill_routes;
+
+    struct phone_region_local_main_chunk_state {
+        uint64_t partial_seq = 0;
+        uint32_t partial_slot = 0;
+        uint64_t scratch_reuse_seq = 0;
+        bool submitted = false;
+    };
+    std::map<int, phone_region_local_main_chunk_state>
+        phone_region_local_main_chunks;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
 
@@ -16605,26 +16614,114 @@ auto prefill_norm_sg_has_prework =
                    phone_region_chunk_id, i, phone_block_end,
                    phone_graph->n_nodes);
         }
-        compute_workers.start_graph(1, phone_graph);
-        compute_status = compute_workers.wait(1);
+        bool phone_region_local_submitted = false;
+        if (region_pipeline_active &&
+                region_local_main_active &&
+                phone_region_fused) {
+            const auto chunk_it =
+                region_pipe_chunks.find(phone_region_chunk_id);
+            if (chunk_it == region_pipe_chunks.end()) {
+                printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
+                       "reason=CHUNK_PLAN_MISSING action=STOP\n",
+                       phone_region_chunk_id);
+                return GGML_STATUS_FAILED;
+            }
+            const auto & entry = chunk_it->second;
 
-        if (region_pipeline_active && phone_region_fused &&
-                compute_status == GGML_STATUS_SUCCESS) {
+            const bool route_prearmed =
+                prearm_phone_prefill_route(
+                    entry.continuation_ready_sg,
+                    46,
+                    phone_region_chunk_id);
+            const auto route_it =
+                pending_phone_prefill_routes.find(
+                    { 46, phone_region_chunk_id });
+            if (!route_prearmed ||
+                    route_it ==
+                        pending_phone_prefill_routes.end()) {
+                printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
+                       "reason=READY_MAILBOX_PREARM_FAILED "
+                       "action=STOP\n",
+                       phone_region_chunk_id);
+                return GGML_STATUS_FAILED;
+            }
+            const phone_prefill_route_task & route =
+                route_it->second;
+
+            ggml_cgraph * attn_graph =
+                build_phone_block_graph(
+                    entry.continuation_begin_sg,
+                    entry.continuation_ready_sg);
+            ggml_cgraph * ffn_graph =
+                build_phone_block_graph(
+                    entry.continuation_ready_sg + 1,
+                    entry.continuation_end_sg);
+
+            char partial_name[96];
+            char residual_name[96];
+            std::snprintf(
+                partial_name, sizeof(partial_name),
+                "prefill_ffn_down_chunk_%d-46",
+                phone_region_chunk_id);
+            std::snprintf(
+                residual_name, sizeof(residual_name),
+                "phone_tensor_ffn_inp_chunk_%d-46",
+                phone_region_chunk_id);
+
+            ggml_tensor * phone_partial =
+                find_sg_named_tensor(
+                    1,
+                    entry.continuation_end_sg,
+                    partial_name);
+            ggml_tensor * phone_residual =
+                find_exact_named_tensor(
+                    1,
+                    residual_name);
+            if (phone_partial == nullptr ||
+                    phone_residual == nullptr ||
+                    ggml_nbytes(phone_partial) !=
+                        ggml_nbytes(phone_residual)) {
+                printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
+                       "partial=%s residual=%s "
+                       "reason=FOLD_TENSOR_MISSING action=STOP\n",
+                       phone_region_chunk_id,
+                       phone_partial != nullptr ?
+                           phone_partial->name : "(null)",
+                       phone_residual != nullptr ?
+                           phone_residual->name : "(null)");
+                return GGML_STATUS_FAILED;
+            }
+
+            ggml_tensor * phone_fold =
+                get_node_aux(phone_partial);
+            phone_fold->view_src =
+                phone_partial->view_src == nullptr ?
+                    phone_partial :
+                    phone_partial->view_src;
+            phone_fold->view_offs =
+                phone_partial->view_offs;
+            phone_fold->op = GGML_OP_ADD;
+            phone_fold->src[0] = phone_partial;
+            phone_fold->src[1] = phone_residual;
+            phone_fold->flags |=
+                GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(phone_fold);
+
+            ggml_cgraph * fold_graph =
+                get_cgraph_aux();
+            fold_graph->nodes[0] = phone_fold;
+            fold_graph->n_nodes = 1;
+
+            auto & phone_cfg =
+                backend_ctx->backend_configs[1];
             const size_t slot_index =
                 static_cast<size_t>(
                     phone_region_chunk_id) % 2;
-            auto & phone_cfg =
-                backend_ctx->backend_configs[1];
             auto & slot =
                 phone_cfg.phone_region_scratch_slots[
                     slot_index];
 
-            // Region completion is NOT a continuation/scheduling event.
-            // Publish a seq only when this scratch slot will be reused by
-            // chunk N+2. The marker is ordered after Region on the same
-            // COMPUTE socket, so bind_phone_region_scratch() can wait for
-            // exactly the old slot owner without draining the Phone queue.
-            // L46 never reads or waits on this seq.
+            uint64_t scratch_reuse_seq = 0;
             const bool will_reuse_slot =
                 phone_region_chunk_id >= 0 &&
                 static_cast<size_t>(
@@ -16648,36 +16745,148 @@ auto prefill_norm_sg_has_prework =
                         local_seq = 1;
                     }
                 }
-                const uint64_t seq =
+                scratch_reuse_seq =
                     REGION_SEQ_PREFIX | local_seq;
-                const ggml_backend_rpc_phone_ffn_mark_ready_t
-                    mark_ready =
-                        ggml_backend_meta_get_phone_ffn_mark_ready(
-                            phone_cfg.backend);
-                const bool marked =
-                    mark_ready != nullptr &&
-                    mark_ready(phone_cfg.backend, seq);
-                if (!marked) {
-                    printf("[PHONE_REGION_SLOT_CREDIT_REJECT] "
-                           "chunk=%d slot=%zu seq=%" PRIu64
-                           " reason=MARK_FAILED action=STOP\n",
-                           phone_region_chunk_id,
-                           slot_index,
-                           seq);
-                    return GGML_STATUS_FAILED;
-                }
+                slot.completion_seq =
+                    scratch_reuse_seq;
+            }
 
-                slot.completion_seq = seq;
+            const ggml_backend_rpc_phone_region_local_submit_t
+                local_submit =
+                    ggml_backend_meta_get_phone_region_local_submit(
+                        phone_cfg.backend);
+            const uint64_t partial_seq =
+                route.producer_seq;
+            const uint32_t partial_slot =
+                static_cast<uint32_t>(
+                    phone_region_chunk_id & 1);
+            const bool submitted =
+                local_submit != nullptr &&
+                local_submit(
+                    phone_cfg.backend,
+                    phone_region_chunk_id,
+                    phone_graph,
+                    attn_graph,
+                    route.src_hidden,
+                    route.src_topk,
+                    route.src_weights,
+                    route.producer_seq,
+                    static_cast<uint32_t>(route.lane),
+                    ffn_graph,
+                    fold_graph,
+                    phone_partial,
+                    partial_seq,
+                    partial_slot,
+                    scratch_reuse_seq);
+            if (!submitted) {
+                slot.completion_seq = 0;
+                printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
+                       "reason=RPC_SUBMIT_FAILED action=STOP\n",
+                       phone_region_chunk_id);
+                return GGML_STATUS_FAILED;
+            }
 
-                if (pipeline_debug) {
-                    printf("[PHONE_REGION_SLOT_CREDIT] "
-                           "chunk=%d slot=%zu seq=%" PRIu64
-                           " marked=1 future_chunk=%d "
-                           "purpose=BUFFER_REUSE_ONLY\n",
-                           phone_region_chunk_id,
-                           slot_index,
-                           seq,
-                           phone_region_chunk_id + 2);
+            phone_region_local_main_chunks[
+                phone_region_chunk_id] = {
+                    partial_seq,
+                    partial_slot,
+                    scratch_reuse_seq,
+                    true,
+                };
+            phone_region_local_submitted = true;
+            compute_status =
+                GGML_STATUS_SUCCESS;
+
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_MAIN_LOCAL] chunk=%d "
+                       "region=[%zu,%zu] "
+                       "attn=[%zu,%zu] ffn=[%zu,%zu] "
+                       "ready_seq=%" PRIu64
+                       " partial_seq=%" PRIu64
+                       " partial_slot=%u reuse_seq=%" PRIu64
+                       " status=SUBMITTED\n",
+                       phone_region_chunk_id,
+                       i, phone_block_end,
+                       entry.continuation_begin_sg,
+                       entry.continuation_ready_sg,
+                       entry.continuation_ready_sg + 1,
+                       entry.continuation_end_sg,
+                       route.producer_seq,
+                       partial_seq,
+                       partial_slot,
+                       scratch_reuse_seq);
+            }
+        } else {
+            compute_workers.start_graph(1, phone_graph);
+            compute_status = compute_workers.wait(1);
+
+            if (region_pipeline_active && phone_region_fused &&
+                    compute_status == GGML_STATUS_SUCCESS) {
+                const size_t slot_index =
+                    static_cast<size_t>(
+                        phone_region_chunk_id) % 2;
+                auto & phone_cfg =
+                    backend_ctx->backend_configs[1];
+                auto & slot =
+                    phone_cfg.phone_region_scratch_slots[
+                        slot_index];
+
+                // Legacy fallback only. In local-MAIN mode the server worker
+                // publishes this credit after PARTIAL is staged.
+                const bool will_reuse_slot =
+                    phone_region_chunk_id >= 0 &&
+                    static_cast<size_t>(
+                        phone_region_chunk_id + 2) <
+                        region_pipe_chunks.size();
+                if (will_reuse_slot) {
+                    constexpr uint64_t REGION_SEQ_PREFIX =
+                        0xA000000000000000ULL;
+                    constexpr uint64_t REGION_SEQ_MASK =
+                        0x0FFFFFFFFFFFFFFFULL;
+                    uint64_t local_seq =
+                        phone_cfg
+                            .phone_region_next_completion_seq++;
+                    local_seq &= REGION_SEQ_MASK;
+                    if (local_seq == 0) {
+                        local_seq =
+                            phone_cfg
+                                .phone_region_next_completion_seq++;
+                        local_seq &= REGION_SEQ_MASK;
+                        if (local_seq == 0) {
+                            local_seq = 1;
+                        }
+                    }
+                    const uint64_t seq =
+                        REGION_SEQ_PREFIX | local_seq;
+                    const ggml_backend_rpc_phone_ffn_mark_ready_t
+                        mark_ready =
+                            ggml_backend_meta_get_phone_ffn_mark_ready(
+                                phone_cfg.backend);
+                    const bool marked =
+                        mark_ready != nullptr &&
+                        mark_ready(phone_cfg.backend, seq);
+                    if (!marked) {
+                        printf("[PHONE_REGION_SLOT_CREDIT_REJECT] "
+                               "chunk=%d slot=%zu seq=%" PRIu64
+                               " reason=MARK_FAILED action=STOP\n",
+                               phone_region_chunk_id,
+                               slot_index,
+                               seq);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    slot.completion_seq = seq;
+
+                    if (pipeline_debug) {
+                        printf("[PHONE_REGION_SLOT_CREDIT] "
+                               "chunk=%d slot=%zu seq=%" PRIu64
+                               " marked=1 future_chunk=%d "
+                               "purpose=BUFFER_REUSE_ONLY\n",
+                               phone_region_chunk_id,
+                               slot_index,
+                               seq,
+                               phone_region_chunk_id + 2);
+                    }
                 }
             }
         }
