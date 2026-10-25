@@ -6613,16 +6613,20 @@ bool rpc_server::graph_recompute_unlocked(
     if (device >= backends.size()) {
         return false;
     }
-    ggml_cgraph * graph = nullptr;
-    {
-        std::lock_guard<std::mutex> graph_lock(stored_graphs_mutex);
-        auto it = stored_graphs[device].find(request.graph_uid);
-        if (it == stored_graphs[device].end() ||
-                it->second.graph == nullptr) {
-            return false;
-        }
-        graph = it->second.graph;
+
+    // The stored graph owns tensor descriptors backed by stored_graph.buffer.
+    // A concurrent GRAPH_REGISTER for the same UID may resize/replace that
+    // buffer. Keep the cache lock for the entire replay so MAIN/LOW execution
+    // never observes a graph whose backing storage is being rebuilt.
+    std::unique_lock<std::mutex> graph_lock(
+        stored_graphs_mutex);
+    auto it = stored_graphs[device].find(request.graph_uid);
+    if (it == stored_graphs[device].end() ||
+            it->second.graph == nullptr) {
+        return false;
     }
+    ggml_cgraph * graph = it->second.graph;
+
     LOG_DBG(
         "[%s] device: %u, graph_uid: %" PRIu64 "\n",
         __func__, device, request.graph_uid);
@@ -7491,8 +7495,24 @@ bool rpc_server::graph_recompute_snapshot(
         return false;
     }
 
+    // Snapshot replay is still GPU work and must obey the same MAIN priority
+    // gate as ordinary GRAPH_RECOMPUTE. Otherwise an old snapshot request can
+    // run concurrently with the Phone-local critical chain.
+    std::unique_lock<std::mutex> gpu_lock(phone_gpu_mutex);
+    phone_gpu_cv.wait(
+        gpu_lock,
+        [&]() {
+            return phone_main_pending.load(
+                       std::memory_order_acquire) == 0 &&
+                   !phone_main_running.load(
+                       std::memory_order_acquire);
+        });
+
+    std::unique_lock<std::mutex> graph_lock(
+        stored_graphs_mutex);
     auto it = stored_graphs[request.device].find(request.graph_uid);
-    if (it == stored_graphs[request.device].end() || it->second.graph == nullptr) {
+    if (it == stored_graphs[request.device].end() ||
+            it->second.graph == nullptr) {
         return false;
     }
 
@@ -7502,13 +7522,18 @@ bool rpc_server::graph_recompute_snapshot(
     }
 
     const int64_t t0 = ggml_time_us();
-    const ggml_status status = ggml_backend_graph_compute(backends[request.device], graph);
+    const ggml_status status =
+        ggml_backend_graph_compute(
+            backends[request.device],
+            graph);
     const int64_t t1 = ggml_time_us();
     if (status != GGML_STATUS_SUCCESS) {
         return false;
     }
 
     ggml_tensor * output = graph->nodes[request.output_node];
+    // Snapshot copies the output while both the GPU lane and graph storage
+    // remain stable. Release both locks only after the payload is materialized.
     const bool snapshot_ok = snapshot_tensor_direct(
         request.device,
         request.slot,
