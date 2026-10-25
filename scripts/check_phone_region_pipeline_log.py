@@ -94,7 +94,12 @@ def main() -> int:
         if found != list(range(n_chunks)):
             print(f"FAIL: {event} chunks={found}; expected 0..{n_chunks - 1}")
             return 1
-    for bad in ("PHONE_REGION_GRAPH_REJECT", "PHONE_REGION_SCRATCH_REJECT", "Compute error"):
+    for bad in (
+        "PHONE_REGION_GRAPH_REJECT",
+        "PHONE_REGION_SCRATCH_REJECT",
+        "PHONE_REGION_CONTINUATION_REJECT",
+        "Compute error",
+    ):
         if bad in block:
             print(f"FAIL: found {bad}")
             return 1
