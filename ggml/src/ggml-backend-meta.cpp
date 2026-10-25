@@ -16255,6 +16255,37 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
             }
 
+            // Join completion proves the payload has been published, but the
+            // PARTIAL RX callback runs on a different worker and can still be
+            // returning from its hook/log tail. Retire those callbacks before
+            // the graph-compute function can destroy the local hook/state they
+            // capture by reference.
+            for (auto & entry : phone_main_local_chunks) {
+                auto & state = entry.second;
+                if (state.partial_worker == nullptr ||
+                        state.partial_task == 0) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PARTIAL_RX_NOT_ARMED "
+                        "action=STOP\n",
+                        entry.first);
+                    return GGML_STATUS_FAILED;
+                }
+                const ggml_status partial_status =
+                    state.partial_worker->wait(
+                        state.partial_task);
+                if (partial_status !=
+                        GGML_STATUS_SUCCESS) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PARTIAL_RX_FAILED "
+                        "status=%d action=STOP\n",
+                        entry.first,
+                        (int) partial_status);
+                    return partial_status;
+                }
+            }
+
             phone_main_pc_join_drained = true;
             if (pipeline_debug) {
                 printf(
