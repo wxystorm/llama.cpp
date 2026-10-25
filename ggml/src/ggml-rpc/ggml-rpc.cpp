@@ -4122,7 +4122,7 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-    std::mutex graph_compute_mutex;
+    std::recursive_mutex graph_compute_mutex;
 
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
@@ -5476,6 +5476,12 @@ bool rpc_server::run_phone_region_local_task(
         const rpc_phone_region_local_task & task) {
     const int64_t begin_us = ggml_time_us();
 
+    // MAIN priority: once a chunk enters Region, no unrelated GRAPH_COMPUTE
+    // may interleave before L46 READY/FFN/PARTIAL is published. graph_compute()
+    // takes the same recursive mutex for cache safety.
+    std::lock_guard<std::recursive_mutex> main_graph_lock(
+        graph_compute_mutex);
+
     // MAIN owns this complete Phone critical path:
     // Region -> L46 Attention/Router -> READY -> Phone FFN -> PARTIAL.
     if (!graph_compute(task.graphs[0])) {
@@ -6319,7 +6325,7 @@ bool rpc_server::set_tensor_graph_compute(
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-    std::lock_guard<std::mutex> graph_lock(graph_compute_mutex);
+    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -6418,7 +6424,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    std::lock_guard<std::mutex> graph_lock(graph_compute_mutex);
+    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -6460,7 +6466,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
-    std::lock_guard<std::mutex> graph_lock(graph_compute_mutex);
+    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     if (request.device >= backends.size() || request.slot >= 2) {
         return false;
     }
