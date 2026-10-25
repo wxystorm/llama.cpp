@@ -15023,7 +15023,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
                "scratch_pool=%d continuation=%d pc_overlap=%d "
-               "reason=%s\n",
+               "phone_main_local=%d reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
@@ -15032,6 +15032,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                region_pipeline_active ? 1 : 0,
                region_pipeline_active &&
                    region_pc_overlap_requested ? 1 : 0,
+               region_pipeline_active &&
+                   phone_main_local_active ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             for (const auto & entry : region_pipe_chunks) {
@@ -15052,6 +15054,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
 
     bool ab_next_entry_dumped = false;
+    bool phone_main_pc_join_drained = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
@@ -15090,6 +15093,44 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
                        "sg=%zu stage=%s event=BEGIN\n",
                        schedule_pos, pipeline_chunk, i, pipeline_stage);
+            }
+        }
+
+        if (region_pipeline_active &&
+                phone_main_local_active) {
+            int local_owned_chunk = -1;
+            const char * local_owned_stage = nullptr;
+            for (const auto & entry :
+                    region_pipe_chunks) {
+                const auto & e = entry.second;
+                if (i == e.begin_sg) {
+                    local_owned_chunk =
+                        entry.first;
+                    local_owned_stage =
+                        "PHONE_REGION";
+                    break;
+                }
+                if (i >= e.continuation_begin_sg &&
+                        i <= e.continuation_end_sg) {
+                    local_owned_chunk =
+                        entry.first;
+                    local_owned_stage =
+                        "P2C_CONTINUE";
+                    break;
+                }
+            }
+            if (local_owned_stage != nullptr) {
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_OWNED] "
+                        "chunk=%d sg=%zu stage=%s "
+                        "pc_action=SKIP_PHONE_GRAPH "
+                        "wait_region=0 status=DELEGATED\n",
+                        local_owned_chunk,
+                        i,
+                        local_owned_stage);
+                }
+                continue;
             }
         }
 
@@ -15199,6 +15240,51 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        pipeline_chunk, seq,
                        static_cast<size_t>(pipeline_chunk) % 2,
                        wait_us / 1000.0);
+            }
+        }
+
+        if (region_pipeline_active &&
+                phone_main_local_active &&
+                !phone_main_pc_join_drained &&
+                subgraph_layer(i) >= 47) {
+            const int64_t join_begin_us =
+                ggml_time_us();
+            for (auto & entry :
+                    phone_main_local_chunks) {
+                auto & state = entry.second;
+                if (state.join_worker == nullptr ||
+                        state.join_task == 0) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PC_JOIN_NOT_ARMED "
+                        "action=STOP\n",
+                        entry.first);
+                    return GGML_STATUS_FAILED;
+                }
+                const ggml_status join_status =
+                    state.join_worker->wait(
+                        state.join_task);
+                if (join_status !=
+                        GGML_STATUS_SUCCESS) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PC_JOIN_FAILED "
+                        "status=%d action=STOP\n",
+                        entry.first,
+                        (int) join_status);
+                    return join_status;
+                }
+            }
+            phone_main_pc_join_drained = true;
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_MAIN_PC_TAIL_READY] "
+                    "chunks=%zu wait_ms=%.3f "
+                    "next_layer=%d status=READY\n",
+                    phone_main_local_chunks.size(),
+                    (ggml_time_us() -
+                        join_begin_us) / 1000.0,
+                    subgraph_layer(i));
             }
         }
 
