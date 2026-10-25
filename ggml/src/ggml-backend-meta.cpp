@@ -267,6 +267,24 @@ static bool ggml_backend_meta_parse_prefill_wave_attn_out_group(
     return name[n] == '\0';
 }
 
+static bool ggml_backend_meta_parse_prefill_wave_attn_norm_group(
+        const char * name,
+        int & chunk_begin,
+        int & chunk_count,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    int n = 0;
+    if (std::sscanf(
+            name, "prefill_wave_attn_norm_group_%d_%d-%d%n",
+            &chunk_begin, &chunk_count, &layer, &n) != 3) {
+        return false;
+    }
+    return name[n] == '\0';
+}
+
 static bool ggml_backend_meta_parse_prefill_wave_l_out_chunk(
         const char * name,
         int & chunk,
@@ -13360,6 +13378,50 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                    layer == phone_layer;
         };
 
+    auto parse_prefill_wave_attn_prework_sg =
+        [&](size_t i, int & chunk_begin, int & chunk_count, int & layer) -> bool {
+            if (n_backends != 2 || i >= backend_ctx->n_subgraphs) {
+                return false;
+            }
+
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+            if (graph == nullptr || graph->n_nodes == 0) {
+                return false;
+            }
+
+            bool found = false;
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                int parsed_begin = -1;
+                int parsed_count = -1;
+                int parsed_layer = -1;
+                if (!ggml_backend_meta_parse_prefill_wave_attn_norm_group(
+                        graph->nodes[k]->name,
+                        parsed_begin,
+                        parsed_count,
+                        parsed_layer)) {
+                    continue;
+                }
+                if (parsed_count <= 0) {
+                    return false;
+                }
+                if (found &&
+                        (parsed_begin != chunk_begin ||
+                         parsed_count != chunk_count ||
+                         parsed_layer != layer)) {
+                    // Multiple attention groups in one SG are not safe to
+                    // collapse into one dependency token. Keep the legacy
+                    // barrier in that rare shape.
+                    return false;
+                }
+                chunk_begin = parsed_begin;
+                chunk_count = parsed_count;
+                layer = parsed_layer;
+                found = true;
+            }
+            return found;
+        };
+
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
         if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
                 !subgraph_is_phone_only(i) || !subgraph_is_phone_only(i + 1)) {
@@ -15021,6 +15083,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     }
 
     bool ab_next_entry_dumped = false;
+    // A wave-attention group may span more than one Meta SG.  The earliest SG
+    // carries prefill_wave_attn_norm_group_* while a later SG carries
+    // prefill_wave_attn_out_group_*.  Track the group so the exact predecessor
+    // dependency is consumed once, before any Q/K/V prework starts.
+    std::set<std::pair<int, int>> return_wave_attn_dependency_started;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
@@ -15151,6 +15218,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         int prefill_wave_attn_chunk = -1;
         int prefill_wave_attn_chunk_count = 1;
         int prefill_wave_attn_layer = -1;
+        int prefill_wave_prework_chunk = -1;
+        int prefill_wave_prework_chunk_count = 1;
+        int prefill_wave_prework_layer = -1;
         const bool is_prefill_norm_sg = parse_prefill_sg(
             i, true, prefill_norm_chunk, prefill_norm_layer);
         const bool is_prefill_down_sg = parse_prefill_sg(
@@ -15158,6 +15228,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const bool is_prefill_wave_attn_sg = parse_prefill_wave_attn_sg(
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
+        const bool is_prefill_wave_attn_prework_sg =
+            return_wavefront_graph &&
+            parse_prefill_wave_attn_prework_sg(
+                i,
+                prefill_wave_prework_chunk,
+                prefill_wave_prework_chunk_count,
+                prefill_wave_prework_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
 
         // C2P decode FFN can appear as a PHONE_ONLY_SG because its terminal
@@ -15286,7 +15363,9 @@ auto prefill_norm_sg_has_prework =
             has_pending_prefill_reduce_for_layer(prefill_down_layer);
 
         const bool continues_prefill_layer =
-            norm_can_overlap || down_can_overlap || is_prefill_wave_attn_sg;
+            norm_can_overlap || down_can_overlap ||
+            is_prefill_wave_attn_sg ||
+            is_prefill_wave_attn_prework_sg;
         const bool pc_phone_exact_prefill_dep =
             pc_phone_exec_v1 &&
             !return_wavefront_graph &&
@@ -15342,78 +15421,132 @@ auto prefill_norm_sg_has_prework =
                     has_pending_prefill_reduce() ? 1 : 0);
             }
         } else if (return_wavefront_graph &&
-                (is_prefill_wave_attn_sg || is_prefill_norm_sg || is_prefill_down_sg)) {
-            if (is_prefill_wave_attn_sg) {
-                // Attention(L,C) consumes OUT(L-1,C), not the most recently
-                // submitted down tensor in graph order.  Let same-layer chunk
-                // prework run while current-layer returns are in flight, and
-                // when crossing a layer boundary wait only for the exact
-                // predecessor chunk.  Older than L-1 is outside the V1
-                // one-layer lookahead window and must be drained first.
-                bool older_waited = false;
-                int64_t older_wait_us = 0;
-                const ggml_status older_status = wait_prefill_reduces_before(
-                    prefill_wave_attn_layer - 1, older_waited, older_wait_us);
-                if (older_waited) {
-                    ++return_wave_old_layer_wait_count;
-                    return_wave_old_layer_wait_us += older_wait_us;
-                }
-                if (older_status != GGML_STATUS_SUCCESS) {
-                    return older_status;
-                }
+                (is_prefill_wave_attn_prework_sg ||
+                 is_prefill_wave_attn_sg ||
+                 is_prefill_norm_sg ||
+                 is_prefill_down_sg)) {
+            if (is_prefill_wave_attn_prework_sg ||
+                    is_prefill_wave_attn_sg) {
+                const int wave_dep_layer =
+                    is_prefill_wave_attn_prework_sg ?
+                        prefill_wave_prework_layer :
+                        prefill_wave_attn_layer;
+                const int wave_dep_chunk =
+                    is_prefill_wave_attn_prework_sg ?
+                        prefill_wave_prework_chunk :
+                        prefill_wave_attn_chunk;
+                const int wave_dep_chunk_count =
+                    is_prefill_wave_attn_prework_sg ?
+                        prefill_wave_prework_chunk_count :
+                        prefill_wave_attn_chunk_count;
+                const auto wave_dep_key =
+                    std::make_pair(wave_dep_layer, wave_dep_chunk);
+                const bool first_group_sg =
+                    return_wave_attn_dependency_started
+                        .insert(wave_dep_key).second;
 
-                bool waited = false;
-                int64_t dependency_wait_us = 0;
-                if (prefill_wave_attn_layer > return_wavefront_first_layer) {
-                    for (int dep_chunk = prefill_wave_attn_chunk;
-                         dep_chunk < prefill_wave_attn_chunk + prefill_wave_attn_chunk_count;
-                         ++dep_chunk) {
-                        bool dep_waited = false;
-                        const int64_t wait_start_us = ggml_time_us();
-                        const ggml_status status = wait_prefill_reduce_dependency(
-                            prefill_wave_attn_layer - 1, dep_chunk, dep_waited);
-                        const int64_t dep_wait_us = ggml_time_us() - wait_start_us;
-                        dependency_wait_us += dep_wait_us;
-                        waited = waited || dep_waited;
-                        if (dep_waited) {
-                            ++return_wave_dependency_wait_count;
-                            return_wave_dependency_wait_us += dep_wait_us;
-                            return_wave_dependency_wait_max_us =
-                                std::max(return_wave_dependency_wait_max_us, dep_wait_us);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[RETURN_WAVEFRONT_DEP_WAIT] layer=%d chunk=%d group_begin=%d group_count=%d "
-                                    "predecessor=%d wait_ms=%.3f\n",
-                                    prefill_wave_attn_layer, dep_chunk,
-                                    prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
-                                    prefill_wave_attn_layer - 1, dep_wait_us / 1000.0);
+                if (first_group_sg) {
+                    // Attention(L,C) consumes OUT(L-1,C).  The norm-group
+                    // marker is deliberately earlier than the attn-out marker,
+                    // so enforce the exact dependency before Q/K/V/cache work
+                    // rather than falling back to a whole-layer barrier.
+                    bool older_waited = false;
+                    int64_t older_wait_us = 0;
+                    const ggml_status older_status =
+                        wait_prefill_reduces_before(
+                            wave_dep_layer - 1,
+                            older_waited,
+                            older_wait_us);
+                    if (older_waited) {
+                        ++return_wave_old_layer_wait_count;
+                        return_wave_old_layer_wait_us += older_wait_us;
+                    }
+                    if (older_status != GGML_STATUS_SUCCESS) {
+                        return older_status;
+                    }
+
+                    bool waited = false;
+                    int64_t dependency_wait_us = 0;
+                    if (wave_dep_layer > return_wavefront_first_layer) {
+                        for (int dep_chunk = wave_dep_chunk;
+                             dep_chunk < wave_dep_chunk + wave_dep_chunk_count;
+                             ++dep_chunk) {
+                            bool dep_waited = false;
+                            const int64_t wait_start_us = ggml_time_us();
+                            const ggml_status status =
+                                wait_prefill_reduce_dependency(
+                                    wave_dep_layer - 1,
+                                    dep_chunk,
+                                    dep_waited);
+                            const int64_t dep_wait_us =
+                                ggml_time_us() - wait_start_us;
+                            dependency_wait_us += dep_wait_us;
+                            waited = waited || dep_waited;
+                            if (dep_waited) {
+                                ++return_wave_dependency_wait_count;
+                                return_wave_dependency_wait_us += dep_wait_us;
+                                return_wave_dependency_wait_max_us =
+                                    std::max(
+                                        return_wave_dependency_wait_max_us,
+                                        dep_wait_us);
+                                if (pipeline_debug) {
+                                    printf(
+                                        "[RETURN_WAVEFRONT_DEP_WAIT] "
+                                        "layer=%d chunk=%d "
+                                        "group_begin=%d group_count=%d "
+                                        "predecessor=%d wait_ms=%.3f\n",
+                                        wave_dep_layer,
+                                        dep_chunk,
+                                        wave_dep_chunk,
+                                        wave_dep_chunk_count,
+                                        wave_dep_layer - 1,
+                                        dep_wait_us / 1000.0);
+                                }
+                            }
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
                             }
                         }
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
-                        }
                     }
-                }
 
-                const bool predecessor_layer_still_in_flight =
-                    prefill_wave_attn_layer > return_wavefront_first_layer &&
-                    has_pending_prefill_reduce_for_layer(prefill_wave_attn_layer - 1);
-                if (has_pending_prefill_reduce()) {
-                    ++return_wave_overlap_boundaries;
-                }
-                if (predecessor_layer_still_in_flight) {
-                    return_wave_ahead_attn_chunks += prefill_wave_attn_chunk_count;
-                }
+                    const bool predecessor_layer_still_in_flight =
+                        wave_dep_layer > return_wavefront_first_layer &&
+                        has_pending_prefill_reduce_for_layer(
+                            wave_dep_layer - 1);
+                    if (has_pending_prefill_reduce()) {
+                        ++return_wave_overlap_boundaries;
+                    }
+                    if (predecessor_layer_still_in_flight) {
+                        return_wave_ahead_attn_chunks +=
+                            wave_dep_chunk_count;
+                    }
 
-                if (pipeline_debug) {
+                    if (pipeline_debug) {
+                        printf(
+                            "[RETURN_WAVEFRONT_PREWORK] "
+                            "layer=%d group_begin=%d group_count=%d "
+                            "source=%s waited=%d wait_ms=%.3f "
+                            "predecessor_pending=%d any_pending=%d\n",
+                            wave_dep_layer,
+                            wave_dep_chunk,
+                            wave_dep_chunk_count,
+                            is_prefill_wave_attn_prework_sg ?
+                                "ATTN_NORM" : "ATTN_OUT",
+                            waited ? 1 : 0,
+                            dependency_wait_us / 1000.0,
+                            predecessor_layer_still_in_flight ? 1 : 0,
+                            has_pending_prefill_reduce() ? 1 : 0);
+                    }
+                } else if (pipeline_debug &&
+                        is_prefill_wave_attn_sg) {
                     printf(
-                        "[RETURN_WAVEFRONT_PREWORK] layer=%d group_begin=%d group_count=%d waited=%d "
-                        "wait_ms=%.3f predecessor_pending=%d any_pending=%d\n",
-                        prefill_wave_attn_layer, prefill_wave_attn_chunk,
-                        prefill_wave_attn_chunk_count, waited ? 1 : 0,
-                        dependency_wait_us / 1000.0,
-                        predecessor_layer_still_in_flight ? 1 : 0,
-                        has_pending_prefill_reduce() ? 1 : 0);
+                        "[RETURN_WAVEFRONT_GROUP_CONTINUE] "
+                        "layer=%d group_begin=%d group_count=%d "
+                        "sg=%zu dependency=ALREADY_ENFORCED\n",
+                        wave_dep_layer,
+                        wave_dep_chunk,
+                        wave_dep_chunk_count,
+                        i);
                 }
             } else if (is_prefill_down_sg &&
                        prefill_down_layer > return_wavefront_first_layer &&
@@ -15441,11 +15574,14 @@ auto prefill_norm_sg_has_prework =
                 printf(
                     "[PC_PHONE_BARRIER_FALLBACK] "
                     "sg=%zu last=%s norm=%d down=%d "
+                    "wave_attn=%d wave_prework=%d "
                     "reason=NON_CHUNK_SG\n",
                     i,
                     barrier_last,
                     is_prefill_norm_sg ? 1 : 0,
-                    is_prefill_down_sg ? 1 : 0);
+                    is_prefill_down_sg ? 1 : 0,
+                    is_prefill_wave_attn_sg ? 1 : 0,
+                    is_prefill_wave_attn_prework_sg ? 1 : 0);
             }
             size_t pending_lanes = 0;
             int barrier_layer = -1;
