@@ -2386,6 +2386,7 @@ struct ggml_backend_meta_context {
         // storage while MAIN owns the GPU/scratch. Keep TopK/weights private
         // for the whole overlap-slot lifetime, just like the hidden input.
         std::array<ggml_backend_buffer_ptr, 2> phone_route_bufs;
+        ggml_backend_buffer_ptr phone_partial_buf;
         std::array<ggml_backend_buffer_ptr, 2> pc_route_bufs;
         ggml_backend_buffer_ptr pc_partial_buf;
     };
@@ -2437,6 +2438,8 @@ struct ggml_backend_meta_context {
                                                                                                   nullptr };
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES> prefill_route_workers { nullptr,
                                                                                                 nullptr };
+    std::array<ggml_backend_meta_transfer_worker *, 2>
+        phone_c2p_partial_workers { nullptr, nullptr };
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -3103,6 +3106,9 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
         delete worker;
     }
     for (auto * worker : prefill_route_workers) {
+        delete worker;
+    }
+    for (auto * worker : phone_c2p_partial_workers) {
         delete worker;
     }
     if (comm_ctx != nullptr) {
@@ -4238,8 +4244,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         size_t slot = 0;
         uint64_t input_task = 0;
         uint64_t pc_prep_task = 0;
+        uint64_t phone_ffn_uid = 0;
+        uint64_t consume_seq = 0;
+        uint64_t partial_tx_task = 0;
         bool input_staged = false;
         bool pc_prepared = false;
+        bool c2p_registered = false;
+        bool c2p_ready_sent = false;
         ggml_tensor * input_dst = nullptr;
         ggml_tensor * pc_topk = nullptr;
         ggml_tensor * pc_weights = nullptr;
