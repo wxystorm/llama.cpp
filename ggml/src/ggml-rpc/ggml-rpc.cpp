@@ -695,6 +695,167 @@ struct ggml_backend_rpc_buffer_context {
     std::array<std::shared_ptr<socket_t>, 2> snapshot_transfer_socks {};
 };
 
+static bool ggml_backend_rpc_graph_register(
+        ggml_backend_t backend,
+        const ggml_cgraph * graph,
+        uint64_t * out_uid) {
+    if (backend == nullptr || graph == nullptr ||
+            graph->n_nodes <= 0) {
+        return false;
+    }
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(
+            backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+    const std::string compute_key =
+        rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) < 14) {
+        return false;
+    }
+
+    const uint64_t uid =
+        rpc_graph_effective_uid(graph);
+    if (uid == 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> input;
+    serialize_graph(
+        rpc_ctx->device,
+        uid,
+        graph,
+        input);
+
+    rpc_msg_graph_register_rsp response {};
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr ||
+            !send_rpc_cmd(
+                sock,
+                RPC_CMD_GRAPH_REGISTER,
+                input.data(),
+                input.size(),
+                &response,
+                sizeof(response)) ||
+            response.result == 0) {
+        return false;
+    }
+
+    auto * dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend)->context);
+    if (dev_ctx != nullptr) {
+        dev_ctx->graph_uids.insert(uid);
+    }
+    if (out_uid != nullptr) {
+        *out_uid = uid;
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_MAIN_GRAPH_REGISTER] side=PC uid=%" PRIu64
+        " nodes=%d status=READY\n",
+        uid, graph->n_nodes);
+    return true;
+}
+
+static bool ggml_backend_rpc_phone_main_register(
+        ggml_backend_t backend,
+        int32_t chunk,
+        uint64_t trigger_reduce_uid,
+        uint64_t region_graph_uid,
+        uint64_t p2c_attention_graph_uid,
+        uint64_t p2c_ffn_graph_uid,
+        uint64_t ready_seq,
+        uint32_t ready_lane,
+        const ggml_tensor * ready_hidden,
+        const ggml_tensor * ready_topk,
+        const ggml_tensor * ready_weights,
+        uint64_t partial_seq,
+        uint32_t partial_slot,
+        const ggml_tensor * partial) {
+    if (backend == nullptr || chunk < 0 ||
+            ready_hidden == nullptr ||
+            ready_topk == nullptr ||
+            ready_weights == nullptr ||
+            partial == nullptr) {
+        return false;
+    }
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(
+            backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+    const std::string compute_key =
+        rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) < 14) {
+        return false;
+    }
+
+    rpc_msg_phone_main_register_req request {};
+    request.device = rpc_ctx->device;
+    request.chunk = chunk;
+    request.trigger_reduce_uid = trigger_reduce_uid;
+    request.region_graph_uid = region_graph_uid;
+    request.p2c_attention_graph_uid =
+        p2c_attention_graph_uid;
+    request.p2c_ffn_graph_uid = p2c_ffn_graph_uid;
+    request.ready_seq = ready_seq;
+    request.ready_lane = ready_lane;
+    request.partial_seq = partial_seq;
+    request.partial_slot = partial_slot;
+    request.ready_tensors[0] =
+        serialize_tensor(ready_hidden);
+    request.ready_tensors[1] =
+        serialize_tensor(ready_topk);
+    request.ready_tensors[2] =
+        serialize_tensor(ready_weights);
+    request.ready_sizes[0] =
+        ggml_nbytes(ready_hidden);
+    request.ready_sizes[1] =
+        ggml_nbytes(ready_topk);
+    request.ready_sizes[2] =
+        ggml_nbytes(ready_weights);
+    request.partial_tensor =
+        serialize_tensor(partial);
+    request.partial_size =
+        ggml_nbytes(partial);
+
+    rpc_msg_phone_main_register_rsp response {};
+    auto sock = get_socket(rpc_ctx->endpoint);
+    const bool ok =
+        sock != nullptr &&
+        send_rpc_cmd(
+            sock,
+            RPC_CMD_PHONE_MAIN_REGISTER,
+            &request,
+            sizeof(request),
+            &response,
+            sizeof(response)) &&
+        response.result != 0;
+
+    if (ok) {
+        GGML_LOG_INFO(
+            "[PHONE_MAIN_REGISTER] side=PC chunk=%d "
+            "trigger_uid=%" PRIu64
+            " region_uid=%" PRIu64
+            " p2c_attn_uid=%" PRIu64
+            " p2c_ffn_uid=%" PRIu64
+            " ready_seq=%" PRIu64
+            " partial_seq=%" PRIu64
+            " status=READY\n",
+            chunk,
+            trigger_reduce_uid,
+            region_graph_uid,
+            p2c_attention_graph_uid,
+            p2c_ffn_graph_uid,
+            ready_seq,
+            partial_seq);
+    }
+    return ok;
+}
+
 static bool ggml_backend_rpc_set_tensor_graph(
         ggml_backend_t backend_src,
         ggml_backend_t backend_dst,
