@@ -2384,6 +2384,10 @@ struct ggml_backend_meta_context {
         int owner_chunk = -1;
         ggml_backend_buffer_ptr phone_input_buf;
         ggml_backend_buffer_ptr pc_input_buf;
+        // Delayed LOW PC fold must not read the live gallocr residual after
+        // later chunk prework reuses that arena. Snapshot one residual chunk
+        // per window slot next to the hidden input.
+        ggml_backend_buffer_ptr pc_residual_buf;
         // Future C2P Router metadata must not land in stock Phone gallocr
         // storage while MAIN owns the GPU/scratch. Keep TopK/weights private
         // for the whole overlap-slot lifetime, just like the hidden input.
@@ -4375,6 +4379,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         bool slot_active = false;
         ggml_tensor * input_dst = nullptr;
         ggml_tensor * pc_input_stage = nullptr;
+        ggml_tensor * pc_residual_src = nullptr;
+        ggml_tensor * pc_residual_stage = nullptr;
         ggml_tensor * pc_topk = nullptr;
         ggml_tensor * pc_weights = nullptr;
         ggml_tensor * pc_partial = nullptr;
@@ -8044,7 +8050,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const bool region_overlap_input =
                     region_pipeline_active &&
                     region_pc_overlap_requested &&
-                    prefill_norm_chunk > 0 &&
+                    (phone_main_local_active ||
+                     prefill_norm_chunk > 0) &&
                     ggml_backend_meta_tensor_c2p_layer(
                         backend_ctx, prefill_norm_layer);
 
@@ -14359,6 +14366,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             overlap_slot.pc_input_buf,
                             storage_bytes(phone_input)) &&
                         ensure_overlap_buf(
+                            pc_cfg.backend,
+                            overlap_slot.pc_residual_buf,
+                            ggml_nbytes(phone_input)) &&
+                        ensure_overlap_buf(
                             phone_cfg.backend,
                             overlap_slot.phone_route_bufs[0],
                             storage_bytes(phone_topk)) &&
@@ -14408,6 +14419,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             c2p_slot_bytes[slot_index] +=
                                 ggml_backend_buffer_get_size(
                                     overlap_slot.pc_input_buf.get());
+                        }
+                        if (overlap_slot.pc_residual_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.pc_residual_buf.get());
                         }
                         for (const auto & route_buf :
                                 overlap_slot.phone_route_bufs) {
