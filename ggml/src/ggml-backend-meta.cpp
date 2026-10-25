@@ -2432,10 +2432,6 @@ struct ggml_backend_meta_context {
     // It remains single-threaded for backend safety, but READY-triggered L46
     // PC FFN can overtake speculative future C2P PC_PREP work.
     ggml_backend_meta_priority_worker * phone_main_pc_worker = nullptr;
-    // Serialize final P2C PC reduces on one backend-owning worker. Route and
-    // snapshot receivers remain independent; only backend graph execution is
-    // single-lane until the later priority executor replaces this bridge.
-    ggml_backend_meta_transfer_worker * phone_main_pc_reduce_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -3220,7 +3216,6 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete prefill_input_worker;
     delete prefill_pc_worker;
     delete phone_main_pc_worker;
-    delete phone_main_pc_reduce_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
@@ -6676,7 +6671,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         ggml_backend_meta_transfer_worker * partial_worker = nullptr;
         uint64_t partial_task = 0;
         uint64_t pc_ffn_task = 0;
-        ggml_backend_meta_transfer_worker * join_worker = nullptr;
+        ggml_backend_meta_priority_worker * join_worker = nullptr;
         uint64_t join_task = 0;
 
         bool graphs_registered = false;
@@ -14911,13 +14906,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     backend_ctx->phone_main_pc_worker =
                         new ggml_backend_meta_priority_worker();
                 }
-                if (backend_ctx->
-                        phone_main_pc_reduce_worker ==
-                        nullptr) {
-                    backend_ctx->
-                        phone_main_pc_reduce_worker =
-                            new ggml_backend_meta_transfer_worker();
-                }
                 for (size_t lane = 0;
                         lane <
                             ggml_backend_meta_context::
@@ -14977,6 +14965,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                         state.join_task =
                             state.join_worker->enqueue(
+                                ggml_backend_meta_priority_worker::
+                                    priority::HIGH,
                                 [pc_backend,
                                  pc_phone_stage,
                                  pc_reduce,
@@ -15022,10 +15012,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             printf(
                                 "[PHONE_MAIN_PC_REDUCE_ENQUEUE] "
                                 "chunk=%d task=%" PRIu64
-                                " reason=BOTH_READY "
+                                " reason=BOTH_READY priority=HIGH "
+                                "pending_high=%zu pending_low=%zu "
                                 "status=QUEUED\n",
                                 chunk,
-                                state.join_task);
+                                state.join_task,
+                                state.join_worker->pending_high(),
+                                state.join_worker->pending_low());
                         }
                         phone_main_pc_event_cv.notify_all();
                     };
@@ -15041,8 +15034,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     auto & state =
                         phone_main_local_chunks.at(chunk);
                     state.join_worker =
-                        backend_ctx->
-                            phone_main_pc_reduce_worker;
+                        backend_ctx->phone_main_pc_worker;
 
                     ggml_cgraph * pc_ffn_graph =
                         pc_cfg.cgraphs[
@@ -15653,7 +15645,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const int64_t join_begin_us = ggml_time_us();
             for (auto & entry : phone_main_local_chunks) {
                 uint64_t join_task = 0;
-                ggml_backend_meta_transfer_worker *
+                ggml_backend_meta_priority_worker *
                     join_worker = nullptr;
                 {
                     std::unique_lock<std::mutex> lock(
