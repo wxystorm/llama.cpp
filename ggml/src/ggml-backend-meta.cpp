@@ -12828,8 +12828,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
 
-        // Chunk markers delimit the FFN, but its inputs may still depend on
-        // full-batch Attention. Check tensor edges, not arena address aliases.
+        // L46 now exposes an explicit per-chunk Attention begin marker and an
+        // existing per-chunk FFN-down end marker. The dependency walk below is
+        // still kept as a correctness guard: every early continuation must
+        // depend only on its own completed Region output, never a future one.
         if (eligible) {
             for (size_t c = 0;
                     c < region_pipe_chunks.size() && eligible; ++c) {
@@ -12841,21 +12843,42 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                 for (size_t sg = last_region_end + 1;
                         sg < backend_ctx->n_subgraphs; ++sg) {
-                    int parsed_chunk = -1;
-                    int parsed_layer = -1;
-
                     if (continuation_begin >=
-                            region_pipe_invalid_sg &&
-                            parse_prefill_sg(
-                                sg, true,
-                                parsed_chunk, parsed_layer) &&
-                            parsed_layer == 46 &&
-                            parsed_chunk == (int) c) {
-                        continuation_begin = sg;
+                            region_pipe_invalid_sg) {
+                        bool found_attn_begin = false;
+                        for (size_t backend = 0;
+                                backend < n_backends &&
+                                !found_attn_begin; ++backend) {
+                            ggml_cgraph * graph =
+                                backend_ctx->backend_configs[backend]
+                                    .cgraphs[sg].cgraph_main;
+                            for (int k = 0;
+                                    graph != nullptr &&
+                                    k < graph->n_nodes; ++k) {
+                                int marker_chunk = -1;
+                                int marker_layer = -1;
+                                int parsed = 0;
+                                const char * name =
+                                    graph->nodes[k]->name;
+                                if (std::sscanf(
+                                        name,
+                                        "phone_tensor_attn_norm_chunk_%d-%d%n",
+                                        &marker_chunk,
+                                        &marker_layer,
+                                        &parsed) == 2 &&
+                                        name[parsed] == '\0' &&
+                                        marker_layer == 46 &&
+                                        marker_chunk == (int) c) {
+                                    continuation_begin = sg;
+                                    found_attn_begin = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
 
-                    parsed_chunk = -1;
-                    parsed_layer = -1;
+                    int parsed_chunk = -1;
+                    int parsed_layer = -1;
                     if (parse_prefill_sg(
                             sg, false,
                             parsed_chunk, parsed_layer) &&
@@ -12870,7 +12893,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         region_pipe_invalid_sg) {
                     eligible = false;
                     region_pipe_reason =
-                        "CONTINUATION_NORM_NOT_FOUND";
+                        "CONTINUATION_ATTN_NOT_FOUND";
                     break;
                 }
                 if (continuation_down >=
