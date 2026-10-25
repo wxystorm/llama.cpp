@@ -12492,6 +12492,78 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
         if (eligible) {
+            // The stock gallocr packs buffers according to ORIGINAL graph
+            // order. Moving Region chunk N before the PC/Phone C2P work for
+            // chunk N+1 is only safe if its live output does not alias any
+            // later C2P Phone writer. Such an alias is legal in the original
+            // order (the future C2P temporary dies before Region N starts),
+            // but would corrupt the early output in this new schedule.
+            auto ranges_overlap = [](const ggml_tensor * a,
+                                     const ggml_tensor * b) -> bool {
+                const uintptr_t pa = reinterpret_cast<uintptr_t>(a->data);
+                const uintptr_t pb = reinterpret_cast<uintptr_t>(b->data);
+                const size_t na = ggml_nbytes(a);
+                const size_t nb = ggml_nbytes(b);
+                return pa != 0 && pb != 0 && na != 0 && nb != 0 &&
+                    pa <= UINTPTR_MAX - na && pb <= UINTPTR_MAX - nb &&
+                    pa < pb + nb && pb < pa + na;
+            };
+            for (size_t c = 0; c < region_pipe_chunks.size() && eligible; ++c) {
+                const auto & e = region_pipe_chunks.at((int) c);
+                char out_name[96];
+                std::snprintf(out_name, sizeof(out_name),
+                              "phone_region_chunk_end_%zu-45", c);
+                ggml_tensor * output =
+                    find_sg_named_tensor(1, e.end_sg, out_name);
+                if (output == nullptr || output->data == nullptr ||
+                        output->buffer == nullptr) {
+                    eligible = false;
+                    region_pipe_reason = "OUTPUT_BUFFER_UNAVAILABLE";
+                    break;
+                }
+                for (size_t future = c + 1;
+                        future < region_pipe_chunks.size() && eligible; ++future) {
+                    const auto & next = region_pipe_chunks.at((int) future);
+                    for (size_t sg : { next.norm_sg, next.down_sg }) {
+                        ggml_cgraph * phone =
+                            backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+                        GGML_ASSERT(phone != nullptr);
+                        for (int k = 0; k < phone->n_nodes; ++k) {
+                            ggml_tensor * node = phone->nodes[k];
+                            if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                                    ggml_is_view_op(node->op)) {
+                                continue;
+                            }
+                            // Nodes without a materialized backing pointer
+                            // cannot be shown disjoint; reject to avoid
+                            // interpreting unknown memory as safe.
+                            if (node->data == nullptr ||
+                                    ranges_overlap(output, node)) {
+                                if (pipeline_debug) {
+                                    printf("[PHONE_REGION_PIPE_ALIAS] "
+                                           "chunk=%zu future=%zu node=%s "
+                                           "reason=%s\n",
+                                           c, future, node->name,
+                                           node->data == nullptr ?
+                                               "UNKNOWN_BUFFER" :
+                                               "OUTPUT_OVERLAP");
+                                }
+                                region_pipe_reason =
+                                    node->data == nullptr ?
+                                        "UNKNOWN_FUTURE_BUFFER" :
+                                        "OUTPUT_BUFFER_ALIAS";
+                                eligible = false;
+                                break;
+                            }
+                        }
+                        if (!eligible) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (eligible) {
             std::vector<bool> covered(backend_ctx->n_subgraphs, false);
             auto add_sg = [&](size_t sg) {
                 if (sg >= covered.size() || covered[sg]) {
@@ -12528,7 +12600,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
         region_pipeline_active = eligible;
-        region_pipe_reason = eligible ? "READY" : "UNSUPPORTED_GRAPH";
+        if (eligible) {
+            region_pipe_reason = "READY";
+        } else if (std::strcmp(region_pipe_reason, "TOPOLOGY") == 0) {
+            region_pipe_reason = "UNSUPPORTED_GRAPH";
+        }
         if (!eligible) {
             region_pipe_schedule.clear();
         }
@@ -12563,9 +12639,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             ++schedule_pos) {
         size_t i = region_pipeline_active ?
             region_pipe_schedule[schedule_pos] : schedule_pos;
-        if (region_pipeline_active && pipeline_debug) {
-            int pipeline_chunk = -1;
-            const char * pipeline_stage = nullptr;
+        int pipeline_chunk = -1;
+        const char * pipeline_stage = nullptr;
+        if (region_pipeline_active) {
             for (const auto & entry : region_pipe_chunks) {
                 if (i == entry.second.norm_sg) {
                     pipeline_chunk = entry.first;
@@ -12578,7 +12654,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     pipeline_stage = "PHONE_REGION";
                 }
             }
-            if (pipeline_stage != nullptr) {
+            if (pipeline_debug && pipeline_stage != nullptr) {
                 printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
                        "sg=%zu stage=%s event=BEGIN\n",
                        schedule_pos, pipeline_chunk, i, pipeline_stage);
@@ -15362,6 +15438,20 @@ auto prefill_norm_sg_has_prework =
             // Return-wavefront Attention is its own subgraph.  It must be
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
+        }
+
+        if (region_pipeline_active && pipeline_debug &&
+                pipeline_stage != nullptr) {
+            // The Phone worker's return means SUBMITTED, not that the GPU
+            // finished; the next C2P route handoff has an existing Phone
+            // synchronize which provides the bounded window-2 credit.
+            printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
+                   "sg=%zu stage=%s event=%s host_ms=%.3f status=OK\n",
+                   schedule_pos, pipeline_chunk, communication_sg,
+                   pipeline_stage,
+                   std::strcmp(pipeline_stage, "PHONE_REGION") == 0 ?
+                       "SUBMITTED" : "COMPLETED",
+                   (ggml_time_us() - layer_wall_start_us) / 1000.0);
         }
     }
 
