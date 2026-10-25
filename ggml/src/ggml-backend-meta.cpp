@@ -6440,9 +6440,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         ggml_tensor * phone_folded_partial = nullptr;
 
         ggml_tensor * pc_partial = nullptr;
-        ggml_tensor * pc_partial_stage = nullptr;
+        ggml_tensor * pc_local_stage = nullptr;
+        ggml_tensor * pc_phone_stage = nullptr;
         ggml_tensor * pc_out_chunk = nullptr;
         ggml_cgraph * pc_reduce_graph = nullptr;
+        ggml_backend_buffer_ptr pc_local_stage_buf;
+        ggml_backend_buffer_ptr pc_phone_stage_buf;
 
         std::shared_ptr<std::vector<uint8_t>> phone_partial_payload;
         ggml_backend_meta_transfer_worker * partial_worker = nullptr;
