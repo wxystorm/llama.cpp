@@ -13225,7 +13225,115 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             state.pc_topk = src_topk;
             state.pc_weights = src_weights;
             state.pc_partial = pc_partial;
+
+            // Snapshot the residual that belongs to this exact C2P chunk.
+            // Chunk-major PC prefix mode exposes an explicit chunk-local
+            // residual; the validated legacy graph falls back to a view into
+            // the full-batch ffn_inp. In both cases the delayed LOW partial
+            // task reads only private slot storage after PC_PREP returns.
+            char residual_name[96];
+            std::snprintf(
+                residual_name,
+                sizeof(residual_name),
+                "c2p_tensor_ffn_inp_chunk_%d-%d",
+                chunk,
+                layer);
+            ggml_tensor * local_residual =
+                find_exact_named_tensor(
+                    0, residual_name);
+            ggml_tensor * residual_src = nullptr;
+            if (local_residual != nullptr &&
+                    ggml_nbytes(local_residual) ==
+                        ggml_nbytes(pc_partial)) {
+                residual_src = local_residual;
+            } else {
+                ggml_tensor * full_residual =
+                    find_recent_ffn_inp(
+                        0, sg, layer);
+                if (full_residual == nullptr) {
+                    printf(
+                        "[REGION_C2P_OVERLAP_REJECT] "
+                        "layer=%d chunk=%d sg=%zu "
+                        "reason=PC_RESIDUAL_MISSING action=STOP\n",
+                        layer, chunk, sg);
+                    restore_c2p_route_bindings(
+                        state.pc_bindings);
+                    return GGML_STATUS_FAILED;
+                }
+                const size_t residual_offset =
+                    down_chunk_offset(
+                        0, true, layer, chunk);
+                if (residual_offset +
+                        ggml_nbytes(pc_partial) >
+                        ggml_nbytes(full_residual)) {
+                    printf(
+                        "[REGION_C2P_OVERLAP_REJECT] "
+                        "layer=%d chunk=%d sg=%zu "
+                        "reason=PC_RESIDUAL_RANGE action=STOP\n",
+                        layer, chunk, sg);
+                    restore_c2p_route_bindings(
+                        state.pc_bindings);
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_tensor * residual_view =
+                    get_node_aux(pc_partial);
+                residual_view->view_src =
+                    full_residual;
+                residual_view->view_offs =
+                    residual_offset;
+                ggml_backend_view_init(
+                    residual_view);
+                residual_src = residual_view;
+            }
+
+            state.pc_residual_src = residual_src;
+            state.pc_residual_stage =
+                get_node_aux(pc_partial);
+            state.pc_residual_stage->buffer =
+                slot.pc_residual_buf.get();
+            state.pc_residual_stage->data =
+                ggml_backend_buffer_get_base(
+                    slot.pc_residual_buf.get());
+            if (state.pc_residual_stage->data == nullptr ||
+                    !ggml_are_same_layout(
+                        pc_partial,
+                        state.pc_residual_stage) ||
+                    !ggml_are_same_layout(
+                        residual_src,
+                        state.pc_residual_stage)) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "reason=PC_RESIDUAL_STAGE_LAYOUT action=STOP\n",
+                    layer, chunk, sg);
+                restore_c2p_route_bindings(
+                    state.pc_bindings);
+                return GGML_STATUS_FAILED;
+            }
+
+            ggml_backend_tensor_copy(
+                residual_src,
+                state.pc_residual_stage);
+            ggml_backend_synchronize(
+                backend_ctx->backend_configs[0].backend);
+
             state.pc_prepared = true;
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_RESIDUAL_STAGE] "
+                    "layer=%d chunk=%d slot=%zu source=%s "
+                    "bytes=%zu mode=%s status=READY\n",
+                    layer,
+                    chunk,
+                    state.slot,
+                    residual_src->name,
+                    ggml_nbytes(state.pc_residual_stage),
+                    local_residual != nullptr &&
+                            residual_src == local_residual ?
+                        "CHUNK_LOCAL" :
+                        "FULL_BATCH_VIEW");
+            }
 
             if (pipeline_debug) {
                 printf(
