@@ -15355,6 +15355,9 @@ auto prefill_norm_sg_has_prework =
         }
         if (phone_block_fused) {
             i = communication_sg;
+            if (!region_pipeline_active) {
+                schedule_pos = communication_sg;
+            }
         }
 
         if (timing_first_layer >= 0) {
