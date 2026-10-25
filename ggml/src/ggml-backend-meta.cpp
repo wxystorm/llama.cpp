@@ -13655,6 +13655,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
     std::vector<int64_t> region_pipe_completion_wait_begin_us(
         region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
+    std::vector<int64_t> region_pipe_completion_event_us(
+        region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
 
     if (region_pipeline_active &&
             backend_ctx->region_completion_worker == nullptr) {
@@ -13970,11 +13972,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 ggml_time_us() - wait_begin_us;
             const int64_t producer_us =
                 completion_index <
-                            region_pipe_completion_wait_begin_us
+                            region_pipe_completion_event_us
                                 .size() &&
+                        region_pipe_completion_event_us[
+                            completion_index] != 0 &&
                         region_pipe_completion_wait_begin_us[
                             completion_index] != 0 ?
-                    ggml_time_us() -
+                    region_pipe_completion_event_us[
+                        completion_index] -
                         region_pipe_completion_wait_begin_us[
                             completion_index] :
                     wait_us;
@@ -14016,6 +14021,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             if (completion_index <
                     region_pipe_completion_wait_begin_us.size()) {
                 region_pipe_completion_wait_begin_us[
+                    completion_index] = 0;
+            }
+            if (completion_index <
+                    region_pipe_completion_event_us.size()) {
+                region_pipe_completion_event_us[
                     completion_index] = 0;
             }
 
@@ -16288,6 +16298,15 @@ auto prefill_norm_sg_has_prework =
                                             ->backend_configs[1]
                                             .backend,
                                         seq);
+                                if (ready &&
+                                        static_cast<size_t>(wait_chunk) <
+                                            region_pipe_completion_event_us
+                                                .size()) {
+                                    region_pipe_completion_event_us[
+                                        static_cast<size_t>(
+                                            wait_chunk)] =
+                                        ggml_time_us();
+                                }
                                 if (pipeline_debug) {
                                     printf(
                                         "[PHONE_REGION_COMPLETION_EVENT] "
