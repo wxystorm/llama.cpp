@@ -16691,8 +16691,14 @@ auto prefill_norm_sg_has_prework =
                     const int64_t submit_wait_us =
                         ggml_time_us() - submit_wait_begin_us;
 
-                    if (return_wavefront_graph &&
+                    if (pc_status == GGML_STATUS_SUCCESS &&
                             submit_status == GGML_STATUS_SUCCESS) {
+                        // Endpoint separation does not depend on the old
+                        // return-wavefront graph shape.  The ordinary
+                        // TENSOR_SPLIT reduce worker already owns the true
+                        // Phone->PC dependency and the existing pending-reduce
+                        // barriers prevent consumers from crossing an
+                        // unfinished reduction.
                         pending_pc_phone_exec_tickets[i] = ticket;
                         phone_status = GGML_STATUS_SUCCESS;
 
@@ -16700,12 +16706,14 @@ auto prefill_norm_sg_has_prework =
                             printf(
                                 "[PC_PHONE_EXEC_V1] side=PC "
                                 "event=DISPATCHED_NO_JOIN "
+                                "wavefront=%d "
                                 "submit_task=%" PRIu64
                                 " completion_task=%" PRIu64
                                 " seq=%" PRIu64
                                 " sg=%zu layer=%d chunk=%d "
                                 "enqueue_ms=%.3f pc_wait_ms=%.3f "
                                 "submit_wait_ms=%.3f\n",
+                                return_wavefront_graph ? 1 : 0,
                                 ticket.submit_task,
                                 ticket.completion_task,
                                 ticket.seq,
@@ -16717,9 +16725,10 @@ auto prefill_norm_sg_has_prework =
                                 submit_wait_us / 1000.0);
                         }
                     } else {
-                        // Conservative fallback when return-wavefront is off:
-                        // preserve synchronous correctness, but completion now
-                        // means the server-side Phone graph really finished.
+                        // Failure cleanup only.  A successful ordinary
+                        // TENSOR_SPLIT dispatch never joins Phone completion
+                        // on the Meta compute thread; the reduce worker owns
+                        // that dependency.
                         ggml_backend_meta_transfer_worker * completion_worker =
                             ensure_phone_exec_completion_worker();
                         const int64_t ready_wait_begin_us =
