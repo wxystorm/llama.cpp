@@ -13614,20 +13614,59 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     std::vector<region_pipe_schedule_entry> region_pipe_schedule;
     const size_t region_pipe_invalid_sg = backend_ctx->n_subgraphs;
     const char * region_pipe_reason = "DISABLED";
+
+    // PC_ONLY layers are direct CPU/CUDA backends, so a repeating model
+    // policy naturally presents Meta with one directional unit at a time.
+    // Discover this invocation's physical boundaries from the actual SGs
+    // instead of hard-coding 34/[35,46)/46.
+    int region_pipe_c2p_layer = -1;
+    int region_pipe_p2c_layer = -1;
+    for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+        int chunk = -1;
+        int layer = -1;
+        if (parse_prefill_sg(sg, false, chunk, layer)) {
+            if (ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, layer)) {
+                if (region_pipe_c2p_layer < 0) {
+                    region_pipe_c2p_layer = layer;
+                } else if (region_pipe_c2p_layer != layer) {
+                    region_pipe_c2p_layer = -2;
+                }
+            }
+            if (ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, layer)) {
+                if (region_pipe_p2c_layer < 0) {
+                    region_pipe_p2c_layer = layer;
+                } else if (region_pipe_p2c_layer != layer) {
+                    region_pipe_p2c_layer = -2;
+                }
+            }
+        }
+    }
+    const int region_pipe_phone_first_layer =
+        region_pipe_c2p_layer >= 0 ?
+            region_pipe_c2p_layer + 1 : -1;
+    const int region_pipe_phone_last_layer =
+        region_pipe_p2c_layer >= 0 ?
+            region_pipe_p2c_layer - 1 : -1;
+
     if (region_pipeline_requested && n_backends == 2 &&
-            ggml_backend_meta_tensor_c2p_layer(backend_ctx, 34) &&
-            ggml_backend_meta_tensor_phone_primary_layer(backend_ctx, 46) &&
+            region_pipe_c2p_layer >= 0 &&
+            region_pipe_p2c_layer >
+                region_pipe_c2p_layer + 1 &&
+            ggml_backend_meta_tensor_phone_primary_layer(
+                backend_ctx, region_pipe_p2c_layer) &&
             !return_wavefront_graph) {
         region_pipe_reason = "TOPOLOGY";
         for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
             int chunk = -1, layer = -1;
             if (parse_prefill_sg(sg, true, chunk, layer) &&
-                    layer == 34 && chunk >= 0) {
+                    layer == region_pipe_c2p_layer && chunk >= 0) {
                 region_pipe_chunks[chunk].norm_sg = sg;
             }
             chunk = -1; layer = -1;
             if (parse_prefill_sg(sg, false, chunk, layer) &&
-                    layer == 34 && chunk >= 0) {
+                    layer == region_pipe_c2p_layer && chunk >= 0) {
                 region_pipe_chunks[chunk].down_sg = sg;
             }
 
@@ -13643,7 +13682,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "phone_region_attn_chunk_%d-%d%n",
                         &parsed_chunk, &parsed_layer, &parsed) == 2 &&
                         name[parsed] == '\0' &&
-                        parsed_chunk >= 0 && parsed_layer == 35) {
+                        parsed_chunk >= 0 &&
+                        parsed_layer == region_pipe_phone_first_layer) {
                     region_pipe_chunks[parsed_chunk].begin_sg = sg;
                 }
                 parsed_chunk = -1; parsed_layer = -1; parsed = 0;
@@ -13651,7 +13691,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "phone_region_chunk_end_%d-%d%n",
                         &parsed_chunk, &parsed_layer, &parsed) == 2 &&
                         name[parsed] == '\0' &&
-                        parsed_chunk >= 0 && parsed_layer == 45 &&
+                        parsed_chunk >= 0 &&
+                        parsed_layer == region_pipe_phone_last_layer &&
                         k + 1 == phone_graph->n_nodes) {
                     region_pipe_chunks[parsed_chunk].end_sg = sg;
                 }
@@ -13738,7 +13779,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                         &marker_layer,
                                         &parsed) == 2 &&
                                         name[parsed] == '\0' &&
-                                        marker_layer == 46 &&
+                                        marker_layer == region_pipe_p2c_layer &&
                                         marker_chunk == (int) c) {
                                     continuation_begin = sg;
                                     found_attn_begin = true;
@@ -13762,7 +13803,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     phone_graph->nodes[k]->name,
                                     route_chunk,
                                     route_layer) &&
-                                    route_layer == 46 &&
+                                    route_layer == region_pipe_p2c_layer &&
                                     route_chunk == (int) c) {
                                 continuation_ready = sg;
                                 break;
@@ -13775,7 +13816,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     if (parse_prefill_sg(
                             sg, false,
                             parsed_chunk, parsed_layer) &&
-                            parsed_layer == 46 &&
+                            parsed_layer == region_pipe_p2c_layer &&
                             parsed_chunk == (int) c) {
                         continuation_down = sg;
                         break;
@@ -13839,7 +13880,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         if (std::sscanf(tensor->name,
                                 "phone_region_chunk_end_%d-%d%n",
                                 &chunk, &layer, &parsed) == 2 &&
-                                tensor->name[parsed] == '\0' && layer == 45) {
+                                tensor->name[parsed] == '\0' &&
+                                layer == region_pipe_phone_last_layer) {
                             if (chunk > (int) c) {
                                 future_output = tensor;
                             }
@@ -13937,7 +13979,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 const auto & e = region_pipe_chunks.at((int) c);
                 char out_name[96];
                 std::snprintf(out_name, sizeof(out_name),
-                              "phone_region_chunk_end_%zu-45", c);
+                              "phone_region_chunk_end_%zu-%d", c,
+                              region_pipe_phone_last_layer);
                 ggml_tensor * output =
                     find_sg_named_tensor(1, e.end_sg, out_name);
                 if (output == nullptr || output->data == nullptr ||
@@ -14044,12 +14087,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     char weights_name[96];
                     std::snprintf(
                         topk_name, sizeof(topk_name),
-                        "c2p_prefill_route_topk_chunk_%zu-34",
-                        c);
+                        "c2p_prefill_route_topk_chunk_%zu-%d",
+                        c, region_pipe_c2p_layer);
                     std::snprintf(
                         weights_name, sizeof(weights_name),
-                        "c2p_prefill_route_weights_chunk_%zu-34",
-                        c);
+                        "c2p_prefill_route_weights_chunk_%zu-%d",
+                        c, region_pipe_c2p_layer);
                     ggml_tensor * pc_topk =
                         find_sg_named_tensor(
                             0, e.down_sg, topk_name);
