@@ -14029,46 +14029,109 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             if (region_pc_overlap_requested) {
-                // V1 PC-side overlap:
+                // PC-side overlap. The validated V1 path keeps one prepared
+                // future Chunk. Event runtime widens that to the actual
+                // window=2 storage budget:
                 //
                 //   C2P0 -> Region0 submit
-                //          -> NORM1 private Phone stage
-                //          -> PC_PREP1 (Router + PC FFN only)
-                //          -> CONTINUE0
-                //          -> Phone FFN/Reduce1 -> Region1 ...
+                //          -> NORM1 + PC_PREP1
+                //          -> NORM2 + PC_PREP2
+                //          -> MAIN Continue0
+                //          -> C2P Phone FFN/Reduce1 -> Region1
+                //          -> NORM3 + PC_PREP3 after slot1 is released
                 //
-                // No future Phone FFN is submitted before the current
-                // continuation. Only PC work and an isolated input transfer
-                // are allowed to overlap the running Phone Region.
+                // Only PC work and isolated transfers are moved ahead.
+                // Future Phone FFN is still not submitted before a ready MAIN
+                // continuation; that becomes the next Phone-local queue step.
                 const auto & first = region_pipe_chunks.at(0);
                 add_sg(first.norm_sg);
                 add_sg(first.down_sg);
                 add_region(first);
 
-                for (size_t chunk = 0;
-                        chunk < region_pipe_chunks.size() &&
-                        eligible; ++chunk) {
-                    const auto & current =
-                        region_pipe_chunks.at((int) chunk);
-                    const size_t next_chunk = chunk + 1;
-                    if (next_chunk < region_pipe_chunks.size()) {
-                        const auto & next =
+                if (region_event_runtime_requested) {
+                    constexpr size_t C2P_LOOKAHEAD_WINDOW = 2;
+                    size_t next_prep = 1;
+                    size_t prepared = 0;
+
+                    while (next_prep <
+                                region_pipe_chunks.size() &&
+                            prepared < C2P_LOOKAHEAD_WINDOW &&
+                            eligible) {
+                        const auto & future =
                             region_pipe_chunks.at(
-                                (int) next_chunk);
-                        add_sg(next.norm_sg);
+                                (int) next_prep);
+                        add_sg(future.norm_sg);
                         add_pc_prep(
-                            next.down_sg,
-                            (int) next_chunk);
+                            future.down_sg,
+                            (int) next_prep);
+                        ++next_prep;
+                        ++prepared;
                     }
 
-                    add_continuation(current);
+                    for (size_t chunk = 0;
+                            chunk < region_pipe_chunks.size() &&
+                            eligible; ++chunk) {
+                        const auto & current =
+                            region_pipe_chunks.at((int) chunk);
+                        add_continuation(current);
 
-                    if (next_chunk < region_pipe_chunks.size()) {
+                        const size_t next_chunk = chunk + 1;
+                        if (next_chunk >=
+                                region_pipe_chunks.size()) {
+                            continue;
+                        }
+
                         const auto & next =
                             region_pipe_chunks.at(
                                 (int) next_chunk);
                         add_sg(next.down_sg);
                         add_region(next);
+
+                        // C2P Reduce(next) releases its overlap slot before
+                        // Region(next) returns to the scheduler. Refill that
+                        // one slot only after Region(next) has been submitted,
+                        // so the new PC work hides under Phone MAIN compute.
+                        if (next_prep <
+                                region_pipe_chunks.size()) {
+                            const auto & future =
+                                region_pipe_chunks.at(
+                                    (int) next_prep);
+                            add_sg(future.norm_sg);
+                            add_pc_prep(
+                                future.down_sg,
+                                (int) next_prep);
+                            ++next_prep;
+                        }
+                    }
+                } else {
+                    // Validated V1 one-Chunk lookahead.
+                    for (size_t chunk = 0;
+                            chunk < region_pipe_chunks.size() &&
+                            eligible; ++chunk) {
+                        const auto & current =
+                            region_pipe_chunks.at((int) chunk);
+                        const size_t next_chunk = chunk + 1;
+                        if (next_chunk <
+                                region_pipe_chunks.size()) {
+                            const auto & next =
+                                region_pipe_chunks.at(
+                                    (int) next_chunk);
+                            add_sg(next.norm_sg);
+                            add_pc_prep(
+                                next.down_sg,
+                                (int) next_chunk);
+                        }
+
+                        add_continuation(current);
+
+                        if (next_chunk <
+                                region_pipe_chunks.size()) {
+                            const auto & next =
+                                region_pipe_chunks.at(
+                                    (int) next_chunk);
+                            add_sg(next.down_sg);
+                            add_region(next);
+                        }
                     }
                 }
             } else {
