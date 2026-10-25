@@ -3898,6 +3898,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    // Only the complete Phone Region prefill graph may use this opt-in
+    // reordered stage schedule. Set to true after structural validation.
+    const char * region_pipeline_env =
+        std::getenv("GGML_META_PHONE_REGION_PIPELINE");
+    const char * region_graph_env =
+        std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
+    const bool region_pipeline_requested =
+        region_pipeline_env != nullptr && std::atoi(region_pipeline_env) != 0 &&
+        region_graph_env != nullptr && std::atoi(region_graph_env) != 0;
+    bool region_pipeline_active = false;
     const char * region_parallel_ffn_env =
         std::getenv("LLAMA_HYBRID_REGION_PARALLEL_FFN");
     const bool region_parallel_ffn =
@@ -10260,7 +10270,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 phone_reduce_graph->nodes[0] = phone_out_chunk;
                 phone_reduce_graph->n_nodes = 1;
 
-                if (last_chunk) {
+                // The region pipeline consumes chunk 0 immediately after its
+                // C2P reduction. The baseline waits until the final C2P
+                // chunk before suppressing the old full-batch l_out producer.
+                // Suppress that producer at chunk 0 in pipeline mode, or it
+                // would overwrite the already Phone-owned partial l_out.
+                if ((!region_pipeline_active && last_chunk) ||
+                    (region_pipeline_active && prefill_down_chunk_0 == 0)) {
                     ggml_tensor * disabled_phone_l_out =
                         disable_layer_output_producers(
                             1, i + 1, prefill_down_layer_0);
@@ -12377,9 +12393,197 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
+    // Opt-in V1: reorder only the already-built, already-allocated Meta
+    // subgraphs. Each C2P chunk may be followed immediately by its complete
+    // L35-L45 Phone Region graph. This gives PC work on chunk N+1 a chance
+    // to overlap the asynchronous Phone execution of chunk N. The existing
+    // C2P route-copy fence still serializes access before the next Phone FFN;
+    // neither KV ordering nor the P2C protocol is changed.
+    struct region_pipe_chunk {
+        size_t norm_sg   = static_cast<size_t>(-1);
+        size_t down_sg   = static_cast<size_t>(-1);
+        size_t begin_sg  = static_cast<size_t>(-1);
+        size_t end_sg    = static_cast<size_t>(-1);
+    };
+    std::map<int, region_pipe_chunk> region_pipe_chunks;
+    std::vector<size_t> region_pipe_schedule;
+    const size_t region_pipe_invalid_sg = backend_ctx->n_subgraphs;
+    const char * region_pipe_reason = "DISABLED";
+    if (region_pipeline_requested && n_backends == 2 &&
+            ggml_backend_meta_tensor_c2p_layer(backend_ctx, 34) &&
+            ggml_backend_meta_tensor_phone_primary_layer(backend_ctx, 46) &&
+            !return_wavefront_graph) {
+        region_pipe_reason = "TOPOLOGY";
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            int chunk = -1, layer = -1;
+            if (parse_prefill_sg(sg, true, chunk, layer) &&
+                    layer == 34 && chunk >= 0) {
+                region_pipe_chunks[chunk].norm_sg = sg;
+            }
+            chunk = -1; layer = -1;
+            if (parse_prefill_sg(sg, false, chunk, layer) &&
+                    layer == 34 && chunk >= 0) {
+                region_pipe_chunks[chunk].down_sg = sg;
+            }
+
+            ggml_cgraph * phone_graph =
+                backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+            if (phone_graph == nullptr) {
+                continue;
+            }
+            for (int k = 0; k < phone_graph->n_nodes; ++k) {
+                const char * name = phone_graph->nodes[k]->name;
+                int parsed_chunk = -1, parsed_layer = -1, parsed = 0;
+                if (std::sscanf(name,
+                        "phone_region_attn_chunk_%d-%d%n",
+                        &parsed_chunk, &parsed_layer, &parsed) == 2 &&
+                        name[parsed] == '\0' &&
+                        parsed_chunk >= 0 && parsed_layer == 35) {
+                    region_pipe_chunks[parsed_chunk].begin_sg = sg;
+                }
+                parsed_chunk = -1; parsed_layer = -1; parsed = 0;
+                if (std::sscanf(name,
+                        "phone_region_chunk_end_%d-%d%n",
+                        &parsed_chunk, &parsed_layer, &parsed) == 2 &&
+                        name[parsed] == '\0' &&
+                        parsed_chunk >= 0 && parsed_layer == 45 &&
+                        k + 1 == phone_graph->n_nodes) {
+                    region_pipe_chunks[parsed_chunk].end_sg = sg;
+                }
+            }
+        }
+
+        // Only the exact direction-pair topology is eligible. In particular,
+        // never reorder an unknown SG, a missing chunk, or a fragmented region
+        // spanning an outer ggml scheduler split.
+        bool eligible = region_pipe_chunks.size() >= 2;
+        size_t first_norm = region_pipe_invalid_sg;
+        size_t last_down = region_pipe_invalid_sg;
+        size_t last_region_end = region_pipe_invalid_sg;
+        for (size_t chunk = 0; eligible &&
+                chunk < region_pipe_chunks.size(); ++chunk) {
+            auto it = region_pipe_chunks.find((int) chunk);
+            if (it == region_pipe_chunks.end()) {
+                eligible = false;
+                break;
+            }
+            const auto & e = it->second;
+            eligible =
+                e.norm_sg < region_pipe_invalid_sg &&
+                e.down_sg < region_pipe_invalid_sg &&
+                e.begin_sg < region_pipe_invalid_sg &&
+                e.end_sg < region_pipe_invalid_sg &&
+                e.norm_sg + 1 == e.down_sg &&
+                e.begin_sg <= e.end_sg;
+            if (!eligible) {
+                break;
+            }
+            if (chunk == 0) {
+                first_norm = e.norm_sg;
+            } else {
+                eligible = e.norm_sg == last_down + 1 &&
+                    e.begin_sg == last_region_end + 1;
+            }
+            last_down = e.down_sg;
+            last_region_end = e.end_sg;
+        }
+        if (eligible) {
+            eligible =
+                region_pipe_chunks.at(0).begin_sg == last_down + 1;
+        }
+        if (eligible) {
+            std::vector<bool> covered(backend_ctx->n_subgraphs, false);
+            auto add_sg = [&](size_t sg) {
+                if (sg >= covered.size() || covered[sg]) {
+                    eligible = false;
+                    return;
+                }
+                covered[sg] = true;
+                region_pipe_schedule.push_back(sg);
+            };
+            for (size_t sg = 0; sg < first_norm; ++sg) {
+                add_sg(sg);
+            }
+            for (size_t chunk = 0;
+                    chunk < region_pipe_chunks.size(); ++chunk) {
+                const auto & e = region_pipe_chunks.at((int) chunk);
+                add_sg(e.norm_sg);
+                add_sg(e.down_sg);
+                add_sg(e.begin_sg);
+                for (size_t sg = e.begin_sg + 1;
+                        sg <= e.end_sg; ++sg) {
+                    if (sg >= covered.size() || covered[sg]) {
+                        eligible = false;
+                        break;
+                    }
+                    covered[sg] = true; // fused into e.begin_sg
+                }
+            }
+            for (size_t sg = last_region_end + 1;
+                    sg < backend_ctx->n_subgraphs; ++sg) {
+                add_sg(sg);
+            }
+            for (bool reached : covered) {
+                eligible = eligible && reached;
+            }
+        }
+        region_pipeline_active = eligible;
+        region_pipe_reason = eligible ? "READY" : "UNSUPPORTED_GRAPH";
+        if (!eligible) {
+            region_pipe_schedule.clear();
+        }
+    }
+    if (region_pipeline_env != nullptr &&
+            std::atoi(region_pipeline_env) != 0) {
+        printf("[PHONE_REGION_PIPE_PLAN] active=%d "
+               "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
+               "reason=%s\n",
+               region_pipeline_active ? 1 : 0,
+               region_pipe_chunks.size(),
+               region_pipe_schedule.size(),
+               backend_ctx->n_subgraphs,
+               region_pipe_reason);
+        if (region_pipeline_active && pipeline_debug) {
+            for (const auto & entry : region_pipe_chunks) {
+                printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
+                       "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
+                       "status=READY\n",
+                       entry.first,
+                       entry.second.norm_sg, entry.second.down_sg,
+                       entry.second.begin_sg, entry.second.end_sg);
+            }
+        }
+    }
+
     bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+    for (size_t schedule_pos = 0;
+            schedule_pos < (region_pipeline_active ?
+                region_pipe_schedule.size() : backend_ctx->n_subgraphs);
+            ++schedule_pos) {
+        size_t i = region_pipeline_active ?
+            region_pipe_schedule[schedule_pos] : schedule_pos;
+        if (region_pipeline_active && pipeline_debug) {
+            int pipeline_chunk = -1;
+            const char * pipeline_stage = nullptr;
+            for (const auto & entry : region_pipe_chunks) {
+                if (i == entry.second.norm_sg) {
+                    pipeline_chunk = entry.first;
+                    pipeline_stage = "C2P_NORM";
+                } else if (i == entry.second.down_sg) {
+                    pipeline_chunk = entry.first;
+                    pipeline_stage = "C2P_FFN_REDUCE";
+                } else if (i == entry.second.begin_sg) {
+                    pipeline_chunk = entry.first;
+                    pipeline_stage = "PHONE_REGION";
+                }
+            }
+            if (pipeline_stage != nullptr) {
+                printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
+                       "sg=%zu stage=%s event=BEGIN\n",
+                       schedule_pos, pipeline_chunk, i, pipeline_stage);
+            }
+        }
         const int64_t layer_wall_start_us = ggml_time_us();
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
