@@ -195,8 +195,15 @@ using ggml_backend_rpc_phone_c2p_register_t = bool (*)(
         uint64_t consume_seq);
 
 using ggml_backend_rpc_phone_c2p_ready_t = bool (*)(
-        ggml_backend_t backend,
-        int32_t chunk);
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        int32_t chunk,
+        const ggml_tensor * src_hidden,
+        ggml_tensor * dst_hidden,
+        const ggml_tensor * src_topk,
+        ggml_tensor * dst_topk,
+        const ggml_tensor * src_weights,
+        ggml_tensor * dst_weights);
 
 using ggml_backend_rpc_phone_c2p_partial_t = bool (*)(
         ggml_backend_t backend_src,
