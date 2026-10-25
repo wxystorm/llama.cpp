@@ -13826,10 +13826,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
             }
 
-            // Pre-connect the independent completion-wait socket while the
-            // Phone is idle. seq=0 is capability-only and does not consume a
-            // marker. The marker itself is sent on the compute socket after
-            // each Region graph, preserving graph -> marker order.
+            // Pre-connect the independent scratch-reuse credit socket while
+            // the Phone is idle. seq=0 is capability-only and consumes no
+            // credit. In local-MAIN mode the server publishes the real credit
+            // only after PARTIAL has been snapshotted; in the legacy fallback
+            // the client publishes it after the synchronous Region submit.
             const ggml_backend_rpc_phone_ffn_mark_ready_t
                 region_mark_ready =
                     ggml_backend_meta_get_phone_ffn_mark_ready(
@@ -14440,14 +14441,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             continue;
         }
 
-        // Region -> L46 is a Phone-local dependency. Do not turn producer
-        // completion into a PC scheduling event: the Region graph and the
-        // L46 Phone graph are submitted on the same ordered COMPUTE socket,
-        // and the RPC server executes graph commands synchronously in FIFO
-        // order. Therefore L46 may be queued immediately after Region while
-        // the Phone is still computing Region; no wait_ready_seq(), completion
-        // worker, REGION_DONE notification, or START_L46 control round-trip
-        // belongs on this edge.
+        // Legacy fallback only. Region -> L46 is a Phone-local dependency,
+        // so even this compatibility path must not turn producer completion
+        // into a PC wait. In local-MAIN mode this schedule entry is removed
+        // entirely and the server owns Region -> L46 Attention -> FFN.
+        // No wait_ready_seq(), completion worker, REGION_DONE notification,
+        // or START_L46 control round-trip belongs on this edge.
         //
         // Completion seqs are retained only by phone_region_scratch_slots for
         // safe N%%2 scratch-buffer reuse. They are memory-lifetime credits,
