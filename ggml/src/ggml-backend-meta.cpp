@@ -2722,19 +2722,25 @@ struct ggml_backend_meta_priority_worker {
     std::mutex mutex;
     std::condition_variable task_cv;
     std::condition_variable done_cv;
+    std::condition_variable idle_cv;
     std::deque<task> high_tasks;
     std::deque<task> low_tasks;
     std::unordered_map<uint64_t, completion> completions;
     uint64_t submitted = 0;
     bool stop = false;
+    bool pause_requested = false;
+    bool paused = false;
+    bool running = false;
 
     ggml_backend_meta_priority_worker() : worker([this]() {
         std::unique_lock<std::mutex> lock(mutex);
         while (true) {
             task_cv.wait(lock, [&]() {
                 return stop ||
-                       !high_tasks.empty() ||
-                       !low_tasks.empty();
+                       (!paused &&
+                        (!high_tasks.empty() ||
+                         !low_tasks.empty())) ||
+                       (pause_requested && !paused);
             });
             if (stop &&
                     high_tasks.empty() &&
@@ -2743,7 +2749,28 @@ struct ggml_backend_meta_priority_worker {
             }
 
             task current;
-            if (!high_tasks.empty()) {
+            if (pause_requested && !stop) {
+                // A graph-arena pause drains already-ready HIGH work, but
+                // leaves LOW work queued. Once paused, newly arriving work is
+                // held until the caller has finished its graph + snapshots.
+                if (!high_tasks.empty()) {
+                    current = std::move(high_tasks.front());
+                    high_tasks.pop_front();
+                } else {
+                    paused = true;
+                    idle_cv.notify_all();
+                    task_cv.wait(lock, [&]() {
+                        return stop || !pause_requested;
+                    });
+                    paused = false;
+                    if (stop &&
+                            high_tasks.empty() &&
+                            low_tasks.empty()) {
+                        return;
+                    }
+                    continue;
+                }
+            } else if (!high_tasks.empty()) {
                 current = std::move(high_tasks.front());
                 high_tasks.pop_front();
             } else {
@@ -2751,16 +2778,19 @@ struct ggml_backend_meta_priority_worker {
                 low_tasks.pop_front();
             }
 
+            running = true;
             lock.unlock();
             const ggml_status task_status =
                 current.run(current.id);
             lock.lock();
+            running = false;
 
             auto it = completions.find(current.id);
             GGML_ASSERT(it != completions.end());
             it->second.done = true;
             it->second.status = task_status;
             done_cv.notify_all();
+            idle_cv.notify_all();
         }
     }) {}
 
@@ -2814,6 +2844,26 @@ struct ggml_backend_meta_priority_worker {
     size_t pending_low() {
         std::lock_guard<std::mutex> lock(mutex);
         return low_tasks.size();
+    }
+
+    void pause_for_graph_arena() {
+        std::unique_lock<std::mutex> lock(mutex);
+        GGML_ASSERT(!pause_requested && !paused);
+        pause_requested = true;
+        task_cv.notify_all();
+        idle_cv.wait(lock, [&]() {
+            return paused && !running;
+        });
+    }
+
+    void resume_after_graph_arena() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(pause_requested && paused && !running);
+            pause_requested = false;
+            paused = false;
+        }
+        task_cv.notify_all();
     }
 };
 
