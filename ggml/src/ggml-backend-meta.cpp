@@ -14828,11 +14828,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     ggml_time_us() -
                                     compute_begin_us;
 
-                                if (!ggml_backend_tensor_copy(
-                                        pc_partial,
-                                        pc_local_stage)) {
-                                    return GGML_STATUS_FAILED;
-                                }
+                                ggml_backend_tensor_copy(
+                                    pc_partial,
+                                    pc_local_stage);
                                 ggml_backend_synchronize(
                                     pc_backend);
 
