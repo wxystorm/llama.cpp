@@ -3990,6 +3990,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_pc_overlap_requested =
         region_pc_overlap_env != nullptr &&
         std::atoi(region_pc_overlap_env) != 0;
+    const char * region_local_main_env =
+        std::getenv("GGML_META_PHONE_REGION_LOCAL_MAIN");
+    const bool region_local_main_requested =
+        region_local_main_env != nullptr &&
+        std::atoi(region_local_main_env) != 0;
+    bool region_local_main_active = false;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -13182,6 +13188,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         size_t begin_sg             = static_cast<size_t>(-1);
         size_t end_sg               = static_cast<size_t>(-1);
         size_t continuation_begin_sg = static_cast<size_t>(-1);
+        size_t continuation_ready_sg = static_cast<size_t>(-1);
         size_t continuation_end_sg   = static_cast<size_t>(-1);
     };
     enum class region_pipe_schedule_kind {
@@ -13292,6 +13299,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 auto & e = region_pipe_chunks.at((int) c);
                 size_t continuation_begin =
                     region_pipe_invalid_sg;
+                size_t continuation_ready =
+                    region_pipe_invalid_sg;
                 size_t continuation_down =
                     region_pipe_invalid_sg;
 
@@ -13331,6 +13340,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         }
                     }
 
+                    if (continuation_ready >=
+                            region_pipe_invalid_sg) {
+                        ggml_cgraph * phone_graph =
+                            backend_ctx->backend_configs[1]
+                                .cgraphs[sg].cgraph_main;
+                        for (int k = 0;
+                                phone_graph != nullptr &&
+                                k < phone_graph->n_nodes; ++k) {
+                            int route_chunk = -1;
+                            int route_layer = -1;
+                            if (ggml_backend_meta_parse_phone_route_weights(
+                                    phone_graph->nodes[k]->name,
+                                    route_chunk,
+                                    route_layer) &&
+                                    route_layer == 46 &&
+                                    route_chunk == (int) c) {
+                                continuation_ready = sg;
+                                break;
+                            }
+                        }
+                    }
+
                     int parsed_chunk = -1;
                     int parsed_layer = -1;
                     if (parse_prefill_sg(
@@ -13350,11 +13381,27 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "CONTINUATION_ATTN_NOT_FOUND";
                     break;
                 }
+                if (continuation_ready >=
+                        region_pipe_invalid_sg) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_READY_NOT_FOUND";
+                    break;
+                }
                 if (continuation_down >=
                         region_pipe_invalid_sg) {
                     eligible = false;
                     region_pipe_reason =
                         "CONTINUATION_DOWN_NOT_FOUND";
+                    break;
+                }
+                if (continuation_begin >
+                        continuation_ready ||
+                        continuation_ready >=
+                            continuation_down) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_READY_ORDER_INVALID";
                     break;
                 }
                 if (continuation_begin >
@@ -13367,6 +13414,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                 e.continuation_begin_sg =
                     continuation_begin;
+                e.continuation_ready_sg =
+                    continuation_ready;
                 e.continuation_end_sg =
                     continuation_down;
 
@@ -14149,11 +14198,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             for (const auto & entry : region_pipe_chunks) {
                 printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
                        "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
-                       "p2c=[%zu,%zu] status=READY\n",
+                       "p2c=[%zu,%zu,%zu] status=READY\n",
                        entry.first,
                        entry.second.norm_sg, entry.second.down_sg,
                        entry.second.begin_sg, entry.second.end_sg,
                        entry.second.continuation_begin_sg,
+                       entry.second.continuation_ready_sg,
                        entry.second.continuation_end_sg);
             }
         }
