@@ -14007,7 +14007,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             slot.owner_chunk = -1;
             slot.completion_seq = 0;
             region_pipe_completion_seq[
-                static_cast<size_t>(pipeline_chunk)] = 0;
+                completion_index] = 0;
+            if (completion_index <
+                    region_pipe_completion_wait_task.size()) {
+                region_pipe_completion_wait_task[
+                    completion_index] = 0;
+            }
+            if (completion_index <
+                    region_pipe_completion_wait_begin_us.size()) {
+                region_pipe_completion_wait_begin_us[
+                    completion_index] = 0;
+            }
 
             if (pipeline_debug) {
                 printf("[PHONE_REGION_CONTINUATION_WAIT] "
@@ -15243,7 +15253,9 @@ auto prefill_norm_sg_has_prework =
                 pending_prefill_input_layer = -1;
                 pending_prefill_input_chunk = -1;
                 if (input_status != GGML_STATUS_SUCCESS) {
-                    compute_workers.wait(0);
+                    if (!c2p_pc_preworked) {
+                        compute_workers.wait(0);
+                    }
                     if (c2p_pc_graph != nullptr) {
                         c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                     }
