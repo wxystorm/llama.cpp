@@ -34,7 +34,8 @@ def main() -> int:
         r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
         r"(?:scratch_pool=(\d+) )?"
         r"(?:continuation=(\d+) )?"
-        r"(?:pc_overlap=(\d+) )?reason=([^\s]+)"
+        r"(?:pc_overlap=(\d+) )?"
+        r"(?:event_runtime=(\d+) )?reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -43,7 +44,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(9)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(10)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -101,6 +102,7 @@ def main() -> int:
             return 1
 
     pc_overlap = plan.group(8) == "1"
+    event_runtime = plan.group(9) == "1"
 
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
@@ -246,6 +248,57 @@ def main() -> int:
         )
         if reject:
             print("FAIL: REGION_C2P_OVERLAP_REJECT present")
+            return 1
+
+    if event_runtime:
+        registered = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[PHONE_REGION_EVENT_REGISTER\] "
+                r"chunk=(\d+) seq=\d+ task=\d+ "
+                r"queue=MAIN status=WATCHING",
+                block,
+            )
+        ]
+        ready = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[PHONE_REGION_EVENT_READY\] "
+                r"chunk=(\d+) seq=\d+ task=\d+ "
+                r"remote_wait_ms=[0-9.]+ "
+                r"queue=MAIN status=READY",
+                block,
+            )
+        ]
+        dequeued = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[PHONE_REGION_MAIN_READY\] "
+                r"chunk=(\d+) seq=\d+ task=\d+ "
+                r"event_ready_before_dequeue=[01] "
+                r"dequeue_wait_ms=[0-9.]+ priority=MAIN "
+                r"status=READY",
+                block,
+            )
+        ]
+        expected_events = list(range(n_chunks))
+        if registered != expected_events:
+            print(
+                f"FAIL: completion registrations={registered}; "
+                f"expected={expected_events}"
+            )
+            return 1
+        if ready != expected_events:
+            print(
+                f"FAIL: completion ready events={ready}; "
+                f"expected={expected_events}"
+            )
+            return 1
+        if dequeued != expected_events:
+            print(
+                f"FAIL: MAIN ready dequeues={dequeued}; "
+                f"expected={expected_events}"
+            )
             return 1
 
     for pattern, event in [
@@ -414,9 +467,10 @@ def main() -> int:
         return 1
 
     mode = "pc-overlap" if pc_overlap else "baseline"
+    runtime = "event" if event_runtime else "sync"
     print(
         f"PASS: {n_chunks} C2P -> Phone Region -> L46 continuations are "
-        f"chunk-pipelined (window=2, mode={mode}, "
+        f"chunk-pipelined (window=2, mode={mode}, runtime={runtime}, "
         f"{plan.group(4)} Meta schedule entries)"
     )
     print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
