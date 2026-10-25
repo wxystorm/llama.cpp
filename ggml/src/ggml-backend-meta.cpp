@@ -10033,6 +10033,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             auto & pc_cfg =
                 backend_ctx->backend_configs[j_dst];
 
+            const auto local_main_partial_it =
+                phone_region_local_main_chunks.find(
+                    prefill_down_chunk_0);
+            const bool local_main_partial =
+                region_pipeline_active &&
+                region_local_main_active &&
+                prefill_down_layer_0 == 46 &&
+                local_main_partial_it !=
+                    phone_region_local_main_chunks.end() &&
+                local_main_partial_it->second.submitted;
+
             ggml_tensor * phone_partial = nodes[j_src];
             ggml_tensor * pc_partial = nodes[j_dst];
             GGML_ASSERT(ggml_is_contiguous(phone_partial));
@@ -10160,6 +10171,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             std::vector<float> phone_before;
             std::vector<float> residual_before;
             if (c2p_self_check &&
+                    !local_main_partial &&
                     pc_partial->type == GGML_TYPE_F32 &&
                     phone_partial->type == GGML_TYPE_F32 &&
                     residual_chunk->type == GGML_TYPE_F32) {
@@ -10181,24 +10193,52 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     0, n * sizeof(float));
             }
 
-            const int64_t phone_fold_begin_us =
-                ggml_time_us();
-            ggml_backend_synchronize(phone_cfg.backend);
-            ggml_status status =
-                ggml_backend_graph_compute_async(
-                    phone_cfg.backend, phone_fold_graph);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+            int64_t phone_fold_us = 0;
+            ggml_status status = GGML_STATUS_SUCCESS;
+            if (!local_main_partial) {
+                const int64_t phone_fold_begin_us =
+                    ggml_time_us();
+                ggml_backend_synchronize(phone_cfg.backend);
+                status =
+                    ggml_backend_graph_compute_async(
+                        phone_cfg.backend, phone_fold_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                ggml_backend_synchronize(phone_cfg.backend);
+                phone_fold_us =
+                    ggml_time_us() - phone_fold_begin_us;
             }
-            ggml_backend_synchronize(phone_cfg.backend);
-            const int64_t phone_fold_us =
-                ggml_time_us() - phone_fold_begin_us;
 
+            const ggml_backend_rpc_set_snapshot_read_t
+                snapshot_read =
+                    local_main_partial ?
+                        ggml_backend_meta_get_snapshot_read_setter(
+                            phone_cfg.backend) :
+                        nullptr;
+            if (local_main_partial && snapshot_read == nullptr) {
+                printf("[PHONE_REGION_PARTIAL_REJECT] "
+                       "layer=%d chunk=%d "
+                       "reason=SNAPSHOT_READ_UNAVAILABLE action=STOP\n",
+                       prefill_down_layer_0,
+                       prefill_down_chunk_0);
+                return GGML_STATUS_FAILED;
+            }
+
+            if (local_main_partial) {
+                snapshot_read(
+                    true,
+                    local_main_partial_it->second.partial_slot,
+                    local_main_partial_it->second.partial_seq);
+            }
             const int64_t copy_begin_us = ggml_time_us();
             ggml_backend_tensor_copy_async(
                 phone_cfg.backend, pc_cfg.backend,
                 phone_partial, pc_tmp);
             ggml_backend_synchronize(pc_cfg.backend);
+            if (local_main_partial) {
+                snapshot_read(false, 0, 0);
+            }
             const int64_t copy_us =
                 ggml_time_us() - copy_begin_us;
             record_copy_wait(copy_us);
@@ -10206,13 +10246,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 i, j_src, j_dst, phone_partial, copy_us);
             record_direct_copy();
 
-            directional_wire_parity(
-                "P2C",
-                prefill_down_layer_0,
-                prefill_down_chunk_0,
-                "PHONE_PARTIAL_PLUS_RESIDUAL",
-                j_src, j_dst,
-                phone_partial, pc_tmp);
+            if (!local_main_partial) {
+                directional_wire_parity(
+                    "P2C",
+                    prefill_down_layer_0,
+                    prefill_down_chunk_0,
+                    "PHONE_PARTIAL_PLUS_RESIDUAL",
+                    j_src, j_dst,
+                    phone_partial, pc_tmp);
+            } else if (pipeline_debug) {
+                printf("[PHONE_REGION_PARTIAL_CONSUME] "
+                       "layer=%d chunk=%d seq=%" PRIu64
+                       " slot=%u bytes=%zu source=SNAPSHOT status=OK\n",
+                       prefill_down_layer_0,
+                       prefill_down_chunk_0,
+                       local_main_partial_it->second.partial_seq,
+                       local_main_partial_it->second.partial_slot,
+                       ggml_nbytes(pc_tmp));
+            }
 
             const int64_t pc_reduce_begin_us =
                 ggml_time_us();
@@ -10271,19 +10322,30 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     max_abs <= 1e-4 ? "PASS" : "FAIL");
             }
 
+            if (local_main_partial) {
+                pending_phone_prefill_routes.erase(
+                    { prefill_down_layer_0,
+                      prefill_down_chunk_0 });
+                phone_region_local_main_chunks.erase(
+                    prefill_down_chunk_0);
+            }
+
             if (pipeline_debug) {
                 printf(
                     "[REGION_P2C_PREFILL] layer=%d chunk=%d "
                     "last=%d bytes=%zu phone_fold_ms=%.3f "
                     "copy_ms=%.3f pc_reduce_ms=%.3f "
-                    "owner=PC status=OK\n",
+                    "owner=PC source=%s status=OK\n",
                     prefill_down_layer_0,
                     prefill_down_chunk_0,
                     last_chunk ? 1 : 0,
                     ggml_nbytes(phone_partial),
                     phone_fold_us / 1000.0,
                     copy_us / 1000.0,
-                    pc_reduce_us / 1000.0);
+                    pc_reduce_us / 1000.0,
+                    local_main_partial ?
+                        "PHONE_MAIN_SNAPSHOT" :
+                        "LEGACY_LIVE");
             }
 
             return GGML_STATUS_SUCCESS;
