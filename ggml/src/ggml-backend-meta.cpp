@@ -14020,8 +14020,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        wait_us / 1000.0,
                        producer_us / 1000.0,
                        wait_task != 0 ?
-                           "ASYNC_EVENT" : "DIRECT",
-                       );
+                           "ASYNC_EVENT" : "DIRECT");
             }
         }
 
