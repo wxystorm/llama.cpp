@@ -16181,6 +16181,53 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         chunk,
                     });
                 };
+            auto add_pc_prefix_gap =
+                [&](int chunk) {
+                    if (chunk <= 0) {
+                        return;
+                    }
+                    const auto prev_it =
+                        region_pipe_chunks.find(chunk - 1);
+                    const auto cur_it =
+                        region_pipe_chunks.find(chunk);
+                    if (prev_it == region_pipe_chunks.end() ||
+                            cur_it == region_pipe_chunks.end()) {
+                        eligible = false;
+                        return;
+                    }
+
+                    const size_t begin =
+                        prev_it->second.down_sg + 1;
+                    const size_t end =
+                        cur_it->second.norm_sg;
+                    if (begin > end ||
+                            end > covered.size()) {
+                        eligible = false;
+                        return;
+                    }
+
+                    for (size_t sg = begin;
+                            sg < end; ++sg) {
+                        if (!covered[sg]) {
+                            add_sg(sg);
+                            if (!eligible) {
+                                return;
+                            }
+                        }
+                    }
+
+                    if (pipeline_debug &&
+                            end > begin) {
+                        printf(
+                            "[PC_PREFIX_CHUNK_SCHEDULE] "
+                            "chunk=%d sg=[%zu,%zu) "
+                            "before_norm=%zu status=READY\n",
+                            chunk,
+                            begin,
+                            end,
+                            cur_it->second.norm_sg);
+                    }
+                };
             auto add_region =
                 [&](const region_pipe_chunk & e) {
                     add_sg(e.begin_sg);
@@ -16241,6 +16288,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         const auto & future =
                             region_pipe_chunks.at(
                                 (int) next_prep);
+                        add_pc_prefix_gap(
+                            (int) next_prep);
                         add_sg(future.norm_sg);
                         add_pc_prep(
                             future.down_sg,
@@ -16278,6 +16327,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             const auto & future =
                                 region_pipe_chunks.at(
                                     (int) next_prep);
+                            add_pc_prefix_gap(
+                                (int) next_prep);
                             add_sg(future.norm_sg);
                             add_pc_prep(
                                 future.down_sg,
@@ -16301,6 +16352,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             const auto & next =
                                 region_pipe_chunks.at(
                                     (int) next_chunk);
+                            add_pc_prefix_gap(
+                                (int) next_chunk);
                             add_sg(next.norm_sg);
                             add_pc_prep(
                                 next.down_sg,
