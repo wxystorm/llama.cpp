@@ -273,6 +273,21 @@ def main() -> int:
                 print(f"FAIL: {event} chunks={found}; expected 0..{n_chunks - 1}")
                 return 1
 
+        partial_gets = [
+            (int(m.group(1)), int(m.group(2)))
+            for m in re.finditer(
+                r"\[PHONE_REGION_PARTIAL_GET\] side=pc "
+                r"slot=(\d+) seq=(\d+) bytes=\d+ .*?status=OK",
+                block,
+            )
+        ]
+        if len(partial_gets) != n_chunks:
+            print(
+                f"FAIL: dedicated PARTIAL GET records={partial_gets}; "
+                f"expected {n_chunks}"
+            )
+            return 1
+
         p2c_sources = [
             int(m.group(1))
             for m in re.finditer(
