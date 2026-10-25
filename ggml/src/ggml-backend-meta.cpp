@@ -2421,6 +2421,10 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
+    // Serialize final P2C PC reduces on one backend-owning worker. Route and
+    // snapshot receivers remain independent; only backend graph execution is
+    // single-lane until the later priority executor replaces this bridge.
+    ggml_backend_meta_transfer_worker * phone_main_pc_reduce_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -3042,6 +3046,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
+    delete phone_main_pc_reduce_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
