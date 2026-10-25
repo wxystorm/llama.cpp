@@ -121,6 +121,23 @@ The pool prewarm now also:
 
 The Region hot path therefore performs descriptor-only pointer rebinding and logs `mode=PREBOUND`; it must not issue a lazy `BUFFER_GET_BASE` request or rescan all Meta subgraphs. Expected preflight now includes `output_plans=<chunks>`.
 
+### Per-slot completion credit (RPC patch 13)
+
+After prebinding removed the output stall, hardware showed `chunk=2 slot=0 reuse_wait_ms≈1315`. The old scratch reuse path called `RPC_CMD_SYNCHRONIZE`, which waits for the **current whole Phone queue**. With Region0 and Region1 both submitted, slot0 reuse therefore waited for Region1 as well even though only Region0 owns slot0.
+
+RPC patch 13 adds a dedicated completion-wait socket and `RPC_CMD_WAIT_READY_SEQ`. Region chunks whose slot will be reused enqueue an existing `PHONE_FFN_MARK_READY(seq)` marker immediately after their graph on the compute socket. Because the server processes that marker only after the preceding graph completes, it precisely marks that slot's producer completion. A later slot reuse waits for that seq through the independent completion socket; Region1 may continue running while slot0 becomes reusable.
+
+Expected three-chunk trace:
+
+```
+[PHONE_REGION_POOL_PREP] ... seq_fence=1 ... reason=READY
+[PHONE_REGION_SLOT_CREDIT] chunk=0 slot=0 seq=... marked=1 future_chunk=2
+...
+[PHONE_REGION_SCRATCH] chunk=2 slot=0 ... reuse_wait_ms=... wait_mode=SEQ status=BOUND
+```
+
+If the seq feature is unavailable, the experimental pipeline fails preflight. At runtime, any missing marker/wait falls back to the previous global fence for correctness. Patch 13 changes the RPC protocol, so **PC and Phone server must be rebuilt from the same commit**.
+
 Each Region stage now also prints:
 
 ```
