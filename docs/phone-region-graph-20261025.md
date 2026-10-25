@@ -16,6 +16,17 @@ For a **single-chunk** request, `l_out-45` uses a separate zero-copy view to pre
 
 The changes are still uncompiled and unverified on Windows/Phone hardware. They specifically address the earlier failure in which an internal `Kcur-41 (view)` was mistaken for a Phone-to-PC layer output at `ggml-backend-meta.cpp:8885`.
 
+## Fix after first 358-token execution failure
+
+The previous test successfully completed C2P prefill chunks 0/1/2 but stopped at:
+`[PHONE_REGION_GRAPH_REJECT] chunk=0 sg=7 node=phone_region_input-35 op=CONT reason=PC_COMPUTE_ACTIVE`.
+
+That `CONT` made a new full-size activation from `l_out-34`. On this Meta layout it was flagged COMPUTE on both PC and Phone; the PC copy would have used a stale shadow of a Phone-owned C2P output, so disabling the ownership guard would be unsafe.
+
+The graph builder now **removes the full-batch CONT** and directly makes chunk views of the contiguous Phone-owned C2P result. Non-contiguous input is rejected with an explicit assertion rather than silently copied. The Meta fusion ownership validator still rejects every real PC compute node (especially CONT/CPY/MUL_MAT); only inherently metadata-only PC operations (VIEW/RESHAPE/PERMUTE/TRANSPOSE) may have their inherited COMPUTE flags ignored, with a `[PHONE_REGION_GRAPH_OWNERSHIP]` summary.
+
+Next run should report `[PHONE_REGION_GRAPH_OWNERSHIP] chunk=0 ... pc_compute=0 status=SAFE` and `[PHONE_REGION_GRAPH_DONE] chunk=0 ... status=0`, followed by chunks 1 and 2. Continue to check output parity, KV ordering, and buffer lifetime before treating the fused graph as verified.
+
 ## First hardware verification (REQUIRED; not yet run)
 
 1. Build and restart matching PC and Phone server binaries at the same branch commit. Compare protocol versions and hashes.
