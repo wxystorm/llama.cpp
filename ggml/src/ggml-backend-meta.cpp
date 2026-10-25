@@ -11065,8 +11065,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 const bool c2p_numeric_trace =
-                    c2p_self_check ||
-                    std::getenv("GGML_META_REGION_C2P_NUMERIC_TRACE") != nullptr;
+                    !phone_main_local_active &&
+                    (c2p_self_check ||
+                     std::getenv(
+                         "GGML_META_REGION_C2P_NUMERIC_TRACE") != nullptr);
                 std::vector<float> c2p_pc_partial;
                 std::vector<float> c2p_phone_partial;
                 std::vector<float> c2p_residual;
@@ -11145,102 +11147,64 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_time_us() - pc_fold_begin_us;
 
                 if (phone_main_local_active) {
-                    auto state_it =
+                    const auto main_it =
                         phone_main_local_chunks.find(
                             prefill_down_chunk_0);
-                    if (state_it ==
+                    const auto overlap_it =
+                        region_c2p_overlap_chunks.find({
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                        });
+                    if (main_it ==
                             phone_main_local_chunks.end() ||
-                            !state_it->second.graphs_registered) {
+                            overlap_it ==
+                                region_c2p_overlap_chunks.end() ||
+                            !main_it->second.graphs_registered ||
+                            !main_it->second.main_registered ||
+                            !main_it->second.c2p_registered ||
+                            !overlap_it->second.c2p_ready_sent ||
+                            main_it->second.c2p_reduce_uid == 0 ||
+                            main_it->second.c2p_phone_pc_partial ==
+                                nullptr) {
                         printf(
                             "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d reason=STATE_NOT_PREPARED "
+                            "chunk=%d reason=C2P_PARTIAL_STATE "
                             "action=STOP\n",
                             prefill_down_chunk_0);
                         return GGML_STATUS_FAILED;
                     }
                     auto & main_state =
-                        state_it->second;
+                        main_it->second;
 
-                    const uint64_t base_uid =
-                        backend_ctx->backend_configs[1]
-                            .cgraphs[i].cgraph_main->uid;
-                    uint64_t trigger_uid =
-                        base_uid ^
-                        0x4d41494e43325052ULL ^
-                        (uint64_t)
-                            (prefill_down_chunk_0 + 1) *
-                            0x9e3779b97f4a7c15ULL;
-                    if (trigger_uid == 0) {
-                        trigger_uid = 1;
-                    }
-                    phone_reduce_graph->uid =
-                        trigger_uid;
-                    main_state.trigger_reduce_uid =
-                        trigger_uid;
-
-                    const ggml_backend_rpc_phone_main_register_t
-                        main_register =
-                            ggml_backend_meta_get_phone_main_register(
+                    const ggml_backend_rpc_phone_c2p_partial_t
+                        c2p_partial =
+                            ggml_backend_meta_get_phone_c2p_partial(
                                 bcj_src.backend);
-                    const ggml_backend_rpc_set_tensor_graph_t
-                        local_set_tensor_graph =
-                            ggml_backend_meta_get_set_tensor_graph(
-                                bcj_src.backend);
-                    if (main_register == nullptr ||
-                            local_set_tensor_graph == nullptr) {
+                    if (c2p_partial == nullptr) {
                         return GGML_STATUS_FAILED;
-                    }
-
-                    if (!main_state.main_registered) {
-                        const bool registered =
-                            main_register(
-                                bcj_src.backend,
-                                prefill_down_chunk_0,
-                                trigger_uid,
-                                main_state.region_uid,
-                                main_state.p2c_attention_uid,
-                                main_state.p2c_ffn_uid,
-                                main_state.ready_seq,
-                                main_state.ready_lane,
-                                main_state.ready_hidden,
-                                main_state.ready_topk,
-                                main_state.ready_weights,
-                                main_state.partial_seq,
-                                main_state.partial_slot,
-                                main_state.phone_folded_partial);
-                        if (!registered) {
-                            printf(
-                                "[PHONE_MAIN_LOCAL_REJECT] "
-                                "chunk=%d trigger_uid=%" PRIu64
-                                " reason=MAIN_REGISTER_FAILED "
-                                "action=STOP\n",
-                                prefill_down_chunk_0,
-                                trigger_uid);
-                            return GGML_STATUS_FAILED;
-                        }
-                        main_state.main_registered = true;
                     }
 
                     const int64_t send_begin_us =
                         ggml_time_us();
                     const bool submitted =
-                        local_set_tensor_graph(
+                        c2p_partial(
                             bcj_dst.backend,
                             bcj_src.backend,
+                            prefill_down_chunk_0,
+                            main_state.c2p_reduce_uid,
                             node_dst,
-                            phone_tmp,
-                            phone_reduce_graph);
+                            main_state.c2p_phone_pc_partial);
                     const int64_t send_us =
                         ggml_time_us() -
                         send_begin_us;
                     if (!submitted) {
                         printf(
                             "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d trigger_uid=%" PRIu64
-                            " reason=TRIGGER_SEND_FAILED "
+                            "chunk=%d reduce_uid=%" PRIu64
+                            " reason=C2P_PARTIAL_SEND_FAILED "
                             "action=STOP\n",
                             prefill_down_chunk_0,
-                            trigger_uid);
+                            main_state.c2p_reduce_uid);
                         return GGML_STATUS_FAILED;
                     }
 
@@ -11254,14 +11218,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     if (pipeline_debug) {
                         printf(
-                            "[PHONE_MAIN_C2P_TRIGGER_SEND] "
-                            "layer=%d chunk=%d trigger_uid=%" PRIu64
+                            "[PHONE_C2P_PARTIAL_SEND] "
+                            "layer=%d chunk=%d reduce_uid=%" PRIu64
+                            " consume_seq=%" PRIu64
                             " bytes=%zu pc_fold_ms=%.3f "
-                            "send_ms=%.3f owner=PHONE "
-                            "wait_phone=0 status=QUEUED\n",
+                            "send_ms=%.3f wait_phone=0 "
+                            "next=SERVER_ADMISSION status=READY\n",
                             prefill_down_layer_0,
                             prefill_down_chunk_0,
-                            trigger_uid,
+                            main_state.c2p_reduce_uid,
+                            main_state.c2p_consume_seq,
                             ggml_nbytes(node_dst),
                             pc_fold_us / 1000.0,
                             send_us / 1000.0);
