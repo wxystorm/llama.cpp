@@ -5109,6 +5109,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
                    (void *) res_use);
         }
 
+        const bool region_cycle_one_sequence =
+            ubatch.n_seqs_unq == 1 &&
+            (!ubatch.equal_seqs() || ubatch.n_seqs == 1);
+        const bool region_cycle_candidate =
+            region_cycle_runtime_enabled &&
+            cparams.causal_attn &&
+            ubatch.n_tokens > 0 &&
+            ubatch.n_tokens <= 512 &&
+            (ubatch.token != nullptr ||
+             ubatch.embd != nullptr) &&
+            ubatch.n_pos == 1 &&
+            region_cycle_one_sequence &&
+            !cparams.embeddings &&
+            !cparams.embeddings_nextn &&
+            cparams.cb_eval == nullptr &&
+            loras->empty() &&
+            std::none_of(
+                cparams.embeddings_layer_inp.begin(),
+                cparams.embeddings_layer_inp.end(),
+                [](bool enabled) { return enabled; });
+
         bool generalized_stage_queue_candidate =
             generalized_stage_queue_runtime_enabled && cparams.causal_attn && ubatch.n_tokens > 1 &&
             ubatch.token != nullptr && ubatch.embd == nullptr && ubatch.n_pos == 1 && !ubatch.equal_seqs() &&
@@ -5162,7 +5183,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const llm_graph_result * res          = nullptr;
         bool                     pipe_success = false;
 
-        if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
+        if (region_cycle_runtime_enabled) {
+            if (!region_cycle_candidate) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_CYCLE_EXEC] ub=%d tokens=%u "
+                    "one_sequence=%d token=%d embd=%d n_pos=%u "
+                    "loras=%zu reason=UNSUPPORTED_UBATCH "
+                    "action=STOP\n",
+                    ubatch_id,
+                    ubatch.n_tokens,
+                    region_cycle_one_sequence ? 1 : 0,
+                    ubatch.token != nullptr ? 1 : 0,
+                    ubatch.embd != nullptr ? 1 : 0,
+                    ubatch.n_pos,
+                    loras->size());
+                status = GGML_STATUS_FAILED;
+            } else {
+                res = process_ubatch_staged(
+                    ubatch,
+                    ctx_type_to_graph_type(cparams.ctx_type),
+                    mctx.get(),
+                    sched.get(),
+                    gf_res_prev.get(),
+                    region_cycle_stages,
+                    ubatch_id,
+                    status);
+                sched_use = sched.get();
+                res_use = gf_res_prev.get();
+            }
+        } else if (generalized_stage_queue_runtime_enabled && !generalized_stage_queue_candidate) {
             LLAMA_LOG_WARN(
                 "[HYBRID_PIPE] ub=%d generalized stage queue unsupported for this ubatch; using full graph\n",
                 ubatch_id);
