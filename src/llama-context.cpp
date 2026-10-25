@@ -3608,9 +3608,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
-    const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
+    const char * pc_phone_exec_v1_env =
+        std::getenv("GGML_META_PC_PHONE_EXEC_V1");
+    const bool pc_phone_exec_v1_requested =
+        pc_phone_exec_v1_env != nullptr &&
+        std::atoi(pc_phone_exec_v1_env) != 0;
+    // PC/Phone executor V1 needs a Tensor-only stage graph for Qwen3-MoE:
+    // the per-chunk return-wavefront graph cannot be built from the mixed
+    // full GPU+CPU+TENSOR graph.  Make the executor opt-in self-contained
+    // instead of requiring a second stage-queue environment switch.
+    const bool stage_queue_requested =
+        (stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0) ||
+        pc_phone_exec_v1_requested;
     const bool return_wavefront_requested =
-        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr ||
+        pc_phone_exec_v1_requested;
     // Execution follows the model policy, not merely the planner flag.
     // A PHONE-primary plan may intentionally run with legacy TENSOR_SPLIT
     // semantics for correctness A/B testing.
@@ -3727,6 +3739,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     if (stage_queue_requested && has_runtime_plan) {
+        if (pc_phone_exec_v1_requested) {
+            LLAMA_LOG_INFO(
+                "[PC_PHONE_STAGE_AUTO] enabled=1 "
+                "stage_queue=%d return_wavefront=%d "
+                "reason=PC_PHONE_EXEC_V1\n",
+                stage_queue_requested ? 1 : 0,
+                return_wavefront_requested ? 1 : 0);
+        }
         if (return_wavefront_full_graph_override) {
             const int attn_group_chunks =
                 llama_hybrid_runtime_prefill_attn_group_chunks();
