@@ -11232,6 +11232,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             backend_ctx->phone_main_pc_worker;
                     const bool local_debug =
                         pipeline_debug;
+                    const size_t communication_index = i;
+                    const size_t copy_src_backend = j_dst;
+                    const size_t copy_dst_backend = j_src;
 
                     const uint64_t tx_task =
                         pc_worker->enqueue(
@@ -11247,6 +11250,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                              layer,
                              reduce_uid,
                              consume_seq,
+                             communication_index,
+                             copy_src_backend,
+                             copy_dst_backend,
                              local_debug]
                             (uint64_t task_id) ->
                             ggml_status {
@@ -11285,9 +11291,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                                 record_copy_wait(send_us);
                                 record_meta_copy(
-                                    i,
-                                    j_dst,
-                                    j_src,
+                                    communication_index,
+                                    copy_src_backend,
+                                    copy_dst_backend,
                                     node_dst,
                                     send_us);
                                 record_direct_copy();
