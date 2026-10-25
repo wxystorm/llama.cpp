@@ -14132,13 +14132,20 @@ auto prefill_norm_sg_has_prework =
             bool found_phone_compute = false;
             size_t pc_view_only_nodes = 0;
             size_t pc_duplicate_compute_disabled = 0;
+            size_t last_scanned_sg = i;
+            std::string last_scanned_node;
             for (size_t sg = i; sg < backend_ctx->n_subgraphs && !found_end; ++sg) {
+                last_scanned_sg = sg;
                 ggml_cgraph * pc_part =
                     backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
                 ggml_cgraph * phone_part =
                     backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
                 GGML_ASSERT(pc_part != nullptr && phone_part != nullptr);
                 GGML_ASSERT(pc_part->n_nodes == phone_part->n_nodes);
+                if (phone_part->n_nodes > 0) {
+                    last_scanned_node =
+                        phone_part->nodes[phone_part->n_nodes - 1]->name;
+                }
                 for (int k = 0; k < phone_part->n_nodes; ++k) {
                     ggml_tensor * pc_node = pc_part->nodes[k];
                     ggml_tensor * phone_node = phone_part->nodes[k];
@@ -14241,10 +14248,20 @@ auto prefill_norm_sg_has_prework =
             }
 
             if (!found_end || !found_phone_compute) {
-                printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
-                       "reason=%s action=STOP\n",
-                       phone_region_chunk_id, i,
+                printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d "
+                       "sg=%zu scan_last_sg=%zu meta_sgs=%zu "
+                       "last_node=%s reason=%s action=STOP\n",
+                       phone_region_chunk_id, i, last_scanned_sg,
+                       backend_ctx->n_subgraphs,
+                       last_scanned_node.empty() ? "(none)" :
+                           last_scanned_node.c_str(),
                        !found_end ? "END_NOT_FOUND" : "NO_PHONE_COMPUTE");
+                // A missing end marker commonly means the *outer* ggml
+                // scheduler split this Phone Region due to its limit on
+                // cross-backend inputs. Never fuse across an outer split:
+                // the required tensors may not be ready or even allocated.
+                // Compare this scan_last_sg/last_node with the scheduler's
+                // SPLIT lines; investigate duplicate mask/KV inputs.
                 return GGML_STATUS_FAILED;
             }
             if (pipeline_debug) {
