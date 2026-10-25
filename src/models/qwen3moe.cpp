@@ -300,9 +300,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     int phone_region_first = -1;
     int phone_region_end = -1;  // exclusive
     std::vector<int> phone_region_chunks;
+    // A real, non-equal single-sequence prefill is represented as
+    // n_seqs=n_tokens, n_seqs_unq=1 by llama_batch_allocr. Reserve graphs
+    // often have equal_seqs=true, n_seqs=1. Both are one sequence.
+    const bool phone_region_single_sequence =
+        ubatch.n_seqs_unq == 1 &&
+        (!ubatch.equal_seqs() || ubatch.n_seqs == 1);
     if (phone_region_requested && !stage_graph && n_layer == 48 &&
-            n_tokens > 1 && ubatch.n_pos == 1 && ubatch.n_seqs == 1 &&
-            ubatch.n_seqs_unq == 1 &&
+            n_tokens > 1 && ubatch.n_pos == 1 &&
+            phone_region_single_sequence &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             planned_chunk_tokens > 0 && loras->empty() &&
             !moe_stage_wavefront &&
@@ -326,6 +332,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
     if (phone_region_requested) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
+            " stage=%d equal_seqs=%d n_seqs=%u n_seq_tokens=%u"
+            " n_seqs_unq=%u n_pos=%u one_sequence=%d"
+            " tensor_mode=%d loras=%zu status=%s\n",
+            n_tokens, stage_graph ? 1 : 0,
+            ubatch.equal_seqs() ? 1 : 0, ubatch.n_seqs,
+            ubatch.n_seq_tokens, ubatch.n_seqs_unq,
+            ubatch.n_pos, phone_region_single_sequence ? 1 : 0,
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 1 : 0,
+            loras->size(), phone_region_first >= 0 ? "READY" : "SKIP");
         LLAMA_LOG_ERROR(
             "[PHONE_REGION_GRAPH_PLAN] enabled=%d layers=[%d,%d) "
             "tokens=%" PRId64 " chunks=%zu graph_per_chunk=1 "
