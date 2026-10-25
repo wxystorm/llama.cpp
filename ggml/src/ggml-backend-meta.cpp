@@ -19608,10 +19608,28 @@ auto prefill_norm_sg_has_prework =
 
         if (region_c2p_prepared_exec &&
                 compute_status == GGML_STATUS_SUCCESS) {
-            release_region_c2p_overlap_chunk(
-                prefill_down_layer,
-                prefill_down_chunk,
-                "C2P_REDUCE_COMPLETE");
+            if (phone_main_local_active) {
+                if (pipeline_debug) {
+                    const auto state_it =
+                        region_c2p_overlap_chunks.find({
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                        });
+                    printf(
+                        "[PHONE_C2P_SLOT_HOLD] "
+                        "layer=%d chunk=%d consume_seq=%" PRIu64
+                        " reason=WAIT_LOCAL_REDUCE status=HELD\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        state_it != region_c2p_overlap_chunks.end() ?
+                            state_it->second.consume_seq : 0);
+                }
+            } else {
+                release_region_c2p_overlap_chunk(
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    "C2P_REDUCE_COMPLETE");
+            }
         }
 
         if (phone_block_fused) {
@@ -19795,6 +19813,75 @@ auto prefill_norm_sg_has_prework =
             return route_status;
         }
         pending_phone_prefill_route_lane_task[lane] = 0;
+    }
+
+    if (phone_main_local_active) {
+        const ggml_backend_rpc_wait_ready_seq_t
+            wait_consumed =
+                ggml_backend_meta_get_wait_ready_seq(
+                    backend_ctx->backend_configs[1].backend);
+        if (wait_consumed == nullptr) {
+            return GGML_STATUS_FAILED;
+        }
+
+        while (!region_c2p_overlap_chunks.empty()) {
+            const auto it =
+                region_c2p_overlap_chunks.begin();
+            const int layer = it->second.layer;
+            const int chunk = it->second.chunk;
+            const size_t slot = it->second.slot;
+            const uint64_t consume_seq =
+                it->second.consume_seq;
+            if (consume_seq == 0) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "reason=MISSING_FINAL_CONSUME_CREDIT "
+                    "action=STOP\n",
+                    layer, chunk, slot);
+                return GGML_STATUS_FAILED;
+            }
+
+            const int64_t wait_begin_us =
+                ggml_time_us();
+            const bool consumed =
+                wait_consumed(
+                    backend_ctx->backend_configs[1].backend,
+                    consume_seq);
+            const int64_t wait_us =
+                ggml_time_us() -
+                wait_begin_us;
+            if (!consumed) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "consume_seq=%" PRIu64
+                    " reason=FINAL_CONSUME_WAIT_FAILED "
+                    "action=STOP\n",
+                    layer,
+                    chunk,
+                    slot,
+                    consume_seq);
+                return GGML_STATUS_FAILED;
+            }
+
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_C2P_FINAL_RELEASE] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "consume_seq=%" PRIu64
+                    " wait_ms=%.3f status=REUSABLE\n",
+                    layer,
+                    chunk,
+                    slot,
+                    consume_seq,
+                    wait_us / 1000.0);
+            }
+            release_region_c2p_overlap_chunk(
+                layer,
+                chunk,
+                "FINAL_REDUCE_CONSUMED");
+        }
     }
 
     if (!region_c2p_overlap_chunks.empty()) {
