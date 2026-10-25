@@ -6147,6 +6147,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         };
 
 
+    using phone_prefill_route_ready_hook_t =
+        std::function<ggml_status(
+            ggml_backend_t,
+            ggml_tensor *, ggml_tensor *,
+            ggml_tensor *, ggml_tensor *,
+            ggml_tensor *, ggml_tensor *)>;
+    std::map<std::pair<int, int>,
+             phone_prefill_route_ready_hook_t>
+        phone_prefill_route_ready_hooks;
+
     // Producer-driven Phone->PC route path.
     //
     // The PC route worker posts GET_ROUTE_SNAPSHOT(seq,lane) before the Phone
@@ -6378,6 +6388,18 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 task_id,
                                 route_us / 1000.0);
                         }
+
+                        const auto hook_it =
+                            phone_prefill_route_ready_hooks.find(
+                                { layer, chunk });
+                        if (hook_it !=
+                                phone_prefill_route_ready_hooks.end()) {
+                            return hook_it->second(
+                                route_dst_backend,
+                                stage_hidden, dst_hidden,
+                                stage_topk, dst_topk,
+                                stage_weights, dst_weights);
+                        }
                         return GGML_STATUS_SUCCESS;
                     });
 
@@ -6461,6 +6483,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
         bool graphs_registered = false;
         bool main_registered = false;
+        bool pc_ffn_ready = false;
+        bool phone_partial_ready = false;
+        bool pc_reduce_queued = false;
     };
     std::map<int, phone_main_local_chunk_state>
         phone_main_local_chunks;
