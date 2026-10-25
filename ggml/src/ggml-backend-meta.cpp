@@ -10225,19 +10225,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 return GGML_STATUS_FAILED;
             }
 
+            const int64_t copy_begin_us = ggml_time_us();
             if (local_main_partial) {
+                // Snapshot selection is thread-local in the RPC client.
+                // Keep GET_SNAPSHOT on this exact Meta thread instead of
+                // relying on a backend async-copy implementation to preserve
+                // that TLS state.
+                const size_t partial_bytes =
+                    ggml_nbytes(phone_partial);
+                std::vector<uint8_t> partial_payload(
+                    partial_bytes);
                 snapshot_read(
                     true,
                     local_main_partial_it->second.partial_slot,
                     local_main_partial_it->second.partial_seq);
-            }
-            const int64_t copy_begin_us = ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                phone_cfg.backend, pc_cfg.backend,
-                phone_partial, pc_tmp);
-            ggml_backend_synchronize(pc_cfg.backend);
-            if (local_main_partial) {
+                ggml_backend_tensor_get(
+                    phone_partial,
+                    partial_payload.data(),
+                    0,
+                    partial_bytes);
                 snapshot_read(false, 0, 0);
+                ggml_backend_tensor_set(
+                    pc_tmp,
+                    partial_payload.data(),
+                    0,
+                    partial_bytes);
+                ggml_backend_synchronize(
+                    pc_cfg.backend);
+            } else {
+                ggml_backend_tensor_copy_async(
+                    phone_cfg.backend, pc_cfg.backend,
+                    phone_partial, pc_tmp);
+                ggml_backend_synchronize(
+                    pc_cfg.backend);
             }
             const int64_t copy_us =
                 ggml_time_us() - copy_begin_us;
