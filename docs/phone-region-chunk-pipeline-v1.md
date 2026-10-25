@@ -112,6 +112,15 @@ Expected preflight:
 
 No `alloc_buffer` attributable to these Region slots should occur between `PHONE_REGION_PIPE_STAGE ... stage=PHONE_REGION event=BEGIN` and `event=SUBMITTED`.
 
+A second hardware trace showed that allocation prewarm alone was not sufficient: chunk 1/2 still spent about 808 ms / 646 ms specifically in `output_bind_ms`. The RPC buffer backend resolves a remote buffer base lazily: the first `ggml_backend_buffer_get_base()` sends `RPC_CMD_BUFFER_GET_BASE` and caches `base_ptr`. Doing that first lookup after an earlier Phone Region graph had been submitted made the control request wait behind Phone work.
+
+The pool prewarm now also:
+- calls `ggml_backend_buffer_get_base()` for every Region output buffer and every private scratch arena before the pipeline starts;
+- precomputes the complete output alias family and its byte offsets once per chunk;
+- stores a local `phone_region_output_bind_plan` for the current Meta execution.
+
+The Region hot path therefore performs descriptor-only pointer rebinding and logs `mode=PREBOUND`; it must not issue a lazy `BUFFER_GET_BASE` request or rescan all Meta subgraphs. Expected preflight now includes `output_plans=<chunks>`.
+
 Each Region stage now also prints:
 
 ```
