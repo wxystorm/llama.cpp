@@ -3686,13 +3686,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_tensor_phone_primary_layer(
                         backend_ctx, phone_primary_l_out_layer);
 
+                // Explicit per-chunk boundary for a complete Phone Full
+                // Region. Never split the eleven Phone layers internally.
+                int phone_region_chunk = -1;
+                int phone_region_layer = -1;
+                int phone_region_parsed = 0;
+                const bool is_phone_region_end =
+                    std::sscanf(node->name,
+                        "phone_region_chunk_end_%d-%d%n",
+                        &phone_region_chunk, &phone_region_layer,
+                        &phone_region_parsed) == 2 &&
+                    node->name[phone_region_parsed] == '\0' &&
+                    phone_region_chunk >= 0;
                 const bool new_subgraph =
                     i == last_meta_node ||
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
-                    is_phone_primary_l_out;
+                    is_phone_primary_l_out ||
+                    is_phone_region_end;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -14052,6 +14065,36 @@ auto prefill_norm_sg_has_prework =
             c2p_pc_status != GGML_STATUS_SUCCESS ?
                 c2p_pc_status : c2p_phone_status;
     } else if (is_phone_only_sg) {
+        // The terminal node alone cannot establish that an entire
+        // cross-layer region is Phone-only; validate each actual node.
+        ggml_cgraph * candidate_phone_graph =
+            backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        ggml_cgraph * candidate_pc_graph =
+            backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        bool explicit_phone_region = false;
+        if (candidate_phone_graph && candidate_phone_graph->n_nodes > 0) {
+            const char * terminal = candidate_phone_graph->nodes[
+                candidate_phone_graph->n_nodes - 1]->name;
+            int region_chunk = -1, region_layer = -1, parsed = 0;
+            explicit_phone_region =
+                std::sscanf(terminal, "phone_region_chunk_end_%d-%d%n",
+                            &region_chunk, &region_layer, &parsed) == 2 &&
+                terminal[parsed] == '\0';
+        }
+        if (explicit_phone_region) {
+            GGML_ASSERT(candidate_pc_graph != nullptr);
+            GGML_ASSERT(candidate_pc_graph->n_nodes ==
+                        candidate_phone_graph->n_nodes);
+            for (int k = 0; k < candidate_pc_graph->n_nodes; ++k) {
+                GGML_ASSERT((candidate_pc_graph->nodes[k]->flags &
+                             GGML_TENSOR_FLAG_COMPUTE) == 0);
+            }
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_GRAPH] sg=%zu nodes=%d "
+                       "status=DEVICE_LOCAL_READY\n",
+                       i, candidate_phone_graph->n_nodes);
+            }
+        }
         size_t phone_block_end = i;
         int first_fused_layer = -1;
         phone_block_fused = find_phone_block(
