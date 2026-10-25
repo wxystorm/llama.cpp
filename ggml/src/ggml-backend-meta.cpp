@@ -4122,6 +4122,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     uint64_t pending_prefill_input_task = 0;
     int pending_prefill_input_layer = -1;
     int pending_prefill_input_chunk = -1;
+    auto has_pending_prefill_input = [&](int layer, int chunk) {
+        return pending_prefill_input_task != 0 &&
+            pending_prefill_input_layer == layer &&
+            pending_prefill_input_chunk == chunk;
+    };
 
     struct phone_prefill_route_task {
         size_t lane = 0;
@@ -10205,7 +10210,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
 
         if (is_prefill_down_chunk) {
-            GGML_ASSERT(pending_prefill_input_task == 0);
+            GGML_ASSERT(!has_pending_prefill_input(
+                prefill_down_layer_0, prefill_down_chunk_0));
             handled = true;
 
             constexpr size_t j_src = 1;
@@ -13960,11 +13966,23 @@ auto prefill_norm_sg_has_prework =
     ggml_status compute_status = GGML_STATUS_SUCCESS;
     if (is_prefill_down_sg) {
         const bool has_async_prefill_input =
-            pending_prefill_input_task != 0;
+            has_pending_prefill_input(prefill_down_layer, prefill_down_chunk);
 
-        if (has_async_prefill_input) {
-            GGML_ASSERT(prefill_down_layer == pending_prefill_input_layer);
-            GGML_ASSERT(prefill_down_chunk == pending_prefill_input_chunk);
+        if (pending_prefill_input_task != 0 && !has_async_prefill_input) {
+            const auto continuation = region_pipe_chunks.find(prefill_down_chunk);
+            GGML_ASSERT(region_pipeline_active &&
+                continuation != region_pipe_chunks.end() &&
+                i >= continuation->second.continuation_begin_sg &&
+                i <= continuation->second.continuation_end_sg &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, pending_prefill_input_layer) &&
+                pending_prefill_input_chunk == prefill_down_chunk + 1);
+            if (pipeline_debug) {
+                printf("[PREFILL_INPUT_PARK] layer=%d chunk=%d "
+                       "consumer_layer=%d consumer_chunk=%d sg=%zu\n",
+                       pending_prefill_input_layer, pending_prefill_input_chunk,
+                       prefill_down_layer, prefill_down_chunk, i);
+            }
         }
 
         if (return_wavefront_graph) {
