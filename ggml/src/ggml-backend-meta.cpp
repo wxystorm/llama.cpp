@@ -10760,6 +10760,132 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t pc_fold_us =
                     ggml_time_us() - pc_fold_begin_us;
 
+                if (phone_main_local_active) {
+                    auto state_it =
+                        phone_main_local_chunks.find(
+                            prefill_down_chunk_0);
+                    if (state_it ==
+                            phone_main_local_chunks.end() ||
+                            !state_it->second.graphs_registered) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reason=STATE_NOT_PREPARED "
+                            "action=STOP\n",
+                            prefill_down_chunk_0);
+                        return GGML_STATUS_FAILED;
+                    }
+                    auto & main_state =
+                        state_it->second;
+
+                    const uint64_t base_uid =
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[i].cgraph_main->uid;
+                    uint64_t trigger_uid =
+                        base_uid ^
+                        0x4d41494e43325052ULL ^
+                        (uint64_t)
+                            (prefill_down_chunk_0 + 1) *
+                            0x9e3779b97f4a7c15ULL;
+                    if (trigger_uid == 0) {
+                        trigger_uid = 1;
+                    }
+                    phone_reduce_graph->uid =
+                        trigger_uid;
+                    main_state.trigger_reduce_uid =
+                        trigger_uid;
+
+                    const ggml_backend_rpc_phone_main_register_t
+                        main_register =
+                            ggml_backend_meta_get_phone_main_register(
+                                bcj_src.backend);
+                    const ggml_backend_rpc_set_tensor_graph_t
+                        local_set_tensor_graph =
+                            ggml_backend_meta_get_set_tensor_graph(
+                                bcj_src.backend);
+                    if (main_register == nullptr ||
+                            local_set_tensor_graph == nullptr) {
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    if (!main_state.main_registered) {
+                        const bool registered =
+                            main_register(
+                                bcj_src.backend,
+                                prefill_down_chunk_0,
+                                trigger_uid,
+                                main_state.region_uid,
+                                main_state.p2c_attention_uid,
+                                main_state.p2c_ffn_uid,
+                                main_state.ready_seq,
+                                main_state.ready_lane,
+                                main_state.ready_hidden,
+                                main_state.ready_topk,
+                                main_state.ready_weights,
+                                main_state.partial_seq,
+                                main_state.partial_slot,
+                                main_state.phone_folded_partial);
+                        if (!registered) {
+                            printf(
+                                "[PHONE_MAIN_LOCAL_REJECT] "
+                                "chunk=%d trigger_uid=%" PRIu64
+                                " reason=MAIN_REGISTER_FAILED "
+                                "action=STOP\n",
+                                prefill_down_chunk_0,
+                                trigger_uid);
+                            return GGML_STATUS_FAILED;
+                        }
+                        main_state.main_registered = true;
+                    }
+
+                    const int64_t send_begin_us =
+                        ggml_time_us();
+                    const bool submitted =
+                        local_set_tensor_graph(
+                            bcj_dst.backend,
+                            bcj_src.backend,
+                            node_dst,
+                            phone_tmp,
+                            phone_reduce_graph);
+                    const int64_t send_us =
+                        ggml_time_us() -
+                        send_begin_us;
+                    if (!submitted) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d trigger_uid=%" PRIu64
+                            " reason=TRIGGER_SEND_FAILED "
+                            "action=STOP\n",
+                            prefill_down_chunk_0,
+                            trigger_uid);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    record_copy_wait(send_us);
+                    record_meta_copy(
+                        i, j_dst, j_src,
+                        node_dst, send_us);
+                    record_direct_copy();
+                    reduce_add_us += pc_fold_us;
+                    ++reduce_to_primary_count;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_MAIN_C2P_TRIGGER_SEND] "
+                            "layer=%d chunk=%d trigger_uid=%" PRIu64
+                            " bytes=%zu pc_fold_ms=%.3f "
+                            "send_ms=%.3f owner=PHONE "
+                            "wait_phone=0 status=QUEUED\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            trigger_uid,
+                            ggml_nbytes(node_dst),
+                            pc_fold_us / 1000.0,
+                            send_us / 1000.0);
+                    }
+
+                    return GGML_STATUS_SUCCESS;
+                }
+
                 const int64_t copy_begin_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
                     bcj_dst.backend,
