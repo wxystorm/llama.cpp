@@ -1884,10 +1884,23 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
-        const int n_gpu_pc = std::min<int>(
-            gpu_pc_layers, pc_layer_ids.size());
+        // Region Cycle GPU mirror keeps CPU as the canonical owner for
+        // every PC Full weight. CUDA residency is populated lazily by the
+        // context-side LRU mirror; static model placement would pin all
+        // selected layers and defeat eviction.
+        const int n_gpu_pc = region_cycle_v1 ? 0 :
+            std::min<int>(
+                gpu_pc_layers, pc_layer_ids.size());
         for (int k = 0; k < n_gpu_pc; ++k) {
-            pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+            pc_layer_backends[pc_layer_ids[k]] =
+                llama_pc_layer_backend::CUDA;
+        }
+        if (region_cycle_v1) {
+            LLAMA_LOG_ERROR(
+                "[REGION_CUDA_CANONICAL] pc_full_layers=%zu "
+                "static_cuda_layers=0 owner=CPU "
+                "execution=CUDA_LRU_MIRROR status=POLICY_READY\n",
+                pc_layer_ids.size());
         }
 
         if (n_gpu_pc > 0) {
