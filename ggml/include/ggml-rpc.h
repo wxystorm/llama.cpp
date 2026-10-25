@@ -96,12 +96,6 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC \
     "ggml_backend_rpc_set_tensor_async_return"
 
-#define GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_LANE_PROC \
-    "ggml_backend_rpc_set_tensor_async_return_lane"
-
-#define GGML_BACKEND_RPC_GET_TENSOR_RETURN_LANE_PROC \
-    "ggml_backend_rpc_get_tensor_return_lane"
-
 #define GGML_BACKEND_RPC_PHONE_FFN_MARK_READY_PROC \
     "ggml_backend_rpc_phone_ffn_mark_ready"
 
@@ -137,20 +131,6 @@ using ggml_backend_rpc_set_tensor_async_return_t = bool (*)(
         ggml_tensor * dst,
         const void * data,
         size_t size);
-
-using ggml_backend_rpc_set_tensor_async_return_lane_t = bool (*)(
-        ggml_backend_t backend_dst,
-        ggml_tensor * dst,
-        const void * data,
-        size_t size,
-        size_t return_lane);
-
-using ggml_backend_rpc_get_tensor_return_lane_t = bool (*)(
-        ggml_backend_t backend_src,
-        const ggml_tensor * src,
-        void * data,
-        size_t size,
-        size_t return_lane);
 
 using ggml_backend_rpc_phone_ffn_mark_ready_t = bool (*)(
         ggml_backend_t backend,

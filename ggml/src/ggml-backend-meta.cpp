@@ -2307,7 +2307,6 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_compute_workers;
-struct ggml_backend_meta_priority_compute_worker;
 struct ggml_backend_meta_transfer_worker;
 
 struct ggml_backend_meta_context;
@@ -2350,27 +2349,6 @@ struct ggml_backend_meta_context {
         // earlier partial before the layer-tail ADD.
         std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
 
-        // Directional Region partial-return staging. Each backend owns one
-        // immutable slot per return lane. V1 validates the async handoff with
-        // lane 0 only; a later window=2 step can use both lanes without
-        // changing tensor ownership or the final reduce protocol.
-        std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
-            region_partial_stage_bufs;
-        // Reducer-side local FFN partials also need private per-credit
-        // storage. Without this, the next chunk can reuse the graph arena
-        // while the previous chunk is still waiting for its remote partial.
-        std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
-            region_local_partial_stage_bufs;
-        // Full stable boundary output. Windowed final Reduce must not write
-        // directly into the scheduler graph arena: later chunk graphs may
-        // legitimately reuse that arena before the boundary drains.
-        ggml_backend_buffer_ptr region_boundary_output_stage_buf;
-        // Directional C2P continuation survives multiple Meta graph_compute
-        // calls. PC residual is immutable; Phone l_out is the sole reducer
-        // output and must remain address-stable for later chunk views.
-        ggml_backend_buffer_ptr region_c2p_pc_residual_stage_buf;
-        ggml_backend_buffer_ptr region_c2p_phone_output_stage_buf;
-
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
@@ -2391,23 +2369,6 @@ struct ggml_backend_meta_context {
     uint64_t                    next_snapshot_seq = 1;
     uint64_t                    next_phone_prefill_route_seq = 1;
     uint64_t                    next_phone_prefill_ffn_seq = 1;
-
-    struct region_prefill_boundary_state {
-        bool active = false;
-        bool complete = false;
-        bool residual_ready = false; // C2P PC source snapshot completed
-        int layer = -1;
-        int next_chunk = 0;
-        size_t full_bytes = 0;
-        size_t bytes_reserved = 0;
-    };
-    // Full-graph continuation may be split into several top-level Meta
-    // compute calls by the scheduler. Keep P2C output assembly state here,
-    // not on the per-call stack.
-    size_t                      region_prefill_hidden_bytes = 0;
-    region_prefill_boundary_state region_c2p_prefill {};
-    region_prefill_boundary_state region_p2c_prefill {};
-
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
     std::vector<uint8_t>        tensor_phone_layer_mask;
@@ -2423,11 +2384,6 @@ struct ggml_backend_meta_context {
     int64_t                          tensor_profile_wave_span_end_us   = 0;
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
-    // Directional Region Prefill role executors. MAIN work and reducer-side
-    // incoming FFN shards share one worker per device, so queued MAIN work
-    // always wins over queued shard work. A running shard is not preempted.
-    ggml_backend_meta_priority_compute_worker * region_pc_exec_worker = nullptr;
-    ggml_backend_meta_priority_compute_worker * region_phone_exec_worker = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
@@ -2608,150 +2564,6 @@ struct ggml_backend_meta_compute_workers {
     void reset_timings() {
         std::fill(backend_time_us.begin(), backend_time_us.end(), 0);
         std::fill(backend_call_count.begin(), backend_call_count.end(), 0);
-    }
-};
-
-// Directional Region role scheduler.
-//
-// The two Tensor boundaries are mirrors, but the reducer-side FFN is different:
-//   PC:    MAIN owns outgoing C2P work; P2C_FFN is the incoming waiting shard.
-//   Phone: MAIN owns outgoing P2C work; C2P_FFN is the incoming waiting shard.
-//
-// MAIN is selected before SHARD whenever both are queued. This deliberately
-// does not try to preempt a graph that has already been submitted to the GPU.
-struct ggml_backend_meta_priority_compute_worker {
-    struct task {
-        uint64_t id = 0;
-        bool main = true;
-        ggml_cgraph * graph = nullptr;
-        bool trace_handoff = false;
-    };
-
-    ggml_backend_meta_compute_workers * submitter = nullptr;
-    size_t backend_index = SIZE_MAX;
-    std::thread worker;
-    std::mutex mutex;
-    std::condition_variable task_cv;
-    std::condition_variable done_cv;
-    std::deque<task> main_tasks;
-    std::deque<task> shard_tasks;
-    std::map<uint64_t, ggml_status> results;
-    uint64_t submitted = 0;
-    bool stop = false;
-
-    explicit ggml_backend_meta_priority_compute_worker(
-            ggml_backend_meta_compute_workers * submitter,
-            size_t backend_index) :
-        submitter(submitter),
-        backend_index(backend_index),
-        worker([this]() {
-            std::unique_lock<std::mutex> lock(mutex);
-            while (true) {
-                task_cv.wait(lock, [&]() {
-                    return stop ||
-                        !main_tasks.empty() ||
-                        !shard_tasks.empty();
-                });
-                if (stop &&
-                        main_tasks.empty() &&
-                        shard_tasks.empty()) {
-                    return;
-                }
-
-                task current;
-                if (!main_tasks.empty()) {
-                    current = main_tasks.front();
-                    main_tasks.pop_front();
-                } else {
-                    current = shard_tasks.front();
-                    shard_tasks.pop_front();
-                }
-
-                lock.unlock();
-                // Only select queue priority here; keep submission on the
-                // canonical backend worker to preserve RPC stream affinity.
-                if (current.trace_handoff) {
-                    std::fprintf(stderr,
-                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
-                        " phase=WORKER_PICKED nodes=%d\n",
-                        this->backend_index == 1 ? "PHONE" : "PC",
-                        current.id, current.graph->n_nodes);
-                    std::fflush(stderr);
-                }
-                GGML_ASSERT(this->submitter != nullptr);
-                GGML_ASSERT(
-                    this->backend_index <
-                    this->submitter->n_backends);
-                const int64_t submit_begin_us = ggml_time_us();
-                this->submitter->start_graph(
-                    this->backend_index, current.graph);
-                if (current.trace_handoff) {
-                    std::fprintf(stderr,
-                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
-                        " phase=BACKEND_WAIT_BEGIN dispatch_ms=%.3f\n",
-                        this->backend_index == 1 ? "PHONE" : "PC",
-                        current.id,
-                        (ggml_time_us() - submit_begin_us) / 1000.0);
-                    std::fflush(stderr);
-                }
-                const ggml_status status =
-                    this->submitter->wait(this->backend_index);
-                if (current.trace_handoff) {
-                    std::fprintf(stderr,
-                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
-                        " phase=BACKEND_WAIT_DONE status=%d wall_ms=%.3f\n",
-                        this->backend_index == 1 ? "PHONE" : "PC",
-                        current.id, (int) status,
-                        (ggml_time_us() - submit_begin_us) / 1000.0);
-                    std::fflush(stderr);
-                }
-                lock.lock();
-
-                results[current.id] = status;
-                done_cv.notify_all();
-            }
-        }) {}
-
-    ~ggml_backend_meta_priority_compute_worker() {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            stop = true;
-        }
-        task_cv.notify_all();
-        worker.join();
-    }
-
-    uint64_t enqueue(
-            ggml_cgraph * graph,
-            bool main,
-            bool trace_handoff = false) {
-        GGML_ASSERT(graph != nullptr);
-        std::lock_guard<std::mutex> lock(mutex);
-        const uint64_t id = ++submitted;
-        task item { id, main, graph, trace_handoff };
-        if (main) {
-            main_tasks.push_back(item);
-        } else {
-            shard_tasks.push_back(item);
-        }
-        task_cv.notify_one();
-        return id;
-    }
-
-    ggml_status wait(uint64_t id) {
-        GGML_ASSERT(id != 0);
-        std::unique_lock<std::mutex> lock(mutex);
-        done_cv.wait(lock, [&]() {
-            return results.find(id) != results.end();
-        });
-        const ggml_status status = results[id];
-        results.erase(id);
-        return status;
-    }
-
-    bool is_completed(uint64_t id) {
-        std::lock_guard<std::mutex> lock(mutex);
-        return results.find(id) != results.end();
     }
 };
 
@@ -3014,46 +2826,6 @@ ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
             GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_PROC));
 }
 
-static ggml_backend_rpc_set_tensor_async_return_lane_t
-ggml_backend_meta_get_set_tensor_async_return_lane(
-        ggml_backend_t backend) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev == nullptr) {
-        return nullptr;
-    }
-
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg == nullptr) {
-        return nullptr;
-    }
-
-    return reinterpret_cast<
-        ggml_backend_rpc_set_tensor_async_return_lane_t>(
-            ggml_backend_reg_get_proc_address(
-                reg,
-                GGML_BACKEND_RPC_SET_TENSOR_ASYNC_RETURN_LANE_PROC));
-}
-
-static ggml_backend_rpc_get_tensor_return_lane_t
-ggml_backend_meta_get_tensor_return_lane(
-        ggml_backend_t backend) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev == nullptr) {
-        return nullptr;
-    }
-
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg == nullptr) {
-        return nullptr;
-    }
-
-    return reinterpret_cast<
-        ggml_backend_rpc_get_tensor_return_lane_t>(
-            ggml_backend_reg_get_proc_address(
-                reg,
-                GGML_BACKEND_RPC_GET_TENSOR_RETURN_LANE_PROC));
-}
-
 static ggml_backend_rpc_phone_ffn_mark_ready_t
 ggml_backend_meta_get_phone_ffn_mark_ready(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -3185,8 +2957,6 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
-    delete region_pc_exec_worker;
-    delete region_phone_exec_worker;
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
@@ -3903,30 +3673,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
-                int directional_down_chunk = -1;
-                int directional_down_layer = -1;
-                const bool is_directional_down_boundary =
-                    n_backends == 2 &&
-                    ggml_backend_meta_parse_prefill_down_chunk(
-                        node->name,
-                        directional_down_chunk,
-                        directional_down_layer) &&
-                    (ggml_backend_meta_tensor_c2p_layer(
-                         backend_ctx, directional_down_layer) ||
-                     ggml_backend_meta_tensor_p2c_layer(
-                         backend_ctx, directional_down_layer));
-
-                if (is_directional_down_boundary &&
-                        std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
-                    printf(
-                        "[REGION_CONT_SPLIT] node=%d layer=%d chunk=%d "
-                        "tensor=%s reason=DIRECTIONAL_DOWN status=HARD\n",
-                        i,
-                        directional_down_layer,
-                        directional_down_chunk,
-                        node->name);
-                }
-
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -3946,18 +3692,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
                     is_phone_route_boundary ||
-                    is_directional_down_boundary ||
                     is_phone_primary_l_out;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                // Directional C2P/P2C down is a host-visible
-                // communication boundary.  Never let the generic MoE
-                // delayed-reduce scan absorb Phone-region nodes past it.
-                const int i_delayed =
-                    is_directional_down_boundary ?
-                        i : get_i_delayed(i);
+                const int i_delayed = get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -4119,88 +3859,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         tensor->buffer = buf_ptr.get();
         tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
     };
-    auto set_region_partial_stage_data =
-        [&](ggml_tensor * tensor, const size_t j, const size_t lane) {
-            GGML_ASSERT(
-                lane < ggml_backend_meta_context::PREFILL_RETURN_LANES);
-            auto & bcj = backend_ctx->backend_configs[j];
-            auto & buf_ptr = bcj.region_partial_stage_bufs[lane];
-            if (!buf_ptr ||
-                    ggml_backend_buffer_get_size(buf_ptr.get()) <
-                        backend_ctx->max_tmp_size) {
-                buf_ptr.reset(
-                    ggml_backend_alloc_buffer(
-                        bcj.backend, backend_ctx->max_tmp_size));
-            }
-            tensor->buffer = buf_ptr.get();
-            tensor->data = ggml_backend_buffer_get_base(buf_ptr.get());
-        };
-    auto set_region_local_partial_stage_data =
-        [&](ggml_tensor * tensor, const size_t j, const size_t lane) {
-            GGML_ASSERT(
-                lane < ggml_backend_meta_context::PREFILL_RETURN_LANES);
-            auto & bcj = backend_ctx->backend_configs[j];
-            auto & buf_ptr =
-                bcj.region_local_partial_stage_bufs[lane];
-            if (!buf_ptr ||
-                    ggml_backend_buffer_get_size(buf_ptr.get()) <
-                        backend_ctx->max_tmp_size) {
-                buf_ptr.reset(
-                    ggml_backend_alloc_buffer(
-                        bcj.backend, backend_ctx->max_tmp_size));
-            }
-            tensor->buffer = buf_ptr.get();
-            tensor->data =
-                ggml_backend_buffer_get_base(buf_ptr.get());
-        };
-    auto ensure_region_boundary_output_stage =
-        [&](const size_t j, const size_t bytes)
-            -> ggml_backend_buffer_t {
-            auto & bcj = backend_ctx->backend_configs[j];
-            auto & buf_ptr =
-                bcj.region_boundary_output_stage_buf;
-            if (!buf_ptr ||
-                    ggml_backend_buffer_get_size(buf_ptr.get()) <
-                        bytes) {
-                buf_ptr.reset(
-                    ggml_backend_alloc_buffer(
-                        bcj.backend, bytes));
-            }
-            GGML_ASSERT(buf_ptr != nullptr);
-            return buf_ptr.get();
-        };
-    auto bind_region_boundary_output_chunk =
-        [&](ggml_tensor * tensor,
-            const size_t j,
-            const size_t full_bytes,
-            const size_t offset) {
-            ggml_backend_buffer_t buffer =
-                ensure_region_boundary_output_stage(
-                    j, full_bytes);
-            GGML_ASSERT(
-                offset + ggml_nbytes(tensor) <=
-                ggml_backend_buffer_get_size(buffer));
-            tensor->view_src = nullptr;
-            tensor->view_offs = 0;
-            tensor->buffer = buffer;
-            tensor->data =
-                static_cast<uint8_t *>(
-                    ggml_backend_buffer_get_base(buffer)) +
-                offset;
-        };
-    auto bind_region_boundary_output_full =
-        [&](ggml_tensor * tensor,
-            const size_t j,
-            const size_t full_bytes) {
-            ggml_backend_buffer_t buffer =
-                ensure_region_boundary_output_stage(
-                    j, full_bytes);
-            tensor->view_src = nullptr;
-            tensor->view_offs = 0;
-            tensor->buffer = buffer;
-            tensor->data =
-                ggml_backend_buffer_get_base(buffer);
-        };
     // FIXME usage_counts
     auto get_cgraph_aux = [&]() -> ggml_cgraph * {
         GGML_ASSERT(iga < backend_ctx->cgraphs_aux.size());
@@ -4232,160 +3890,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_parallel_ffn =
         region_parallel_ffn_env != nullptr &&
         std::atoi(region_parallel_ffn_env) != 0;
-    const char * region_route_overlap_env =
-        std::getenv("LLAMA_HYBRID_REGION_ROUTE_OVERLAP");
-    const bool region_route_overlap =
-        region_route_overlap_env != nullptr &&
-        std::atoi(region_route_overlap_env) != 0;
-    const char * region_async_partial_env =
-        std::getenv("LLAMA_HYBRID_REGION_ASYNC_PARTIAL");
-    const bool region_async_partial =
-        region_async_partial_env != nullptr &&
-        std::atoi(region_async_partial_env) != 0;
-    const char * region_priority_queues_env =
-        std::getenv("LLAMA_HYBRID_REGION_PRIORITY_QUEUES");
-    const bool region_priority_queues =
-        region_priority_queues_env != nullptr &&
-        std::atoi(region_priority_queues_env) != 0;
-    const char * region_window_env =
-        std::getenv("LLAMA_HYBRID_REGION_WINDOW");
-    int region_window_requested =
-        region_window_env != nullptr ?
-            std::atoi(region_window_env) : 1;
-    region_window_requested =
-        std::max(1, std::min(
-            region_window_requested,
-            (int) ggml_backend_meta_context::PREFILL_RETURN_LANES));
-    const ggml_backend_rpc_set_tensor_async_return_lane_t
-        region_return_set_lane =
-            n_backends > 1 ?
-                ggml_backend_meta_get_set_tensor_async_return_lane(
-                    backend_ctx->backend_configs[1].backend) :
-                nullptr;
-    const ggml_backend_rpc_get_tensor_return_lane_t
-        region_return_get_lane =
-            n_backends > 1 ?
-                ggml_backend_meta_get_tensor_return_lane(
-                    backend_ctx->backend_configs[1].backend) :
-                nullptr;
-    const bool region_return_lane_capable =
-        region_return_set_lane != nullptr &&
-        region_return_get_lane != nullptr &&
-        region_return_set_lane(
-            backend_ctx->backend_configs[1].backend,
-            nullptr,
-            nullptr,
-            0,
-            0) &&
-        region_return_set_lane(
-            backend_ctx->backend_configs[1].backend,
-            nullptr,
-            nullptr,
-            0,
-            1) &&
-        region_return_get_lane(
-            backend_ctx->backend_configs[1].backend,
-            nullptr,
-            nullptr,
-            0,
-            0) &&
-        region_return_get_lane(
-            backend_ctx->backend_configs[1].backend,
-            nullptr,
-            nullptr,
-            0,
-            1);
-
-    const bool region_window2 =
-        region_window_requested >= 2 &&
-        region_priority_queues &&
-        region_async_partial &&
-        region_return_lane_capable;
-    const char * region_chunk_cont_env =
-        std::getenv("LLAMA_HYBRID_REGION_CHUNK_CONTINUATION");
-    const bool region_chunk_continuation =
-        region_chunk_cont_env != nullptr &&
-        std::atoi(region_chunk_cont_env) != 0;
-
-    auto get_region_exec_worker =
-        [&](size_t backend_index)
-            -> ggml_backend_meta_priority_compute_worker * {
-            GGML_ASSERT(
-                backend_index <
-                backend_ctx->backend_configs.size());
-            GGML_ASSERT(backend_index < 2);
-            ggml_backend_meta_priority_compute_worker ** slot =
-                backend_index == 0 ?
-                    &backend_ctx->region_pc_exec_worker :
-                    &backend_ctx->region_phone_exec_worker;
-            if (*slot == nullptr) {
-                GGML_ASSERT(backend_ctx->compute_workers != nullptr);
-                *slot =
-                    new ggml_backend_meta_priority_compute_worker(
-                        backend_ctx->compute_workers,
-                        backend_index);
-            }
-            return *slot;
-        };
-
-    auto run_region_main_graph =
-        [&](size_t backend_index,
-            ggml_cgraph * graph,
-            const char * direction,
-            const char * role,
-            int layer,
-            int chunk) -> ggml_status {
-            GGML_ASSERT(region_priority_queues);
-            GGML_ASSERT(graph != nullptr);
-
-            const bool trace_c2p_reduce =
-                pipeline_debug && backend_index == 1 &&
-                direction != nullptr && role != nullptr &&
-                std::strcmp(direction, "C2P") == 0 &&
-                std::strcmp(role, "REDUCE") == 0;
-            if (trace_c2p_reduce) {
-                std::fprintf(stderr,
-                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
-                    "phase=ENQUEUE_BEGIN nodes=%d\n",
-                    layer, chunk, graph->n_nodes);
-                std::fflush(stderr);
-            }
-            auto * region_worker = get_region_exec_worker(backend_index);
-            const uint64_t task =
-                region_worker->enqueue(graph, true, trace_c2p_reduce);
-
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_EXEC_QUEUE] side=%s "
-                    "queue=MAIN priority=HIGH "
-                    "direction=%s role=%s "
-                    "layer=%d chunk=%d task=%" PRIu64
-                    " status=ENQUEUED\n",
-                    backend_index == 0 ? "PC" : "PHONE",
-                    direction != nullptr ? direction : "LOCAL",
-                    role != nullptr ? role : "MAIN",
-                    layer,
-                    chunk,
-                    task);
-            }
-
-            if (trace_c2p_reduce) {
-                std::fprintf(stderr,
-                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
-                    "task=%" PRIu64 " phase=QUEUE_WAIT_BEGIN\n",
-                    layer, chunk, task);
-                std::fflush(stderr);
-            }
-            const ggml_status result = region_worker->wait(task);
-            if (trace_c2p_reduce) {
-                std::fprintf(stderr,
-                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
-                    "task=%" PRIu64 " phase=QUEUE_WAIT_DONE status=%d\n",
-                    layer, chunk, task, (int) result);
-                std::fflush(stderr);
-            }
-            return result;
-        };
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -4584,18 +4088,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::map<std::pair<int, int>, phone_prefill_route_task>
         pending_phone_prefill_routes;
-
-    struct region_p2c_early_ffn_state {
-        bool active = false;
-        size_t route_sg = SIZE_MAX;
-        size_t ffn_sg = SIZE_MAX;
-        int layer = -1;
-        int chunk = -1;
-        uint64_t route_task = 0;
-        ggml_backend_meta_transfer_worker * route_worker = nullptr;
-        uint64_t phone_main_task = 0;
-    };
-    region_p2c_early_ffn_state region_p2c_early_ffn;
     std::array<uint64_t, ggml_backend_meta_context::PREFILL_ROUTE_LANES>
         pending_phone_prefill_route_lane_task { 0, 0 };
 
@@ -4959,32 +4451,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     auto subgraph_is_phone_only = [&](size_t sg) -> bool {
         return subgraph_is_phone_owned(sg);
     };
-    auto subgraph_is_region_phone_continuation =
-        [&](size_t sg) -> bool {
-            if (!region_chunk_continuation ||
-                    n_backends != 2 ||
-                    sg >= backend_ctx->n_subgraphs) {
-                return false;
-            }
-            for (size_t backend = 0; backend < n_backends; ++backend) {
-                ggml_cgraph * graph =
-                    backend_ctx->backend_configs[backend]
-                        .cgraphs[sg].cgraph_main;
-                if (graph == nullptr) {
-                    continue;
-                }
-                for (int k = 0; k < graph->n_nodes; ++k) {
-                    const char * name = graph->nodes[k]->name;
-                    if (std::strncmp(
-                            name, "region_phone_", 13) == 0 ||
-                        std::strncmp(
-                            name, "region_p2c_", 11) == 0) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        };
     std::map<int, bool> layer_phone_primary_cache;
     auto layer_attention_phone_owned = [&](int layer) -> bool {
         if (n_backends != 2 || layer < 0) {
@@ -5200,51 +4666,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return false;
         };
 
-    // Prefill-only detector used at a Phone full-region exit.  A P2C
-    // boundary starts with Phone-owned Attention, so the preceding full
-    // activation must stay Phone-local; the P2C Router/READY path will send
-    // exactly the data the PC shard needs.  Keep this detector deliberately
-    // narrower than the generic Tensor-layer helpers so Decode semantics are
-    // unchanged.
-    auto subgraph_prefill_p2c_layer =
-        [&](size_t sg, int & layer) -> bool {
-            layer = -1;
-            if (sg >= backend_ctx->n_subgraphs) {
-                return false;
-            }
-
-            for (size_t backend = 0; backend < n_backends; ++backend) {
-                ggml_cgraph * graph =
-                    backend_ctx->backend_configs[backend]
-                        .cgraphs[sg].cgraph_main;
-                if (graph == nullptr) {
-                    continue;
-                }
-
-                for (int k = 0; k < graph->n_nodes; ++k) {
-                    int chunk = -1;
-                    int parsed_layer = -1;
-                    const bool prefill =
-                        ggml_backend_meta_parse_prefill_norm_chunk(
-                            graph->nodes[k]->name,
-                            chunk,
-                            parsed_layer) ||
-                        ggml_backend_meta_parse_prefill_down_chunk(
-                            graph->nodes[k]->name,
-                            chunk,
-                            parsed_layer);
-                    if (prefill &&
-                            ggml_backend_meta_tensor_p2c_layer(
-                                backend_ctx, parsed_layer)) {
-                        layer = parsed_layer;
-                        return true;
-                    }
-                }
-            }
-
-            return false;
-        };
-
     auto prefill_layer_hands_off_to_phone = [&](size_t sg, int layer) -> bool {
         if (layer_is_tensor_phone_primary(layer)) {
             return false;
@@ -5414,13 +4835,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return graph->nodes[k];
                 }
             }
-            for (int k = 0; k < graph->n_leafs; ++k) {
-                int parsed_layer = -1;
-                if (std::sscanf(graph->leafs[k]->name, "l_out-%d", &parsed_layer) == 1 &&
-                        parsed_layer == layer) {
-                    return graph->leafs[k];
-                }
-            }
         }
         return nullptr;
     };
@@ -5450,160 +4864,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
-
-    // Reattach Phone continuation views to the stable C2P output on every
-    // graph_compute call. The scheduler can split a logical full graph into
-    // several Meta graphs, whose simple tensor containers are rotated. A
-    // previous graph's l_out tensor pointer is therefore never retained.
-    auto bind_region_c2p_phone_backing = [&](int layer) -> bool {
-        const auto & state = backend_ctx->region_c2p_prefill;
-        auto & stage_buf = backend_ctx->backend_configs[1]
-                               .region_c2p_phone_output_stage_buf;
-        if (!region_chunk_continuation || !state.active ||
-                state.layer != layer || state.full_bytes == 0 ||
-                stage_buf == nullptr) {
-            return false;
-        }
-
-        ggml_backend_buffer_t stable = stage_buf.get();
-        auto * base = static_cast<uint8_t *>(
-            ggml_backend_buffer_get_base(stable));
-        GGML_ASSERT(ggml_backend_buffer_get_size(stable) >= state.full_bytes);
-
-        char output_name[64];
-        std::snprintf(output_name, sizeof(output_name), "l_out-%d", layer);
-        size_t bound_entries = 0;
-        size_t rebound_graphs = 0;
-
-        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
-            ggml_cgraph * graph = backend_ctx->backend_configs[1]
-                                      .cgraphs[sg].cgraph_main;
-            if (graph == nullptr) {
-                continue;
-            }
-
-            bool graph_changed = false;
-            for (int k = 0; k < graph->n_nodes; ++k) {
-                ggml_tensor * node = graph->nodes[k];
-                if (node == nullptr) {
-                    continue;
-                }
-
-                int entry_chunk = -1;
-                int entry_layer = -1;
-                const bool is_entry =
-                    std::sscanf(node->name,
-                                "region_cont_entry_chunk_%d-%d",
-                                &entry_chunk, &entry_layer) == 2 &&
-                    entry_layer == layer + 1;
-
-                // Only VIEWs of l_out-L (and l_out-L itself) are rebound.
-                // No unrelated graph tensors or backend allocations change.
-                std::vector<ggml_tensor *> chain;
-                for (ggml_tensor * t = node;
-                        t != nullptr && chain.size() < 32;
-                        t = t->view_src) {
-                    chain.push_back(t);
-                }
-                ggml_tensor * root =
-                    chain.empty() ? nullptr : chain.back();
-                if (root == nullptr ||
-                        std::strcmp(root->name, output_name) != 0) {
-                    if (is_entry) {
-                        printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
-                               "chunk=%d entry=%s root=%s "
-                               "status=BAD_VIEW_SOURCE\n",
-                               layer, sg, entry_chunk, node->name,
-                               root != nullptr ? root->name : "(null)");
-                        return false;
-                    }
-                    continue;
-                }
-                if (root->view_src != nullptr ||
-                        ggml_nbytes(root) != state.full_bytes) {
-                    printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
-                           "root=%s bytes=%zu expected=%zu "
-                           "status=BAD_ROOT\n",
-                           layer, sg, root->name, ggml_nbytes(root),
-                           state.full_bytes);
-                    return false;
-                }
-
-                bool changed =
-                    root->buffer != stable || root->data != base;
-                root->buffer = stable;
-                root->data = base;
-                // Update already-materialized simple VIEW addresses, which
-                // are not recomputed automatically after reassigning root.
-                for (int v = (int) chain.size() - 2; v >= 0; --v) {
-                    ggml_tensor * view = chain[(size_t) v];
-                    ggml_tensor * parent = chain[(size_t) v + 1];
-                    if (view->view_offs > ggml_nbytes(parent)) {
-                        printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
-                               "tensor=%s status=BAD_VIEW_OFFSET\n",
-                               layer, sg, view->name);
-                        return false;
-                    }
-                    void * wanted =
-                        static_cast<uint8_t *>(parent->data) +
-                        view->view_offs;
-                    changed |=
-                        view->buffer != stable || view->data != wanted;
-                    view->buffer = stable;
-                    view->data = wanted;
-                }
-
-                if (is_entry) {
-                    ++bound_entries;
-                    if (node->buffer != stable) {
-                        return false;
-                    }
-                }
-                graph_changed |= changed;
-            }
-
-            if (graph_changed) {
-                // GPU/RPC graph cache keys must not reuse the old addresses.
-                graph->uid = 0;
-                ++rebound_graphs;
-            }
-        }
-
-        if (pipeline_debug && (bound_entries || rebound_graphs)) {
-            printf("[REGION_C2P_PHONE_BIND] layer=%d bytes=%zu "
-                   "entries=%zu rebound_graphs=%zu owner=PHONE status=OK\n",
-                   layer, state.full_bytes, bound_entries, rebound_graphs);
-        }
-        return true;
-    };
-
-    // Only the final P2C output commit retires the C2P ownership epoch.
-    // The buffers themselves remain allocated for reuse, while stale logical
-    // dimensions can never leak into the following prompt.
-    auto retire_region_c2p_on_p2c_commit =
-        [&](int p2c_layer, const char * origin) {
-            auto & state = backend_ctx->region_c2p_prefill;
-            if (!region_chunk_continuation || !state.active) {
-                return;
-            }
-            if (!state.complete) {
-                printf("[REGION_CONT_EPOCH] event=RETIRE_DEFERRED "
-                       "c2p_layer=%d p2c_layer=%d chunks=%d "
-                       "reserved=%zu/%zu source=%s status=INCOMPLETE\n",
-                       state.layer, p2c_layer, state.next_chunk,
-                       state.bytes_reserved, state.full_bytes, origin);
-                return;
-            }
-            if (pipeline_debug) {
-                printf("[REGION_CONT_EPOCH] event=RETIRED "
-                       "c2p_layer=%d p2c_layer=%d chunks=%d "
-                       "bytes=%zu source=%s status=OK\n",
-                       state.layer, p2c_layer, state.next_chunk,
-                       state.full_bytes, origin);
-            }
-            state = ggml_backend_meta_context::
-                region_prefill_boundary_state {};
-        };
 
     // Read-only A/B correctness captures for a single Tensor layer.
     // Values are stored in logical element order; GGML VIEW padding/strides
@@ -5907,328 +5167,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             mismatch == 0 ? "PASS" : "FAIL");
         return mismatch == 0;
     };
-
-    struct region_window_metrics {
-        int64_t wire_us = 0;
-        int64_t reduce_us = 0;
-    };
-
-    struct region_window_pending {
-        bool active = false;
-        int layer = -1;
-        int chunk = -1;
-        size_t sg = SIZE_MAX;
-        size_t lane = 0;
-        size_t src_backend = 0;
-        size_t dst_backend = 0;
-        uint64_t task = 0;
-        ggml_backend_meta_transfer_worker * worker = nullptr;
-        ggml_tensor * wire_src = nullptr;
-        ggml_tensor * wire_dst = nullptr;
-        ggml_tensor * out_chunk = nullptr;
-        size_t bytes = 0;
-        int64_t fold_us = 0;
-        int64_t stage_us = 0;
-        bool boundary_last = false;
-        bool numeric_check = false;
-        std::shared_ptr<region_window_metrics> metrics;
-        std::shared_ptr<std::vector<float>> before_a;
-        std::shared_ptr<std::vector<float>> before_b;
-        std::shared_ptr<std::vector<float>> before_residual;
-    };
-
-    std::array<
-        region_window_pending,
-        ggml_backend_meta_context::PREFILL_RETURN_LANES>
-        pending_region_c2p {};
-    std::array<
-        region_window_pending,
-        ggml_backend_meta_context::PREFILL_RETURN_LANES>
-        pending_region_p2c {};
-
-    auto region_active_credits =
-        [&](const auto & pending) -> size_t {
-            size_t n = 0;
-            for (const auto & p : pending) {
-                n += p.active ? 1 : 0;
-            }
-            return n;
-        };
-
-    auto region_has_later_boundary_chunk =
-        [&](size_t current_sg, int layer, int chunk) -> bool {
-            for (size_t sg = current_sg + 1;
-                    sg < backend_ctx->n_subgraphs; ++sg) {
-                for (size_t backend = 0;
-                        backend < std::min<size_t>(n_backends, 2);
-                        ++backend) {
-                    ggml_cgraph * graph =
-                        backend_ctx->backend_configs[backend]
-                            .cgraphs[sg].cgraph_main;
-                    if (graph == nullptr) {
-                        continue;
-                    }
-                    for (int k = 0; k < graph->n_nodes; ++k) {
-                        int later_chunk = -1;
-                        int later_layer = -1;
-                        if (ggml_backend_meta_parse_prefill_down_chunk(
-                                graph->nodes[k]->name,
-                                later_chunk,
-                                later_layer) &&
-                                later_layer == layer &&
-                                later_chunk > chunk) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
-        };
-
-    auto wait_region_window_lane =
-        [&](auto & pending,
-            const char * direction,
-            size_t lane,
-            const char * reason) -> ggml_status {
-            GGML_ASSERT(
-                lane <
-                ggml_backend_meta_context::PREFILL_RETURN_LANES);
-            auto & p = pending[lane];
-            if (!p.active) {
-                return GGML_STATUS_SUCCESS;
-            }
-
-            GGML_ASSERT(p.worker != nullptr);
-            GGML_ASSERT(p.task != 0);
-            GGML_ASSERT(p.metrics != nullptr);
-
-            const int64_t join_begin_us = ggml_time_us();
-            const ggml_status status =
-                p.worker->wait(p.task);
-            const int64_t join_wait_us =
-                ggml_time_us() - join_begin_us;
-
-            if (status == GGML_STATUS_SUCCESS) {
-                record_copy_wait(p.metrics->wire_us);
-                record_meta_copy(
-                    p.sg,
-                    p.src_backend,
-                    p.dst_backend,
-                    p.wire_src,
-                    p.metrics->wire_us);
-                record_direct_copy();
-                directional_wire_parity(
-                    direction,
-                    p.layer,
-                    p.chunk,
-                    std::strcmp(direction, "C2P") == 0 ?
-                        "PC_PARTIAL_PLUS_RESIDUAL" :
-                        "PHONE_PARTIAL_PLUS_RESIDUAL",
-                    p.src_backend,
-                    p.dst_backend,
-                    p.wire_src,
-                    p.wire_dst);
-                record_reduce_add(
-                    p.fold_us + p.metrics->reduce_us,
-                    true);
-
-                if (p.numeric_check &&
-                        p.before_a != nullptr &&
-                        p.before_b != nullptr &&
-                        p.before_residual != nullptr &&
-                        !p.before_a->empty() &&
-                        p.out_chunk != nullptr) {
-                    const size_t n = p.before_a->size();
-                    std::vector<float> actual(n);
-                    ggml_backend_tensor_get(
-                        p.out_chunk,
-                        actual.data(),
-                        0,
-                        n * sizeof(float));
-
-                    double diff2 = 0.0;
-                    double actual_l2 = 0.0;
-                    double expected_l2 = 0.0;
-                    double dot = 0.0;
-                    double max_abs = 0.0;
-                    size_t worst = 0;
-                    for (size_t q = 0; q < n; ++q) {
-                        const double expected =
-                            (double) (*p.before_a)[q] +
-                            (double) (*p.before_b)[q] +
-                            (double) (*p.before_residual)[q];
-                        const double got = actual[q];
-                        const double d = got - expected;
-                        diff2 += d * d;
-                        actual_l2 += got * got;
-                        expected_l2 += expected * expected;
-                        dot += got * expected;
-                        if (std::abs(d) > max_abs) {
-                            max_abs = std::abs(d);
-                            worst = q;
-                        }
-                    }
-                    const double rms =
-                        n > 0 ?
-                            std::sqrt(diff2 / (double) n) : 0.0;
-                    const double cosine =
-                        actual_l2 > 0.0 && expected_l2 > 0.0 ?
-                            dot / std::sqrt(
-                                actual_l2 * expected_l2) : 0.0;
-                    printf(
-                        "[REGION_%s_NUMERIC] layer=%d chunk=%d "
-                        "n=%zu max_abs=%.9g rms=%.9g "
-                        "cosine=%.12f worst=%zu "
-                        "actual=%.9f expected=%.9f status=%s\n",
-                        direction,
-                        p.layer,
-                        p.chunk,
-                        n,
-                        max_abs,
-                        rms,
-                        cosine,
-                        worst,
-                        actual[worst],
-                        (double) (*p.before_a)[worst] +
-                            (double) (*p.before_b)[worst] +
-                            (double) (*p.before_residual)[worst],
-                        max_abs <= 1e-4 ? "PASS" : "FAIL");
-                }
-
-                if (pipeline_debug) {
-                    if (std::strcmp(direction, "C2P") == 0) {
-                        printf(
-                            "[REGION_C2P_PREFILL] layer=%d chunk=%d "
-                            "last=%d bytes=%zu pc_fold_ms=%.3f "
-                            "stage_ms=%.3f copy_ms=%.3f "
-                            "join_wait_ms=%.3f phone_reduce_ms=%.3f "
-                            "async_partial=1 window=2 "
-                            "owner=PHONE status=OK\n",
-                            p.layer,
-                            p.chunk,
-                            p.boundary_last ? 1 : 0,
-                            p.bytes,
-                            p.fold_us / 1000.0,
-                            p.stage_us / 1000.0,
-                            p.metrics->wire_us / 1000.0,
-                            join_wait_us / 1000.0,
-                            p.metrics->reduce_us / 1000.0);
-                    } else {
-                        printf(
-                            "[REGION_P2C_PREFILL] layer=%d chunk=%d "
-                            "last=%d bytes=%zu phone_fold_ms=%.3f "
-                            "stage_ms=%.3f copy_ms=%.3f "
-                            "join_wait_ms=%.3f pc_reduce_ms=%.3f "
-                            "async_partial=1 window=2 "
-                            "owner=PC status=OK\n",
-                            p.layer,
-                            p.chunk,
-                            p.boundary_last ? 1 : 0,
-                            p.bytes,
-                            p.fold_us / 1000.0,
-                            p.stage_us / 1000.0,
-                            p.metrics->wire_us / 1000.0,
-                            join_wait_us / 1000.0,
-                            p.metrics->reduce_us / 1000.0);
-                    }
-                }
-            }
-
-            const int layer = p.layer;
-            const int chunk = p.chunk;
-            const uint64_t task = p.task;
-            p = region_window_pending {};
-
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_RETURN_JOIN] direction=%s "
-                    "layer=%d chunk=%d lane=%zu task=%" PRIu64
-                    " wait_ms=%.3f window=2 reason=%s status=%s\n",
-                    direction,
-                    layer,
-                    chunk,
-                    lane,
-                    task,
-                    join_wait_us / 1000.0,
-                    reason != nullptr ? reason : "DEPENDENCY",
-                    status == GGML_STATUS_SUCCESS ? "OK" : "FAIL");
-                printf(
-                    "[REGION_CREDIT] direction=%s event=RELEASE "
-                    "layer=%d chunk=%d lane=%zu inflight=%zu/2 "
-                    "reason=%s\n",
-                    direction,
-                    layer,
-                    chunk,
-                    lane,
-                    region_active_credits(pending),
-                    reason != nullptr ? reason : "DEPENDENCY");
-            }
-
-            return status;
-        };
-
-    auto drain_region_window =
-        [&](auto & pending,
-            const char * direction,
-            const char * reason) -> ggml_status {
-            ggml_status result = GGML_STATUS_SUCCESS;
-            for (size_t lane = 0;
-                    lane <
-                        ggml_backend_meta_context::PREFILL_RETURN_LANES;
-                    ++lane) {
-                const ggml_status status =
-                    wait_region_window_lane(
-                        pending,
-                        direction,
-                        lane,
-                        reason);
-                if (result == GGML_STATUS_SUCCESS &&
-                        status != GGML_STATUS_SUCCESS) {
-                    result = status;
-                }
-            }
-            return result;
-        };
-
-    auto wait_region_window_dependency =
-        [&](auto & pending,
-            const char * direction,
-            int layer,
-            int chunk,
-            const char * reason,
-            bool & waited) -> ggml_status {
-            waited = false;
-            for (size_t lane = 0;
-                    lane <
-                        ggml_backend_meta_context::PREFILL_RETURN_LANES;
-                    ++lane) {
-                if (!pending[lane].active ||
-                        pending[lane].layer != layer ||
-                        pending[lane].chunk != chunk) {
-                    continue;
-                }
-                waited = true;
-                return wait_region_window_lane(
-                    pending,
-                    direction,
-                    lane,
-                    reason);
-            }
-            return GGML_STATUS_SUCCESS;
-        };
-
-    if (pipeline_debug && region_window_requested >= 2) {
-        printf(
-            "[REGION_WINDOW_CONFIG] requested=%d active=%d "
-            "credits=%zu async_partial=%d priority_queues=%d "
-            "return_lane_rpc=%d\n",
-            region_window_requested,
-            region_window2 ? 1 : 0,
-            ggml_backend_meta_context::PREFILL_RETURN_LANES,
-            region_async_partial ? 1 : 0,
-            region_priority_queues ? 1 : 0,
-            region_return_lane_capable ? 1 : 0);
-    }
 
     auto ab_find_sg_named =
         [&](size_t backend, size_t sg,
@@ -7002,25 +5940,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // publishes READY. The consumer never reads a live producer tensor.
     auto prearm_phone_prefill_route =
         [&](size_t sg, int layer, int chunk) -> bool {
-            const bool region_p2c_overlap =
-                region_route_overlap &&
-                ggml_backend_meta_tensor_p2c_layer(
-                    backend_ctx, layer);
-            if ((!phone_prefill_producer_route &&
-                 !region_p2c_overlap) ||
-                    (!phone_prefill_chunk_pipeline &&
-                     !region_p2c_overlap) ||
+            if (!phone_prefill_producer_route ||
+                    !phone_prefill_chunk_pipeline ||
                     phone_primary_strict_route ||
                     chunk < 0 ||
                     n_backends != 2 ||
-                    (!region_p2c_overlap &&
-                     std::getenv(
+                    std::getenv(
                         "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") ==
-                        nullptr) ||
-                    (!region_p2c_overlap &&
-                     std::getenv(
+                        nullptr ||
+                    std::getenv(
                         "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") ==
-                        nullptr)) {
+                        nullptr) {
                 return false;
             }
 
@@ -8885,18 +7815,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const auto producer_route_it =
                 pending_phone_prefill_routes.find(
                     { phone_route_layer, phone_route_chunk });
-            const bool region_p2c_mailbox =
-                region_route_overlap &&
-                p2c_directional &&
-                phone_route_chunk >= 0 &&
-                region_p2c_early_ffn.active &&
-                region_p2c_early_ffn.route_sg == i &&
-                region_p2c_early_ffn.layer ==
-                    phone_route_layer &&
-                region_p2c_early_ffn.chunk ==
-                    phone_route_chunk;
-            if ((phone_prefill_producer_route ||
-                 region_p2c_mailbox) &&
+            if (phone_prefill_producer_route &&
                     producer_route_it !=
                         pending_phone_prefill_routes.end() &&
                     producer_route_it->second.producer_seq != 0) {
@@ -8917,21 +7836,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 // Soft dual-return policy: lane 0 stays fully eager.  Lane 1
                 // is released as soon as the final route for this layer has
                 // been posted, not when the route transfer or FFN completes.
-                if (!region_p2c_mailbox) {
-                    open_phone_prefill_lane1_return_gate(
-                        phone_route_layer,
-                        phone_route_chunk);
-                } else if (pipeline_debug) {
-                    printf(
-                        "[REGION_P2C_ROUTE_OVERLAP] "
-                        "phase=HANDOFF layer=%d chunk=%d "
-                        "route_task=%" PRIu64 " phone_ffn_sg=%zu "
-                        "status=IN_FLIGHT\n",
-                        phone_route_layer,
-                        phone_route_chunk,
-                        producer_route_it->second.task,
-                        region_p2c_early_ffn.ffn_sg);
-                }
+                open_phone_prefill_lane1_return_gate(
+                    phone_route_layer,
+                    phone_route_chunk);
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -9683,18 +8590,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
-        const bool region_phone_cont_sg =
-            active_count == 1 &&
-            active_backend == 1 &&
-            subgraph_is_region_phone_continuation(i);
-
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
             !c2p_tensor_sg &&
-            !region_phone_cont_sg &&
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
@@ -9818,33 +8719,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             const bool pc_needed_next =
                 i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
-
-            // Full-graph directional Region interior is explicitly
-            // Phone-owned.  Chunk-local tensors are not complete layer
-            // activations and must never enter the generic Phone->PC l_out
-            // handoff/copy path.  The only cross-device exit is the explicit
-            // P2C boundary machinery at L46.
-            if (region_phone_cont_sg &&
-                    !c2p_prefill_down_boundary &&
-                    !c2p_decode_single_boundary) {
-                handled = true;
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_PHONE_CONT_KEEP] sg=%zu tensor=%s "
-                        "bytes=%zu next_pc=%d next_phone=%d "
-                        "action=NO_HANDOFF status=OK\n",
-                        i,
-                        nodes[1] != nullptr ?
-                            nodes[1]->name : "(null)",
-                        nodes[1] != nullptr ?
-                            ggml_nbytes(nodes[1]) : 0,
-                        pc_needed_next ? 1 : 0,
-                        i + 1 < backend_ctx->n_subgraphs ?
-                            (int) subgraph_will_execute_phone(i + 1) : -1);
-                }
-                return GGML_STATUS_SUCCESS;
-            }
-
             if (c2p_tensor_sg) {
                 handled = true;
                 if (pipeline_debug) {
@@ -9876,44 +8750,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (pipeline_debug) {
                     printf("[META_KEEP_PHONE] sg=%zu tensor=%s bytes=%zu next_pc_compute=0\n",
                            i, nodes[1]->name, ggml_nbytes(nodes[1]));
-                }
-                return GGML_STATUS_SUCCESS;
-            }
-
-            // Region directional pair:
-            //
-            //   ... L45 Phone Full -> L46 P2C (Phone Attention)
-            //
-            // force_phone_block_exit marks L45 as a generic Phone-owner exit,
-            // but the next P2C layer still starts on Phone.  Falling through
-            // to the generic active-backend mirror copies the complete L45
-            // activation Phone->PC even though PC never consumes it.  Besides
-            // wasting a full-H transfer, that blocking RPC copy sits directly
-            // on the Prefill critical path.  Keep ownership on Phone and let
-            // the explicit P2C READY/Router handoff provide only the tensors
-            // needed by the PC FFN shard.
-            int next_p2c_prefill_layer = -1;
-            const bool keep_phone_for_p2c_prefill =
-                !c2p_prefill_down_boundary &&
-                !c2p_decode_single_boundary &&
-                phone_owner_exit &&
-                i + 1 < backend_ctx->n_subgraphs &&
-                subgraph_prefill_p2c_layer(
-                    i + 1, next_p2c_prefill_layer) &&
-                layer_attention_phone_owned(
-                    next_p2c_prefill_layer);
-            if (keep_phone_for_p2c_prefill) {
-                handled = true;
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_KEEP_PHONE_EXIT] sg=%zu layer=%d "
-                        "next_layer=%d tensor=%s "
-                        "reason=NEXT_P2C_PHONE_ATTN status=OK\n",
-                        i,
-                        force_phone_block_layer,
-                        next_p2c_prefill_layer,
-                        nodes[1] != nullptr ?
-                            nodes[1]->name : "(null)");
                 }
                 return GGML_STATUS_SUCCESS;
             }
@@ -10876,142 +9712,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool last_chunk =
                 prefill_is_last_down_chunk(
                     i, prefill_down_layer_0);
-            const bool region_boundary_last =
-                !region_has_later_boundary_chunk(
-                    i,
-                    prefill_down_layer_0,
-                    prefill_down_chunk_0);
-            const size_t region_partial_lane =
-                region_window2 ?
-                    ((size_t) prefill_down_chunk_0 %
-                     ggml_backend_meta_context::PREFILL_RETURN_LANES) :
-                    0;
-            // Full-graph Region P2C carries the residual as a
-            // chunk-local tensor named prefill_wave_ffn_inp_chunk_C-L.
-            // Legacy layouts expose one full-layer ffn_inp-L instead.  Prefer
-            // the exact chunk-local residual and fall back to the old lookup.
-            char p2c_residual_name[96];
-            std::snprintf(
-                p2c_residual_name,
-                sizeof(p2c_residual_name),
-                "prefill_wave_ffn_inp_chunk_%d-%d",
-                prefill_down_chunk_0,
-                prefill_down_layer_0);
             ggml_tensor * phone_residual =
-                find_exact_named_tensor(
-                    1, p2c_residual_name);
-            const bool p2c_chunk_local_residual =
-                phone_residual != nullptr;
-            if (phone_residual == nullptr) {
-                phone_residual =
-                    find_recent_ffn_inp(
-                        1, i, prefill_down_layer_0);
-            }
-
+                find_recent_ffn_inp(
+                    1, i, prefill_down_layer_0);
             ggml_tensor * pc_l_out =
                 find_layer_output(
                     0, prefill_down_layer_0);
             GGML_ASSERT(phone_residual != nullptr);
+            GGML_ASSERT(pc_l_out != nullptr);
 
-            size_t full_output_bytes =
-                pc_l_out != nullptr ?
-                    ggml_nbytes(pc_l_out) :
-                    backend_ctx->region_prefill_hidden_bytes;
-            size_t chunk_offset = 0;
-            bool region_output_complete = false;
-
-            if (region_chunk_continuation) {
-                GGML_ASSERT(full_output_bytes > 0);
-                auto & output_state =
-                    backend_ctx->region_p2c_prefill;
-                if (!output_state.active) {
-                    GGML_ASSERT(prefill_down_chunk_0 == 0);
-                    output_state.active = true;
-                    output_state.complete = false;
-                    output_state.layer = prefill_down_layer_0;
-                    output_state.next_chunk = 0;
-                    output_state.full_bytes = full_output_bytes;
-                    output_state.bytes_reserved = 0;
-                }
-
-                GGML_ASSERT(
-                    output_state.layer ==
-                    prefill_down_layer_0);
-                GGML_ASSERT(
-                    output_state.full_bytes ==
-                    full_output_bytes);
-                GGML_ASSERT(
-                    output_state.next_chunk ==
+            const size_t chunk_offset =
+                down_chunk_offset(
+                    1, true,
+                    prefill_down_layer_0,
                     prefill_down_chunk_0);
-
-                chunk_offset =
-                    output_state.bytes_reserved;
-                output_state.bytes_reserved +=
-                    ggml_nbytes(pc_partial);
-                ++output_state.next_chunk;
-                GGML_ASSERT(
-                    output_state.bytes_reserved <=
-                    output_state.full_bytes);
-                output_state.complete =
-                    output_state.bytes_reserved ==
-                    output_state.full_bytes;
-                region_output_complete =
-                    output_state.complete;
-
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_P2C_OUTPUT_STATE] "
-                        "layer=%d chunk=%d offset=%zu "
-                        "chunk_bytes=%zu reserved=%zu/%zu "
-                        "complete=%d pc_l_out_visible=%d "
-                        "status=OK\n",
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0,
-                        chunk_offset,
-                        ggml_nbytes(pc_partial),
-                        output_state.bytes_reserved,
-                        output_state.full_bytes,
-                        output_state.complete ? 1 : 0,
-                        pc_l_out != nullptr ? 1 : 0);
-                }
-            } else {
-                GGML_ASSERT(pc_l_out != nullptr);
-                chunk_offset =
-                    down_chunk_offset(
-                        1, true,
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0);
-                region_output_complete =
-                    last_chunk;
-            }
-
-            const size_t residual_offset =
-                p2c_chunk_local_residual ?
-                    0 : chunk_offset;
 
             ggml_tensor * residual_chunk =
                 get_node_aux(phone_partial);
             residual_chunk->view_src = phone_residual;
-            residual_chunk->view_offs = residual_offset;
+            residual_chunk->view_offs = chunk_offset;
             ggml_backend_view_init(residual_chunk);
             GGML_ASSERT(
-                residual_offset + ggml_nbytes(residual_chunk) <=
+                chunk_offset + ggml_nbytes(residual_chunk) <=
                 ggml_nbytes(phone_residual));
-
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_P2C_RESIDUAL] layer=%d chunk=%d "
-                    "tensor=%s source=%s residual_offs=%zu "
-                    "chunk_offs=%zu bytes=%zu status=OK\n",
-                    prefill_down_layer_0,
-                    prefill_down_chunk_0,
-                    phone_residual->name,
-                    p2c_chunk_local_residual ?
-                        "CHUNK_LOCAL" : "FULL_LAYER",
-                    residual_offset,
-                    chunk_offset,
-                    ggml_nbytes(residual_chunk));
-            }
 
             ggml_tensor * phone_fold =
                 get_node_aux(phone_partial);
@@ -11033,51 +9756,35 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             ggml_tensor * pc_tmp =
                 get_node_aux(pc_partial);
-            if (region_async_partial) {
-                set_region_partial_stage_data(
-                    pc_tmp, j_dst, region_partial_lane);
-            } else {
-                set_tmp_data(pc_tmp, j_dst, 0);
-            }
+            set_tmp_data(pc_tmp, j_dst, 0);
 
             ggml_tensor * pc_out_chunk =
                 get_node_aux(pc_partial);
+            pc_out_chunk->view_src = pc_l_out;
+            pc_out_chunk->view_offs = chunk_offset;
             pc_out_chunk->op = GGML_OP_ADD;
             pc_out_chunk->src[0] = pc_partial;
             pc_out_chunk->src[1] = pc_tmp;
             pc_out_chunk->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            if (region_chunk_continuation || region_window2) {
-                bind_region_boundary_output_chunk(
-                    pc_out_chunk,
-                    j_dst,
-                    full_output_bytes,
-                    chunk_offset);
-            } else {
-                pc_out_chunk->view_src = pc_l_out;
-                pc_out_chunk->view_offs = chunk_offset;
-                ggml_backend_view_init(pc_out_chunk);
-            }
+            ggml_backend_view_init(pc_out_chunk);
             GGML_ASSERT(
                 chunk_offset + ggml_nbytes(pc_out_chunk) <=
-                full_output_bytes);
+                ggml_nbytes(pc_l_out));
 
             ggml_cgraph * pc_reduce_graph =
                 get_cgraph_aux();
             pc_reduce_graph->nodes[0] = pc_out_chunk;
             pc_reduce_graph->n_nodes = 1;
 
-            if (region_output_complete &&
-                    pc_l_out != nullptr) {
+            if (last_chunk) {
                 ggml_tensor * disabled_pc =
                     disable_layer_output_producers(
-                        0, 0, prefill_down_layer_0);
-                if (disabled_pc != nullptr) {
-                    GGML_ASSERT(disabled_pc == pc_l_out);
-                }
+                        0, i + 1, prefill_down_layer_0);
+                GGML_ASSERT(disabled_pc == pc_l_out);
                 ggml_tensor * disabled_phone =
                     disable_layer_output_producers(
-                        1, 0, prefill_down_layer_0);
-                (void) disabled_phone;
+                        1, i + 1, prefill_down_layer_0);
+                GGML_ASSERT(disabled_phone != nullptr);
             }
 
             std::vector<float> pc_before;
@@ -11109,16 +9816,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_time_us();
             ggml_backend_synchronize(phone_cfg.backend);
             ggml_status status =
-                region_priority_queues ?
-                    run_region_main_graph(
-                        1,
-                        phone_fold_graph,
-                        "P2C",
-                        "OUTGOING_FOLD",
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0) :
-                    ggml_backend_graph_compute_async(
-                        phone_cfg.backend, phone_fold_graph);
+                ggml_backend_graph_compute_async(
+                    phone_cfg.backend, phone_fold_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -11126,401 +9825,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const int64_t phone_fold_us =
                 ggml_time_us() - phone_fold_begin_us;
 
-            int64_t partial_stage_us = 0;
-            int64_t partial_join_wait_us = 0;
-            int64_t copy_us = 0;
-            ggml_tensor * partial_wire_src = phone_partial;
-
-            if (region_async_partial) {
-                if (region_window2) {
-                    const size_t partial_lane =
-                        region_partial_lane;
-
-                    status =
-                        wait_region_window_lane(
-                            pending_region_p2c,
-                            "P2C",
-                            partial_lane,
-                            "LANE_REUSE");
-                    if (status != GGML_STATUS_SUCCESS) {
-                        return status;
-                    }
-
-                    // Pin the reducer-side PC FFN result before another
-                    // chunk can reuse the graph arena.
-                    ggml_tensor * pc_local_stage =
-                        get_node_aux(pc_partial);
-                    set_region_local_partial_stage_data(
-                        pc_local_stage, j_dst, partial_lane);
-
-                    const int64_t local_stage_begin_us =
-                        ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        pc_cfg.backend,
-                        pc_cfg.backend,
-                        pc_partial,
-                        pc_local_stage);
-                    ggml_backend_synchronize(pc_cfg.backend);
-                    const int64_t local_stage_us =
-                        ggml_time_us() - local_stage_begin_us;
-
-                    // The eventual PC reduce consumes the pinned local
-                    // partial, not the reusable graph output.
-                    pc_out_chunk->src[0] = pc_local_stage;
-
-                    ggml_tensor * phone_stage =
-                        get_node_aux(phone_partial);
-                    set_region_partial_stage_data(
-                        phone_stage, j_src, partial_lane);
-
-                    const int64_t stage_begin_us =
-                        ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        phone_cfg.backend,
-                        phone_cfg.backend,
-                        phone_partial,
-                        phone_stage);
-                    ggml_backend_synchronize(phone_cfg.backend);
-                    partial_stage_us =
-                        local_stage_us +
-                        (ggml_time_us() - stage_begin_us);
-                    partial_wire_src = phone_stage;
-
-                    auto & worker_slot =
-                        backend_ctx->prefill_return_workers[
-                            partial_lane];
-                    if (worker_slot == nullptr) {
-                        worker_slot =
-                            new ggml_backend_meta_transfer_worker();
-                    }
-                    auto * return_worker = worker_slot;
-                    auto * reducer_exec =
-                        get_region_exec_worker(0);
-                    auto metrics =
-                        std::make_shared<region_window_metrics>();
-
-                    const int layer = prefill_down_layer_0;
-                    const int chunk = prefill_down_chunk_0;
-                    const size_t bytes =
-                        ggml_nbytes(phone_stage);
-                    const bool debug = pipeline_debug;
-
-                    const uint64_t return_task =
-                        return_worker->enqueue(
-                            [phone_backend = phone_cfg.backend,
-                             pc_backend = pc_cfg.backend,
-                             phone_stage,
-                             pc_tmp,
-                             pc_reduce_graph,
-                             reducer_exec,
-                             region_return_get_lane,
-                             metrics,
-                             layer,
-                             chunk,
-                             partial_lane,
-                             bytes,
-                             debug]
-                            (uint64_t task_id) -> ggml_status {
-                                const int64_t wire_begin_us =
-                                    ggml_time_us();
-                                std::vector<uint8_t> payload(bytes);
-                                const bool received =
-                                    region_return_get_lane(
-                                        phone_backend,
-                                        phone_stage,
-                                        payload.data(),
-                                        payload.size(),
-                                        partial_lane);
-                                if (!received) {
-                                    return GGML_STATUS_FAILED;
-                                }
-                                ggml_backend_tensor_set(
-                                    pc_tmp,
-                                    payload.data(),
-                                    0,
-                                    payload.size());
-                                ggml_backend_synchronize(pc_backend);
-                                metrics->wire_us =
-                                    ggml_time_us() - wire_begin_us;
-
-                                if (debug) {
-                                    printf(
-                                        "[REGION_RETURN_TX] "
-                                        "direction=P2C layer=%d "
-                                        "chunk=%d lane=%zu "
-                                        "task=%" PRIu64
-                                        " bytes=%zu wire_ms=%.3f "
-                                        "transport=RETURN_LANE "
-                                        "status=DONE\n",
-                                        layer,
-                                        chunk,
-                                        partial_lane,
-                                        task_id,
-                                        bytes,
-                                        metrics->wire_us / 1000.0);
-                                }
-
-                                const int64_t reduce_begin_us =
-                                    ggml_time_us();
-                                const uint64_t reduce_task =
-                                    reducer_exec->enqueue(
-                                        pc_reduce_graph,
-                                        true);
-                                if (debug) {
-                                    printf(
-                                        "[REGION_EXEC_QUEUE] side=PC "
-                                        "queue=MAIN priority=HIGH "
-                                        "direction=P2C role=REDUCE "
-                                        "layer=%d chunk=%d "
-                                        "task=%" PRIu64
-                                        " status=ENQUEUED_ASYNC\n",
-                                        layer,
-                                        chunk,
-                                        reduce_task);
-                                }
-                                const ggml_status reduce_status =
-                                    reducer_exec->wait(reduce_task);
-                                if (reduce_status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return reduce_status;
-                                }
-                                ggml_backend_synchronize(pc_backend);
-                                metrics->reduce_us =
-                                    ggml_time_us() - reduce_begin_us;
-                                return GGML_STATUS_SUCCESS;
-                            });
-
-                    auto & pending =
-                        pending_region_p2c[partial_lane];
-                    GGML_ASSERT(!pending.active);
-                    pending.active = true;
-                    pending.layer = layer;
-                    pending.chunk = chunk;
-                    pending.sg = i;
-                    pending.lane = partial_lane;
-                    pending.src_backend = j_src;
-                    pending.dst_backend = j_dst;
-                    pending.task = return_task;
-                    pending.worker = return_worker;
-                    pending.wire_src = phone_stage;
-                    pending.wire_dst = pc_tmp;
-                    pending.out_chunk = pc_out_chunk;
-                    pending.bytes = bytes;
-                    pending.fold_us = phone_fold_us;
-                    pending.stage_us = partial_stage_us;
-                    pending.boundary_last =
-                        region_output_complete;
-                    pending.numeric_check =
-                        c2p_self_check &&
-                        !pc_before.empty();
-                    pending.metrics = metrics;
-                    pending.before_a =
-                        std::make_shared<std::vector<float>>(
-                            std::move(pc_before));
-                    pending.before_b =
-                        std::make_shared<std::vector<float>>(
-                            std::move(phone_before));
-                    pending.before_residual =
-                        std::make_shared<std::vector<float>>(
-                            std::move(residual_before));
-
-                    if (pipeline_debug) {
-                        printf(
-                            "[REGION_RETURN_STAGE] "
-                            "direction=P2C layer=%d chunk=%d "
-                            "lane=%zu bytes=%zu stage_ms=%.3f "
-                            "status=READY\n",
-                            layer,
-                            chunk,
-                            partial_lane,
-                            bytes,
-                            partial_stage_us / 1000.0);
-                        printf(
-                            "[REGION_CREDIT] direction=P2C "
-                            "event=ACQUIRE layer=%d chunk=%d "
-                            "lane=%zu inflight=%zu/2\n",
-                            layer,
-                            chunk,
-                            partial_lane,
-                            region_active_credits(
-                                pending_region_p2c));
-                    }
-
-                    if (region_output_complete) {
-                        status =
-                            drain_region_window(
-                                pending_region_p2c,
-                                "P2C",
-                                "BOUNDARY_DRAIN");
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
-                        }
-
-                        if (pc_l_out != nullptr) {
-                            ggml_tensor * staged_l_out =
-                                get_node_aux(pc_l_out);
-                            bind_region_boundary_output_full(
-                                staged_l_out,
-                                j_dst,
-                                full_output_bytes);
-
-                            const int64_t commit_begin_us =
-                                ggml_time_us();
-                            ggml_backend_tensor_copy_async(
-                                pc_cfg.backend,
-                                pc_cfg.backend,
-                                staged_l_out,
-                                pc_l_out);
-                            ggml_backend_synchronize(
-                                pc_cfg.backend);
-                            const int64_t commit_us =
-                                ggml_time_us() - commit_begin_us;
-
-                            if (c2p_self_check &&
-                                    staged_l_out->type == GGML_TYPE_F32 &&
-                                    pc_l_out->type == GGML_TYPE_F32) {
-                                directional_wire_parity(
-                                    "P2C",
-                                    prefill_down_layer_0,
-                                    -1,
-                                    "BOUNDARY_OUTPUT_COMMIT",
-                                    j_dst,
-                                    j_dst,
-                                    staged_l_out,
-                                    pc_l_out);
-                            }
-
-                            backend_ctx->region_p2c_prefill.active = false;
-
-                            if (pipeline_debug) {
-                                printf(
-                                    "[REGION_BOUNDARY_OUTPUT_COMMIT] "
-                                    "direction=P2C layer=%d "
-                                    "bytes=%zu commit_ms=%.3f "
-                                    "source=CURRENT_GRAPH "
-                                    "owner=PC status=OK\n",
-                                    prefill_down_layer_0,
-                                    full_output_bytes,
-                                    commit_us / 1000.0);
-                            }
-                        } else if (pipeline_debug) {
-                            printf(
-                                "[REGION_BOUNDARY_OUTPUT_PENDING] "
-                                "direction=P2C layer=%d bytes=%zu "
-                                "reason=L_OUT_NOT_VISIBLE status=WAIT_GRAPH\n",
-                                prefill_down_layer_0,
-                                full_output_bytes);
-                        }
-                    }
-
-                    return GGML_STATUS_SUCCESS;
-                }
-
-                constexpr size_t partial_lane = 0;
-
-                ggml_tensor * phone_stage =
-                    get_node_aux(phone_partial);
-                set_region_partial_stage_data(
-                    phone_stage, j_src, partial_lane);
-
-                const int64_t stage_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    phone_cfg.backend, phone_cfg.backend,
-                    phone_partial, phone_stage);
-                ggml_backend_synchronize(phone_cfg.backend);
-                partial_stage_us =
-                    ggml_time_us() - stage_begin_us;
-                partial_wire_src = phone_stage;
-
-                auto & worker_slot =
-                    backend_ctx->prefill_return_workers[partial_lane];
-                if (worker_slot == nullptr) {
-                    worker_slot =
-                        new ggml_backend_meta_transfer_worker();
-                }
-                auto * return_worker = worker_slot;
-                auto wire_us =
-                    std::make_shared<int64_t>(0);
-
-                const int layer = prefill_down_layer_0;
-                const int chunk = prefill_down_chunk_0;
-                const size_t bytes = ggml_nbytes(phone_stage);
-                const bool debug = pipeline_debug;
-
-                const uint64_t return_task =
-                    return_worker->enqueue(
-                        [phone_backend = phone_cfg.backend,
-                         pc_backend = pc_cfg.backend,
-                         phone_stage,
-                         pc_tmp,
-                         wire_us,
-                         layer,
-                         chunk,
-                         bytes,
-                         debug]
-                        (uint64_t task_id) -> ggml_status {
-                            const int64_t wire_begin_us =
-                                ggml_time_us();
-                            ggml_backend_tensor_copy_async(
-                                phone_backend, pc_backend,
-                                phone_stage, pc_tmp);
-                            ggml_backend_synchronize(pc_backend);
-                            *wire_us =
-                                ggml_time_us() - wire_begin_us;
-
-                            if (debug) {
-                                printf(
-                                    "[REGION_RETURN_TX] "
-                                    "direction=P2C layer=%d chunk=%d "
-                                    "lane=0 task=%" PRIu64 " bytes=%zu "
-                                    "wire_ms=%.3f status=DONE\n",
-                                    layer, chunk, task_id, bytes,
-                                    *wire_us / 1000.0);
-                            }
-                            return GGML_STATUS_SUCCESS;
-                        });
-
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_RETURN_STAGE] "
-                        "direction=P2C layer=%d chunk=%d lane=0 "
-                        "bytes=%zu stage_ms=%.3f status=READY\n",
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0,
-                        ggml_nbytes(phone_stage),
-                        partial_stage_us / 1000.0);
-                }
-
-                const int64_t join_begin_us = ggml_time_us();
-                const ggml_status return_status =
-                    return_worker->wait(return_task);
-                partial_join_wait_us =
-                    ggml_time_us() - join_begin_us;
-                if (return_status != GGML_STATUS_SUCCESS) {
-                    return return_status;
-                }
-                copy_us = *wire_us;
-
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_RETURN_JOIN] "
-                        "direction=P2C layer=%d chunk=%d lane=0 "
-                        "task=%" PRIu64 " wait_ms=%.3f "
-                        "window=1 status=OK\n",
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0,
-                        return_task,
-                        partial_join_wait_us / 1000.0);
-                }
-            } else {
-                const int64_t copy_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    phone_cfg.backend, pc_cfg.backend,
-                    phone_partial, pc_tmp);
-                ggml_backend_synchronize(pc_cfg.backend);
-                copy_us = ggml_time_us() - copy_begin_us;
-            }
-
+            const int64_t copy_begin_us = ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                phone_cfg.backend, pc_cfg.backend,
+                phone_partial, pc_tmp);
+            ggml_backend_synchronize(pc_cfg.backend);
+            const int64_t copy_us =
+                ggml_time_us() - copy_begin_us;
             record_copy_wait(copy_us);
             record_meta_copy(
                 i, j_src, j_dst, phone_partial, copy_us);
@@ -11532,21 +9843,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 prefill_down_chunk_0,
                 "PHONE_PARTIAL_PLUS_RESIDUAL",
                 j_src, j_dst,
-                partial_wire_src, pc_tmp);
+                phone_partial, pc_tmp);
 
             const int64_t pc_reduce_begin_us =
                 ggml_time_us();
-            status =
-                region_priority_queues ?
-                    run_region_main_graph(
-                        0,
-                        pc_reduce_graph,
-                        "P2C",
-                        "REDUCE",
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0) :
-                    ggml_backend_graph_compute_async(
-                        pc_cfg.backend, pc_reduce_graph);
+            status = ggml_backend_graph_compute_async(
+                pc_cfg.backend, pc_reduce_graph);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -11557,58 +9859,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             reduce_add_us +=
                 phone_fold_us + pc_reduce_us;
             ++reduce_to_primary_count;
-
-            if (region_chunk_continuation &&
-                    region_output_complete &&
-                    pc_l_out != nullptr &&
-                    backend_ctx->region_p2c_prefill.active) {
-                ggml_tensor * staged_l_out =
-                    get_node_aux(pc_l_out);
-                bind_region_boundary_output_full(
-                    staged_l_out,
-                    j_dst,
-                    full_output_bytes);
-
-                const int64_t commit_begin_us =
-                    ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    pc_cfg.backend,
-                    pc_cfg.backend,
-                    staged_l_out,
-                    pc_l_out);
-                ggml_backend_synchronize(pc_cfg.backend);
-                const int64_t commit_us =
-                    ggml_time_us() - commit_begin_us;
-
-                if (c2p_self_check &&
-                        staged_l_out->type == GGML_TYPE_F32 &&
-                        pc_l_out->type == GGML_TYPE_F32) {
-                    directional_wire_parity(
-                        "P2C",
-                        prefill_down_layer_0,
-                        -1,
-                        "BOUNDARY_OUTPUT_COMMIT",
-                        j_dst,
-                        j_dst,
-                        staged_l_out,
-                        pc_l_out);
-                }
-
-                backend_ctx->region_p2c_prefill.active = false;
-                retire_region_c2p_on_p2c_commit(
-                    prefill_down_layer_0, "P2C_CURRENT_GRAPH");
-
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_BOUNDARY_OUTPUT_COMMIT] "
-                        "direction=P2C layer=%d bytes=%zu "
-                        "commit_ms=%.3f source=CURRENT_GRAPH "
-                        "owner=PC status=OK\n",
-                        prefill_down_layer_0,
-                        full_output_bytes,
-                        commit_us / 1000.0);
-                }
-            }
 
             if (c2p_self_check && !pc_before.empty()) {
                 const size_t n = pc_before.size();
@@ -11656,19 +9906,15 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 printf(
                     "[REGION_P2C_PREFILL] layer=%d chunk=%d "
                     "last=%d bytes=%zu phone_fold_ms=%.3f "
-                    "stage_ms=%.3f copy_ms=%.3f join_wait_ms=%.3f "
-                    "pc_reduce_ms=%.3f async_partial=%d "
+                    "copy_ms=%.3f pc_reduce_ms=%.3f "
                     "owner=PC status=OK\n",
                     prefill_down_layer_0,
                     prefill_down_chunk_0,
-                    region_output_complete ? 1 : 0,
+                    last_chunk ? 1 : 0,
                     ggml_nbytes(phone_partial),
                     phone_fold_us / 1000.0,
-                    partial_stage_us / 1000.0,
                     copy_us / 1000.0,
-                    partial_join_wait_us / 1000.0,
-                    pc_reduce_us / 1000.0,
-                    region_async_partial ? 1 : 0);
+                    pc_reduce_us / 1000.0);
             }
 
             return GGML_STATUS_SUCCESS;
@@ -11927,205 +10173,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 const bool last_chunk =
                     prefill_is_last_down_chunk(i, prefill_down_layer_0);
-                const bool region_boundary_last =
-                    !region_has_later_boundary_chunk(
-                        i,
-                        prefill_down_layer_0,
-                        prefill_down_chunk_0);
-                const size_t region_partial_lane =
-                    region_window2 ?
-                        ((size_t) prefill_down_chunk_0 %
-                         ggml_backend_meta_context::PREFILL_RETURN_LANES) :
-                        0;
-                // The full-layer ffn_inp is not necessarily in the current
-                // Meta graph for chunk > 0. Capture it once on chunk 0 and
-                // use the PC-owned snapshot, never a stale simple-tensor ptr.
                 ggml_tensor * pc_residual =
-                    (!region_chunk_continuation ||
-                     prefill_down_chunk_0 == 0) ?
-                        find_recent_ffn_inp(
-                            0, i, prefill_down_layer_0) : nullptr;
+                    find_recent_ffn_inp(0, i, prefill_down_layer_0);
                 ggml_tensor * phone_l_out =
                     find_layer_output(1, prefill_down_layer_0);
-                size_t full_hidden_bytes = 0;
 
-                if (region_chunk_continuation) {
-                    if (prefill_down_chunk_0 == 0) {
-                        GGML_ASSERT(pc_residual != nullptr);
-                        full_hidden_bytes = ggml_nbytes(pc_residual);
-                    } else {
-                        const auto & prior =
-                            backend_ctx->region_c2p_prefill;
-                        GGML_ASSERT(prior.active);
-                        GGML_ASSERT(prior.residual_ready);
-                        GGML_ASSERT(prior.layer == prefill_down_layer_0);
-                        full_hidden_bytes = prior.full_bytes;
-                    }
-                    // A Phone l_out producer may only be present in another
-                    // graph_compute. Its persistent buffer is authoritative.
-                    if (phone_l_out != nullptr) {
-                        GGML_ASSERT(
-                            ggml_nbytes(phone_l_out) ==
-                            full_hidden_bytes);
-                    }
-                } else {
-                    GGML_ASSERT(pc_residual != nullptr);
-                    GGML_ASSERT(phone_l_out != nullptr);
-                    GGML_ASSERT(
-                        ggml_nbytes(pc_residual) ==
-                        ggml_nbytes(phone_l_out));
-                    full_hidden_bytes = ggml_nbytes(phone_l_out);
-                }
+                GGML_ASSERT(pc_residual != nullptr);
+                GGML_ASSERT(phone_l_out != nullptr);
+                GGML_ASSERT(
+                    ggml_nbytes(pc_residual) ==
+                    ggml_nbytes(phone_l_out));
 
-                if (region_chunk_continuation) {
-                    if (prefill_down_chunk_0 == 0) {
-                        backend_ctx->region_prefill_hidden_bytes =
-                            full_hidden_bytes;
-                        backend_ctx->region_c2p_prefill =
-                            ggml_backend_meta_context::
-                                region_prefill_boundary_state {};
-                        backend_ctx->region_p2c_prefill =
-                            ggml_backend_meta_context::
-                                region_prefill_boundary_state {};
-                        if (pipeline_debug) {
-                            printf(
-                                "[REGION_CONT_OUTPUT_STATE] "
-                                "event=RESET c2p_layer=%d "
-                                "full_bytes=%zu status=OK\n",
-                                prefill_down_layer_0,
-                                full_hidden_bytes);
-                        }
-                    } else {
-                        GGML_ASSERT(
-                            backend_ctx->region_prefill_hidden_bytes ==
-                            full_hidden_bytes);
-                    }
-                }
-
-                size_t chunk_offset = 0;
-                bool c2p_output_complete = false;
-                if (region_chunk_continuation) {
-                    auto & output_state =
-                        backend_ctx->region_c2p_prefill;
-                    if (!output_state.active) {
-                        GGML_ASSERT(prefill_down_chunk_0 == 0);
-                        output_state.active = true;
-                        output_state.complete = false;
-                        output_state.layer = prefill_down_layer_0;
-                        output_state.next_chunk = 0;
-                        output_state.full_bytes = full_hidden_bytes;
-                        output_state.bytes_reserved = 0;
-                    }
-
-                    GGML_ASSERT(
-                        output_state.layer ==
-                        prefill_down_layer_0);
-                    GGML_ASSERT(
-                        output_state.full_bytes == full_hidden_bytes);
-                    GGML_ASSERT(
-                        output_state.next_chunk ==
-                        prefill_down_chunk_0);
-
-                    chunk_offset =
-                        output_state.bytes_reserved;
-                    output_state.bytes_reserved +=
-                        ggml_nbytes(node_dst);
-                    ++output_state.next_chunk;
-                    GGML_ASSERT(
-                        output_state.bytes_reserved <=
-                        output_state.full_bytes);
-                    output_state.complete =
-                        output_state.bytes_reserved ==
-                        output_state.full_bytes;
-                    c2p_output_complete =
-                        output_state.complete;
-
-                    if (pipeline_debug) {
-                        printf(
-                            "[REGION_C2P_OUTPUT_STATE] "
-                            "layer=%d chunk=%d offset=%zu "
-                            "chunk_bytes=%zu reserved=%zu/%zu "
-                            "complete=%d status=OK\n",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0,
-                            chunk_offset,
-                            ggml_nbytes(node_dst),
-                            output_state.bytes_reserved,
-                            output_state.full_bytes,
-                            output_state.complete ? 1 : 0);
-                    }
-                } else {
-                    chunk_offset =
-                        down_chunk_offset(
-                            0, true,
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0);
-                    c2p_output_complete =
-                        last_chunk;
-                }
-
-                if (region_chunk_continuation) {
-                    auto & state = backend_ctx->region_c2p_prefill;
-                    auto & pc_stage_buf =
-                        backend_ctx->backend_configs[0]
-                            .region_c2p_pc_residual_stage_buf;
-                    auto & phone_stage_buf =
-                        backend_ctx->backend_configs[1]
-                            .region_c2p_phone_output_stage_buf;
-
-                    if (prefill_down_chunk_0 == 0) {
-                        GGML_ASSERT(pc_residual != nullptr);
-                        GGML_ASSERT(
-                            ggml_is_contiguous(pc_residual));
-                        GGML_ASSERT(pc_residual->type == node_dst->type);
-                        if (pc_stage_buf == nullptr ||
-                                ggml_backend_buffer_get_size(
-                                    pc_stage_buf.get()) < state.full_bytes) {
-                            pc_stage_buf.reset(
-                                ggml_backend_alloc_buffer(
-                                    bcj_dst.backend, state.full_bytes));
-                        }
-                        GGML_ASSERT(pc_stage_buf != nullptr);
-
-                        ggml_tensor * snapshot =
-                            get_node_aux(pc_residual);
-                        snapshot->buffer = pc_stage_buf.get();
-                        snapshot->data = ggml_backend_buffer_get_base(
-                            pc_stage_buf.get());
-                        const int64_t snapshot_begin_us = ggml_time_us();
-                        ggml_backend_tensor_copy_async(
-                            bcj_dst.backend, bcj_dst.backend,
-                            pc_residual, snapshot);
-                        ggml_backend_synchronize(bcj_dst.backend);
-                        state.residual_ready = true;
-                        if (pipeline_debug) {
-                            printf("[REGION_C2P_RESIDUAL_STAGE] "
-                                   "layer=%d bytes=%zu copy_ms=%.3f "
-                                   "owner=PC status=READY\n",
-                                   state.layer, state.full_bytes,
-                                   (ggml_time_us() - snapshot_begin_us) /
-                                       1000.0);
-                        }
-                    }
-                    GGML_ASSERT(state.residual_ready);
-                    GGML_ASSERT(pc_stage_buf != nullptr);
-                    GGML_ASSERT(
-                        ggml_backend_buffer_get_size(pc_stage_buf.get()) >=
-                        state.full_bytes);
-
-                    if (phone_stage_buf == nullptr ||
-                            ggml_backend_buffer_get_size(
-                                phone_stage_buf.get()) < state.full_bytes) {
-                        phone_stage_buf.reset(
-                            ggml_backend_alloc_buffer(
-                                bcj_src.backend, state.full_bytes));
-                    }
-                    GGML_ASSERT(phone_stage_buf != nullptr);
-                    if (!bind_region_c2p_phone_backing(
-                            prefill_down_layer_0)) {
-                        return GGML_STATUS_FAILED;
-                    }
-                }
+                const size_t chunk_offset = down_chunk_offset(
+                    0, true, prefill_down_layer_0, prefill_down_chunk_0);
 
                 // At this boundary both FFN shard outputs are live and are the
                 // exact tensors consumed by the C2P reduction. Capture them
@@ -12144,34 +10204,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 // PC: fold the residual into the local FFN partial in-place.
                 ggml_tensor * residual_chunk = get_node_aux(node_dst);
-                if (region_chunk_continuation) {
-                    ggml_backend_buffer_t stable =
-                        backend_ctx->backend_configs[0]
-                            .region_c2p_pc_residual_stage_buf.get();
-                    GGML_ASSERT(stable != nullptr);
-                    GGML_ASSERT(
-                        chunk_offset + ggml_nbytes(residual_chunk) <=
-                        backend_ctx->region_c2p_prefill.full_bytes);
-                    residual_chunk->buffer = stable;
-                    residual_chunk->data =
-                        static_cast<uint8_t *>(
-                            ggml_backend_buffer_get_base(stable)) +
-                        chunk_offset;
-                    if (pipeline_debug) {
-                        printf("[REGION_C2P_RESIDUAL] layer=%d chunk=%d "
-                               "source=PERSISTENT_PC offset=%zu bytes=%zu "
-                               "status=OK\n",
-                               prefill_down_layer_0, prefill_down_chunk_0,
-                               chunk_offset, ggml_nbytes(residual_chunk));
-                    }
-                } else {
-                    residual_chunk->view_src = pc_residual;
-                    residual_chunk->view_offs = chunk_offset;
-                    ggml_backend_view_init(residual_chunk);
-                    GGML_ASSERT(
-                        chunk_offset + ggml_nbytes(residual_chunk) <=
-                        ggml_nbytes(pc_residual));
-                }
+                residual_chunk->view_src = pc_residual;
+                residual_chunk->view_offs = chunk_offset;
+                ggml_backend_view_init(residual_chunk);
+                GGML_ASSERT(
+                    chunk_offset + ggml_nbytes(residual_chunk) <=
+                    ggml_nbytes(pc_residual));
 
                 ggml_tensor * pc_fold = get_node_aux(node_dst);
                 pc_fold->view_src =
@@ -12190,65 +10228,38 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 // Phone staging for the second PC->Phone transfer.
                 ggml_tensor * phone_tmp = get_node_aux(node_src);
-                if (region_async_partial) {
-                    set_region_partial_stage_data(
-                        phone_tmp, j_src, region_partial_lane);
-                } else {
-                    set_tmp_data(phone_tmp, j_src, 0);
-                }
+                set_tmp_data(phone_tmp, j_src, 0);
 
-                // Phone Reduce is the only writer of this layer's output.
-                // Write directly into stable storage so L35(C) can consume it
-                // even if its VIEW belongs to a later Meta graph_compute.
+                // Phone: write the completed chunk directly into l_out.
                 ggml_tensor * phone_out_chunk = get_node_aux(node_src);
+                phone_out_chunk->view_src = phone_l_out;
+                phone_out_chunk->view_offs = chunk_offset;
                 phone_out_chunk->op = GGML_OP_ADD;
                 phone_out_chunk->src[0] = node_src;
                 phone_out_chunk->src[1] = phone_tmp;
                 phone_out_chunk->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                if (region_chunk_continuation) {
-                    ggml_backend_buffer_t stable =
-                        backend_ctx->backend_configs[1]
-                            .region_c2p_phone_output_stage_buf.get();
-                    GGML_ASSERT(stable != nullptr);
-                    phone_out_chunk->buffer = stable;
-                    phone_out_chunk->data =
-                        static_cast<uint8_t *>(
-                            ggml_backend_buffer_get_base(stable)) +
-                        chunk_offset;
-                } else {
-                    phone_out_chunk->view_src = phone_l_out;
-                    phone_out_chunk->view_offs = chunk_offset;
-                    ggml_backend_view_init(phone_out_chunk);
-                }
+                ggml_backend_view_init(phone_out_chunk);
                 GGML_ASSERT(
                     chunk_offset + ggml_nbytes(phone_out_chunk) <=
-                    full_hidden_bytes);
+                    ggml_nbytes(phone_l_out));
 
                 ggml_cgraph * phone_reduce_graph = get_cgraph_aux();
                 phone_reduce_graph->nodes[0] = phone_out_chunk;
                 phone_reduce_graph->n_nodes = 1;
 
-                const bool disable_c2p_output_producer =
-                    last_chunk || region_chunk_continuation;
-                if (disable_c2p_output_producer) {
+                if (last_chunk) {
                     ggml_tensor * disabled_phone_l_out =
                         disable_layer_output_producers(
                             1, i + 1, prefill_down_layer_0);
-                    if (!region_chunk_continuation) {
-                        GGML_ASSERT(disabled_phone_l_out == phone_l_out);
-                    } else if (disabled_phone_l_out != nullptr &&
-                               phone_l_out != nullptr) {
-                        GGML_ASSERT(disabled_phone_l_out == phone_l_out);
-                    }
+                    GGML_ASSERT(disabled_phone_l_out == phone_l_out);
 
-                    // PC is not the C2P output owner. A later graph may no
-                    // longer contain the original l_out producer at all.
+                    // PC l_out is not an owner in C2P.  Suppress the legacy
+                    // concat/add producer so the completed activation remains
+                    // Phone-local for the following Phone Region.
                     ggml_tensor * disabled_pc_l_out =
                         disable_layer_output_producers(
                             0, i + 1, prefill_down_layer_0);
-                    if (!region_chunk_continuation) {
-                        GGML_ASSERT(disabled_pc_l_out != nullptr);
-                    }
+                    GGML_ASSERT(disabled_pc_l_out != nullptr);
                 }
 
                 const bool c2p_numeric_trace =
@@ -12322,16 +10333,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t pc_fold_begin_us = ggml_time_us();
                 ggml_backend_synchronize(bcj_dst.backend);
                 ggml_status status =
-                    region_priority_queues ?
-                        run_region_main_graph(
-                            0,
-                            pc_fold_graph,
-                            "C2P",
-                            "OUTGOING_FOLD",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0) :
-                        ggml_backend_graph_compute_async(
-                            bcj_dst.backend, pc_fold_graph);
+                    ggml_backend_graph_compute_async(
+                        bcj_dst.backend, pc_fold_graph);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -12339,557 +10342,48 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 const int64_t pc_fold_us =
                     ggml_time_us() - pc_fold_begin_us;
 
-                int64_t partial_stage_us = 0;
-                int64_t partial_join_wait_us = 0;
-                int64_t copy_us = 0;
-                ggml_tensor * partial_wire_src = node_dst;
-
-                if (region_async_partial) {
-                    if (region_window2) {
-                        const size_t partial_lane =
-                            region_partial_lane;
-
-                        status =
-                            wait_region_window_lane(
-                                pending_region_c2p,
-                                "C2P",
-                                partial_lane,
-                                "LANE_REUSE");
-                        if (status != GGML_STATUS_SUCCESS) {
-                            return status;
-                        }
-
-                        // Pin the reducer-side Phone FFN result before the
-                        // next C2P chunk can reuse the Phone graph arena.
-                        ggml_tensor * phone_local_stage =
-                            get_node_aux(node_src);
-                        set_region_local_partial_stage_data(
-                            phone_local_stage,
-                            j_src,
-                            partial_lane);
-
-                        const int64_t local_stage_begin_us =
-                            ggml_time_us();
-                        ggml_backend_tensor_copy_async(
-                            bcj_src.backend,
-                            bcj_src.backend,
-                            node_src,
-                            phone_local_stage);
-                        ggml_backend_synchronize(bcj_src.backend);
-                        const int64_t local_stage_us =
-                            ggml_time_us() - local_stage_begin_us;
-
-                        phone_out_chunk->src[0] =
-                            phone_local_stage;
-
-                        ggml_tensor * pc_stage =
-                            get_node_aux(node_dst);
-                        set_region_partial_stage_data(
-                            pc_stage, j_dst, partial_lane);
-
-                        const int64_t stage_begin_us =
-                            ggml_time_us();
-                        ggml_backend_tensor_copy_async(
-                            bcj_dst.backend,
-                            bcj_dst.backend,
-                            node_dst,
-                            pc_stage);
-                        ggml_backend_synchronize(bcj_dst.backend);
-                        partial_stage_us =
-                            local_stage_us +
-                            (ggml_time_us() - stage_begin_us);
-                        partial_wire_src = pc_stage;
-
-                        auto & worker_slot =
-                            backend_ctx->prefill_return_workers[
-                                partial_lane];
-                        if (worker_slot == nullptr) {
-                            worker_slot =
-                                new ggml_backend_meta_transfer_worker();
-                        }
-                        auto * return_worker = worker_slot;
-                        auto * reducer_exec =
-                            get_region_exec_worker(1);
-                        auto metrics =
-                            std::make_shared<region_window_metrics>();
-
-                        const int layer = prefill_down_layer_0;
-                        const int chunk = prefill_down_chunk_0;
-                        const size_t bytes =
-                            ggml_nbytes(pc_stage);
-                        const bool debug = pipeline_debug;
-
-                        const uint64_t return_task =
-                            return_worker->enqueue(
-                                [pc_backend = bcj_dst.backend,
-                                 phone_backend = bcj_src.backend,
-                                 pc_stage,
-                                 phone_tmp,
-                                 phone_reduce_graph,
-                                 reducer_exec,
-                                 region_return_set_lane,
-                                 metrics,
-                                 layer,
-                                 chunk,
-                                 partial_lane,
-                                 bytes,
-                                 debug]
-                                (uint64_t task_id) -> ggml_status {
-                                    const int64_t wire_begin_us =
-                                        ggml_time_us();
-                                    std::vector<uint8_t> payload(bytes);
-                                    ggml_backend_tensor_get(
-                                        pc_stage,
-                                        payload.data(),
-                                        0,
-                                        payload.size());
-                                    const bool sent =
-                                        region_return_set_lane(
-                                            phone_backend,
-                                            phone_tmp,
-                                            payload.data(),
-                                            payload.size(),
-                                            partial_lane);
-                                    if (!sent) {
-                                        return GGML_STATUS_FAILED;
-                                    }
-                                    metrics->wire_us =
-                                        ggml_time_us() - wire_begin_us;
-
-                                    if (debug) {
-                                        printf(
-                                            "[REGION_RETURN_TX] "
-                                            "direction=C2P layer=%d "
-                                            "chunk=%d lane=%zu "
-                                            "task=%" PRIu64
-                                            " bytes=%zu wire_ms=%.3f "
-                                            "transport=RETURN_LANE "
-                                            "status=DONE\n",
-                                            layer,
-                                            chunk,
-                                            partial_lane,
-                                            task_id,
-                                            bytes,
-                                            metrics->wire_us / 1000.0);
-                                    }
-
-                                    const int64_t reduce_begin_us =
-                                        ggml_time_us();
-                                    const uint64_t reduce_task =
-                                        reducer_exec->enqueue(
-                                            phone_reduce_graph,
-                                            true);
-                                    if (debug) {
-                                        printf(
-                                            "[REGION_EXEC_QUEUE] "
-                                            "side=PHONE queue=MAIN "
-                                            "priority=HIGH "
-                                            "direction=C2P role=REDUCE "
-                                            "layer=%d chunk=%d "
-                                            "task=%" PRIu64
-                                            " status=ENQUEUED_ASYNC\n",
-                                            layer,
-                                            chunk,
-                                            reduce_task);
-                                    }
-                                    const ggml_status reduce_status =
-                                        reducer_exec->wait(
-                                            reduce_task);
-                                    if (reduce_status !=
-                                            GGML_STATUS_SUCCESS) {
-                                        return reduce_status;
-                                    }
-                                    ggml_backend_synchronize(
-                                        phone_backend);
-                                    metrics->reduce_us =
-                                        ggml_time_us() - reduce_begin_us;
-                                    return GGML_STATUS_SUCCESS;
-                                });
-
-                        auto & pending =
-                            pending_region_c2p[partial_lane];
-                        GGML_ASSERT(!pending.active);
-                        pending.active = true;
-                        pending.layer = layer;
-                        pending.chunk = chunk;
-                        pending.sg = i;
-                        pending.lane = partial_lane;
-                        pending.src_backend = j_dst;
-                        pending.dst_backend = j_src;
-                        pending.task = return_task;
-                        pending.worker = return_worker;
-                        pending.wire_src = pc_stage;
-                        pending.wire_dst = phone_tmp;
-                        pending.out_chunk = phone_out_chunk;
-                        pending.bytes = bytes;
-                        pending.fold_us = pc_fold_us;
-                        pending.stage_us = partial_stage_us;
-                        pending.boundary_last =
-                            c2p_output_complete;
-                        pending.numeric_check =
-                            c2p_numeric_trace &&
-                            !c2p_pc_partial.empty();
-                        pending.metrics = metrics;
-                        pending.before_a =
-                            std::make_shared<std::vector<float>>(
-                                std::move(c2p_pc_partial));
-                        pending.before_b =
-                            std::make_shared<std::vector<float>>(
-                                std::move(c2p_phone_partial));
-                        pending.before_residual =
-                            std::make_shared<std::vector<float>>(
-                                std::move(c2p_residual));
-
-                        if (pipeline_debug) {
-                            printf(
-                                "[REGION_RETURN_STAGE] "
-                                "direction=C2P layer=%d chunk=%d "
-                                "lane=%zu bytes=%zu stage_ms=%.3f "
-                                "status=READY\n",
-                                layer,
-                                chunk,
-                                partial_lane,
-                                bytes,
-                                partial_stage_us / 1000.0);
-                            printf(
-                                "[REGION_CREDIT] direction=C2P "
-                                "event=ACQUIRE layer=%d chunk=%d "
-                                "lane=%zu inflight=%zu/2\n",
-                                layer,
-                                chunk,
-                                partial_lane,
-                                region_active_credits(
-                                    pending_region_c2p));
-                        }
-
-                        if (region_chunk_continuation) {
-                            // The full-graph Region is depth-first by chunk:
-                            // L35(C) is the immediate consumer of this C2P
-                            // output.  Join exactly this credit before leaving
-                            // the directional down subgraph.  P2C remains
-                            // windowed/asynchronous and can overlap later PC
-                            // work; C2P cannot expose l_out(C) before Reduce(C)
-                            // has completed.
-                            const int64_t cont_join_begin_us =
-                                ggml_time_us();
-                            status =
-                                wait_region_window_lane(
-                                    pending_region_c2p,
-                                    "C2P",
-                                    partial_lane,
-                                    "PHONE_CONTINUATION");
-                            const int64_t cont_join_us =
-                                ggml_time_us() -
-                                cont_join_begin_us;
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
-                            }
-                            if (pipeline_debug) {
-                                printf(
-                                    "[REGION_CONT_JOIN] direction=C2P "
-                                    "layer=%d chunk=%d lane=%zu "
-                                    "wait_ms=%.3f status=OK\n",
-                                    layer,
-                                    chunk,
-                                    partial_lane,
-                                    cont_join_us / 1000.0);
-                            }
-                        }
-
-                        if (region_boundary_last &&
-                                !region_chunk_continuation) {
-                            status =
-                                drain_region_window(
-                                    pending_region_c2p,
-                                    "C2P",
-                                    "BOUNDARY_DRAIN");
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
-                            }
-
-                            if (ab_trace_requested &&
-                                    prefill_down_layer_0 ==
-                                        ab_trace_layer &&
-                                    ab_full_tokens() >=
-                                        ab_min_tokens) {
-                                ab_dump_tensor(
-                                    1,
-                                    -1,
-                                    "l_out",
-                                    phone_l_out);
-                                printf(
-                                    "[AB_C2P_L_OUT_READY] "
-                                    "layer=%d tokens=%" PRId64
-                                    " owner=PHONE tensor=%s "
-                                    "status=CAPTURED\n",
-                                    prefill_down_layer_0,
-                                    ab_full_tokens(),
-                                    phone_l_out->name);
-                            }
-                        }
-
-                        return GGML_STATUS_SUCCESS;
-                    }
-
-                    constexpr size_t partial_lane = 0;
-
-                    ggml_tensor * pc_stage =
-                        get_node_aux(node_dst);
-                    set_region_partial_stage_data(
-                        pc_stage, j_dst, partial_lane);
-
-                    const int64_t stage_begin_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        bcj_dst.backend, bcj_dst.backend,
-                        node_dst, pc_stage);
-                    ggml_backend_synchronize(bcj_dst.backend);
-                    partial_stage_us =
-                        ggml_time_us() - stage_begin_us;
-                    partial_wire_src = pc_stage;
-
-                    if (pipeline_debug) {
-                        printf(
-                            "[REGION_RETURN_STAGE] "
-                            "direction=C2P layer=%d chunk=%d lane=0 "
-                            "bytes=%zu stage_ms=%.3f status=READY\n",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0,
-                            ggml_nbytes(pc_stage),
-                            partial_stage_us / 1000.0);
-                    }
-
-                    if (region_chunk_continuation) {
-                        // Window=1 continuation is a strict dependency: L35(C)
-                        // must not run before C2P Reduce(C). There is no useful
-                        // overlap from queueing a transfer then immediately
-                        // joining its worker. Keep the RPC copy on the graph
-                        // coordinator thread and avoid a cross-thread completion
-                        // wait (and its backend synchronization interaction).
-                        if (pipeline_debug) {
-                            fprintf(stderr,
-                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
-                                    "phase=COPY_BEGIN bytes=%zu path=DIRECT_MAIN\n",
-                                    prefill_down_layer_0, prefill_down_chunk_0,
-                                    ggml_nbytes(pc_stage));
-                        }
-                        const int64_t wire_begin_us = ggml_time_us();
-                        ggml_backend_tensor_copy_async(
-                            bcj_dst.backend,
-                            bcj_src.backend,
-                            pc_stage,
-                            phone_tmp);
-                        if (pipeline_debug) {
-                            fprintf(stderr,
-                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
-                                    "phase=COPY_SUBMITTED path=DIRECT_MAIN\n",
-                                    prefill_down_layer_0, prefill_down_chunk_0);
-                        }
-                        ggml_backend_synchronize(bcj_src.backend);
-                        copy_us = ggml_time_us() - wire_begin_us;
-                        if (pipeline_debug) {
-                            fprintf(stderr,
-                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
-                                    "phase=FENCE_DONE wall_ms=%.3f "
-                                    "path=DIRECT_MAIN\n",
-                                    prefill_down_layer_0, prefill_down_chunk_0,
-                                    copy_us / 1000.0);
-                            printf("[REGION_RETURN_TX] "
-                                   "direction=C2P layer=%d chunk=%d lane=0 "
-                                   "task=0 bytes=%zu wire_ms=%.3f "
-                                   "path=DIRECT_MAIN status=DONE\n",
-                                   prefill_down_layer_0, prefill_down_chunk_0,
-                                   ggml_nbytes(pc_stage), copy_us / 1000.0);
-                            printf("[REGION_RETURN_JOIN] "
-                                   "direction=C2P layer=%d chunk=%d lane=0 "
-                                   "task=0 wait_ms=0.000 window=1 "
-                                   "path=DIRECT_MAIN status=OK\n",
-                                   prefill_down_layer_0, prefill_down_chunk_0);
-                            fflush(stdout);
-                        }
-                    } else {
-                        auto & worker_slot =
-                            backend_ctx->prefill_return_workers[partial_lane];
-                        if (worker_slot == nullptr) {
-                            worker_slot =
-                                new ggml_backend_meta_transfer_worker();
-                        }
-                        auto * return_worker = worker_slot;
-                        auto wire_us =
-                            std::make_shared<int64_t>(0);
-
-                        const int layer = prefill_down_layer_0;
-                        const int chunk = prefill_down_chunk_0;
-                        const size_t bytes = ggml_nbytes(pc_stage);
-                        const bool debug = pipeline_debug;
-
-                        const uint64_t return_task =
-                            return_worker->enqueue(
-                                [pc_backend = bcj_dst.backend,
-                                 phone_backend = bcj_src.backend,
-                                 pc_stage,
-                                 phone_tmp,
-                                 wire_us,
-                                 layer,
-                                 chunk,
-                                 bytes,
-                                 debug]
-                                (uint64_t task_id) -> ggml_status {
-                                    const int64_t wire_begin_us =
-                                        ggml_time_us();
-                                    ggml_backend_tensor_copy_async(
-                                        pc_backend, phone_backend,
-                                        pc_stage, phone_tmp);
-                                    ggml_backend_synchronize(phone_backend);
-                                    *wire_us =
-                                        ggml_time_us() - wire_begin_us;
-
-                                    if (debug) {
-                                        printf(
-                                            "[REGION_RETURN_TX] "
-                                            "direction=C2P layer=%d chunk=%d "
-                                            "lane=0 task=%" PRIu64 " bytes=%zu "
-                                            "wire_ms=%.3f status=DONE\n",
-                                            layer, chunk, task_id, bytes,
-                                            *wire_us / 1000.0);
-                                    }
-                                    return GGML_STATUS_SUCCESS;
-                                });
-
-                        const int64_t join_begin_us = ggml_time_us();
-                        const ggml_status return_status =
-                            return_worker->wait(return_task);
-                        partial_join_wait_us =
-                            ggml_time_us() - join_begin_us;
-                        if (return_status != GGML_STATUS_SUCCESS) {
-                            return return_status;
-                        }
-                        copy_us = *wire_us;
-
-                        if (pipeline_debug) {
-                            printf(
-                                "[REGION_RETURN_JOIN] "
-                                "direction=C2P layer=%d chunk=%d lane=0 "
-                                "task=%" PRIu64 " wait_ms=%.3f "
-                                "window=1 status=OK\n",
-                                prefill_down_layer_0,
-                                prefill_down_chunk_0,
-                                return_task,
-                                partial_join_wait_us / 1000.0);
-                        }
-                    }
-                } else {
-                    const int64_t copy_begin_us = ggml_time_us();
-                    ggml_backend_tensor_copy_async(
-                        bcj_dst.backend,
-                        bcj_src.backend,
-                        node_dst,
-                        phone_tmp);
-                    ggml_backend_synchronize(bcj_src.backend);
-                    copy_us = ggml_time_us() - copy_begin_us;
-                }
-
+                const int64_t copy_begin_us = ggml_time_us();
+                ggml_backend_tensor_copy_async(
+                    bcj_dst.backend,
+                    bcj_src.backend,
+                    node_dst,
+                    phone_tmp);
+                ggml_backend_synchronize(bcj_src.backend);
+                const int64_t copy_us =
+                    ggml_time_us() - copy_begin_us;
                 record_copy_wait(copy_us);
                 record_meta_copy(
                     i, j_dst, j_src, node_dst, copy_us);
                 record_direct_copy();
 
-                if (region_chunk_continuation && pipeline_debug) {
-                    fprintf(stderr,
-                            "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
-                            "phase=PARITY_BEGIN\n",
-                            prefill_down_layer_0, prefill_down_chunk_0);
-                }
-                directional_wire_parity("C2P",
+                directional_wire_parity("C2P", 
                     prefill_down_layer_0, prefill_down_chunk_0,
                     "PC_PARTIAL_PLUS_RESIDUAL", j_dst, j_src,
-                    partial_wire_src, phone_tmp);
-                if (region_chunk_continuation && pipeline_debug) {
-                    fprintf(stderr,
-                            "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
-                            "phase=PARITY_DONE\n",
-                            prefill_down_layer_0, prefill_down_chunk_0);
-                }
+                    node_dst, phone_tmp);
 
                 const int64_t phone_reduce_begin_us = ggml_time_us();
-                status =
-                    region_priority_queues ?
-                        run_region_main_graph(
-                            1,
-                            phone_reduce_graph,
-                            "C2P",
-                            "REDUCE",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0) :
-                        ggml_backend_graph_compute_async(
-                            bcj_src.backend, phone_reduce_graph);
+                status = ggml_backend_graph_compute_async(
+                    bcj_src.backend, phone_reduce_graph);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
-                }
-                if (region_chunk_continuation && pipeline_debug) {
-                    std::fprintf(stderr,
-                        "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
-                        "phase=GPU_FENCE_BEGIN\n",
-                        prefill_down_layer_0, prefill_down_chunk_0);
-                    std::fflush(stderr);
                 }
                 ggml_backend_synchronize(bcj_src.backend);
                 const int64_t phone_reduce_us =
                     ggml_time_us() - phone_reduce_begin_us;
-                if (region_chunk_continuation && pipeline_debug) {
-                    std::fprintf(stderr,
-                        "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
-                        "phase=GPU_FENCE_DONE reduce_ms=%.3f\n",
-                        prefill_down_layer_0, prefill_down_chunk_0,
-                        phone_reduce_us / 1000.0);
-                    std::fflush(stderr);
-                }
 
                 reduce_add_us += pc_fold_us + phone_reduce_us;
                 ++reduce_to_primary_count;
-
-                // Stderr traces are deliberately flushed: stdout log order
-                // cannot identify the blocking step under pipe redirection.
-                // In particular, GPU_FENCE_DONE does not mean the caller has
-                // already completed the directional boundary.
-                if (region_chunk_continuation && pipeline_debug) {
-                    std::fprintf(stderr,
-                        "[REGION_HANG_TRACE] phase=C2P_AFTER_REDUCE "
-                        "layer=%d chunk=%d numeric_enabled=%d "
-                        "numeric_values=%zu output_complete=%d "
-                        "ab_trace=%d\n",
-                        prefill_down_layer_0, prefill_down_chunk_0,
-                        c2p_numeric_trace ? 1 : 0,
-                        c2p_pc_partial.size(),
-                        c2p_output_complete ? 1 : 0,
-                        ab_trace_requested ? 1 : 0);
-                    std::fflush(stderr);
-                }
 
                 if (c2p_numeric_trace &&
                         !c2p_pc_partial.empty() &&
                         phone_out_chunk->type == GGML_TYPE_F32) {
                     const size_t n = c2p_pc_partial.size();
                     std::vector<float> actual(n);
-                    if (region_chunk_continuation && pipeline_debug) {
-                        std::fprintf(stderr,
-                            "[REGION_HANG_TRACE] phase=NUMERIC_GET_BEGIN "
-                            "layer=%d chunk=%d bytes=%zu\n",
-                            prefill_down_layer_0, prefill_down_chunk_0,
-                            n * sizeof(float));
-                        std::fflush(stderr);
-                    }
                     ggml_backend_tensor_get(
                         phone_out_chunk,
                         actual.data(),
                         0,
                         n * sizeof(float));
-                    if (region_chunk_continuation && pipeline_debug) {
-                        std::fprintf(stderr,
-                            "[REGION_HANG_TRACE] phase=NUMERIC_GET_DONE "
-                            "layer=%d chunk=%d\n",
-                            prefill_down_layer_0, prefill_down_chunk_0);
-                        std::fflush(stderr);
-                    }
 
                     double diff_l2 = 0.0;
                     double actual_l2 = 0.0;
@@ -12939,76 +10433,35 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         max_abs_diff <= 1e-4 ? "PASS" : "FAIL");
                 }
 
-                if (c2p_output_complete &&
+                if (last_chunk &&
                         ab_trace_requested &&
                         prefill_down_layer_0 == ab_trace_layer &&
                         ab_full_tokens() >= ab_min_tokens) {
                     // This is the authoritative C2P layer output: all chunks
                     // have been reduced into the Phone-owned l_out buffer.
-                    ggml_tensor * full_phone_out = phone_l_out;
-                    if (full_phone_out == nullptr &&
-                            region_chunk_continuation) {
-                        // A later graph may have no l_out node of its own.
-                        // Capture the stable full output with a temporary
-                        // descriptor, not a pointer from an earlier graph.
-                        const auto & state =
-                            backend_ctx->region_c2p_prefill;
-                        GGML_ASSERT(ggml_is_contiguous(node_src));
-                        GGML_ASSERT(node_src->ne[2] == 1);
-                        GGML_ASSERT(node_src->ne[3] == 1);
-                        GGML_ASSERT(node_src->nb[1] > 0);
-                        GGML_ASSERT(
-                            state.full_bytes % node_src->nb[1] == 0);
-                        full_phone_out = get_node_aux(node_src);
-                        full_phone_out->ne[1] =
-                            state.full_bytes / node_src->nb[1];
-                        full_phone_out->nb[2] = state.full_bytes;
-                        full_phone_out->nb[3] = state.full_bytes;
-                        ggml_set_name(full_phone_out,
-                                      "region_c2p_phone_stable_l_out");
-                        auto * stable =
-                            backend_ctx->backend_configs[1]
-                                .region_c2p_phone_output_stage_buf.get();
-                        full_phone_out->buffer = stable;
-                        full_phone_out->data =
-                            ggml_backend_buffer_get_base(stable);
-                    }
-                    GGML_ASSERT(full_phone_out != nullptr);
-                    ab_dump_tensor(1, -1, "l_out", full_phone_out);
+                    ab_dump_tensor(1, -1, "l_out", phone_l_out);
                     printf(
                         "[AB_C2P_L_OUT_READY] layer=%d tokens=%" PRId64
                         " owner=PHONE tensor=%s status=CAPTURED\n",
                         prefill_down_layer_0,
                         ab_full_tokens(),
-                        full_phone_out->name);
+                        phone_l_out->name);
                 }
 
                 if (pipeline_debug) {
                     printf(
                         "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
-                        "bytes=%zu pc_fold_ms=%.3f stage_ms=%.3f "
-                        "copy_ms=%.3f join_wait_ms=%.3f "
-                        "phone_reduce_ms=%.3f async_partial=%d "
-                        "owner=PHONE status=OK\n",
+                        "bytes=%zu pc_fold_ms=%.3f copy_ms=%.3f "
+                        "phone_reduce_ms=%.3f owner=PHONE status=OK\n",
                         prefill_down_layer_0,
                         prefill_down_chunk_0,
-                        c2p_output_complete ? 1 : 0,
+                        last_chunk ? 1 : 0,
                         ggml_nbytes(node_dst),
                         pc_fold_us / 1000.0,
-                        partial_stage_us / 1000.0,
                         copy_us / 1000.0,
-                        partial_join_wait_us / 1000.0,
-                        phone_reduce_us / 1000.0,
-                        region_async_partial ? 1 : 0);
+                        phone_reduce_us / 1000.0);
                 }
 
-                if (region_chunk_continuation && pipeline_debug) {
-                    std::fprintf(stderr,
-                        "[REGION_HANG_TRACE] phase=C2P_RETURN "
-                        "layer=%d chunk=%d status=OK\n",
-                        prefill_down_layer_0, prefill_down_chunk_0);
-                    std::fflush(stderr);
-                }
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -14673,28 +12126,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
         int attn_layer = -1;
         int ffn_layer = -1;
-        const char * attn_name =
-            g0->nodes[g0->n_nodes - 1]->name;
-        const char * ffn_name =
-            g1->nodes[0]->name;
         const bool is_attn =
-            std::sscanf(
-                attn_name,
-                "attn_out-%d",
-                &attn_layer) == 1 ||
-            std::sscanf(
-                attn_name,
-                "region_phone_attn_out_chunk_%*d-%d",
-                &attn_layer) == 1;
+            std::sscanf(g0->nodes[g0->n_nodes - 1]->name, "attn_out-%d", &attn_layer) == 1;
         const bool is_ffn =
-            std::sscanf(
-                ffn_name,
-                "ffn_inp-%d",
-                &ffn_layer) == 1 ||
-            std::sscanf(
-                ffn_name,
-                "region_phone_ffn_inp_chunk_%*d-%d",
-                &ffn_layer) == 1;
+            std::sscanf(g1->nodes[0]->name, "ffn_inp-%d", &ffn_layer) == 1;
         if (!is_attn || !is_ffn || attn_layer != ffn_layer) {
             return false;
         }
@@ -14831,12 +12266,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 int layer = -1;
                 if (ggml_backend_meta_parse_prefill_norm_chunk(name, chunk, layer) ||
                     ggml_backend_meta_parse_prefill_down_chunk(name, chunk, layer) ||
-                    std::sscanf(name, "region_phone_attn_out_chunk_%*d-%d", &layer) == 1 ||
-                    std::sscanf(name, "region_phone_ffn_inp_chunk_%*d-%d", &layer) == 1 ||
-                    std::sscanf(name, "region_phone_ffn_norm_chunk_%*d-%d", &layer) == 1 ||
-                    std::sscanf(name, "region_phone_ffn_down_chunk_%*d-%d", &layer) == 1 ||
-                    std::sscanf(name, "region_phone_l_out_chunk_%*d-%d", &layer) == 1 ||
-                    std::sscanf(name, "region_p2c_attn_out_chunk_%*d-%d", &layer) == 1 ||
                     std::sscanf(name, "attn_out-%d", &layer) == 1 ||
                     std::sscanf(name, "ffn_inp-%d", &layer) == 1 ||
                     std::sscanf(name, "l_out-%d", &layer) == 1) {
@@ -14935,167 +12364,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
-    auto commit_completed_region_p2c_if_visible =
-        [&]() -> ggml_status {
-            auto & state =
-                backend_ctx->region_p2c_prefill;
-            if (!region_chunk_continuation ||
-                    !state.active ||
-                    !state.complete) {
-                return GGML_STATUS_SUCCESS;
-            }
-
-            ggml_tensor * pc_l_out =
-                find_layer_output(0, state.layer);
-            if (pc_l_out == nullptr) {
-                return GGML_STATUS_SUCCESS;
-            }
-            GGML_ASSERT(
-                ggml_nbytes(pc_l_out) ==
-                state.full_bytes);
-
-            ggml_tensor * disabled_pc =
-                disable_layer_output_producers(
-                    0, 0, state.layer);
-            if (disabled_pc != nullptr) {
-                GGML_ASSERT(disabled_pc == pc_l_out);
-            }
-            disable_layer_output_producers(
-                1, 0, state.layer);
-
-            ggml_tensor * staged_l_out =
-                get_node_aux(pc_l_out);
-            bind_region_boundary_output_full(
-                staged_l_out,
-                0,
-                state.full_bytes);
-
-            auto & pc_cfg =
-                backend_ctx->backend_configs[0];
-            const int64_t commit_begin_us =
-                ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend,
-                pc_cfg.backend,
-                staged_l_out,
-                pc_l_out);
-            ggml_backend_synchronize(pc_cfg.backend);
-            const int64_t commit_us =
-                ggml_time_us() - commit_begin_us;
-
-            if (c2p_self_check &&
-                    staged_l_out->type == GGML_TYPE_F32 &&
-                    pc_l_out->type == GGML_TYPE_F32) {
-                directional_wire_parity(
-                    "P2C",
-                    state.layer,
-                    -1,
-                    "BOUNDARY_OUTPUT_COMMIT",
-                    0,
-                    0,
-                    staged_l_out,
-                    pc_l_out);
-            }
-
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_BOUNDARY_OUTPUT_COMMIT] "
-                    "direction=P2C layer=%d bytes=%zu "
-                    "commit_ms=%.3f source=LATER_GRAPH "
-                    "owner=PC status=OK\n",
-                    state.layer,
-                    state.full_bytes,
-                    commit_us / 1000.0);
-            }
-
-            state.active = false;
-            retire_region_c2p_on_p2c_commit(
-                state.layer, "P2C_LATER_GRAPH");
-            return GGML_STATUS_SUCCESS;
-        };
-
-    {
-        const ggml_status region_commit_status =
-            commit_completed_region_p2c_if_visible();
-        if (region_commit_status != GGML_STATUS_SUCCESS) {
-            return region_commit_status;
-        }
-    }
-
-    // The requested Region mode is a process-wide option, not a per-request
-    // epoch. Warmup/small-prefill executions may leave an already-completed
-    // C2P epoch whose size differs from the next full prompt. A new C2P
-    // chunk-0 boundary is authoritative: retire the old epoch BEFORE trying
-    // to bind the newly materialized Phone l_out/views.
-    bool graph_starts_c2p_epoch = false;
-    bool graph_uses_region_continuation = false;
-    int graph_c2p_start_layer = -1;
-    for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
-        int down_chunk = -1;
-        int down_layer = -1;
-        if (parse_prefill_sg(
-                sg, false, down_chunk, down_layer) &&
-                ggml_backend_meta_tensor_c2p_layer(
-                    backend_ctx, down_layer)) {
-            graph_uses_region_continuation = true;
-            if (down_chunk == 0) {
-                graph_starts_c2p_epoch = true;
-                graph_c2p_start_layer = down_layer;
-            }
-        }
-
-        ggml_cgraph * graph =
-            backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
-        if (graph == nullptr) {
-            continue;
-        }
-        for (int k = 0; k < graph->n_nodes; ++k) {
-            ggml_tensor * node = graph->nodes[k];
-            if (node == nullptr) {
-                continue;
-            }
-            const char * name = node->name;
-            if (std::strncmp(name, "region_cont_entry_chunk_", 24) == 0 ||
-                std::strncmp(name, "region_phone_", 13) == 0 ||
-                std::strncmp(name, "region_p2c_", 11) == 0) {
-                graph_uses_region_continuation = true;
-                break;
-            }
-        }
-    }
-
-    if (region_chunk_continuation && graph_starts_c2p_epoch) {
-        auto & prior = backend_ctx->region_c2p_prefill;
-        if (pipeline_debug) {
-            printf("[REGION_CONT_EPOCH] event=BEGIN "
-                   "layer=%d previous_active=%d previous_layer=%d "
-                   "previous_chunks=%d previous_bytes=%zu "
-                   "previous_complete=%d status=RESET\n",
-                   graph_c2p_start_layer, prior.active ? 1 : 0,
-                   prior.layer, prior.next_chunk, prior.full_bytes,
-                   prior.complete ? 1 : 0);
-        }
-        // All outstanding transfers from the previous compute call are
-        // drained before it returns. Do not free backend-owned buffers here.
-        prior = ggml_backend_meta_context::
-            region_prefill_boundary_state {};
-        backend_ctx->region_p2c_prefill =
-            ggml_backend_meta_context::
-                region_prefill_boundary_state {};
-        backend_ctx->region_prefill_hidden_bytes = 0;
-    }
-
-    // A normal decode graph also contains l_out-34, but is not a Region
-    // continuation graph. Never attach its tensors to prefill storage.
-    if (region_chunk_continuation &&
-            graph_uses_region_continuation &&
-            backend_ctx->region_c2p_prefill.active &&
-            backend_ctx->region_c2p_prefill.next_chunk > 0 &&
-            !bind_region_c2p_phone_backing(
-                backend_ctx->region_c2p_prefill.layer)) {
-        return GGML_STATUS_FAILED;
-    }
-
     bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
@@ -15124,20 +12392,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
-        if (pipeline_debug && region_chunk_continuation) {
-            std::fprintf(stderr,
-                "[REGION_HANG_TRACE] phase=SG_BEGIN "
-                "uid=%" PRIu64 " sg=%zu/%zu "
-                "down_layer=%d down_chunk=%d norm_layer=%d norm_chunk=%d "
-                "phone_only=%d\n",
-                cgraph->uid, i, backend_ctx->n_subgraphs,
-                is_prefill_down_sg ? prefill_down_layer : -1,
-                is_prefill_down_sg ? prefill_down_chunk : -1,
-                is_prefill_norm_sg ? prefill_norm_layer : -1,
-                is_prefill_norm_sg ? prefill_norm_chunk : -1,
-                is_phone_only_sg ? 1 : 0);
-            std::fflush(stderr);
-        }
 
         // C2P decode FFN can appear as a PHONE_ONLY_SG because its terminal
         // ffn_moe_out node is Phone-active, even though the PC Router and PC
@@ -15266,52 +12520,6 @@ auto prefill_norm_sg_has_prework =
 
         const bool continues_prefill_layer =
             norm_can_overlap || down_can_overlap || is_prefill_wave_attn_sg;
-
-        // In Region continuation mode L35(C) consumes the C2P reducer's
-        // stable Phone-owned L34(C).  Wait only for that exact credit; leave
-        // the other C2P chunks in flight so PHONE_C2P_FFN can overlap MAIN.
-        if (region_chunk_continuation &&
-                region_window2 &&
-                is_prefill_wave_attn_sg &&
-                prefill_wave_attn_layer > 0 &&
-                ggml_backend_meta_tensor_c2p_layer(
-                    backend_ctx,
-                    prefill_wave_attn_layer - 1)) {
-            for (int dep_chunk = prefill_wave_attn_chunk;
-                    dep_chunk <
-                        prefill_wave_attn_chunk +
-                            prefill_wave_attn_chunk_count;
-                    ++dep_chunk) {
-                bool waited = false;
-                const int64_t wait_begin_us = ggml_time_us();
-                const ggml_status dep_status =
-                    wait_region_window_dependency(
-                        pending_region_c2p,
-                        "C2P",
-                        prefill_wave_attn_layer - 1,
-                        dep_chunk,
-                        "PHONE_CONTINUATION",
-                        waited);
-                const int64_t wait_us =
-                    ggml_time_us() - wait_begin_us;
-                if (dep_status != GGML_STATUS_SUCCESS) {
-                    return dep_status;
-                }
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_CONT_DEP] direction=C2P "
-                        "producer=%d/%d consumer=%d/%d "
-                        "waited=%d wait_ms=%.3f status=OK\n",
-                        prefill_wave_attn_layer - 1,
-                        dep_chunk,
-                        prefill_wave_attn_layer,
-                        dep_chunk,
-                        waited ? 1 : 0,
-                        wait_us / 1000.0);
-                }
-            }
-        }
-
         if (return_wavefront_graph &&
                 (is_prefill_wave_attn_sg || is_prefill_norm_sg || is_prefill_down_sg)) {
             if (is_prefill_wave_attn_sg) {
@@ -15543,159 +12751,7 @@ auto prefill_norm_sg_has_prework =
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
-    const bool region_p2c_join =
-        region_p2c_early_ffn.active &&
-        region_p2c_early_ffn.ffn_sg == i;
-
-    if (region_p2c_join) {
-        GGML_ASSERT(is_prefill_down_sg);
-        GGML_ASSERT(
-            prefill_down_layer ==
-            region_p2c_early_ffn.layer);
-        GGML_ASSERT(
-            prefill_down_chunk ==
-            region_p2c_early_ffn.chunk);
-        GGML_ASSERT(
-            region_p2c_early_ffn.route_worker != nullptr);
-        GGML_ASSERT(
-            region_p2c_early_ffn.route_task != 0);
-
-        const int64_t route_wait_begin_us =
-            ggml_time_us();
-        const ggml_status route_status =
-            region_p2c_early_ffn.route_worker->wait(
-                region_p2c_early_ffn.route_task);
-        const int64_t route_wait_us =
-            ggml_time_us() - route_wait_begin_us;
-
-        ggml_status pc_status = route_status;
-        ggml_status phone_status = GGML_STATUS_SUCCESS;
-        int64_t pc_stage_us = 0;
-
-        auto route_it =
-            pending_phone_prefill_routes.find(
-                { region_p2c_early_ffn.layer,
-                  region_p2c_early_ffn.chunk });
-        GGML_ASSERT(
-            route_it != pending_phone_prefill_routes.end());
-        const phone_prefill_route_task route =
-            route_it->second;
-
-        if (route_status == GGML_STATUS_SUCCESS) {
-            auto & pc_cfg =
-                backend_ctx->backend_configs[0];
-
-            const int64_t stage_begin_us =
-                ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend, pc_cfg.backend,
-                route.stage_hidden, route.dst_hidden);
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend, pc_cfg.backend,
-                route.stage_topk, route.dst_topk);
-            ggml_backend_tensor_copy_async(
-                pc_cfg.backend, pc_cfg.backend,
-                route.stage_weights, route.dst_weights);
-            ggml_backend_synchronize(pc_cfg.backend);
-            pc_stage_us =
-                ggml_time_us() - stage_begin_us;
-
-            directional_wire_parity(
-                "P2C",
-                region_p2c_early_ffn.layer,
-                region_p2c_early_ffn.chunk,
-                "FFN_NORM",
-                0, 0,
-                route.stage_hidden, route.dst_hidden);
-            directional_wire_parity(
-                "P2C",
-                region_p2c_early_ffn.layer,
-                region_p2c_early_ffn.chunk,
-                "ROUTER_TOPK",
-                0, 0,
-                route.stage_topk, route.dst_topk);
-            directional_wire_parity(
-                "P2C",
-                region_p2c_early_ffn.layer,
-                region_p2c_early_ffn.chunk,
-                "ROUTER_WEIGHTS",
-                0, 0,
-                route.stage_weights, route.dst_weights);
-
-            if (region_priority_queues) {
-                const uint64_t pc_p2c_ffn_task =
-                    get_region_exec_worker(0)->enqueue(
-                        backend_ctx->backend_configs[0]
-                            .cgraphs[i].cgraph_main,
-                        false);
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_EXEC_QUEUE] side=PC "
-                        "queue=P2C_FFN priority=LOW "
-                        "direction=P2C role=INCOMING_FFN "
-                        "layer=%d chunk=%d task=%" PRIu64
-                        " status=ENQUEUED\n",
-                        region_p2c_early_ffn.layer,
-                        region_p2c_early_ffn.chunk,
-                        pc_p2c_ffn_task);
-                }
-                pc_status =
-                    get_region_exec_worker(0)->wait(
-                        pc_p2c_ffn_task);
-            } else {
-                compute_workers.start(0, i);
-                pc_status = compute_workers.wait(0);
-            }
-        }
-
-        if (region_priority_queues) {
-            GGML_ASSERT(
-                region_p2c_early_ffn.phone_main_task != 0);
-            phone_status =
-                get_region_exec_worker(1)->wait(
-                    region_p2c_early_ffn.phone_main_task);
-        } else {
-            phone_status = compute_workers.wait(1);
-        }
-
-        if (route.lane <
-                pending_phone_prefill_route_lane_task.size() &&
-                pending_phone_prefill_route_lane_task[
-                    route.lane] == route.task) {
-            pending_phone_prefill_route_lane_task[
-                route.lane] = 0;
-        }
-        phone_prefill_route_producer_seq.erase(
-            { region_p2c_early_ffn.layer,
-              region_p2c_early_ffn.chunk });
-        pending_phone_prefill_routes.erase(
-            { region_p2c_early_ffn.layer,
-              region_p2c_early_ffn.chunk });
-
-        if (pipeline_debug) {
-            printf(
-                "[REGION_P2C_FFN_PARALLEL] "
-                "phase=PREFILL layer=%d chunk=%d "
-                "route_wait_ms=%.3f pc_stage_ms=%.3f "
-                "pc_status=%d phone_status=%d status=%s\n",
-                region_p2c_early_ffn.layer,
-                region_p2c_early_ffn.chunk,
-                route_wait_us / 1000.0,
-                pc_stage_us / 1000.0,
-                (int) pc_status,
-                (int) phone_status,
-                (pc_status == GGML_STATUS_SUCCESS &&
-                 phone_status == GGML_STATUS_SUCCESS) ?
-                    "OK" : "FAIL");
-        }
-
-        region_p2c_early_ffn =
-            region_p2c_early_ffn_state {};
-
-        compute_status =
-            pc_status != GGML_STATUS_SUCCESS ?
-                pc_status : phone_status;
-    } else if (is_prefill_down_sg) {
+    if (is_prefill_down_sg) {
         const bool has_async_prefill_input =
             pending_prefill_input_task != 0;
 
@@ -16338,12 +13394,6 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_prefix_graph = nullptr;
             int c2p_pc_route_stop = -1;
             bool c2p_parallel_ready = false;
-            bool c2p_route_pretransferred = false;
-            ggml_cgraph * c2p_pc_suffix_graph = nullptr;
-            bool c2p_pc_ffn_started_early = false;
-            uint64_t c2p_pc_main_task = 0;
-            std::vector<uint8_t> c2p_route_topk_host;
-            std::vector<uint8_t> c2p_route_weights_host;
 
             if (c2p_prefill_exec) {
                 char topk_name[96];
@@ -16357,18 +13407,14 @@ auto prefill_norm_sg_has_prework =
                     "c2p_prefill_route_weights_chunk_%d-%d",
                     prefill_down_chunk, prefill_down_layer);
 
-                // A full-graph hard split may place Router/TopK in the
-                // preceding subgraph while the directional down chunk is the
-                // current subgraph. Names are unique by (layer, chunk), so
-                // resolve them across the whole Meta graph.
                 c2p_src_topk =
-                    find_exact_named_tensor(0, topk_name);
+                    find_sg_named_tensor(0, i, topk_name);
                 c2p_dst_topk =
-                    find_exact_named_tensor(1, topk_name);
+                    find_sg_named_tensor(1, i, topk_name);
                 c2p_src_weights =
-                    find_exact_named_tensor(0, weights_name);
+                    find_sg_named_tensor(0, i, weights_name);
                 c2p_dst_weights =
-                    find_exact_named_tensor(1, weights_name);
+                    find_sg_named_tensor(1, i, weights_name);
 
                 GGML_ASSERT(c2p_src_topk != nullptr);
                 GGML_ASSERT(c2p_dst_topk != nullptr);
@@ -16385,100 +13431,76 @@ auto prefill_norm_sg_has_prework =
                     ggml_are_same_layout(
                         c2p_src_weights, c2p_dst_weights));
 
+                const size_t route_slot =
+                    static_cast<size_t>(
+                        std::max(0, prefill_down_chunk));
+                auto & c2p_slots =
+                    backend_ctx->backend_configs[0].
+                        c2p_route_stage_bufs;
+                if (c2p_slots.size() <= route_slot) {
+                    c2p_slots.resize(route_slot + 1);
+                }
+
+                bind_c2p_route_storage(
+                    c2p_src_topk,
+                    c2p_slots[route_slot][0],
+                    c2p_bindings);
+                bind_c2p_route_storage(
+                    c2p_src_weights,
+                    c2p_slots[route_slot][1],
+                    c2p_bindings);
+
+                // Rebinding graph tensors changes their backing addresses.
+                // Force the local backend to rebuild/rebind this graph instead
+                // of reusing a cached graph prepared for the old arena.
                 c2p_pc_graph =
                     backend_ctx->backend_configs[0]
                         .cgraphs[i].cgraph_main;
                 if (c2p_pc_graph != nullptr) {
                     c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
 
-                    const int topk_index =
-                        graph_node_index(
-                            c2p_pc_graph, c2p_src_topk);
-                    const int weights_index =
-                        graph_node_index(
-                            c2p_pc_graph, c2p_src_weights);
-
-                    // Full-graph directional hard split:
-                    // Router was already produced/copied by the preceding
-                    // generic C2P route subgraph. The current graph contains
-                    // only FFN/down work, so reusing that transfer is both
-                    // correct and avoids a duplicate Router copy.
-                    c2p_route_pretransferred =
-                        topk_index < 0 &&
-                        weights_index < 0;
-
-                    if (!c2p_route_pretransferred) {
-                        const size_t route_slot =
-                            static_cast<size_t>(
-                                std::max(0, prefill_down_chunk));
-                        auto & c2p_slots =
-                            backend_ctx->backend_configs[0].
-                                c2p_route_stage_bufs;
-                        if (c2p_slots.size() <= route_slot) {
-                            c2p_slots.resize(route_slot + 1);
+                    if (region_parallel_ffn) {
+                        const int topk_index =
+                            graph_node_index(
+                                c2p_pc_graph, c2p_src_topk);
+                        const int weights_index =
+                            graph_node_index(
+                                c2p_pc_graph, c2p_src_weights);
+                        c2p_pc_route_stop =
+                            std::max(topk_index, weights_index) + 1;
+                        c2p_parallel_ready =
+                            topk_index >= 0 &&
+                            weights_index >= 0 &&
+                            c2p_pc_route_stop > 0 &&
+                            c2p_pc_route_stop < c2p_pc_graph->n_nodes;
+                        if (c2p_parallel_ready) {
+                            c2p_pc_prefix_graph =
+                                build_region_graph_slice(
+                                    c2p_pc_graph,
+                                    0,
+                                    c2p_pc_route_stop,
+                                    i,
+                                    0x4352505052454649ULL);
                         }
+                    }
 
-                        bind_c2p_route_storage(
-                            c2p_src_topk,
-                            c2p_slots[route_slot][0],
-                            c2p_bindings);
-                        bind_c2p_route_storage(
-                            c2p_src_weights,
-                            c2p_slots[route_slot][1],
-                            c2p_bindings);
-
-                        if (region_parallel_ffn) {
-                            c2p_pc_route_stop =
-                                std::max(
-                                    topk_index,
-                                    weights_index) + 1;
-                            c2p_parallel_ready =
-                                topk_index >= 0 &&
-                                weights_index >= 0 &&
-                                c2p_pc_route_stop > 0 &&
-                                c2p_pc_route_stop <
-                                    c2p_pc_graph->n_nodes;
-                            if (c2p_parallel_ready) {
-                                c2p_pc_prefix_graph =
-                                    build_region_graph_slice(
-                                        c2p_pc_graph,
-                                        0,
-                                        c2p_pc_route_stop,
-                                        i,
-                                        0x4352505052454649ULL);
-                            }
-                        }
-
-                        if (!c2p_parallel_ready) {
-                            // Rebinding Router tensors changes their backing
-                            // addresses, so only the legacy same-SG path needs
-                            // cache invalidation.
-                            c2p_pc_graph->uid = 0;
-                        }
+                    if (!c2p_parallel_ready) {
+                        // Serial fallback keeps the old cache invalidation
+                        // because Router tensors were rebound to private storage.
+                        c2p_pc_graph->uid = 0;
                     }
                 }
 
                 if (pipeline_debug) {
-                    if (c2p_route_pretransferred) {
-                        printf(
-                            "[REGION_C2P_ROUTE_REUSE] "
-                            "layer=%d chunk=%d sg=%zu "
-                            "source=PREVIOUS_SG "
-                            "status=REUSE_PRETRANSFERRED\n",
-                            prefill_down_layer,
-                            prefill_down_chunk,
-                            i);
-                    } else {
-                        printf(
-                            "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
-                            "topk_bytes=%zu weights_bytes=%zu "
-                            "trigger=PREFILL_DOWN status=READY\n",
-                            prefill_down_layer,
-                            prefill_down_chunk,
-                            i,
-                            ggml_nbytes(c2p_src_topk),
-                            ggml_nbytes(c2p_src_weights));
-                    }
+                    printf(
+                        "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                        "topk_bytes=%zu weights_bytes=%zu "
+                        "trigger=PREFILL_DOWN status=READY\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        ggml_nbytes(c2p_src_topk),
+                        ggml_nbytes(c2p_src_weights));
                 }
             }
 
@@ -16561,210 +13583,87 @@ auto prefill_norm_sg_has_prework =
 
                     ggml_backend_synchronize(pc_cfg.backend);
 
-                    if (!c2p_route_pretransferred) {
-                        if (region_route_overlap &&
-                                c2p_parallel_ready) {
-                            c2p_route_topk_host.resize(
-                                ggml_nbytes(c2p_src_topk));
-                            c2p_route_weights_host.resize(
-                                ggml_nbytes(c2p_src_weights));
-                            ggml_backend_tensor_get(
-                                c2p_src_topk,
-                                c2p_route_topk_host.data(),
-                                0,
-                                c2p_route_topk_host.size());
-                            ggml_backend_tensor_get(
-                                c2p_src_weights,
-                                c2p_route_weights_host.data(),
-                                0,
-                                c2p_route_weights_host.size());
+                    const int64_t topk_begin_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        pc_cfg.backend,
+                        phone_cfg.backend,
+                        c2p_src_topk,
+                        c2p_dst_topk);
+                    ggml_backend_synchronize(phone_cfg.backend);
+                    const int64_t topk_us =
+                        ggml_time_us() - topk_begin_us;
+                    record_copy_wait(topk_us);
+                    record_meta_copy(
+                        i, 0, 1, c2p_src_topk, topk_us);
+                    record_direct_copy();
 
-                            c2p_pc_suffix_graph =
-                                build_region_graph_slice(
-                                    c2p_pc_graph,
-                                    c2p_pc_route_stop,
-                                    c2p_pc_graph->n_nodes,
-                                    i,
-                                    0x4352505355464649ULL);
-                            if (region_priority_queues) {
-                                c2p_pc_main_task =
-                                    get_region_exec_worker(0)->enqueue(
-                                        c2p_pc_suffix_graph,
-                                        true);
-                                if (pipeline_debug) {
-                                    printf(
-                                        "[REGION_EXEC_QUEUE] side=PC "
-                                        "queue=MAIN priority=HIGH "
-                                        "direction=C2P role=OUTGOING_FFN "
-                                        "layer=%d chunk=%d task=%" PRIu64
-                                        " status=ENQUEUED\n",
-                                        prefill_down_layer,
-                                        prefill_down_chunk,
-                                        c2p_pc_main_task);
-                                }
-                            } else {
-                                compute_workers.start_graph(
-                                    0, c2p_pc_suffix_graph);
-                            }
-                            c2p_pc_ffn_started_early = true;
-                        }
+                    const int64_t weights_begin_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        pc_cfg.backend,
+                        phone_cfg.backend,
+                        c2p_src_weights,
+                        c2p_dst_weights);
+                    ggml_backend_synchronize(phone_cfg.backend);
+                    const int64_t weights_us =
+                        ggml_time_us() - weights_begin_us;
+                    record_copy_wait(weights_us);
+                    record_meta_copy(
+                        i, 0, 1, c2p_src_weights, weights_us);
+                    record_direct_copy();
 
-                        const int64_t topk_begin_us = ggml_time_us();
-                        if (c2p_pc_ffn_started_early) {
-                            ggml_backend_tensor_set(
-                                c2p_dst_topk,
-                                c2p_route_topk_host.data(),
-                                0,
-                                c2p_route_topk_host.size());
-                        } else {
-                            ggml_backend_tensor_copy_async(
-                                pc_cfg.backend,
-                                phone_cfg.backend,
-                                c2p_src_topk,
-                                c2p_dst_topk);
-                            ggml_backend_synchronize(phone_cfg.backend);
-                        }
-                        const int64_t topk_us =
-                            ggml_time_us() - topk_begin_us;
-                        record_copy_wait(topk_us);
-                        record_meta_copy(
-                            i, 0, 1, c2p_src_topk, topk_us);
-                        record_direct_copy();
+                    directional_wire_parity("C2P", 
+                        prefill_down_layer, prefill_down_chunk,
+                        "ROUTER_TOPK", 0, 1,
+                        c2p_src_topk, c2p_dst_topk);
+                    directional_wire_parity("C2P", 
+                        prefill_down_layer, prefill_down_chunk,
+                        "ROUTER_WEIGHTS", 0, 1,
+                        c2p_src_weights, c2p_dst_weights);
 
-                        const int64_t weights_begin_us = ggml_time_us();
-                        if (c2p_pc_ffn_started_early) {
-                            ggml_backend_tensor_set(
-                                c2p_dst_weights,
-                                c2p_route_weights_host.data(),
-                                0,
-                                c2p_route_weights_host.size());
-                        } else {
-                            ggml_backend_tensor_copy_async(
-                                pc_cfg.backend,
-                                phone_cfg.backend,
-                                c2p_src_weights,
-                                c2p_dst_weights);
-                            ggml_backend_synchronize(phone_cfg.backend);
-                        }
-                        const int64_t weights_us =
-                            ggml_time_us() - weights_begin_us;
-                        record_copy_wait(weights_us);
-                        record_meta_copy(
-                            i, 0, 1, c2p_src_weights, weights_us);
-                        record_direct_copy();
+                    if (ab_trace_requested &&
+                            prefill_down_layer == ab_trace_layer &&
+                            ab_full_tokens() >= ab_min_tokens) {
+                        ab_dump_tensor(
+                            1, prefill_down_chunk,
+                            "router_topk", c2p_dst_topk);
+                        ab_dump_tensor(
+                            1, prefill_down_chunk,
+                            "router_weights", c2p_dst_weights);
+                    }
 
-                        directional_wire_parity("C2P", 
-                            prefill_down_layer, prefill_down_chunk,
-                            "ROUTER_TOPK", 0, 1,
-                            c2p_src_topk, c2p_dst_topk);
-                        directional_wire_parity("C2P", 
-                            prefill_down_layer, prefill_down_chunk,
-                            "ROUTER_WEIGHTS", 0, 1,
-                            c2p_src_weights, c2p_dst_weights);
-
-                        if (ab_trace_requested &&
-                                prefill_down_layer == ab_trace_layer &&
-                                ab_full_tokens() >= ab_min_tokens) {
-                            ab_dump_tensor(
-                                1, prefill_down_chunk,
-                                "router_topk", c2p_dst_topk);
-                            ab_dump_tensor(
-                                1, prefill_down_chunk,
-                                "router_weights", c2p_dst_weights);
-                        }
-
-                        if (pipeline_debug) {
-                            printf(
-                                "[REGION_C2P_ROUTE] layer=%d chunk=%d "
-                                "direction=PC_TO_PHONE "
-                                "topk_bytes=%zu weights_bytes=%zu "
-                                "topk_ms=%.3f weights_ms=%.3f "
-                                "owner=PC trigger=PREFILL_DOWN status=OK\n",
-                                prefill_down_layer,
-                                prefill_down_chunk,
-                                ggml_nbytes(c2p_src_topk),
-                                ggml_nbytes(c2p_src_weights),
-                                topk_us / 1000.0,
-                                weights_us / 1000.0);
-                        }
-
-
-                    } else if (pipeline_debug) {
+                    if (pipeline_debug) {
                         printf(
                             "[REGION_C2P_ROUTE] layer=%d chunk=%d "
-                            "direction=PC_TO_PHONE owner=PC "
-                            "trigger=PREVIOUS_SG action=REUSE "
-                            "status=OK\n",
+                            "direction=PC_TO_PHONE "
+                            "topk_bytes=%zu weights_bytes=%zu "
+                            "topk_ms=%.3f weights_ms=%.3f "
+                            "owner=PC trigger=PREFILL_DOWN status=OK\n",
                             prefill_down_layer,
-                            prefill_down_chunk);
+                            prefill_down_chunk,
+                            ggml_nbytes(c2p_src_topk),
+                            ggml_nbytes(c2p_src_weights),
+                            topk_us / 1000.0,
+                            weights_us / 1000.0);
                     }
 
                     if (c2p_parallel_ready) {
-                        if (c2p_pc_suffix_graph == nullptr) {
-                            c2p_pc_suffix_graph =
-                                build_region_graph_slice(
-                                    c2p_pc_graph,
-                                    c2p_pc_route_stop,
-                                    c2p_pc_graph->n_nodes,
-                                    i,
-                                    0x4352505355464649ULL);
-                        }
+                        ggml_cgraph * c2p_pc_suffix_graph =
+                            build_region_graph_slice(
+                                c2p_pc_graph,
+                                c2p_pc_route_stop,
+                                c2p_pc_graph->n_nodes,
+                                i,
+                                0x4352505355464649ULL);
 
                         const int64_t parallel_begin_us =
                             ggml_time_us();
-                        uint64_t phone_c2p_ffn_task = 0;
-                        if (region_priority_queues) {
-                            if (!c2p_pc_ffn_started_early) {
-                                c2p_pc_main_task =
-                                    get_region_exec_worker(0)->enqueue(
-                                        c2p_pc_suffix_graph,
-                                        true);
-                                if (pipeline_debug) {
-                                    printf(
-                                        "[REGION_EXEC_QUEUE] side=PC "
-                                        "queue=MAIN priority=HIGH "
-                                        "direction=C2P role=OUTGOING_FFN "
-                                        "layer=%d chunk=%d task=%" PRIu64
-                                        " status=ENQUEUED\n",
-                                        prefill_down_layer,
-                                        prefill_down_chunk,
-                                        c2p_pc_main_task);
-                                }
-                            }
-                            phone_c2p_ffn_task =
-                                get_region_exec_worker(1)->enqueue(
-                                    backend_ctx->backend_configs[1]
-                                        .cgraphs[i].cgraph_main,
-                                    false);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[REGION_EXEC_QUEUE] side=PHONE "
-                                    "queue=C2P_FFN priority=LOW "
-                                    "direction=C2P role=INCOMING_FFN "
-                                    "layer=%d chunk=%d task=%" PRIu64
-                                    " status=ENQUEUED\n",
-                                    prefill_down_layer,
-                                    prefill_down_chunk,
-                                    phone_c2p_ffn_task);
-                            }
-                        } else {
-                            if (!c2p_pc_ffn_started_early) {
-                                compute_workers.start_graph(
-                                    0, c2p_pc_suffix_graph);
-                            }
-                            compute_workers.start(1, i);
-                        }
+                        compute_workers.start_graph(
+                            0, c2p_pc_suffix_graph);
+                        compute_workers.start(1, i);
 
                         const ggml_status pc_ffn_status =
-                            region_priority_queues ?
-                                get_region_exec_worker(0)->wait(
-                                    c2p_pc_main_task) :
-                                compute_workers.wait(0);
-                        phone_status =
-                            region_priority_queues ?
-                                get_region_exec_worker(1)->wait(
-                                    phone_c2p_ffn_task) :
-                                compute_workers.wait(1);
+                            compute_workers.wait(0);
+                        phone_status = compute_workers.wait(1);
                         pc_status = pc_ffn_status;
 
                         if (pipeline_debug) {
@@ -16772,8 +13671,7 @@ auto prefill_norm_sg_has_prework =
                                 "[REGION_C2P_FFN_PARALLEL] "
                                 "phase=PREFILL layer=%d chunk=%d "
                                 "router_nodes=%d pc_ffn_nodes=%d "
-                                "phone_nodes=%d route_overlap=%d "
-                                "submit_wait_ms=%.3f "
+                                "phone_nodes=%d submit_wait_ms=%.3f "
                                 "pc_status=%d phone_status=%d\n",
                                 prefill_down_layer,
                                 prefill_down_chunk,
@@ -16782,7 +13680,6 @@ auto prefill_norm_sg_has_prework =
                                     c2p_pc_route_stop,
                                 backend_ctx->backend_configs[1]
                                     .cgraphs[i].cgraph_main->n_nodes,
-                                c2p_pc_ffn_started_early ? 1 : 0,
                                 (ggml_time_us() - parallel_begin_us) /
                                     1000.0,
                                 (int) pc_ffn_status,
@@ -16794,31 +13691,9 @@ auto prefill_norm_sg_has_prework =
                     } else {
                         restore_c2p_route_bindings(
                             c2p_bindings);
-                        if (region_priority_queues) {
-                            const uint64_t phone_c2p_ffn_task =
-                                get_region_exec_worker(1)->enqueue(
-                                    backend_ctx->backend_configs[1]
-                                        .cgraphs[i].cgraph_main,
-                                    false);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[REGION_EXEC_QUEUE] side=PHONE "
-                                    "queue=C2P_FFN priority=LOW "
-                                    "direction=C2P role=INCOMING_FFN "
-                                    "layer=%d chunk=%d task=%" PRIu64
-                                    " status=ENQUEUED_SERIAL\n",
-                                    prefill_down_layer,
-                                    prefill_down_chunk,
-                                    phone_c2p_ffn_task);
-                            }
-                            phone_status =
-                                get_region_exec_worker(1)->wait(
-                                    phone_c2p_ffn_task);
-                        } else {
-                            compute_workers.start(1, i);
-                            phone_status =
-                                compute_workers.wait(1);
-                        }
+                        compute_workers.start(1, i);
+                        phone_status =
+                            compute_workers.wait(1);
                     }
                 } else {
                     restore_c2p_route_bindings(c2p_bindings);
@@ -16918,22 +13793,8 @@ auto prefill_norm_sg_has_prework =
 
     } else if (subgraph_is_prefill_pc_only(i)) {
 
-        if (region_priority_queues) {
-            ggml_cgraph * pc_main_graph =
-                backend_ctx->backend_configs[0]
-                    .cgraphs[i].cgraph_main;
-            compute_status =
-                run_region_main_graph(
-                    0,
-                    pc_main_graph,
-                    "LOCAL",
-                    "FULL_REGION",
-                    subgraph_layer(i),
-                    -1);
-        } else {
-            compute_workers.start(0, i);
-            compute_status = compute_workers.wait(0);
-        }
+        compute_workers.start(0, i);
+        compute_status = compute_workers.wait(0);
 
         if (pipeline_debug) {
             ggml_cgraph * graph =
@@ -17035,10 +13896,6 @@ auto prefill_norm_sg_has_prework =
         ggml_cgraph * c2p_decode_prefix_graph = nullptr;
         int c2p_decode_route_stop = -1;
         bool c2p_decode_parallel_ready = false;
-        ggml_cgraph * c2p_decode_suffix_graph = nullptr;
-        bool c2p_decode_pc_ffn_started_early = false;
-        std::vector<uint8_t> c2p_decode_topk_host;
-        std::vector<uint8_t> c2p_decode_weights_host;
         if (region_parallel_ffn &&
                 c2p_decode_pc_graph != nullptr) {
             const int topk_index =
@@ -17096,67 +13953,21 @@ auto prefill_norm_sg_has_prework =
             auto & phone_cfg = backend_ctx->backend_configs[1];
 
             ggml_backend_synchronize(pc_cfg.backend);
-
-            if (region_route_overlap &&
-                    c2p_decode_parallel_ready) {
-                c2p_decode_topk_host.resize(
-                    ggml_nbytes(src_topk));
-                c2p_decode_weights_host.resize(
-                    ggml_nbytes(src_weights));
-                ggml_backend_tensor_get(
-                    src_topk,
-                    c2p_decode_topk_host.data(),
-                    0,
-                    c2p_decode_topk_host.size());
-                ggml_backend_tensor_get(
-                    src_weights,
-                    c2p_decode_weights_host.data(),
-                    0,
-                    c2p_decode_weights_host.size());
-
-                c2p_decode_suffix_graph =
-                    build_region_graph_slice(
-                        c2p_decode_pc_graph,
-                        c2p_decode_route_stop,
-                        c2p_decode_pc_graph->n_nodes,
-                        i,
-                        0x4352445355464649ULL);
-                compute_workers.start_graph(
-                    0, c2p_decode_suffix_graph);
-                c2p_decode_pc_ffn_started_early = true;
-            }
-
             const int64_t topk_begin_us = ggml_time_us();
-            if (c2p_decode_pc_ffn_started_early) {
-                ggml_backend_tensor_set(
-                    dst_topk,
-                    c2p_decode_topk_host.data(),
-                    0,
-                    c2p_decode_topk_host.size());
-            } else {
-                ggml_backend_tensor_copy_async(
-                    pc_cfg.backend, phone_cfg.backend,
-                    src_topk, dst_topk);
-                ggml_backend_synchronize(phone_cfg.backend);
-            }
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, phone_cfg.backend,
+                src_topk, dst_topk);
+            ggml_backend_synchronize(phone_cfg.backend);
             const int64_t topk_us = ggml_time_us() - topk_begin_us;
             record_copy_wait(topk_us);
             record_meta_copy(i, 0, 1, src_topk, topk_us);
             record_direct_copy();
 
             const int64_t weights_begin_us = ggml_time_us();
-            if (c2p_decode_pc_ffn_started_early) {
-                ggml_backend_tensor_set(
-                    dst_weights,
-                    c2p_decode_weights_host.data(),
-                    0,
-                    c2p_decode_weights_host.size());
-            } else {
-                ggml_backend_tensor_copy_async(
-                    pc_cfg.backend, phone_cfg.backend,
-                    src_weights, dst_weights);
-                ggml_backend_synchronize(phone_cfg.backend);
-            }
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend, phone_cfg.backend,
+                src_weights, dst_weights);
+            ggml_backend_synchronize(phone_cfg.backend);
             const int64_t weights_us = ggml_time_us() - weights_begin_us;
             record_copy_wait(weights_us);
             record_meta_copy(i, 0, 1, src_weights, weights_us);
@@ -17177,22 +13988,18 @@ auto prefill_norm_sg_has_prework =
             }
 
             if (c2p_decode_parallel_ready) {
-                if (c2p_decode_suffix_graph == nullptr) {
-                    c2p_decode_suffix_graph =
-                        build_region_graph_slice(
-                            c2p_decode_pc_graph,
-                            c2p_decode_route_stop,
-                            c2p_decode_pc_graph->n_nodes,
-                            i,
-                            0x4352445355464649ULL);
-                }
+                ggml_cgraph * c2p_decode_suffix_graph =
+                    build_region_graph_slice(
+                        c2p_decode_pc_graph,
+                        c2p_decode_route_stop,
+                        c2p_decode_pc_graph->n_nodes,
+                        i,
+                        0x4352445355464649ULL);
 
                 const int64_t parallel_begin_us =
                     ggml_time_us();
-                if (!c2p_decode_pc_ffn_started_early) {
-                    compute_workers.start_graph(
-                        0, c2p_decode_suffix_graph);
-                }
+                compute_workers.start_graph(
+                    0, c2p_decode_suffix_graph);
                 compute_workers.start(1, i);
 
                 const ggml_status pc_ffn_status =
@@ -17206,8 +14013,7 @@ auto prefill_norm_sg_has_prework =
                         "[REGION_C2P_FFN_PARALLEL] "
                         "phase=DECODE layer=%d chunk=-1 "
                         "router_nodes=%d pc_ffn_nodes=%d "
-                        "phone_nodes=%d route_overlap=%d "
-                        "submit_wait_ms=%.3f "
+                        "phone_nodes=%d submit_wait_ms=%.3f "
                         "pc_status=%d phone_status=%d\n",
                         c2p_decode_ffn_layer,
                         c2p_decode_route_stop,
@@ -17215,7 +14021,6 @@ auto prefill_norm_sg_has_prework =
                             c2p_decode_route_stop,
                         backend_ctx->backend_configs[1]
                             .cgraphs[i].cgraph_main->n_nodes,
-                        c2p_decode_pc_ffn_started_early ? 1 : 0,
                         (ggml_time_us() - parallel_begin_us) /
                             1000.0,
                         (int) pc_ffn_status,
@@ -17264,7 +14069,6 @@ auto prefill_norm_sg_has_prework =
         int direct_route_layer = -1;
         bool direct_route_bound = false;
         bool direct_route_rebound = false;
-        bool region_p2c_producer_route = false;
         uint64_t saved_phone_graph_uid = 0;
         if (!phone_block_fused &&
                 phone_graph != nullptr &&
@@ -17278,36 +14082,7 @@ auto prefill_norm_sg_has_prework =
             // immediately after this graph completes.  It must therefore
             // detect the boundary without rebinding those tensors into the
             // legacy deferred-Phone-FFN staging storage.
-            if (region_route_overlap &&
-                    direct_route_chunk >= 0 &&
-                    ggml_backend_meta_tensor_p2c_layer(
-                        backend_ctx, direct_route_layer) &&
-                    i + 1 < backend_ctx->n_subgraphs) {
-                ggml_tensor * pc_next =
-                    get_prefill_down_boundary_node(0, i + 1);
-                ggml_tensor * phone_next =
-                    get_prefill_down_boundary_node(1, i + 1);
-                int pc_chunk = -1;
-                int pc_layer = -1;
-                int phone_chunk = -1;
-                int phone_layer = -1;
-                region_p2c_producer_route =
-                    pc_next != nullptr &&
-                    phone_next != nullptr &&
-                    ggml_backend_meta_parse_prefill_down_chunk(
-                        pc_next->name, pc_chunk, pc_layer) &&
-                    ggml_backend_meta_parse_prefill_down_chunk(
-                        phone_next->name, phone_chunk, phone_layer) &&
-                    pc_chunk == direct_route_chunk &&
-                    phone_chunk == direct_route_chunk &&
-                    pc_layer == direct_route_layer &&
-                    phone_layer == direct_route_layer &&
-                    (pc_next->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-                    (phone_next->flags & GGML_TENSOR_FLAG_COMPUTE);
-            }
-
-            if (phone_prefill_producer_route ||
-                    region_p2c_producer_route) {
+            if (phone_prefill_producer_route) {
                 direct_route_bound = true;
             } else if (bind_phone_prefill_route_outputs_direct(
                     direct_route_layer,
@@ -17327,54 +14102,14 @@ auto prefill_norm_sg_has_prework =
                     direct_route_layer,
                     direct_route_chunk);
         }
-        if (region_p2c_producer_route &&
-                !producer_route_prearmed) {
-            // Snapshot mailbox support is optional. If the RPC endpoint cannot
-            // prearm an immutable route snapshot, fall back to the proven
-            // synchronous P2C handoff and do not start the next Phone FFN early.
-            region_p2c_producer_route = false;
-            direct_route_bound = false;
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_P2C_ROUTE_OVERLAP] "
-                    "phase=PREARM layer=%d chunk=%d "
-                    "status=FALLBACK_SYNC\n",
-                    direct_route_layer,
-                    direct_route_chunk);
-            }
-        }
 
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (pipeline_debug && phone_block_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
         }
-        if (region_priority_queues) {
-            const int main_layer =
-                direct_route_layer >= 0 ?
-                    direct_route_layer :
-                    (phone_block_fused ?
-                        first_fused_layer :
-                        subgraph_layer(i));
-            const char * main_role =
-                region_p2c_producer_route ?
-                    "P2C_ROUTE" :
-                    (phone_block_fused ?
-                        "FULL_REGION_FUSED" :
-                        "FULL_REGION");
-            compute_status =
-                run_region_main_graph(
-                    1,
-                    phone_graph,
-                    region_p2c_producer_route ?
-                        "P2C" : "LOCAL",
-                    main_role,
-                    main_layer,
-                    direct_route_chunk);
-        } else {
-            compute_workers.start_graph(1, phone_graph);
-            compute_status = compute_workers.wait(1);
-        }
+        compute_workers.start_graph(1, phone_graph);
+        compute_status = compute_workers.wait(1);
 
         if (direct_route_bound) {
             if (direct_route_rebound) {
@@ -17430,72 +14165,6 @@ auto prefill_norm_sg_has_prework =
                 published = mark_ready(phone_backend, seq);
             }
             GGML_ASSERT(published);
-
-            if (region_p2c_producer_route &&
-                    producer_route_prearmed &&
-                    compute_status == GGML_STATUS_SUCCESS) {
-                GGML_ASSERT(!region_p2c_early_ffn.active);
-                GGML_ASSERT(i + 1 < backend_ctx->n_subgraphs);
-
-                const auto route_it =
-                    pending_phone_prefill_routes.find(
-                        { direct_route_layer,
-                          direct_route_chunk });
-                GGML_ASSERT(
-                    route_it !=
-                    pending_phone_prefill_routes.end());
-                GGML_ASSERT(route_it->second.worker != nullptr);
-                GGML_ASSERT(route_it->second.task != 0);
-
-                uint64_t phone_main_task = 0;
-                if (region_priority_queues) {
-                    phone_main_task =
-                        get_region_exec_worker(1)->enqueue(
-                            backend_ctx->backend_configs[1]
-                                .cgraphs[i + 1].cgraph_main,
-                            true);
-                    if (pipeline_debug) {
-                        printf(
-                            "[REGION_EXEC_QUEUE] side=PHONE "
-                            "queue=MAIN priority=HIGH "
-                            "direction=P2C role=OUTGOING_FFN "
-                            "layer=%d chunk=%d task=%" PRIu64
-                            " status=ENQUEUED_EARLY\n",
-                            direct_route_layer,
-                            direct_route_chunk,
-                            phone_main_task);
-                    }
-                } else {
-                    compute_workers.start(1, i + 1);
-                }
-
-                region_p2c_early_ffn.active = true;
-                region_p2c_early_ffn.route_sg = i;
-                region_p2c_early_ffn.ffn_sg = i + 1;
-                region_p2c_early_ffn.layer =
-                    direct_route_layer;
-                region_p2c_early_ffn.chunk =
-                    direct_route_chunk;
-                region_p2c_early_ffn.route_task =
-                    route_it->second.task;
-                region_p2c_early_ffn.route_worker =
-                    route_it->second.worker;
-                region_p2c_early_ffn.phone_main_task =
-                    phone_main_task;
-
-                if (pipeline_debug) {
-                    printf(
-                        "[REGION_P2C_ROUTE_OVERLAP] "
-                        "phase=PHONE_FFN_EARLY layer=%d chunk=%d "
-                        "route_sg=%zu ffn_sg=%zu route_task=%" PRIu64
-                        " status=SUBMITTED\n",
-                        direct_route_layer,
-                        direct_route_chunk,
-                        i,
-                        i + 1,
-                        route_it->second.task);
-                }
-            }
 
             if (pipeline_debug ||
                     tensor_phone_stage_profile) {
@@ -17899,14 +14568,6 @@ auto prefill_norm_sg_has_prework =
 
     subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
     compute_wall_us += subgraph_compute_wall_us;
-    if (pipeline_debug && region_chunk_continuation) {
-        std::fprintf(stderr,
-            "[REGION_HANG_TRACE] phase=SG_COMPUTE_DONE "
-            "uid=%" PRIu64 " sg=%zu compute_status=%d wall_ms=%.3f\n",
-            cgraph->uid, i, (int) compute_status,
-            subgraph_compute_wall_us / 1000.0);
-        std::fflush(stderr);
-    }
 
     if (return_wavefront_graph) {
         int wave_profile_layer = -1;
@@ -17931,16 +14592,6 @@ auto prefill_norm_sg_has_prework =
     }
 
     if (compute_status != GGML_STATUS_SUCCESS) {
-        if (region_window2) {
-            drain_region_window(
-                pending_region_c2p,
-                "C2P",
-                "ERROR_DRAIN");
-            drain_region_window(
-                pending_region_p2c,
-                "P2C",
-                "ERROR_DRAIN");
-        }
         if (has_pending_prefill_reduce()) {
             wait_all_prefill_reduces(nullptr);
         }
@@ -18138,29 +14789,12 @@ auto prefill_norm_sg_has_prework =
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
-            if (pipeline_debug && region_chunk_continuation) {
-                std::fprintf(stderr,
-                    "[REGION_HANG_TRACE] phase=COMM_BEGIN "
-                    "uid=%" PRIu64 " sg=%zu compute_complete=%d\n",
-                    cgraph->uid, communication_sg,
-                    compute_complete ? 1 : 0);
-                std::fflush(stderr);
-            }
             const ggml_status specialized_status =
                 specialized_communication(
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
-            }
-            if (pipeline_debug && region_chunk_continuation) {
-                std::fprintf(stderr,
-                    "[REGION_HANG_TRACE] phase=COMM_SPECIALIZED_DONE "
-                    "uid=%" PRIu64 " sg=%zu completed=%d status=%d\n",
-                    cgraph->uid, communication_sg,
-                    communication_complete ? 1 : 0,
-                    (int) specialized_status);
-                std::fflush(stderr);
             }
             if (!communication_complete && backend_ctx->comm_ctx) {
                 ++reduce_comm_count;
@@ -18187,13 +14821,6 @@ auto prefill_norm_sg_has_prework =
             const int64_t reduce_us = ggml_time_us() - reduce_start_us;
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
-            if (pipeline_debug && region_chunk_continuation) {
-                std::fprintf(stderr,
-                    "[REGION_HANG_TRACE] phase=COMM_DONE "
-                    "uid=%" PRIu64 " sg=%zu wall_ms=%.3f\n",
-                    cgraph->uid, communication_sg, reduce_us / 1000.0);
-                std::fflush(stderr);
-            }
         }
         if (phone_block_fused) {
             i = communication_sg;
@@ -18286,14 +14913,6 @@ auto prefill_norm_sg_has_prework =
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
         }
-
-        if (pipeline_debug && region_chunk_continuation) {
-            std::fprintf(stderr,
-                "[REGION_HANG_TRACE] phase=SG_DONE "
-                "uid=%" PRIu64 " sg=%zu communication_sg=%zu\n",
-                cgraph->uid, i, communication_sg);
-            std::fflush(stderr);
-        }
     }
 
     while (!pending_phone_prefill_pc_branches.empty()) {
@@ -18321,25 +14940,6 @@ auto prefill_norm_sg_has_prework =
             return route_status;
         }
         pending_phone_prefill_route_lane_task[lane] = 0;
-    }
-
-    if (region_window2) {
-        const ggml_status c2p_window_status =
-            drain_region_window(
-                pending_region_c2p,
-                "C2P",
-                "GRAPH_DRAIN");
-        if (c2p_window_status != GGML_STATUS_SUCCESS) {
-            return c2p_window_status;
-        }
-        const ggml_status p2c_window_status =
-            drain_region_window(
-                pending_region_p2c,
-                "P2C",
-                "GRAPH_DRAIN");
-        if (p2c_window_status != GGML_STATUS_SUCCESS) {
-            return p2c_window_status;
-        }
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
