@@ -13784,7 +13784,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         norm_bytes));
             }
             if (!norm_buf) {
-                return GGML_STATUS_ALLOC_FAILED;
+                return GGML_STATUS_FAILED;
             }
 
             ggml_tensor * norm_stage =
@@ -13939,18 +13939,51 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 return GGML_STATUS_FAILED;
             }
 
-            const int64_t wait_begin_us = ggml_time_us();
-            const bool ready = wait_ready(
-                backend_ctx->backend_configs[1].backend,
-                seq);
+            const size_t completion_index =
+                static_cast<size_t>(pipeline_chunk);
+            const uint64_t wait_task =
+                completion_index <
+                        region_pipe_completion_wait_task.size() ?
+                    region_pipe_completion_wait_task[
+                        completion_index] : 0;
+            const int64_t wait_begin_us =
+                ggml_time_us();
+            ggml_status completion_status =
+                GGML_STATUS_SUCCESS;
+            if (wait_task != 0 &&
+                    backend_ctx->region_completion_worker !=
+                        nullptr) {
+                completion_status =
+                    backend_ctx->region_completion_worker->wait(
+                        wait_task);
+            } else {
+                const bool ready =
+                    wait_ready(
+                        backend_ctx->backend_configs[1].backend,
+                        seq);
+                completion_status =
+                    ready ?
+                        GGML_STATUS_SUCCESS :
+                        GGML_STATUS_FAILED;
+            }
             const int64_t wait_us =
                 ggml_time_us() - wait_begin_us;
-            if (!ready) {
+            const int64_t producer_us =
+                completion_index <
+                            region_pipe_completion_wait_begin_us
+                                .size() &&
+                        region_pipe_completion_wait_begin_us[
+                            completion_index] != 0 ?
+                    ggml_time_us() -
+                        region_pipe_completion_wait_begin_us[
+                            completion_index] :
+                    wait_us;
+            if (completion_status != GGML_STATUS_SUCCESS) {
                 printf("[PHONE_REGION_CONTINUATION_REJECT] "
                        "chunk=%d seq=%" PRIu64
                        " reason=WAIT_FAILED action=STOP\n",
                        pipeline_chunk, seq);
-                return GGML_STATUS_FAILED;
+                return completion_status;
             }
 
             auto & slot =
@@ -13980,10 +14013,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 printf("[PHONE_REGION_CONTINUATION_WAIT] "
                        "chunk=%d seq=%" PRIu64
                        " slot=%zu wait_ms=%.3f "
+                       "producer_ms=%.3f wait_mode=%s "
                        "slot_released=1 status=READY\n",
                        pipeline_chunk, seq,
                        static_cast<size_t>(pipeline_chunk) % 2,
-                       wait_us / 1000.0);
+                       wait_us / 1000.0,
+                       producer_us / 1000.0,
+                       wait_task != 0 ?
+                           "ASYNC_EVENT" : "DIRECT",
+                       );
             }
         }
 
@@ -16196,9 +16234,74 @@ auto prefill_norm_sg_has_prework =
                         static_cast<size_t>(
                             phone_region_chunk_id) <
                             region_pipe_completion_seq.size());
-                    region_pipe_completion_seq[
+                    const size_t completion_index =
                         static_cast<size_t>(
-                            phone_region_chunk_id)] = seq;
+                            phone_region_chunk_id);
+                    region_pipe_completion_seq[
+                        completion_index] = seq;
+
+                    // Do not block the Meta scheduler on the RPC completion
+                    // socket. The dedicated worker waits for exactly this
+                    // producer sequence while the scheduler uses the PC for
+                    // the next chunk's C2P Router/FFN prework.
+                    GGML_ASSERT(
+                        backend_ctx->region_completion_worker !=
+                            nullptr);
+                    const ggml_backend_rpc_wait_ready_seq_t
+                        wait_ready =
+                            ggml_backend_meta_get_wait_ready_seq(
+                                phone_cfg.backend);
+                    if (wait_ready == nullptr) {
+                        printf(
+                            "[PHONE_REGION_CONTINUATION_REJECT] "
+                            "chunk=%d seq=%" PRIu64
+                            " reason=WAIT_API_MISSING "
+                            "action=STOP\n",
+                            phone_region_chunk_id, seq);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    region_pipe_completion_wait_begin_us[
+                        completion_index] = ggml_time_us();
+                    const int wait_chunk =
+                        phone_region_chunk_id;
+                    region_pipe_completion_wait_task[
+                        completion_index] =
+                        backend_ctx->region_completion_worker->enqueue(
+                            [&, seq, wait_ready,
+                             wait_chunk](uint64_t) ->
+                                ggml_status {
+                                const bool ready =
+                                    wait_ready(
+                                        backend_ctx
+                                            ->backend_configs[1]
+                                            .backend,
+                                        seq);
+                                if (pipeline_debug) {
+                                    printf(
+                                        "[PHONE_REGION_COMPLETION_EVENT] "
+                                        "chunk=%d seq=%" PRIu64
+                                        " ready=%d status=%s\n",
+                                        wait_chunk, seq,
+                                        ready ? 1 : 0,
+                                        ready ? "READY" : "FAILED");
+                                }
+                                return ready ?
+                                    GGML_STATUS_SUCCESS :
+                                    GGML_STATUS_FAILED;
+                            });
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_REGION_COMPLETION_WATCH] "
+                            "chunk=%d seq=%" PRIu64
+                            " task=%" PRIu64
+                            " mode=ASYNC_WAIT status=ARMED\n",
+                            phone_region_chunk_id,
+                            seq,
+                            region_pipe_completion_wait_task[
+                                completion_index]);
+                    }
                 }
                 if (will_reuse_slot) {
                     slot.completion_seq = seq;
