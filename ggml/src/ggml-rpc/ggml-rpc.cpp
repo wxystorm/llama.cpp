@@ -8007,6 +8007,63 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PHONE_C2P_REGISTER: {
+                rpc_msg_phone_c2p_register_req request {};
+                if (!recv_msg(
+                        sock,
+                        &request,
+                        sizeof(request))) {
+                    return;
+                }
+                rpc_msg_phone_c2p_register_rsp response {};
+                response.result =
+                    server.phone_c2p_register(request) ?
+                        1 : 0;
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_C2P_READY: {
+                rpc_msg_phone_c2p_ready_req request {};
+                if (!recv_msg(
+                        sock,
+                        &request,
+                        sizeof(request))) {
+                    return;
+                }
+                rpc_msg_phone_c2p_ready_rsp response {};
+                response.result =
+                    server.phone_c2p_ready(request) ?
+                        1 : 0;
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_C2P_PARTIAL: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_phone_c2p_partial_rsp response {};
+                response.result =
+                    server.phone_c2p_partial(input) ?
+                        1 : 0;
+                if (!send_msg(
+                        sock,
+                        &response,
+                        sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GRAPH_RECOMPUTE: {
                 rpc_msg_graph_recompute_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -8946,6 +9003,24 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_PHONE_MAIN_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_phone_main_register);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_C2P_REGISTER_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_c2p_register);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_C2P_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_c2p_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_C2P_PARTIAL_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_c2p_partial);
     }
     GGML_UNUSED(reg);
 
