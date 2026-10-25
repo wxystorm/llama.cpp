@@ -441,18 +441,6 @@ struct rpc_msg_get_route_snapshot_req {
     uint64_t sizes[3];
 };
 
-struct rpc_msg_phone_region_local_submit_req {
-    uint32_t device;
-    int32_t chunk;
-    uint64_t graph_sizes[3]; // Region, L46 Attention/Router, L46 Phone FFN
-    rpc_msg_route_snapshot_ready_req ready;
-    rpc_msg_snapshot_tensor_req partial;
-};
-
-struct rpc_msg_phone_region_local_submit_rsp {
-    uint8_t accepted;
-};
-
 struct rpc_msg_set_tensor_graph_req_v6 {
     rpc_tensor tensor;
     uint64_t offset;
@@ -532,6 +520,19 @@ struct rpc_msg_get_snapshot_req {
     uint64_t seq;
     uint64_t size;
 };
+
+struct rpc_msg_phone_region_local_submit_req {
+    uint32_t device;
+    int32_t chunk;
+    uint64_t graph_sizes[3]; // Region, L46 Attention/Router, L46 Phone FFN
+    rpc_msg_route_snapshot_ready_req ready;
+    rpc_msg_snapshot_tensor_req partial;
+};
+
+struct rpc_msg_phone_region_local_submit_rsp {
+    uint8_t accepted;
+};
+
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
     // 0:不支持本地文件加载
@@ -687,6 +688,14 @@ static bool ggml_backend_rpc_set_tensor_graph(
         const ggml_tensor * src,
         ggml_tensor * dst,
         const ggml_cgraph * graph);
+
+static uint64_t rpc_graph_effective_uid(
+        const ggml_cgraph * cgraph);
+static void serialize_graph(
+        uint32_t device,
+        uint64_t graph_uid,
+        const ggml_cgraph * cgraph,
+        std::vector<uint8_t> & output);
 
 static bool ggml_backend_rpc_prepare_fused_ffn_input(
         ggml_backend_t backend,
