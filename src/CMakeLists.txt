@@ -20,6 +20,11 @@ add_library(llama
             llama-grammar.cpp
             llama-graph.cpp
             llama-hybrid.cpp
+            llama-hybrid-cycle-attention.cpp
+            llama-hybrid-cycle-physical.cpp
+            llama-hybrid-cycle-phone-executor.cpp
+            llama-hybrid-cycle-model-io.cpp
+            llama-region-cuda-mirror.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
