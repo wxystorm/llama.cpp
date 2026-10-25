@@ -4032,6 +4032,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         region_local_main_env != nullptr &&
         std::atoi(region_local_main_env) != 0;
     bool region_local_main_active = false;
+    // Physical layers for the one directional unit visible in this Meta
+    // invocation. Repeating cycles are separated by direct PC_ONLY layers,
+    // so each Meta graph still carries exactly one unit.
+    int region_cycle_c2p_layer = -1;
+    int region_cycle_phone_first_layer = -1;
+    int region_cycle_phone_last_layer = -1;
+    int region_cycle_p2c_layer = -1;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -10091,7 +10098,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool local_main_partial =
                 region_pipeline_active &&
                 region_local_main_active &&
-                prefill_down_layer_0 == 46 &&
+                prefill_down_layer_0 == region_cycle_p2c_layer &&
                 local_main_partial_it !=
                     phone_region_local_main_chunks.end() &&
                 local_main_partial_it->second.submitted;
@@ -13619,8 +13626,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // policy naturally presents Meta with one directional unit at a time.
     // Discover this invocation's physical boundaries from the actual SGs
     // instead of hard-coding 34/[35,46)/46.
-    int region_pipe_c2p_layer = -1;
-    int region_pipe_p2c_layer = -1;
+    int & region_pipe_c2p_layer = region_cycle_c2p_layer;
+    int & region_pipe_p2c_layer = region_cycle_p2c_layer;
     for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
         int chunk = -1;
         int layer = -1;
@@ -13643,12 +13650,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
     }
-    const int region_pipe_phone_first_layer =
+    region_cycle_phone_first_layer =
         region_pipe_c2p_layer >= 0 ?
             region_pipe_c2p_layer + 1 : -1;
-    const int region_pipe_phone_last_layer =
+    region_cycle_phone_last_layer =
         region_pipe_p2c_layer >= 0 ?
             region_pipe_p2c_layer - 1 : -1;
+    const int region_pipe_phone_first_layer =
+        region_cycle_phone_first_layer;
+    const int region_pipe_phone_last_layer =
+        region_cycle_phone_last_layer;
 
     if (region_pipeline_requested && n_backends == 2 &&
             region_pipe_c2p_layer >= 0 &&
@@ -14272,7 +14283,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 char out_name[96];
                 std::snprintf(
                     out_name, sizeof(out_name),
-                    "phone_region_chunk_end_%zu-45", c);
+                    "phone_region_chunk_end_%zu-%d", c,
+                    region_pipe_phone_last_layer);
                 ggml_tensor * output =
                     find_sg_named_tensor(1, e.end_sg, out_name);
                 ggml_tensor * output_root =
@@ -15526,7 +15538,7 @@ auto prefill_norm_sg_has_prework =
         const bool region_local_main_p2c_down =
             region_pipeline_active &&
             region_local_main_active &&
-            prefill_down_layer == 46 &&
+            prefill_down_layer == region_cycle_p2c_layer &&
             local_main_it !=
                 phone_region_local_main_chunks.end() &&
             local_main_it->second.submitted &&
@@ -17233,11 +17245,12 @@ auto prefill_norm_sg_has_prework =
             const bool route_prearmed =
                 prearm_phone_prefill_route(
                     entry.continuation_ready_sg,
-                    46,
+                    region_cycle_p2c_layer,
                     phone_region_chunk_id);
             const auto route_it =
                 pending_phone_prefill_routes.find(
-                    { 46, phone_region_chunk_id });
+                    { region_cycle_p2c_layer,
+                      phone_region_chunk_id });
             if (!route_prearmed ||
                     route_it ==
                         pending_phone_prefill_routes.end()) {
@@ -17263,12 +17276,14 @@ auto prefill_norm_sg_has_prework =
             char residual_name[96];
             std::snprintf(
                 partial_name, sizeof(partial_name),
-                "prefill_ffn_down_chunk_%d-46",
-                phone_region_chunk_id);
+                "prefill_ffn_down_chunk_%d-%d",
+                phone_region_chunk_id,
+                region_cycle_p2c_layer);
             std::snprintf(
                 residual_name, sizeof(residual_name),
-                "phone_tensor_ffn_inp_chunk_%d-46",
-                phone_region_chunk_id);
+                "phone_tensor_ffn_inp_chunk_%d-%d",
+                phone_region_chunk_id,
+                region_cycle_p2c_layer);
 
             ggml_tensor * phone_partial =
                 find_sg_named_tensor(
