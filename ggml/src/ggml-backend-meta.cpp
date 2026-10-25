@@ -12389,6 +12389,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
         size_t communication_sg = i;
         bool phone_block_fused = false;
+        bool phone_region_fused = false;
         int phone_block_last_layer = -1;
         int prefill_norm_chunk = -1;
         int prefill_norm_layer = -1;
@@ -14097,11 +14098,115 @@ auto prefill_norm_sg_has_prework =
         }
         size_t phone_block_end = i;
         int first_fused_layer = -1;
-        phone_block_fused = find_phone_block(
-            i, phone_block_end, first_fused_layer, phone_block_last_layer);
-        if (phone_block_fused) {
-            timing_first_layer = first_fused_layer;
-            timing_last_layer  = phone_block_last_layer;
+        int phone_region_chunk_id = -1;
+
+        // Qwen3-MoE emits a chunk-major L35..L45 Phone-only DAG. Meta's
+        // PARTIAL markers still split it into many scheduling subgraphs.
+        // Find the exact chunk boundaries and submit their union once,
+        // avoiding communication/hand-off checks at internal PARTIALs.
+        //
+        // Scan *all* PC flags, not just each subgraph's terminal flag.
+        // If the graph actually needs PC work, fail closed rather than
+        // silently dropping that work or copying an intermediate K view.
+        if (n_backends == 2) {
+            ggml_cgraph * start_phone_graph =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            if (start_phone_graph != nullptr) {
+                for (int k = 0; k < start_phone_graph->n_nodes; ++k) {
+                    const char * name = start_phone_graph->nodes[k]->name;
+                    int chunk = -1, layer = -1, parsed = 0;
+                    if (std::sscanf(name,
+                            "phone_region_attn_chunk_%d-%d%n",
+                            &chunk, &layer, &parsed) == 2 &&
+                            name[parsed] == '\0' &&
+                            chunk >= 0 && layer == 35) {
+                        phone_region_chunk_id = chunk;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (phone_region_chunk_id >= 0) {
+            bool found_end = false;
+            bool found_phone_compute = false;
+            for (size_t sg = i; sg < backend_ctx->n_subgraphs && !found_end; ++sg) {
+                ggml_cgraph * pc_part =
+                    backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+                ggml_cgraph * phone_part =
+                    backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+                GGML_ASSERT(pc_part != nullptr && phone_part != nullptr);
+                GGML_ASSERT(pc_part->n_nodes == phone_part->n_nodes);
+                for (int k = 0; k < phone_part->n_nodes; ++k) {
+                    const ggml_tensor * pc_node = pc_part->nodes[k];
+                    const ggml_tensor * phone_node = phone_part->nodes[k];
+                    if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                        printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
+                               "node=%s op=%s reason=PC_COMPUTE_ACTIVE "
+                               "action=STOP\n",
+                               phone_region_chunk_id, sg, pc_node->name,
+                               ggml_op_name(pc_node->op));
+                        return GGML_STATUS_FAILED;
+                    }
+                    found_phone_compute =
+                        found_phone_compute ||
+                        (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+                    const char * name = phone_node->name;
+                    int chunk = -1, layer = -1, parsed = 0;
+                    const bool is_another_begin =
+                        std::sscanf(name,
+                            "phone_region_attn_chunk_%d-%d%n",
+                            &chunk, &layer, &parsed) == 2 &&
+                        name[parsed] == '\0' &&
+                        layer == 35 && chunk != phone_region_chunk_id;
+                    if (is_another_begin) {
+                        printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
+                               "reason=NEXT_CHUNK_BEFORE_END action=STOP\n",
+                               phone_region_chunk_id, sg);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    chunk = -1; layer = -1; parsed = 0;
+                    if (std::sscanf(name,
+                            "phone_region_chunk_end_%d-%d%n",
+                            &chunk, &layer, &parsed) == 2 &&
+                            name[parsed] == '\0') {
+                        if (chunk != phone_region_chunk_id || layer != 45 ||
+                                k + 1 != phone_part->n_nodes) {
+                            printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
+                                   "node=%s reason=INVALID_END action=STOP\n",
+                                   phone_region_chunk_id, sg, name);
+                            return GGML_STATUS_FAILED;
+                        }
+                        phone_block_end = sg;
+                        found_end = true;
+                    }
+                }
+            }
+
+            if (!found_end || !found_phone_compute) {
+                printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
+                       "reason=%s action=STOP\n",
+                       phone_region_chunk_id, i,
+                       !found_end ? "END_NOT_FOUND" : "NO_PHONE_COMPUTE");
+                return GGML_STATUS_FAILED;
+            }
+            phone_block_fused = true;
+            phone_region_fused = true;
+            first_fused_layer = 35;
+            // No forced PC handoff here: L46's Attention is Phone-owned.
+            // The real C2P/P2C boundaries remain managed by the baseline.
+            phone_block_last_layer = -1;
+            timing_first_layer = 35;
+            timing_last_layer = 45;
+        } else {
+            phone_block_fused = find_phone_block(
+                i, phone_block_end, first_fused_layer, phone_block_last_layer);
+            if (phone_block_fused) {
+                timing_first_layer = first_fused_layer;
+                timing_last_layer = phone_block_last_layer;
+            }
         }
         ggml_cgraph * phone_graph = phone_block_fused ?
             build_phone_block_graph(i, phone_block_end) :
@@ -14147,9 +14252,15 @@ auto prefill_norm_sg_has_prework =
         }
 
         const int64_t phone_submit_begin_us = ggml_time_us();
-        if (pipeline_debug && phone_block_fused) {
+        if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
+        }
+        if (phone_region_fused && pipeline_debug) {
+            printf("[PHONE_REGION_GRAPH] chunk=%d sg=%zu..%zu "
+                   "layers=[35,46) nodes=%d status=DEVICE_LOCAL_READY\n",
+                   phone_region_chunk_id, i, phone_block_end,
+                   phone_graph->n_nodes);
         }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
@@ -14372,14 +14483,23 @@ auto prefill_norm_sg_has_prework =
         }
 
         const int64_t phone_submit_end_us = ggml_time_us();
-        if (pipeline_debug && phone_block_fused) {
+        if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_END] layers=%d..%d t=%" PRId64 " dur=%.3f ms\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_end_us,
                    (phone_submit_end_us - phone_submit_begin_us) / 1000.0);
         }
+        if (pipeline_debug && phone_region_fused) {
+            printf("[PHONE_REGION_GRAPH_DONE] chunk=%d sg=%zu..%zu "
+                   "wall_ms=%.3f status=%d\n",
+                   phone_region_chunk_id, i, phone_block_end,
+                   (phone_submit_end_us - phone_submit_begin_us) / 1000.0,
+                   (int) compute_status);
+        }
 
         if (pipeline_debug) {
-            if (phone_block_fused) {
+            if (phone_region_fused) {
+                // An explicit Region graph was already logged above.
+            } else if (phone_block_fused) {
                 printf(
                     "[PHONE_BLOCK_FUSED] sg=%zu..%zu layers=%d..%d nodes=%d\n",
                     i, phone_block_end, first_fused_layer,
@@ -14828,7 +14948,10 @@ auto prefill_norm_sg_has_prework =
             phone_block_last_layer >= 0 &&
             !layer_is_tensor_phone_primary(
                 phone_block_last_layer);
-        if (n_backends > 1 &&
+        // A fused Phone-only chunk ends at an internal scheduling marker,
+        // never at an inter-device reduction/handoff boundary. Its output
+        // remains Phone-resident for the next chunk or L46 Phone Attention.
+        if (n_backends > 1 && !phone_region_fused &&
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
