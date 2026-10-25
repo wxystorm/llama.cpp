@@ -83,6 +83,18 @@ def main() -> int:
             print(f"FAIL: found {bad}")
             return 1
 
+    prep = list(re.finditer(
+        r"\[PHONE_REGION_POOL_PREP\] ready=(\d+) outputs=(\d+).*?"
+        r"slot0_mib=([0-9.]+) slot1_mib=([0-9.]+).*?reason=([^\s]+)",
+        text,
+    ))
+    if not prep or prep[-1].group(1) != "1":
+        print("FAIL: missing successful PHONE_REGION_POOL_PREP")
+        return 1
+    if int(prep[-1].group(2)) != n_chunks:
+        print(f"FAIL: prewarmed outputs={prep[-1].group(2)}; expected {n_chunks}")
+        return 1
+
     scratch = list(re.finditer(
         r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?status=BOUND",
         block,
