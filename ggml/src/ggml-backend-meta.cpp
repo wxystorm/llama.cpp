@@ -7651,10 +7651,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 handled = true;
                 auto & bcj_src = backend_ctx->backend_configs[0];
                 auto & bcj_dst = backend_ctx->backend_configs[1];
-                ggml_tensor * src = nodes[0];
+                region_c2p_pc_prework_state * pc_prework =
+                    find_region_c2p_pc_prework(
+                        prefill_norm_layer,
+                        prefill_norm_chunk);
+                const bool use_staged_norm =
+                    pc_prework != nullptr &&
+                    pc_prework->ready &&
+                    pc_prework->status == GGML_STATUS_SUCCESS &&
+                    pc_prework->norm_stage != nullptr;
+                ggml_tensor * src =
+                    use_staged_norm ?
+                        pc_prework->norm_stage : nodes[0];
                 ggml_tensor * dst = nodes[1];
                 GGML_ASSERT(ggml_is_contiguous(src));
                 GGML_ASSERT(ggml_is_contiguous(dst));
+                GGML_ASSERT(
+                    ggml_nbytes(src) == ggml_nbytes(dst));
+
+                if (pipeline_debug && use_staged_norm) {
+                    printf(
+                        "[REGION_C2P_NORM_STAGE_CONSUME] "
+                        "layer=%d chunk=%d bytes=%zu "
+                        "source=PC_PRIVATE_STAGE status=READY\n",
+                        prefill_norm_layer,
+                        prefill_norm_chunk,
+                        ggml_nbytes(src));
+                }
 
                 pending_prefill_input_task =
                     backend_ctx->prefill_input_worker->enqueue(
