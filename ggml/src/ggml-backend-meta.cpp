@@ -2339,6 +2339,13 @@ struct ggml_backend_meta_context {
         // outputs remain live after the PC FFN consumes them so Meta can copy
         // the exact TopK/weights to Phone without graph-arena reuse.
         std::vector<std::array<ggml_backend_buffer_ptr, 2>> c2p_route_stage_bufs;
+        // Region event-pipeline C2P PC prework. The normalized hidden and PC
+        // FFN partial must survive an intervening L46 continuation, whose PC
+        // graph may reuse the stock gallocr arena. Keep one private allocation
+        // per chunk for each value; Router TopK/weights continue to use the
+        // existing c2p_route_stage_bufs above.
+        std::vector<ggml_backend_buffer_ptr> c2p_prefill_norm_stage_bufs;
+        std::vector<ggml_backend_buffer_ptr> c2p_prefill_partial_stage_bufs;
         // Private Phone-side storage used by Router-first deferred FFN.
         // The full normalized hidden is produced directly into one layer-local
         // buffer, while top-k/weights use per-chunk buffers.
@@ -2409,6 +2416,10 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
+    // Dedicated waiter for Phone Region completion sequence credits. It may
+    // block on the RPC wait socket while the Meta scheduler uses the PC for
+    // the next chunk's C2P prework.
+    ggml_backend_meta_transfer_worker * region_completion_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -3000,6 +3011,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete transfer_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
+    delete region_completion_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
