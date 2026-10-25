@@ -4780,11 +4780,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             int next_chunk = -1;
             int next_layer = -1;
             if (ggml_backend_meta_parse_prefill_down_chunk(
-                    last->name, next_chunk, next_layer)) {
-                return next_layer != layer;
-            }
-            if (subgraph_is_phone_only(next) || subgraph_is_prefill_pc_only(next)) {
-                return true;
+                    last->name, next_chunk, next_layer) && next_layer == layer) {
+                return false;
             }
         }
         return true;
@@ -12831,22 +12828,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
 
-        // Discover each L46 continuation from its explicit chunk markers.
-        // Do NOT infer chunk ownership by recursively comparing tensor roots:
-        // the stock allocator intentionally aliases views and the final
-        // l_out-46 tail is shared across chunks, which can make unrelated
-        // chunks appear to depend on the same root and falsely report
-        // CONTINUATION_OVERLAP.
-        //
-        // The graph already provides unambiguous per-chunk boundaries:
-        //
-        //   prefill_ffn_norm_chunk_<c>-46  -> continuation begin
-        //   prefill_ffn_down_chunk_<c>-46  -> continuation end
-        //
-        // Any SG outside those explicit ranges (for example the observed
-        // post-Region layer-34 bridge and the shared l_out-46 tail) remains
-        // outside the chunk continuation and is executed later by the normal
-        // uncovered-SG path.
+        // Chunk markers delimit the FFN, but its inputs may still depend on
+        // full-batch Attention. Check tensor edges, not arena address aliases.
         if (eligible) {
             for (size_t c = 0;
                     c < region_pipe_chunks.size() && eligible; ++c) {
@@ -12909,6 +12892,50 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     continuation_begin;
                 e.continuation_end_sg =
                     continuation_down;
+
+                std::set<ggml_tensor *> visited;
+                ggml_tensor * future_output = nullptr;
+                std::function<void(ggml_tensor *)> visit =
+                    [&](ggml_tensor * tensor) {
+                        if (tensor == nullptr || future_output != nullptr ||
+                                !visited.insert(tensor).second) {
+                            return;
+                        }
+                        int chunk = -1, layer = -1, parsed = 0;
+                        if (std::sscanf(tensor->name,
+                                "phone_region_chunk_end_%d-%d%n",
+                                &chunk, &layer, &parsed) == 2 &&
+                                tensor->name[parsed] == '\0' && layer == 45) {
+                            if (chunk > (int) c) {
+                                future_output = tensor;
+                            }
+                            return;
+                        }
+                        visit(tensor->view_src);
+                        for (ggml_tensor * src : tensor->src) {
+                            visit(src);
+                        }
+                    };
+                for (size_t backend = 0; backend < n_backends && eligible; ++backend) {
+                    for (size_t sg = continuation_begin;
+                            sg <= continuation_down && eligible; ++sg) {
+                        ggml_cgraph * graph =
+                            backend_ctx->backend_configs[backend].cgraphs[sg].cgraph_main;
+                        for (int k = 0; graph != nullptr && k < graph->n_nodes; ++k) {
+                            if (graph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                                visit(graph->nodes[k]);
+                            }
+                        }
+                        if (future_output != nullptr) {
+                            eligible = false;
+                            region_pipe_reason = "CONTINUATION_FUTURE_REGION_INPUT";
+                            printf("[PHONE_REGION_CONTINUATION_DEPENDENCY] "
+                                   "chunk=%zu sg=%zu backend=%zu input=%s "
+                                   "reason=FUTURE_REGION_OUTPUT action=FALLBACK\n",
+                                   c, sg, backend, future_output->name);
+                        }
+                    }
+                }
             }
 
             // The explicit chunk ranges must be strictly ordered and

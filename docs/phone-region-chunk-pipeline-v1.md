@@ -213,6 +213,25 @@ If `[PHONE_REGION_PIPE_PLAN] active=0`, inspect the `reason`:
 
 A fallback is *not* a failure of the existing serial Phone Region graph. It intentionally runs the previous order to avoid silent buffer corruption.
 
+## Continuation dependency fallback
+
+L46 currently builds Attention for the full batch before splitting only its
+FFN into chunks. Its first FFN chunk therefore depends on all L45 Region
+outputs. The `prefill_ffn_norm_chunk_0-46` marker alone does not make that
+chunk safe to execute immediately after Region0.
+
+Preflight now follows tensor dependency edges and falls back to the original
+serial subgraph order if a continuation needs a future Region output. Expect
+`PHONE_REGION_CONTINUATION_DEPENDENCY ... action=FALLBACK` and
+`PHONE_REGION_PIPE_PLAN active=0 ... reason=CONTINUATION_FUTURE_REGION_INPUT`.
+The opt-in Region graph remains enabled; this rejects the unsafe scheduling
+order rather than bypassing the dependency. Enabling early L46 continuations
+requires chunk-local Attention producers and a separate buffer-lifetime audit.
+
+The last-FFN-chunk check also scans past intervening Phone-owned norm/router
+subgraphs. For three L46 chunks, `REGION_P2C_PREFILL` must report `last=0` for
+chunks 0/1 and `last=1` only for chunk 2.
+
 ## Required hardware validation
 
 1. Build PC and Phone server from compatible commits as applicable; test 2-token warmup first. **Both the Region Graph and V1 pipeline now stay disabled for a single chunk**, so warmup follows the validated legacy Phone path. This is intentional: the single-chunk Region shape was not fused and exposed a Phone-side `GGML_OP_SET_ROWS` index assertion without providing any pipeline benefit.
