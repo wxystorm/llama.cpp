@@ -138,6 +138,8 @@ def main() -> int:
         "PHONE_REGION_CONTINUATION_DEPENDENCY",
         "CONTINUATION_FUTURE_REGION_INPUT",
         "PHONE_TENSOR_ATTN_OWNER_REJECT",
+        "REGION_C2P_PC_PREWORK_REJECT",
+        "REGION_C2P_PC_PREWORK_SKIP",
         "PREFILL_INPUT_PARK",
         "Compute error",
     ):
@@ -229,6 +231,85 @@ def main() -> int:
         )
         return 1
 
+    expected_prework_chunks = list(range(1, n_chunks))
+    pc_prework = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[REGION_C2P_PC_PREWORK\] layer=34 chunk=(\d+) "
+            r".*?state=PC_READY_PHONE_DEFERRED status=OK",
+            block,
+        )
+    ]
+    if pc_prework != expected_prework_chunks:
+        print(
+            f"FAIL: PC prework chunks={pc_prework}; "
+            f"expected={expected_prework_chunks}"
+        )
+        return 1
+
+    norm_stage_consume = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[REGION_C2P_NORM_STAGE_CONSUME\] "
+            r"layer=34 chunk=(\d+) .*?"
+            r"source=PC_PRIVATE_STAGE status=READY",
+            block,
+        )
+    ]
+    if norm_stage_consume != expected_prework_chunks:
+        print(
+            f"FAIL: staged C2P norm chunks={norm_stage_consume}; "
+            f"expected={expected_prework_chunks}"
+        )
+        return 1
+
+    pc_prework_consume = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[REGION_C2P_PC_PREWORK_CONSUME\] "
+            r"layer=34 chunk=(\d+) .*?status=PC_READY",
+            block,
+        )
+    ]
+    if pc_prework_consume != expected_prework_chunks:
+        print(
+            f"FAIL: PC prework consume chunks={pc_prework_consume}; "
+            f"expected={expected_prework_chunks}"
+        )
+        return 1
+
+    deferred_phone = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[REGION_C2P_FFN_DEFERRED_PHONE\] "
+            r"phase=PREFILL layer=34 chunk=(\d+) "
+            r".*?status=JOIN",
+            block,
+        )
+    ]
+    if deferred_phone != expected_prework_chunks:
+        print(
+            f"FAIL: deferred Phone C2P chunks={deferred_phone}; "
+            f"expected={expected_prework_chunks}"
+        )
+        return 1
+
+    pc_prework_release = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[REGION_C2P_PC_PREWORK_RELEASE\] "
+            r"layer=34 chunk=(\d+) .*?"
+            r"status=RELEASED_AFTER_REDUCE",
+            block,
+        )
+    ]
+    if pc_prework_release != expected_prework_chunks:
+        print(
+            f"FAIL: PC prework release chunks={pc_prework_release}; "
+            f"expected={expected_prework_chunks}"
+        )
+        return 1
+
     continuation_credits = [
         (int(m.group(1)), int(m.group(2)))
         for m in re.finditer(
@@ -244,22 +325,73 @@ def main() -> int:
         )
         return 1
 
-    continuation_waits = [
-        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    completion_watches = [
+        int(m.group(1))
         for m in re.finditer(
-            r"\[PHONE_REGION_CONTINUATION_WAIT\] "
-            r"chunk=(\d+) seq=\d+ slot=(\d+) "
-            r"wait_ms=[0-9.]+ slot_released=(\d+) status=READY",
+            r"\[PHONE_REGION_COMPLETION_WATCH\] "
+            r"chunk=(\d+) seq=\d+ task=\d+ "
+            r"mode=ASYNC_WAIT status=ARMED",
             block,
         )
     ]
-    expected_waits = [(c, c % 2, 1) for c in range(n_chunks)]
-    if continuation_waits != expected_waits:
+    if completion_watches != list(range(n_chunks)):
         print(
-            f"FAIL: continuation waits={continuation_waits}; "
-            f"expected={expected_waits}"
+            f"FAIL: completion watches={completion_watches}; "
+            f"expected 0..{n_chunks - 1}"
         )
         return 1
+
+    completion_events = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[PHONE_REGION_COMPLETION_EVENT\] "
+            r"chunk=(\d+) seq=\d+ ready=1 status=READY",
+            block,
+        )
+    ]
+    if completion_events != list(range(n_chunks)):
+        print(
+            f"FAIL: completion events={completion_events}; "
+            f"expected 0..{n_chunks - 1}"
+        )
+        return 1
+
+    continuation_waits = [
+        (
+            int(m.group(1)),
+            int(m.group(2)),
+            float(m.group(3)),
+            float(m.group(4)),
+            m.group(5),
+            int(m.group(6)),
+        )
+        for m in re.finditer(
+            r"\[PHONE_REGION_CONTINUATION_WAIT\] "
+            r"chunk=(\d+) seq=\d+ slot=(\d+) "
+            r"wait_ms=([0-9.]+) producer_ms=([0-9.]+) "
+            r"wait_mode=(\w+) slot_released=(\d+) status=READY",
+            block,
+        )
+    ]
+    if len(continuation_waits) != n_chunks:
+        print(
+            f"FAIL: continuation waits={continuation_waits}; "
+            f"expected {n_chunks} async waits"
+        )
+        return 1
+    for chunk, slot, wait_ms, producer_ms, mode, released in continuation_waits:
+        if chunk < 0 or chunk >= n_chunks or slot != chunk % 2:
+            print(f"FAIL: invalid continuation wait tuple={continuation_waits}")
+            return 1
+        if mode != "ASYNC_EVENT" or released != 1:
+            print(
+                f"FAIL: chunk {chunk} completion mode={mode} "
+                f"released={released}; expected ASYNC_EVENT/1"
+            )
+            return 1
+        if producer_ms <= 0:
+            print(f"FAIL: chunk {chunk} producer_ms={producer_ms}")
+            return 1
 
     seq_reuse = list(re.finditer(
         r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?"
@@ -291,6 +423,8 @@ def main() -> int:
         f"chunk-pipelined (window=2, {plan.group(4)} Meta schedule entries)"
     )
     print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
+    print("PASS: Region completion uses async event watches instead of blocking the scheduler")
+    print("PASS: next-chunk L34 PC Router/FFN prework is staged across the current Region")
     print("PASS: every Region completion credit is consumed by its own L46 continuation")
     print("PASS: continuation releases the scratch slot before later reuse")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
