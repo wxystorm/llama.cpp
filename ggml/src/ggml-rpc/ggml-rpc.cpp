@@ -524,7 +524,7 @@ struct rpc_msg_get_snapshot_req {
 struct rpc_msg_phone_region_local_submit_req {
     uint32_t device;
     int32_t chunk;
-    uint64_t graph_sizes[3]; // Region, L46 Attention/Router, L46 Phone FFN
+    uint64_t graph_sizes[4]; // Region, L46 Attention/Router, Phone FFN, residual fold
     rpc_msg_route_snapshot_ready_req ready;
     rpc_msg_snapshot_tensor_req partial;
 };
@@ -3131,6 +3131,7 @@ static bool ggml_backend_rpc_phone_region_local_submit(
         uint64_t ready_seq,
         uint32_t ready_lane,
         const ggml_cgraph * ffn_graph,
+        const ggml_cgraph * fold_graph,
         const ggml_tensor * partial,
         uint64_t partial_seq,
         uint32_t partial_slot) {
@@ -3153,7 +3154,8 @@ static bool ggml_backend_rpc_phone_region_local_submit(
 
     // Capability query used by Meta during pipeline preflight.
     if (region_graph == nullptr && attn_graph == nullptr &&
-            ffn_graph == nullptr && ready_hidden == nullptr &&
+            ffn_graph == nullptr && fold_graph == nullptr &&
+            ready_hidden == nullptr &&
             ready_topk == nullptr && ready_weights == nullptr &&
             partial == nullptr && ready_seq == 0 &&
             partial_seq == 0) {
@@ -3163,6 +3165,7 @@ static bool ggml_backend_rpc_phone_region_local_submit(
 
     if (chunk < 0 || region_graph == nullptr ||
             attn_graph == nullptr || ffn_graph == nullptr ||
+            fold_graph == nullptr ||
             ready_hidden == nullptr || ready_topk == nullptr ||
             ready_weights == nullptr || partial == nullptr ||
             ready_seq == 0 || partial_seq == 0 ||
@@ -3201,7 +3204,7 @@ static bool ggml_backend_rpc_phone_region_local_submit(
         return false;
     }
 
-    std::array<std::vector<uint8_t>, 3> graphs;
+    std::array<std::vector<uint8_t>, 4> graphs;
     const ggml_cgraph * graph_ptrs[3] = {
         region_graph, attn_graph, ffn_graph,
     };
@@ -5483,6 +5486,9 @@ bool rpc_server::run_phone_region_local_task(
     if (!graph_compute(task.graphs[2])) {
         return false;
     }
+    if (!graph_compute(task.graphs[3])) {
+        return false;
+    }
 
     if (!snapshot_tensor(task.partial)) {
         return false;
@@ -5494,7 +5500,8 @@ bool rpc_server::run_phone_region_local_task(
             stderr,
             "[PHONE_REGION_MAIN_PATH] chunk=%d "
             "path=REGION_L35_L45>L46_ATTN>READY>"
-            "L46_PHONE_FFN>PARTIAL wall_ms=%.3f status=OK\n",
+            "L46_PHONE_FFN>RESIDUAL_FOLD>PARTIAL "
+            "wall_ms=%.3f status=OK\n",
             task.chunk,
             (ggml_time_us() - begin_us) / 1000.0);
         std::fflush(stderr);
