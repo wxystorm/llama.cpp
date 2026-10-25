@@ -14857,10 +14857,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 return GGML_STATUS_SUCCESS;
                             });
 
+                    if (backend_ctx->
+                            phone_main_pc_reduce_worker ==
+                            nullptr) {
+                        backend_ctx->
+                            phone_main_pc_reduce_worker =
+                                new ggml_backend_meta_transfer_worker();
+                    }
                     state.join_worker =
                         backend_ctx->
-                            prefill_reduce_workers[
-                                state.partial_slot];
+                            phone_main_pc_reduce_worker;
                     ggml_backend_meta_transfer_worker *
                         partial_worker =
                             state.partial_worker;
