@@ -752,6 +752,26 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     "phone_region_chunk_begin_" + std::to_string(ci);
                 cb(hidden, chunk_begin_name.c_str(), phone_region_first);
 
+                // K/V write indices and causal mask depend on token range,
+                // not on the current transformer layer. Build them ONCE per
+                // chunk and reuse for all L35-L45 attention calls. Otherwise
+                // each layer creates fresh host inputs, and ggml's outer
+                // scheduler (30 cross-backend inputs per split) fragments a
+                // single Phone Region across multiple scheduler splits.
+                // The same reuse applies to the position slice.
+                auto * chunk_attn = build_attn_inp_kv_range(
+                    (uint32_t) token_begin, (uint32_t) count);
+                ggml_tensor * pos_chunk = ggml_view_1d(
+                    ctx0, inp_pos, count, token_begin * inp_pos->nb[0]);
+                if (phone_region_requested) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_REGION_INPUT_REUSE] chunk=%zu "
+                        "tokens=%" PRId64 " begin=%" PRId64
+                        " attention_inputs=1 layers=%d status=READY\n",
+                        ci, count, token_begin,
+                        phone_region_end - phone_region_first);
+                }
+
                 // Chunk-major graph order. Finish every layer of chunk N
                 // before beginning chunk N+1. The per-range KV inputs use the
                 // same token positions/masks as the ordinary attention path.
@@ -780,8 +800,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         NULL, LLM_NORM_RMS, region_il);
                     cb(Kcur, "Kcur_normed", region_il);
 
-                    ggml_tensor * pos_chunk = ggml_view_1d(
-                        ctx0, inp_pos, count, token_begin * inp_pos->nb[0]);
                     Qcur = ggml_rope_ext(
                         ctx0, Qcur, pos_chunk, nullptr,
                         n_rot, rope_type, n_ctx_orig,
@@ -796,8 +814,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     cb(Kcur, "Kcur", region_il);
                     cb(Vcur, "Vcur", region_il);
 
-                    auto * chunk_attn = build_attn_inp_kv_range(
-                        (uint32_t) token_begin, (uint32_t) count);
                     ggml_tensor * attn = build_attn(
                         chunk_attn, model.layers[region_il].wo,
                         model.layers[region_il].wo_b,
