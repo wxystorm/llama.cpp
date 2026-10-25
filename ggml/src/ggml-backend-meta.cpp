@@ -6682,6 +6682,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint64_t join_task = 0;
 
         bool graphs_registered = false;
+        bool c2p_registered = false;
         bool main_registered = false;
         bool pc_ffn_ready = false;
         bool phone_partial_ready = false;
@@ -14504,8 +14505,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 ggml_backend_meta_get_graph_register(phone_cfg.backend);
             const ggml_backend_rpc_phone_main_register_t main_register =
                 ggml_backend_meta_get_phone_main_register(phone_cfg.backend);
-            const ggml_backend_rpc_set_tensor_graph_t set_tensor_graph =
-                ggml_backend_meta_get_set_tensor_graph(phone_cfg.backend);
+            const ggml_backend_rpc_phone_c2p_register_t c2p_register =
+                ggml_backend_meta_get_phone_c2p_register(phone_cfg.backend);
+            const ggml_backend_rpc_phone_c2p_ready_t c2p_ready =
+                ggml_backend_meta_get_phone_c2p_ready(phone_cfg.backend);
+            const ggml_backend_rpc_phone_c2p_partial_t c2p_partial =
+                ggml_backend_meta_get_phone_c2p_partial(phone_cfg.backend);
             const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
                 ggml_backend_meta_get_snapshot_read_setter(phone_cfg.backend);
             const ggml_backend_rpc_get_route_snapshot_t route_get_snapshot =
@@ -14519,7 +14524,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pc_overlap_requested &&
                 graph_register != nullptr &&
                 main_register != nullptr &&
-                set_tensor_graph != nullptr &&
+                c2p_register != nullptr &&
+                c2p_ready != nullptr &&
+                c2p_partial != nullptr &&
                 set_snapshot_read != nullptr &&
                 route_get_snapshot != nullptr &&
                 route_snapshot_ready != nullptr &&
@@ -14552,6 +14559,218 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     e.continuation_route_sg;
                 state.down_sg =
                     e.continuation_end_sg;
+
+                // Pre-register the L34 Phone FFN and Reduce against the exact
+                // private window-slot buffers. Runtime C2P only publishes
+                // READY/PARTIAL data; it never reconstructs or starts these
+                // graphs from the PC.
+                auto & c2p_slot =
+                    backend_ctx->region_c2p_overlap_slots[c % 2];
+                ggml_cgraph * c2p_phone_graph =
+                    phone_cfg.cgraphs[e.down_sg].cgraph_main;
+                if (c2p_phone_graph == nullptr ||
+                        c2p_phone_graph->n_nodes <= 0) {
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_FFN_GRAPH_MISSING";
+                    break;
+                }
+
+                char c2p_hidden_name[96];
+                char c2p_topk_name[96];
+                char c2p_weights_name[96];
+                char c2p_partial_name[96];
+                std::snprintf(
+                    c2p_hidden_name, sizeof(c2p_hidden_name),
+                    "prefill_ffn_norm_chunk_%d-34", chunk);
+                std::snprintf(
+                    c2p_topk_name, sizeof(c2p_topk_name),
+                    "c2p_prefill_route_topk_chunk_%d-34", chunk);
+                std::snprintf(
+                    c2p_weights_name, sizeof(c2p_weights_name),
+                    "c2p_prefill_route_weights_chunk_%d-34", chunk);
+                std::snprintf(
+                    c2p_partial_name, sizeof(c2p_partial_name),
+                    "prefill_ffn_down_chunk_%d-34", chunk);
+
+                ggml_tensor * c2p_phone_hidden =
+                    find_sg_named_tensor(
+                        1, e.down_sg, c2p_hidden_name);
+                ggml_tensor * c2p_phone_topk =
+                    find_sg_named_tensor(
+                        1, e.down_sg, c2p_topk_name);
+                ggml_tensor * c2p_phone_weights =
+                    find_sg_named_tensor(
+                        1, e.down_sg, c2p_weights_name);
+                ggml_tensor * c2p_phone_partial =
+                    find_sg_named_tensor(
+                        1, e.down_sg, c2p_partial_name);
+                if (c2p_phone_hidden == nullptr ||
+                        c2p_phone_topk == nullptr ||
+                        c2p_phone_weights == nullptr ||
+                        c2p_phone_partial == nullptr ||
+                        !c2p_slot.phone_input_buf ||
+                        !c2p_slot.phone_route_bufs[0] ||
+                        !c2p_slot.phone_route_bufs[1] ||
+                        !c2p_slot.phone_partial_buf ||
+                        !c2p_slot.phone_pc_partial_buf) {
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_PRIVATE_STORAGE_MISSING";
+                    break;
+                }
+
+                std::vector<c2p_route_binding_backup>
+                    c2p_graph_bindings;
+                bind_c2p_private_storage(
+                    1, c2p_phone_hidden,
+                    c2p_slot.phone_input_buf,
+                    c2p_graph_bindings);
+                bind_c2p_private_storage(
+                    1, c2p_phone_topk,
+                    c2p_slot.phone_route_bufs[0],
+                    c2p_graph_bindings);
+                bind_c2p_private_storage(
+                    1, c2p_phone_weights,
+                    c2p_slot.phone_route_bufs[1],
+                    c2p_graph_bindings);
+                bind_c2p_private_storage(
+                    1, c2p_phone_partial,
+                    c2p_slot.phone_partial_buf,
+                    c2p_graph_bindings);
+
+                const uint64_t saved_c2p_ffn_uid =
+                    c2p_phone_graph->uid;
+                c2p_phone_graph->uid ^=
+                    0x43325046464e4c34ULL ^
+                    (uint64_t) (chunk + 1) *
+                        0x9e3779b97f4a7c15ULL;
+                if (c2p_phone_graph->uid == 0) {
+                    c2p_phone_graph->uid = 1;
+                }
+                if (!graph_register(
+                        phone_cfg.backend,
+                        c2p_phone_graph,
+                        &state.c2p_ffn_uid)) {
+                    c2p_phone_graph->uid =
+                        saved_c2p_ffn_uid;
+                    restore_c2p_route_bindings(
+                        c2p_graph_bindings);
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_FFN_REGISTER_FAILED";
+                    break;
+                }
+                c2p_phone_graph->uid =
+                    saved_c2p_ffn_uid;
+
+                state.c2p_phone_pc_partial =
+                    get_node_aux(c2p_phone_partial);
+                state.c2p_phone_pc_partial->buffer =
+                    c2p_slot.phone_pc_partial_buf.get();
+                state.c2p_phone_pc_partial->data =
+                    ggml_backend_buffer_get_base(
+                        c2p_slot.phone_pc_partial_buf.get());
+                if (state.c2p_phone_pc_partial->data == nullptr ||
+                        !ggml_are_same_layout(
+                            c2p_phone_partial,
+                            state.c2p_phone_pc_partial)) {
+                    restore_c2p_route_bindings(
+                        c2p_graph_bindings);
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_PARTIAL_STAGE_FAILED";
+                    break;
+                }
+
+                ggml_tensor * c2p_phone_l_out =
+                    find_layer_output(1, 34);
+                if (c2p_phone_l_out == nullptr) {
+                    restore_c2p_route_bindings(
+                        c2p_graph_bindings);
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_OUTPUT_MISSING";
+                    break;
+                }
+                const size_t c2p_chunk_offset =
+                    down_chunk_offset(0, true, 34, chunk);
+
+                ggml_tensor * c2p_phone_out =
+                    get_node_aux(c2p_phone_partial);
+                c2p_phone_out->view_src =
+                    c2p_phone_l_out;
+                c2p_phone_out->view_offs =
+                    c2p_chunk_offset;
+                c2p_phone_out->op = GGML_OP_ADD;
+                c2p_phone_out->src[0] =
+                    c2p_phone_partial;
+                c2p_phone_out->src[1] =
+                    state.c2p_phone_pc_partial;
+                c2p_phone_out->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(c2p_phone_out);
+                if (c2p_chunk_offset +
+                        ggml_nbytes(c2p_phone_out) >
+                        ggml_nbytes(c2p_phone_l_out)) {
+                    restore_c2p_route_bindings(
+                        c2p_graph_bindings);
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_OUTPUT_RANGE";
+                    break;
+                }
+
+                ggml_cgraph * c2p_reduce_graph =
+                    get_cgraph_aux();
+                c2p_reduce_graph->nodes[0] =
+                    c2p_phone_out;
+                c2p_reduce_graph->n_nodes = 1;
+                c2p_reduce_graph->uid =
+                    0x4332505245445543ULL ^
+                    (uint64_t) (chunk + 1) *
+                        0xbf58476d1ce4e5b9ULL;
+                if (c2p_reduce_graph->uid == 0) {
+                    c2p_reduce_graph->uid = 1;
+                }
+                if (!graph_register(
+                        phone_cfg.backend,
+                        c2p_reduce_graph,
+                        &state.c2p_reduce_uid)) {
+                    restore_c2p_route_bindings(
+                        c2p_graph_bindings);
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_C2P_REDUCE_REGISTER_FAILED";
+                    break;
+                }
+
+                state.c2p_consume_seq =
+                    backend_ctx->next_phone_prefill_ffn_seq++;
+                if (state.c2p_consume_seq == 0) {
+                    state.c2p_consume_seq =
+                        backend_ctx->next_phone_prefill_ffn_seq++;
+                }
+
+                // Remote graph descriptors now own the private buffer addresses.
+                // Restore host graph descriptors; runtime binding will reattach
+                // the same slot before READY is sent.
+                restore_c2p_route_bindings(
+                    c2p_graph_bindings);
+
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_C2P_GRAPH_PREP] "
+                        "chunk=%d slot=%zu ffn_uid=%" PRIu64
+                        " reduce_uid=%" PRIu64
+                        " consume_seq=%" PRIu64
+                        " status=READY\n",
+                        chunk,
+                        c % 2,
+                        state.c2p_ffn_uid,
+                        state.c2p_reduce_uid,
+                        state.c2p_consume_seq);
+                }
 
                 char hidden_name[96];
                 char topk_name[96];
