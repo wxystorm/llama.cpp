@@ -5979,122 +5979,138 @@ bool rpc_server::set_tensor_graph_compute(
     return ok;
 }
 
-bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
-    // serialization format:
-    // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+bool rpc_server::graph_register(const std::vector<uint8_t> & input) {
+    // Same wire format as GRAPH_COMPUTE, but registration only reconstructs
+    // and stores the graph. No backend work is submitted here.
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
         return false;
     }
     const uint8_t * src = input.data();
-    uint32_t device;
+    uint32_t device = 0;
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
     if (device >= backends.size()) {
         return false;
     }
-    uint64_t graph_uid;
+    uint64_t graph_uid = 0;
     memcpy(&graph_uid, src, sizeof(graph_uid));
     src += sizeof(graph_uid);
-    uint32_t n_nodes;
+    if (graph_uid == 0) {
+        return false;
+    }
+    uint32_t n_nodes = 0;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
-    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+    if (input.size() <
+            2*sizeof(uint32_t) + sizeof(uint64_t) +
+            n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
         return false;
     }
-    const uint64_t * nodes = (const uint64_t *)src;
+    const uint64_t * nodes =
+        reinterpret_cast<const uint64_t *>(src);
     src += n_nodes*sizeof(uint64_t);
-    uint32_t n_tensors;
+    uint32_t n_tensors = 0;
     memcpy(&n_tensors, src, sizeof(n_tensors));
     src += sizeof(n_tensors);
-    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+    if (input.size() <
+            2*sizeof(uint32_t) + sizeof(uint64_t) +
+            n_nodes*sizeof(uint64_t) + sizeof(uint32_t) +
+            n_tensors*sizeof(rpc_tensor)) {
         return false;
     }
-    const rpc_tensor * tensors = (const rpc_tensor *)src;
-    LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, graph_uid, n_nodes, n_tensors);
+    const rpc_tensor * tensors =
+        reinterpret_cast<const rpc_tensor *>(src);
 
-    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
-    stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
+    size_t buf_size =
+        ggml_tensor_overhead()*(n_nodes + n_tensors) +
+        ggml_graph_overhead_custom(n_nodes, false);
+    stored_graph & graph_entry =
+        stored_graphs[device][graph_uid];
     if (graph_entry.buffer.size() < buf_size) {
         graph_entry.buffer.resize(buf_size);
     }
+
     struct ggml_init_params params = {
         /*.mem_size   =*/ buf_size,
         /*.mem_buffer =*/ graph_entry.buffer.data(),
         /*.no_alloc   =*/ true,
     };
-    ggml_context_ptr ctx_ptr { ggml_init(params) }; //智能指针
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx, n_nodes, false);
     graph->n_nodes = n_nodes;
+
     std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
     tensor_ptrs.reserve(n_tensors);
-    for (uint32_t i = 0; i < n_tensors; i++) {
+    for (uint32_t i = 0; i < n_tensors; ++i) {
         tensor_ptrs.emplace(tensors[i].id, &tensors[i]);
     }
     std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
     tensor_map.reserve(n_nodes);
-    for (uint32_t i = 0; i < n_nodes; i++) {
-        int64_t id;
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        int64_t id = 0;
         memcpy(&id, &nodes[i], sizeof(id));
-        graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
-
-        // Check if create_node failed for a *non-zero* ID.
-        // If id was 0, create_node returning nullptr is expected.
-        // If id was non-zero and create_node returned nullptr, it indicates a deserialization error.
+        graph->nodes[i] =
+            create_node(id, ctx, tensor_ptrs, tensor_map);
         if (graph->nodes[i] == nullptr && id != 0) {
-            GGML_LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
+            GGML_LOG_ERROR(
+                "[%s] failed to create graph node %u "
+                "(id=%" PRId64 ")\n",
+                __func__, i, id);
+            graph_entry.graph = nullptr;
             return false;
         }
-    }   //恢复原来的计算图
-    const int64_t t0 = ggml_time_us();
-
-    ggml_status status =
-        ggml_backend_graph_compute(
-            backends[device],
-            graph);
-
-    const int64_t t1 = ggml_time_us();
-
-    rpc_tensor_phone_log_graph_compute(
-        "compute",
-        graph_uid,
-        graph,
-        t1 - t0,
-        0);
-
-    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
-        printf(
-            "[RPC_GRAPH_SERVER] uid=%" PRIu64
-            " nodes=%d compute=%.3f ms\n",
-            graph_uid,
-            graph->n_nodes,
-            (t1 - t0) / 1000.0);
-        fflush(stdout);
     }
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     graph_entry.graph = graph;
+
+    GGML_LOG_INFO(
+        "[PHONE_MAIN_GRAPH_REGISTER] device=%u uid=%" PRIu64
+        " nodes=%u tensors=%u status=READY\n",
+        device, graph_uid, n_nodes, n_tensors);
     return true;
 }
 
-bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    uint32_t device = request.device;
+bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(uint32_t) + sizeof(uint64_t)) {
+        return false;
+    }
+    uint32_t device = 0;
+    uint64_t graph_uid = 0;
+    memcpy(&device, input.data(), sizeof(device));
+    memcpy(&graph_uid, input.data() + sizeof(device), sizeof(graph_uid));
+
+    if (!graph_register(input)) {
+        return false;
+    }
+
+    rpc_msg_graph_recompute_req request {};
+    request.device = device;
+    request.graph_uid = graph_uid;
+    return graph_recompute(request);
+}
+
+bool rpc_server::graph_recompute_unlocked(
+        const rpc_msg_graph_recompute_req & request) {
+    const uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
     }
     auto it = stored_graphs[device].find(request.graph_uid);
-    if (it == stored_graphs[device].end() || it->second.graph == nullptr) {
+    if (it == stored_graphs[device].end() ||
+            it->second.graph == nullptr) {
         return false;
     }
     ggml_cgraph * graph = it->second.graph;
-    LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
+    LOG_DBG(
+        "[%s] device: %u, graph_uid: %" PRIu64 "\n",
+        __func__, device, request.graph_uid);
     const int64_t t0 = ggml_time_us();
-
-    ggml_status status =
+    const ggml_status status =
         ggml_backend_graph_compute(
             backends[device],
             graph);
-
     const int64_t t1 = ggml_time_us();
 
     rpc_tensor_phone_log_graph_compute(
@@ -6104,7 +6120,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         t1 - t0,
         0);
 
-    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+    if (RPC_DEBUG ||
+            std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
         printf(
             "[RPC_GRAPH_SERVER] uid=%" PRIu64
             " nodes=%d compute=%.3f ms\n",
@@ -6113,8 +6130,35 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
             (t1 - t0) / 1000.0);
         fflush(stdout);
     }
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    return true;
+    GGML_ASSERT(
+        status == GGML_STATUS_SUCCESS &&
+        "Unsuccessful graph computations are not supported with RPC");
+    return status == GGML_STATUS_SUCCESS;
+}
+
+bool rpc_server::graph_recompute(
+        const rpc_msg_graph_recompute_req & request) {
+    std::unique_lock<std::mutex> gpu_lock(phone_gpu_mutex);
+    phone_gpu_cv.wait(
+        gpu_lock,
+        [&]() {
+            return phone_main_pending == 0 &&
+                   !phone_main_running;
+        });
+
+    const bool ok = graph_recompute_unlocked(request);
+    if (ok) {
+        // The trigger is checked while the ordinary GPU lane is still held.
+        // If it admits MAIN, phone_main_pending becomes non-zero before this
+        // lock is released, so no later normal RPC graph can overtake MAIN.
+        phone_main_trigger_after_graph(
+            request.device,
+            request.graph_uid);
+    }
+
+    gpu_lock.unlock();
+    phone_gpu_cv.notify_all();
+    return ok;
 }
 
 bool rpc_server::graph_recompute_snapshot(
