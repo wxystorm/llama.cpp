@@ -13859,6 +13859,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     phone_prefill_chunk_pipeline &&
                     phone_prefill_producer_route &&
                     !phone_prefill_async_return_active &&
+                    std::getenv(
+                        "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") !=
+                        nullptr &&
+                    std::getenv(
+                        "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") !=
+                        nullptr &&
                     local_submit(
                         phone_cfg.backend,
                         0,
@@ -16816,7 +16822,6 @@ auto prefill_norm_sg_has_prework =
                    phone_region_chunk_id, i, phone_block_end,
                    phone_graph->n_nodes);
         }
-        bool phone_region_local_submitted = false;
         if (region_pipeline_active &&
                 region_local_main_active &&
                 phone_region_fused) {
@@ -16995,7 +17000,6 @@ auto prefill_norm_sg_has_prework =
                     scratch_reuse_seq,
                     true,
                 };
-            phone_region_local_submitted = true;
             compute_status =
                 GGML_STATUS_SUCCESS;
 
@@ -17093,10 +17097,12 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
-        // wait(1) means ggml_backend_graph_compute_async() has consumed and
-        // serialized the graph descriptors. The GPU may still be executing,
-        // but it now owns the private remote addresses, so host descriptors
-        // can return to their original gallocr bindings immediately.
+        // Both paths have serialized the rebound Region descriptors before
+        // this point: legacy waits for the RPC graph submit, while local-MAIN
+        // serializes all four graph blobs inside local_submit() before its
+        // queue ACK. The Phone may still be computing asynchronously, but the
+        // remote addresses are now owned by the server task, so the host-side
+        // descriptors can return to their gallocr bindings immediately.
         if (phone_region_uid_rebound) {
             phone_graph->uid = phone_region_saved_uid;
             restore_region_bindings(
