@@ -2375,6 +2375,18 @@ struct ggml_backend_meta_context {
             bufs.resize(n_reduce_steps);
         }
     };
+    // Window=2 storage for the Region/C2P overlap path. The buffers live on
+    // the Meta context so their lifetime spans the synthetic PC_PREP stage and
+    // the later real C2P Phone FFN/reduce stage.
+    struct region_c2p_overlap_slot {
+        int owner_layer = -1;
+        int owner_chunk = -1;
+        ggml_backend_buffer_ptr phone_input_buf;
+        std::array<ggml_backend_buffer_ptr, 2> pc_route_bufs;
+        ggml_backend_buffer_ptr pc_partial_buf;
+    };
+    std::array<region_c2p_overlap_slot, 2> region_c2p_overlap_slots;
+
     std::string                 name;
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
@@ -3953,6 +3965,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_parallel_ffn =
         region_parallel_ffn_env != nullptr &&
         std::atoi(region_parallel_ffn_env) != 0;
+    const char * region_pc_overlap_env =
+        std::getenv("GGML_META_PHONE_REGION_PC_OVERLAP");
+    const bool region_pc_overlap_requested =
+        region_pc_overlap_env != nullptr &&
+        std::atoi(region_pc_overlap_env) != 0;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -4119,10 +4136,39 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         snapshot_prepares[sg].seq = seq;
     };
 
+    struct c2p_route_binding_backup {
+        ggml_tensor * tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+    };
+
+    struct region_c2p_overlap_chunk_state {
+        int layer = -1;
+        int chunk = -1;
+        size_t slot = 0;
+        uint64_t input_task = 0;
+        bool input_staged = false;
+        bool pc_prepared = false;
+        ggml_tensor * input_dst = nullptr;
+        ggml_tensor * pc_topk = nullptr;
+        ggml_tensor * pc_weights = nullptr;
+        ggml_tensor * pc_partial = nullptr;
+        std::vector<c2p_route_binding_backup> input_bindings;
+        std::vector<c2p_route_binding_backup> pc_bindings;
+    };
+    std::map<std::pair<int, int>, region_c2p_overlap_chunk_state>
+        region_c2p_overlap_chunks;
+
     uint64_t pending_prefill_input_task = 0;
     int pending_prefill_input_layer = -1;
     int pending_prefill_input_chunk = -1;
     auto has_pending_prefill_input = [&](int layer, int chunk) {
+        const auto overlap_it =
+            region_c2p_overlap_chunks.find({ layer, chunk });
+        if (overlap_it != region_c2p_overlap_chunks.end() &&
+                overlap_it->second.input_task != 0) {
+            return true;
+        }
         return pending_prefill_input_task != 0 &&
             pending_prefill_input_layer == layer &&
             pending_prefill_input_chunk == chunk;
@@ -5773,12 +5819,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             phone_prefill_direct_bindings.erase(binding_it);
         };
 
-    struct c2p_route_binding_backup {
-        ggml_tensor * tensor = nullptr;
-        ggml_backend_buffer_t buffer = nullptr;
-        void * data = nullptr;
-    };
-
     auto find_sg_named_tensor =
         [&](size_t backend, size_t sg,
             const char * expected) -> ggml_tensor * {
@@ -5810,11 +5850,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             return nullptr;
         };
 
-    auto bind_c2p_route_storage =
-        [&](ggml_tensor * tensor,
+    auto bind_c2p_private_storage =
+        [&](size_t backend_index,
+            ggml_tensor * tensor,
             ggml_backend_buffer_ptr & buf,
             std::vector<c2p_route_binding_backup> & backups) {
             GGML_ASSERT(tensor != nullptr);
+            GGML_ASSERT(backend_index < n_backends);
 
             auto backup_once = [&](ggml_tensor * target) {
                 GGML_ASSERT(target != nullptr);
@@ -5840,7 +5882,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_buffer_get_size(buf.get()) < need) {
                 buf.reset(
                     ggml_backend_alloc_buffer(
-                        backend_ctx->backend_configs[0].backend,
+                        backend_ctx->backend_configs[backend_index].backend,
                         need));
             }
             GGML_ASSERT(buf != nullptr);
@@ -5860,6 +5902,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         };
 
+    auto bind_c2p_route_storage =
+        [&](ggml_tensor * tensor,
+            ggml_backend_buffer_ptr & buf,
+            std::vector<c2p_route_binding_backup> & backups) {
+            bind_c2p_private_storage(
+                0, tensor, buf, backups);
+        };
+
     auto restore_c2p_route_bindings =
         [&](std::vector<c2p_route_binding_backup> & backups) {
             for (auto it = backups.rbegin();
@@ -5868,6 +5918,49 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 it->tensor->data = it->data;
             }
             backups.clear();
+        };
+
+    auto release_region_c2p_overlap_chunk =
+        [&](int layer, int chunk, const char * reason) {
+            auto it =
+                region_c2p_overlap_chunks.find({ layer, chunk });
+            if (it == region_c2p_overlap_chunks.end()) {
+                return;
+            }
+
+            auto & state = it->second;
+            GGML_ASSERT(state.slot < 2);
+            auto & slot =
+                backend_ctx->region_c2p_overlap_slots[state.slot];
+            if (slot.owner_chunk != chunk ||
+                    slot.owner_layer != layer) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] layer=%d chunk=%d "
+                    "slot=%zu owner_layer=%d owner_chunk=%d "
+                    "reason=SLOT_OWNER_MISMATCH action=STOP\n",
+                    layer, chunk, state.slot,
+                    slot.owner_layer, slot.owner_chunk);
+                GGML_ASSERT(
+                    slot.owner_chunk == chunk &&
+                    slot.owner_layer == layer);
+            }
+
+            restore_c2p_route_bindings(state.pc_bindings);
+            restore_c2p_route_bindings(state.input_bindings);
+            slot.owner_layer = -1;
+            slot.owner_chunk = -1;
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_SLOT_RELEASE] layer=%d chunk=%d "
+                    "slot=%zu input=%d pc_prepared=%d reason=%s "
+                    "status=FREE\n",
+                    layer, chunk, state.slot,
+                    state.input_staged ? 1 : 0,
+                    state.pc_prepared ? 1 : 0,
+                    reason != nullptr ? reason : "UNKNOWN");
+            }
+            region_c2p_overlap_chunks.erase(it);
         };
 
     auto phone_prefill_direct_defer_eligible =
@@ -7603,7 +7696,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             if (direct_prefill_down) {
-                GGML_ASSERT(pending_prefill_input_task == 0);
+                const bool region_overlap_input =
+                    region_pipeline_active &&
+                    region_pc_overlap_requested &&
+                    prefill_norm_chunk > 0 &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, prefill_norm_layer);
+
+                if (!region_overlap_input) {
+                    GGML_ASSERT(pending_prefill_input_task == 0);
+                }
 
                 if (backend_ctx->prefill_input_worker == nullptr) {
                     backend_ctx->prefill_input_worker =
@@ -7618,7 +7720,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(ggml_is_contiguous(src));
                 GGML_ASSERT(ggml_is_contiguous(dst));
 
-                pending_prefill_input_task =
+                region_c2p_overlap_chunk_state * overlap_state =
+                    nullptr;
+                if (region_overlap_input) {
+                    const auto key =
+                        std::make_pair(
+                            prefill_norm_layer,
+                            prefill_norm_chunk);
+                    auto & state =
+                        region_c2p_overlap_chunks[key];
+                    if (state.input_staged ||
+                            state.input_task != 0 ||
+                            state.pc_prepared) {
+                        printf(
+                            "[REGION_C2P_OVERLAP_REJECT] "
+                            "layer=%d chunk=%d "
+                            "reason=DUPLICATE_INPUT_STAGE action=STOP\n",
+                            prefill_norm_layer,
+                            prefill_norm_chunk);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    const size_t slot_index =
+                        static_cast<size_t>(
+                            prefill_norm_chunk) % 2;
+                    auto & slot =
+                        backend_ctx->region_c2p_overlap_slots[
+                            slot_index];
+                    if (slot.owner_chunk >= 0 &&
+                            (slot.owner_chunk != prefill_norm_chunk ||
+                             slot.owner_layer != prefill_norm_layer)) {
+                        printf(
+                            "[REGION_C2P_OVERLAP_REJECT] "
+                            "layer=%d chunk=%d slot=%zu "
+                            "owner_layer=%d owner_chunk=%d "
+                            "reason=INPUT_SLOT_BUSY action=STOP\n",
+                            prefill_norm_layer,
+                            prefill_norm_chunk,
+                            slot_index,
+                            slot.owner_layer,
+                            slot.owner_chunk);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    slot.owner_layer = prefill_norm_layer;
+                    slot.owner_chunk = prefill_norm_chunk;
+                    state.layer = prefill_norm_layer;
+                    state.chunk = prefill_norm_chunk;
+                    state.slot = slot_index;
+                    state.input_dst = dst;
+                    bind_c2p_private_storage(
+                        1,
+                        dst,
+                        slot.phone_input_buf,
+                        state.input_bindings);
+                    state.input_staged = true;
+                    overlap_state = &state;
+                }
+
+                const uint64_t input_task =
                     backend_ctx->prefill_input_worker->enqueue(
                         [&, src, dst, i](uint64_t) -> ggml_status {
                             const int64_t copy_start_us = ggml_time_us();
@@ -7630,8 +7790,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             record_meta_copy(i, 0, 1, src, copy_us);
                             return GGML_STATUS_SUCCESS;
                         });
-                pending_prefill_input_layer = prefill_norm_layer;
-                pending_prefill_input_chunk = prefill_norm_chunk;
+
+                if (overlap_state != nullptr) {
+                    overlap_state->input_task = input_task;
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_C2P_INPUT_STAGE] "
+                            "layer=%d chunk=%d slot=%zu "
+                            "task=%" PRIu64 " bytes=%zu "
+                            "status=QUEUED\n",
+                            prefill_norm_layer,
+                            prefill_norm_chunk,
+                            overlap_state->slot,
+                            input_task,
+                            ggml_nbytes(dst));
+                    }
+                } else {
+                    pending_prefill_input_task = input_task;
+                    pending_prefill_input_layer = prefill_norm_layer;
+                    pending_prefill_input_chunk = prefill_norm_chunk;
+                }
                 record_direct_copy();
 
                 if (pipeline_debug) {
@@ -12217,6 +12395,160 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     phone_last->name, phone_chunk, phone_layer);
         return parsed && chunk == phone_chunk && layer == phone_layer;
     };
+
+    auto prepare_region_c2p_pc =
+        [&](size_t sg, int expected_chunk) -> ggml_status {
+            int chunk = -1;
+            int layer = -1;
+            if (!parse_prefill_sg(
+                    sg, false, chunk, layer) ||
+                    chunk != expected_chunk ||
+                    !ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, layer)) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "chunk=%d sg=%zu reason=PC_PREP_NOT_C2P "
+                    "action=STOP\n",
+                    expected_chunk, sg);
+                return GGML_STATUS_FAILED;
+            }
+
+            auto state_it =
+                region_c2p_overlap_chunks.find({ layer, chunk });
+            if (state_it == region_c2p_overlap_chunks.end() ||
+                    !state_it->second.input_staged ||
+                    state_it->second.input_task == 0) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "reason=INPUT_NOT_STAGED action=STOP\n",
+                    layer, chunk, sg);
+                return GGML_STATUS_FAILED;
+            }
+
+            auto & state = state_it->second;
+            GGML_ASSERT(state.slot < 2);
+            auto & slot =
+                backend_ctx->region_c2p_overlap_slots[state.slot];
+            if (slot.owner_layer != layer ||
+                    slot.owner_chunk != chunk) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "owner_layer=%d owner_chunk=%d "
+                    "reason=PC_PREP_SLOT_MISMATCH action=STOP\n",
+                    layer, chunk, state.slot,
+                    slot.owner_layer, slot.owner_chunk);
+                return GGML_STATUS_FAILED;
+            }
+            if (state.pc_prepared) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            char topk_name[96];
+            char weights_name[96];
+            std::snprintf(
+                topk_name, sizeof(topk_name),
+                "c2p_prefill_route_topk_chunk_%d-%d",
+                chunk, layer);
+            std::snprintf(
+                weights_name, sizeof(weights_name),
+                "c2p_prefill_route_weights_chunk_%d-%d",
+                chunk, layer);
+
+            ggml_tensor * src_topk =
+                find_sg_named_tensor(0, sg, topk_name);
+            ggml_tensor * src_weights =
+                find_sg_named_tensor(0, sg, weights_name);
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[sg].cgraph_main;
+            if (src_topk == nullptr ||
+                    src_weights == nullptr ||
+                    pc_graph == nullptr ||
+                    pc_graph->n_nodes == 0) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "reason=PC_PREP_GRAPH_MISSING action=STOP\n",
+                    layer, chunk, sg);
+                return GGML_STATUS_FAILED;
+            }
+
+            ggml_tensor * pc_partial =
+                pc_graph->nodes[pc_graph->n_nodes - 1];
+            int partial_chunk = -1;
+            int partial_layer = -1;
+            if (!ggml_backend_meta_parse_prefill_down_chunk(
+                    pc_partial->name,
+                    partial_chunk,
+                    partial_layer) ||
+                    partial_chunk != chunk ||
+                    partial_layer != layer) {
+                printf(
+                    "[REGION_C2P_OVERLAP_REJECT] "
+                    "layer=%d chunk=%d sg=%zu partial=%s "
+                    "reason=PC_PARTIAL_MARKER action=STOP\n",
+                    layer, chunk, sg, pc_partial->name);
+                return GGML_STATUS_FAILED;
+            }
+
+            bind_c2p_private_storage(
+                0, src_topk,
+                slot.pc_route_bufs[0],
+                state.pc_bindings);
+            bind_c2p_private_storage(
+                0, src_weights,
+                slot.pc_route_bufs[1],
+                state.pc_bindings);
+            bind_c2p_private_storage(
+                0, pc_partial,
+                slot.pc_partial_buf,
+                state.pc_bindings);
+
+            const uint64_t saved_uid = pc_graph->uid;
+            pc_graph->uid = 0;
+            const int64_t prep_begin_us = ggml_time_us();
+            compute_workers.start(0, sg);
+            const ggml_status status =
+                compute_workers.wait(0);
+            const int64_t prep_us =
+                ggml_time_us() - prep_begin_us;
+            pc_graph->uid = saved_uid;
+
+            if (status != GGML_STATUS_SUCCESS) {
+                if (state.input_task != 0 &&
+                        backend_ctx->prefill_input_worker != nullptr) {
+                    backend_ctx->prefill_input_worker->wait(
+                        state.input_task);
+                    state.input_task = 0;
+                }
+                release_region_c2p_overlap_chunk(
+                    layer, chunk, "PC_PREP_FAILED");
+                return status;
+            }
+
+            state.pc_topk = src_topk;
+            state.pc_weights = src_weights;
+            state.pc_partial = pc_partial;
+            state.pc_prepared = true;
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_PC_PREP] "
+                    "layer=%d chunk=%d sg=%zu slot=%zu "
+                    "topk_bytes=%zu weights_bytes=%zu "
+                    "partial_bytes=%zu wall_ms=%.3f "
+                    "status=READY\n",
+                    layer, chunk, sg, state.slot,
+                    ggml_nbytes(src_topk),
+                    ggml_nbytes(src_weights),
+                    ggml_nbytes(pc_partial),
+                    prep_us / 1000.0);
+            }
+            return GGML_STATUS_SUCCESS;
+        };
+
     auto parse_prefill_wave_attn_sg =
         [&](size_t i, int & chunk_begin, int & chunk_count, int & layer) -> bool {
             if (n_backends != 2 || i >= backend_ctx->n_subgraphs) {
@@ -12832,8 +13164,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         size_t continuation_begin_sg = static_cast<size_t>(-1);
         size_t continuation_end_sg   = static_cast<size_t>(-1);
     };
+    enum class region_pipe_schedule_kind {
+        NORMAL,
+        C2P_PC_PREP,
+    };
+    struct region_pipe_schedule_entry {
+        size_t sg = 0;
+        region_pipe_schedule_kind kind =
+            region_pipe_schedule_kind::NORMAL;
+        int chunk = -1;
+    };
+
     std::map<int, region_pipe_chunk> region_pipe_chunks;
-    std::vector<size_t> region_pipe_schedule;
+    std::vector<region_pipe_schedule_entry> region_pipe_schedule;
     const size_t region_pipe_invalid_sg = backend_ctx->n_subgraphs;
     const char * region_pipe_reason = "DISABLED";
     if (region_pipeline_requested && n_backends == 2 &&
@@ -13169,10 +13512,159 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             // allocator/queue and turn a cheap host stage into ~700 ms.
             const int64_t pool_prep_begin_us = ggml_time_us();
             auto & phone_cfg = backend_ctx->backend_configs[1];
+            auto & pc_cfg = backend_ctx->backend_configs[0];
             std::array<size_t, 2> slot_bytes { 0, 0 };
+            std::array<size_t, 2> c2p_slot_bytes { 0, 0 };
             size_t output_bytes = 0;
             size_t output_count = 0;
             bool prep_ok = true;
+
+            if (region_pc_overlap_requested) {
+                auto ensure_overlap_buf =
+                    [&](ggml_backend_t backend,
+                        ggml_backend_buffer_ptr & buf,
+                        size_t need) -> bool {
+                        if (!buf ||
+                                ggml_backend_buffer_get_size(
+                                    buf.get()) < need) {
+                            buf.reset(
+                                ggml_backend_alloc_buffer(
+                                    backend, need));
+                        }
+                        return buf != nullptr &&
+                            ggml_backend_buffer_get_base(
+                                buf.get()) != nullptr;
+                    };
+
+                for (size_t c = 1;
+                        c < region_pipe_chunks.size() &&
+                        prep_ok; ++c) {
+                    const auto & e =
+                        region_pipe_chunks.at((int) c);
+                    const size_t slot_index = c % 2;
+                    auto & overlap_slot =
+                        backend_ctx->region_c2p_overlap_slots[
+                            slot_index];
+
+                    ggml_cgraph * phone_norm_graph =
+                        phone_cfg.cgraphs[e.norm_sg].cgraph_main;
+                    ggml_cgraph * pc_down_graph =
+                        pc_cfg.cgraphs[e.down_sg].cgraph_main;
+                    if (phone_norm_graph == nullptr ||
+                            phone_norm_graph->n_nodes == 0 ||
+                            pc_down_graph == nullptr ||
+                            pc_down_graph->n_nodes == 0) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "C2P_OVERLAP_GRAPH_MISSING";
+                        break;
+                    }
+
+                    ggml_tensor * phone_input =
+                        phone_norm_graph->nodes[
+                            phone_norm_graph->n_nodes - 1];
+                    char topk_name[96];
+                    char weights_name[96];
+                    std::snprintf(
+                        topk_name, sizeof(topk_name),
+                        "c2p_prefill_route_topk_chunk_%zu-34",
+                        c);
+                    std::snprintf(
+                        weights_name, sizeof(weights_name),
+                        "c2p_prefill_route_weights_chunk_%zu-34",
+                        c);
+                    ggml_tensor * pc_topk =
+                        find_sg_named_tensor(
+                            0, e.down_sg, topk_name);
+                    ggml_tensor * pc_weights =
+                        find_sg_named_tensor(
+                            0, e.down_sg, weights_name);
+                    ggml_tensor * pc_partial =
+                        pc_down_graph->nodes[
+                            pc_down_graph->n_nodes - 1];
+                    if (phone_input == nullptr ||
+                            pc_topk == nullptr ||
+                            pc_weights == nullptr ||
+                            pc_partial == nullptr) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "C2P_OVERLAP_TENSOR_MISSING";
+                        break;
+                    }
+
+                    auto storage_bytes =
+                        [](ggml_tensor * tensor) -> size_t {
+                            ggml_tensor * storage =
+                                tensor->view_src != nullptr ?
+                                    tensor->view_src : tensor;
+                            return ggml_nbytes(storage);
+                        };
+
+                    prep_ok =
+                        ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_input_buf,
+                            storage_bytes(phone_input)) &&
+                        ensure_overlap_buf(
+                            pc_cfg.backend,
+                            overlap_slot.pc_route_bufs[0],
+                            storage_bytes(pc_topk)) &&
+                        ensure_overlap_buf(
+                            pc_cfg.backend,
+                            overlap_slot.pc_route_bufs[1],
+                            storage_bytes(pc_weights)) &&
+                        ensure_overlap_buf(
+                            pc_cfg.backend,
+                            overlap_slot.pc_partial_buf,
+                            storage_bytes(pc_partial));
+                    if (!prep_ok) {
+                        region_pipe_reason =
+                            "C2P_OVERLAP_POOL_ALLOC_FAILED";
+                        break;
+                    }
+                }
+
+                if (prep_ok) {
+                    for (size_t slot_index = 0;
+                            slot_index < 2; ++slot_index) {
+                        const auto & overlap_slot =
+                            backend_ctx->region_c2p_overlap_slots[
+                                slot_index];
+                        if (overlap_slot.phone_input_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.phone_input_buf.get());
+                        }
+                        for (const auto & route_buf :
+                                overlap_slot.pc_route_bufs) {
+                            if (route_buf) {
+                                c2p_slot_bytes[slot_index] +=
+                                    ggml_backend_buffer_get_size(
+                                        route_buf.get());
+                            }
+                        }
+                        if (overlap_slot.pc_partial_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.pc_partial_buf.get());
+                        }
+                    }
+                }
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_OVERLAP_POOL] "
+                        "ready=%d slot0_mib=%.3f "
+                        "slot1_mib=%.3f reason=%s\n",
+                        prep_ok ? 1 : 0,
+                        c2p_slot_bytes[0] /
+                            (1024.0 * 1024.0),
+                        c2p_slot_bytes[1] /
+                            (1024.0 * 1024.0),
+                        prep_ok ? "READY" :
+                            region_pipe_reason);
+                }
+            }
 
             // Pre-connect the independent completion-wait socket while the
             // Phone is idle. seq=0 is capability-only and does not consume a
@@ -13475,8 +13967,26 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     return;
                 }
                 covered[sg] = true;
-                region_pipe_schedule.push_back(sg);
+                region_pipe_schedule.push_back({
+                    sg,
+                    region_pipe_schedule_kind::NORMAL,
+                    -1,
+                });
             };
+            auto add_pc_prep =
+                [&](size_t sg, int chunk) {
+                    if (sg >= covered.size()) {
+                        eligible = false;
+                        return;
+                    }
+                    // Synthetic pass: do not mark the SG covered. The real
+                    // C2P Phone FFN/reduce pass still consumes this SG later.
+                    region_pipe_schedule.push_back({
+                        sg,
+                        region_pipe_schedule_kind::C2P_PC_PREP,
+                        chunk,
+                    });
+                };
             auto add_region =
                 [&](const region_pipe_chunk & e) {
                     add_sg(e.begin_sg);
@@ -13508,31 +14018,66 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 add_sg(sg);
             }
 
-            // Correctness-first chunk continuation:
-            //
-            //   C2P_NORM(c)
-            //   -> C2P_FFN_REDUCE(c)
-            //   -> REGION(c)
-            //   -> P2C_CONTINUE(c)
-            //
-            // Do not pre-stage C2P_NORM(c+1) before P2C_CONTINUE(c).
-            // C2P_NORM is not PC-only: it immediately starts the async
-            // PC->Phone FFN_NORM transfer and leaves pending_prefill_input
-            // state on Phone. Crossing an L46 continuation with that future
-            // Phone-side state can let allocator/staging reuse corrupt the
-            // next chunk's MoE indices (observed as SET_ROWS i1 OOB).
-            //
-            // We can reintroduce this overlap later only after C2P input
-            // staging has its own lifetime-isolated per-chunk storage.
-            for (size_t chunk = 0;
-                    chunk < region_pipe_chunks.size() &&
-                    eligible; ++chunk) {
-                const auto & current =
-                    region_pipe_chunks.at((int) chunk);
-                add_sg(current.norm_sg);
-                add_sg(current.down_sg);
-                add_region(current);
-                add_continuation(current);
+            if (region_pc_overlap_requested) {
+                // V1 PC-side overlap:
+                //
+                //   C2P0 -> Region0 submit
+                //          -> NORM1 private Phone stage
+                //          -> PC_PREP1 (Router + PC FFN only)
+                //          -> CONTINUE0
+                //          -> Phone FFN/Reduce1 -> Region1 ...
+                //
+                // No future Phone FFN is submitted before the current
+                // continuation. Only PC work and an isolated input transfer
+                // are allowed to overlap the running Phone Region.
+                const auto & first = region_pipe_chunks.at(0);
+                add_sg(first.norm_sg);
+                add_sg(first.down_sg);
+                add_region(first);
+
+                for (size_t chunk = 0;
+                        chunk < region_pipe_chunks.size() &&
+                        eligible; ++chunk) {
+                    const auto & current =
+                        region_pipe_chunks.at((int) chunk);
+                    const size_t next_chunk = chunk + 1;
+                    if (next_chunk < region_pipe_chunks.size()) {
+                        const auto & next =
+                            region_pipe_chunks.at(
+                                (int) next_chunk);
+                        add_sg(next.norm_sg);
+                        add_pc_prep(
+                            next.down_sg,
+                            (int) next_chunk);
+                    }
+
+                    add_continuation(current);
+
+                    if (next_chunk < region_pipe_chunks.size()) {
+                        const auto & next =
+                            region_pipe_chunks.at(
+                                (int) next_chunk);
+                        add_sg(next.down_sg);
+                        add_region(next);
+                    }
+                }
+            } else {
+                // Correctness-first baseline:
+                //
+                //   C2P_NORM(c)
+                //   -> C2P_FFN_REDUCE(c)
+                //   -> REGION(c)
+                //   -> P2C_CONTINUE(c)
+                for (size_t chunk = 0;
+                        chunk < region_pipe_chunks.size() &&
+                        eligible; ++chunk) {
+                    const auto & current =
+                        region_pipe_chunks.at((int) chunk);
+                    add_sg(current.norm_sg);
+                    add_sg(current.down_sg);
+                    add_region(current);
+                    add_continuation(current);
+                }
             }
 
             // Preserve every unrelated/shared post-Region SG after all
@@ -13566,13 +14111,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             std::atoi(region_pipeline_env) != 0) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
-               "scratch_pool=%d continuation=%d reason=%s\n",
+               "scratch_pool=%d continuation=%d pc_overlap=%d "
+               "reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
                backend_ctx->n_subgraphs,
                region_pipeline_active ? 1 : 0,
                region_pipeline_active ? 1 : 0,
+               region_pipeline_active &&
+                   region_pc_overlap_requested ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             for (const auto & entry : region_pipe_chunks) {
@@ -13598,24 +14146,32 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_schedule.size() : backend_ctx->n_subgraphs);
             ++schedule_pos) {
         size_t i = region_pipeline_active ?
-            region_pipe_schedule[schedule_pos] : schedule_pos;
+            region_pipe_schedule[schedule_pos].sg : schedule_pos;
         int pipeline_chunk = -1;
         const char * pipeline_stage = nullptr;
         if (region_pipeline_active) {
-            for (const auto & entry : region_pipe_chunks) {
-                if (i == entry.second.norm_sg) {
-                    pipeline_chunk = entry.first;
-                    pipeline_stage = "C2P_NORM";
-                } else if (i == entry.second.down_sg) {
-                    pipeline_chunk = entry.first;
-                    pipeline_stage = "C2P_FFN_REDUCE";
-                } else if (i == entry.second.begin_sg) {
-                    pipeline_chunk = entry.first;
-                    pipeline_stage = "PHONE_REGION";
-                } else if (i ==
-                        entry.second.continuation_begin_sg) {
-                    pipeline_chunk = entry.first;
-                    pipeline_stage = "P2C_CONTINUE";
+            const auto & scheduled =
+                region_pipe_schedule[schedule_pos];
+            if (scheduled.kind ==
+                    region_pipe_schedule_kind::C2P_PC_PREP) {
+                pipeline_chunk = scheduled.chunk;
+                pipeline_stage = "C2P_PC_PREP";
+            } else {
+                for (const auto & entry : region_pipe_chunks) {
+                    if (i == entry.second.norm_sg) {
+                        pipeline_chunk = entry.first;
+                        pipeline_stage = "C2P_NORM";
+                    } else if (i == entry.second.down_sg) {
+                        pipeline_chunk = entry.first;
+                        pipeline_stage = "C2P_FFN_REDUCE";
+                    } else if (i == entry.second.begin_sg) {
+                        pipeline_chunk = entry.first;
+                        pipeline_stage = "PHONE_REGION";
+                    } else if (i ==
+                            entry.second.continuation_begin_sg) {
+                        pipeline_chunk = entry.first;
+                        pipeline_stage = "P2C_CONTINUE";
+                    }
                 }
             }
             if (pipeline_debug && pipeline_stage != nullptr) {
@@ -13623,6 +14179,32 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        "sg=%zu stage=%s event=BEGIN\n",
                        schedule_pos, pipeline_chunk, i, pipeline_stage);
             }
+        }
+
+        if (region_pipeline_active &&
+                pipeline_stage != nullptr &&
+                std::strcmp(
+                    pipeline_stage,
+                    "C2P_PC_PREP") == 0) {
+            const int64_t prep_stage_begin_us =
+                ggml_time_us();
+            const ggml_status prep_status =
+                prepare_region_c2p_pc(
+                    i, pipeline_chunk);
+            if (prep_status != GGML_STATUS_SUCCESS) {
+                return prep_status;
+            }
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_REGION_PIPE_STAGE] "
+                    "step=%zu chunk=%d sg=%zu "
+                    "stage=C2P_PC_PREP event=COMPLETED "
+                    "host_ms=%.3f status=OK\n",
+                    schedule_pos, pipeline_chunk, i,
+                    (ggml_time_us() -
+                        prep_stage_begin_us) / 1000.0);
+            }
+            continue;
         }
 
         // A continuation may run on a transfer/PC path rather than solely on
@@ -14099,7 +14681,174 @@ auto prefill_norm_sg_has_prework =
     }
 
     ggml_status compute_status = GGML_STATUS_SUCCESS;
-    if (is_prefill_down_sg) {
+
+    auto region_c2p_exec_it =
+        is_prefill_down_sg ?
+            region_c2p_overlap_chunks.find(
+                { prefill_down_layer, prefill_down_chunk }) :
+            region_c2p_overlap_chunks.end();
+    const bool region_c2p_prepared_exec =
+        region_pipeline_active &&
+        region_pc_overlap_requested &&
+        is_prefill_down_sg &&
+        ggml_backend_meta_tensor_c2p_layer(
+            backend_ctx, prefill_down_layer) &&
+        region_c2p_exec_it !=
+            region_c2p_overlap_chunks.end() &&
+        region_c2p_exec_it->second.pc_prepared;
+
+    if (region_c2p_prepared_exec) {
+        auto & state = region_c2p_exec_it->second;
+        GGML_ASSERT(state.input_staged);
+        GGML_ASSERT(state.input_task != 0);
+        GGML_ASSERT(state.pc_topk != nullptr);
+        GGML_ASSERT(state.pc_weights != nullptr);
+        GGML_ASSERT(state.pc_partial != nullptr);
+        GGML_ASSERT(
+            backend_ctx->prefill_input_worker != nullptr);
+
+        const int64_t input_wait_begin_us =
+            ggml_time_us();
+        const ggml_status input_status =
+            backend_ctx->prefill_input_worker->wait(
+                state.input_task);
+        const int64_t input_wait_us =
+            ggml_time_us() - input_wait_begin_us;
+        tensor_wait_us += input_wait_us;
+        state.input_task = 0;
+        if (input_status != GGML_STATUS_SUCCESS) {
+            release_region_c2p_overlap_chunk(
+                prefill_down_layer,
+                prefill_down_chunk,
+                "INPUT_WAIT_FAILED");
+            return input_status;
+        }
+
+        char topk_name[96];
+        char weights_name[96];
+        std::snprintf(
+            topk_name, sizeof(topk_name),
+            "c2p_prefill_route_topk_chunk_%d-%d",
+            prefill_down_chunk, prefill_down_layer);
+        std::snprintf(
+            weights_name, sizeof(weights_name),
+            "c2p_prefill_route_weights_chunk_%d-%d",
+            prefill_down_chunk, prefill_down_layer);
+
+        ggml_tensor * dst_topk =
+            find_sg_named_tensor(1, i, topk_name);
+        ggml_tensor * dst_weights =
+            find_sg_named_tensor(1, i, weights_name);
+        GGML_ASSERT(dst_topk != nullptr);
+        GGML_ASSERT(dst_weights != nullptr);
+        GGML_ASSERT(
+            ggml_are_same_layout(
+                state.pc_topk, dst_topk));
+        GGML_ASSERT(
+            ggml_are_same_layout(
+                state.pc_weights, dst_weights));
+
+        auto & pc_cfg =
+            backend_ctx->backend_configs[0];
+        auto & phone_cfg =
+            backend_ctx->backend_configs[1];
+        ggml_backend_synchronize(pc_cfg.backend);
+
+        const int64_t topk_begin_us =
+            ggml_time_us();
+        ggml_backend_tensor_copy_async(
+            pc_cfg.backend,
+            phone_cfg.backend,
+            state.pc_topk,
+            dst_topk);
+        ggml_backend_synchronize(phone_cfg.backend);
+        const int64_t topk_us =
+            ggml_time_us() - topk_begin_us;
+        record_copy_wait(topk_us);
+        record_meta_copy(
+            i, 0, 1, state.pc_topk, topk_us);
+        record_direct_copy();
+
+        const int64_t weights_begin_us =
+            ggml_time_us();
+        ggml_backend_tensor_copy_async(
+            pc_cfg.backend,
+            phone_cfg.backend,
+            state.pc_weights,
+            dst_weights);
+        ggml_backend_synchronize(phone_cfg.backend);
+        const int64_t weights_us =
+            ggml_time_us() - weights_begin_us;
+        record_copy_wait(weights_us);
+        record_meta_copy(
+            i, 0, 1, state.pc_weights, weights_us);
+        record_direct_copy();
+
+        directional_wire_parity(
+            "C2P",
+            prefill_down_layer,
+            prefill_down_chunk,
+            "ROUTER_TOPK",
+            0, 1,
+            state.pc_topk,
+            dst_topk);
+        directional_wire_parity(
+            "C2P",
+            prefill_down_layer,
+            prefill_down_chunk,
+            "ROUTER_WEIGHTS",
+            0, 1,
+            state.pc_weights,
+            dst_weights);
+
+        if (pipeline_debug) {
+            printf(
+                "[REGION_C2P_ROUTE] layer=%d chunk=%d "
+                "direction=PC_TO_PHONE "
+                "topk_bytes=%zu weights_bytes=%zu "
+                "topk_ms=%.3f weights_ms=%.3f "
+                "owner=PC trigger=PC_PREP_REUSE status=OK\n",
+                prefill_down_layer,
+                prefill_down_chunk,
+                ggml_nbytes(state.pc_topk),
+                ggml_nbytes(state.pc_weights),
+                topk_us / 1000.0,
+                weights_us / 1000.0);
+        }
+
+        ggml_cgraph * phone_graph =
+            phone_cfg.cgraphs[i].cgraph_main;
+        GGML_ASSERT(phone_graph != nullptr);
+        const uint64_t saved_phone_uid =
+            phone_graph->uid;
+        phone_graph->uid = 0;
+        const int64_t phone_begin_us =
+            ggml_time_us();
+        compute_workers.start(1, i);
+        compute_status =
+            compute_workers.wait(1);
+        const int64_t phone_us =
+            ggml_time_us() - phone_begin_us;
+        phone_graph->uid =
+            saved_phone_uid;
+
+        if (pipeline_debug) {
+            printf(
+                "[REGION_C2P_PC_REUSE] "
+                "layer=%d chunk=%d sg=%zu slot=%zu "
+                "input_wait_ms=%.3f phone_ms=%.3f "
+                "pc_partial=%s status=%s\n",
+                prefill_down_layer,
+                prefill_down_chunk,
+                i,
+                state.slot,
+                input_wait_us / 1000.0,
+                phone_us / 1000.0,
+                state.pc_partial->name,
+                compute_status == GGML_STATUS_SUCCESS ?
+                    "OK" : "FAIL");
+        }
+    } else if (is_prefill_down_sg) {
         const bool has_async_prefill_input =
             has_pending_prefill_input(prefill_down_layer, prefill_down_chunk);
 
@@ -16402,6 +17151,12 @@ auto prefill_norm_sg_has_prework =
     }
 
     if (compute_status != GGML_STATUS_SUCCESS) {
+        if (region_c2p_prepared_exec) {
+            release_region_c2p_overlap_chunk(
+                prefill_down_layer,
+                prefill_down_chunk,
+                "PHONE_COMPUTE_FAILED");
+        }
         if (has_pending_prefill_reduce()) {
             wait_all_prefill_reduces(nullptr);
         }
@@ -16607,6 +17362,12 @@ auto prefill_norm_sg_has_prework =
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
             if (specialized_status != GGML_STATUS_SUCCESS) {
+                if (region_c2p_prepared_exec) {
+                    release_region_c2p_overlap_chunk(
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        "C2P_COMM_FAILED");
+                }
                 return specialized_status;
             }
             if (!communication_complete && backend_ctx->comm_ctx) {
@@ -16635,6 +17396,15 @@ auto prefill_norm_sg_has_prework =
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
         }
+
+        if (region_c2p_prepared_exec &&
+                compute_status == GGML_STATUS_SUCCESS) {
+            release_region_c2p_overlap_chunk(
+                prefill_down_layer,
+                prefill_down_chunk,
+                "C2P_REDUCE_COMPLETE");
+        }
+
         if (phone_block_fused) {
             i = communication_sg;
             if (!region_pipeline_active) {
@@ -16805,6 +17575,22 @@ auto prefill_norm_sg_has_prework =
             return route_status;
         }
         pending_phone_prefill_route_lane_task[lane] = 0;
+    }
+
+    if (!region_c2p_overlap_chunks.empty()) {
+        const auto & leaked =
+            region_c2p_overlap_chunks.begin()->second;
+        printf(
+            "[REGION_C2P_OVERLAP_REJECT] "
+            "layer=%d chunk=%d slot=%zu "
+            "input_task=%" PRIu64 " pc_prepared=%d "
+            "reason=STATE_LEAK_AFTER_META_LOOP action=STOP\n",
+            leaked.layer,
+            leaked.chunk,
+            leaked.slot,
+            leaked.input_task,
+            leaked.pc_prepared ? 1 : 0);
+        return GGML_STATUS_FAILED;
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
