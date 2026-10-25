@@ -14131,6 +14131,7 @@ auto prefill_norm_sg_has_prework =
             bool found_end = false;
             bool found_phone_compute = false;
             size_t pc_view_only_nodes = 0;
+            size_t pc_duplicate_compute_disabled = 0;
             for (size_t sg = i; sg < backend_ctx->n_subgraphs && !found_end; ++sg) {
                 ggml_cgraph * pc_part =
                     backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
@@ -14139,37 +14140,72 @@ auto prefill_norm_sg_has_prework =
                 GGML_ASSERT(pc_part != nullptr && phone_part != nullptr);
                 GGML_ASSERT(pc_part->n_nodes == phone_part->n_nodes);
                 for (int k = 0; k < phone_part->n_nodes; ++k) {
-                    const ggml_tensor * pc_node = pc_part->nodes[k];
-                    const ggml_tensor * phone_node = phone_part->nodes[k];
-                    if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
-                        // VIEW/RESHAPE/PERMUTE/TRANSPOSE only describe
-                        // tensor layout and do not execute a PC kernel.
-                        // They may inherit mirrored PC flags from the
-                        // pre-region C2P buffer. Do NOT waive real ops:
-                        // in particular CONT is a real copy and unsafe.
+                    ggml_tensor * pc_node = pc_part->nodes[k];
+                    ggml_tensor * phone_node = phone_part->nodes[k];
+                    const bool pc_compute =
+                        (pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                    const bool phone_compute =
+                        (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+                    if (pc_compute) {
+                        // The L35-L45 graph is explicitly Phone-only, but
+                        // Meta keeps mirrored activation operations such
+                        // as norm-35 active on both devices. In this region
+                        // the PC copy sees an obsolete C2P shadow; only the
+                        // Phone-owned activation is valid. Suppress *only*
+                        // the redundant PC side of a same-shape operation
+                        // for which Phone already has an active kernel.
                         const bool pc_metadata_only =
                             pc_node->op == GGML_OP_VIEW ||
                             pc_node->op == GGML_OP_RESHAPE ||
                             pc_node->op == GGML_OP_PERMUTE ||
                             pc_node->op == GGML_OP_TRANSPOSE;
-                        if (pc_metadata_only) {
+
+                        // A host pass-through VIEW may literally be shared
+                        // by both backend graphs. Never mutate shared flags.
+                        const bool shared_metadata =
+                            pc_node == phone_node && pc_metadata_only;
+                        const bool full_phone_duplicate =
+                            pc_node != phone_node &&
+                            phone_compute &&
+                            ggml_nelements(pc_node) > 0 &&
+                            ggml_nelements(pc_node) ==
+                                ggml_nelements(phone_node);
+
+                        if (shared_metadata) {
+                            ++pc_view_only_nodes;
+                        } else if (full_phone_duplicate) {
+                            pc_node->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                            if (pc_metadata_only) {
+                                ++pc_view_only_nodes;
+                            } else {
+                                ++pc_duplicate_compute_disabled;
+                            }
+                        } else if (pc_metadata_only &&
+                                pc_node != phone_node) {
+                            // PC-side layout-only nodes do not produce
+                            // values. They can be dropped even if their
+                            // Phone counterpart has no compute flag.
+                            pc_node->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
                             ++pc_view_only_nodes;
                         } else {
                             printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
                                    "node=%s op=%s pc_elems=%" PRId64
-                                   " phone_elems=%" PRId64 " phone_compute=%d "
-                                   "reason=PC_COMPUTE_ACTIVE action=STOP\n",
+                                   " phone_elems=%" PRId64
+                                   " phone_compute=%d shared=%d "
+                                   "reason=PC_REQUIRED_OR_SPLIT_SHAPE "
+                                   "action=STOP\n",
                                    phone_region_chunk_id, sg, pc_node->name,
                                    ggml_op_name(pc_node->op),
                                    ggml_nelements(pc_node),
                                    ggml_nelements(phone_node),
-                                   (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0);
+                                   phone_compute ? 1 : 0,
+                                   pc_node == phone_node ? 1 : 0);
                             return GGML_STATUS_FAILED;
                         }
                     }
                     found_phone_compute =
-                        found_phone_compute ||
-                        (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                        found_phone_compute || phone_compute;
 
                     const char * name = phone_node->name;
                     int chunk = -1, layer = -1, parsed = 0;
@@ -14214,9 +14250,10 @@ auto prefill_norm_sg_has_prework =
             if (pipeline_debug) {
                 printf("[PHONE_REGION_GRAPH_OWNERSHIP] chunk=%d "
                        "sg=%zu..%zu pc_metadata_only=%zu "
-                       "pc_compute=0 status=SAFE\n",
+                       "pc_duplicate_disabled=%zu "
+                       "pc_compute_required=0 status=SAFE\n",
                        phone_region_chunk_id, i, phone_block_end,
-                       pc_view_only_nodes);
+                       pc_view_only_nodes, pc_duplicate_compute_disabled);
             }
             phone_block_fused = true;
             phone_region_fused = true;
