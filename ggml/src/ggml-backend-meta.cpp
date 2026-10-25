@@ -13776,6 +13776,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     local_submit != nullptr &&
                     phone_prefill_chunk_pipeline &&
                     phone_prefill_producer_route &&
+                    !phone_prefill_async_return_active &&
                     local_submit(
                         phone_cfg.backend,
                         0,
@@ -14115,6 +14116,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 };
             auto add_continuation =
                 [&](const region_pipe_chunk & e) {
+                    if (region_local_main_active) {
+                        // Phone MAIN owns Attn/Router + Phone FFN. Keep only
+                        // the down SG as a PC consumer/final-reduce shell.
+                        for (size_t sg =
+                                e.continuation_begin_sg;
+                                sg <= e.continuation_end_sg;
+                                ++sg) {
+                            if (sg >= covered.size() || covered[sg]) {
+                                eligible = false;
+                                break;
+                            }
+                            covered[sg] = true;
+                        }
+                        if (eligible) {
+                            region_pipe_schedule.push_back({
+                                e.continuation_end_sg,
+                                region_pipe_schedule_kind::NORMAL,
+                                -1,
+                            });
+                        }
+                        return;
+                    }
+
                     for (size_t sg =
                             e.continuation_begin_sg;
                             sg <= e.continuation_end_sg;
@@ -14282,10 +14306,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     } else if (i == entry.second.begin_sg) {
                         pipeline_chunk = entry.first;
                         pipeline_stage = "PHONE_REGION";
-                    } else if (i ==
-                            entry.second.continuation_begin_sg) {
+                    } else if (
+                            (!region_local_main_active &&
+                             i == entry.second.continuation_begin_sg) ||
+                            (region_local_main_active &&
+                             i == entry.second.continuation_end_sg)) {
                         pipeline_chunk = entry.first;
-                        pipeline_stage = "P2C_CONTINUE";
+                        pipeline_stage =
+                            region_local_main_active ?
+                                "P2C_PC_REDUCE" :
+                                "P2C_CONTINUE";
                     }
                 }
             }
