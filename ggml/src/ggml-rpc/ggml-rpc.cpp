@@ -28,6 +28,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 static constexpr size_t RPC_RETURN_TRANSFER_LANES = 2;
+static constexpr size_t RPC_SNAPSHOT_SLOTS = 4;
 
 static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
@@ -3997,7 +3998,9 @@ struct rpc_snapshot_slot {
 };
 
 struct rpc_snapshot_device {
-    std::array<rpc_snapshot_slot, 2> slots;
+    // Storage slots are independent from the two snapshot transfer sockets.
+    // Slots 0/2 share transfer lane 0 and 1/3 share lane 1.
+    std::array<rpc_snapshot_slot, RPC_SNAPSHOT_SLOTS> slots;
 };
 
 struct rpc_route_snapshot_slot {
@@ -6214,7 +6217,8 @@ bool rpc_server::send_phone_region_partial(
 }
 
 bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
-    if (request.device >= backends.size() || request.slot >= 2) {
+    if (request.device >= backends.size() ||
+            request.slot >= RPC_SNAPSHOT_SLOTS) {
         return false;
     }
 
@@ -6254,7 +6258,7 @@ bool rpc_server::snapshot_tensor_direct(
         uint64_t offset,
         uint64_t size) {
     if (device >= backends.size() ||
-        slot_id >= 2 ||
+        slot_id >= RPC_SNAPSHOT_SLOTS ||
         tensor == nullptr ||
         tensor->buffer == nullptr) {
         return false;
@@ -6314,7 +6318,8 @@ bool rpc_server::snapshot_tensor_direct(
 }
 
 bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock) {
-    if (request.device >= backends.size() || request.slot >= 2) {
+    if (request.device >= backends.size() ||
+            request.slot >= RPC_SNAPSHOT_SLOTS) {
         return false;
     }
 
@@ -6829,7 +6834,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
-    if (request.device >= backends.size() || request.slot >= 2) {
+    if (request.device >= backends.size() ||
+            request.slot >= RPC_SNAPSHOT_SLOTS) {
         return false;
     }
 
