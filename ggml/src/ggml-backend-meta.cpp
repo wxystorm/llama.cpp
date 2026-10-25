@@ -12825,88 +12825,65 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
 
-        // Discover the per-chunk L46 continuation from the already-built
-        // graph instead of assuming a fixed number of post-Region subgraphs.
-        // The first continuation SG is the first post-Region graph whose
-        // dependency closure reaches this chunk's private L45 output. The
-        // P2C down boundary is the terminal anchor for that chunk. Keeping
-        // this topology explicit lets the schedule run:
+        // Discover each L46 continuation from its explicit chunk markers.
+        // Do NOT infer chunk ownership by recursively comparing tensor roots:
+        // the stock allocator intentionally aliases views and the final
+        // l_out-46 tail is shared across chunks, which can make unrelated
+        // chunks appear to depend on the same root and falsely report
+        // CONTINUATION_OVERLAP.
         //
-        //   C2P(c) -> Region(c) -> L46/P2C(c)
+        // The graph already provides unambiguous per-chunk boundaries:
         //
-        // without waiting for all Region chunks to be submitted first.
+        //   prefill_ffn_norm_chunk_<c>-46  -> continuation begin
+        //   prefill_ffn_down_chunk_<c>-46  -> continuation end
+        //
+        // Any SG outside those explicit ranges (for example the observed
+        // post-Region layer-34 bridge and the shared l_out-46 tail) remains
+        // outside the chunk continuation and is executed later by the normal
+        // uncovered-SG path.
         if (eligible) {
-            auto graph_depends_on_region_output =
-                [&](ggml_cgraph * graph,
-                    ggml_tensor * output_root) -> bool {
-                    if (graph == nullptr || output_root == nullptr) {
-                        return false;
-                    }
-
-                    std::set<ggml_tensor *> visited;
-                    std::function<bool(ggml_tensor *)> depends =
-                        [&](ggml_tensor * tensor) -> bool {
-                            if (tensor == nullptr ||
-                                    !visited.insert(tensor).second) {
-                                return false;
-                            }
-                            if (phone_region_root(tensor) == output_root) {
-                                return true;
-                            }
-                            if (tensor->view_src != nullptr &&
-                                    depends(tensor->view_src)) {
-                                return true;
-                            }
-                            for (ggml_tensor * src : tensor->src) {
-                                if (depends(src)) {
-                                    return true;
-                                }
-                            }
-                            return false;
-                        };
-
-                    for (int k = 0; k < graph->n_nodes; ++k) {
-                        if (depends(graph->nodes[k])) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-
             for (size_t c = 0;
                     c < region_pipe_chunks.size() && eligible; ++c) {
                 auto & e = region_pipe_chunks.at((int) c);
-                char out_name[96];
-                std::snprintf(
-                    out_name, sizeof(out_name),
-                    "phone_region_chunk_end_%zu-45", c);
-                ggml_tensor * output =
-                    find_sg_named_tensor(1, e.end_sg, out_name);
-                ggml_tensor * output_root =
-                    phone_region_root(output);
-                if (output_root == nullptr) {
-                    eligible = false;
-                    region_pipe_reason =
-                        "CONTINUATION_OUTPUT_UNAVAILABLE";
-                    break;
-                }
-
+                size_t continuation_begin =
+                    region_pipe_invalid_sg;
                 size_t continuation_down =
                     region_pipe_invalid_sg;
+
                 for (size_t sg = last_region_end + 1;
                         sg < backend_ctx->n_subgraphs; ++sg) {
-                    int down_chunk = -1;
-                    int down_layer = -1;
+                    int parsed_chunk = -1;
+                    int parsed_layer = -1;
+
+                    if (continuation_begin >=
+                            region_pipe_invalid_sg &&
+                            parse_prefill_sg(
+                                sg, true,
+                                parsed_chunk, parsed_layer) &&
+                            parsed_layer == 46 &&
+                            parsed_chunk == (int) c) {
+                        continuation_begin = sg;
+                    }
+
+                    parsed_chunk = -1;
+                    parsed_layer = -1;
                     if (parse_prefill_sg(
                             sg, false,
-                            down_chunk, down_layer) &&
-                            down_layer == 46 &&
-                            down_chunk == (int) c) {
+                            parsed_chunk, parsed_layer) &&
+                            parsed_layer == 46 &&
+                            parsed_chunk == (int) c) {
                         continuation_down = sg;
                         break;
                     }
                 }
 
+                if (continuation_begin >=
+                        region_pipe_invalid_sg) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_NORM_NOT_FOUND";
+                    break;
+                }
                 if (continuation_down >=
                         region_pipe_invalid_sg) {
                     eligible = false;
@@ -12914,35 +12891,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "CONTINUATION_DOWN_NOT_FOUND";
                     break;
                 }
-
-                size_t continuation_begin =
-                    region_pipe_invalid_sg;
-                for (size_t sg = last_region_end + 1;
-                        sg <= continuation_down; ++sg) {
-                    bool consumes_output = false;
-                    for (size_t backend = 0;
-                            backend < n_backends &&
-                            !consumes_output; ++backend) {
-                        ggml_cgraph * graph =
-                            backend_ctx->backend_configs[backend]
-                                .cgraphs[sg].cgraph_main;
-                        consumes_output =
-                            graph_depends_on_region_output(
-                                graph, output_root);
-                    }
-                    if (consumes_output) {
-                        continuation_begin = sg;
-                        break;
-                    }
-                }
-
-                if (continuation_begin >=
-                        region_pipe_invalid_sg ||
-                        continuation_begin >
-                            continuation_down) {
+                if (continuation_begin >
+                        continuation_down) {
                     eligible = false;
                     region_pipe_reason =
-                        "CONTINUATION_BEGIN_NOT_FOUND";
+                        "CONTINUATION_ORDER_INVALID";
                     break;
                 }
 
@@ -12952,39 +12905,24 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     continuation_down;
             }
 
-            if (eligible) {
-                // The current Region experiment requires the post-Region
-                // L46 chunks to be chunk-major. Extend each continuation to
-                // the SG immediately before the next chunk begins so inactive
-                // bridge/view SGs stay with their producer chunk. Fail closed
-                // on overlap or an unknown prefix instead of reordering an
-                // ambiguous graph.
-                if (region_pipe_chunks.at(0)
-                        .continuation_begin_sg !=
-                        last_region_end + 1) {
+            // The explicit chunk ranges must be strictly ordered and
+            // non-overlapping. Gaps are allowed because they are shared or
+            // unrelated SGs, not part of any per-chunk continuation.
+            for (size_t c = 0;
+                    c + 1 < region_pipe_chunks.size() &&
+                    eligible; ++c) {
+                const auto & current =
+                    region_pipe_chunks.at((int) c);
+                const auto & next =
+                    region_pipe_chunks.at((int) c + 1);
+                if (current.continuation_begin_sg >=
+                        next.continuation_begin_sg ||
+                        current.continuation_end_sg >=
+                            next.continuation_begin_sg) {
                     eligible = false;
                     region_pipe_reason =
-                        "CONTINUATION_PREFIX_GAP";
-                }
-
-                for (size_t c = 0;
-                        c + 1 < region_pipe_chunks.size() &&
-                        eligible; ++c) {
-                    auto & current =
-                        region_pipe_chunks.at((int) c);
-                    const auto & next =
-                        region_pipe_chunks.at((int) c + 1);
-                    if (current.continuation_begin_sg >=
-                            next.continuation_begin_sg ||
-                            current.continuation_end_sg >=
-                                next.continuation_begin_sg) {
-                        eligible = false;
-                        region_pipe_reason =
-                            "CONTINUATION_OVERLAP";
-                        break;
-                    }
-                    current.continuation_end_sg =
-                        next.continuation_begin_sg - 1;
+                        "CONTINUATION_MARKER_OVERLAP";
+                    break;
                 }
             }
         }
@@ -13434,9 +13372,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
             }
 
-            // Preserve every unrelated tail SG in original order. Continuation
-            // ranges were already marked above, so only genuinely uncovered
-            // post-L46 work is appended here.
+            // Preserve every unrelated/shared post-Region SG after all
+            // per-chunk continuations. Explicit L46 marker ranges were already
+            // covered above; gaps such as the layer-34 bridge and the shared
+            // l_out-46 tail remain here instead of being misclassified as a
+            // chunk continuation.
             for (size_t sg = last_region_end + 1;
                     sg < backend_ctx->n_subgraphs; ++sg) {
                 if (!covered[sg]) {
