@@ -3862,8 +3862,11 @@ public:
         std::vector<uint8_t> & response);
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool graph_register(const std::vector<uint8_t> & input);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool phone_main_register(const rpc_msg_phone_main_register_req & request);
+    bool phone_main_trigger_after_graph(uint32_t device, uint64_t graph_uid);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -3896,6 +3899,9 @@ private:
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
+    bool graph_recompute_unlocked(
+        const rpc_msg_graph_recompute_req & request);
+    void phone_main_loop();
 
 
     std::vector<ggml_backend_t> backends;
@@ -3925,6 +3931,22 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+
+    // Phone-local MAIN owns the critical GPU chain. Normal RPC graph work may
+    // run only while no MAIN job is pending/running. This is deliberately one
+    // physical GPU lane with logical MAIN priority.
+    std::mutex phone_gpu_mutex;
+    std::condition_variable phone_gpu_cv;
+    size_t phone_main_pending = 0;
+    bool phone_main_running = false;
+
+    std::mutex phone_main_mutex;
+    std::condition_variable phone_main_cv;
+    std::map<std::pair<uint32_t, uint64_t>,
+             rpc_msg_phone_main_register_req> phone_main_plans;
+    std::deque<rpc_msg_phone_main_register_req> phone_main_jobs;
+    std::thread phone_main_worker;
+    bool phone_main_stop = false;
 
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
@@ -6218,6 +6240,16 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    {
+        std::lock_guard<std::mutex> lock(phone_main_mutex);
+        phone_main_stop = true;
+    }
+    phone_main_cv.notify_all();
+    phone_gpu_cv.notify_all();
+    if (phone_main_worker.joinable()) {
+        phone_main_worker.join();
+    }
+
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
         const auto & stats = snapshot_breakdown[lane];
         if (stats.requests == 0) {
