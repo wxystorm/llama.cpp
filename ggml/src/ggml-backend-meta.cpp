@@ -2384,6 +2384,9 @@ struct ggml_backend_meta_context {
         ggml_backend_buffer_ptr phone_input_buf;
         std::array<ggml_backend_buffer_ptr, 2> pc_route_bufs;
         ggml_backend_buffer_ptr pc_partial_buf;
+        // Private Phone destination for the already-folded PC partial. This
+        // lets the second C2P send run independently of the Phone FFN output.
+        ggml_backend_buffer_ptr phone_pc_partial_buf;
     };
     std::array<region_c2p_overlap_slot, 2> region_c2p_overlap_slots;
 
@@ -4212,6 +4215,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         ggml_tensor * pc_topk = nullptr;
         ggml_tensor * pc_weights = nullptr;
         ggml_tensor * pc_partial = nullptr;
+        ggml_tensor * phone_pc_partial_stage = nullptr;
+        uint64_t partial_task = 0;
+        int64_t partial_fold_us = 0;
+        int64_t partial_copy_us = 0;
+        bool pc_partial_folded = false;
         std::vector<c2p_route_binding_backup> input_bindings;
         std::vector<c2p_route_binding_backup> pc_bindings;
     };
@@ -6018,6 +6026,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     slot.owner_layer == layer);
             }
 
+            if (state.partial_task != 0 &&
+                    backend_ctx->prefill_input_worker != nullptr) {
+                backend_ctx->prefill_input_worker->wait(
+                    state.partial_task);
+                state.partial_task = 0;
+            }
             restore_c2p_route_bindings(state.pc_bindings);
             restore_c2p_route_bindings(state.input_bindings);
             slot.owner_layer = -1;
@@ -10783,9 +10797,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 pc_fold_graph->nodes[0] = pc_fold;
                 pc_fold_graph->n_nodes = 1;
 
-                // Phone staging for the second PC->Phone transfer.
-                ggml_tensor * phone_tmp = get_node_aux(node_src);
-                set_tmp_data(phone_tmp, j_src, 0);
+                const auto c2p_overlap_it =
+                    region_c2p_overlap_chunks.find({
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                    });
+                const bool c2p_partial_prefetched =
+                    region_bidir_pipeline_requested &&
+                    c2p_overlap_it !=
+                        region_c2p_overlap_chunks.end() &&
+                    c2p_overlap_it->second.pc_prepared &&
+                    c2p_overlap_it->second.pc_partial_folded &&
+                    c2p_overlap_it->second.partial_task != 0 &&
+                    c2p_overlap_it->second
+                        .phone_pc_partial_stage != nullptr;
+
+                // Phone staging for the second PC->Phone transfer. In the
+                // bidirectional path this is private slot storage already
+                // being filled by the prefetch worker.
+                ggml_tensor * phone_tmp = nullptr;
+                if (c2p_partial_prefetched) {
+                    phone_tmp =
+                        c2p_overlap_it->second
+                            .phone_pc_partial_stage;
+                } else {
+                    phone_tmp = get_node_aux(node_src);
+                    set_tmp_data(phone_tmp, j_src, 0);
+                }
 
                 // Phone: write the completed chunk directly into l_out.
                 ggml_tensor * phone_out_chunk = get_node_aux(node_src);
@@ -10893,31 +10931,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     trace_component("RESIDUAL", c2p_residual);
                 }
 
-                const int64_t pc_fold_begin_us = ggml_time_us();
-                ggml_backend_synchronize(bcj_dst.backend);
+                int64_t pc_fold_us = 0;
+                int64_t copy_us = 0;
+                int64_t partial_prefetch_wait_us = 0;
                 ggml_status status =
-                    ggml_backend_graph_compute_async(
-                        bcj_dst.backend, pc_fold_graph);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
-                ggml_backend_synchronize(bcj_dst.backend);
-                const int64_t pc_fold_us =
-                    ggml_time_us() - pc_fold_begin_us;
+                    GGML_STATUS_SUCCESS;
 
-                const int64_t copy_begin_us = ggml_time_us();
-                ggml_backend_tensor_copy_async(
-                    bcj_dst.backend,
-                    bcj_src.backend,
-                    node_dst,
-                    phone_tmp);
-                ggml_backend_synchronize(bcj_src.backend);
-                const int64_t copy_us =
-                    ggml_time_us() - copy_begin_us;
-                record_copy_wait(copy_us);
-                record_meta_copy(
-                    i, j_dst, j_src, node_dst, copy_us);
-                record_direct_copy();
+                if (c2p_partial_prefetched) {
+                    auto & overlap_state =
+                        c2p_overlap_it->second;
+                    const int64_t wait_begin_us =
+                        ggml_time_us();
+                    status =
+                        backend_ctx->prefill_input_worker->wait(
+                            overlap_state.partial_task);
+                    partial_prefetch_wait_us =
+                        ggml_time_us() - wait_begin_us;
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                    overlap_state.partial_task = 0;
+                    pc_fold_us =
+                        overlap_state.partial_fold_us;
+                    copy_us =
+                        overlap_state.partial_copy_us;
+                } else {
+                    const int64_t pc_fold_begin_us =
+                        ggml_time_us();
+                    ggml_backend_synchronize(
+                        bcj_dst.backend);
+                    status =
+                        ggml_backend_graph_compute_async(
+                            bcj_dst.backend, pc_fold_graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                    ggml_backend_synchronize(
+                        bcj_dst.backend);
+                    pc_fold_us =
+                        ggml_time_us() -
+                        pc_fold_begin_us;
+
+                    const int64_t copy_begin_us =
+                        ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        bcj_dst.backend,
+                        bcj_src.backend,
+                        node_dst,
+                        phone_tmp);
+                    ggml_backend_synchronize(
+                        bcj_src.backend);
+                    copy_us =
+                        ggml_time_us() -
+                        copy_begin_us;
+                    record_copy_wait(copy_us);
+                    record_meta_copy(
+                        i, j_dst, j_src,
+                        node_dst, copy_us);
+                    record_direct_copy();
+                }
 
                 directional_wire_parity("C2P", 
                     prefill_down_layer_0, prefill_down_chunk_0,
@@ -11015,6 +11087,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     printf(
                         "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
                         "bytes=%zu pc_fold_ms=%.3f copy_ms=%.3f "
+                        "partial_prefetch=%d prefetch_wait_ms=%.3f "
                         "phone_reduce_ms=%.3f owner=PHONE status=OK\n",
                         prefill_down_layer_0,
                         prefill_down_chunk_0,
@@ -11022,6 +11095,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ggml_nbytes(node_dst),
                         pc_fold_us / 1000.0,
                         copy_us / 1000.0,
+                        c2p_partial_prefetched ? 1 : 0,
+                        partial_prefetch_wait_us / 1000.0,
                         phone_reduce_us / 1000.0);
                 }
 
@@ -12753,6 +12828,142 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             state.pc_topk = src_topk;
             state.pc_weights = src_weights;
             state.pc_partial = pc_partial;
+
+            // V1 bidirectional C2P pipeline: the PC shard is already complete
+            // while the previous Phone Region is running. Fold the residual
+            // now and queue the second PC->Phone send into private Phone
+            // storage. The later real C2P stage only waits for the tail, then
+            // performs the final Phone-local ADD with its own FFN partial.
+            if (region_bidir_pipeline_requested &&
+                    !c2p_self_check &&
+                    std::getenv(
+                        "GGML_META_REGION_C2P_NUMERIC_TRACE") ==
+                        nullptr) {
+                GGML_ASSERT(slot.phone_pc_partial_buf != nullptr);
+                GGML_ASSERT(
+                    backend_ctx->prefill_input_worker != nullptr);
+
+                ggml_tensor * pc_residual =
+                    find_recent_ffn_inp(0, sg, layer);
+                GGML_ASSERT(pc_residual != nullptr);
+                const size_t chunk_offset =
+                    down_chunk_offset(0, true, layer, chunk);
+
+                ggml_tensor * residual_chunk =
+                    get_node_aux(pc_partial);
+                residual_chunk->view_src = pc_residual;
+                residual_chunk->view_offs = chunk_offset;
+                ggml_backend_view_init(residual_chunk);
+                GGML_ASSERT(
+                    chunk_offset +
+                        ggml_nbytes(residual_chunk) <=
+                    ggml_nbytes(pc_residual));
+
+                ggml_tensor * pc_fold =
+                    get_node_aux(pc_partial);
+                pc_fold->view_src =
+                    pc_partial->view_src == nullptr ?
+                        pc_partial : pc_partial->view_src;
+                pc_fold->view_offs =
+                    pc_partial->view_offs;
+                pc_fold->op = GGML_OP_ADD;
+                pc_fold->src[0] = pc_partial;
+                pc_fold->src[1] = residual_chunk;
+                pc_fold->flags |=
+                    GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(pc_fold);
+
+                ggml_cgraph * pc_fold_graph =
+                    get_cgraph_aux();
+                pc_fold_graph->nodes[0] = pc_fold;
+                pc_fold_graph->n_nodes = 1;
+
+                auto & pc_cfg =
+                    backend_ctx->backend_configs[0];
+                auto & phone_cfg =
+                    backend_ctx->backend_configs[1];
+
+                const int64_t fold_begin_us =
+                    ggml_time_us();
+                ggml_backend_synchronize(pc_cfg.backend);
+                ggml_status fold_status =
+                    ggml_backend_graph_compute_async(
+                        pc_cfg.backend, pc_fold_graph);
+                if (fold_status != GGML_STATUS_SUCCESS) {
+                    release_region_c2p_overlap_chunk(
+                        layer, chunk,
+                        "PC_PARTIAL_FOLD_FAILED");
+                    return fold_status;
+                }
+                ggml_backend_synchronize(pc_cfg.backend);
+                state.partial_fold_us =
+                    ggml_time_us() - fold_begin_us;
+                state.pc_partial_folded = true;
+
+                ggml_tensor * phone_stage =
+                    get_node_aux(pc_partial);
+                phone_stage->buffer =
+                    slot.phone_pc_partial_buf.get();
+                phone_stage->data =
+                    ggml_backend_buffer_get_base(
+                        slot.phone_pc_partial_buf.get());
+                GGML_ASSERT(phone_stage->data != nullptr);
+                state.phone_pc_partial_stage =
+                    phone_stage;
+
+                region_c2p_overlap_chunk_state * state_ptr =
+                    &state;
+                const uint64_t partial_task =
+                    backend_ctx->prefill_input_worker->enqueue(
+                        [&, pc_partial, phone_stage,
+                         state_ptr, sg, layer, chunk]
+                        (uint64_t task_id) -> ggml_status {
+                            const int64_t copy_begin_us =
+                                ggml_time_us();
+                            ggml_backend_tensor_copy_async(
+                                backend_ctx->backend_configs[0].backend,
+                                backend_ctx->backend_configs[1].backend,
+                                pc_partial,
+                                phone_stage);
+                            state_ptr->partial_copy_us =
+                                ggml_time_us() -
+                                copy_begin_us;
+                            record_copy_wait(
+                                state_ptr->partial_copy_us);
+                            record_meta_copy(
+                                sg, 0, 1, pc_partial,
+                                state_ptr->partial_copy_us);
+                            record_direct_copy();
+
+                            if (pipeline_debug ||
+                                    tensor_phone_stage_profile) {
+                                printf(
+                                    "[REGION_C2P_PARTIAL_PREFETCH] "
+                                    "layer=%d chunk=%d task=%" PRIu64
+                                    " bytes=%zu event=TRANSFER_DONE "
+                                    "copy_ms=%.3f status=OK\n",
+                                    layer, chunk, task_id,
+                                    ggml_nbytes(pc_partial),
+                                    state_ptr->partial_copy_us /
+                                        1000.0);
+                            }
+                            return GGML_STATUS_SUCCESS;
+                        });
+                state.partial_task = partial_task;
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[REGION_C2P_PARTIAL_PREFETCH] "
+                        "layer=%d chunk=%d task=%" PRIu64
+                        " bytes=%zu fold_ms=%.3f "
+                        "event=QUEUED status=OK\n",
+                        layer, chunk, partial_task,
+                        ggml_nbytes(pc_partial),
+                        state.partial_fold_us / 1000.0);
+                }
+            }
+
             state.pc_prepared = true;
 
             if (pipeline_debug) {
@@ -12761,12 +12972,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     "layer=%d chunk=%d sg=%zu slot=%zu "
                     "topk_bytes=%zu weights_bytes=%zu "
                     "partial_bytes=%zu wall_ms=%.3f "
-                    "status=READY\n",
+                    "partial_prefetch=%d status=READY\n",
                     layer, chunk, sg, state.slot,
                     ggml_nbytes(src_topk),
                     ggml_nbytes(src_weights),
                     ggml_nbytes(pc_partial),
-                    prep_us / 1000.0);
+                    prep_us / 1000.0,
+                    state.partial_task != 0 ? 1 : 0);
             }
             return GGML_STATUS_SUCCESS;
         };
@@ -13881,7 +14093,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         ensure_overlap_buf(
                             pc_cfg.backend,
                             overlap_slot.pc_partial_buf,
-                            storage_bytes(pc_partial));
+                            storage_bytes(pc_partial)) &&
+                        (!region_bidir_pipeline_requested ||
+                         ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_pc_partial_buf,
+                            storage_bytes(pc_partial)));
                     if (!prep_ok) {
                         region_pipe_reason =
                             "C2P_OVERLAP_POOL_ALLOC_FAILED";
@@ -13912,6 +14129,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             c2p_slot_bytes[slot_index] +=
                                 ggml_backend_buffer_get_size(
                                     overlap_slot.pc_partial_buf.get());
+                        }
+                        if (overlap_slot.phone_pc_partial_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.phone_pc_partial_buf.get());
                         }
                     }
                 }
