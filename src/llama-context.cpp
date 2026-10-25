@@ -11,6 +11,8 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-region-cuda-mirror.h"
+#include "llama-hybrid-cycle-model-io.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -490,6 +492,116 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        const char * region_cycle_env =
+            std::getenv("LLAMA_HYBRID_REGION_CYCLE_V1");
+        const bool region_cycle_enabled =
+            region_cycle_env != nullptr &&
+            std::atoi(region_cycle_env) != 0;
+        const char * region_mirror_env =
+            std::getenv("LLAMA_HYBRID_REGION_GPU_MIRROR");
+        const bool region_mirror_enabled =
+            region_cycle_enabled &&
+            (region_mirror_env == nullptr ||
+             std::atoi(region_mirror_env) != 0);
+        if (region_mirror_enabled) {
+            if (cparams.n_ctx_seq > 512) {
+                throw std::runtime_error(
+                    "Region CUDA mirror physical KV supports at most "
+                    "512 tokens; use -c 512 or smaller");
+            }
+
+            ggml_backend_dev_t cuda_dev = nullptr;
+            for (size_t i = 0;
+                    i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev =
+                    ggml_backend_dev_get(i);
+                ggml_backend_reg_t reg =
+                    dev ?
+                        ggml_backend_dev_backend_reg(dev) :
+                        nullptr;
+                if (!dev || !reg ||
+                        ggml_backend_dev_type(dev) !=
+                            GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                const char * reg_name =
+                    ggml_backend_reg_name(reg);
+                if (reg_name != nullptr &&
+                        std::strcmp(reg_name, "CUDA") == 0) {
+                    cuda_dev = dev;
+                    break;
+                }
+            }
+            if (cuda_dev == nullptr) {
+                throw std::runtime_error(
+                    "LLAMA_HYBRID_REGION_CYCLE_V1 requires "
+                    "a local CUDA backend for PC Full mirror");
+            }
+
+            region_cuda_backend.reset(
+                ggml_backend_dev_init(
+                    cuda_dev, nullptr));
+            if (!region_cuda_backend) {
+                throw std::runtime_error(
+                    "failed to initialize Region CUDA mirror backend");
+            }
+
+            size_t mirror_budget_bytes = 0;
+            const char * budget_raw =
+                std::getenv(
+                    "LLAMA_HYBRID_REGION_CUDA_BUDGET_MIB");
+            if (budget_raw == nullptr) {
+                budget_raw =
+                    std::getenv(
+                        "LLAMA_HYBRID_CYCLE_CUDA_BUDGET_MIB");
+            }
+            if (budget_raw != nullptr) {
+                char * tail = nullptr;
+                const unsigned long long mib =
+                    std::strtoull(
+                        budget_raw, &tail, 10);
+                constexpr unsigned long long scale =
+                    1024ULL * 1024ULL;
+                if (!*budget_raw ||
+                        budget_raw[0] == '-' ||
+                        tail == budget_raw ||
+                        (tail && *tail != '\0') ||
+                        mib >
+                            std::numeric_limits<size_t>::max() /
+                                scale) {
+                    throw std::runtime_error(
+                        "invalid Region CUDA mirror budget MiB");
+                }
+                mirror_budget_bytes =
+                    static_cast<size_t>(mib * scale);
+            }
+
+            region_cuda_mirror =
+                std::make_unique<
+                    llama_region_cuda_mirror>();
+            std::string mirror_reason;
+            if (!region_cuda_mirror->prepare(
+                    model,
+                    backend_cpu,
+                    region_cuda_backend.get(),
+                    cparams.n_ctx_seq,
+                    mirror_budget_bytes,
+                    mirror_reason)) {
+                throw std::runtime_error(
+                    "Region CUDA mirror prepare failed: " +
+                    mirror_reason);
+            }
+            LLAMA_LOG_INFO(
+                "[REGION_CUDA_MIRROR] action=CONTEXT_INIT "
+                "backend=%s resident_slots=%d planned_mib=%.2f "
+                "status=READY\n",
+                ggml_backend_name(
+                    region_cuda_backend.get()),
+                region_cuda_mirror->resident_capacity(),
+                region_cuda_mirror->planned_bytes() /
+                    (1024.0 * 1024.0));
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
