@@ -6768,8 +6768,36 @@ bool rpc_server::phone_main_register(
             std::make_pair(
                 request.device,
                 request.trigger_reduce_uid);
-        if (phone_main_plans.count(key) != 0) {
-            return false;
+        auto existing_plan =
+            phone_main_plans.find(key);
+        if (existing_plan != phone_main_plans.end()) {
+            const auto c2p_key =
+                std::make_pair(
+                    request.device,
+                    request.chunk);
+            const auto c2p_it =
+                phone_c2p_states.find(c2p_key);
+            const bool inactive_setup =
+                c2p_it != phone_c2p_states.end() &&
+                !c2p_it->second.ready &&
+                !c2p_it->second.ffn_queued &&
+                !c2p_it->second.ffn_done &&
+                !c2p_it->second.partial_ready &&
+                !c2p_it->second.reduce_queued;
+            if (!inactive_setup) {
+                GGML_LOG_ERROR(
+                    "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
+                    " status=FAIL reason=ACTIVE_PLAN_EXISTS\n",
+                    request.chunk,
+                    request.trigger_reduce_uid);
+                return false;
+            }
+            phone_main_plans.erase(existing_plan);
+            GGML_LOG_INFO(
+                "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
+                " status=REPLACE_STALE_SETUP\n",
+                request.chunk,
+                request.trigger_reduce_uid);
         }
         if (!phone_main_worker.joinable()) {
             try {
@@ -6889,8 +6917,30 @@ bool rpc_server::phone_c2p_register(
             std::make_pair(
                 request.device,
                 request.chunk);
-        if (phone_c2p_states.count(key) != 0) {
-            return false;
+        auto existing =
+            phone_c2p_states.find(key);
+        if (existing != phone_c2p_states.end()) {
+            const auto & old = existing->second;
+            const bool active =
+                old.ready ||
+                old.ffn_queued ||
+                old.ffn_done ||
+                old.partial_ready ||
+                old.reduce_queued;
+            if (active) {
+                GGML_LOG_ERROR(
+                    "[PHONE_C2P_REGISTER] chunk=%d device=%u "
+                    "status=FAIL reason=ACTIVE_STATE_EXISTS\n",
+                    request.chunk,
+                    request.device);
+                return false;
+            }
+            phone_c2p_states.erase(existing);
+            GGML_LOG_INFO(
+                "[PHONE_C2P_REGISTER] chunk=%d device=%u "
+                "status=REPLACE_STALE_SETUP\n",
+                request.chunk,
+                request.device);
         }
         if (!phone_main_worker.joinable()) {
             try {
