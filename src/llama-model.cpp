@@ -455,9 +455,9 @@ static int llama_hybrid_region_boundary_env_int(
 //
 // The cycle is tiled from layer 0. Any suffix that cannot fit one complete
 // unit is intentionally left PC_ONLY so ownership always ends on PC and no
-// truncated cross-device boundary is created. Defaults x=1,y=1; x/y remain
-// environment-tunable for later load balancing. The production baseline is
-// X=4,Y=2 (8 physical layers per cycle).
+// truncated cross-device boundary is created. X/Y remain environment-tunable
+// for later load balancing. The production/default baseline is X=4,Y=2
+// (8 physical layers per cycle).
 static std::vector<llama_hybrid_layer_mode>
 llama_build_region_cycle_v1_policy(int n_layer) {
     const int pc_layers = std::max(
