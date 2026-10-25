@@ -264,6 +264,8 @@ enum rpc_cmd {
     RPC_CMD_PHONE_FFN_MARK_READY,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_WAIT_READY_SEQ,
+    RPC_CMD_GRAPH_REGISTER,
+    RPC_CMD_PHONE_MAIN_REGISTER,
     RPC_CMD_COUNT,
 };
 
@@ -285,6 +287,8 @@ static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must
 static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_WAIT_READY_SEQ == 33, "RPC_CMD_WAIT_READY_SEQ must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_GRAPH_REGISTER == 34, "RPC_CMD_GRAPH_REGISTER must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_MAIN_REGISTER == 35, "RPC_CMD_PHONE_MAIN_REGISTER must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -475,6 +479,31 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t graph_uid;
+};
+
+struct rpc_msg_graph_register_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_phone_main_register_req {
+    uint32_t device;
+    int32_t chunk;
+    uint64_t trigger_reduce_uid;
+    uint64_t region_graph_uid;
+    uint64_t p2c_attention_graph_uid;
+    uint64_t p2c_ffn_graph_uid;
+    uint64_t ready_seq;
+    uint32_t ready_lane;
+    uint32_t partial_slot;
+    rpc_tensor ready_tensors[3];
+    uint64_t ready_sizes[3];
+    uint64_t partial_seq;
+    rpc_tensor partial_tensor;
+    uint64_t partial_size;
+};
+
+struct rpc_msg_phone_main_register_rsp {
+    uint8_t result;
 };
 
 struct rpc_msg_graph_recompute_snapshot_req {
