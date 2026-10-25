@@ -34,7 +34,8 @@ def main() -> int:
         r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
         r"(?:scratch_pool=(\d+) )?"
         r"(?:continuation=(\d+) )?"
-        r"(?:pc_overlap=(\d+) )?reason=([^\s]+)"
+        r"(?:pc_overlap=(\d+) )?"
+        r"(?:local_main=(\d+) )?reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -43,7 +44,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(9)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(10)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -101,14 +102,16 @@ def main() -> int:
             return 1
 
     pc_overlap = plan.group(8) == "1"
+    local_main = plan.group(9) == "1"
 
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
-        r"stage=(C2P_NORM|C2P_FFN_REDUCE|C2P_PC_PREP|PHONE_REGION|P2C_CONTINUE) "
+        r"stage=(C2P_NORM|C2P_FFN_REDUCE|C2P_PC_PREP|PHONE_REGION|P2C_CONTINUE|P2C_PC_REDUCE) "
         r"event=BEGIN"
     )
     observed = [(int(m.group(1)), m.group(2)) for m in begin_re.finditer(block)]
 
+    p2c_stage = "P2C_PC_REDUCE" if local_main else "P2C_CONTINUE"
     if pc_overlap:
         expected = [
             (0, "C2P_NORM"),
@@ -121,7 +124,7 @@ def main() -> int:
                     (c + 1, "C2P_NORM"),
                     (c + 1, "C2P_PC_PREP"),
                 ])
-            expected.append((c, "P2C_CONTINUE"))
+            expected.append((c, p2c_stage))
             if c + 1 < n_chunks:
                 expected.extend([
                     (c + 1, "C2P_FFN_REDUCE"),
@@ -135,7 +138,7 @@ def main() -> int:
                 "C2P_NORM",
                 "C2P_FFN_REDUCE",
                 "PHONE_REGION",
-                "P2C_CONTINUE",
+                p2c_stage,
             )
         ]
 
@@ -218,13 +221,13 @@ def main() -> int:
             )
             cont_match = re.search(
                 rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
-                rf"stage=P2C_CONTINUE event=BEGIN",
+                rf"stage={p2c_stage} event=BEGIN",
                 block,
             )
             if region_match is None or prep_match is None or cont_match is None:
                 print(
                     f"FAIL: missing overlap ordering marker for "
-                    f"Region{c} -> PC_PREP{c + 1} -> CONTINUE{c}"
+                    f"Region{c} -> PC_PREP{c + 1} -> {p2c_stage}{c}"
                 )
                 return 1
             if not (
@@ -248,15 +251,59 @@ def main() -> int:
             print("FAIL: REGION_C2P_OVERLAP_REJECT present")
             return 1
 
-    for pattern, event in [
+    common_success = [
         (r"\[REGION_C2P_PREFILL\] layer=34 chunk=(\d+).*?status=OK", "C2P"),
-        (r"\[PHONE_REGION_GRAPH\] chunk=(\d+).*?status=DEVICE_LOCAL_READY", "Phone Region"),
-        (r"\[PHONE_REGION_GRAPH_DONE\] chunk=(\d+).*?status=0", "Phone submit"),
+        (r"\[PHONE_REGION_GRAPH\] chunk=(\d+).*?status=DEVICE_LOCAL_READY", "Phone Region graph"),
         (r"\[REGION_P2C_PREFILL\] layer=46 chunk=(\d+).*?status=OK", "P2C"),
-    ]:
+    ]
+    for pattern, event in common_success:
         found = [int(m.group(1)) for m in re.finditer(pattern, block)]
         if found != list(range(n_chunks)):
             print(f"FAIL: {event} chunks={found}; expected 0..{n_chunks - 1}")
+            return 1
+
+    if local_main:
+        for pattern, event in [
+            (r"\[PHONE_REGION_MAIN_LOCAL\] chunk=(\d+).*?status=SUBMITTED", "MAIN submit"),
+            (r"\[PHONE_REGION_P2C_PC_CONSUMER\] layer=46 chunk=(\d+).*?phone_submit=0 status=OK", "PC READY consumer"),
+            (r"\[PHONE_REGION_PARTIAL_CONSUME\] layer=46 chunk=(\d+).*?source=SNAPSHOT status=OK", "PARTIAL consumer"),
+        ]:
+            found = [int(m.group(1)) for m in re.finditer(pattern, block)]
+            if found != list(range(n_chunks)):
+                print(f"FAIL: {event} chunks={found}; expected 0..{n_chunks - 1}")
+                return 1
+
+        p2c_sources = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[REGION_P2C_PREFILL\] layer=46 chunk=(\d+).*?"
+                r"source=PHONE_MAIN_SNAPSHOT status=OK",
+                block,
+            )
+        ]
+        if p2c_sources != list(range(n_chunks)):
+            print(
+                f"FAIL: Phone-MAIN P2C sources={p2c_sources}; "
+                f"expected 0..{n_chunks - 1}"
+            )
+            return 1
+
+        if "stage=P2C_CONTINUE event=BEGIN" in block:
+            print("FAIL: local-main trace still contains PC-driven P2C_CONTINUE")
+            return 1
+        if "[PHONE_REGION_GRAPH_DONE]" in block:
+            print("FAIL: local-main trace still contains synchronous Region GRAPH_DONE")
+            return 1
+    else:
+        found = [
+            int(m.group(1))
+            for m in re.finditer(
+                r"\[PHONE_REGION_GRAPH_DONE\] chunk=(\d+).*?status=0",
+                block,
+            )
+        ]
+        if found != list(range(n_chunks)):
+            print(f"FAIL: Phone submit chunks={found}; expected 0..{n_chunks - 1}")
             return 1
     for bad in (
         "PHONE_REGION_GRAPH_REJECT",
@@ -316,21 +363,49 @@ def main() -> int:
         print(f"FAIL: scratch slot order={slots}; expected={expected_slots}")
         return 1
 
-    credits = [
-        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        for m in re.finditer(
-            r"\[PHONE_REGION_SLOT_CREDIT\] chunk=(\d+) slot=(\d+) "
-            r"seq=\d+ marked=(\d+)",
-            block,
-        )
-    ]
-    expected_credit_chunks = max(0, n_chunks - 2)
-    if len(credits) != expected_credit_chunks:
-        print(f"FAIL: slot credits={credits}; expected {expected_credit_chunks}")
-        return 1
-    if any(marked != 1 for _, _, marked in credits):
-        print(f"FAIL: unmarked slot credit: {credits}")
-        return 1
+    if local_main:
+        main_reuse = [
+            (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            for m in re.finditer(
+                r"\[PHONE_REGION_MAIN_LOCAL\] chunk=(\d+).*?"
+                r"partial_slot=(\d+) reuse_seq=(\d+) status=SUBMITTED",
+                block,
+            )
+        ]
+        expected_credit_chunks = max(0, n_chunks - 2)
+        if len(main_reuse) != n_chunks:
+            print(f"FAIL: MAIN reuse records={main_reuse}; expected {n_chunks}")
+            return 1
+        for chunk, slot, seq in main_reuse:
+            if slot != chunk % 2:
+                print(f"FAIL: chunk {chunk} partial slot={slot}; expected {chunk % 2}")
+                return 1
+            should_have_credit = chunk < expected_credit_chunks
+            if should_have_credit != (seq != 0):
+                print(
+                    f"FAIL: chunk {chunk} reuse_seq={seq}; "
+                    f"expected {'nonzero' if should_have_credit else 'zero'}"
+                )
+                return 1
+        if "[PHONE_REGION_SLOT_CREDIT]" in block:
+            print("FAIL: local-main must publish reuse credit on Phone, not PC")
+            return 1
+    else:
+        credits = [
+            (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            for m in re.finditer(
+                r"\[PHONE_REGION_SLOT_CREDIT\] chunk=(\d+) slot=(\d+) "
+                r"seq=\d+ marked=(\d+)",
+                block,
+            )
+        ]
+        expected_credit_chunks = max(0, n_chunks - 2)
+        if len(credits) != expected_credit_chunks:
+            print(f"FAIL: slot credits={credits}; expected {expected_credit_chunks}")
+            return 1
+        if any(marked != 1 for _, _, marked in credits):
+            print(f"FAIL: unmarked slot credit: {credits}")
+            return 1
 
     p2c_residuals = [
         (int(m.group(1)), m.group(2), int(m.group(3)), int(m.group(4)))
@@ -366,13 +441,21 @@ def main() -> int:
             block,
         )
     ]
-    expected_local = [(c, c % 2) for c in range(n_chunks)]
-    if local_continuations != expected_local:
-        print(
-            f"FAIL: local continuations={local_continuations}; "
-            f"expected={expected_local}"
-        )
-        return 1
+    if local_main:
+        if local_continuations:
+            print(
+                "FAIL: Phone MAIN should not expose Region completion "
+                f"to the PC continuation scheduler: {local_continuations}"
+            )
+            return 1
+    else:
+        expected_local = [(c, c % 2) for c in range(n_chunks)]
+        if local_continuations != expected_local:
+            print(
+                f"FAIL: local continuations={local_continuations}; "
+                f"expected={expected_local}"
+            )
+            return 1
 
     for forbidden in (
         "[PHONE_REGION_CONTINUATION_WAIT]",
@@ -410,14 +493,21 @@ def main() -> int:
         print(f"FAIL: output slots={outputs}; expected 0..{n_chunks - 1}")
         return 1
 
-    mode = "pc-overlap" if pc_overlap else "baseline"
+    mode = (
+        ("pc-overlap" if pc_overlap else "baseline")
+        + ("+phone-main" if local_main else "+pc-continuation")
+    )
     print(
         f"PASS: {n_chunks} C2P -> Phone Region -> L46 continuations are "
         f"chunk-pipelined (window=2, mode={mode}, "
         f"{plan.group(4)} Meta schedule entries)"
     )
     print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
-    print("PASS: Region -> L46 uses Phone FIFO ordering with no PC completion wait")
+    if local_main:
+        print("PASS: Region -> L46 Attention -> Phone FFN is owned by Phone MAIN")
+        print("PASS: PC observes only READY and PARTIAL data events")
+    else:
+        print("PASS: Region -> L46 uses Phone FIFO ordering with no PC completion wait")
     print("PASS: Region completion seq is used only for scratch-slot reuse")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
     print("NOTE: this does not verify GPU kernel duration, KV parity or logits")
