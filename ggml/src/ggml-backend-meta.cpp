@@ -12731,10 +12731,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // C2P route-copy fence still serializes access before the next Phone FFN;
     // neither KV ordering nor the P2C protocol is changed.
     struct region_pipe_chunk {
-        size_t norm_sg   = static_cast<size_t>(-1);
-        size_t down_sg   = static_cast<size_t>(-1);
-        size_t begin_sg  = static_cast<size_t>(-1);
-        size_t end_sg    = static_cast<size_t>(-1);
+        size_t norm_sg              = static_cast<size_t>(-1);
+        size_t down_sg              = static_cast<size_t>(-1);
+        size_t begin_sg             = static_cast<size_t>(-1);
+        size_t end_sg               = static_cast<size_t>(-1);
+        size_t continuation_begin_sg = static_cast<size_t>(-1);
+        size_t continuation_end_sg   = static_cast<size_t>(-1);
     };
     std::map<int, region_pipe_chunk> region_pipe_chunks;
     std::vector<size_t> region_pipe_schedule;
@@ -12822,6 +12824,171 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             eligible =
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
+
+        // Discover the per-chunk L46 continuation from the already-built
+        // graph instead of assuming a fixed number of post-Region subgraphs.
+        // The first continuation SG is the first post-Region graph whose
+        // dependency closure reaches this chunk's private L45 output. The
+        // P2C down boundary is the terminal anchor for that chunk. Keeping
+        // this topology explicit lets the schedule run:
+        //
+        //   C2P(c) -> Region(c) -> L46/P2C(c)
+        //
+        // without waiting for all Region chunks to be submitted first.
+        if (eligible) {
+            auto graph_depends_on_region_output =
+                [&](ggml_cgraph * graph,
+                    ggml_tensor * output_root) -> bool {
+                    if (graph == nullptr || output_root == nullptr) {
+                        return false;
+                    }
+
+                    std::set<ggml_tensor *> visited;
+                    std::function<bool(ggml_tensor *)> depends =
+                        [&](ggml_tensor * tensor) -> bool {
+                            if (tensor == nullptr ||
+                                    !visited.insert(tensor).second) {
+                                return false;
+                            }
+                            if (phone_region_root(tensor) == output_root) {
+                                return true;
+                            }
+                            if (tensor->view_src != nullptr &&
+                                    depends(tensor->view_src)) {
+                                return true;
+                            }
+                            for (ggml_tensor * src : tensor->src) {
+                                if (depends(src)) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        if (depends(graph->nodes[k])) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+            for (size_t c = 0;
+                    c < region_pipe_chunks.size() && eligible; ++c) {
+                auto & e = region_pipe_chunks.at((int) c);
+                char out_name[96];
+                std::snprintf(
+                    out_name, sizeof(out_name),
+                    "phone_region_chunk_end_%zu-45", c);
+                ggml_tensor * output =
+                    find_sg_named_tensor(1, e.end_sg, out_name);
+                ggml_tensor * output_root =
+                    phone_region_root(output);
+                if (output_root == nullptr) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_OUTPUT_UNAVAILABLE";
+                    break;
+                }
+
+                size_t continuation_down =
+                    region_pipe_invalid_sg;
+                for (size_t sg = last_region_end + 1;
+                        sg < backend_ctx->n_subgraphs; ++sg) {
+                    int down_chunk = -1;
+                    int down_layer = -1;
+                    if (parse_prefill_sg(
+                            sg, false,
+                            down_chunk, down_layer) &&
+                            down_layer == 46 &&
+                            down_chunk == (int) c) {
+                        continuation_down = sg;
+                        break;
+                    }
+                }
+
+                if (continuation_down >=
+                        region_pipe_invalid_sg) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_DOWN_NOT_FOUND";
+                    break;
+                }
+
+                size_t continuation_begin =
+                    region_pipe_invalid_sg;
+                for (size_t sg = last_region_end + 1;
+                        sg <= continuation_down; ++sg) {
+                    bool consumes_output = false;
+                    for (size_t backend = 0;
+                            backend < n_backends &&
+                            !consumes_output; ++backend) {
+                        ggml_cgraph * graph =
+                            backend_ctx->backend_configs[backend]
+                                .cgraphs[sg].cgraph_main;
+                        consumes_output =
+                            graph_depends_on_region_output(
+                                graph, output_root);
+                    }
+                    if (consumes_output) {
+                        continuation_begin = sg;
+                        break;
+                    }
+                }
+
+                if (continuation_begin >=
+                        region_pipe_invalid_sg ||
+                        continuation_begin >
+                            continuation_down) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_BEGIN_NOT_FOUND";
+                    break;
+                }
+
+                e.continuation_begin_sg =
+                    continuation_begin;
+                e.continuation_end_sg =
+                    continuation_down;
+            }
+
+            if (eligible) {
+                // The current Region experiment requires the post-Region
+                // L46 chunks to be chunk-major. Extend each continuation to
+                // the SG immediately before the next chunk begins so inactive
+                // bridge/view SGs stay with their producer chunk. Fail closed
+                // on overlap or an unknown prefix instead of reordering an
+                // ambiguous graph.
+                if (region_pipe_chunks.at(0)
+                        .continuation_begin_sg !=
+                        last_region_end + 1) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_PREFIX_GAP";
+                }
+
+                for (size_t c = 0;
+                        c + 1 < region_pipe_chunks.size() &&
+                        eligible; ++c) {
+                    auto & current =
+                        region_pipe_chunks.at((int) c);
+                    const auto & next =
+                        region_pipe_chunks.at((int) c + 1);
+                    if (current.continuation_begin_sg >=
+                            next.continuation_begin_sg ||
+                            current.continuation_end_sg >=
+                                next.continuation_begin_sg) {
+                        eligible = false;
+                        region_pipe_reason =
+                            "CONTINUATION_OVERLAP";
+                        break;
+                    }
+                    current.continuation_end_sg =
+                        next.continuation_begin_sg - 1;
+                }
+            }
+        }
+
         bool region_pipe_isolation_needed = false;
         if (eligible) {
             // The stock gallocr is intentionally allowed to alias Region
@@ -13203,27 +13370,78 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 covered[sg] = true;
                 region_pipe_schedule.push_back(sg);
             };
+            auto add_region =
+                [&](const region_pipe_chunk & e) {
+                    add_sg(e.begin_sg);
+                    for (size_t sg = e.begin_sg + 1;
+                            sg <= e.end_sg; ++sg) {
+                        if (sg >= covered.size() ||
+                                covered[sg]) {
+                            eligible = false;
+                            break;
+                        }
+                        // The complete L35-L45 graph is fused into begin_sg.
+                        covered[sg] = true;
+                    }
+                };
+            auto add_continuation =
+                [&](const region_pipe_chunk & e) {
+                    for (size_t sg =
+                            e.continuation_begin_sg;
+                            sg <= e.continuation_end_sg;
+                            ++sg) {
+                        add_sg(sg);
+                        if (!eligible) {
+                            break;
+                        }
+                    }
+                };
+
             for (size_t sg = 0; sg < first_norm; ++sg) {
                 add_sg(sg);
             }
-            for (size_t chunk = 0;
-                    chunk < region_pipe_chunks.size(); ++chunk) {
-                const auto & e = region_pipe_chunks.at((int) chunk);
-                add_sg(e.norm_sg);
-                add_sg(e.down_sg);
-                add_sg(e.begin_sg);
-                for (size_t sg = e.begin_sg + 1;
-                        sg <= e.end_sg; ++sg) {
-                    if (sg >= covered.size() || covered[sg]) {
-                        eligible = false;
-                        break;
-                    }
-                    covered[sg] = true; // fused into e.begin_sg
+
+            // Chunk-major continuation with one useful overlap: while
+            // Region(c-1) runs on Phone, execute only C2P_NORM(c), which is
+            // PC-owned prework. Do not submit C2P_FFN_REDUCE(c) before the
+            // previous continuation, because that would enqueue Phone work
+            // ahead of L46(c-1) and defeat "Region done -> Tensor now".
+            if (!region_pipe_chunks.empty()) {
+                const auto & first =
+                    region_pipe_chunks.at(0);
+                add_sg(first.norm_sg);
+                add_sg(first.down_sg);
+                add_region(first);
+
+                for (size_t chunk = 1;
+                        chunk < region_pipe_chunks.size() &&
+                        eligible; ++chunk) {
+                    const auto & current =
+                        region_pipe_chunks.at((int) chunk);
+                    const auto & previous =
+                        region_pipe_chunks.at((int) chunk - 1);
+
+                    add_sg(current.norm_sg);
+                    add_continuation(previous);
+                    add_sg(current.down_sg);
+                    add_region(current);
+                }
+
+                if (eligible) {
+                    add_continuation(
+                        region_pipe_chunks.at(
+                            (int) region_pipe_chunks.size() - 1));
                 }
             }
+
+            // Preserve every unrelated tail SG in original order. Continuation
+            // ranges were already marked above, so only genuinely uncovered
+            // post-L46 work is appended here.
             for (size_t sg = last_region_end + 1;
                     sg < backend_ctx->n_subgraphs; ++sg) {
-                add_sg(sg);
+                if (!covered[sg]) {
+                    add_sg(sg);
+                }
             }
             for (bool reached : covered) {
                 eligible = eligible && reached;
@@ -13245,24 +13463,30 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             std::atoi(region_pipeline_env) != 0) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
-               "scratch_pool=%d reason=%s\n",
+               "scratch_pool=%d continuation=%d reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
                backend_ctx->n_subgraphs,
+               region_pipeline_active ? 1 : 0,
                region_pipeline_active ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             for (const auto & entry : region_pipe_chunks) {
                 printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
                        "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
-                       "status=READY\n",
+                       "p2c=[%zu,%zu] status=READY\n",
                        entry.first,
                        entry.second.norm_sg, entry.second.down_sg,
-                       entry.second.begin_sg, entry.second.end_sg);
+                       entry.second.begin_sg, entry.second.end_sg,
+                       entry.second.continuation_begin_sg,
+                       entry.second.continuation_end_sg);
             }
         }
     }
+
+    std::vector<uint64_t> region_pipe_completion_seq(
+        region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
 
     bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
@@ -13285,6 +13509,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 } else if (i == entry.second.begin_sg) {
                     pipeline_chunk = entry.first;
                     pipeline_stage = "PHONE_REGION";
+                } else if (i ==
+                        entry.second.continuation_begin_sg) {
+                    pipeline_chunk = entry.first;
+                    pipeline_stage = "P2C_CONTINUE";
                 }
             }
             if (pipeline_debug && pipeline_stage != nullptr) {
@@ -13293,6 +13521,90 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        schedule_pos, pipeline_chunk, i, pipeline_stage);
             }
         }
+
+        // A continuation may run on a transfer/PC path rather than solely on
+        // the Phone compute socket, so do not rely on socket ordering alone.
+        // Wait for exactly this Region producer, then release its scratch
+        // slot. This is the dependency edge that turns the old phase barrier
+        // into per-chunk dataflow.
+        if (region_pipeline_active &&
+                pipeline_stage != nullptr &&
+                std::strcmp(
+                    pipeline_stage,
+                    "P2C_CONTINUE") == 0) {
+            if (pipeline_chunk < 0 ||
+                    static_cast<size_t>(pipeline_chunk) >=
+                        region_pipe_completion_seq.size()) {
+                printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                       "chunk=%d reason=INVALID_CHUNK action=STOP\n",
+                       pipeline_chunk);
+                return GGML_STATUS_FAILED;
+            }
+
+            const uint64_t seq =
+                region_pipe_completion_seq[
+                    static_cast<size_t>(pipeline_chunk)];
+            const ggml_backend_rpc_wait_ready_seq_t
+                wait_ready =
+                    ggml_backend_meta_get_wait_ready_seq(
+                        backend_ctx->backend_configs[1].backend);
+            if (seq == 0 || wait_ready == nullptr) {
+                printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                       "chunk=%d seq=%" PRIu64
+                       " reason=MISSING_COMPLETION_CREDIT "
+                       "action=STOP\n",
+                       pipeline_chunk, seq);
+                return GGML_STATUS_FAILED;
+            }
+
+            const int64_t wait_begin_us = ggml_time_us();
+            const bool ready = wait_ready(
+                backend_ctx->backend_configs[1].backend,
+                seq);
+            const int64_t wait_us =
+                ggml_time_us() - wait_begin_us;
+            if (!ready) {
+                printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                       "chunk=%d seq=%" PRIu64
+                       " reason=WAIT_FAILED action=STOP\n",
+                       pipeline_chunk, seq);
+                return GGML_STATUS_FAILED;
+            }
+
+            auto & slot =
+                backend_ctx->backend_configs[1]
+                    .phone_region_scratch_slots[
+                        static_cast<size_t>(pipeline_chunk) % 2];
+            if (slot.owner_chunk != pipeline_chunk ||
+                    (slot.completion_seq != 0 &&
+                     slot.completion_seq != seq)) {
+                printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                       "chunk=%d seq=%" PRIu64
+                       " slot_owner=%d slot_seq=%" PRIu64
+                       " reason=SLOT_CREDIT_MISMATCH "
+                       "action=STOP\n",
+                       pipeline_chunk, seq,
+                       slot.owner_chunk,
+                       slot.completion_seq);
+                return GGML_STATUS_FAILED;
+            }
+
+            slot.owner_chunk = -1;
+            slot.completion_seq = 0;
+            region_pipe_completion_seq[
+                static_cast<size_t>(pipeline_chunk)] = 0;
+
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_CONTINUATION_WAIT] "
+                       "chunk=%d seq=%" PRIu64
+                       " slot=%zu wait_ms=%.3f "
+                       "slot_released=1 status=READY\n",
+                       pipeline_chunk, seq,
+                       static_cast<size_t>(pipeline_chunk) % 2,
+                       wait_us / 1000.0);
+            }
+        }
+
         const int64_t layer_wall_start_us = ggml_time_us();
         int64_t phone_region_pre_graph_us = 0;
         int64_t phone_region_graph_build_us = 0;
@@ -15357,15 +15669,26 @@ auto prefill_norm_sg_has_prework =
                 phone_cfg.phone_region_scratch_slots[
                     slot_index];
 
-            // Only chunks whose scratch slot will be reused in this Meta
-            // execution need a completion marker. This avoids leaving
-            // unconsumed sequence IDs on the server after the final use.
+            // Every Region chunk now publishes a producer-completion credit
+            // for its own L46 continuation. Chunks whose scratch slot will be
+            // reused also expose the same seq as a slot credit; the
+            // continuation consumes it first and releases the slot, so later
+            // reuse no longer needs a global/device fence.
             const bool will_reuse_slot =
                 phone_region_chunk_id >= 0 &&
                 static_cast<size_t>(
                     phone_region_chunk_id + 2) <
                     region_pipe_chunks.size();
-            if (will_reuse_slot) {
+            const auto continuation_it =
+                region_pipe_chunks.find(
+                    phone_region_chunk_id);
+            const bool has_continuation =
+                continuation_it !=
+                    region_pipe_chunks.end() &&
+                continuation_it->second
+                        .continuation_begin_sg <
+                    region_pipe_invalid_sg;
+            if (has_continuation || will_reuse_slot) {
                 constexpr uint64_t REGION_SEQ_PREFIX =
                     0xA000000000000000ULL;
                 constexpr uint64_t REGION_SEQ_MASK =
@@ -15392,17 +15715,45 @@ auto prefill_norm_sg_has_prework =
                 const bool marked =
                     mark_ready != nullptr &&
                     mark_ready(phone_cfg.backend, seq);
-                slot.completion_seq =
-                    marked ? seq : 0;
-                if (pipeline_debug) {
+                if (!marked) {
+                    printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                           "chunk=%d seq=%" PRIu64
+                           " reason=MARK_FAILED action=STOP\n",
+                           phone_region_chunk_id, seq);
+                    return GGML_STATUS_FAILED;
+                }
+
+                if (has_continuation) {
+                    GGML_ASSERT(
+                        phone_region_chunk_id >= 0 &&
+                        static_cast<size_t>(
+                            phone_region_chunk_id) <
+                            region_pipe_completion_seq.size());
+                    region_pipe_completion_seq[
+                        static_cast<size_t>(
+                            phone_region_chunk_id)] = seq;
+                }
+                if (will_reuse_slot) {
+                    slot.completion_seq = seq;
+                }
+
+                if (pipeline_debug && will_reuse_slot) {
                     printf("[PHONE_REGION_SLOT_CREDIT] "
                            "chunk=%d slot=%zu seq=%" PRIu64
-                           " marked=%d future_chunk=%d\n",
+                           " marked=1 future_chunk=%d\n",
                            phone_region_chunk_id,
                            slot_index,
                            seq,
-                           marked ? 1 : 0,
                            phone_region_chunk_id + 2);
+                }
+                if (pipeline_debug && has_continuation) {
+                    printf("[PHONE_REGION_CONTINUATION_CREDIT] "
+                           "chunk=%d seq=%" PRIu64
+                           " marked=1 p2c_sg=%zu\n",
+                           phone_region_chunk_id,
+                           seq,
+                           continuation_it->second
+                               .continuation_begin_sg);
                 }
             }
         }
