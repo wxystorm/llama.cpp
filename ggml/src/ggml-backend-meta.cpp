@@ -6505,6 +6505,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_main_local_chunks;
     std::mutex phone_main_pc_event_mutex;
     std::condition_variable phone_main_pc_event_cv;
+    std::function<void(int)>
+        phone_main_maybe_enqueue_pc_reduce;
 
     struct tensor_expert_load_accum {
         uint64_t assignments = 0;
@@ -14664,13 +14666,24 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 state.graphs_registered = true;
             }
 
-            // Phase B: all structural work succeeded. Only now arm blocking
-            // network receivers and PC workers.
+            // Phase B: all structural work succeeded. Arm only producers
+            // and event-driven consumers. Network RX tasks may block on their
+            // sockets; PC compute/reduce workers never wait for a remote
+            // dependency. READY arrival enqueues PC FFN. READY-side FFN and
+            // PARTIAL arrival independently set join bits; the second event
+            // enqueues the PC Reduce.
             if (local_ok) {
                 if (backend_ctx->prefill_pc_worker ==
                         nullptr) {
                     backend_ctx->prefill_pc_worker =
                         new ggml_backend_meta_transfer_worker();
+                }
+                if (backend_ctx->
+                        phone_main_pc_reduce_worker ==
+                        nullptr) {
+                    backend_ctx->
+                        phone_main_pc_reduce_worker =
+                            new ggml_backend_meta_transfer_worker();
                 }
                 for (size_t lane = 0;
                         lane <
@@ -14684,15 +14697,294 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             prefill_return_workers[lane] =
                                 new ggml_backend_meta_transfer_worker();
                     }
-                    if (backend_ctx->
-                            prefill_reduce_workers[lane] ==
-                            nullptr) {
-                        backend_ctx->
-                            prefill_reduce_workers[lane] =
-                                new ggml_backend_meta_transfer_worker();
-                    }
                 }
 
+                ggml_backend_t pc_backend =
+                    pc_cfg.backend;
+                const bool local_debug =
+                    pipeline_debug;
+                phone_main_maybe_enqueue_pc_reduce =
+                    [&, pc_backend, local_debug](
+                        int chunk) {
+                        std::lock_guard<std::mutex> lock(
+                            phone_main_pc_event_mutex);
+                        auto state_it =
+                            phone_main_local_chunks.find(
+                                chunk);
+                        if (state_it ==
+                                phone_main_local_chunks.end()) {
+                            return;
+                        }
+                        auto & state =
+                            state_it->second;
+                        if (state.pc_event_failed ||
+                                state.pc_reduce_queued ||
+                                !state.pc_ffn_ready ||
+                                !state.phone_partial_ready) {
+                            phone_main_pc_event_cv.notify_all();
+                            return;
+                        }
+
+                        GGML_ASSERT(
+                            state.join_worker != nullptr);
+                        GGML_ASSERT(
+                            state.pc_reduce_graph != nullptr);
+                        GGML_ASSERT(
+                            state.pc_phone_stage != nullptr);
+                        GGML_ASSERT(
+                            state.phone_partial_payload != nullptr);
+
+                        state.pc_reduce_queued = true;
+                        ggml_tensor * pc_phone_stage =
+                            state.pc_phone_stage;
+                        ggml_cgraph * pc_reduce =
+                            state.pc_reduce_graph;
+                        auto join_payload =
+                            state.phone_partial_payload;
+
+                        state.join_task =
+                            state.join_worker->enqueue(
+                                [pc_backend,
+                                 pc_phone_stage,
+                                 pc_reduce,
+                                 join_payload,
+                                 chunk,
+                                 local_debug]
+                                (uint64_t task_id) ->
+                                ggml_status {
+                                    const int64_t begin_us =
+                                        ggml_time_us();
+                                    ggml_backend_tensor_set(
+                                        pc_phone_stage,
+                                        join_payload->data(),
+                                        0,
+                                        join_payload->size());
+                                    const ggml_status status =
+                                        ggml_backend_graph_compute(
+                                            pc_backend,
+                                            pc_reduce);
+                                    if (status ==
+                                            GGML_STATUS_SUCCESS) {
+                                        ggml_backend_synchronize(
+                                            pc_backend);
+                                    }
+                                    if (local_debug) {
+                                        printf(
+                                            "[PHONE_MAIN_PC_JOIN] "
+                                            "chunk=%d task=%" PRIu64
+                                            " bytes=%zu total_ms=%.3f "
+                                            "status=%d\n",
+                                            chunk,
+                                            task_id,
+                                            join_payload->size(),
+                                            (ggml_time_us() -
+                                                begin_us) /
+                                                1000.0,
+                                            (int) status);
+                                    }
+                                    return status;
+                                });
+
+                        if (local_debug) {
+                            printf(
+                                "[PHONE_MAIN_PC_REDUCE_ENQUEUE] "
+                                "chunk=%d task=%" PRIu64
+                                " reason=BOTH_READY "
+                                "status=QUEUED\n",
+                                chunk,
+                                state.join_task);
+                        }
+                        phone_main_pc_event_cv.notify_all();
+                    };
+
+                // Install every READY hook before posting any GET_ROUTE. This
+                // keeps the hook map immutable while RX workers are active.
+                for (size_t c = 0;
+                        c < region_pipe_chunks.size();
+                        ++c) {
+                    const int chunk = (int) c;
+                    const auto & e =
+                        region_pipe_chunks.at(chunk);
+                    auto & state =
+                        phone_main_local_chunks.at(chunk);
+                    state.join_worker =
+                        backend_ctx->
+                            phone_main_pc_reduce_worker;
+
+                    ggml_cgraph * pc_ffn_graph =
+                        pc_cfg.cgraphs[
+                            e.continuation_end_sg]
+                            .cgraph_main;
+                    ggml_tensor * pc_partial =
+                        state.pc_partial;
+                    ggml_tensor * pc_local_stage =
+                        state.pc_local_stage;
+                    ggml_backend_meta_transfer_worker *
+                        pc_worker =
+                            backend_ctx->prefill_pc_worker;
+
+                    phone_prefill_route_ready_hooks[
+                        { 46, chunk }] =
+                        [&, pc_backend,
+                         pc_ffn_graph,
+                         pc_partial,
+                         pc_local_stage,
+                         pc_worker,
+                         chunk,
+                         local_debug](
+                            bool ready_ok,
+                            ggml_backend_t,
+                            ggml_tensor * stage_hidden,
+                            ggml_tensor * dst_hidden,
+                            ggml_tensor * stage_topk,
+                            ggml_tensor * dst_topk,
+                            ggml_tensor * stage_weights,
+                            ggml_tensor * dst_weights)
+                            -> ggml_status {
+                            if (!ready_ok) {
+                                {
+                                    std::lock_guard<std::mutex>
+                                        lock(
+                                            phone_main_pc_event_mutex);
+                                    auto & failed =
+                                        phone_main_local_chunks
+                                            .at(chunk);
+                                    failed.pc_event_failed =
+                                        true;
+                                    failed.pc_event_status =
+                                        GGML_STATUS_FAILED;
+                                }
+                                phone_main_pc_event_cv
+                                    .notify_all();
+                                return GGML_STATUS_FAILED;
+                            }
+
+                            const uint64_t pc_task =
+                                pc_worker->enqueue(
+                                    [&, pc_backend,
+                                     pc_ffn_graph,
+                                     pc_partial,
+                                     pc_local_stage,
+                                     stage_hidden,
+                                     dst_hidden,
+                                     stage_topk,
+                                     dst_topk,
+                                     stage_weights,
+                                     dst_weights,
+                                     chunk,
+                                     local_debug]
+                                    (uint64_t task_id) ->
+                                    ggml_status {
+                                        const int64_t begin_us =
+                                            ggml_time_us();
+                                        ggml_backend_tensor_copy_async(
+                                            pc_backend,
+                                            pc_backend,
+                                            stage_hidden,
+                                            dst_hidden);
+                                        ggml_backend_tensor_copy_async(
+                                            pc_backend,
+                                            pc_backend,
+                                            stage_topk,
+                                            dst_topk);
+                                        ggml_backend_tensor_copy_async(
+                                            pc_backend,
+                                            pc_backend,
+                                            stage_weights,
+                                            dst_weights);
+                                        ggml_backend_synchronize(
+                                            pc_backend);
+                                        const int64_t compute_begin_us =
+                                            ggml_time_us();
+                                        const ggml_status status =
+                                            ggml_backend_graph_compute(
+                                                pc_backend,
+                                                pc_ffn_graph);
+                                        if (status !=
+                                                GGML_STATUS_SUCCESS) {
+                                            {
+                                                std::lock_guard<
+                                                    std::mutex>
+                                                    lock(
+                                                        phone_main_pc_event_mutex);
+                                                auto & failed =
+                                                    phone_main_local_chunks
+                                                        .at(chunk);
+                                                failed.pc_event_failed =
+                                                    true;
+                                                failed.pc_event_status =
+                                                    status;
+                                            }
+                                            phone_main_pc_event_cv
+                                                .notify_all();
+                                            return status;
+                                        }
+                                        ggml_backend_synchronize(
+                                            pc_backend);
+                                        const int64_t compute_us =
+                                            ggml_time_us() -
+                                            compute_begin_us;
+
+                                        ggml_backend_tensor_copy(
+                                            pc_partial,
+                                            pc_local_stage);
+                                        ggml_backend_synchronize(
+                                            pc_backend);
+
+                                        {
+                                            std::lock_guard<std::mutex>
+                                                lock(
+                                                    phone_main_pc_event_mutex);
+                                            auto & ready =
+                                                phone_main_local_chunks
+                                                    .at(chunk);
+                                            ready.pc_ffn_ready =
+                                                true;
+                                        }
+
+                                        if (local_debug) {
+                                            printf(
+                                                "[PHONE_MAIN_PC_FFN] "
+                                                "chunk=%d task=%" PRIu64
+                                                " event_to_start_ms=%.3f "
+                                                "compute_ms=%.3f "
+                                                "status=READY\n",
+                                                chunk,
+                                                task_id,
+                                                (compute_begin_us -
+                                                    begin_us) /
+                                                    1000.0,
+                                                compute_us /
+                                                    1000.0);
+                                        }
+                                        phone_main_maybe_enqueue_pc_reduce(
+                                            chunk);
+                                        return GGML_STATUS_SUCCESS;
+                                    });
+
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    phone_main_pc_event_mutex);
+                                phone_main_local_chunks
+                                    .at(chunk)
+                                    .pc_ffn_task =
+                                        pc_task;
+                            }
+                            if (local_debug) {
+                                printf(
+                                    "[PHONE_MAIN_PC_FFN_ENQUEUE] "
+                                    "chunk=%d task=%" PRIu64
+                                    " source=READY_EVENT "
+                                    "status=QUEUED\n",
+                                    chunk,
+                                    pc_task);
+                            }
+                            phone_main_pc_event_cv.notify_all();
+                            return GGML_STATUS_SUCCESS;
+                        };
+                }
+
+                // With hooks installed, post READY and PARTIAL receives.
                 for (size_t c = 0;
                         c < region_pipe_chunks.size();
                         ++c) {
@@ -14702,10 +14994,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     auto & state =
                         phone_main_local_chunks.at(chunk);
 
-                    // Capability/layout validation was completed in Phase A.
-                    // Failure here indicates a hard runtime setup error; do
-                    // not silently fall back after earlier chunks have armed
-                    // blocking mailbox receives.
                     if (!prearm_phone_prefill_route(
                             e.continuation_route_sg,
                             46,
@@ -14750,11 +15038,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         state.phone_folded_partial;
                     auto partial_payload =
                         state.phone_partial_payload;
-                    const bool local_debug =
-                        pipeline_debug;
                     state.partial_task =
                         state.partial_worker->enqueue(
-                            [set_snapshot_read,
+                            [&, set_snapshot_read,
                              partial_src,
                              partial_payload,
                              partial_seq,
@@ -14776,6 +15062,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     partial_payload->size());
                                 set_snapshot_read(
                                     false, 0, 0);
+
+                                {
+                                    std::lock_guard<std::mutex>
+                                        lock(
+                                            phone_main_pc_event_mutex);
+                                    phone_main_local_chunks
+                                        .at(chunk)
+                                        .phone_partial_ready =
+                                            true;
+                                }
+
                                 if (local_debug) {
                                     printf(
                                         "[PHONE_MAIN_PARTIAL_RX] "
@@ -14793,196 +15090,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                             begin_us) /
                                             1000.0);
                                 }
+                                phone_main_maybe_enqueue_pc_reduce(
+                                    chunk);
                                 return GGML_STATUS_SUCCESS;
-                            });
-
-                    ggml_cgraph * pc_ffn_graph =
-                        pc_cfg.cgraphs[
-                            e.continuation_end_sg]
-                            .cgraph_main;
-                    ggml_backend_t pc_backend =
-                        pc_cfg.backend;
-                    ggml_backend_meta_transfer_worker *
-                        pc_worker =
-                            backend_ctx->
-                                prefill_pc_worker;
-                    ggml_tensor * pc_partial =
-                        state.pc_partial;
-                    ggml_tensor * pc_local_stage =
-                        state.pc_local_stage;
-
-                    state.pc_ffn_task =
-                        pc_worker->enqueue(
-                            [route,
-                             pc_backend,
-                             pc_ffn_graph,
-                             pc_partial,
-                             pc_local_stage,
-                             chunk,
-                             local_debug]
-                            (uint64_t task_id) ->
-                            ggml_status {
-                                const int64_t wait_begin_us =
-                                    ggml_time_us();
-                                const ggml_status route_status =
-                                    route.worker->wait(
-                                        route.task);
-                                const int64_t route_wait_us =
-                                    ggml_time_us() -
-                                    wait_begin_us;
-                                if (route_status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return route_status;
-                                }
-
-                                const int64_t copy_begin_us =
-                                    ggml_time_us();
-                                ggml_backend_tensor_copy_async(
-                                    pc_backend,
-                                    pc_backend,
-                                    route.stage_hidden,
-                                    route.dst_hidden);
-                                ggml_backend_tensor_copy_async(
-                                    pc_backend,
-                                    pc_backend,
-                                    route.stage_topk,
-                                    route.dst_topk);
-                                ggml_backend_tensor_copy_async(
-                                    pc_backend,
-                                    pc_backend,
-                                    route.stage_weights,
-                                    route.dst_weights);
-                                ggml_backend_synchronize(
-                                    pc_backend);
-                                const int64_t copy_us =
-                                    ggml_time_us() -
-                                    copy_begin_us;
-
-                                const int64_t compute_begin_us =
-                                    ggml_time_us();
-                                const ggml_status status =
-                                    ggml_backend_graph_compute(
-                                        pc_backend,
-                                        pc_ffn_graph);
-                                if (status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return status;
-                                }
-                                ggml_backend_synchronize(
-                                    pc_backend);
-                                const int64_t compute_us =
-                                    ggml_time_us() -
-                                    compute_begin_us;
-
-                                ggml_backend_tensor_copy(
-                                    pc_partial,
-                                    pc_local_stage);
-                                ggml_backend_synchronize(
-                                    pc_backend);
-
-                                if (local_debug) {
-                                    printf(
-                                        "[PHONE_MAIN_PC_FFN] "
-                                        "chunk=%d task=%" PRIu64
-                                        " ready_wait_ms=%.3f "
-                                        "input_copy_ms=%.3f "
-                                        "compute_ms=%.3f "
-                                        "status=READY\n",
-                                        chunk,
-                                        task_id,
-                                        route_wait_us /
-                                            1000.0,
-                                        copy_us / 1000.0,
-                                        compute_us / 1000.0);
-                                }
-                                return GGML_STATUS_SUCCESS;
-                            });
-
-                    if (backend_ctx->
-                            phone_main_pc_reduce_worker ==
-                            nullptr) {
-                        backend_ctx->
-                            phone_main_pc_reduce_worker =
-                                new ggml_backend_meta_transfer_worker();
-                    }
-                    state.join_worker =
-                        backend_ctx->
-                            phone_main_pc_reduce_worker;
-                    ggml_backend_meta_transfer_worker *
-                        partial_worker =
-                            state.partial_worker;
-                    const uint64_t partial_task =
-                        state.partial_task;
-                    const uint64_t pc_task =
-                        state.pc_ffn_task;
-                    ggml_tensor * pc_phone_stage =
-                        state.pc_phone_stage;
-                    ggml_cgraph * pc_reduce =
-                        state.pc_reduce_graph;
-                    auto join_payload =
-                        state.phone_partial_payload;
-
-                    state.join_task =
-                        state.join_worker->enqueue(
-                            [pc_worker,
-                             pc_task,
-                             partial_worker,
-                             partial_task,
-                             pc_backend,
-                             pc_phone_stage,
-                             pc_reduce,
-                             join_payload,
-                             chunk,
-                             local_debug]
-                            (uint64_t task_id) ->
-                            ggml_status {
-                                const int64_t begin_us =
-                                    ggml_time_us();
-                                const ggml_status pc_status =
-                                    pc_worker->wait(
-                                        pc_task);
-                                if (pc_status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return pc_status;
-                                }
-                                const ggml_status partial_status =
-                                    partial_worker->wait(
-                                        partial_task);
-                                if (partial_status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return partial_status;
-                                }
-
-                                ggml_backend_tensor_set(
-                                    pc_phone_stage,
-                                    join_payload->data(),
-                                    0,
-                                    join_payload->size());
-                                const ggml_status reduce_status =
-                                    ggml_backend_graph_compute(
-                                        pc_backend,
-                                        pc_reduce);
-                                if (reduce_status ==
-                                        GGML_STATUS_SUCCESS) {
-                                    ggml_backend_synchronize(
-                                        pc_backend);
-                                }
-
-                                if (local_debug) {
-                                    printf(
-                                        "[PHONE_MAIN_PC_JOIN] "
-                                        "chunk=%d task=%" PRIu64
-                                        " bytes=%zu total_ms=%.3f "
-                                        "status=%d\n",
-                                        chunk,
-                                        task_id,
-                                        join_payload->size(),
-                                        (ggml_time_us() -
-                                            begin_us) /
-                                            1000.0,
-                                        (int) reduce_status);
-                                }
-                                return reduce_status;
                             });
 
                     if (pipeline_debug) {
@@ -14995,9 +15105,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             " ready_lane=%u "
                             "partial_seq=%" PRIu64
                             " partial_slot=%u "
-                            "pc_task=%" PRIu64
+                            "ready_task=%" PRIu64
                             " partial_task=%" PRIu64
-                            " join_task=%" PRIu64
                             " status=ARMED\n",
                             chunk,
                             state.region_uid,
@@ -15007,9 +15116,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             state.ready_lane,
                             state.partial_seq,
                             state.partial_slot,
-                            state.pc_ffn_task,
-                            state.partial_task,
-                            state.join_task);
+                            route.task,
+                            state.partial_task);
                     }
                 }
 
