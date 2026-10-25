@@ -6361,16 +6361,21 @@ bool rpc_server::phone_main_register(
         request.p2c_attention_graph_uid,
         request.p2c_ffn_graph_uid,
     };
-    for (uint64_t uid : required) {
-        const auto it =
-            stored_graphs[request.device].find(uid);
-        if (it == stored_graphs[request.device].end() ||
-                it->second.graph == nullptr) {
-            GGML_LOG_ERROR(
-                "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
-                " status=FAIL reason=GRAPH_NOT_REGISTERED\n",
-                request.chunk, uid);
-            return false;
+    {
+        std::lock_guard<std::mutex> graph_lock(
+            stored_graphs_mutex);
+        for (uint64_t uid : required) {
+            const auto it =
+                stored_graphs[request.device].find(uid);
+            if (it ==
+                    stored_graphs[request.device].end() ||
+                    it->second.graph == nullptr) {
+                GGML_LOG_ERROR(
+                    "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
+                    " status=FAIL reason=GRAPH_NOT_REGISTERED\n",
+                    request.chunk, uid);
+                return false;
+            }
         }
     }
 
