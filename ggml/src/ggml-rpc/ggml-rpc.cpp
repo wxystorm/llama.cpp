@@ -526,6 +526,8 @@ struct rpc_msg_phone_c2p_register_rsp {
 struct rpc_msg_phone_c2p_ready_req {
     uint32_t device;
     int32_t chunk;
+    rpc_tensor tensors[3];
+    uint64_t sizes[3];
 };
 
 struct rpc_msg_phone_c2p_ready_rsp {
@@ -4267,7 +4269,7 @@ public:
     bool phone_main_register(const rpc_msg_phone_main_register_req & request);
     bool phone_main_trigger_after_graph(uint32_t device, uint64_t graph_uid);
     bool phone_c2p_register(const rpc_msg_phone_c2p_register_req & request);
-    bool phone_c2p_ready(const rpc_msg_phone_c2p_ready_req & request);
+    bool phone_c2p_ready(const std::vector<uint8_t> & input);
     bool phone_c2p_partial(const std::vector<uint8_t> & input);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
