@@ -2429,6 +2429,11 @@ struct ggml_backend_meta_context {
                                                                                                   nullptr };
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_ROUTE_LANES> prefill_route_workers { nullptr,
                                                                                                 nullptr };
+    // Dedicated P2C PARTIAL prefetch lanes. These issue the Phone->PC
+    // mailbox GET before the producer is ready so the payload can move while
+    // the PC FFN is still running.
+    std::array<ggml_backend_meta_transfer_worker *, 2> phone_region_partial_workers { nullptr,
+                                                                                      nullptr };
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -3059,6 +3064,9 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
         delete worker;
     }
     for (auto * worker : prefill_route_workers) {
+        delete worker;
+    }
+    for (auto * worker : phone_region_partial_workers) {
         delete worker;
     }
     if (comm_ctx != nullptr) {
@@ -4010,6 +4018,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     const bool region_pc_overlap_requested =
         region_pc_overlap_env != nullptr &&
         std::atoi(region_pc_overlap_env) != 0;
+    const char * region_bidir_pipeline_env =
+        std::getenv("GGML_META_PHONE_REGION_BIDIR_PIPELINE");
+    const bool region_bidir_pipeline_requested =
+        region_bidir_pipeline_env != nullptr &&
+        std::atoi(region_bidir_pipeline_env) != 0;
     const char * region_local_main_env =
         std::getenv("GGML_META_PHONE_REGION_LOCAL_MAIN");
     const bool region_local_main_requested =
@@ -4254,6 +4267,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint32_t partial_slot = 0;
         uint64_t scratch_reuse_seq = 0;
         bool submitted = false;
+
+        ggml_backend_meta_transfer_worker * partial_worker = nullptr;
+        uint64_t partial_task = 0;
+        std::shared_ptr<std::vector<uint8_t>> partial_payload;
+        int64_t partial_prefetch_submit_us = 0;
     };
     std::map<int, phone_region_local_main_chunk_state>
         phone_region_local_main_chunks;
@@ -10246,41 +10264,99 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             const int64_t copy_begin_us = ggml_time_us();
+            int64_t partial_prefetch_wait_us = 0;
+            bool partial_prefetch_used = false;
             if (local_main_partial) {
                 // PARTIAL has its own two-slot mailbox and its own sockets.
-                // Do not reuse generic RPC snapshot slots: those are shared
-                // by legacy prefill/decode snapshot pipelines and can hold an
-                // unrelated seq/size while Phone MAIN is trying to publish.
+                // In V1 bidirectional-pipeline mode the GET was preissued when
+                // Phone MAIN was submitted, so only the unhidden tail remains
+                // on this reduce path.
                 const size_t partial_bytes =
                     ggml_nbytes(phone_partial);
-                std::vector<uint8_t> partial_payload(
-                    partial_bytes);
-                const bool got_partial =
-                    partial_get(
-                        phone_cfg.backend,
-                        local_main_partial_it->second.partial_slot,
-                        local_main_partial_it->second.partial_seq,
-                        partial_payload.data(),
-                        partial_bytes);
-                if (!got_partial) {
-                    printf("[PHONE_REGION_PARTIAL_REJECT] "
-                           "layer=%d chunk=%d slot=%u seq=%" PRIu64
-                           " bytes=%zu reason=PARTIAL_GET_FAILED "
-                           "action=STOP\n",
-                           prefill_down_layer_0,
-                           prefill_down_chunk_0,
-                           local_main_partial_it->second.partial_slot,
-                           local_main_partial_it->second.partial_seq,
-                           partial_bytes);
-                    return GGML_STATUS_FAILED;
+                auto & local_state =
+                    local_main_partial_it->second;
+
+                const uint8_t * partial_data = nullptr;
+                std::vector<uint8_t> fallback_payload;
+                if (local_state.partial_worker != nullptr &&
+                        local_state.partial_task != 0 &&
+                        local_state.partial_payload != nullptr &&
+                        local_state.partial_payload->size() ==
+                            partial_bytes) {
+                    const int64_t prefetch_wait_begin_us =
+                        ggml_time_us();
+                    const ggml_status partial_status =
+                        local_state.partial_worker->wait(
+                            local_state.partial_task);
+                    partial_prefetch_wait_us =
+                        ggml_time_us() -
+                        prefetch_wait_begin_us;
+                    if (partial_status !=
+                            GGML_STATUS_SUCCESS) {
+                        printf("[PHONE_REGION_PARTIAL_REJECT] "
+                               "layer=%d chunk=%d slot=%u seq=%" PRIu64
+                               " bytes=%zu reason=PARTIAL_PREFETCH_FAILED "
+                               "action=STOP\n",
+                               prefill_down_layer_0,
+                               prefill_down_chunk_0,
+                               local_state.partial_slot,
+                               local_state.partial_seq,
+                               partial_bytes);
+                        return GGML_STATUS_FAILED;
+                    }
+                    partial_data =
+                        local_state.partial_payload->data();
+                    partial_prefetch_used = true;
+                    local_state.partial_task = 0;
+                } else {
+                    fallback_payload.resize(partial_bytes);
+                    const bool got_partial =
+                        partial_get(
+                            phone_cfg.backend,
+                            local_state.partial_slot,
+                            local_state.partial_seq,
+                            fallback_payload.data(),
+                            partial_bytes);
+                    if (!got_partial) {
+                        printf("[PHONE_REGION_PARTIAL_REJECT] "
+                               "layer=%d chunk=%d slot=%u seq=%" PRIu64
+                               " bytes=%zu reason=PARTIAL_GET_FAILED "
+                               "action=STOP\n",
+                               prefill_down_layer_0,
+                               prefill_down_chunk_0,
+                               local_state.partial_slot,
+                               local_state.partial_seq,
+                               partial_bytes);
+                        return GGML_STATUS_FAILED;
+                    }
+                    partial_data =
+                        fallback_payload.data();
                 }
+
                 ggml_backend_tensor_set(
                     pc_tmp,
-                    partial_payload.data(),
+                    partial_data,
                     0,
                     partial_bytes);
                 ggml_backend_synchronize(
                     pc_cfg.backend);
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_REGION_PARTIAL_CONSUMER] "
+                        "layer=%d chunk=%d prefetch=%d "
+                        "prefetch_wait_ms=%.3f "
+                        "since_submit_ms=%.3f status=OK\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        partial_prefetch_used ? 1 : 0,
+                        partial_prefetch_wait_us / 1000.0,
+                        local_state.partial_prefetch_submit_us > 0 ?
+                            (ggml_time_us() -
+                                local_state.partial_prefetch_submit_us) /
+                                1000.0 : 0.0);
+                }
             } else {
                 ggml_backend_tensor_copy_async(
                     phone_cfg.backend, pc_cfg.backend,
@@ -14371,7 +14447,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
                "scratch_pool=%d continuation=%d pc_overlap=%d "
-               "local_main=%d reason=%s\n",
+               "bidir_pipeline=%d local_main=%d reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
@@ -14380,6 +14456,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                region_pipeline_active ? 1 : 0,
                region_pipeline_active &&
                    region_pc_overlap_requested ? 1 : 0,
+               region_pipeline_active &&
+                   region_bidir_pipeline_requested ? 1 : 0,
                region_pipeline_active &&
                    region_local_main_active ? 1 : 0,
                region_pipe_reason);
@@ -17026,13 +17104,98 @@ auto prefill_norm_sg_has_prework =
                 return GGML_STATUS_FAILED;
             }
 
+            phone_region_local_main_chunk_state local_state {};
+            local_state.partial_seq = partial_seq;
+            local_state.partial_slot = partial_slot;
+            local_state.scratch_reuse_seq = scratch_reuse_seq;
+            local_state.submitted = true;
+
+            if (region_bidir_pipeline_requested) {
+                const ggml_backend_rpc_phone_region_partial_get_t
+                    partial_get =
+                        ggml_backend_meta_get_phone_region_partial_get(
+                            phone_cfg.backend);
+                GGML_ASSERT(partial_get != nullptr);
+
+                auto & partial_worker =
+                    backend_ctx->phone_region_partial_workers[
+                        partial_slot & 1u];
+                if (partial_worker == nullptr) {
+                    partial_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+
+                auto partial_payload =
+                    std::make_shared<std::vector<uint8_t>>(
+                        ggml_nbytes(phone_partial));
+                const int64_t prefetch_submit_us =
+                    ggml_time_us();
+                const uint64_t partial_task =
+                    partial_worker->enqueue(
+                        [partial_get,
+                         phone_backend = phone_cfg.backend,
+                         partial_slot,
+                         partial_seq,
+                         partial_payload,
+                         chunk = phone_region_chunk_id,
+                         pipeline_debug,
+                         tensor_phone_stage_profile]
+                        (uint64_t task_id) -> ggml_status {
+                            const int64_t begin_us =
+                                ggml_time_us();
+                            const bool ok =
+                                partial_get(
+                                    phone_backend,
+                                    partial_slot,
+                                    partial_seq,
+                                    partial_payload->data(),
+                                    partial_payload->size());
+                            if (pipeline_debug ||
+                                    tensor_phone_stage_profile) {
+                                printf(
+                                    "[PHONE_REGION_PARTIAL_PREFETCH] "
+                                    "chunk=%d task=%" PRIu64
+                                    " slot=%u seq=%" PRIu64
+                                    " bytes=%zu event=TRANSFER_DONE "
+                                    "wall_ms=%.3f status=%s\n",
+                                    chunk,
+                                    task_id,
+                                    partial_slot,
+                                    partial_seq,
+                                    partial_payload->size(),
+                                    (ggml_time_us() -
+                                        begin_us) / 1000.0,
+                                    ok ? "OK" : "FAIL");
+                            }
+                            return ok ?
+                                GGML_STATUS_SUCCESS :
+                                GGML_STATUS_FAILED;
+                        });
+
+                local_state.partial_worker = partial_worker;
+                local_state.partial_task = partial_task;
+                local_state.partial_payload = partial_payload;
+                local_state.partial_prefetch_submit_us =
+                    prefetch_submit_us;
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile) {
+                    printf(
+                        "[PHONE_REGION_PARTIAL_PREFETCH] "
+                        "chunk=%d task=%" PRIu64
+                        " slot=%u seq=%" PRIu64
+                        " bytes=%zu event=QUEUED status=OK\n",
+                        phone_region_chunk_id,
+                        partial_task,
+                        partial_slot,
+                        partial_seq,
+                        partial_payload->size());
+                }
+            }
+
             phone_region_local_main_chunks[
-                phone_region_chunk_id] = {
-                    partial_seq,
-                    partial_slot,
-                    scratch_reuse_seq,
-                    true,
-                };
+                phone_region_chunk_id] =
+                    std::move(local_state);
             compute_status =
                 GGML_STATUS_SUCCESS;
 
