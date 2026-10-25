@@ -10,13 +10,17 @@ Set `LLAMA_HYBRID_PHONE_REGION_GRAPH=1` on the PC when running the 48-layer dire
 
 The Qwen3MoE graph now builds **chunk-major**: L35 through L45 in one contiguous forward DAG for chunk 0, then L35 through L45 for chunk 1, and so on. Every attention call uses `build_attn_inp_kv_range(token_begin, token_count)`, including its range-specific mask and KV insertion positions. We expand each completed chunk into the top-level graph in order, to preserve KV operations' graph order. `phone_region_chunk_end_{chunk}-45` is a deliberate Meta split point. The resulting device-local Phone chunk graph should be submitted once for that chunk, without any host intervention between L35 and L45.
 
-At the Meta execution boundary a per-node check rejects any explicit Phone region graph containing a PC compute node. This is a correctness guard, not a recovery mechanism. If a guard trips, do not silence it: analyze the unexpected owner or spurious Meta boundary.
+At the Meta execution boundary, `PARTIAL` state markers can still create *internal* Meta subgraphs. The execution engine now detects a chunk by `phone_region_attn_chunk_{chunk}-35`, scans until `phone_region_chunk_end_{chunk}-45`, and fuses all of the Phone subgraphs into **one RPC graph submission** with no intermediate handoff or all-reduce. Every node is checked for PC compute ownership before fusion; an unexpected PC compute node prints `[PHONE_REGION_GRAPH_REJECT] ... reason=PC_COMPUTE_ACTIVE` and stops, instead of silently dropping required PC work.
+
+For a **single-chunk** request, `l_out-45` uses a separate zero-copy view to preserve the terminal `phone_region_chunk_end_0-45` marker. This fixes the missing end marker discovered in the 2-token warmup path.
+
+The changes are still uncompiled and unverified on Windows/Phone hardware. They specifically address the earlier failure in which an internal `Kcur-41 (view)` was mistaken for a Phone-to-PC layer output at `ggml-backend-meta.cpp:8885`.
 
 ## First hardware verification (REQUIRED; not yet run)
 
 1. Build and restart matching PC and Phone server binaries at the same branch commit. Compare protocol versions and hashes.
 2. Enable `GGML_META_PIPELINE_DEBUG=1`; compare the output to the same prompt on the unchanged baseline with `LLAMA_HYBRID_PHONE_REGION_GRAPH` unset.
-3. For 358 tokens with XT=128, expect `[PHONE_REGION_GRAPH_PLAN] ... chunks=3 ... status=READY`; each explicit `[PHONE_REGION_GRAPH]` should have exactly one Phone graph covering L35-L45 and zero PC compute nodes.
+3. First verify 2-token warmup: expect `[PHONE_REGION_GRAPH] chunk=0 ... layers=[35,46) ... status=DEVICE_LOCAL_READY` and `[PHONE_REGION_GRAPH_DONE] ... status=0`; then test 358 tokens with XT=128 and expect `[PHONE_REGION_GRAPH_PLAN] enabled=1 ... chunks=3 ... status=READY` plus three fused region submissions. If any `PHONE_REGION_GRAPH_REJECT` appears, inspect the exact PC-active node and do not ignore the error.
 4. Verify no `[PHONE_ONLY_SG]` markers inside a Phone Region chunk, unless a deliberate subgraph boundary must be investigated. Check L34 final `l_out`, L45 output, L46 input, L46 P2C parity, full-vocabulary logits and generated text.
 5. Run 1, 2, 16, 120, 128, 358 and 512 prompt-token cases; also run incremental decode. Decode uses the existing baseline path.
 6. Inspect KV per-layer positions for all chunks and compare the last token of each chunk against the baseline. Ensure position/mask validity for the following chunks.
