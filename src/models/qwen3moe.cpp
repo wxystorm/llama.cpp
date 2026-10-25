@@ -291,6 +291,51 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
+    // Region Boundary V1: the Phone-only middle is executed as a single
+    // device-local graph for each prefill chunk, not as per-layer RPC graphs.
+    // Keep this opt-in and restricted to the verified directional pair.
+    const char * phone_region_env = std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
+    const bool phone_region_requested =
+        phone_region_env != nullptr && std::atoi(phone_region_env) != 0;
+    int phone_region_first = -1;
+    int phone_region_end = -1;  // exclusive
+    std::vector<int> phone_region_chunks;
+    if (phone_region_requested && !stage_graph && n_layer == 48 &&
+            n_tokens > 1 && ubatch.n_pos == 1 && ubatch.n_seqs == 1 &&
+            ubatch.n_seqs_unq == 1 &&
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            planned_chunk_tokens > 0 && loras->empty() &&
+            !moe_stage_wavefront &&
+            model.hybrid_layer_mode(34) == llama_hybrid_layer_mode::TENSOR_C2P &&
+            model.hybrid_layer_mode(46) == llama_hybrid_layer_mode::TENSOR_P2C) {
+        bool phone_only = true;
+        for (int il = 35; il < 46; ++il) {
+            phone_only = phone_only &&
+                model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::PHONE_ONLY &&
+                cvec->tensor_for(il) == nullptr &&
+                (size_t) il < cparams.embeddings_layer_inp.size() &&
+                !cparams.embeddings_layer_inp[(size_t) il];
+        }
+        if (phone_only) {
+            phone_region_chunks = llama_hybrid_runtime_tensor_chunks(
+                (int) n_tokens, planned_chunk_tokens);
+            if (!phone_region_chunks.empty()) {
+                phone_region_first = 35;
+                phone_region_end = 46;
+            }
+        }
+    }
+    if (phone_region_requested) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_REGION_GRAPH_PLAN] enabled=%d layers=[%d,%d) "
+            "tokens=%" PRId64 " chunks=%zu graph_per_chunk=1 "
+            "fallback=LEGACY status=%s\n",
+            phone_region_first >= 0 ? 1 : 0,
+            phone_region_first, phone_region_end, n_tokens,
+            phone_region_chunks.size(),
+            phone_region_first >= 0 ? "READY" : "SKIP_UNSUPPORTED");
+    }
+
     if (moe_stage_wavefront) {
         std::vector<int64_t> chunk_begin(
             wave_chunk_sizes.size(), 0);
@@ -663,6 +708,136 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     for (int il = layer_begin; il < layer_end; ++il) {
+        if (il == phone_region_first) {
+            // Keep the C2P final owner and the L46 P2C protocol untouched.
+            // L34's complete Phone-owned output is the immutable input to
+            // each chunk; only the Phone Full region is re-tiled here.
+            GGML_ASSERT(inpL->ne[1] == n_tokens);
+            ggml_tensor * region_entry = ggml_cont(ctx0, inpL);
+            cb(region_entry, "phone_region_input", il);
+
+            std::vector<ggml_tensor *> region_outputs;
+            region_outputs.reserve(phone_region_chunks.size());
+            int64_t token_begin = 0;
+            for (size_t ci = 0; ci < phone_region_chunks.size(); ++ci) {
+                const int64_t count = phone_region_chunks[ci];
+                GGML_ASSERT(count > 0 && token_begin + count <= n_tokens);
+                ggml_tensor * hidden = ggml_view_2d(
+                    ctx0, region_entry, region_entry->ne[0], count,
+                    region_entry->nb[1], token_begin * region_entry->nb[1]);
+                const std::string chunk_begin_name =
+                    "phone_region_chunk_begin_" + std::to_string(ci);
+                cb(hidden, chunk_begin_name.c_str(), phone_region_first);
+
+                // Chunk-major graph order. Finish every layer of chunk N
+                // before beginning chunk N+1. The per-range KV inputs use the
+                // same token positions/masks as the ordinary attention path.
+                for (int region_il = phone_region_first;
+                     region_il < phone_region_end; ++region_il) {
+                    if (ci == 0) {
+                        // Per-layer embedding extraction is excluded by the
+                        // eligibility check above.
+                        res->t_layer_inp[region_il] = hidden;
+                    }
+                    ggml_tensor * residual = hidden;
+                    ggml_tensor * attn_norm = build_norm(
+                        hidden, model.layers[region_il].attn_norm, NULL,
+                        LLM_NORM_RMS, region_il);
+                    cb(attn_norm, "attn_norm", region_il);
+
+                    auto [Qcur, Kcur, Vcur] = build_qkv(
+                        model.layers[region_il], attn_norm,
+                        n_embd_head, n_head, n_head_kv, region_il);
+                    Qcur = build_norm(
+                        Qcur, model.layers[region_il].attn_q_norm,
+                        NULL, LLM_NORM_RMS, region_il);
+                    cb(Qcur, "Qcur_normed", region_il);
+                    Kcur = build_norm(
+                        Kcur, model.layers[region_il].attn_k_norm,
+                        NULL, LLM_NORM_RMS, region_il);
+                    cb(Kcur, "Kcur_normed", region_il);
+
+                    ggml_tensor * pos_chunk = ggml_view_1d(
+                        ctx0, inp_pos, count, token_begin * inp_pos->nb[0]);
+                    Qcur = ggml_rope_ext(
+                        ctx0, Qcur, pos_chunk, nullptr,
+                        n_rot, rope_type, n_ctx_orig,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        beta_fast, beta_slow);
+                    Kcur = ggml_rope_ext(
+                        ctx0, Kcur, pos_chunk, nullptr,
+                        n_rot, rope_type, n_ctx_orig,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        beta_fast, beta_slow);
+                    cb(Qcur, "Qcur", region_il);
+                    cb(Kcur, "Kcur", region_il);
+                    cb(Vcur, "Vcur", region_il);
+
+                    auto * chunk_attn = build_attn_inp_kv_range(
+                        (uint32_t) token_begin, (uint32_t) count);
+                    ggml_tensor * attn = build_attn(
+                        chunk_attn, model.layers[region_il].wo,
+                        model.layers[region_il].wo_b,
+                        model.layers[region_il].wo_s,
+                        Qcur, Kcur, Vcur,
+                        nullptr, nullptr, nullptr,
+                        1.0f / sqrtf(float(n_embd_head)), region_il);
+                    const std::string attn_name =
+                        "phone_region_attn_chunk_" + std::to_string(ci);
+                    cb(attn, attn_name.c_str(), region_il);
+
+                    ggml_tensor * ffn_inp = ggml_add(ctx0, attn, residual);
+                    const std::string ffn_inp_name =
+                        "phone_region_ffn_inp_chunk_" + std::to_string(ci);
+                    cb(ffn_inp, ffn_inp_name.c_str(), region_il);
+                    ggml_tensor * ffn_norm = build_norm(
+                        ffn_inp, model.layers[region_il].ffn_norm,
+                        NULL, LLM_NORM_RMS, region_il);
+                    const std::string ffn_norm_name =
+                        "phone_region_ffn_norm_chunk_" + std::to_string(ci);
+                    cb(ffn_norm, ffn_norm_name.c_str(), region_il);
+
+                    ggml_tensor * moe_out = build_moe_ffn(
+                        ffn_norm, model.layers[region_il].ffn_gate_inp,
+                        model.layers[region_il].ffn_up_exps,
+                        model.layers[region_il].ffn_gate_exps,
+                        model.layers[region_il].ffn_down_exps,
+                        nullptr, n_expert, n_expert_used,
+                        LLM_FFN_SILU, true, hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, region_il,
+                        nullptr, nullptr,
+                        model.layers[region_il].ffn_up_exps_s,
+                        model.layers[region_il].ffn_gate_exps_s,
+                        model.layers[region_il].ffn_down_exps_s);
+                    const std::string ffn_out_name =
+                        "phone_region_ffn_out_chunk_" + std::to_string(ci);
+                    cb(moe_out, ffn_out_name.c_str(), region_il);
+                    hidden = ggml_add(ctx0, moe_out, ffn_inp);
+                    const std::string output_name =
+                        region_il + 1 == phone_region_end ?
+                        "phone_region_chunk_end_" + std::to_string(ci) :
+                        "phone_region_l_out_chunk_" + std::to_string(ci);
+                    cb(hidden, output_name.c_str(), region_il);
+                }
+
+                // Explicit graph expansion preserves KV-write ordering across
+                // chunks, even where KV-cache dependencies are implicit.
+                ggml_build_forward_expand(gf, hidden);
+                region_outputs.push_back(hidden);
+                token_begin += count;
+            }
+            GGML_ASSERT(token_begin == n_tokens);
+            ggml_tensor * region_join = region_outputs.front();
+            for (size_t ci = 1; ci < region_outputs.size(); ++ci) {
+                region_join = ggml_concat(ctx0, region_join,
+                                          region_outputs[ci], 1);
+            }
+            cb(region_join, "l_out", phone_region_end - 1);
+            inpL = region_join;
+            il = phone_region_end - 1;
+            continue;
+        }
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
