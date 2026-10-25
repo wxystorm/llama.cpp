@@ -16629,9 +16629,9 @@ auto prefill_norm_sg_has_prework =
 
         if (region_pipeline_active && pipeline_debug &&
                 pipeline_stage != nullptr) {
-            // The Phone worker's return means SUBMITTED, not that the GPU
-            // finished; the next C2P route handoff has an existing Phone
-            // synchronize which provides the bounded window-2 credit.
+            // A Region stage is only submitted here. Its exact producer
+            // completion is consumed later by P2C_CONTINUE via the dedicated
+            // per-sequence wait socket; all other stages complete normally.
             printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
                    "sg=%zu stage=%s event=%s host_ms=%.3f status=OK\n",
                    schedule_pos, pipeline_chunk, communication_sg,
