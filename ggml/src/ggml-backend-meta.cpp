@@ -8470,6 +8470,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 record_direct_copy();
 
+                // Keep the PC priority worker paused until both the norm
+                // input and residual have been copied out of the shared graph
+                // arena. A later P2C FFN must not recycle that arena first.
+                if (local_input_stage) {
+                    GGML_ASSERT(overlap_state != nullptr);
+                    const ggml_status input_status =
+                        backend_ctx->prefill_input_worker->wait(
+                            input_task);
+                    overlap_state->input_task = 0;
+                    if (input_status != GGML_STATUS_SUCCESS) {
+                        release_region_c2p_overlap_chunk(
+                            prefill_norm_layer,
+                            prefill_norm_chunk,
+                            "INPUT_SNAPSHOT_FAILED");
+                        return input_status;
+                    }
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_MAIN_C2P_INPUT_READY] "
+                            "layer=%d chunk=%d task=%" PRIu64
+                            " residual_snapshot=1 status=READY\n",
+                            prefill_norm_layer,
+                            prefill_norm_chunk,
+                            input_task);
+                    }
+                }
+
                 if (pipeline_debug) {
                     GGML_LOG_INFO(
                         "[PREFILL_INPUT] layer=%d chunk=%d tensor=%s "
@@ -13273,7 +13300,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_c2p_overlap_chunks.find({ layer, chunk });
             if (state_it == region_c2p_overlap_chunks.end() ||
                     !state_it->second.input_staged ||
-                    state_it->second.input_task == 0) {
+                    (state_it->second.input_task == 0 &&
+                     !phone_main_local_active)) {
                 printf(
                     "[REGION_C2P_OVERLAP_REJECT] "
                     "layer=%d chunk=%d sg=%zu "
