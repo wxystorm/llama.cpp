@@ -6,6 +6,7 @@
 #include "transport.h"
 
 #include <array>
+#include <deque>
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
@@ -264,6 +265,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_FFN_MARK_READY,
     RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT,
     RPC_CMD_WAIT_READY_SEQ,
+    RPC_CMD_PHONE_REGION_LOCAL_SUBMIT,
     RPC_CMD_COUNT,
 };
 
@@ -285,6 +287,7 @@ static_assert(RPC_CMD_GET_ROUTE_SNAPSHOT == 30, "RPC_CMD_GET_ROUTE_SNAPSHOT must
 static_assert(RPC_CMD_PHONE_FFN_MARK_READY == 31, "RPC_CMD_PHONE_FFN_MARK_READY must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_WAIT_READY_SEQ == 33, "RPC_CMD_WAIT_READY_SEQ must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_REGION_LOCAL_SUBMIT == 34, "RPC_CMD_PHONE_REGION_LOCAL_SUBMIT must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -436,6 +439,18 @@ struct rpc_msg_get_route_snapshot_req {
     uint32_t lane;
     uint64_t seq;
     uint64_t sizes[3];
+};
+
+struct rpc_msg_phone_region_local_submit_req {
+    uint32_t device;
+    int32_t chunk;
+    uint64_t graph_sizes[3]; // Region, L46 Attention/Router, L46 Phone FFN
+    rpc_msg_route_snapshot_ready_req ready;
+    rpc_msg_snapshot_tensor_req partial;
+};
+
+struct rpc_msg_phone_region_local_submit_rsp {
+    uint8_t accepted;
 };
 
 struct rpc_msg_set_tensor_graph_req_v6 {
@@ -3095,6 +3110,177 @@ static bool ggml_backend_rpc_wait_ready_seq(
     return status;
 }
 
+
+static bool ggml_backend_rpc_phone_region_local_submit(
+        ggml_backend_t backend,
+        int chunk,
+        const ggml_cgraph * region_graph,
+        const ggml_cgraph * attn_graph,
+        const ggml_tensor * ready_hidden,
+        const ggml_tensor * ready_topk,
+        const ggml_tensor * ready_weights,
+        uint64_t ready_seq,
+        uint32_t ready_lane,
+        const ggml_cgraph * ffn_graph,
+        const ggml_tensor * partial,
+        uint64_t partial_seq,
+        uint32_t partial_slot) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_PHONE_REGION_LOCAL_MIN_PATCH = 14;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_PHONE_REGION_LOCAL_MIN_PATCH) {
+        return false;
+    }
+
+    // Capability query used by Meta during pipeline preflight.
+    if (region_graph == nullptr && attn_graph == nullptr &&
+            ffn_graph == nullptr && ready_hidden == nullptr &&
+            ready_topk == nullptr && ready_weights == nullptr &&
+            partial == nullptr && ready_seq == 0 &&
+            partial_seq == 0) {
+        return ready_lane < RPC_ROUTE_TRANSFER_LANES &&
+            partial_slot < 2;
+    }
+
+    if (chunk < 0 || region_graph == nullptr ||
+            attn_graph == nullptr || ffn_graph == nullptr ||
+            ready_hidden == nullptr || ready_topk == nullptr ||
+            ready_weights == nullptr || partial == nullptr ||
+            ready_seq == 0 || partial_seq == 0 ||
+            ready_lane >= RPC_ROUTE_TRANSFER_LANES ||
+            partial_slot >= 2) {
+        return false;
+    }
+
+    const ggml_tensor * ready_tensors[3] = {
+        ready_hidden, ready_topk, ready_weights,
+    };
+    for (const ggml_tensor * tensor : ready_tensors) {
+        if (tensor->buffer == nullptr ||
+                !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+            return false;
+        }
+        auto * buffer_ctx =
+            static_cast<ggml_backend_rpc_buffer_context *>(
+                tensor->buffer->context);
+        if (buffer_ctx == nullptr ||
+                buffer_ctx->endpoint != rpc_ctx->endpoint ||
+                buffer_ctx->device != rpc_ctx->device) {
+            return false;
+        }
+    }
+    if (partial->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(partial->buffer)) {
+        return false;
+    }
+    auto * partial_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            partial->buffer->context);
+    if (partial_buffer_ctx == nullptr ||
+            partial_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            partial_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    std::array<std::vector<uint8_t>, 3> graphs;
+    const ggml_cgraph * graph_ptrs[3] = {
+        region_graph, attn_graph, ffn_graph,
+    };
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        serialize_graph(
+            rpc_ctx->device,
+            rpc_graph_effective_uid(graph_ptrs[i]),
+            graph_ptrs[i],
+            graphs[i]);
+    }
+
+    rpc_msg_phone_region_local_submit_req request {};
+    request.device = rpc_ctx->device;
+    request.chunk = chunk;
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        request.graph_sizes[i] = graphs[i].size();
+    }
+
+    request.ready.device = rpc_ctx->device;
+    request.ready.lane = ready_lane;
+    request.ready.seq = ready_seq;
+    for (size_t i = 0; i < 3; ++i) {
+        request.ready.tensors[i] =
+            serialize_tensor(ready_tensors[i]);
+        request.ready.sizes[i] =
+            ggml_nbytes(ready_tensors[i]);
+    }
+
+    request.partial.device = rpc_ctx->device;
+    request.partial.slot = partial_slot;
+    request.partial.seq = partial_seq;
+    request.partial.tensor = serialize_tensor(partial);
+    request.partial.offset = 0;
+    request.partial.size = ggml_nbytes(partial);
+
+    size_t input_size = sizeof(request);
+    for (const auto & graph : graphs) {
+        if (graph.size() > SIZE_MAX - input_size) {
+            return false;
+        }
+        input_size += graph.size();
+    }
+
+    std::vector<uint8_t> input(input_size);
+    uint8_t * out = input.data();
+    memcpy(out, &request, sizeof(request));
+    out += sizeof(request);
+    for (const auto & graph : graphs) {
+        memcpy(out, graph.data(), graph.size());
+        out += graph.size();
+    }
+    GGML_ASSERT(
+        static_cast<size_t>(out - input.data()) ==
+        input.size());
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    RPC_STATUS_ASSERT(sock != nullptr);
+
+    rpc_msg_phone_region_local_submit_rsp response {};
+    const int64_t begin_us = ggml_time_us();
+    const bool status = send_rpc_cmd(
+        sock,
+        RPC_CMD_PHONE_REGION_LOCAL_SUBMIT,
+        input.data(),
+        input.size(),
+        &response,
+        sizeof(response));
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[PHONE_REGION_MAIN_SUBMIT] side=pc chunk=%d "
+            "ready_seq=%" PRIu64 " ready_lane=%u "
+            "partial_seq=%" PRIu64 " partial_slot=%u "
+            "submit_ms=%.3f accepted=%d\n",
+            chunk,
+            ready_seq,
+            ready_lane,
+            partial_seq,
+            partial_slot,
+            (ggml_time_us() - begin_us) / 1000.0,
+            status && response.accepted ? 1 : 0);
+        std::fflush(stderr);
+    }
+
+    return status && response.accepted != 0;
+}
+
 static bool ggml_backend_rpc_set_tensor_async_return_wait(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -3782,6 +3968,14 @@ struct rpc_opencl_tensor_storage_entry {
     bool ambiguous = false;
 };
 
+
+struct rpc_phone_region_local_task {
+    int chunk = -1;
+    std::array<std::vector<uint8_t>, 3> graphs;
+    rpc_msg_route_snapshot_ready_req ready {};
+    rpc_msg_snapshot_tensor_req partial {};
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
@@ -3797,6 +3991,8 @@ public:
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
         }
+        phone_region_main_thread =
+            std::thread([this]() { phone_region_main_loop(); });
     }
     ~rpc_server();
 
@@ -3828,6 +4024,9 @@ public:
     bool route_snapshot_ready(
         const rpc_msg_route_snapshot_ready_req & request,
         rpc_msg_route_snapshot_ready_rsp & response);
+    bool phone_region_local_submit(
+        const std::vector<uint8_t> & input,
+        rpc_msg_phone_region_local_submit_rsp & response);
     bool get_route_snapshot(
         const rpc_msg_get_route_snapshot_req & request,
         std::vector<uint8_t> & response);
@@ -3852,6 +4051,9 @@ public:
         ggml_cgraph          * graph;
     };
 private:
+    void phone_region_main_loop();
+    bool run_phone_region_local_task(
+        const rpc_phone_region_local_task & task);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     bool is_opencl_tensor(const ggml_tensor * tensor) const;
     rpc_opencl_tensor_extra_key opencl_tensor_extra_key(const ggml_tensor * tensor) const;
@@ -3871,6 +4073,12 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+
+    std::mutex phone_region_main_mutex;
+    std::condition_variable phone_region_main_cv;
+    std::deque<rpc_phone_region_local_task> phone_region_main_queue;
+    std::thread phone_region_main_thread;
+    bool phone_region_main_stop = false;
     std::unordered_set<ggml_backend_buffer_t> buffers;
 
     // Non-owning OpenCL-only tensor state. Entries are removed before the
@@ -5136,6 +5344,155 @@ bool rpc_server::get_tensor(
     return get_tensor_into(request, response.data());
 }
 
+
+bool rpc_server::phone_region_local_submit(
+        const std::vector<uint8_t> & input,
+        rpc_msg_phone_region_local_submit_rsp & response) {
+    response.accepted = 0;
+    if (input.size() < sizeof(rpc_msg_phone_region_local_submit_req)) {
+        return true;
+    }
+
+    rpc_msg_phone_region_local_submit_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+    if (request.device >= backends.size() ||
+            request.chunk < 0 ||
+            request.ready.device != request.device ||
+            request.partial.device != request.device ||
+            request.ready.lane >= RPC_ROUTE_TRANSFER_LANES ||
+            request.partial.slot >= 2 ||
+            request.ready.seq == 0 ||
+            request.partial.seq == 0) {
+        return true;
+    }
+
+    size_t expected = sizeof(request);
+    for (size_t i = 0; i < 3; ++i) {
+        if (request.graph_sizes[i] == 0 ||
+                request.graph_sizes[i] > SIZE_MAX - expected) {
+            return true;
+        }
+        expected += static_cast<size_t>(request.graph_sizes[i]);
+    }
+    if (expected != input.size()) {
+        return true;
+    }
+
+    rpc_phone_region_local_task task;
+    task.chunk = request.chunk;
+    task.ready = request.ready;
+    task.partial = request.partial;
+
+    const uint8_t * src = input.data() + sizeof(request);
+    for (size_t i = 0; i < task.graphs.size(); ++i) {
+        const size_t graph_size =
+            static_cast<size_t>(request.graph_sizes[i]);
+        task.graphs[i].assign(src, src + graph_size);
+        src += graph_size;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        if (phone_region_main_stop) {
+            return true;
+        }
+        phone_region_main_queue.emplace_back(std::move(task));
+    }
+    phone_region_main_cv.notify_one();
+    response.accepted = 1;
+
+    if (RPC_DEBUG ||
+            rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[PHONE_REGION_MAIN_ENQUEUE] chunk=%d "
+            "ready_seq=%" PRIu64 " lane=%u "
+            "partial_seq=%" PRIu64 " slot=%u status=QUEUED\n",
+            request.chunk,
+            request.ready.seq,
+            request.ready.lane,
+            request.partial.seq,
+            request.partial.slot);
+        std::fflush(stderr);
+    }
+
+    return true;
+}
+
+void rpc_server::phone_region_main_loop() {
+    while (true) {
+        rpc_phone_region_local_task task;
+        {
+            std::unique_lock<std::mutex> lock(phone_region_main_mutex);
+            phone_region_main_cv.wait(
+                lock,
+                [&]() {
+                    return phone_region_main_stop ||
+                        !phone_region_main_queue.empty();
+                });
+            if (phone_region_main_stop &&
+                    phone_region_main_queue.empty()) {
+                return;
+            }
+            task = std::move(phone_region_main_queue.front());
+            phone_region_main_queue.pop_front();
+        }
+
+        const bool ok = run_phone_region_local_task(task);
+        std::fprintf(
+            stderr,
+            "[PHONE_REGION_MAIN_DONE] chunk=%d "
+            "ready_seq=%" PRIu64 " partial_seq=%" PRIu64
+            " status=%s\n",
+            task.chunk,
+            task.ready.seq,
+            task.partial.seq,
+            ok ? "OK" : "FAIL");
+        std::fflush(stderr);
+    }
+}
+
+bool rpc_server::run_phone_region_local_task(
+        const rpc_phone_region_local_task & task) {
+    const int64_t begin_us = ggml_time_us();
+
+    // MAIN owns this complete Phone critical path:
+    // Region -> L46 Attention/Router -> READY -> Phone FFN -> PARTIAL.
+    if (!graph_compute(task.graphs[0])) {
+        return false;
+    }
+    if (!graph_compute(task.graphs[1])) {
+        return false;
+    }
+
+    rpc_msg_route_snapshot_ready_rsp ready_response {};
+    if (!route_snapshot_ready(task.ready, ready_response) ||
+            ready_response.result == 0) {
+        return false;
+    }
+
+    if (!graph_compute(task.graphs[2])) {
+        return false;
+    }
+
+    if (!snapshot_tensor(task.partial)) {
+        return false;
+    }
+
+    if (RPC_DEBUG ||
+            rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[PHONE_REGION_MAIN_PATH] chunk=%d "
+            "path=REGION_L35_L45>L46_ATTN>READY>"
+            "L46_PHONE_FFN>PARTIAL wall_ms=%.3f status=OK\n",
+            task.chunk,
+            (ggml_time_us() - begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+    return true;
+}
+
 bool rpc_server::route_snapshot_ready(
         const rpc_msg_route_snapshot_ready_req & request,
         rpc_msg_route_snapshot_ready_rsp & response) {
@@ -6189,6 +6546,15 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        phone_region_main_stop = true;
+    }
+    phone_region_main_cv.notify_all();
+    if (phone_region_main_thread.joinable()) {
+        phone_region_main_thread.join();
+    }
+
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
         const auto & stats = snapshot_breakdown[lane];
         if (stats.requests == 0) {
@@ -6826,6 +7192,22 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_REGION_LOCAL_SUBMIT: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_phone_region_local_submit_rsp response {};
+                if (!server.phone_region_local_submit(
+                        input, response)) {
+                    return;
+                }
+                if (!send_msg(
+                        sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
@@ -7733,6 +8115,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_wait_ready_seq);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_region_local_submit);
     }
     GGML_UNUSED(reg);
 
