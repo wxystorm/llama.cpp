@@ -4090,8 +4090,10 @@ private:
 
     std::mutex opencl_tensor_extras_mutex;
 
-    // store computed graphs for each backend by graph uid
+    // store computed graphs for each backend by graph uid. MAIN replay and
+    // ordinary RPC registration can run on different host threads.
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+    std::mutex stored_graphs_mutex;
 
     // Phone-local MAIN owns the critical GPU chain. Normal RPC graph work may
     // run only while no MAIN job is pending/running. This is deliberately one
@@ -6185,6 +6187,7 @@ bool rpc_server::graph_register(const std::vector<uint8_t> & input) {
     size_t buf_size =
         ggml_tensor_overhead()*(n_nodes + n_tensors) +
         ggml_graph_overhead_custom(n_nodes, false);
+    std::lock_guard<std::mutex> graph_lock(stored_graphs_mutex);
     stored_graph & graph_entry =
         stored_graphs[device][graph_uid];
     if (graph_entry.buffer.size() < buf_size) {
@@ -6258,12 +6261,16 @@ bool rpc_server::graph_recompute_unlocked(
     if (device >= backends.size()) {
         return false;
     }
-    auto it = stored_graphs[device].find(request.graph_uid);
-    if (it == stored_graphs[device].end() ||
-            it->second.graph == nullptr) {
-        return false;
+    ggml_cgraph * graph = nullptr;
+    {
+        std::lock_guard<std::mutex> graph_lock(stored_graphs_mutex);
+        auto it = stored_graphs[device].find(request.graph_uid);
+        if (it == stored_graphs[device].end() ||
+                it->second.graph == nullptr) {
+            return false;
+        }
+        graph = it->second.graph;
     }
-    ggml_cgraph * graph = it->second.graph;
     LOG_DBG(
         "[%s] device: %u, graph_uid: %" PRIu64 "\n",
         __func__, device, request.graph_uid);
