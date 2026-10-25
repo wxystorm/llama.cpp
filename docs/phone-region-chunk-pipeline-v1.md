@@ -98,6 +98,44 @@ For three chunks, expect scratch/output ownership similar to:
 
 The non-zero `reuse_wait_ms` on chunk 2 is the explicit window=2 credit: slot 0 cannot be overwritten until the Phone backend has completed the earlier graph that used it.
 
+### Pool prewarm and host-stage profiling
+
+The first scratch-pool implementation allocated a slot/output lazily when its Region stage began. On the first 358-token hardware run this exposed roughly 795 ms and 720 ms in Region chunk 1/2 even though `PHONE_REGION_GRAPH_DONE` itself was only a few milliseconds. A plausible cause is remote OpenCL/RPC allocation serializing behind the already-submitted previous Region graph.
+
+The current branch therefore allocates **all two scratch slots and every per-chunk L45 output buffer before the first C2P/Region pipeline stage starts**. The buffers remain persistent in the Meta backend config and subsequent graph executions reuse them.
+
+Expected preflight:
+
+```
+[PHONE_REGION_POOL_PREP] ready=1 outputs=3 output_mib=... slot0_mib=... slot1_mib=... alloc_ms=... reason=READY
+```
+
+No `alloc_buffer` attributable to these Region slots should occur between `PHONE_REGION_PIPE_STAGE ... stage=PHONE_REGION event=BEGIN` and `event=SUBMITTED`.
+
+Each Region stage now also prints:
+
+```
+[PHONE_REGION_HOST_BREAKDOWN] chunk=N
+  pre_graph_ms=...
+  graph_build_ms=...
+  output_bind_ms=...
+  scratch_bind_ms=...
+  submit_ms=...
+  post_submit_ms=...
+  other_ms=...
+  total_ms=...
+```
+
+This separates structural ownership scanning, fused graph assembly, descriptor rebinding, RPC graph submission, and post-submit Meta work. Do not interpret `submit_ms` as Phone GPU execution time; the RPC compute path is asynchronous.
+
+The RPC backend already caches non-zero graph UIDs and sends `GRAPH_RECOMPUTE` on a cache hit. Region submissions now log a stable per chunk/slot key:
+
+```
+[PHONE_REGION_CACHE_KEY] chunk=N slot=S uid=... policy=PERSISTENT_SLOT_UID
+```
+
+Because scratch/output buffers are persistent, that UID describes stable remote addresses across repeated executions of the same graph shape. A new RPC graph-registration protocol is intentionally deferred: the measured `PHONE_REGION_GRAPH_DONE` time was already small, so prewarming allocation is the higher-priority fix. If later logs still show large `submit_ms`, inspect PC `[RPC_GRAPH] ... cmd=GRAPH_COMPUTE/GRAPH_RECOMPUTE` before adding protocol complexity.
+
 If `[PHONE_REGION_PIPE_PLAN] active=0`, inspect the `reason`:
 - `UNSUPPORTED_GRAPH`: missing, non-consecutive, or otherwise unsuitable SG arrangement.
 - `OUTPUT_BUFFER_UNAVAILABLE`: the graph does not expose a materialized L45 chunk output that can be rebound safely.
