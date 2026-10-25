@@ -198,11 +198,13 @@ inline llama_hybrid_cycle_reduce_graph llama_hybrid_cycle_build_reduce_graph(
 inline llama_hybrid_cycle_ffn_shard_weights llama_hybrid_cycle_get_physical_ffn_weights(
         const ggml_tensor * up, const ggml_tensor * gate,
         const ggml_tensor * down, size_t device_index) {
-    return {
-        ggml_backend_meta_get_static_weight_shard(up, device_index),
-        ggml_backend_meta_get_static_weight_shard(gate, device_index),
-        ggml_backend_meta_get_static_weight_shard(down, device_index),
-    };
+    // The Region-cycle mirror imports only PC Full primitives. Tensor/Phone
+    // physical shards continue to be resolved by the existing Meta path.
+    GGML_UNUSED(up);
+    GGML_UNUSED(gate);
+    GGML_UNUSED(down);
+    GGML_UNUSED(device_index);
+    return {};
 }
 
 inline bool llama_hybrid_cycle_ffn_shard_weights_valid(
