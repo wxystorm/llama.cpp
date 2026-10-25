@@ -2424,9 +2424,12 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
     // V1 endpoint separation: ordinary PC-primary Tensor FFN work destined
     // for Phone is submitted through its own FIFO instead of borrowing the
-    // PC Meta compute-worker control path. Directional C2P/P2C and Region
-    // execution keep their existing paths for now.
+    // PC Meta compute-worker control path. Completion is consumed on a
+    // separate completion socket/worker so a graph submit is never mistaken
+    // for a completed Phone FFN.
     ggml_backend_meta_transfer_worker * phone_exec_worker = nullptr;
+    ggml_backend_meta_transfer_worker * phone_exec_completion_worker = nullptr;
+    uint64_t                            next_pc_phone_exec_seq = 1;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
@@ -3064,6 +3067,7 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
     delete phone_exec_worker;
+    delete phone_exec_completion_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
     for (auto * worker : prefill_return_workers) {
@@ -11232,13 +11236,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 GGML_ASSERT(ggml_nbytes(pc_output_chunk) == ggml_nbytes(node_dst));
             }
 
+            ggml_backend_meta_transfer_worker * phone_ready_worker = nullptr;
+            uint64_t phone_ready_task = 0;
+            uint64_t phone_ready_seq = 0;
+            auto pc_phone_ticket_it =
+                pending_pc_phone_exec_tickets.find(i);
+            if (pc_phone_ticket_it !=
+                    pending_pc_phone_exec_tickets.end()) {
+                phone_ready_worker =
+                    ensure_phone_exec_completion_worker();
+                phone_ready_task =
+                    pc_phone_ticket_it->second.completion_task;
+                phone_ready_seq =
+                    pc_phone_ticket_it->second.seq;
+                pending_pc_phone_exec_tickets.erase(
+                    pc_phone_ticket_it);
+            }
+
             const int64_t return_enqueue_us = ggml_time_us();
             const uint64_t reduce_task = reduce_worker->enqueue(
                 [&, node_src, node_dst, node_tmp, cgraph_aux, i, set_stage_ready, rpc_fence,
                     set_snapshot_read, use_snapshot_pipeline, snapshot_slot,
                     snapshot_seq, return_enqueue_us, handoff_to_phone, prefill_down_layer_0,
                     prefill_down_chunk_0, layer_handoff, pc_l_out, phone_l_out,
-                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane](uint64_t task_id) -> ggml_status {
+                    pc_output_chunk, chunk_layer_graph, reduce_worker, return_lane,
+                    phone_ready_worker, phone_ready_task, phone_ready_seq](uint64_t task_id) -> ggml_status {
                     ggml_backend_meta_stage_ready_context stage_context {
                         reduce_worker,
                         task_id,
@@ -11281,6 +11303,36 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         }
                         return result;
                     };
+
+                    if (phone_ready_worker != nullptr &&
+                            phone_ready_task != 0) {
+                        const int64_t ready_wait_begin_us =
+                            ggml_time_us();
+                        const ggml_status ready_status =
+                            phone_ready_worker->wait(
+                                phone_ready_task);
+                        const int64_t ready_wait_us =
+                            ggml_time_us() - ready_wait_begin_us;
+                        if (pipeline_debug) {
+                            printf(
+                                "[PC_PHONE_EXEC_V1] side=PC "
+                                "event=REDUCE_READY "
+                                "seq=%" PRIu64
+                                " sg=%zu layer=%d chunk=%d "
+                                "reduce_task=%" PRIu64
+                                " wait_ms=%.3f status=%d\n",
+                                phone_ready_seq,
+                                i,
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                task_id,
+                                ready_wait_us / 1000.0,
+                                (int) ready_status);
+                        }
+                        if (ready_status != GGML_STATUS_SUCCESS) {
+                            return finish_return(ready_status);
+                        }
+                    }
 
                     if (use_snapshot_pipeline) {
                         set_snapshot_read(true, snapshot_slot, snapshot_seq);
@@ -12682,54 +12734,126 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return backend_ctx->phone_exec_worker;
     };
 
+    auto ensure_phone_exec_completion_worker =
+        [&]() -> ggml_backend_meta_transfer_worker * {
+            GGML_ASSERT(n_backends == 2);
+            if (backend_ctx->phone_exec_completion_worker == nullptr) {
+                backend_ctx->phone_exec_completion_worker =
+                    new ggml_backend_meta_transfer_worker();
+            }
+            return backend_ctx->phone_exec_completion_worker;
+        };
+
+    struct pc_phone_exec_ticket {
+        uint64_t submit_task = 0;
+        uint64_t completion_task = 0;
+        uint64_t seq = 0;
+    };
+    std::map<size_t, pc_phone_exec_ticket>
+        pending_pc_phone_exec_tickets;
+
     auto enqueue_phone_exec_graph =
-        [&](ggml_cgraph * graph, size_t sg, int layer, int chunk) -> uint64_t {
+        [&](ggml_cgraph * graph, size_t sg, int layer, int chunk)
+            -> pc_phone_exec_ticket {
             GGML_ASSERT(pc_phone_exec_v1);
             GGML_ASSERT(n_backends == 2);
             GGML_ASSERT(graph != nullptr);
 
-            ggml_backend_meta_transfer_worker * worker =
-                ensure_phone_exec_worker();
             ggml_backend_t phone_backend =
                 backend_ctx->backend_configs[1].backend;
+            const ggml_backend_rpc_phone_ffn_mark_ready_t mark_ready =
+                ggml_backend_meta_get_phone_ffn_mark_ready(phone_backend);
+            const ggml_backend_rpc_wait_ready_seq_t wait_ready =
+                ggml_backend_meta_get_wait_ready_seq(phone_backend);
+            GGML_ASSERT(mark_ready != nullptr);
+            GGML_ASSERT(wait_ready != nullptr);
+            GGML_ASSERT(mark_ready(phone_backend, 0));
+            GGML_ASSERT(wait_ready(phone_backend, 0));
 
-            return worker->enqueue(
-                [&, graph, phone_backend, sg, layer, chunk]
+            uint64_t seq = backend_ctx->next_pc_phone_exec_seq++;
+            if (seq == 0) {
+                seq = backend_ctx->next_pc_phone_exec_seq++;
+                GGML_ASSERT(seq != 0);
+            }
+
+            ggml_backend_meta_transfer_worker * submit_worker =
+                ensure_phone_exec_worker();
+            ggml_backend_meta_transfer_worker * completion_worker =
+                ensure_phone_exec_completion_worker();
+            const int64_t dispatch_us = ggml_time_us();
+
+            const uint64_t submit_task = submit_worker->enqueue(
+                [graph, phone_backend, mark_ready, seq, sg, layer, chunk,
+                    pipeline_debug, dispatch_us]
                 (uint64_t task_id) -> ggml_status {
                     const int64_t begin_us = ggml_time_us();
                     if (pipeline_debug) {
                         printf(
-                            "[PC_PHONE_EXEC_V1] side=PHONE event=BEGIN "
-                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d\n",
-                            task_id, sg, layer, chunk);
+                            "[PC_PHONE_EXEC_V1] side=PHONE event=SUBMIT_BEGIN "
+                            "task=%" PRIu64 " seq=%" PRIu64
+                            " sg=%zu layer=%d chunk=%d queue_ms=%.3f\n",
+                            task_id, seq, sg, layer, chunk,
+                            (begin_us - dispatch_us) / 1000.0);
                     }
 
                     const ggml_status status =
                         ggml_backend_graph_compute_async(
                             phone_backend, graph);
-                    const int64_t end_us = ggml_time_us();
-
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            compute_workers.mutex);
-                        compute_workers.backend_time_us[1] +=
-                            end_us - begin_us;
-                        compute_workers.backend_call_count[1] += 1;
-                        compute_workers.completed_time_us[1] =
-                            end_us;
+                    bool marked = false;
+                    if (status == GGML_STATUS_SUCCESS) {
+                        // The marker uses the same ordered compute socket as
+                        // GRAPH_COMPUTE.  The server cannot publish seq until
+                        // the preceding Phone graph has actually completed.
+                        marked = mark_ready(phone_backend, seq);
                     }
+                    const int64_t end_us = ggml_time_us();
 
                     if (pipeline_debug) {
                         printf(
-                            "[PC_PHONE_EXEC_V1] side=PHONE event=END "
-                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d "
-                            "wall_ms=%.3f status=%d\n",
-                            task_id, sg, layer, chunk,
+                            "[PC_PHONE_EXEC_V1] side=PHONE event=SUBMITTED "
+                            "task=%" PRIu64 " seq=%" PRIu64
+                            " sg=%zu layer=%d chunk=%d "
+                            "submit_ms=%.3f graph_status=%d marked=%d\n",
+                            task_id, seq, sg, layer, chunk,
                             (end_us - begin_us) / 1000.0,
-                            (int) status);
+                            (int) status,
+                            marked ? 1 : 0);
                     }
-                    return status;
+                    return status == GGML_STATUS_SUCCESS && marked ?
+                        GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
                 });
+
+            const uint64_t completion_task = completion_worker->enqueue(
+                [submit_worker, submit_task, phone_backend, wait_ready,
+                    seq, sg, layer, chunk, pipeline_debug, dispatch_us]
+                (uint64_t task_id) -> ggml_status {
+                    const ggml_status submit_status =
+                        submit_worker->wait(submit_task);
+                    if (submit_status != GGML_STATUS_SUCCESS) {
+                        return submit_status;
+                    }
+
+                    const int64_t wait_begin_us = ggml_time_us();
+                    const bool ready = wait_ready(phone_backend, seq);
+                    const int64_t ready_us = ggml_time_us();
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PC_PHONE_EXEC_V1] side=PHONE event=PARTIAL_READY "
+                            "task=%" PRIu64 " submit_task=%" PRIu64
+                            " seq=%" PRIu64 " sg=%zu layer=%d chunk=%d "
+                            "ready_wait_ms=%.3f dispatch_to_ready_ms=%.3f "
+                            "status=%d\n",
+                            task_id, submit_task, seq, sg, layer, chunk,
+                            (ready_us - wait_begin_us) / 1000.0,
+                            (ready_us - dispatch_us) / 1000.0,
+                            ready ? 1 : 0);
+                    }
+                    return ready ?
+                        GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+                });
+
+            return { submit_task, completion_task, seq };
         };
 
     if (pc_phone_exec_v1 && pipeline_debug) {
@@ -12737,7 +12861,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             "[PC_PHONE_EXEC_V1_PLAN] active=1 "
             "scope=LEGACY_PC_PRIMARY_PREFILL "
             "pc=COMPUTE_WORKER phone=DEDICATED_FIFO "
-            "join=BEFORE_REDUCE directional=UNCHANGED\n");
+            "completion=PHONE_SEQ_READY "
+            "reduce=RETURN_WORKER directional=UNCHANGED\n");
     }
 
     int64_t compute_wall_us = 0;
@@ -16537,7 +16662,7 @@ auto prefill_norm_sg_has_prework =
                             .cgraphs[i].cgraph_main;
                     const int64_t enqueue_begin_us =
                         ggml_time_us();
-                    const uint64_t phone_task =
+                    const pc_phone_exec_ticket ticket =
                         enqueue_phone_exec_graph(
                             phone_graph, i,
                             prefill_down_layer,
@@ -16545,45 +16670,86 @@ auto prefill_norm_sg_has_prework =
                     const int64_t enqueue_us =
                         ggml_time_us() - enqueue_begin_us;
 
-                    // PC and Phone now have distinct executors. PC finishes
-                    // its own FFN shard without driving the Phone worker.
+                    // PC and Phone are independent executors.  The Meta
+                    // thread waits only for its local PC FFN and for the
+                    // lightweight Phone command submission.  In wavefront
+                    // mode the real Phone completion is consumed later by
+                    // the return/reduce worker.
                     const int64_t pc_wait_begin_us =
                         ggml_time_us();
                     pc_status = compute_workers.wait(0);
                     const int64_t pc_wait_us =
                         ggml_time_us() - pc_wait_begin_us;
 
-                    // V1 still joins at the true data dependency: reduction
-                    // cannot consume the Phone partial before it exists.
-                    // Later iterations can move this join into an RX/REDUCE
-                    // ready queue without changing the endpoint boundary.
-                    ggml_backend_meta_transfer_worker * phone_worker =
+                    ggml_backend_meta_transfer_worker * submit_worker =
                         ensure_phone_exec_worker();
-                    const bool phone_done_before_join =
-                        phone_worker->is_completed(phone_task);
-                    const int64_t join_begin_us =
+                    const int64_t submit_wait_begin_us =
                         ggml_time_us();
-                    phone_status =
-                        phone_worker->wait(phone_task);
-                    const int64_t join_us =
-                        ggml_time_us() - join_begin_us;
+                    const ggml_status submit_status =
+                        submit_worker->wait(ticket.submit_task);
+                    const int64_t submit_wait_us =
+                        ggml_time_us() - submit_wait_begin_us;
 
-                    if (pipeline_debug) {
-                        printf(
-                            "[PC_PHONE_EXEC_V1] side=PC event=JOIN_BEFORE_REDUCE "
-                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d "
-                            "enqueue_ms=%.3f pc_wait_ms=%.3f "
-                            "phone_ready_before_join=%d join_ms=%.3f "
-                            "pc_status=%d phone_status=%d\n",
-                            phone_task, i,
-                            prefill_down_layer,
-                            prefill_down_chunk,
-                            enqueue_us / 1000.0,
-                            pc_wait_us / 1000.0,
-                            phone_done_before_join ? 1 : 0,
-                            join_us / 1000.0,
-                            (int) pc_status,
-                            (int) phone_status);
+                    if (return_wavefront_graph &&
+                            submit_status == GGML_STATUS_SUCCESS) {
+                        pending_pc_phone_exec_tickets[i] = ticket;
+                        phone_status = GGML_STATUS_SUCCESS;
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[PC_PHONE_EXEC_V1] side=PC "
+                                "event=DISPATCHED_NO_JOIN "
+                                "submit_task=%" PRIu64
+                                " completion_task=%" PRIu64
+                                " seq=%" PRIu64
+                                " sg=%zu layer=%d chunk=%d "
+                                "enqueue_ms=%.3f pc_wait_ms=%.3f "
+                                "submit_wait_ms=%.3f\n",
+                                ticket.submit_task,
+                                ticket.completion_task,
+                                ticket.seq,
+                                i,
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                enqueue_us / 1000.0,
+                                pc_wait_us / 1000.0,
+                                submit_wait_us / 1000.0);
+                        }
+                    } else {
+                        // Conservative fallback when return-wavefront is off:
+                        // preserve synchronous correctness, but completion now
+                        // means the server-side Phone graph really finished.
+                        ggml_backend_meta_transfer_worker * completion_worker =
+                            ensure_phone_exec_completion_worker();
+                        const int64_t ready_wait_begin_us =
+                            ggml_time_us();
+                        phone_status =
+                            submit_status != GGML_STATUS_SUCCESS ?
+                                submit_status :
+                                completion_worker->wait(
+                                    ticket.completion_task);
+                        const int64_t ready_wait_us =
+                            ggml_time_us() - ready_wait_begin_us;
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[PC_PHONE_EXEC_V1] side=PC "
+                                "event=SYNC_COMPLETION_FALLBACK "
+                                "seq=%" PRIu64
+                                " sg=%zu layer=%d chunk=%d "
+                                "pc_wait_ms=%.3f submit_wait_ms=%.3f "
+                                "ready_wait_ms=%.3f "
+                                "pc_status=%d phone_status=%d\n",
+                                ticket.seq,
+                                i,
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                pc_wait_us / 1000.0,
+                                submit_wait_us / 1000.0,
+                                ready_wait_us / 1000.0,
+                                (int) pc_status,
+                                (int) phone_status);
+                        }
                     }
                 } else {
                     compute_workers.start(1, i);
@@ -18619,6 +18785,22 @@ auto prefill_norm_sg_has_prework =
     }
 
     debug_handoff_watch("AFTER_META_LOOP");
+
+    if (!pending_pc_phone_exec_tickets.empty()) {
+        const auto & leaked =
+            *pending_pc_phone_exec_tickets.begin();
+        printf(
+            "[PC_PHONE_EXEC_V1_REJECT] "
+            "sg=%zu submit_task=%" PRIu64
+            " completion_task=%" PRIu64
+            " seq=%" PRIu64
+            " reason=UNCONSUMED_COMPLETION action=STOP\n",
+            leaked.first,
+            leaked.second.submit_task,
+            leaked.second.completion_task,
+            leaked.second.seq);
+        return GGML_STATUS_FAILED;
+    }
 
     if (pipeline_debug && debug_terminal_handoff_dst != nullptr) {
         printf(
