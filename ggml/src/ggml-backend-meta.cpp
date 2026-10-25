@@ -13989,9 +13989,17 @@ auto prefill_norm_sg_has_prework =
             }
 
             // Any other unmatched async input is also unsafe to consume here.
-            // Preserve the old invariant as a fail-closed assertion outside
-            // the Region continuation experiment.
-            GGML_ASSERT(has_async_prefill_input);
+            // Fail closed with diagnostics instead of letting stale Phone
+            // staging reach a later MoE SET_ROWS.
+            printf(
+                "[PREFILL_INPUT_STATE_REJECT] "
+                "consumer_layer=%d consumer_chunk=%d sg=%zu "
+                "pending_input_layer=%d pending_input_chunk=%d "
+                "reason=UNMATCHED_ASYNC_INPUT action=STOP\n",
+                prefill_down_layer, prefill_down_chunk, i,
+                pending_prefill_input_layer,
+                pending_prefill_input_chunk);
+            return GGML_STATUS_FAILED;
         }
 
         if (return_wavefront_graph) {
