@@ -2896,6 +2896,26 @@ ggml_backend_meta_get_wait_ready_seq(ggml_backend_t backend) {
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC));
 }
 
+static ggml_backend_rpc_phone_region_local_submit_t
+ggml_backend_meta_get_phone_region_local_submit(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_phone_region_local_submit_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC));
+}
+
 static ggml_backend_rpc_set_tensor_async_return_wait_t
 ggml_backend_meta_get_set_tensor_async_return_wait(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
