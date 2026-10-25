@@ -13367,37 +13367,31 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 add_sg(sg);
             }
 
-            // Chunk-major continuation with one useful overlap: while
-            // Region(c-1) runs on Phone, execute only C2P_NORM(c), which is
-            // PC-owned prework. Do not submit C2P_FFN_REDUCE(c) before the
-            // previous continuation, because that would enqueue Phone work
-            // ahead of L46(c-1) and defeat "Region done -> Tensor now".
-            if (!region_pipe_chunks.empty()) {
-                const auto & first =
-                    region_pipe_chunks.at(0);
-                add_sg(first.norm_sg);
-                add_sg(first.down_sg);
-                add_region(first);
-
-                for (size_t chunk = 1;
-                        chunk < region_pipe_chunks.size() &&
-                        eligible; ++chunk) {
-                    const auto & current =
-                        region_pipe_chunks.at((int) chunk);
-                    const auto & previous =
-                        region_pipe_chunks.at((int) chunk - 1);
-
-                    add_sg(current.norm_sg);
-                    add_continuation(previous);
-                    add_sg(current.down_sg);
-                    add_region(current);
-                }
-
-                if (eligible) {
-                    add_continuation(
-                        region_pipe_chunks.at(
-                            (int) region_pipe_chunks.size() - 1));
-                }
+            // Correctness-first chunk continuation:
+            //
+            //   C2P_NORM(c)
+            //   -> C2P_FFN_REDUCE(c)
+            //   -> REGION(c)
+            //   -> P2C_CONTINUE(c)
+            //
+            // Do not pre-stage C2P_NORM(c+1) before P2C_CONTINUE(c).
+            // C2P_NORM is not PC-only: it immediately starts the async
+            // PC->Phone FFN_NORM transfer and leaves pending_prefill_input
+            // state on Phone. Crossing an L46 continuation with that future
+            // Phone-side state can let allocator/staging reuse corrupt the
+            // next chunk's MoE indices (observed as SET_ROWS i1 OOB).
+            //
+            // We can reintroduce this overlap later only after C2P input
+            // staging has its own lifetime-isolated per-chunk storage.
+            for (size_t chunk = 0;
+                    chunk < region_pipe_chunks.size() &&
+                    eligible; ++chunk) {
+                const auto & current =
+                    region_pipe_chunks.at((int) chunk);
+                add_sg(current.norm_sg);
+                add_sg(current.down_sg);
+                add_region(current);
+                add_continuation(current);
             }
 
             // Preserve every unrelated/shared post-Region SG after all
@@ -13969,20 +13963,35 @@ auto prefill_norm_sg_has_prework =
             has_pending_prefill_input(prefill_down_layer, prefill_down_chunk);
 
         if (pending_prefill_input_task != 0 && !has_async_prefill_input) {
-            const auto continuation = region_pipe_chunks.find(prefill_down_chunk);
-            GGML_ASSERT(region_pipeline_active &&
+            const auto continuation =
+                region_pipe_chunks.find(prefill_down_chunk);
+            const bool crosses_region_continuation =
+                region_pipeline_active &&
                 continuation != region_pipe_chunks.end() &&
                 i >= continuation->second.continuation_begin_sg &&
                 i <= continuation->second.continuation_end_sg &&
                 ggml_backend_meta_tensor_c2p_layer(
                     backend_ctx, pending_prefill_input_layer) &&
-                pending_prefill_input_chunk == prefill_down_chunk + 1);
-            if (pipeline_debug) {
-                printf("[PREFILL_INPUT_PARK] layer=%d chunk=%d "
-                       "consumer_layer=%d consumer_chunk=%d sg=%zu\n",
-                       pending_prefill_input_layer, pending_prefill_input_chunk,
-                       prefill_down_layer, prefill_down_chunk, i);
+                pending_prefill_input_chunk ==
+                    prefill_down_chunk + 1;
+
+            if (crosses_region_continuation) {
+                printf(
+                    "[PHONE_REGION_CONTINUATION_REJECT] "
+                    "chunk=%d sg=%zu pending_input_layer=%d "
+                    "pending_input_chunk=%d "
+                    "reason=PREFILL_INPUT_CROSSES_CONTINUATION "
+                    "action=STOP\n",
+                    prefill_down_chunk, i,
+                    pending_prefill_input_layer,
+                    pending_prefill_input_chunk);
+                return GGML_STATUS_FAILED;
             }
+
+            // Any other unmatched async input is also unsafe to consume here.
+            // Preserve the old invariant as a fail-closed assertion outside
+            // the Region continuation experiment.
+            GGML_ASSERT(has_async_prefill_input);
         }
 
         if (return_wavefront_graph) {
