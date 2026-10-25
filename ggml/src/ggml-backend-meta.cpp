@@ -15562,10 +15562,59 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 return GGML_STATUS_SUCCESS;
                             });
 
+                    // Phone-side control is fully registered before Meta enters
+                    // the runtime schedule. C2P READY only admits the low
+                    // FFN; C2P PARTIAL plus FFN_DONE admits the pre-registered
+                    // Reduce as MAIN, which then continues Region -> L46.
+                    if (!c2p_register(
+                            phone_cfg.backend,
+                            chunk,
+                            state.c2p_ffn_uid,
+                            state.c2p_consume_seq)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reason=C2P_REGISTER_FAILED "
+                            "action=STOP\n",
+                            chunk);
+                        return GGML_STATUS_FAILED;
+                    }
+                    state.c2p_registered = true;
+
+                    if (!main_register(
+                            phone_cfg.backend,
+                            chunk,
+                            state.c2p_reduce_uid,
+                            state.region_uid,
+                            state.p2c_attention_uid,
+                            state.p2c_ffn_uid,
+                            state.ready_seq,
+                            state.ready_lane,
+                            state.ready_hidden,
+                            state.ready_topk,
+                            state.ready_weights,
+                            state.partial_seq,
+                            state.partial_slot,
+                            state.phone_folded_partial)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reduce_uid=%" PRIu64
+                            " reason=MAIN_REGISTER_FAILED "
+                            "action=STOP\n",
+                            chunk,
+                            state.c2p_reduce_uid);
+                        return GGML_STATUS_FAILED;
+                    }
+                    state.main_registered = true;
+                    state.trigger_reduce_uid =
+                        state.c2p_reduce_uid;
+
                     if (pipeline_debug) {
                         printf(
                             "[PHONE_MAIN_LOCAL_PREP] "
-                            "chunk=%d region_uid=%" PRIu64
+                            "chunk=%d c2p_ffn_uid=%" PRIu64
+                            " c2p_reduce_uid=%" PRIu64
+                            " consume_seq=%" PRIu64
+                            " region_uid=%" PRIu64
                             " attn_uid=%" PRIu64
                             " ffn_uid=%" PRIu64
                             " ready_seq=%" PRIu64
@@ -15576,6 +15625,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             " partial_task=%" PRIu64
                             " status=ARMED\n",
                             chunk,
+                            state.c2p_ffn_uid,
+                            state.c2p_reduce_uid,
+                            state.c2p_consume_seq,
                             state.region_uid,
                             state.p2c_attention_uid,
                             state.p2c_ffn_uid,
@@ -15616,7 +15668,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
             printf(
                 "[PHONE_MAIN_LOCAL_PLAN] requested=1 active=%d "
-                "chunks=%zu rpc_patch=14 reason=%s\n",
+                "chunks=%zu rpc_patch=15 reason=%s\n",
                 phone_main_local_active ? 1 : 0,
                 phone_main_local_chunks.size(),
                 phone_main_local_active ?
