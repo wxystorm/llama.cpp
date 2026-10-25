@@ -2388,7 +2388,10 @@ struct ggml_backend_meta_context {
         // storage while MAIN owns the GPU/scratch. Keep TopK/weights private
         // for the whole overlap-slot lifetime, just like the hidden input.
         std::array<ggml_backend_buffer_ptr, 2> phone_route_bufs;
+        // Phone FFN output and incoming PC folded partial may be live at the
+        // same time. They must never alias.
         ggml_backend_buffer_ptr phone_partial_buf;
+        ggml_backend_buffer_ptr phone_pc_partial_buf;
         std::array<ggml_backend_buffer_ptr, 2> pc_route_bufs;
         ggml_backend_buffer_ptr pc_partial_buf;
     };
@@ -6648,6 +6651,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         uint64_t p2c_attention_uid = 0;
         uint64_t p2c_ffn_uid = 0;
         uint64_t trigger_reduce_uid = 0;
+        uint64_t c2p_ffn_uid = 0;
+        uint64_t c2p_reduce_uid = 0;
+        uint64_t c2p_consume_seq = 0;
+        ggml_tensor * c2p_phone_pc_partial = nullptr;
 
         uint64_t ready_seq = 0;
         uint32_t ready_lane = 0;
@@ -14010,7 +14017,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 buf.get()) != nullptr;
                     };
 
-                for (size_t c = 1;
+                for (size_t c =
+                            phone_main_local_requested ? 0 : 1;
                         c < region_pipe_chunks.size() &&
                         prep_ok; ++c) {
                     const auto & e =
@@ -14108,6 +14116,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             overlap_slot.phone_partial_buf,
                             storage_bytes(pc_partial)) &&
                         ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_pc_partial_buf,
+                            storage_bytes(pc_partial)) &&
+                        ensure_overlap_buf(
                             pc_cfg.backend,
                             overlap_slot.pc_route_bufs[0],
                             storage_bytes(pc_topk)) &&
@@ -14154,6 +14166,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             c2p_slot_bytes[slot_index] +=
                                 ggml_backend_buffer_get_size(
                                     overlap_slot.phone_partial_buf.get());
+                        }
+                        if (overlap_slot.phone_pc_partial_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.phone_pc_partial_buf.get());
                         }
                         for (const auto & route_buf :
                                 overlap_slot.pc_route_bufs) {
@@ -14499,6 +14516,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 ggml_backend_meta_get_stage_ready_setter(phone_cfg.backend);
 
             bool local_ok =
+                region_pc_overlap_requested &&
                 graph_register != nullptr &&
                 main_register != nullptr &&
                 set_tensor_graph != nullptr &&
