@@ -14180,16 +14180,27 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     ggml_tensor * pc_partial =
                         pc_down_graph->nodes[
                             pc_down_graph->n_nodes - 1];
+                    ggml_cgraph * phone_down_graph =
+                        phone_cfg.cgraphs[e.down_sg].cgraph_main;
+                    ggml_tensor * phone_partial =
+                        phone_down_graph != nullptr &&
+                        phone_down_graph->n_nodes > 0 ?
+                            phone_down_graph->nodes[
+                                phone_down_graph->n_nodes - 1] :
+                            nullptr;
                     if (phone_input == nullptr ||
                             phone_topk == nullptr ||
                             phone_weights == nullptr ||
                             pc_topk == nullptr ||
                             pc_weights == nullptr ||
                             pc_partial == nullptr ||
+                            phone_partial == nullptr ||
                             !ggml_are_same_layout(
                                 phone_topk, pc_topk) ||
                             !ggml_are_same_layout(
-                                phone_weights, pc_weights)) {
+                                phone_weights, pc_weights) ||
+                            !ggml_are_same_layout(
+                                phone_partial, pc_partial)) {
                         prep_ok = false;
                         region_pipe_reason =
                             "C2P_OVERLAP_TENSOR_MISSING";
@@ -14224,7 +14235,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         ensure_overlap_buf(
                             phone_cfg.backend,
                             overlap_slot.phone_partial_buf,
-                            storage_bytes(pc_partial)) &&
+                            storage_bytes(phone_partial)) &&
                         ensure_overlap_buf(
                             phone_cfg.backend,
                             overlap_slot.phone_pc_partial_buf,
