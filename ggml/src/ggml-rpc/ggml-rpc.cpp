@@ -3207,8 +3207,8 @@ static bool ggml_backend_rpc_phone_region_local_submit(
     }
 
     std::array<std::vector<uint8_t>, 4> graphs;
-    const ggml_cgraph * graph_ptrs[3] = {
-        region_graph, attn_graph, ffn_graph,
+    const ggml_cgraph * graph_ptrs[4] = {
+        region_graph, attn_graph, ffn_graph, fold_graph,
     };
     for (size_t i = 0; i < graphs.size(); ++i) {
         serialize_graph(
