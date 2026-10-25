@@ -14142,10 +14142,14 @@ auto prefill_norm_sg_has_prework =
                     const ggml_tensor * phone_node = phone_part->nodes[k];
                     if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
                         printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
-                               "node=%s op=%s reason=PC_COMPUTE_ACTIVE "
-                               "action=STOP\n",
+                               "node=%s op=%s pc_elems=%" PRId64
+                               " phone_elems=%" PRId64 " phone_compute=%d "
+                               "reason=PC_COMPUTE_ACTIVE action=STOP\n",
                                phone_region_chunk_id, sg, pc_node->name,
-                               ggml_op_name(pc_node->op));
+                               ggml_op_name(pc_node->op),
+                               ggml_nelements(pc_node),
+                               ggml_nelements(phone_node),
+                               (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0);
                         return GGML_STATUS_FAILED;
                     }
                     found_phone_compute =
