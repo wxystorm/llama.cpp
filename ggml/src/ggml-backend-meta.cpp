@@ -2916,6 +2916,26 @@ ggml_backend_meta_get_phone_region_local_submit(
                 GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC));
 }
 
+static ggml_backend_rpc_phone_region_partial_get_t
+ggml_backend_meta_get_phone_region_partial_get(
+        ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_phone_region_partial_get_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC));
+}
+
 static ggml_backend_rpc_set_tensor_async_return_wait_t
 ggml_backend_meta_get_set_tensor_async_return_wait(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -10210,16 +10230,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_time_us() - phone_fold_begin_us;
             }
 
-            const ggml_backend_rpc_set_snapshot_read_t
-                snapshot_read =
+            const ggml_backend_rpc_phone_region_partial_get_t
+                partial_get =
                     local_main_partial ?
-                        ggml_backend_meta_get_snapshot_read_setter(
+                        ggml_backend_meta_get_phone_region_partial_get(
                             phone_cfg.backend) :
                         nullptr;
-            if (local_main_partial && snapshot_read == nullptr) {
+            if (local_main_partial && partial_get == nullptr) {
                 printf("[PHONE_REGION_PARTIAL_REJECT] "
                        "layer=%d chunk=%d "
-                       "reason=SNAPSHOT_READ_UNAVAILABLE action=STOP\n",
+                       "reason=PARTIAL_GET_UNAVAILABLE action=STOP\n",
                        prefill_down_layer_0,
                        prefill_down_chunk_0);
                 return GGML_STATUS_FAILED;
@@ -10227,24 +10247,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             const int64_t copy_begin_us = ggml_time_us();
             if (local_main_partial) {
-                // Snapshot selection is thread-local in the RPC client.
-                // Keep GET_SNAPSHOT on this exact Meta thread instead of
-                // relying on a backend async-copy implementation to preserve
-                // that TLS state.
+                // PARTIAL has its own two-slot mailbox and its own sockets.
+                // Do not reuse generic RPC snapshot slots: those are shared
+                // by legacy prefill/decode snapshot pipelines and can hold an
+                // unrelated seq/size while Phone MAIN is trying to publish.
                 const size_t partial_bytes =
                     ggml_nbytes(phone_partial);
                 std::vector<uint8_t> partial_payload(
                     partial_bytes);
-                snapshot_read(
-                    true,
-                    local_main_partial_it->second.partial_slot,
-                    local_main_partial_it->second.partial_seq);
-                ggml_backend_tensor_get(
-                    phone_partial,
-                    partial_payload.data(),
-                    0,
-                    partial_bytes);
-                snapshot_read(false, 0, 0);
+                const bool got_partial =
+                    partial_get(
+                        phone_cfg.backend,
+                        local_main_partial_it->second.partial_slot,
+                        local_main_partial_it->second.partial_seq,
+                        partial_payload.data(),
+                        partial_bytes);
+                if (!got_partial) {
+                    printf("[PHONE_REGION_PARTIAL_REJECT] "
+                           "layer=%d chunk=%d slot=%u seq=%" PRIu64
+                           " bytes=%zu reason=PARTIAL_GET_FAILED "
+                           "action=STOP\n",
+                           prefill_down_layer_0,
+                           prefill_down_chunk_0,
+                           local_main_partial_it->second.partial_slot,
+                           local_main_partial_it->second.partial_seq,
+                           partial_bytes);
+                    return GGML_STATUS_FAILED;
+                }
                 ggml_backend_tensor_set(
                     pc_tmp,
                     partial_payload.data(),
@@ -10277,7 +10306,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             } else if (pipeline_debug) {
                 printf("[PHONE_REGION_PARTIAL_CONSUME] "
                        "layer=%d chunk=%d seq=%" PRIu64
-                       " slot=%u bytes=%zu source=SNAPSHOT status=OK\n",
+                       " slot=%u bytes=%zu source=PARTIAL_MAILBOX status=OK\n",
                        prefill_down_layer_0,
                        prefill_down_chunk_0,
                        local_main_partial_it->second.partial_seq,
@@ -10364,7 +10393,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     copy_us / 1000.0,
                     pc_reduce_us / 1000.0,
                     local_main_partial ?
-                        "PHONE_MAIN_SNAPSHOT" :
+                        "PHONE_MAIN_PARTIAL" :
                         "LEGACY_LIVE");
             }
 
@@ -13855,8 +13884,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     local_submit =
                         ggml_backend_meta_get_phone_region_local_submit(
                             phone_cfg.backend);
+                const ggml_backend_rpc_phone_region_partial_get_t
+                    partial_get =
+                        ggml_backend_meta_get_phone_region_partial_get(
+                            phone_cfg.backend);
                 const bool local_submit_ready =
                     local_submit != nullptr &&
+                    partial_get != nullptr &&
                     phone_prefill_chunk_pipeline &&
                     phone_prefill_producer_route &&
                     !phone_prefill_async_return_active &&
