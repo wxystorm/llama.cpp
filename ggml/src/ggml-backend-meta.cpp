@@ -14207,28 +14207,32 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             auto & phone_cfg = backend_ctx->backend_configs[1];
             auto & pc_cfg = backend_ctx->backend_configs[0];
 
-            const ggml_backend_rpc_graph_register_t
-                graph_register =
-                    ggml_backend_meta_get_graph_register(
-                        phone_cfg.backend);
-            const ggml_backend_rpc_phone_main_register_t
-                main_register =
-                    ggml_backend_meta_get_phone_main_register(
-                        phone_cfg.backend);
-            const ggml_backend_rpc_set_tensor_graph_t
-                set_tensor_graph =
-                    ggml_backend_meta_get_set_tensor_graph(
-                        phone_cfg.backend);
-            const ggml_backend_rpc_set_snapshot_read_t
-                set_snapshot_read =
-                    ggml_backend_meta_get_snapshot_read_setter(
-                        phone_cfg.backend);
+            const ggml_backend_rpc_graph_register_t graph_register =
+                ggml_backend_meta_get_graph_register(phone_cfg.backend);
+            const ggml_backend_rpc_phone_main_register_t main_register =
+                ggml_backend_meta_get_phone_main_register(phone_cfg.backend);
+            const ggml_backend_rpc_set_tensor_graph_t set_tensor_graph =
+                ggml_backend_meta_get_set_tensor_graph(phone_cfg.backend);
+            const ggml_backend_rpc_set_snapshot_read_t set_snapshot_read =
+                ggml_backend_meta_get_snapshot_read_setter(phone_cfg.backend);
+            const ggml_backend_rpc_get_route_snapshot_t route_get_snapshot =
+                ggml_backend_meta_get_route_snapshot(phone_cfg.backend);
+            const ggml_backend_rpc_route_snapshot_ready_t route_snapshot_ready =
+                ggml_backend_meta_get_route_snapshot_ready(phone_cfg.backend);
+            const ggml_backend_rpc_set_stage_ready_t route_set_stage_ready =
+                ggml_backend_meta_get_stage_ready_setter(phone_cfg.backend);
 
             bool local_ok =
                 graph_register != nullptr &&
                 main_register != nullptr &&
                 set_tensor_graph != nullptr &&
-                set_snapshot_read != nullptr;
+                set_snapshot_read != nullptr &&
+                route_get_snapshot != nullptr &&
+                route_snapshot_ready != nullptr &&
+                route_set_stage_ready != nullptr &&
+                route_snapshot_ready(
+                    phone_cfg.backend, 0, 0,
+                    nullptr, nullptr, nullptr);
 
             if (!local_ok) {
                 eligible = false;
@@ -14236,6 +14240,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     "PHONE_MAIN_LOCAL_RPC_UNAVAILABLE";
             }
 
+            // Phase A: validate and register every Phone graph, and build all
+            // PC-side reduce storage. No blocking READY/PARTIAL receiver is
+            // started in this phase. Therefore a structural/register failure
+            // can still fall back without leaving a worker stuck on data that
+            // will never be published.
             for (size_t c = 0;
                     c < region_pipe_chunks.size() &&
                     local_ok; ++c) {
@@ -14250,36 +14259,51 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 state.down_sg =
                     e.continuation_end_sg;
 
-                // READY receive is armed on a dedicated route lane before the
-                // Phone MAIN can ever publish it. The PC worker below waits on
-                // this mailbox task; the Meta scheduler never waits for READY.
-                if (!prearm_phone_prefill_route(
-                        e.continuation_route_sg,
-                        46,
-                        chunk)) {
+                char hidden_name[96];
+                char topk_name[96];
+                char weights_name[96];
+                std::snprintf(
+                    hidden_name, sizeof(hidden_name),
+                    "prefill_ffn_norm_chunk_%d-46",
+                    chunk);
+                std::snprintf(
+                    topk_name, sizeof(topk_name),
+                    "phone_prefill_route_topk_chunk_%d-46",
+                    chunk);
+                std::snprintf(
+                    weights_name, sizeof(weights_name),
+                    "phone_prefill_route_weights_chunk_%d-46",
+                    chunk);
+                state.ready_hidden =
+                    find_exact_named_tensor(1, hidden_name);
+                state.ready_topk =
+                    find_exact_named_tensor(1, topk_name);
+                state.ready_weights =
+                    find_exact_named_tensor(1, weights_name);
+
+                ggml_tensor * pc_hidden =
+                    find_exact_named_tensor(0, hidden_name);
+                ggml_tensor * pc_topk =
+                    find_exact_named_tensor(0, topk_name);
+                ggml_tensor * pc_weights =
+                    find_exact_named_tensor(0, weights_name);
+                if (state.ready_hidden == nullptr ||
+                        state.ready_topk == nullptr ||
+                        state.ready_weights == nullptr ||
+                        pc_hidden == nullptr ||
+                        pc_topk == nullptr ||
+                        pc_weights == nullptr ||
+                        !ggml_are_same_layout(
+                            state.ready_hidden, pc_hidden) ||
+                        !ggml_are_same_layout(
+                            state.ready_topk, pc_topk) ||
+                        !ggml_are_same_layout(
+                            state.ready_weights, pc_weights)) {
                     local_ok = false;
                     region_pipe_reason =
-                        "PHONE_MAIN_READY_PREARM_FAILED";
+                        "PHONE_MAIN_READY_LAYOUT";
                     break;
                 }
-                const auto route_it =
-                    pending_phone_prefill_routes.find(
-                        { 46, chunk });
-                if (route_it ==
-                        pending_phone_prefill_routes.end()) {
-                    local_ok = false;
-                    region_pipe_reason =
-                        "PHONE_MAIN_READY_STATE_MISSING";
-                    break;
-                }
-                const phone_prefill_route_task route =
-                    route_it->second;
-                state.ready_seq = route.producer_seq;
-                state.ready_lane =
-                    static_cast<uint32_t>(route.lane);
-                state.ready_hidden = route.src_hidden;
-                state.ready_topk = route.src_topk;
-                state.ready_weights = route.src_weights;
 
                 char region_output_name[96];
                 std::snprintf(
@@ -14305,8 +14329,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         e.begin_sg, e.end_sg);
                 std::vector<phone_region_binding_backup>
                     region_scratch_backups;
-                const size_t region_slot =
-                    c % 2;
+                const size_t region_slot = c % 2;
                 if (!bind_phone_region_scratch(
                         region_graph,
                         chunk,
@@ -14387,7 +14410,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     build_phone_block_graph(
                         e.continuation_route_sg + 1,
                         e.continuation_end_sg);
-
                 char partial_name[96];
                 std::snprintf(
                     partial_name,
@@ -14399,7 +14421,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         1,
                         e.continuation_end_sg,
                         partial_name);
-
                 char residual_name[96];
                 std::snprintf(
                     residual_name,
@@ -14428,9 +14449,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     break;
                 }
 
-                // Fold the chunk-local residual into the Phone FFN partial
-                // inside MAIN before Send #2. The transmitted PARTIAL remains
-                // one H-sized tensor and PC owns the final L46 reduce.
                 ggml_tensor * phone_fold =
                     get_node_aux(phone_partial);
                 phone_fold->view_src =
@@ -14445,16 +14463,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 phone_fold->flags |=
                     GGML_TENSOR_FLAG_COMPUTE;
                 ggml_backend_view_init(phone_fold);
-
                 p2c_ffn_graph->nodes[
                     p2c_ffn_graph->n_nodes++] =
                         phone_fold;
-                const size_t partial_hash_pos =
+                const size_t fold_hash =
                     ggml_hash_insert(
                         &p2c_ffn_graph->visited_hash_set,
                         phone_fold);
-                p2c_ffn_graph->use_counts[
-                    partial_hash_pos] = 0;
+                p2c_ffn_graph->use_counts[fold_hash] = 0;
                 state.phone_folded_partial =
                     phone_fold;
 
@@ -14485,10 +14501,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 p2c_ffn_graph->uid =
                     saved_ffn_uid;
 
-                // Graph registration serialized the private Region addresses.
-                // Host descriptors can now return to their stock gallocr
-                // bindings. Local MAIN is one physical GPU lane, so the same
-                // scratch slot may be reused by a later registered chunk.
                 restore_region_bindings(
                     region_scratch_backups);
                 restore_region_bindings(
@@ -14498,81 +14510,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         region_slot];
                 scratch_slot.owner_chunk = -1;
                 scratch_slot.completion_seq = 0;
-
-                state.partial_seq =
-                    backend_ctx->next_snapshot_seq++;
-                state.partial_slot =
-                    static_cast<uint32_t>(c % 2);
-                state.phone_partial_payload =
-                    std::make_shared<
-                        std::vector<uint8_t>>(
-                            ggml_nbytes(
-                                state.phone_folded_partial));
-
-                auto & partial_worker_slot =
-                    backend_ctx->prefill_return_workers[
-                        state.partial_slot];
-                if (partial_worker_slot == nullptr) {
-                    partial_worker_slot =
-                        new ggml_backend_meta_transfer_worker();
-                }
-                state.partial_worker =
-                    partial_worker_slot;
-
-                const uint64_t partial_seq =
-                    state.partial_seq;
-                const uint32_t partial_slot =
-                    state.partial_slot;
-                ggml_tensor * partial_src =
-                    state.phone_folded_partial;
-                auto partial_payload =
-                    state.phone_partial_payload;
-                ggml_backend_t phone_backend =
-                    phone_cfg.backend;
-                const bool local_debug =
-                    pipeline_debug;
-                state.partial_task =
-                    partial_worker_slot->enqueue(
-                        [set_snapshot_read,
-                         phone_backend,
-                         partial_src,
-                         partial_payload,
-                         partial_seq,
-                         partial_slot,
-                         chunk,
-                         local_debug]
-                        (uint64_t task_id) ->
-                        ggml_status {
-                            const int64_t begin_us =
-                                ggml_time_us();
-                            set_snapshot_read(
-                                true,
-                                partial_slot,
-                                partial_seq);
-                            ggml_backend_tensor_get(
-                                partial_src,
-                                partial_payload->data(),
-                                0,
-                                partial_payload->size());
-                            set_snapshot_read(
-                                false, 0, 0);
-                            if (local_debug) {
-                                printf(
-                                    "[PHONE_MAIN_PARTIAL_RX] "
-                                    "chunk=%d task=%" PRIu64
-                                    " seq=%" PRIu64
-                                    " slot=%u bytes=%zu "
-                                    "wall_ms=%.3f status=READY\n",
-                                    chunk,
-                                    task_id,
-                                    partial_seq,
-                                    partial_slot,
-                                    partial_payload->size(),
-                                    (ggml_time_us() -
-                                        begin_us) / 1000.0);
-                            }
-                            return GGML_STATUS_SUCCESS;
-                        });
 
                 ggml_cgraph * pc_ffn_graph =
                     pc_cfg.cgraphs[
@@ -14589,88 +14526,44 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     pc_ffn_graph->nodes[
                         pc_ffn_graph->n_nodes - 1];
 
-                if (backend_ctx->prefill_pc_worker ==
-                        nullptr) {
-                    backend_ctx->prefill_pc_worker =
-                        new ggml_backend_meta_transfer_worker();
+                const size_t partial_bytes =
+                    ggml_nbytes(state.pc_partial);
+                state.pc_local_stage =
+                    get_node_aux(state.pc_partial);
+                state.pc_phone_stage =
+                    get_node_aux(state.pc_partial);
+                state.pc_local_stage_buf.reset(
+                    ggml_backend_alloc_buffer(
+                        pc_cfg.backend,
+                        partial_bytes));
+                state.pc_phone_stage_buf.reset(
+                    ggml_backend_alloc_buffer(
+                        pc_cfg.backend,
+                        partial_bytes));
+                if (!state.pc_local_stage_buf ||
+                        !state.pc_phone_stage_buf) {
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_PC_STAGE_ALLOC_FAILED";
+                    break;
                 }
-                ggml_backend_meta_transfer_worker *
-                    pc_worker =
-                        backend_ctx->prefill_pc_worker;
-                ggml_backend_t pc_backend =
-                    pc_cfg.backend;
-
-                state.pc_ffn_task =
-                    pc_worker->enqueue(
-                        [route,
-                         pc_backend,
-                         pc_ffn_graph,
-                         chunk,
-                         local_debug]
-                        (uint64_t task_id) ->
-                        ggml_status {
-                            const int64_t wait_begin_us =
-                                ggml_time_us();
-                            const ggml_status route_status =
-                                route.worker->wait(
-                                    route.task);
-                            const int64_t route_wait_us =
-                                ggml_time_us() -
-                                wait_begin_us;
-                            if (route_status !=
-                                    GGML_STATUS_SUCCESS) {
-                                return route_status;
-                            }
-
-                            const int64_t copy_begin_us =
-                                ggml_time_us();
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_hidden,
-                                route.dst_hidden);
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_topk,
-                                route.dst_topk);
-                            ggml_backend_tensor_copy_async(
-                                pc_backend,
-                                pc_backend,
-                                route.stage_weights,
-                                route.dst_weights);
-                            ggml_backend_synchronize(
-                                pc_backend);
-                            const int64_t copy_us =
-                                ggml_time_us() -
-                                copy_begin_us;
-
-                            const int64_t compute_begin_us =
-                                ggml_time_us();
-                            const ggml_status status =
-                                ggml_backend_graph_compute(
-                                    pc_backend,
-                                    pc_ffn_graph);
-                            const int64_t compute_us =
-                                ggml_time_us() -
-                                compute_begin_us;
-
-                            if (local_debug) {
-                                printf(
-                                    "[PHONE_MAIN_PC_FFN] "
-                                    "chunk=%d task=%" PRIu64
-                                    " ready_wait_ms=%.3f "
-                                    "input_copy_ms=%.3f "
-                                    "compute_ms=%.3f status=%d\n",
-                                    chunk,
-                                    task_id,
-                                    route_wait_us / 1000.0,
-                                    copy_us / 1000.0,
-                                    compute_us / 1000.0,
-                                    (int) status);
-                            }
-                            return status;
-                        });
+                state.pc_local_stage->buffer =
+                    state.pc_local_stage_buf.get();
+                state.pc_local_stage->data =
+                    ggml_backend_buffer_get_base(
+                        state.pc_local_stage_buf.get());
+                state.pc_phone_stage->buffer =
+                    state.pc_phone_stage_buf.get();
+                state.pc_phone_stage->data =
+                    ggml_backend_buffer_get_base(
+                        state.pc_phone_stage_buf.get());
+                if (state.pc_local_stage->data == nullptr ||
+                        state.pc_phone_stage->data == nullptr) {
+                    local_ok = false;
+                    region_pipe_reason =
+                        "PHONE_MAIN_PC_STAGE_BASE_FAILED";
+                    break;
+                }
 
                 ggml_tensor * pc_l_out =
                     find_layer_output(0, 46);
@@ -14683,14 +14576,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 const size_t chunk_offset =
                     down_chunk_offset(
                         0, true, 46, chunk);
-
-                state.pc_partial_stage =
-                    get_node_aux(state.pc_partial);
-                set_prefill_tmp_data(
-                    state.pc_partial_stage,
-                    0,
-                    state.partial_slot);
-
                 state.pc_out_chunk =
                     get_node_aux(state.pc_partial);
                 state.pc_out_chunk->view_src =
@@ -14700,9 +14585,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 state.pc_out_chunk->op =
                     GGML_OP_ADD;
                 state.pc_out_chunk->src[0] =
-                    state.pc_partial;
+                    state.pc_local_stage;
                 state.pc_out_chunk->src[1] =
-                    state.pc_partial_stage;
+                    state.pc_phone_stage;
                 state.pc_out_chunk->flags |=
                     GGML_TENSOR_FLAG_COMPUTE;
                 ggml_backend_view_init(
@@ -14715,128 +14600,369 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "PHONE_MAIN_PC_OUTPUT_RANGE";
                     break;
                 }
-
                 state.pc_reduce_graph =
                     get_cgraph_aux();
                 state.pc_reduce_graph->nodes[0] =
                     state.pc_out_chunk;
                 state.pc_reduce_graph->n_nodes = 1;
 
-                auto & join_worker_slot =
-                    backend_ctx->prefill_reduce_workers[
-                        state.partial_slot];
-                if (join_worker_slot == nullptr) {
-                    join_worker_slot =
-                        new ggml_backend_meta_transfer_worker();
-                }
-                state.join_worker =
-                    join_worker_slot;
-
-                ggml_backend_meta_transfer_worker *
-                    partial_worker =
-                        state.partial_worker;
-                const uint64_t partial_task =
-                    state.partial_task;
-                const uint64_t pc_task =
-                    state.pc_ffn_task;
-                ggml_tensor * pc_stage =
-                    state.pc_partial_stage;
-                ggml_cgraph * pc_reduce =
-                    state.pc_reduce_graph;
-                auto join_payload =
-                    state.phone_partial_payload;
-
-                state.join_task =
-                    join_worker_slot->enqueue(
-                        [pc_worker,
-                         pc_task,
-                         partial_worker,
-                         partial_task,
-                         pc_backend,
-                         pc_stage,
-                         pc_reduce,
-                         join_payload,
-                         chunk,
-                         local_debug]
-                        (uint64_t task_id) ->
-                        ggml_status {
-                            const int64_t begin_us =
-                                ggml_time_us();
-                            const ggml_status pc_status =
-                                pc_worker->wait(pc_task);
-                            if (pc_status !=
-                                    GGML_STATUS_SUCCESS) {
-                                return pc_status;
-                            }
-                            const ggml_status partial_status =
-                                partial_worker->wait(
-                                    partial_task);
-                            if (partial_status !=
-                                    GGML_STATUS_SUCCESS) {
-                                return partial_status;
-                            }
-
-                            ggml_backend_tensor_set(
-                                pc_stage,
-                                join_payload->data(),
-                                0,
-                                join_payload->size());
-                            const ggml_status reduce_status =
-                                ggml_backend_graph_compute(
-                                    pc_backend,
-                                    pc_reduce);
-                            if (reduce_status ==
-                                    GGML_STATUS_SUCCESS) {
-                                ggml_backend_synchronize(
-                                    pc_backend);
-                            }
-
-                            if (local_debug) {
-                                printf(
-                                    "[PHONE_MAIN_PC_JOIN] "
-                                    "chunk=%d task=%" PRIu64
-                                    " bytes=%zu total_ms=%.3f "
-                                    "status=%d\n",
-                                    chunk,
-                                    task_id,
-                                    join_payload->size(),
-                                    (ggml_time_us() -
-                                        begin_us) / 1000.0,
-                                    (int) reduce_status);
-                            }
-                            return reduce_status;
-                        });
-
+                state.partial_seq =
+                    backend_ctx->next_snapshot_seq++;
+                state.partial_slot =
+                    static_cast<uint32_t>(c % 2);
+                state.phone_partial_payload =
+                    std::make_shared<
+                        std::vector<uint8_t>>(
+                            ggml_nbytes(
+                                state.phone_folded_partial));
                 state.graphs_registered = true;
-
-                if (pipeline_debug) {
-                    printf(
-                        "[PHONE_MAIN_LOCAL_PREP] "
-                        "chunk=%d region_uid=%" PRIu64
-                        " attn_uid=%" PRIu64
-                        " ffn_uid=%" PRIu64
-                        " ready_seq=%" PRIu64
-                        " ready_lane=%u partial_seq=%" PRIu64
-                        " partial_slot=%u pc_task=%" PRIu64
-                        " partial_task=%" PRIu64
-                        " join_task=%" PRIu64
-                        " status=READY\n",
-                        chunk,
-                        state.region_uid,
-                        state.p2c_attention_uid,
-                        state.p2c_ffn_uid,
-                        state.ready_seq,
-                        state.ready_lane,
-                        state.partial_seq,
-                        state.partial_slot,
-                        state.pc_ffn_task,
-                        state.partial_task,
-                        state.join_task);
-                }
             }
 
-            if (local_ok &&
-                    !region_pipe_chunks.empty()) {
+            // Phase B: all structural work succeeded. Only now arm blocking
+            // network receivers and PC workers.
+            if (local_ok) {
+                if (backend_ctx->prefill_pc_worker ==
+                        nullptr) {
+                    backend_ctx->prefill_pc_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+                for (size_t lane = 0;
+                        lane <
+                            ggml_backend_meta_context::
+                                PREFILL_RETURN_LANES;
+                        ++lane) {
+                    if (backend_ctx->
+                            prefill_return_workers[lane] ==
+                            nullptr) {
+                        backend_ctx->
+                            prefill_return_workers[lane] =
+                                new ggml_backend_meta_transfer_worker();
+                    }
+                    if (backend_ctx->
+                            prefill_reduce_workers[lane] ==
+                            nullptr) {
+                        backend_ctx->
+                            prefill_reduce_workers[lane] =
+                                new ggml_backend_meta_transfer_worker();
+                    }
+                }
+
+                for (size_t c = 0;
+                        c < region_pipe_chunks.size();
+                        ++c) {
+                    const int chunk = (int) c;
+                    const auto & e =
+                        region_pipe_chunks.at(chunk);
+                    auto & state =
+                        phone_main_local_chunks.at(chunk);
+
+                    // Capability/layout validation was completed in Phase A.
+                    // Failure here indicates a hard runtime setup error; do
+                    // not silently fall back after earlier chunks have armed
+                    // blocking mailbox receives.
+                    if (!prearm_phone_prefill_route(
+                            e.continuation_route_sg,
+                            46,
+                            chunk)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reason=READY_ARM_FAILED "
+                            "action=STOP\n",
+                            chunk);
+                        return GGML_STATUS_FAILED;
+                    }
+                    const auto route_it =
+                        pending_phone_prefill_routes.find(
+                            { 46, chunk });
+                    if (route_it ==
+                            pending_phone_prefill_routes.end()) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    const phone_prefill_route_task route =
+                        route_it->second;
+                    state.ready_seq =
+                        route.producer_seq;
+                    state.ready_lane =
+                        static_cast<uint32_t>(
+                            route.lane);
+                    state.ready_hidden =
+                        route.src_hidden;
+                    state.ready_topk =
+                        route.src_topk;
+                    state.ready_weights =
+                        route.src_weights;
+
+                    state.partial_worker =
+                        backend_ctx->
+                            prefill_return_workers[
+                                state.partial_slot];
+                    const uint64_t partial_seq =
+                        state.partial_seq;
+                    const uint32_t partial_slot =
+                        state.partial_slot;
+                    ggml_tensor * partial_src =
+                        state.phone_folded_partial;
+                    auto partial_payload =
+                        state.phone_partial_payload;
+                    const bool local_debug =
+                        pipeline_debug;
+                    state.partial_task =
+                        state.partial_worker->enqueue(
+                            [set_snapshot_read,
+                             partial_src,
+                             partial_payload,
+                             partial_seq,
+                             partial_slot,
+                             chunk,
+                             local_debug]
+                            (uint64_t task_id) ->
+                            ggml_status {
+                                const int64_t begin_us =
+                                    ggml_time_us();
+                                set_snapshot_read(
+                                    true,
+                                    partial_slot,
+                                    partial_seq);
+                                ggml_backend_tensor_get(
+                                    partial_src,
+                                    partial_payload->data(),
+                                    0,
+                                    partial_payload->size());
+                                set_snapshot_read(
+                                    false, 0, 0);
+                                if (local_debug) {
+                                    printf(
+                                        "[PHONE_MAIN_PARTIAL_RX] "
+                                        "chunk=%d task=%" PRIu64
+                                        " seq=%" PRIu64
+                                        " slot=%u bytes=%zu "
+                                        "wall_ms=%.3f "
+                                        "status=READY\n",
+                                        chunk,
+                                        task_id,
+                                        partial_seq,
+                                        partial_slot,
+                                        partial_payload->size(),
+                                        (ggml_time_us() -
+                                            begin_us) /
+                                            1000.0);
+                                }
+                                return GGML_STATUS_SUCCESS;
+                            });
+
+                    ggml_cgraph * pc_ffn_graph =
+                        pc_cfg.cgraphs[
+                            e.continuation_end_sg]
+                            .cgraph_main;
+                    ggml_backend_t pc_backend =
+                        pc_cfg.backend;
+                    ggml_backend_meta_transfer_worker *
+                        pc_worker =
+                            backend_ctx->
+                                prefill_pc_worker;
+                    ggml_tensor * pc_partial =
+                        state.pc_partial;
+                    ggml_tensor * pc_local_stage =
+                        state.pc_local_stage;
+
+                    state.pc_ffn_task =
+                        pc_worker->enqueue(
+                            [route,
+                             pc_backend,
+                             pc_ffn_graph,
+                             pc_partial,
+                             pc_local_stage,
+                             chunk,
+                             local_debug]
+                            (uint64_t task_id) ->
+                            ggml_status {
+                                const int64_t wait_begin_us =
+                                    ggml_time_us();
+                                const ggml_status route_status =
+                                    route.worker->wait(
+                                        route.task);
+                                const int64_t route_wait_us =
+                                    ggml_time_us() -
+                                    wait_begin_us;
+                                if (route_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return route_status;
+                                }
+
+                                const int64_t copy_begin_us =
+                                    ggml_time_us();
+                                ggml_backend_tensor_copy_async(
+                                    pc_backend,
+                                    pc_backend,
+                                    route.stage_hidden,
+                                    route.dst_hidden);
+                                ggml_backend_tensor_copy_async(
+                                    pc_backend,
+                                    pc_backend,
+                                    route.stage_topk,
+                                    route.dst_topk);
+                                ggml_backend_tensor_copy_async(
+                                    pc_backend,
+                                    pc_backend,
+                                    route.stage_weights,
+                                    route.dst_weights);
+                                ggml_backend_synchronize(
+                                    pc_backend);
+                                const int64_t copy_us =
+                                    ggml_time_us() -
+                                    copy_begin_us;
+
+                                const int64_t compute_begin_us =
+                                    ggml_time_us();
+                                const ggml_status status =
+                                    ggml_backend_graph_compute(
+                                        pc_backend,
+                                        pc_ffn_graph);
+                                if (status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return status;
+                                }
+                                ggml_backend_synchronize(
+                                    pc_backend);
+                                const int64_t compute_us =
+                                    ggml_time_us() -
+                                    compute_begin_us;
+
+                                if (!ggml_backend_tensor_copy(
+                                        pc_partial,
+                                        pc_local_stage)) {
+                                    return GGML_STATUS_FAILED;
+                                }
+                                ggml_backend_synchronize(
+                                    pc_backend);
+
+                                if (local_debug) {
+                                    printf(
+                                        "[PHONE_MAIN_PC_FFN] "
+                                        "chunk=%d task=%" PRIu64
+                                        " ready_wait_ms=%.3f "
+                                        "input_copy_ms=%.3f "
+                                        "compute_ms=%.3f "
+                                        "status=READY\n",
+                                        chunk,
+                                        task_id,
+                                        route_wait_us /
+                                            1000.0,
+                                        copy_us / 1000.0,
+                                        compute_us / 1000.0);
+                                }
+                                return GGML_STATUS_SUCCESS;
+                            });
+
+                    state.join_worker =
+                        backend_ctx->
+                            prefill_reduce_workers[
+                                state.partial_slot];
+                    ggml_backend_meta_transfer_worker *
+                        partial_worker =
+                            state.partial_worker;
+                    const uint64_t partial_task =
+                        state.partial_task;
+                    const uint64_t pc_task =
+                        state.pc_ffn_task;
+                    ggml_tensor * pc_phone_stage =
+                        state.pc_phone_stage;
+                    ggml_cgraph * pc_reduce =
+                        state.pc_reduce_graph;
+                    auto join_payload =
+                        state.phone_partial_payload;
+
+                    state.join_task =
+                        state.join_worker->enqueue(
+                            [pc_worker,
+                             pc_task,
+                             partial_worker,
+                             partial_task,
+                             pc_backend,
+                             pc_phone_stage,
+                             pc_reduce,
+                             join_payload,
+                             chunk,
+                             local_debug]
+                            (uint64_t task_id) ->
+                            ggml_status {
+                                const int64_t begin_us =
+                                    ggml_time_us();
+                                const ggml_status pc_status =
+                                    pc_worker->wait(
+                                        pc_task);
+                                if (pc_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return pc_status;
+                                }
+                                const ggml_status partial_status =
+                                    partial_worker->wait(
+                                        partial_task);
+                                if (partial_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return partial_status;
+                                }
+
+                                ggml_backend_tensor_set(
+                                    pc_phone_stage,
+                                    join_payload->data(),
+                                    0,
+                                    join_payload->size());
+                                const ggml_status reduce_status =
+                                    ggml_backend_graph_compute(
+                                        pc_backend,
+                                        pc_reduce);
+                                if (reduce_status ==
+                                        GGML_STATUS_SUCCESS) {
+                                    ggml_backend_synchronize(
+                                        pc_backend);
+                                }
+
+                                if (local_debug) {
+                                    printf(
+                                        "[PHONE_MAIN_PC_JOIN] "
+                                        "chunk=%d task=%" PRIu64
+                                        " bytes=%zu total_ms=%.3f "
+                                        "status=%d\n",
+                                        chunk,
+                                        task_id,
+                                        join_payload->size(),
+                                        (ggml_time_us() -
+                                            begin_us) /
+                                            1000.0,
+                                        (int) reduce_status);
+                                }
+                                return reduce_status;
+                            });
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_PREP] "
+                            "chunk=%d region_uid=%" PRIu64
+                            " attn_uid=%" PRIu64
+                            " ffn_uid=%" PRIu64
+                            " ready_seq=%" PRIu64
+                            " ready_lane=%u "
+                            "partial_seq=%" PRIu64
+                            " partial_slot=%u "
+                            "pc_task=%" PRIu64
+                            " partial_task=%" PRIu64
+                            " join_task=%" PRIu64
+                            " status=ARMED\n",
+                            chunk,
+                            state.region_uid,
+                            state.p2c_attention_uid,
+                            state.p2c_ffn_uid,
+                            state.ready_seq,
+                            state.ready_lane,
+                            state.partial_seq,
+                            state.partial_slot,
+                            state.pc_ffn_task,
+                            state.partial_task,
+                            state.join_task);
+                    }
+                }
+
                 const auto & last =
                     region_pipe_chunks.rbegin()->second;
                 ggml_tensor * disabled_pc =
@@ -14849,18 +14975,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         1,
                         last.continuation_end_sg + 1,
                         46);
-                local_ok =
-                    disabled_pc != nullptr &&
-                    disabled_phone != nullptr;
-                if (!local_ok) {
-                    region_pipe_reason =
-                        "PHONE_MAIN_DISABLE_L46_TAIL_FAILED";
+                if (disabled_pc == nullptr ||
+                        disabled_phone == nullptr) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "reason=DISABLE_L46_TAIL_FAILED "
+                        "action=STOP\n");
+                    return GGML_STATUS_FAILED;
                 }
-            }
 
-            phone_main_local_active =
-                local_ok;
-            if (!local_ok) {
+                phone_main_local_active = true;
+            } else {
                 eligible = false;
             }
 
