@@ -2624,6 +2624,7 @@ struct ggml_backend_meta_priority_compute_worker {
         uint64_t id = 0;
         bool main = true;
         ggml_cgraph * graph = nullptr;
+        bool trace_handoff = false;
     };
 
     ggml_backend_meta_compute_workers * submitter = nullptr;
@@ -2667,21 +2668,43 @@ struct ggml_backend_meta_priority_compute_worker {
                 }
 
                 lock.unlock();
-                // Preserve the original per-backend submission thread.  RPC,
-                // CUDA and OpenCL paths may carry thread-local connection /
-                // stream ordering state, so the priority scheduler must never
-                // submit a graph to the backend directly from this new thread.
-                // It only chooses MAIN vs SHARD; the canonical compute worker
-                // performs the actual backend submission.
+                // Only select queue priority here; keep submission on the
+                // canonical backend worker to preserve RPC stream affinity.
+                if (current.trace_handoff) {
+                    std::fprintf(stderr,
+                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
+                        " phase=WORKER_PICKED nodes=%d\n",
+                        this->backend_index == 1 ? "PHONE" : "PC",
+                        current.id, current.graph->n_nodes);
+                    std::fflush(stderr);
+                }
                 GGML_ASSERT(this->submitter != nullptr);
                 GGML_ASSERT(
                     this->backend_index <
                     this->submitter->n_backends);
+                const int64_t submit_begin_us = ggml_time_us();
                 this->submitter->start_graph(
                     this->backend_index, current.graph);
+                if (current.trace_handoff) {
+                    std::fprintf(stderr,
+                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
+                        " phase=BACKEND_WAIT_BEGIN dispatch_ms=%.3f\n",
+                        this->backend_index == 1 ? "PHONE" : "PC",
+                        current.id,
+                        (ggml_time_us() - submit_begin_us) / 1000.0);
+                    std::fflush(stderr);
+                }
                 const ggml_status status =
-                    this->submitter->wait(
-                        this->backend_index);
+                    this->submitter->wait(this->backend_index);
+                if (current.trace_handoff) {
+                    std::fprintf(stderr,
+                        "[REGION_REDUCE_TRACE] side=%s task=%" PRIu64
+                        " phase=BACKEND_WAIT_DONE status=%d wall_ms=%.3f\n",
+                        this->backend_index == 1 ? "PHONE" : "PC",
+                        current.id, (int) status,
+                        (ggml_time_us() - submit_begin_us) / 1000.0);
+                    std::fflush(stderr);
+                }
                 lock.lock();
 
                 results[current.id] = status;
@@ -2700,11 +2723,12 @@ struct ggml_backend_meta_priority_compute_worker {
 
     uint64_t enqueue(
             ggml_cgraph * graph,
-            bool main) {
+            bool main,
+            bool trace_handoff = false) {
         GGML_ASSERT(graph != nullptr);
         std::lock_guard<std::mutex> lock(mutex);
         const uint64_t id = ++submitted;
-        task item { id, main, graph };
+        task item { id, main, graph, trace_handoff };
         if (main) {
             main_tasks.push_back(item);
         } else {
@@ -4314,9 +4338,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(region_priority_queues);
             GGML_ASSERT(graph != nullptr);
 
+            const bool trace_c2p_reduce =
+                pipeline_debug && backend_index == 1 &&
+                direction != nullptr && role != nullptr &&
+                std::strcmp(direction, "C2P") == 0 &&
+                std::strcmp(role, "REDUCE") == 0;
+            if (trace_c2p_reduce) {
+                std::fprintf(stderr,
+                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
+                    "phase=ENQUEUE_BEGIN nodes=%d\n",
+                    layer, chunk, graph->n_nodes);
+                std::fflush(stderr);
+            }
+            auto * region_worker = get_region_exec_worker(backend_index);
             const uint64_t task =
-                get_region_exec_worker(backend_index)->enqueue(
-                    graph, true);
+                region_worker->enqueue(graph, true, trace_c2p_reduce);
 
             if (pipeline_debug) {
                 printf(
@@ -4333,7 +4369,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     task);
             }
 
-            return get_region_exec_worker(backend_index)->wait(task);
+            if (trace_c2p_reduce) {
+                std::fprintf(stderr,
+                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
+                    "task=%" PRIu64 " phase=QUEUE_WAIT_BEGIN\n",
+                    layer, chunk, task);
+                std::fflush(stderr);
+            }
+            const ggml_status result = region_worker->wait(task);
+            if (trace_c2p_reduce) {
+                std::fprintf(stderr,
+                    "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
+                    "task=%" PRIu64 " phase=QUEUE_WAIT_DONE status=%d\n",
+                    layer, chunk, task, (int) result);
+                std::fflush(stderr);
+            }
+            return result;
         };
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
@@ -12774,9 +12825,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+                if (region_chunk_continuation && pipeline_debug) {
+                    std::fprintf(stderr,
+                        "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
+                        "phase=GPU_FENCE_BEGIN\n",
+                        prefill_down_layer_0, prefill_down_chunk_0);
+                    std::fflush(stderr);
+                }
                 ggml_backend_synchronize(bcj_src.backend);
                 const int64_t phone_reduce_us =
                     ggml_time_us() - phone_reduce_begin_us;
+                if (region_chunk_continuation && pipeline_debug) {
+                    std::fprintf(stderr,
+                        "[REGION_REDUCE_TRACE] side=PHONE layer=%d chunk=%d "
+                        "phase=GPU_FENCE_DONE reduce_ms=%.3f\n",
+                        prefill_down_layer_0, prefill_down_chunk_0,
+                        phone_reduce_us / 1000.0);
+                    std::fflush(stderr);
+                }
 
                 reduce_add_us += pc_fold_us + phone_reduce_us;
                 ++reduce_to_primary_count;
