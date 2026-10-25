@@ -14078,8 +14078,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             if (chunk == 0) {
                 first_norm = e.norm_sg;
             } else {
-                eligible = e.norm_sg == last_down + 1 &&
+                // Chunk-major PC prefix mode intentionally inserts one or
+                // more PC-only SGs between down(chunk-1) and norm(chunk).
+                // They are scheduled by add_pc_prefix_gap() immediately
+                // before this norm. Preserve the stronger invariants that the
+                // current norm follows the previous down in graph order and
+                // Phone Region chunks themselves remain contiguous.
+                eligible =
+                    e.norm_sg > last_down &&
                     e.begin_sg == last_region_end + 1;
+                if (eligible &&
+                        pipeline_debug &&
+                        e.norm_sg > last_down + 1) {
+                    printf(
+                        "[PC_PREFIX_CHUNK_TOPOLOGY] "
+                        "chunk=%zu gap=[%zu,%zu) "
+                        "norm=%zu down=%zu status=ACCEPTED\n",
+                        chunk,
+                        last_down + 1,
+                        e.norm_sg,
+                        e.norm_sg,
+                        e.down_sg);
+                }
             }
             last_down = e.down_sg;
             last_region_end = e.end_sg;
