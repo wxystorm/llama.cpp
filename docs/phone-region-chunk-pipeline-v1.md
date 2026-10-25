@@ -23,7 +23,11 @@ Phone L45 -> L46 graph join / P2C(46) (unchanged)
 PC tail (unchanged)
 ```
 
-Only *one* L35-L45 graph is issued for each chunk, with KV work ordered chunk 0, 1, 2. PC-side C2P norm/router preparation for chunk N+1 may run while the earlier Phone graph has been submitted and the Phone GPU continues working; a **pre-existing Phone synchronize** during the next PC->Phone router transfer provides the GPU credit and ensures no C2P Phone FFN overlaps unsafe live Phone scratch. This is a bounded, correctness-first **window=2** stage pipeline, not a completely independent dual-queue GPU execution engine. In particular, full C2P vs full Phone overlap and P2C per-chunk pipelining are future steps, *not implemented here*.
+Only *one* L35-L45 graph is issued for each chunk, with KV work ordered chunk 0, 1, 2. PC-side C2P norm/router preparation for chunk N+1 may run while the earlier Phone graph has been submitted and the Phone GPU continues working.
+
+The stock gallocr arena is **not used by an in-flight Region graph**. Meta maintains two persistent Phone scratch slots. Every transient Region tensor is rebound at submit time to a private clone of its original Phone compute arena, preserving all gallocr offsets and VIEW relationships. Chunk N uses slot `N % 2`; before slot reuse, Meta explicitly fences the Phone backend. The final `phone_region_chunk_end_N-45` is excluded from scratch and gets its own compact per-chunk Phone output buffer so it remains valid until L46 consumes it.
+
+This is a bounded, correctness-first **window=2** stage pipeline, not a completely independent dual-queue GPU execution engine. P2C per-chunk pipelining remains a future step.
 
 Important: `PHONE_REGION_GRAPH_DONE` and `PHONE_REGION_PIPE_STAGE ... event=SUBMITTED` mean the host worker returned from asynchronous graph submission; they are NOT GPU execution timings.
 
@@ -55,7 +59,7 @@ The execution schedule changes **only** if the already-allocated Meta graph cont
 - Matching ordered Phone Region graphs `phone_region_attn_chunk_N-35` through `phone_region_chunk_end_N-45`.
 - One exact uninterrupted run of C2P chunks, followed by one exact run of Phone chunks, with no unaccounted Meta subgraphs and no outer scheduler split inside a chunk.
 - The expected C2P L34 + P2C L46 directional owner layout.
-- **Distinct memory:** each early Phone Region output must not alias a future C2P Phone writer. Missing backing pointers or alias collisions trigger a return to the original Meta execution order.
+- **Private Region memory:** gallocr aliasing with future C2P is expected and reported as `PHONE_REGION_PIPE_ALIAS ... action=ISOLATE`. When the pipeline is active, two private Region scratch slots isolate all transient L35-L45 tensors from the serial arena, and per-chunk output buffers preserve L45 outputs until L46. A scratch/output binding failure is fatal for the experimental path rather than silently falling back after execution has begun.
 
 When a pipeline is activated, the previous legacy L34 `l_out-34` producer is disabled **at C2P chunk 0**, not at the final chunk. That producer would otherwise overwrite the Phone-owned, partially accumulated L34 output before Region chunk 0 reads it.
 
@@ -64,7 +68,7 @@ The graph's PC/Phone ownership and real COMPUTE checks continue to run in the ex
 ## Expected diagnostics, 358-token prefill
 
 ```
-[PHONE_REGION_PIPE_PLAN] active=1 window=2 chunks=3 ... reason=READY
+[PHONE_REGION_PIPE_PLAN] active=1 window=2 chunks=3 ... scratch_pool=1 reason=READY_SCRATCH_POOL
 [PHONE_REGION_PIPE_CHUNK] chunk=0 c2p_norm=1 c2p_down=2 region=[7,29] status=READY
 [PHONE_REGION_PIPE_CHUNK] chunk=1 c2p_norm=3 c2p_down=4 region=[30,52] status=READY
 [PHONE_REGION_PIPE_CHUNK] chunk=2 c2p_norm=5 c2p_down=6 region=[53,75] status=READY
@@ -81,10 +85,23 @@ The graph's PC/Phone ownership and real COMPUTE checks continue to run in the ex
 
 The exact SG ranges are specific to the current 358-token graph and can change with graph construction; the structural validator does not hard-code them.
 
+For three chunks, expect scratch/output ownership similar to:
+
+```
+[PHONE_REGION_OUTPUT_SLOT] chunk=0 ... status=BOUND
+[PHONE_REGION_SCRATCH] chunk=0 slot=0 ... status=BOUND
+[PHONE_REGION_OUTPUT_SLOT] chunk=1 ... status=BOUND
+[PHONE_REGION_SCRATCH] chunk=1 slot=1 ... status=BOUND
+[PHONE_REGION_OUTPUT_SLOT] chunk=2 ... status=BOUND
+[PHONE_REGION_SCRATCH] chunk=2 slot=0 ... reuse_wait_ms=... status=BOUND
+```
+
+The non-zero `reuse_wait_ms` on chunk 2 is the explicit window=2 credit: slot 0 cannot be overwritten until the Phone backend has completed the earlier graph that used it.
+
 If `[PHONE_REGION_PIPE_PLAN] active=0`, inspect the `reason`:
 - `UNSUPPORTED_GRAPH`: missing, non-consecutive, or otherwise unsuitable SG arrangement.
-- `OUTPUT_BUFFER_ALIAS`: a live Region output shares storage with a future C2P Phone writer.
-- `OUTPUT_BUFFER_UNAVAILABLE` or `UNKNOWN_FUTURE_BUFFER`: unable to prove memory safety.
+- `OUTPUT_BUFFER_UNAVAILABLE`: the graph does not expose a materialized L45 chunk output that can be rebound safely.
+- `PHONE_REGION_SCRATCH_REJECT`: the experimental pipeline was selected but private scratch/output binding could not be proven safe.
 - `DISABLED`: both opt-in flags not set or another prerequisite not present.
 
 A fallback is *not* a failure of the existing serial Phone Region graph. It intentionally runs the previous order to avoid silent buffer corruption.
