@@ -325,9 +325,21 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         if (phone_only) {
             phone_region_chunks = llama_hybrid_runtime_tensor_chunks(
                 (int) n_tokens, planned_chunk_tokens);
-            if (!phone_region_chunks.empty()) {
+
+            // The Region Graph exists to make multi-chunk prefill a schedulable
+            // unit. For a single chunk there is no pipeline opportunity, and
+            // the current Meta graph does not fuse that shape: it falls back to
+            // many PHONE_ONLY_SG submissions plus a one-node terminal graph.
+            // Keep warmup / tiny-prefill on the already-validated legacy path.
+            //
+            // This also avoids exercising the range-input / SET_ROWS path on a
+            // shape for which it provides no performance benefit. Multi-chunk
+            // prefill (the 358-token XT=128 case) remains unchanged.
+            if (phone_region_chunks.size() > 1) {
                 phone_region_first = 35;
                 phone_region_end = 46;
+            } else {
+                phone_region_chunks.clear();
             }
         }
     }
