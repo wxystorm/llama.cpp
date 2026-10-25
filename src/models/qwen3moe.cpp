@@ -373,7 +373,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         pc_prefix_chunk_enabled =
             pc_only &&
             model.hybrid_layer_mode(pc_prefix_end) ==
-                llama_hybrid_layer_mode::TENSOR_C2P;
+                llama_hybrid_layer_mode::TENSOR_C2P &&
+            cvec->tensor_for(pc_prefix_end) == nullptr &&
+            (size_t) pc_prefix_end <
+                cparams.embeddings_layer_inp.size() &&
+            !cparams.embeddings_layer_inp[
+                (size_t) pc_prefix_end];
     }
 
     if (pc_prefix_chunk_requested) {
@@ -784,6 +789,488 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         return;
     }
 
+    int graph_loop_begin = layer_begin;
+
+    if (pc_prefix_chunk_enabled) {
+        // Chunk-major PC prefix + L34 C2P Attention.  This removes the old
+        // full-batch barriers at both L0-L33 and the L34 Attention path:
+        //
+        //   chunk0: L0..L33 -> L34 Attention/Router/PC-FFN
+        //   chunk1: L0..L33 -> L34 Attention/Router/PC-FFN
+        //   ...
+        //
+        // Meta still owns the directional C2P protocol.  The exact L34
+        // boundary marker names below intentionally match the already
+        // validated C2P runtime.
+        GGML_ASSERT(layer_begin == 0);
+        GGML_ASSERT(pc_prefix_end == 34);
+        GGML_ASSERT(!phone_region_chunks.empty());
+        GGML_ASSERT(ggml_is_contiguous(inpL));
+
+        std::vector<ggml_tensor *> c2p_down_chunks;
+        std::vector<ggml_tensor *> c2p_residual_chunks;
+        c2p_down_chunks.reserve(phone_region_chunks.size());
+        c2p_residual_chunks.reserve(phone_region_chunks.size());
+
+        int64_t token_begin = 0;
+        for (size_t ci = 0;
+                ci < phone_region_chunks.size(); ++ci) {
+            const int64_t token_count =
+                phone_region_chunks[ci];
+            GGML_ASSERT(
+                token_count > 0 &&
+                token_begin + token_count <= n_tokens);
+
+            ggml_tensor * hidden =
+                ggml_view_2d(
+                    ctx0,
+                    inpL,
+                    inpL->ne[0],
+                    token_count,
+                    inpL->nb[1],
+                    token_begin * inpL->nb[1]);
+            const std::string entry_name =
+                "pc_prefix_chunk_begin_" +
+                std::to_string(ci);
+            cb(hidden, entry_name.c_str(), 0);
+
+            auto * chunk_attn =
+                build_attn_inp_kv_range(
+                    (uint32_t) token_begin,
+                    (uint32_t) token_count);
+            ggml_tensor * pos_chunk =
+                ggml_view_1d(
+                    ctx0,
+                    inp_pos,
+                    token_count,
+                    token_begin * inp_pos->nb[0]);
+
+            for (int prefix_il = 0;
+                    prefix_il < pc_prefix_end;
+                    ++prefix_il) {
+                if (ci == 0) {
+                    res->t_layer_inp[prefix_il] = hidden;
+                }
+
+                ggml_tensor * residual = hidden;
+                ggml_tensor * attn_norm =
+                    build_norm(
+                        hidden,
+                        model.layers[prefix_il].attn_norm,
+                        NULL,
+                        LLM_NORM_RMS,
+                        prefix_il);
+                const std::string attn_norm_name =
+                    "pc_prefix_attn_norm_chunk_" +
+                    std::to_string(ci);
+                cb(
+                    attn_norm,
+                    attn_norm_name.c_str(),
+                    prefix_il);
+
+                auto [Qcur, Kcur, Vcur] =
+                    build_qkv(
+                        model.layers[prefix_il],
+                        attn_norm,
+                        n_embd_head,
+                        n_head,
+                        n_head_kv,
+                        prefix_il);
+
+                Qcur = build_norm(
+                    Qcur,
+                    model.layers[prefix_il].attn_q_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    prefix_il);
+                const std::string qnorm_name =
+                    "pc_prefix_q_norm_chunk_" +
+                    std::to_string(ci);
+                cb(Qcur, qnorm_name.c_str(), prefix_il);
+
+                Kcur = build_norm(
+                    Kcur,
+                    model.layers[prefix_il].attn_k_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    prefix_il);
+                const std::string knorm_name =
+                    "pc_prefix_k_norm_chunk_" +
+                    std::to_string(ci);
+                cb(Kcur, knorm_name.c_str(), prefix_il);
+
+                Qcur = ggml_rope_ext(
+                    ctx0,
+                    Qcur,
+                    pos_chunk,
+                    nullptr,
+                    n_rot,
+                    rope_type,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+                Kcur = ggml_rope_ext(
+                    ctx0,
+                    Kcur,
+                    pos_chunk,
+                    nullptr,
+                    n_rot,
+                    rope_type,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+
+                const std::string q_name =
+                    "pc_prefix_q_chunk_" +
+                    std::to_string(ci);
+                const std::string k_name =
+                    "pc_prefix_k_chunk_" +
+                    std::to_string(ci);
+                const std::string v_name =
+                    "pc_prefix_v_chunk_" +
+                    std::to_string(ci);
+                cb(Qcur, q_name.c_str(), prefix_il);
+                cb(Kcur, k_name.c_str(), prefix_il);
+                cb(Vcur, v_name.c_str(), prefix_il);
+
+                ggml_tensor * attn =
+                    build_attn(
+                        chunk_attn,
+                        model.layers[prefix_il].wo,
+                        model.layers[prefix_il].wo_b,
+                        model.layers[prefix_il].wo_s,
+                        Qcur,
+                        Kcur,
+                        Vcur,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        1.0f /
+                            sqrtf(float(n_embd_head)),
+                        prefix_il);
+                const std::string attn_name =
+                    "pc_prefix_attn_chunk_" +
+                    std::to_string(ci);
+                cb(attn, attn_name.c_str(), prefix_il);
+
+                ggml_tensor * ffn_inp =
+                    ggml_add(ctx0, attn, residual);
+                const std::string ffn_inp_name =
+                    "pc_prefix_ffn_inp_chunk_" +
+                    std::to_string(ci);
+                cb(
+                    ffn_inp,
+                    ffn_inp_name.c_str(),
+                    prefix_il);
+
+                ggml_tensor * ffn_norm =
+                    build_norm(
+                        ffn_inp,
+                        model.layers[prefix_il].ffn_norm,
+                        NULL,
+                        LLM_NORM_RMS,
+                        prefix_il);
+                const std::string ffn_norm_name =
+                    "pc_prefix_ffn_norm_chunk_" +
+                    std::to_string(ci);
+                cb(
+                    ffn_norm,
+                    ffn_norm_name.c_str(),
+                    prefix_il);
+
+                ggml_tensor * moe_out =
+                    build_moe_ffn(
+                        ffn_norm,
+                        model.layers[prefix_il].ffn_gate_inp,
+                        model.layers[prefix_il].ffn_up_exps,
+                        model.layers[prefix_il].ffn_gate_exps,
+                        model.layers[prefix_il].ffn_down_exps,
+                        nullptr,
+                        n_expert,
+                        n_expert_used,
+                        LLM_FFN_SILU,
+                        true,
+                        hparams.expert_weights_scale,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        prefix_il,
+                        nullptr,
+                        nullptr,
+                        model.layers[prefix_il].ffn_up_exps_s,
+                        model.layers[prefix_il].ffn_gate_exps_s,
+                        model.layers[prefix_il].ffn_down_exps_s);
+                const std::string moe_name =
+                    "pc_prefix_ffn_out_chunk_" +
+                    std::to_string(ci);
+                cb(moe_out, moe_name.c_str(), prefix_il);
+
+                hidden =
+                    ggml_add(ctx0, moe_out, ffn_inp);
+                const std::string out_name =
+                    prefix_il + 1 == pc_prefix_end ?
+                        "pc_prefix_chunk_end_" +
+                            std::to_string(ci) :
+                        "pc_prefix_l_out_chunk_" +
+                            std::to_string(ci);
+                cb(hidden, out_name.c_str(), prefix_il);
+            }
+
+            // L34 C2P Attention/Router is chunk-local as well.  READY can now
+            // leave the PC as soon as this chunk reaches the Tensor boundary.
+            constexpr int tensor_il = pc_prefix_end;
+            if (ci == 0) {
+                res->t_layer_inp[tensor_il] = hidden;
+            }
+
+            ggml_tensor * tensor_residual = hidden;
+            ggml_tensor * tensor_attn_norm =
+                build_norm(
+                    hidden,
+                    model.layers[tensor_il].attn_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    tensor_il);
+            const std::string tensor_attn_norm_name =
+                "c2p_tensor_attn_norm_chunk_" +
+                std::to_string(ci);
+            cb(
+                tensor_attn_norm,
+                tensor_attn_norm_name.c_str(),
+                tensor_il);
+
+            auto [TQ, TK, TV] =
+                build_qkv(
+                    model.layers[tensor_il],
+                    tensor_attn_norm,
+                    n_embd_head,
+                    n_head,
+                    n_head_kv,
+                    tensor_il);
+            TQ = build_norm(
+                TQ,
+                model.layers[tensor_il].attn_q_norm,
+                NULL,
+                LLM_NORM_RMS,
+                tensor_il);
+            TK = build_norm(
+                TK,
+                model.layers[tensor_il].attn_k_norm,
+                NULL,
+                LLM_NORM_RMS,
+                tensor_il);
+
+            const std::string tqn_name =
+                "c2p_tensor_q_norm_chunk_" +
+                std::to_string(ci);
+            const std::string tkn_name =
+                "c2p_tensor_k_norm_chunk_" +
+                std::to_string(ci);
+            cb(TQ, tqn_name.c_str(), tensor_il);
+            cb(TK, tkn_name.c_str(), tensor_il);
+
+            TQ = ggml_rope_ext(
+                ctx0,
+                TQ,
+                pos_chunk,
+                nullptr,
+                n_rot,
+                rope_type,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+            TK = ggml_rope_ext(
+                ctx0,
+                TK,
+                pos_chunk,
+                nullptr,
+                n_rot,
+                rope_type,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+
+            const std::string tq_name =
+                "c2p_tensor_q_chunk_" +
+                std::to_string(ci);
+            const std::string tk_name =
+                "c2p_tensor_k_chunk_" +
+                std::to_string(ci);
+            const std::string tv_name =
+                "c2p_tensor_v_chunk_" +
+                std::to_string(ci);
+            cb(TQ, tq_name.c_str(), tensor_il);
+            cb(TK, tk_name.c_str(), tensor_il);
+            cb(TV, tv_name.c_str(), tensor_il);
+
+            ggml_tensor * tensor_attn =
+                build_attn(
+                    chunk_attn,
+                    model.layers[tensor_il].wo,
+                    model.layers[tensor_il].wo_b,
+                    model.layers[tensor_il].wo_s,
+                    TQ,
+                    TK,
+                    TV,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    1.0f / sqrtf(float(n_embd_head)),
+                    tensor_il);
+            const std::string tensor_attn_name =
+                "c2p_tensor_attn_chunk_" +
+                std::to_string(ci);
+            cb(
+                tensor_attn,
+                tensor_attn_name.c_str(),
+                tensor_il);
+
+            ggml_tensor * tensor_ffn_inp =
+                ggml_add(
+                    ctx0,
+                    tensor_attn,
+                    tensor_residual);
+            const std::string tensor_ffn_inp_name =
+                "c2p_tensor_ffn_inp_chunk_" +
+                std::to_string(ci);
+            cb(
+                tensor_ffn_inp,
+                tensor_ffn_inp_name.c_str(),
+                tensor_il);
+
+            ggml_tensor * tensor_norm =
+                build_norm(
+                    tensor_ffn_inp,
+                    model.layers[tensor_il].ffn_norm,
+                    NULL,
+                    LLM_NORM_RMS,
+                    tensor_il);
+            const std::string norm_name =
+                "prefill_ffn_norm_chunk_" +
+                std::to_string(ci);
+            cb(tensor_norm, norm_name.c_str(), tensor_il);
+
+            llm_graph_moe_routing routing =
+                build_moe_routing(
+                    tensor_norm,
+                    model.layers[tensor_il].ffn_gate_inp,
+                    nullptr,
+                    nullptr,
+                    n_expert,
+                    n_expert_used,
+                    true,
+                    hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    tensor_il);
+            const std::string topk_name =
+                "c2p_prefill_route_topk_chunk_" +
+                std::to_string(ci);
+            const std::string weights_name =
+                "c2p_prefill_route_weights_chunk_" +
+                std::to_string(ci);
+            cb(
+                routing.selected_experts,
+                topk_name.c_str(),
+                tensor_il);
+            cb(
+                routing.weights,
+                weights_name.c_str(),
+                tensor_il);
+
+            ggml_tensor * tensor_down =
+                build_moe_ffn(
+                    tensor_norm,
+                    model.layers[tensor_il].ffn_gate_inp,
+                    model.layers[tensor_il].ffn_up_exps,
+                    model.layers[tensor_il].ffn_gate_exps,
+                    model.layers[tensor_il].ffn_down_exps,
+                    nullptr,
+                    n_expert,
+                    n_expert_used,
+                    LLM_FFN_SILU,
+                    true,
+                    hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    tensor_il,
+                    nullptr,
+                    nullptr,
+                    model.layers[tensor_il].ffn_up_exps_s,
+                    model.layers[tensor_il].ffn_gate_exps_s,
+                    model.layers[tensor_il].ffn_down_exps_s,
+                    routing.selected_experts,
+                    1,
+                    nullptr,
+                    routing.weights);
+            const std::string down_name =
+                "prefill_ffn_down_chunk_" +
+                std::to_string(ci);
+            cb(tensor_down, down_name.c_str(), tensor_il);
+
+            // Materialize one complete PC macro at a time. The next chunk is
+            // appended only after this boundary, so Meta sees chunk-major
+            // producer order instead of one full-prefix phase barrier.
+            ggml_build_forward_expand(gf, tensor_down);
+
+            c2p_down_chunks.push_back(tensor_down);
+            c2p_residual_chunks.push_back(tensor_ffn_inp);
+
+            LLAMA_LOG_ERROR(
+                "[PC_PREFIX_CHUNK] chunk=%zu begin=%" PRId64
+                " tokens=%" PRId64
+                " layers=[0,34] c2p_ready=1 status=BUILT\n",
+                ci,
+                token_begin,
+                token_count);
+
+            token_begin += token_count;
+        }
+        GGML_ASSERT(token_begin == n_tokens);
+
+        // Keep a full L34 output descriptor only as the stable target buffer
+        // used by the existing Phone-side C2P Reduce.  Local-MAIN disables
+        // this legacy producer at chunk0, so it is not a runtime barrier.
+        ggml_tensor * down_join =
+            c2p_down_chunks.front();
+        ggml_tensor * residual_join =
+            c2p_residual_chunks.front();
+        for (size_t ci = 1;
+                ci < c2p_down_chunks.size(); ++ci) {
+            down_join =
+                ggml_concat(
+                    ctx0,
+                    down_join,
+                    c2p_down_chunks[ci],
+                    1);
+            residual_join =
+                ggml_concat(
+                    ctx0,
+                    residual_join,
+                    c2p_residual_chunks[ci],
+                    1);
+        }
+        cur = ggml_add(
+            ctx0,
+            down_join,
+            residual_join);
+        cb(cur, "l_out", pc_prefix_end);
+        inpL = cur;
+        graph_loop_begin = pc_prefix_end + 1;
+    }
+
     // Preserve the chunk-local L45 outputs and their range-Attention inputs
     // across the loop boundary. L46 is a P2C Tensor layer whose Attention is
     // Phone-owned, so it must continue from each Region chunk directly rather
@@ -792,7 +1279,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     std::vector<llm_graph_input_attn_kv *> phone_region_attn_inputs_for_tensor;
     std::vector<int64_t> phone_region_token_begin_for_tensor;
 
-    for (int il = layer_begin; il < layer_end; ++il) {
+    for (int il = graph_loop_begin; il < layer_end; ++il) {
         if (il == phone_region_first) {
             // Keep the C2P final owner and the L46 P2C protocol untouched.
             // L34's complete Phone-owned output is the immutable input to
