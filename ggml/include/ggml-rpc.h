@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    14
+#define RPC_PROTO_PATCH_VERSION    15
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -111,6 +111,15 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_PHONE_MAIN_REGISTER_PROC \
     "ggml_backend_rpc_phone_main_register"
 
+#define GGML_BACKEND_RPC_PHONE_C2P_REGISTER_PROC \
+    "ggml_backend_rpc_phone_c2p_register"
+
+#define GGML_BACKEND_RPC_PHONE_C2P_READY_PROC \
+    "ggml_backend_rpc_phone_c2p_ready"
+
+#define GGML_BACKEND_RPC_PHONE_C2P_PARTIAL_PROC \
+    "ggml_backend_rpc_phone_c2p_partial"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -174,6 +183,28 @@ using ggml_backend_rpc_phone_main_register_t = bool (*)(
         uint64_t partial_seq,
         uint32_t partial_slot,
         const ggml_tensor * partial);
+
+// Register and drive the low-priority C2P Phone FFN queue. READY only
+// admits FFN after all private Phone input buffers are device-ready. PARTIAL
+// carries the PC-side second payload; Reduce is admitted locally only after
+// both FFN_DONE and PARTIAL_READY.
+using ggml_backend_rpc_phone_c2p_register_t = bool (*)(
+        ggml_backend_t backend,
+        int32_t chunk,
+        uint64_t ffn_graph_uid,
+        uint64_t consume_seq);
+
+using ggml_backend_rpc_phone_c2p_ready_t = bool (*)(
+        ggml_backend_t backend,
+        int32_t chunk);
+
+using ggml_backend_rpc_phone_c2p_partial_t = bool (*)(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        int32_t chunk,
+        uint64_t reduce_graph_uid,
+        const ggml_tensor * src,
+        ggml_tensor * dst);
 
 using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         ggml_backend_t backend_dst,
