@@ -13251,6 +13251,33 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 return GGML_STATUS_SUCCESS;
             }
 
+            // The input-stage worker also snapshots the residual into the
+            // private slot. Retire it before PC graph compute can recycle any
+            // source arena that the residual view points into.
+            if (state.input_task != 0) {
+                if (backend_ctx->prefill_input_worker == nullptr) {
+                    return GGML_STATUS_FAILED;
+                }
+                const uint64_t input_task =
+                    state.input_task;
+                const ggml_status input_status =
+                    backend_ctx->prefill_input_worker->wait(
+                        input_task);
+                state.input_task = 0;
+                if (input_status != GGML_STATUS_SUCCESS) {
+                    release_region_c2p_overlap_chunk(
+                        layer, chunk, "INPUT_STAGE_FAILED");
+                    return input_status;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_MAIN_C2P_INPUT_READY] "
+                        "layer=%d chunk=%d task=%" PRIu64
+                        " residual_snapshot=1 status=READY\n",
+                        layer, chunk, input_task);
+                }
+            }
+
             char topk_name[96];
             char weights_name[96];
             std::snprintf(
@@ -17194,29 +17221,31 @@ auto prefill_norm_sg_has_prework =
     if (region_c2p_prepared_exec) {
         auto & state = region_c2p_exec_it->second;
         GGML_ASSERT(state.input_staged);
-        GGML_ASSERT(state.input_task != 0);
         GGML_ASSERT(state.pc_topk != nullptr);
         GGML_ASSERT(state.pc_weights != nullptr);
         GGML_ASSERT(state.pc_partial != nullptr);
-        GGML_ASSERT(
-            backend_ctx->prefill_input_worker != nullptr);
 
-        const int64_t input_wait_begin_us =
-            ggml_time_us();
-        const ggml_status input_status =
-            backend_ctx->prefill_input_worker->wait(
-                state.input_task);
-        const int64_t input_wait_us =
-            ggml_time_us() - input_wait_begin_us;
-        tensor_wait_us += input_wait_us;
-        state.input_task = 0;
-        if (input_status != GGML_STATUS_SUCCESS) {
-            release_region_c2p_overlap_chunk(
-                prefill_down_layer,
-                prefill_down_chunk,
-                "INPUT_WAIT_FAILED");
-            return input_status;
+        int64_t input_wait_us = 0;
+        if (state.input_task != 0) {
+            GGML_ASSERT(
+                backend_ctx->prefill_input_worker != nullptr);
+            const int64_t input_wait_begin_us =
+                ggml_time_us();
+            const ggml_status input_status =
+                backend_ctx->prefill_input_worker->wait(
+                    state.input_task);
+            input_wait_us =
+                ggml_time_us() - input_wait_begin_us;
+            state.input_task = 0;
+            if (input_status != GGML_STATUS_SUCCESS) {
+                release_region_c2p_overlap_chunk(
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    "INPUT_WAIT_FAILED");
+                return input_status;
+            }
         }
+        tensor_wait_us += input_wait_us;
 
         char topk_name[96];
         char weights_name[96];
