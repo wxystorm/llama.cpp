@@ -127,7 +127,7 @@ After prebinding removed the output stall, hardware showed `chunk=2 slot=0 reuse
 
 RPC patch 13 adds a dedicated completion-wait socket and `RPC_CMD_WAIT_READY_SEQ`. Region chunks whose slot will be reused enqueue an existing `PHONE_FFN_MARK_READY(seq)` marker immediately after their graph on the compute socket. Because the server processes that marker only after the preceding graph completes, it precisely marks that slot's producer completion. A later slot reuse waits for that seq through the independent completion socket; Region1 may continue running while slot0 becomes reusable.
 
-Expected three-chunk trace:
+On the standalone per-slot-fence branch, the expected three-chunk trace was:
 
 ```
 [PHONE_REGION_POOL_PREP] ... seq_fence=1 ... reason=READY
@@ -135,6 +135,8 @@ Expected three-chunk trace:
 ...
 [PHONE_REGION_SCRATCH] chunk=2 slot=0 ... reuse_wait_ms=... wait_mode=SEQ status=BOUND
 ```
+
+The continuation branch below consumes that credit earlier at L46 and releases the slot, so its later reuse is expected to switch from `wait_mode=SEQ` to `wait_mode=NONE`.
 
 If the seq feature is unavailable, the experimental pipeline fails preflight. At runtime, any missing marker/wait falls back to the previous global fence for correctness. Patch 13 changes the RPC protocol, so **PC and Phone server must be rebuilt from the same commit**.
 
