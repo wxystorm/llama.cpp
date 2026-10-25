@@ -2382,6 +2382,10 @@ struct ggml_backend_meta_context {
         int owner_layer = -1;
         int owner_chunk = -1;
         ggml_backend_buffer_ptr phone_input_buf;
+        // Future C2P Router metadata must not land in stock Phone gallocr
+        // storage while MAIN owns the GPU/scratch. Keep TopK/weights private
+        // for the whole overlap-slot lifetime, just like the hidden input.
+        std::array<ggml_backend_buffer_ptr, 2> phone_route_bufs;
         std::array<ggml_backend_buffer_ptr, 2> pc_route_bufs;
         ggml_backend_buffer_ptr pc_partial_buf;
     };
@@ -4196,6 +4200,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         ggml_tensor * pc_weights = nullptr;
         ggml_tensor * pc_partial = nullptr;
         std::vector<c2p_route_binding_backup> input_bindings;
+        std::vector<c2p_route_binding_backup> phone_bindings;
         std::vector<c2p_route_binding_backup> pc_bindings;
     };
     std::map<std::pair<int, int>, region_c2p_overlap_chunk_state>
@@ -5988,6 +5993,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             restore_c2p_route_bindings(state.pc_bindings);
+            restore_c2p_route_bindings(state.phone_bindings);
             restore_c2p_route_bindings(state.input_bindings);
             slot.owner_layer = -1;
             slot.owner_chunk = -1;
