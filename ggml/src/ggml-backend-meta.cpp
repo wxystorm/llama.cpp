@@ -6362,7 +6362,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // synchronously captures hidden/top-k/weights into that slot and only then
     // publishes READY. The consumer never reads a live producer tensor.
     auto prearm_phone_prefill_route =
-        [&](size_t sg, int layer, int chunk) -> bool {
+        [&](size_t sg,
+            int layer,
+            int chunk,
+            uint64_t reserved_seq,
+            size_t reserved_lane) -> bool {
             const bool legacy_route_mode =
                 phone_prefill_producer_route &&
                 phone_prefill_chunk_pipeline &&
@@ -6459,8 +6463,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
 
             const size_t lane =
-                static_cast<size_t>(chunk) %
-                ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+                reserved_lane != SIZE_MAX ?
+                    reserved_lane :
+                    static_cast<size_t>(chunk) %
+                        ggml_backend_meta_context::PREFILL_ROUTE_LANES;
+            if (lane >=
+                    ggml_backend_meta_context::PREFILL_ROUTE_LANES) {
+                return false;
+            }
             auto & route_worker =
                 backend_ctx->prefill_route_workers[lane];
             if (route_worker == nullptr) {
@@ -6517,8 +6527,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_buffer_get_base(buf.get());
             }
 
-            const uint64_t producer_seq =
-                backend_ctx->next_phone_prefill_route_seq++;
+            uint64_t producer_seq =
+                reserved_seq != 0 ?
+                    reserved_seq :
+                    backend_ctx->next_phone_prefill_route_seq++;
+            if (producer_seq == 0) {
+                producer_seq =
+                    backend_ctx->next_phone_prefill_route_seq++;
+            }
             ggml_backend_t route_src_backend = bcj_src.backend;
             ggml_backend_t route_dst_backend = bcj_dst.backend;
 
@@ -15714,7 +15730,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     if (!prearm_phone_prefill_route(
                             e.continuation_route_sg,
                             46,
-                            chunk)) {
+                            chunk,
+                            state.ready_seq,
+                            state.ready_lane)) {
                         printf(
                             "[PHONE_MAIN_LOCAL_REJECT] "
                             "chunk=%d reason=READY_ARM_FAILED "
@@ -18855,7 +18873,9 @@ auto prefill_norm_sg_has_prework =
                 prearm_phone_prefill_route(
                     i,
                     direct_route_layer,
-                    direct_route_chunk);
+                    direct_route_chunk,
+                    0,
+                    SIZE_MAX);
         }
 
         std::vector<phone_region_binding_backup>
