@@ -6491,6 +6491,25 @@ bool rpc_server::phone_main_register(
             }
         }
         phone_main_plans.emplace(key, request);
+
+        // C2P-local ingress may have completed both prerequisites before the
+        // continuation plan arrived. Admission remains event-driven: this only
+        // queues MAIN when FFN_DONE && PARTIAL_READY are already true.
+        const auto c2p_key =
+            std::make_pair(
+                request.device,
+                request.chunk);
+        const auto c2p_it =
+            phone_c2p_states.find(c2p_key);
+        if (c2p_it != phone_c2p_states.end() &&
+                c2p_it->second.reduce_graph_uid ==
+                    request.trigger_reduce_uid) {
+            if (!phone_c2p_try_admit_reduce_locked(
+                    request.device,
+                    request.chunk)) {
+                return false;
+            }
+        }
     }
 
     GGML_LOG_INFO(
@@ -6516,7 +6535,8 @@ bool rpc_server::phone_main_register(
 bool rpc_server::phone_main_trigger_after_graph(
         uint32_t device,
         uint64_t graph_uid) {
-    // Called while phone_gpu_mutex is held by the normal graph path.
+    // Legacy/bootstrap trigger: the Reduce graph has already executed on the
+    // normal RPC lane. Queue only the post-Reduce MAIN continuation.
     std::lock_guard<std::mutex> lock(phone_main_mutex);
     const auto key =
         std::make_pair(device, graph_uid);
@@ -6528,54 +6548,414 @@ bool rpc_server::phone_main_trigger_after_graph(
         return false;
     }
 
-    phone_main_jobs.push_back(it->second);
+    phone_main_jobs.push_back({
+        it->second,
+        false,
+    });
     const int chunk = it->second.chunk;
     phone_main_plans.erase(it);
-    ++phone_main_pending;
+    phone_main_pending.fetch_add(
+        1, std::memory_order_release);
 
     GGML_LOG_INFO(
         "[PHONE_MAIN_TRIGGER] chunk=%d device=%u "
         "trigger_uid=%" PRIu64
-        " main_depth=%zu priority=MAIN status=QUEUED\n",
+        " main_depth=%zu priority=MAIN "
+        "execute_reduce=0 status=QUEUED\n",
         chunk, device, graph_uid,
         phone_main_jobs.size());
     phone_main_cv.notify_one();
     return true;
 }
 
+bool rpc_server::phone_c2p_register(
+        const rpc_msg_phone_c2p_register_req & request) {
+    if (request.device >= backends.size() ||
+            request.chunk < 0 ||
+            request.ffn_graph_uid == 0 ||
+            request.consume_seq == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> graph_lock(
+            stored_graphs_mutex);
+        const auto it =
+            stored_graphs[request.device].find(
+                request.ffn_graph_uid);
+        if (it ==
+                stored_graphs[request.device].end() ||
+                it->second.graph == nullptr) {
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(phone_main_mutex);
+        if (phone_main_stop) {
+            return false;
+        }
+        const auto key =
+            std::make_pair(
+                request.device,
+                request.chunk);
+        if (phone_c2p_states.count(key) != 0) {
+            return false;
+        }
+        if (!phone_main_worker.joinable()) {
+            try {
+                phone_main_worker =
+                    std::thread([this]() {
+                        phone_main_loop();
+                    });
+            } catch (...) {
+                return false;
+            }
+        }
+
+        phone_c2p_state state {};
+        state.device = request.device;
+        state.chunk = request.chunk;
+        state.ffn_graph_uid =
+            request.ffn_graph_uid;
+        state.consume_seq =
+            request.consume_seq;
+        phone_c2p_states.emplace(
+            key, std::move(state));
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_C2P_REGISTER] chunk=%d device=%u "
+        "ffn_uid=%" PRIu64
+        " consume_seq=%" PRIu64
+        " queue=C2P_FFN status=READY\n",
+        request.chunk,
+        request.device,
+        request.ffn_graph_uid,
+        request.consume_seq);
+    return true;
+}
+
+bool rpc_server::phone_c2p_ready(
+        const rpc_msg_phone_c2p_ready_req & request) {
+    std::lock_guard<std::mutex> lock(phone_main_mutex);
+    const auto key =
+        std::make_pair(
+            request.device,
+            request.chunk);
+    const auto it =
+        phone_c2p_states.find(key);
+    if (it == phone_c2p_states.end() ||
+            it->second.failed ||
+            it->second.ready ||
+            it->second.ffn_queued ||
+            it->second.ffn_done) {
+        return false;
+    }
+
+    it->second.ready = true;
+    it->second.ffn_queued = true;
+    phone_c2p_ffn_jobs.push_back(key);
+
+    GGML_LOG_INFO(
+        "[PHONE_C2P_READY] chunk=%d device=%u "
+        "low_depth=%zu priority=C2P_FFN status=QUEUED\n",
+        request.chunk,
+        request.device,
+        phone_c2p_ffn_jobs.size());
+    phone_main_cv.notify_one();
+    return true;
+}
+
+bool rpc_server::phone_c2p_try_admit_reduce_locked(
+        uint32_t device,
+        int32_t chunk) {
+    const auto c2p_key =
+        std::make_pair(device, chunk);
+    const auto state_it =
+        phone_c2p_states.find(c2p_key);
+    if (state_it == phone_c2p_states.end()) {
+        return false;
+    }
+    auto & state = state_it->second;
+    if (state.failed ||
+            state.reduce_queued ||
+            !state.ffn_done ||
+            !state.partial_ready ||
+            state.reduce_graph_uid == 0) {
+        return true;
+    }
+
+    const auto plan_key =
+        std::make_pair(
+            device,
+            state.reduce_graph_uid);
+    const auto plan_it =
+        phone_main_plans.find(plan_key);
+    if (plan_it == phone_main_plans.end()) {
+        // Main registration may arrive just after FFN/PARTIAL. Keep both
+        // readiness bits and retry from phone_main_register().
+        return true;
+    }
+
+    state.reduce_queued = true;
+    phone_main_jobs.push_back({
+        plan_it->second,
+        true,
+    });
+    phone_main_plans.erase(plan_it);
+    phone_main_pending.fetch_add(
+        1, std::memory_order_release);
+
+    GGML_LOG_INFO(
+        "[PHONE_C2P_REDUCE_ADMIT] chunk=%d device=%u "
+        "reduce_uid=%" PRIu64
+        " main_depth=%zu reason=BOTH_READY "
+        "priority=MAIN status=QUEUED\n",
+        chunk,
+        device,
+        state.reduce_graph_uid,
+        phone_main_jobs.size());
+    phone_main_cv.notify_one();
+    return true;
+}
+
+bool rpc_server::phone_c2p_partial(
+        const std::vector<uint8_t> & input) {
+    if (input.size() <
+            sizeof(rpc_msg_phone_c2p_partial_req)) {
+        return false;
+    }
+
+    rpc_msg_phone_c2p_partial_req request {};
+    memcpy(
+        &request,
+        input.data(),
+        sizeof(request));
+    if (request.device >= backends.size() ||
+            request.chunk < 0 ||
+            request.reduce_graph_uid == 0 ||
+            request.size == 0 ||
+            request.offset >
+                std::numeric_limits<uint64_t>::max() -
+                    request.size ||
+            input.size() !=
+                sizeof(request) + request.size) {
+        return false;
+    }
+
+    const void * data =
+        input.data() + sizeof(request);
+    if (!set_tensor_direct(
+            request.tensor,
+            request.offset,
+            data,
+            static_cast<size_t>(request.size))) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(phone_main_mutex);
+        const auto key =
+            std::make_pair(
+                request.device,
+                request.chunk);
+        const auto it =
+            phone_c2p_states.find(key);
+        if (it == phone_c2p_states.end() ||
+                it->second.failed ||
+                it->second.partial_ready ||
+                it->second.reduce_queued) {
+            return false;
+        }
+        it->second.reduce_graph_uid =
+            request.reduce_graph_uid;
+        it->second.partial_ready = true;
+        if (!phone_c2p_try_admit_reduce_locked(
+                request.device,
+                request.chunk)) {
+            return false;
+        }
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_C2P_PARTIAL_READY] chunk=%d device=%u "
+        "reduce_uid=%" PRIu64
+        " bytes=%" PRIu64
+        " status=READY\n",
+        request.chunk,
+        request.device,
+        request.reduce_graph_uid,
+        request.size);
+    return true;
+}
+
 void rpc_server::phone_main_loop() {
     while (true) {
-        rpc_msg_phone_main_register_req plan {};
+        bool run_main = false;
+        phone_main_job main_job {};
+        std::pair<uint32_t, int32_t> c2p_key {
+            0, -1
+        };
+
         {
             std::unique_lock<std::mutex> lock(phone_main_mutex);
             phone_main_cv.wait(
                 lock,
                 [&]() {
                     return phone_main_stop ||
-                           !phone_main_jobs.empty();
+                           !phone_main_jobs.empty() ||
+                           !phone_c2p_ffn_jobs.empty();
                 });
             if (phone_main_stop &&
-                    phone_main_jobs.empty()) {
+                    phone_main_jobs.empty() &&
+                    phone_c2p_ffn_jobs.empty()) {
                 return;
             }
-            plan = phone_main_jobs.front();
-            phone_main_jobs.pop_front();
+
+            // MAIN always wins dequeue. C2P_FFN only fills GPU bubbles.
+            if (!phone_main_jobs.empty()) {
+                run_main = true;
+                main_job =
+                    phone_main_jobs.front();
+                phone_main_jobs.pop_front();
+            } else {
+                c2p_key =
+                    phone_c2p_ffn_jobs.front();
+                phone_c2p_ffn_jobs.pop_front();
+            }
         }
 
-        std::unique_lock<std::mutex> gpu_lock(phone_gpu_mutex);
-        GGML_ASSERT(phone_main_pending > 0);
-        --phone_main_pending;
-        phone_main_running = true;
+        if (!run_main) {
+            std::unique_lock<std::mutex> gpu_lock(
+                phone_gpu_mutex);
 
+            // A MAIN event may have arrived after LOW dequeue but before LOW
+            // acquired the physical GPU lane. Put LOW back and serve MAIN.
+            if (phone_main_pending.load(
+                        std::memory_order_acquire) != 0 ||
+                    phone_main_running.load(
+                        std::memory_order_acquire)) {
+                gpu_lock.unlock();
+                {
+                    std::lock_guard<std::mutex> lock(
+                        phone_main_mutex);
+                    const auto it =
+                        phone_c2p_states.find(c2p_key);
+                    if (it != phone_c2p_states.end() &&
+                            !it->second.ffn_done &&
+                            !it->second.failed) {
+                        phone_c2p_ffn_jobs.push_front(
+                            c2p_key);
+                    }
+                }
+                phone_main_cv.notify_one();
+                continue;
+            }
+
+            uint64_t ffn_uid = 0;
+            uint64_t consume_seq = 0;
+            int32_t chunk = c2p_key.second;
+            {
+                std::lock_guard<std::mutex> lock(
+                    phone_main_mutex);
+                const auto it =
+                    phone_c2p_states.find(c2p_key);
+                if (it == phone_c2p_states.end() ||
+                        it->second.failed ||
+                        !it->second.ready ||
+                        !it->second.ffn_queued ||
+                        it->second.ffn_done) {
+                    continue;
+                }
+                ffn_uid = it->second.ffn_graph_uid;
+                consume_seq = it->second.consume_seq;
+            }
+
+            rpc_msg_graph_recompute_req run {};
+            run.device = c2p_key.first;
+            run.graph_uid = ffn_uid;
+            const int64_t begin_us = ggml_time_us();
+            const bool ok =
+                graph_recompute_unlocked(run);
+            const int64_t done_us = ggml_time_us();
+            gpu_lock.unlock();
+            phone_gpu_cv.notify_all();
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    phone_main_mutex);
+                const auto it =
+                    phone_c2p_states.find(c2p_key);
+                if (it != phone_c2p_states.end()) {
+                    it->second.ffn_done = ok;
+                    it->second.failed = !ok;
+                    if (ok) {
+                        phone_c2p_try_admit_reduce_locked(
+                            c2p_key.first,
+                            c2p_key.second);
+                    }
+                }
+            }
+
+            if (ok) {
+                {
+                    std::lock_guard<std::mutex> lock(
+                        phone_ffn_ready_mutex);
+                    phone_ffn_ready_seqs[
+                        c2p_key.first].insert(
+                            consume_seq);
+                }
+                phone_ffn_ready_cv.notify_all();
+            }
+
+            GGML_LOG_INFO(
+                "[PHONE_C2P_FFN_DONE] chunk=%d device=%u "
+                "ffn_uid=%" PRIu64
+                " consume_seq=%" PRIu64
+                " wall_ms=%.3f priority=C2P_FFN "
+                "status=%s\n",
+                chunk,
+                c2p_key.first,
+                ffn_uid,
+                consume_seq,
+                (done_us - begin_us) / 1000.0,
+                ok ? "READY" : "FAIL");
+            continue;
+        }
+
+        std::unique_lock<std::mutex> gpu_lock(
+            phone_gpu_mutex);
+        const size_t pending_before =
+            phone_main_pending.load(
+                std::memory_order_acquire);
+        GGML_ASSERT(pending_before > 0);
+        phone_main_pending.fetch_sub(
+            1, std::memory_order_acq_rel);
+        phone_main_running.store(
+            true, std::memory_order_release);
+
+        const auto & plan = main_job.plan;
         const int64_t main_begin_us = ggml_time_us();
         bool ok = true;
 
         rpc_msg_graph_recompute_req run {};
         run.device = plan.device;
 
+        int64_t reduce_begin_us = main_begin_us;
+        int64_t reduce_done_us = main_begin_us;
+        if (main_job.execute_trigger_reduce) {
+            run.graph_uid =
+                plan.trigger_reduce_uid;
+            reduce_begin_us = ggml_time_us();
+            ok = graph_recompute_unlocked(run);
+            reduce_done_us = ggml_time_us();
+        }
+
         run.graph_uid = plan.region_graph_uid;
         const int64_t region_begin_us = ggml_time_us();
-        ok = graph_recompute_unlocked(run);
+        if (ok) {
+            ok = graph_recompute_unlocked(run);
+        }
         const int64_t region_done_us = ggml_time_us();
 
         if (ok) {
@@ -6623,22 +7003,37 @@ void rpc_server::phone_main_loop() {
 
         GGML_LOG_INFO(
             "[PHONE_MAIN_CHAIN] chunk=%d "
-            "region_ms=%.3f attn_ms=%.3f "
-            "ready_stage_ms=%.3f ffn_ms=%.3f "
-            "partial_stage_ms=%.3f total_ms=%.3f "
-            "status=%s\n",
+            "reduce_ms=%.3f region_ms=%.3f "
+            "attn_ms=%.3f ready_stage_ms=%.3f "
+            "ffn_ms=%.3f partial_stage_ms=%.3f "
+            "total_ms=%.3f execute_reduce=%d status=%s\n",
             plan.chunk,
+            main_job.execute_trigger_reduce ?
+                (reduce_done_us - reduce_begin_us) /
+                    1000.0 :
+                0.0,
             (region_done_us - region_begin_us) / 1000.0,
             (attn_done_us - region_done_us) / 1000.0,
             (ready_done_us - attn_done_us) / 1000.0,
             (ffn_done_us - ready_done_us) / 1000.0,
             (partial_done_us - ffn_done_us) / 1000.0,
             (partial_done_us - main_begin_us) / 1000.0,
+            main_job.execute_trigger_reduce ? 1 : 0,
             ok ? "OK" : "FAIL");
 
-        phone_main_running = false;
+        phone_main_running.store(
+            false, std::memory_order_release);
         gpu_lock.unlock();
         phone_gpu_cv.notify_all();
+
+        if (main_job.execute_trigger_reduce) {
+            std::lock_guard<std::mutex> lock(
+                phone_main_mutex);
+            phone_c2p_states.erase(
+                std::make_pair(
+                    plan.device,
+                    plan.chunk));
+        }
 
         if (!ok) {
             GGML_LOG_ERROR(
