@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    13
+#define RPC_PROTO_PATCH_VERSION    14
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -105,6 +105,12 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC \
     "ggml_backend_rpc_wait_ready_seq"
 
+#define GGML_BACKEND_RPC_GRAPH_REGISTER_PROC \
+    "ggml_backend_rpc_graph_register"
+
+#define GGML_BACKEND_RPC_PHONE_MAIN_REGISTER_PROC \
+    "ggml_backend_rpc_phone_main_register"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -142,6 +148,32 @@ using ggml_backend_rpc_phone_ffn_mark_ready_t = bool (*)(
 using ggml_backend_rpc_wait_ready_seq_t = bool (*)(
         ggml_backend_t backend,
         uint64_t seq);
+
+// Register a stable RPC graph in the Phone server cache without executing it.
+// out_uid is the exact cache key later referenced by Phone-local MAIN.
+using ggml_backend_rpc_graph_register_t = bool (*)(
+        ggml_backend_t backend,
+        const struct ggml_cgraph * graph,
+        uint64_t * out_uid);
+
+// Register one Phone-local MAIN continuation. Runtime execution is triggered
+// by completion of trigger_reduce_uid on the Phone server; no START_MAIN or
+// REGION_DONE round trip is required.
+using ggml_backend_rpc_phone_main_register_t = bool (*)(
+        ggml_backend_t backend,
+        int32_t chunk,
+        uint64_t trigger_reduce_uid,
+        uint64_t region_graph_uid,
+        uint64_t p2c_attention_graph_uid,
+        uint64_t p2c_ffn_graph_uid,
+        uint64_t ready_seq,
+        uint32_t ready_lane,
+        const ggml_tensor * ready_hidden,
+        const ggml_tensor * ready_topk,
+        const ggml_tensor * ready_weights,
+        uint64_t partial_seq,
+        uint32_t partial_slot,
+        const ggml_tensor * partial);
 
 using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         ggml_backend_t backend_dst,
