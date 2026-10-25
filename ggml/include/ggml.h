@@ -2735,6 +2735,7 @@ extern "C" {
     GGML_API void                 ggml_graph_cpy       (struct ggml_cgraph * src, struct ggml_cgraph * dst);
     GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph); // set regular grads + optimizer momenta to 0, set loss grad to 1
     GGML_API void                 ggml_graph_clear     (struct ggml_cgraph * cgraph);
+    GGML_API void                 ggml_graph_set_uid   (struct ggml_cgraph * cgraph, uint64_t uid);
 
     GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);
     GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
