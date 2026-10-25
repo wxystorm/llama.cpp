@@ -117,18 +117,43 @@ def main() -> int:
             (0, "C2P_FFN_REDUCE"),
             (0, "PHONE_REGION"),
         ]
-        for c in range(n_chunks):
-            if c + 1 < n_chunks:
+        if event_runtime:
+            next_prep = 1
+            prepared = 0
+            while next_prep < n_chunks and prepared < 2:
                 expected.extend([
-                    (c + 1, "C2P_NORM"),
-                    (c + 1, "C2P_PC_PREP"),
+                    (next_prep, "C2P_NORM"),
+                    (next_prep, "C2P_PC_PREP"),
                 ])
-            expected.append((c, "P2C_CONTINUE"))
-            if c + 1 < n_chunks:
-                expected.extend([
-                    (c + 1, "C2P_FFN_REDUCE"),
-                    (c + 1, "PHONE_REGION"),
-                ])
+                next_prep += 1
+                prepared += 1
+
+            for c in range(n_chunks):
+                expected.append((c, "P2C_CONTINUE"))
+                if c + 1 < n_chunks:
+                    expected.extend([
+                        (c + 1, "C2P_FFN_REDUCE"),
+                        (c + 1, "PHONE_REGION"),
+                    ])
+                    if next_prep < n_chunks:
+                        expected.extend([
+                            (next_prep, "C2P_NORM"),
+                            (next_prep, "C2P_PC_PREP"),
+                        ])
+                        next_prep += 1
+        else:
+            for c in range(n_chunks):
+                if c + 1 < n_chunks:
+                    expected.extend([
+                        (c + 1, "C2P_NORM"),
+                        (c + 1, "C2P_PC_PREP"),
+                    ])
+                expected.append((c, "P2C_CONTINUE"))
+                if c + 1 < n_chunks:
+                    expected.extend([
+                        (c + 1, "C2P_FFN_REDUCE"),
+                        (c + 1, "PHONE_REGION"),
+                    ])
     else:
         expected = [
             (c, stage)
@@ -207,40 +232,74 @@ def main() -> int:
             )
             return 1
 
-        for c in range(n_chunks - 1):
-            region_match = re.search(
-                rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
-                rf"stage=PHONE_REGION event=BEGIN",
+        if event_runtime:
+            # For the first Region, both available lookahead slots should be
+            # filled before MAIN continuation is dequeued.
+            region0 = re.search(
+                r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=0 .*?"
+                r"stage=PHONE_REGION event=BEGIN",
                 block,
             )
-            prep_match = re.search(
-                rf"\[REGION_C2P_PC_PREP\] layer=34 chunk={c + 1} "
-                rf"sg=\d+ slot=\d+ .*?status=READY",
+            cont0 = re.search(
+                r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=0 .*?"
+                r"stage=P2C_CONTINUE event=BEGIN",
                 block,
             )
-            cont_match = re.search(
-                rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
-                rf"stage=P2C_CONTINUE event=BEGIN",
-                block,
-            )
-            if region_match is None or prep_match is None or cont_match is None:
-                print(
-                    f"FAIL: missing overlap ordering marker for "
-                    f"Region{c} -> PC_PREP{c + 1} -> CONTINUE{c}"
-                )
+            if region0 is None or cont0 is None:
+                print("FAIL: missing Region0/Continue0 markers")
                 return 1
-            if not (
-                region_match.start()
-                < prep_match.start()
-                < cont_match.start()
-            ):
-                print(
-                    f"FAIL: overlap order for chunk {c}: "
-                    f"region={region_match.start()} "
-                    f"prep={prep_match.start()} "
-                    f"continue={cont_match.start()}"
+            initial_window = min(2, n_chunks - 1)
+            for future in range(1, 1 + initial_window):
+                prep_match = re.search(
+                    rf"\[REGION_C2P_PC_PREP\] layer=34 chunk={future} "
+                    rf"sg=\d+ slot=\d+ .*?status=READY",
+                    block,
                 )
-                return 1
+                if prep_match is None or not (
+                    region0.start()
+                    < prep_match.start()
+                    < cont0.start()
+                ):
+                    print(
+                        f"FAIL: chunk {future} was not prepared inside "
+                        f"the Region0 -> Continue0 lookahead window"
+                    )
+                    return 1
+        else:
+            for c in range(n_chunks - 1):
+                region_match = re.search(
+                    rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
+                    rf"stage=PHONE_REGION event=BEGIN",
+                    block,
+                )
+                prep_match = re.search(
+                    rf"\[REGION_C2P_PC_PREP\] layer=34 chunk={c + 1} "
+                    rf"sg=\d+ slot=\d+ .*?status=READY",
+                    block,
+                )
+                cont_match = re.search(
+                    rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
+                    rf"stage=P2C_CONTINUE event=BEGIN",
+                    block,
+                )
+                if region_match is None or prep_match is None or cont_match is None:
+                    print(
+                        f"FAIL: missing overlap ordering marker for "
+                        f"Region{c} -> PC_PREP{c + 1} -> CONTINUE{c}"
+                    )
+                    return 1
+                if not (
+                    region_match.start()
+                    < prep_match.start()
+                    < cont_match.start()
+                ):
+                    print(
+                        f"FAIL: overlap order for chunk {c}: "
+                        f"region={region_match.start()} "
+                        f"prep={prep_match.start()} "
+                        f"continue={cont_match.start()}"
+                    )
+                    return 1
 
         reject = re.search(
             r"\[REGION_C2P_OVERLAP_REJECT\]",
