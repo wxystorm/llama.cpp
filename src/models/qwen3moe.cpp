@@ -291,56 +291,95 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
-    // Region Boundary V1: the Phone-only middle is executed as a single
-    // device-local graph for each prefill chunk, not as per-layer RPC graphs.
-    // Keep this opt-in and restricted to the verified directional pair.
-    const char * phone_region_env = std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
+    // Region Cycle V1: every contiguous PHONE_ONLY span bracketed by
+    // TENSOR_C2P / TENSOR_P2C is eligible for the same chunk-major,
+    // device-local Region graph.  The graph builder therefore follows the
+    // model policy instead of hard-coding one [35,46) interval.
+    const char * phone_region_env =
+        std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
     const bool phone_region_requested =
         phone_region_env != nullptr && std::atoi(phone_region_env) != 0;
-    int phone_region_first = -1;
-    int phone_region_end = -1;  // exclusive
+    struct phone_region_span {
+        int c2p_layer = -1;
+        int first_layer = -1;
+        int end_layer = -1;   // exclusive; also the P2C layer
+        int p2c_layer = -1;
+    };
+    std::vector<phone_region_span> phone_region_spans;
     std::vector<int> phone_region_chunks;
+    int active_phone_region_end = -1;
+
     // A real, non-equal single-sequence prefill is represented as
     // n_seqs=n_tokens, n_seqs_unq=1 by llama_batch_allocr. Reserve graphs
     // often have equal_seqs=true, n_seqs=1. Both are one sequence.
     const bool phone_region_single_sequence =
         ubatch.n_seqs_unq == 1 &&
         (!ubatch.equal_seqs() || ubatch.n_seqs == 1);
-    if (phone_region_requested && !stage_graph && n_layer == 48 &&
+    if (phone_region_requested && !stage_graph &&
             n_tokens > 1 && ubatch.n_pos == 1 &&
             phone_region_single_sequence &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             planned_chunk_tokens > 0 && loras->empty() &&
-            !moe_stage_wavefront &&
-            model.hybrid_layer_mode(34) == llama_hybrid_layer_mode::TENSOR_C2P &&
-            model.hybrid_layer_mode(46) == llama_hybrid_layer_mode::TENSOR_P2C) {
-        bool phone_only = true;
-        for (int il = 35; il < 46; ++il) {
-            phone_only = phone_only &&
-                model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::PHONE_ONLY &&
-                cvec->tensor_for(il) == nullptr &&
-                (size_t) il < cparams.embeddings_layer_inp.size() &&
-                !cparams.embeddings_layer_inp[(size_t) il];
-        }
-        if (phone_only) {
-            phone_region_chunks = llama_hybrid_runtime_tensor_chunks(
-                (int) n_tokens, planned_chunk_tokens);
-
-            // The Region Graph exists to make multi-chunk prefill a schedulable
-            // unit. For a single chunk there is no pipeline opportunity, and
-            // the current Meta graph does not fuse that shape: it falls back to
-            // many PHONE_ONLY_SG submissions plus a one-node terminal graph.
-            // Keep warmup / tiny-prefill on the already-validated legacy path.
-            //
-            // This also avoids exercising the range-input / SET_ROWS path on a
-            // shape for which it provides no performance benefit. Multi-chunk
-            // prefill (the 358-token XT=128 case) remains unchanged.
-            if (phone_region_chunks.size() > 1) {
-                phone_region_first = 35;
-                phone_region_end = 46;
-            } else {
-                phone_region_chunks.clear();
+            !moe_stage_wavefront) {
+        bool spans_valid = true;
+        for (int il = 0; il < n_layer && spans_valid; ++il) {
+            if (model.hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::TENSOR_C2P) {
+                continue;
             }
+
+            const int first = il + 1;
+            int p2c = first;
+            while (p2c < n_layer &&
+                    model.hybrid_layer_mode(p2c) ==
+                        llama_hybrid_layer_mode::PHONE_ONLY) {
+                ++p2c;
+            }
+
+            // A schedulable Region needs at least one full Phone layer and a
+            // closing P2C owner transition. Truncated suffixes are PC_ONLY by
+            // policy and therefore never appear here.
+            if (p2c <= first || p2c >= n_layer ||
+                    model.hybrid_layer_mode(p2c) !=
+                        llama_hybrid_layer_mode::TENSOR_P2C) {
+                spans_valid = false;
+                break;
+            }
+
+            for (int region_il = first;
+                    region_il < p2c; ++region_il) {
+                spans_valid = spans_valid &&
+                    cvec->tensor_for(region_il) == nullptr &&
+                    (size_t) region_il <
+                        cparams.embeddings_layer_inp.size() &&
+                    !cparams.embeddings_layer_inp[
+                        (size_t) region_il];
+            }
+            if (!spans_valid) {
+                break;
+            }
+
+            phone_region_spans.push_back({
+                il,
+                first,
+                p2c,
+                p2c,
+            });
+            il = p2c;
+        }
+
+        if (spans_valid && !phone_region_spans.empty()) {
+            phone_region_chunks =
+                llama_hybrid_runtime_tensor_chunks(
+                    (int) n_tokens, planned_chunk_tokens);
+
+            // Keep tiny/single-chunk prefill on the validated legacy path.
+            if (phone_region_chunks.size() <= 1) {
+                phone_region_chunks.clear();
+                phone_region_spans.clear();
+            }
+        } else {
+            phone_region_spans.clear();
         }
     }
     if (phone_region_requested) {
@@ -348,21 +387,29 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
             " stage=%d equal_seqs=%d n_seqs=%u n_seq_tokens=%u"
             " n_seqs_unq=%u n_pos=%u one_sequence=%d"
-            " tensor_mode=%d loras=%zu status=%s\n",
+            " tensor_mode=%d loras=%zu regions=%zu status=%s\n",
             n_tokens, stage_graph ? 1 : 0,
             ubatch.equal_seqs() ? 1 : 0, ubatch.n_seqs,
             ubatch.n_seq_tokens, ubatch.n_seqs_unq,
             ubatch.n_pos, phone_region_single_sequence ? 1 : 0,
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 1 : 0,
-            loras->size(), phone_region_first >= 0 ? "READY" : "SKIP");
-        LLAMA_LOG_ERROR(
-            "[PHONE_REGION_GRAPH_PLAN] enabled=%d layers=[%d,%d) "
-            "tokens=%" PRId64 " chunks=%zu graph_per_chunk=1 "
-            "fallback=LEGACY status=%s\n",
-            phone_region_first >= 0 ? 1 : 0,
-            phone_region_first, phone_region_end, n_tokens,
-            phone_region_chunks.size(),
-            phone_region_first >= 0 ? "READY" : "SKIP_UNSUPPORTED");
+            loras->size(), phone_region_spans.size(),
+            !phone_region_spans.empty() ? "READY" : "SKIP");
+        for (size_t ri = 0; ri < phone_region_spans.size(); ++ri) {
+            const auto & span = phone_region_spans[ri];
+            LLAMA_LOG_ERROR(
+                "[PHONE_REGION_GRAPH_PLAN] region=%zu enabled=1 "
+                "c2p=%d layers=[%d,%d) p2c=%d "
+                "tokens=%" PRId64 " chunks=%zu graph_per_chunk=1 "
+                "fallback=LEGACY status=READY\n",
+                ri,
+                span.c2p_layer,
+                span.first_layer,
+                span.end_layer,
+                span.p2c_layer,
+                n_tokens,
+                phone_region_chunks.size());
+        }
     }
 
     if (moe_stage_wavefront) {
@@ -745,7 +792,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     std::vector<int64_t> phone_region_token_begin_for_tensor;
 
     for (int il = layer_begin; il < layer_end; ++il) {
-        if (il == phone_region_first) {
+        const auto phone_region_it = std::find_if(
+            phone_region_spans.begin(),
+            phone_region_spans.end(),
+            [il](const phone_region_span & span) {
+                return span.first_layer == il;
+            });
+        if (phone_region_it != phone_region_spans.end()) {
+            const int phone_region_first =
+                phone_region_it->first_layer;
+            const int phone_region_end =
+                phone_region_it->end_layer;
+            active_phone_region_end = phone_region_end;
             // Keep the C2P final owner and the L46 P2C protocol untouched.
             // L34's complete Phone-owned output is the immutable input to
             // each chunk; only the Phone Full region is re-tiled here.
@@ -900,8 +958,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
             if (region_outputs.size() == 1) {
                 // Do not rename the only chunk's end tensor: Meta relies on
-                // phone_region_chunk_end_N-45 for the single-graph boundary.
-                // This VIEW is a separate zero-copy alias for L46's input.
+                // phone_region_chunk_end_N-L for the single-graph boundary.
+                // This VIEW is a separate zero-copy alias for the following
+                // P2C layer input.
                 region_join = ggml_view_2d(
                     ctx0, region_join, region_join->ne[0],
                     region_join->ne[1], region_join->nb[1], 0);
@@ -912,7 +971,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             continue;
         }
 
-        if (il == phone_region_end &&
+        if (il == active_phone_region_end &&
                 !phone_region_outputs_for_tensor.empty()) {
             // L46 P2C Tensor continuation, fully chunk-local from Attention
             // through Router/Top-K and FFN. The previous implementation joined
@@ -1093,7 +1152,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLAMA_LOG_ERROR(
                     "[PHONE_TENSOR_ATTN_CHUNK] layer=%d chunk=%zu "
                     "begin=%" PRId64 " tokens=%" PRId64
-                    " source=REGION_L45 status=BUILT\n",
+                    " source=PHONE_REGION status=BUILT\n",
                     il, ci, token_begin, token_count);
             }
             GGML_ASSERT(tensor_token_total == n_tokens);
@@ -1118,6 +1177,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_cvec(cur, il);
             cb(cur, "l_out", il);
             inpL = cur;
+            phone_region_outputs_for_tensor.clear();
+            phone_region_attn_inputs_for_tensor.clear();
+            phone_region_token_begin_for_tensor.clear();
+            active_phone_region_end = -1;
             continue;
         }
 
