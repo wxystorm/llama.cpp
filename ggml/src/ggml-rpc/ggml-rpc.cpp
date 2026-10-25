@@ -5385,7 +5385,7 @@ bool rpc_server::phone_region_local_submit(
     }
 
     size_t expected = sizeof(request);
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < 4; ++i) {
         if (request.graph_sizes[i] == 0 ||
                 request.graph_sizes[i] > SIZE_MAX - expected) {
             return true;
