@@ -13872,6 +13872,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         weights_name, sizeof(weights_name),
                         "c2p_prefill_route_weights_chunk_%zu-34",
                         c);
+                    ggml_tensor * phone_topk =
+                        find_sg_named_tensor(
+                            1, e.down_sg, topk_name);
+                    ggml_tensor * phone_weights =
+                        find_sg_named_tensor(
+                            1, e.down_sg, weights_name);
                     ggml_tensor * pc_topk =
                         find_sg_named_tensor(
                             0, e.down_sg, topk_name);
@@ -13882,9 +13888,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         pc_down_graph->nodes[
                             pc_down_graph->n_nodes - 1];
                     if (phone_input == nullptr ||
+                            phone_topk == nullptr ||
+                            phone_weights == nullptr ||
                             pc_topk == nullptr ||
                             pc_weights == nullptr ||
-                            pc_partial == nullptr) {
+                            pc_partial == nullptr ||
+                            !ggml_are_same_layout(
+                                phone_topk, pc_topk) ||
+                            !ggml_are_same_layout(
+                                phone_weights, pc_weights)) {
                         prep_ok = false;
                         region_pipe_reason =
                             "C2P_OVERLAP_TENSOR_MISSING";
@@ -13904,6 +13916,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             phone_cfg.backend,
                             overlap_slot.phone_input_buf,
                             storage_bytes(phone_input)) &&
+                        ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_route_bufs[0],
+                            storage_bytes(phone_topk)) &&
+                        ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_route_bufs[1],
+                            storage_bytes(phone_weights)) &&
                         ensure_overlap_buf(
                             pc_cfg.backend,
                             overlap_slot.pc_route_bufs[0],
@@ -13933,6 +13953,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             c2p_slot_bytes[slot_index] +=
                                 ggml_backend_buffer_get_size(
                                     overlap_slot.phone_input_buf.get());
+                        }
+                        for (const auto & route_buf :
+                                overlap_slot.phone_route_bufs) {
+                            if (route_buf) {
+                                c2p_slot_bytes[slot_index] +=
+                                    ggml_backend_buffer_get_size(
+                                        route_buf.get());
+                            }
                         }
                         for (const auto & route_buf :
                                 overlap_slot.pc_route_bufs) {
