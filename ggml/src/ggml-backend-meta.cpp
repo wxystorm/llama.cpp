@@ -4656,7 +4656,24 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     int parsed_layer = -1;
                     int chunk = -1;
 
+                    int parsed_chars = 0;
+                    const bool phone_tensor_attn_marker =
+                        std::sscanf(
+                            node->name,
+                            "phone_tensor_attn_norm_chunk_%d-%d%n",
+                            &chunk, &parsed_layer, &parsed_chars) == 2 &&
+                        node->name[parsed_chars] == '\0';
+                    parsed_chars = 0;
+                    const bool phone_tensor_attn_out_marker =
+                        std::sscanf(
+                            node->name,
+                            "phone_tensor_attn_chunk_%d-%d%n",
+                            &chunk, &parsed_layer, &parsed_chars) == 2 &&
+                        node->name[parsed_chars] == '\0';
+
                     const bool parsed =
+                        phone_tensor_attn_marker ||
+                        phone_tensor_attn_out_marker ||
                         std::sscanf(
                             node->name, "attn_out-%d",
                             &parsed_layer) == 1 ||
@@ -8664,6 +8681,40 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
+
+        if (pipeline_debug && phone_owner_exit) {
+            int chunked_attn_layer = -1;
+            int chunked_attn_chunk = -1;
+            for (size_t backend = 0;
+                    backend < n_backends &&
+                    chunked_attn_layer < 0; ++backend) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[i].cgraph_main;
+                for (int k = 0;
+                        graph != nullptr && k < graph->n_nodes; ++k) {
+                    int parsed = 0;
+                    if (std::sscanf(
+                            graph->nodes[k]->name,
+                            "phone_tensor_attn_chunk_%d-%d%n",
+                            &chunked_attn_chunk,
+                            &chunked_attn_layer,
+                            &parsed) == 2 &&
+                            graph->nodes[k]->name[parsed] == '\0') {
+                        break;
+                    }
+                }
+            }
+            if (chunked_attn_layer >= 0) {
+                printf(
+                    "[PHONE_TENSOR_ATTN_OWNER_REJECT] "
+                    "sg=%zu layer=%d chunk=%d "
+                    "reason=CHUNK_ATTENTION_MUST_KEEP_PHONE_OWNER "
+                    "action=STOP\n",
+                    i, chunked_attn_layer, chunked_attn_chunk);
+                return GGML_STATUS_FAILED;
+            }
+        }
 
         if (pipeline_debug && c2p_tensor_sg) {
             printf(
