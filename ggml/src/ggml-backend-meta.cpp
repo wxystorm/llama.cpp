@@ -13593,7 +13593,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     // Opt-in V1: reorder only the already-built, already-allocated Meta
     // subgraphs. Each C2P chunk may be followed immediately by its complete
-    // L35-L45 Phone Region graph. This gives PC work on chunk N+1 a chance
+    // Phone-only Region graph. This gives PC work on chunk N+1 a chance
     // to overlap the asynchronous Phone execution of chunk N. The existing
     // C2P route-copy fence still serializes access before the next Phone FFN;
     // neither KV ordering nor the P2C protocol is changed.
@@ -13661,7 +13661,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     const int region_pipe_phone_last_layer =
         region_cycle_phone_last_layer;
 
-    if (region_pipeline_requested && n_backends == 2 &&
+    if (region_pipeline_requested && pipeline_debug) {
+        printf(
+            "[PHONE_REGION_CYCLE_UNIT] c2p=%d phone=[%d,%d] p2c=%d "
+            "meta_sgs=%zu status=%s\n",
+            region_pipe_c2p_layer,
+            region_pipe_phone_first_layer,
+            region_pipe_phone_last_layer,
+            region_pipe_p2c_layer,
+            backend_ctx->n_subgraphs,
+            region_pipe_c2p_layer >= 0 &&
+                    region_pipe_p2c_layer >
+                        region_pipe_c2p_layer + 1 ?
+                "DETECTED" :
+                (region_pipe_c2p_layer == -2 ||
+                 region_pipe_p2c_layer == -2 ?
+                    "MULTIPLE_UNITS" : "NOT_FOUND"));
+    }
+
+    if (region_pipeline_requested &&
+            (region_pipe_c2p_layer == -2 ||
+             region_pipe_p2c_layer == -2)) {
+        region_pipe_reason = "MULTIPLE_DIRECTIONAL_UNITS_IN_META_GRAPH";
+    } else if (region_pipeline_requested && n_backends == 2 &&
             region_pipe_c2p_layer >= 0 &&
             region_pipe_p2c_layer >
                 region_pipe_c2p_layer + 1 &&
@@ -13749,8 +13771,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
 
-        // L46 now exposes an explicit per-chunk Attention begin marker and an
-        // existing per-chunk FFN-down end marker. The dependency walk below is
+        // The P2C layer exposes an explicit per-chunk Attention begin marker
+        // and an existing per-chunk FFN-down end marker. The dependency walk below is
         // still kept as a correctness guard: every early continuation must
         // depend only on its own completed Region output, never a future one.
         if (eligible) {
@@ -14693,10 +14715,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             // Preserve every unrelated/shared post-Region SG after all
-            // per-chunk continuations. Explicit L46 marker ranges were already
-            // covered above; gaps such as the layer-34 bridge and the shared
-            // l_out-46 tail remain here instead of being misclassified as a
-            // chunk continuation.
+            // per-chunk continuations. Explicit P2C marker ranges were already
+            // covered above; shared bridge/tail SGs remain here instead of
+            // being misclassified as a chunk continuation.
             for (size_t sg = last_region_end + 1;
                     sg < backend_ctx->n_subgraphs; ++sg) {
                 if (!covered[sg]) {
