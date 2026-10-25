@@ -5526,6 +5526,34 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         return true;
     };
 
+    // Only the final P2C output commit retires the C2P ownership epoch.
+    // The buffers themselves remain allocated for reuse, while stale logical
+    // dimensions can never leak into the following prompt.
+    auto retire_region_c2p_on_p2c_commit =
+        [&](int p2c_layer, const char * origin) {
+            auto & state = backend_ctx->region_c2p_prefill;
+            if (!region_chunk_continuation || !state.active) {
+                return;
+            }
+            if (!state.complete) {
+                printf("[REGION_CONT_EPOCH] event=RETIRE_DEFERRED "
+                       "c2p_layer=%d p2c_layer=%d chunks=%d "
+                       "reserved=%zu/%zu source=%s status=INCOMPLETE\n",
+                       state.layer, p2c_layer, state.next_chunk,
+                       state.bytes_reserved, state.full_bytes, origin);
+                return;
+            }
+            if (pipeline_debug) {
+                printf("[REGION_CONT_EPOCH] event=RETIRED "
+                       "c2p_layer=%d p2c_layer=%d chunks=%d "
+                       "bytes=%zu source=%s status=OK\n",
+                       state.layer, p2c_layer, state.next_chunk,
+                       state.full_bytes, origin);
+            }
+            state = ggml_backend_meta_context::
+                region_prefill_boundary_state {};
+        };
+
     // Read-only A/B correctness captures for a single Tensor layer.
     // Values are stored in logical element order; GGML VIEW padding/strides
     // are stripped before writing, especially for argsort TopK I32 views.
@@ -11516,6 +11544,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 backend_ctx->region_p2c_prefill.active = false;
+                retire_region_c2p_on_p2c_commit(
+                    prefill_down_layer_0, "P2C_CURRENT_GRAPH");
 
                 if (pipeline_debug) {
                     printf(
@@ -14811,6 +14841,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             state.active = false;
+            retire_region_c2p_on_p2c_commit(
+                state.layer, "P2C_LATER_GRAPH");
             return GGML_STATUS_SUCCESS;
         };
 
@@ -14822,9 +14854,73 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
     }
 
-    // Every new Meta graph can materialize new Phone VIEW descriptors. Bind
-    // those to the already-committed C2P output before any Phone work starts.
+    // The requested Region mode is a process-wide option, not a per-request
+    // epoch. Warmup/small-prefill executions may leave an already-completed
+    // C2P epoch whose size differs from the next full prompt. A new C2P
+    // chunk-0 boundary is authoritative: retire the old epoch BEFORE trying
+    // to bind the newly materialized Phone l_out/views.
+    bool graph_starts_c2p_epoch = false;
+    bool graph_uses_region_continuation = false;
+    int graph_c2p_start_layer = -1;
+    for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+        int down_chunk = -1;
+        int down_layer = -1;
+        if (parse_prefill_sg(
+                sg, false, down_chunk, down_layer) &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, down_layer)) {
+            graph_uses_region_continuation = true;
+            if (down_chunk == 0) {
+                graph_starts_c2p_epoch = true;
+                graph_c2p_start_layer = down_layer;
+            }
+        }
+
+        ggml_cgraph * graph =
+            backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+        if (graph == nullptr) {
+            continue;
+        }
+        for (int k = 0; k < graph->n_nodes; ++k) {
+            ggml_tensor * node = graph->nodes[k];
+            if (node == nullptr) {
+                continue;
+            }
+            const char * name = node->name;
+            if (std::strncmp(name, "region_cont_entry_chunk_", 24) == 0 ||
+                std::strncmp(name, "region_phone_", 13) == 0 ||
+                std::strncmp(name, "region_p2c_", 11) == 0) {
+                graph_uses_region_continuation = true;
+                break;
+            }
+        }
+    }
+
+    if (region_chunk_continuation && graph_starts_c2p_epoch) {
+        auto & prior = backend_ctx->region_c2p_prefill;
+        if (pipeline_debug) {
+            printf("[REGION_CONT_EPOCH] event=BEGIN "
+                   "layer=%d previous_active=%d previous_layer=%d "
+                   "previous_chunks=%d previous_bytes=%zu "
+                   "previous_complete=%d status=RESET\n",
+                   graph_c2p_start_layer, prior.active ? 1 : 0,
+                   prior.layer, prior.next_chunk, prior.full_bytes,
+                   prior.complete ? 1 : 0);
+        }
+        // All outstanding transfers from the previous compute call are
+        // drained before it returns. Do not free backend-owned buffers here.
+        prior = ggml_backend_meta_context::
+            region_prefill_boundary_state {};
+        backend_ctx->region_p2c_prefill =
+            ggml_backend_meta_context::
+                region_prefill_boundary_state {};
+        backend_ctx->region_prefill_hidden_bytes = 0;
+    }
+
+    // A normal decode graph also contains l_out-34, but is not a Region
+    // continuation graph. Never attach its tensors to prefill storage.
     if (region_chunk_continuation &&
+            graph_uses_region_continuation &&
             backend_ctx->region_c2p_prefill.active &&
             backend_ctx->region_c2p_prefill.next_chunk > 0 &&
             !bind_region_c2p_phone_backing(
